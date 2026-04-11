@@ -1,7 +1,7 @@
 //! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{OwnedBatch, MemBatch, partition_for_key};
+use crate::storage::{Batch, MemBatch, partition_for_key};
 
 use super::util::{extract_group_key, payload_idx};
 
@@ -51,7 +51,7 @@ impl PartitionRouter {
     /// Rows with negative weight retract; non-negative weight records.
     pub fn record_routing(
         &mut self,
-        batch: &OwnedBatch,
+        batch: &Batch,
         schema: &SchemaDescriptor,
         tid: u32,
         col_idx: u32,
@@ -117,11 +117,11 @@ fn hash_row_for_partition(
 }
 
 pub fn op_repartition_batch(
-    batch: &OwnedBatch,
+    batch: &Batch,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<OwnedBatch> {
+) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batch: count={} num_workers={}", batch.count, num_workers);
     let npc = schema.num_columns as usize - 1;
     let n = batch.count;
@@ -134,27 +134,27 @@ pub fn op_repartition_batch(
         worker_indices[w].push(i as u32);
     }
 
-    let mut result: Vec<Option<OwnedBatch>> = (0..num_workers).map(|_| None).collect();
+    let mut result: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
     for w in 0..num_workers {
         if !worker_indices[w].is_empty() {
-            result[w] = Some(OwnedBatch::from_indexed_rows(&mb, &worker_indices[w], schema));
+            result[w] = Some(Batch::from_indexed_rows(&mb, &worker_indices[w], schema));
         }
     }
     result
         .into_iter()
-        .map(|opt| opt.unwrap_or_else(|| OwnedBatch::empty(npc)))
+        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
         .collect()
 }
 
 pub fn op_repartition_batches(
-    sources: &[Option<&OwnedBatch>],
+    sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<OwnedBatch> {
+) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
     let npc = schema.num_columns as usize - 1;
-    let mut dest: Vec<Option<OwnedBatch>> = (0..num_workers).map(|_| None).collect();
+    let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
     for src_opt in sources {
         let src = match src_opt {
@@ -171,7 +171,7 @@ pub fn op_repartition_batches(
         for w in 0..num_workers {
             if !worker_indices[w].is_empty() {
                 let d = dest[w].get_or_insert_with(|| {
-                    OwnedBatch::with_schema(*schema, worker_indices[w].len())
+                    Batch::with_schema(*schema, worker_indices[w].len())
                 });
                 d.append_indexed_rows(&mb, &worker_indices[w], schema);
             }
@@ -179,16 +179,16 @@ pub fn op_repartition_batches(
     }
 
     dest.into_iter()
-        .map(|opt| opt.unwrap_or_else(|| OwnedBatch::empty(npc)))
+        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
         .collect()
 }
 
 pub fn op_repartition_batches_merged(
-    sources: &[Option<&OwnedBatch>],
+    sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<OwnedBatch> {
+) -> Vec<Batch> {
     gnitz_debug!(
         "op_repartition_batches_merged: sources={} num_workers={}",
         sources.len(),
@@ -197,7 +197,7 @@ pub fn op_repartition_batches_merged(
     let npc = schema.num_columns as usize - 1;
     let n = sources.len();
     let mut cursors: Vec<usize> = vec![0; n];
-    let mut dest: Vec<Option<OwnedBatch>> = (0..num_workers).map(|_| None).collect();
+    let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
     // Pre-compute MemBatch views to avoid per-row allocation in as_mem_batch()
     let mem_batches: Vec<Option<MemBatch>> = sources
@@ -243,7 +243,7 @@ pub fn op_repartition_batches_merged(
         let partition = hash_row_for_partition(mb, src_idx, col_indices, schema);
         let dw = worker_for_partition(partition, num_workers);
 
-        let d = dest[dw].get_or_insert_with(|| OwnedBatch::with_schema(*schema, 16));
+        let d = dest[dw].get_or_insert_with(|| Batch::with_schema(*schema, 16));
         d.append_batch(src, src_idx, src_idx + 1);
         cursors[min_w] += 1;
     }
@@ -256,17 +256,17 @@ pub fn op_repartition_batches_merged(
                 d.schema = Some(*schema);
                 d
             }
-            None => OwnedBatch::empty(npc),
+            None => Batch::empty(npc),
         })
         .collect()
 }
 
 pub fn op_relay_scatter(
-    sources: &[Option<&OwnedBatch>],
+    sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<OwnedBatch> {
+) -> Vec<Batch> {
     let all_consolidated = sources.iter().all(|src_opt| match src_opt {
         Some(s) if s.count > 0 => s.consolidated,
         _ => true,
@@ -279,7 +279,7 @@ pub fn op_relay_scatter(
     );
     if !has_any {
         let npc = schema.num_columns as usize - 1;
-        return (0..num_workers).map(|_| OwnedBatch::empty(npc)).collect();
+        return (0..num_workers).map(|_| Batch::empty(npc)).collect();
     }
     if all_consolidated {
         op_repartition_batches_merged(sources, col_indices, schema, num_workers)
@@ -289,11 +289,11 @@ pub fn op_relay_scatter(
 }
 
 pub fn op_multi_scatter(
-    batch: &OwnedBatch,
+    batch: &Batch,
     col_specs: &[&[u32]],
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<Vec<OwnedBatch>> {
+) -> Vec<Vec<Batch>> {
     gnitz_debug!(
         "op_multi_scatter: count={} specs={} num_workers={}",
         batch.count,
@@ -316,15 +316,15 @@ pub fn op_multi_scatter(
         }
     }
 
-    let mut results: Vec<Vec<OwnedBatch>> = (0..n_specs)
-        .map(|_| (0..num_workers).map(|_| OwnedBatch::empty(npc)).collect())
+    let mut results: Vec<Vec<Batch>> = (0..n_specs)
+        .map(|_| (0..num_workers).map(|_| Batch::empty(npc)).collect())
         .collect();
 
     for si in 0..n_specs {
         for w in 0..num_workers {
             let indices = &flat_indices[si * num_workers + w];
             if !indices.is_empty() {
-                results[si][w] = OwnedBatch::from_indexed_rows(&mb, indices, schema);
+                results[si][w] = Batch::from_indexed_rows(&mb, indices, schema);
             }
         }
     }
@@ -436,9 +436,9 @@ mod tests {
         }
     }
 
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> OwnedBatch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -453,9 +453,9 @@ mod tests {
         b
     }
 
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> OwnedBatch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, s) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -484,7 +484,7 @@ mod tests {
         b
     }
 
-    fn total_rows(batches: &[OwnedBatch]) -> usize {
+    fn total_rows(batches: &[Batch]) -> usize {
         batches.iter().map(|b| b.count).sum()
     }
 
@@ -494,7 +494,7 @@ mod tests {
         let num_workers = 4;
         let pk_vals: &[u64] = &[1, 7, 42, 100, 255, 1024, 65537, 999983];
 
-        let mut b = OwnedBatch::with_schema(schema, pk_vals.len());
+        let mut b = Batch::with_schema(schema, pk_vals.len());
 
         for &pk in pk_vals {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -531,7 +531,7 @@ mod tests {
         ];
 
         let n = pk_pairs.len();
-        let mut b = OwnedBatch::with_schema(schema, n);
+        let mut b = Batch::with_schema(schema, n);
 
         for &(lo, hi) in pk_pairs {
             b.extend_pk_lo(&lo.to_le_bytes());
@@ -563,7 +563,7 @@ mod tests {
         let num_workers = 4;
         let same_val: i64 = 42;
 
-        let mut b = OwnedBatch::with_schema(schema, 4);
+        let mut b = Batch::with_schema(schema, 4);
 
         for pk in [1u64, 2, 3, 4] {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -644,7 +644,7 @@ mod tests {
         let b1 = make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]);
         assert!(b0.consolidated && b1.consolidated);
 
-        let sources: Vec<Option<&OwnedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 6);
@@ -664,7 +664,7 @@ mod tests {
         let mut b1 = make_batch(&schema, &[(2, 1, 20)]);
         b1.consolidated = false;
 
-        let sources: Vec<Option<&OwnedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 2);
@@ -717,7 +717,7 @@ mod tests {
         let num_workers = 4;
         let vals: Vec<i64> = (0..64i64).map(|i| i * 997 + 1).collect();
 
-        let mut b = OwnedBatch::with_schema(schema, vals.len());
+        let mut b = Batch::with_schema(schema, vals.len());
 
         for (i, &v) in vals.iter().enumerate() {
             b.extend_pk_lo(&((i + 1) as u64).to_le_bytes());
@@ -792,7 +792,7 @@ mod tests {
         // claim consolidated because it uses PK-only comparison.
         let b0 = make_batch(&schema, &[(1, 1, 10)]);
         let b1 = make_batch(&schema, &[(1, 1, 10)]);
-        let sources: Vec<Option<&OwnedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 2, "both rows must appear in output");

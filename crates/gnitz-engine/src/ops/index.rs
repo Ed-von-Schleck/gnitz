@@ -1,7 +1,7 @@
 //! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
 
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
-use crate::storage::{OwnedBatch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 
 // ---------------------------------------------------------------------------
 // Helper: payload index
@@ -209,7 +209,7 @@ fn make_avi_schema() -> SchemaDescriptor {
 /// Ports interpreter.py:171-221.  The Rust Table handles memtable capacity
 /// internally (flush-on-overflow), so no explicit MemTableFullError retry.
 pub fn op_integrate_with_indexes(
-    batch: &OwnedBatch,
+    batch: &Batch,
     target_table: Option<&mut crate::storage::Table>,
     input_schema: &SchemaDescriptor,
     gi: Option<&GiDesc>,
@@ -236,7 +236,7 @@ pub fn op_integrate_with_indexes(
     // Phase 2: GroupIndex population (interpreter.py:175-199)
     if let Some(gi_desc) = gi {
         let gi_schema = make_gi_schema();
-        let mut gi_batch = OwnedBatch::with_schema(gi_schema, batch.count);
+        let mut gi_batch = Batch::with_schema(gi_schema, batch.count);
         gi_batch.sorted = false;
         gi_batch.consolidated = false;
 
@@ -282,7 +282,7 @@ pub fn op_integrate_with_indexes(
     // Phase 3: AggValueIndex population (interpreter.py:200-221)
     if let Some(avi_desc) = avi {
         let avi_schema = make_avi_schema();
-        let mut avi_batch = OwnedBatch::with_schema(avi_schema, batch.count);
+        let mut avi_batch = Batch::with_schema(avi_schema, batch.count);
         avi_batch.sorted = false;
         avi_batch.consolidated = false;
 

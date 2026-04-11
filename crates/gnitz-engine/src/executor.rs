@@ -15,7 +15,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_
 use crate::schema::SchemaDescriptor;
 use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR, W2M_HEADER_SIZE, WireConflictMode};
 use crate::master::MasterDispatcher;
-use crate::storage::OwnedBatch;
+use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,7 +73,7 @@ struct PendingEntry {
     fd: i32,
     client_id: u64,
     target_id: i64,
-    batch: OwnedBatch,
+    batch: Batch,
     mode: WireConflictMode,
 }
 
@@ -95,7 +95,7 @@ impl PendingBatch {
 
     fn add(
         &mut self, fd: i32, client_id: u64, target_id: i64,
-        batch: OwnedBatch, mode: WireConflictMode,
+        batch: Batch, mode: WireConflictMode,
     ) {
         self.row_count += batch.count;
         self.by_tid.entry(target_id).or_default()
@@ -225,9 +225,9 @@ impl ServerExecutor {
     // -- Data operations (direct catalog calls, no FFI) -----------------------
 
     fn handle_push(
-        &mut self, target_id: i64, in_batch: Option<Box<OwnedBatch>>,
+        &mut self, target_id: i64, in_batch: Option<Box<Batch>>,
         mode: WireConflictMode,
-    ) -> Result<(Option<Arc<OwnedBatch>>, u64), String> {
+    ) -> Result<(Option<Arc<Batch>>, u64), String> {
         if target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
@@ -269,7 +269,7 @@ impl ServerExecutor {
     }
 
 
-    fn seek_family(&mut self, target_id: i64, pk_lo: u64, pk_hi: u64) -> Option<OwnedBatch> {
+    fn seek_family(&mut self, target_id: i64, pk_lo: u64, pk_hi: u64) -> Option<Batch> {
         match self.cat().seek_family(target_id, pk_lo, pk_hi) {
             Ok(opt) => opt,
             Err(_) => None,
@@ -278,7 +278,7 @@ impl ServerExecutor {
 
     fn seek_by_index(
         &mut self, target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
-    ) -> Option<OwnedBatch> {
+    ) -> Option<Batch> {
         match self.cat().seek_by_index(target_id, col_idx, key_lo, key_hi) {
             Ok(opt) => opt,
             Err(_) => None,
@@ -292,7 +292,7 @@ impl ServerExecutor {
         transport: &mut Transport<IoUringRing>,
         fd: i32,
         target_id: i64,
-        result: Option<&OwnedBatch>,
+        result: Option<&Batch>,
         status: u32,
         error_msg: &[u8],
         client_id: u64,
@@ -426,7 +426,7 @@ impl ServerExecutor {
                     .iter()
                     .map(|e| e.batch.count)
                     .sum();
-                let mut m = OwnedBatch::with_schema(schema, total_rows.max(1));
+                let mut m = Batch::with_schema(schema, total_rows.max(1));
                 for k in run_start..run_end {
                     let b = &entries[k].batch;
                     m.append_batch(b, 0, b.count);

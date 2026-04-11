@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, StoreHandle};
-use crate::storage::{OwnedBatch, PartitionedTable, partition_arena_size, CursorHandle, Table};
+use crate::storage::{Batch, PartitionedTable, partition_arena_size, CursorHandle, Table};
 
 // Re-export items used by other crate modules.
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
@@ -33,13 +33,13 @@ pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
 use sys_tables::*;
 
 // ---------------------------------------------------------------------------
-// BatchBuilder — construct OwnedBatch rows for system table mutations
+// BatchBuilder — construct Batch rows for system table mutations
 // ---------------------------------------------------------------------------
 
-/// Lightweight row-by-row builder for constructing OwnedBatch in Rust.
-/// Operates on OwnedBatch directly.
+/// Lightweight row-by-row builder for constructing Batch in Rust.
+/// Operates on Batch directly.
 pub(crate) struct BatchBuilder {
-    batch: OwnedBatch,
+    batch: Batch,
     schema: SchemaDescriptor,
     // per-row state
     curr_null_word: u64,
@@ -48,7 +48,7 @@ pub(crate) struct BatchBuilder {
 
 impl BatchBuilder {
     pub(crate) fn new(schema: SchemaDescriptor) -> Self {
-        let batch = OwnedBatch::with_schema(schema, 8);
+        let batch = Batch::with_schema(schema, 8);
         BatchBuilder {
             batch,
             schema,
@@ -124,7 +124,7 @@ impl BatchBuilder {
     }
 
     /// Convenience: begin + put columns + end for a simple row.
-    pub(crate) fn finish(self) -> OwnedBatch {
+    pub(crate) fn finish(self) -> Batch {
         self.batch
     }
 
@@ -244,7 +244,7 @@ struct IndexInfo {
 // Free function: ingest a batch into a table (avoids borrow conflicts)
 // ---------------------------------------------------------------------------
 
-fn ingest_batch_into(table: &mut Table, batch: &OwnedBatch) {
+fn ingest_batch_into(table: &mut Table, batch: &Batch) {
     if batch.count == 0 { return; }
     let npc = batch.num_payload_cols();
     let (ptrs, sizes) = batch.to_region_ptrs();
@@ -721,7 +721,7 @@ impl CatalogEngine {
 
         // Scan all live rows and process through hooks
         let mut cursor = unsafe { (*table_ptr).create_cursor().map_err(|e| format!("cursor error: {}", e))? };
-        let mut batch = OwnedBatch::with_schema(schema, 512);
+        let mut batch = Batch::with_schema(schema, 512);
         let mut count = 0;
 
         while cursor.cursor.valid {
@@ -732,7 +732,7 @@ impl CatalogEngine {
 
                 if count >= 512 {
                     self.fire_hooks(sys_table_id, &batch)?;
-                    batch = OwnedBatch::with_schema(schema, 512);
+                    batch = Batch::with_schema(schema, 512);
                     count = 0;
                 }
             }
@@ -750,7 +750,7 @@ impl CatalogEngine {
         &self,
         cursor: &CursorHandle,
         schema: &SchemaDescriptor,
-        batch: &mut OwnedBatch,
+        batch: &mut Batch,
     ) {
         copy_cursor_row_with_weight(cursor, schema, batch, cursor.cursor.current_weight);
     }
@@ -761,7 +761,7 @@ impl CatalogEngine {
 fn copy_cursor_row_with_weight(
     cursor: &CursorHandle,
     schema: &SchemaDescriptor,
-    batch: &mut OwnedBatch,
+    batch: &mut Batch,
     weight: i64,
 ) {
         let pk_lo = cursor.cursor.current_key_lo;
@@ -812,8 +812,8 @@ fn copy_cursor_row_with_weight(
 
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
-fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> OwnedBatch {
-    let mut batch = OwnedBatch::with_schema(*schema, 1);
+fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> Batch {
+    let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
         Err(_) => return batch,
@@ -832,8 +832,8 @@ fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, 
 /// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
 /// emitting each as a retraction (weight=-1). Exploits U128 sort order
 /// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
-fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> OwnedBatch {
-    let mut batch = OwnedBatch::with_schema(*schema, 8);
+fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> Batch {
+    let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
         Err(_) => return batch,
@@ -859,7 +859,7 @@ fn retract_and_ingest(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
-    fn fire_hooks(&mut self, sys_table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    fn fire_hooks(&mut self, sys_table_id: i64, batch: &Batch) -> Result<(), String> {
         match sys_table_id {
             SCHEMA_TAB_ID => self.on_schema_delta(batch),
             TABLE_TAB_ID => self.on_table_delta(batch),
@@ -873,7 +873,7 @@ impl CatalogEngine {
         }
     }
 
-    fn on_schema_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
+    fn on_schema_delta(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
@@ -905,7 +905,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn on_table_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
+    fn on_table_delta(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
@@ -1022,7 +1022,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn on_view_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
+    fn on_view_delta(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
@@ -1111,7 +1111,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn on_index_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
+    fn on_index_delta(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
@@ -1205,10 +1205,10 @@ impl CatalogEngine {
         }
     }
 
-    fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Arc<OwnedBatch> {
+    fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Arc<Batch> {
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
-            None => return Arc::new(OwnedBatch::empty(schema.num_columns as usize - 1)),
+            None => return Arc::new(Batch::empty(schema.num_columns as usize - 1)),
         };
 
         // Extract single-Table handle (Single, Borrowed, or 1-partition Partitioned)
@@ -1251,7 +1251,7 @@ impl CatalogEngine {
                     let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                     match ptbl.create_cursor() {
                         Ok(c) => c,
-                        Err(_) => return Arc::new(OwnedBatch::empty(schema.num_columns as usize - 1)),
+                        Err(_) => return Arc::new(Batch::empty(schema.num_columns as usize - 1)),
                     }
                 }
                 _ => unreachable!(),
@@ -1259,7 +1259,7 @@ impl CatalogEngine {
         };
 
         let estimated = cursor.cursor.estimated_length().max(8);
-        let mut batch = OwnedBatch::with_schema(*schema, estimated);
+        let mut batch = Batch::with_schema(*schema, estimated);
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
@@ -1415,14 +1415,14 @@ impl CatalogEngine {
 
     // -- Batch field readers -----------------------------------------------
 
-    fn read_batch_u64(&self, batch: &OwnedBatch, row: usize, payload_col: usize) -> u64 {
+    fn read_batch_u64(&self, batch: &Batch, row: usize, payload_col: usize) -> u64 {
         let off = row * 8;
         let col = batch.col_data(payload_col);
         if off + 8 > col.len() { return 0; }
         u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
     }
 
-    fn read_batch_string(&self, batch: &OwnedBatch, row: usize, payload_col: usize) -> String {
+    fn read_batch_string(&self, batch: &Batch, row: usize, payload_col: usize) -> String {
         let off = row * 16;
         let data = batch.col_data(payload_col);
         if off + 16 > data.len() { return String::new(); }
@@ -2089,7 +2089,7 @@ impl CatalogEngine {
     /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
     /// For system tables: fires hooks after ingestion.
     /// For user tables: delegates to DagEngine::ingest_to_family.
-    pub fn ingest_to_family(&mut self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             // System table: ingest into owned Table, then fire hooks.
             let schema = sys_tab_schema(table_id);
@@ -2130,8 +2130,8 @@ impl CatalogEngine {
     /// batch for later DAG evaluation but does NOT evaluate immediately.
     /// System tables are NOT supported (use `ingest_to_family` for those).
     pub fn ingest_returning_effective(
-        &mut self, table_id: i64, batch: OwnedBatch,
-    ) -> Result<OwnedBatch, String> {
+        &mut self, table_id: i64, batch: Batch,
+    ) -> Result<Batch, String> {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("ingest_returning_effective not supported for system tables".to_string());
         }
@@ -2149,7 +2149,7 @@ impl CatalogEngine {
     /// For unique_pk tables, the effective batch (with auto-retractions) is
     /// passed to the DAG evaluator so views see correct deltas.
     /// System tables are NOT supported; use ingest_to_family for those.
-    pub fn push_and_evaluate(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    pub fn push_and_evaluate(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("push_and_evaluate not supported for system tables".to_string());
         }
@@ -2173,7 +2173,7 @@ impl CatalogEngine {
     }
 
     /// Scan all positive-weight rows from a table.
-    pub fn scan_family(&mut self, table_id: i64) -> Result<Arc<OwnedBatch>, String> {
+    pub fn scan_family(&mut self, table_id: i64) -> Result<Arc<Batch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
@@ -2185,7 +2185,7 @@ impl CatalogEngine {
     }
 
     /// Point lookup by PK. Returns a single-row batch if found, None otherwise.
-    pub fn seek_family(&mut self, table_id: i64, pk_lo: u64, pk_hi: u64) -> Result<Option<OwnedBatch>, String> {
+    pub fn seek_family(&mut self, table_id: i64, pk_lo: u64, pk_hi: u64) -> Result<Option<Batch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
@@ -2234,14 +2234,14 @@ impl CatalogEngine {
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
 
-        let mut batch = OwnedBatch::with_schema(schema, 1);
+        let mut batch = Batch::with_schema(schema, 1);
         self.copy_cursor_row_to_batch(&cursor, &schema, &mut batch);
         Ok(Some(batch))
     }
 
     /// Index-assisted lookup: look up by secondary index key, resolve to source row.
     pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, key_lo: u64, key_hi: u64)
-        -> Result<Option<OwnedBatch>, String>
+        -> Result<Option<Batch>, String>
     {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
@@ -2302,7 +2302,7 @@ impl CatalogEngine {
     /// Worker DDL sync: memonly ingest into system table + fire hooks.
     /// Workers receive DDL deltas from master and need to update their registry
     /// without writing to WAL (master owns durability).
-    pub fn ddl_sync(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         if table_id >= FIRST_USER_TABLE_ID {
             return Err("ddl_sync only for system tables".into());
         }
@@ -2331,7 +2331,7 @@ impl CatalogEngine {
     }
 
     /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
-    pub fn raw_store_ingest(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    pub fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
         let npc = batch.num_payload_cols();
@@ -2364,7 +2364,7 @@ impl CatalogEngine {
     /// Index shards see duplicate `(+1, -1)` projections when a batch
     /// is replayed after already having been flushed. These consolidate
     /// to zero on read and are pruned at the next compaction.
-    pub fn replay_ingest(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    pub fn replay_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             // System tables: use raw ingest (no unique_pk semantics).
             return self.raw_store_ingest(table_id, batch);
@@ -2600,7 +2600,7 @@ impl CatalogEngine {
 
     // -- FK inline validation (single-worker) ------------------------------
 
-    pub fn validate_fk_inline(&self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn validate_fk_inline(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let constraints = match self.fk_constraints.get(&table_id) {
             Some(c) if !c.is_empty() => c,
             _ => return Ok(()),
@@ -2666,7 +2666,7 @@ impl CatalogEngine {
     /// Validate FK RESTRICT on parent DELETE (single-worker path).
     /// For each retraction row, checks whether any child table still references
     /// the PK being deleted via the child's FK index. Returns an error if so.
-    pub fn validate_fk_parent_restrict(&self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn validate_fk_parent_restrict(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let children = self.fk_children_of(table_id);
         if children.is_empty() { return Ok(()); }
 
@@ -2713,7 +2713,7 @@ impl CatalogEngine {
     /// For unique_pk tables, UPSERT rows (PK already exists) get special
     /// handling: the old index entry will be retracted by enforce_unique_pk,
     /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
-    pub fn validate_unique_indices(&mut self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
@@ -2827,7 +2827,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn promote_to_pk_key(&self, batch: &OwnedBatch, row: usize, payload_col: usize, col_type: u8) -> (u64, u64) {
+    fn promote_to_pk_key(&self, batch: &Batch, row: usize, payload_col: usize, col_type: u8) -> (u64, u64) {
         match col_type {
             type_code::U128 => {
                 let data = batch.get_col_ptr(row, payload_col, 16);

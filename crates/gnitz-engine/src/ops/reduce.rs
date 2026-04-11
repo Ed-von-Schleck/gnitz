@@ -2,7 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{OwnedBatch, MemBatch, ReadCursor};
+use crate::storage::{Batch, MemBatch, ReadCursor};
 
 use super::util::{
     consolidate_owned, append_cursor_row_to_batch, write_string_from_batch, payload_idx,
@@ -392,7 +392,7 @@ fn compare_by_group_cols(
 
 /// Argsort delta batch by group columns.
 fn argsort_delta(
-    batch: &OwnedBatch,
+    batch: &Batch,
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> Vec<u32> {
@@ -429,7 +429,7 @@ fn argsort_delta(
 
 /// Sort batch by (PK, payload) without consolidation.
 /// Used by op_gather_reduce where we need to see each partial separately.
-fn sort_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
+fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     let n = batch.count;
     if n <= 1 || batch.sorted {
         return batch.clone_batch();
@@ -450,7 +450,7 @@ fn sort_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
     });
 
     // Scatter-copy in sorted order
-    let mut output = OwnedBatch::with_schema(*schema, n);
+    let mut output = Batch::with_schema(*schema, n);
     for &idx in &indices {
         output.append_batch(batch, idx as usize, idx as usize + 1);
     }
@@ -510,7 +510,7 @@ fn apply_agg_from_value_index(
 
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
 pub fn op_reduce(
-    delta: &OwnedBatch,
+    delta: &Batch,
     trace_in_cursor: Option<&mut ReadCursor>,
     trace_out_cursor: &mut ReadCursor,
     input_schema: &SchemaDescriptor,
@@ -527,7 +527,7 @@ pub fn op_reduce(
     _gi_col_type_code: u8,
     finalize_prog: Option<&crate::expr::ExprProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
-) -> (OwnedBatch, Option<OwnedBatch>) {
+) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
     let num_out_cols = output_schema.num_columns as usize;
     let out_npc = num_out_cols - 1;
@@ -541,7 +541,7 @@ pub fn op_reduce(
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     let consolidated;
-    let working: &OwnedBatch = if all_linear {
+    let working: &Batch = if all_linear {
         delta
     } else {
         consolidated = consolidate_owned(delta, input_schema);
@@ -551,9 +551,9 @@ pub fn op_reduce(
     let n = working.count;
     if n == 0 {
         let empty_fin = finalize_out_schema.map(|fs| {
-            OwnedBatch::empty(fs.num_columns as usize - 1)
+            Batch::empty(fs.num_columns as usize - 1)
         });
-        return (OwnedBatch::empty(out_npc), empty_fin);
+        return (Batch::empty(out_npc), empty_fin);
     }
 
     // group_by_pk detection
@@ -577,9 +577,9 @@ pub fn op_reduce(
         false
     };
 
-    let mut raw_output = OwnedBatch::with_schema(*output_schema, 32);
+    let mut raw_output = Batch::with_schema(*output_schema, 32);
     let mut fin_output = finalize_out_schema.map(|fs| {
-        OwnedBatch::with_schema(*fs, 32)
+        Batch::with_schema(*fs, 32)
     });
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
@@ -687,7 +687,7 @@ pub fn op_reduce(
                 gnitz_debug!("reduce: AVI lookup gc={:#x} found={}", gc_u64, found);
             } else {
                 // Full replay path: build replay batch from trace_in + delta
-                let mut replay = OwnedBatch::with_schema(*input_schema, 32);
+                let mut replay = Batch::with_schema(*input_schema, 32);
                 replay.sorted = false;
                 replay.consolidated = false;
 
@@ -818,7 +818,7 @@ pub fn op_reduce(
 
 /// Emit one reduce output row.
 fn emit_reduce_row(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
     group_key_lo: u64,
@@ -909,8 +909,8 @@ fn emit_reduce_row(
 /// Handles COPY_COL (copy column from raw→finalized), EMIT (computed value),
 /// and EMIT_NULL (null column) instructions by pre-scanning the bytecode.
 fn emit_finalized_row(
-    fin_output: &mut OwnedBatch,
-    raw_output: &OwnedBatch,
+    fin_output: &mut Batch,
+    raw_output: &Batch,
     raw_row: usize,
     group_key_lo: u64,
     group_key_hi: u64,
@@ -1039,9 +1039,9 @@ fn emit_finalized_row(
     fin_output.count += 1;
 }
 
-/// Append a row from a MemBatch to an OwnedBatch.
+/// Append a row from a MemBatch to an Batch.
 fn append_membatch_row_to_batch(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     mb: &MemBatch,
     row: usize,
     schema: &SchemaDescriptor,
@@ -1124,11 +1124,11 @@ fn cursor_matches_group(
 
 /// Gather-reduce: merge partial aggregate deltas from workers.
 pub fn op_gather_reduce(
-    partial_batch: &OwnedBatch,
+    partial_batch: &Batch,
     trace_out_cursor: &mut ReadCursor,
     partial_schema: &SchemaDescriptor,
     agg_descs: &[AggDescriptor],
-) -> OwnedBatch {
+) -> Batch {
     let num_aggs = agg_descs.len();
     let num_out_cols = partial_schema.num_columns as usize;
     let out_npc = num_out_cols - 1;
@@ -1137,7 +1137,7 @@ pub fn op_gather_reduce(
     let sorted = sort_owned(partial_batch, partial_schema);
     let n = sorted.count;
     if n == 0 {
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     let smb = sorted.as_mem_batch();
@@ -1146,7 +1146,7 @@ pub fn op_gather_reduce(
     let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
     let _use_natural_pk_gather = num_group_cols == 0;
 
-    let mut output = OwnedBatch::with_schema(*partial_schema, n);
+    let mut output = Batch::with_schema(*partial_schema, n);
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
@@ -1233,7 +1233,7 @@ pub fn op_gather_reduce(
 
 /// Emit one gather-reduce output row.
 fn emit_gather_row(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
     group_key_lo: u64,
@@ -1308,7 +1308,7 @@ fn emit_gather_row(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -1326,9 +1326,9 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1356,9 +1356,9 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> OwnedBatch {
+    fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1401,14 +1401,14 @@ mod tests {
         s
     }
 
-    /// Build a 3-column OwnedBatch (U64 pk, I64 grp, STRING val) from tuples.
+    /// Build a 3-column Batch (U64 pk, I64 grp, STRING val) from tuples.
     /// All strings must be <= 12 bytes (inline, no blob needed).
     fn make_batch_3col_grp_str(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64, &str)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, grp, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1445,11 +1445,11 @@ mod tests {
         s
     }
 
-    /// Build a GI OwnedBatch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
-    fn make_gi_batch(rows: &[(u64, u64, i64)]) -> OwnedBatch {
+    /// Build a GI Batch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
+    fn make_gi_batch(rows: &[(u64, u64, i64)]) -> Batch {
         let gi_schema = make_gi_schema();
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(gi_schema, n.max(1));
+        let mut b = Batch::with_schema(gi_schema, n.max(1));
 
         for &(ck_lo, gc_u64, spk_hi) in rows {
             b.extend_pk_lo(&ck_lo.to_le_bytes());
@@ -1494,11 +1494,11 @@ mod tests {
         };
 
         // Empty trace_out
-        let empty_out = Arc::new(OwnedBatch::empty(2));
+        let empty_out = Arc::new(Batch::empty(2));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
-        let mut delta1 = OwnedBatch::with_schema(in_schema, 3);
+        let mut delta1 = Batch::with_schema(in_schema, 3);
 
         for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
             delta1.extend_pk_lo(&pk.to_le_bytes());
@@ -1531,7 +1531,7 @@ mod tests {
         let prev_out = Arc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
-        let mut delta2 = OwnedBatch::with_schema(in_schema, 1);
+        let mut delta2 = Batch::with_schema(in_schema, 1);
 
         delta2.extend_pk_lo(&2u64.to_le_bytes());
         delta2.extend_pk_hi(&0u64.to_le_bytes());
@@ -1574,7 +1574,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
@@ -1618,7 +1618,7 @@ mod tests {
         let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]));
 
         // trace_out: empty (no previous aggregate, no retraction emitted)
-        let to_batch = Arc::new(OwnedBatch::empty(output_schema.num_columns as usize - 1));
+        let to_batch = Arc::new(Batch::empty(output_schema.num_columns as usize - 1));
 
         // delta: retract apple at PK=1
         let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);
@@ -1698,10 +1698,10 @@ mod tests {
         };
 
         // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
-        let mut partial1 = OwnedBatch::with_schema(schema, 2);
+        let mut partial1 = Batch::with_schema(schema, 2);
 
         // Two entries for same group key (pk=1), count=2 each
         for count in [2i64, 2] {
@@ -1726,7 +1726,7 @@ mod tests {
         let prev_out = Arc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
-        let mut partial2 = OwnedBatch::with_schema(schema, 2);
+        let mut partial2 = Batch::with_schema(schema, 2);
 
         for count in [-1i64, -1] {
             partial2.extend_pk_lo(&1u64.to_le_bytes());
@@ -1838,9 +1838,9 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> OwnedBatch {
+    fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1855,9 +1855,9 @@ mod tests {
         b
     }
 
-    fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> OwnedBatch {
+    fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1892,7 +1892,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I32 values, group by PK
@@ -1939,7 +1939,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
@@ -1983,7 +1983,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I16 values, all same PK
@@ -2028,10 +2028,10 @@ mod tests {
         };
 
         // Tick 1: partial MIN=5 from one worker → global MIN=5
-        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
-        let mut partial1 = OwnedBatch::with_schema(schema, 1);
+        let mut partial1 = Batch::with_schema(schema, 1);
 
         partial1.extend_pk_lo(&1u64.to_le_bytes());
         partial1.extend_pk_hi(&0u64.to_le_bytes());
@@ -2054,7 +2054,7 @@ mod tests {
         let prev_out = Arc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
-        let mut partial2 = OwnedBatch::with_schema(schema, 1);
+        let mut partial2 = Batch::with_schema(schema, 1);
 
         partial2.extend_pk_lo(&1u64.to_le_bytes());
         partial2.extend_pk_hi(&0u64.to_le_bytes());

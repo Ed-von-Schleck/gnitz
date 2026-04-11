@@ -1,6 +1,6 @@
 //! Thread-local buffer pool for `Vec<u8>` recycling.
 //!
-//! OwnedBatch uses only 2 heap allocations (data + blob). This pool
+//! Batch uses only 2 heap allocations (data + blob). This pool
 //! recycles those buffers so steady-state batch operations allocate nothing.
 //!
 //! No schema keying needed — any buffer works for any batch.
@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-use super::memtable::OwnedBatch;
+use super::batch::Batch;
 
 const MAX_POOLED: usize = 64;
 
@@ -35,8 +35,8 @@ pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     });
 }
 
-/// Recycle an OwnedBatch's data and blob buffers back to the pool.
-pub(crate) fn recycle(batch: OwnedBatch) {
+/// Recycle an Batch's data and blob buffers back to the pool.
+pub(crate) fn recycle(batch: Batch) {
     let (data, blob) = batch.into_buffers();
     recycle_buf(data);
     recycle_buf(blob);

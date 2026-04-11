@@ -15,7 +15,7 @@ use crate::ipc::{
     FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
     SalWriter, W2mReceiver, W2M_HEADER_SIZE,
 };
-use crate::storage::{OwnedBatch, partition_for_key};
+use crate::storage::{Batch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
     worker_for_partition_pub,
@@ -26,7 +26,7 @@ use crate::ops::{
 // ---------------------------------------------------------------------------
 
 struct ExchangeAccumulator {
-    payloads:   HashMap<i64, Vec<Option<OwnedBatch>>>,
+    payloads:   HashMap<i64, Vec<Option<Batch>>>,
     counts:     HashMap<i64, usize>,
     schemas:    HashMap<i64, SchemaDescriptor>,
     source_ids: HashMap<i64, i64>,
@@ -85,7 +85,7 @@ impl ExchangeAccumulator {
 
 struct PendingRelay {
     view_id:   i64,
-    payloads:  Vec<Option<OwnedBatch>>,
+    payloads:  Vec<Option<Batch>>,
     schema:    SchemaDescriptor,
     source_id: i64,
 }
@@ -98,9 +98,9 @@ struct PendingRelay {
 enum CheckPayload {
     /// Replicate the same batch to every worker; each worker filters
     /// its local partition.
-    Broadcast(OwnedBatch),
+    Broadcast(Batch),
     /// Per-worker sub-batches (caller has already routed by key).
-    Partitioned(Vec<OwnedBatch>),
+    Partitioned(Vec<Batch>),
 }
 
 /// A single distributed has-pk check queued for pipelined execution.
@@ -214,7 +214,7 @@ struct UniqueIndexDesc {
 
 /// Walk every positive-weight, non-null row of `batch` and insert the
 /// indexed-column value into `filter`. Respects the filter's capped state.
-fn extract_into_filter(filter: &mut UniqueFilter, batch: &OwnedBatch, d: &UniqueIndexDesc) {
+fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndexDesc) {
     for i in 0..batch.count {
         if filter.capped { return; }
         if batch.get_weight(i) <= 0 { continue; }
@@ -306,7 +306,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         flags: u32,
-        worker_batches: &[Option<&OwnedBatch>],
+        worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk_lo: u64,
@@ -336,7 +336,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         flags: u32,
-        batch: Option<&OwnedBatch>,
+        batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk_lo: u64,
@@ -364,7 +364,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         flags: u32,
-        batch: Option<&OwnedBatch>,
+        batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk_lo: u64,
@@ -399,7 +399,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         flags: u32,
-        worker_batches: &[Option<&OwnedBatch>],
+        worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk_lo: u64,
@@ -461,7 +461,7 @@ impl MasterDispatcher {
     /// `mode` is encoded into the control block so the worker knows whether
     /// to run SQL-standard rejection or silent-upsert semantics.
     pub(crate) fn write_ingest(
-        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(
@@ -542,7 +542,7 @@ impl MasterDispatcher {
     /// Pre-sums worker counts to allocate the destination buffer once via
     /// `with_schema` (which goes through `batch_pool`), eliminating the
     /// doubling-cascade `reserve_rows` grow loop.
-    fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<OwnedBatch, String> {
+    fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<Batch, String> {
         let results = self.wait_all_workers()?;
 
         // Sum first so the buffer is allocated to its final size in one shot.
@@ -555,7 +555,7 @@ impl MasterDispatcher {
 
         // with_schema goes through batch_pool::acquire_buf, so steady-state
         // calls reuse a recycled Vec<u8> with no allocation.
-        let mut out = OwnedBatch::with_schema(*schema, total_rows.max(1));
+        let mut out = Batch::with_schema(*schema, total_rows.max(1));
 
         for decoded_opt in &results {
             if let Some(decoded) = decoded_opt {
@@ -632,7 +632,7 @@ impl MasterDispatcher {
             cat.dag.get_shard_cols(view_id)
         };
 
-        let sources: Vec<Option<&OwnedBatch>> = payloads.iter()
+        let sources: Vec<Option<&Batch>> = payloads.iter()
             .map(|opt| opt.as_ref())
             .collect();
 
@@ -643,14 +643,14 @@ impl MasterDispatcher {
         let names = cat.get_column_names(view_id);
         let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
 
-        let refs: Vec<Option<&OwnedBatch>> = dest_batches.iter()
+        let refs: Vec<Option<&Batch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
         self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes, 0, 0, 0)
     }
 
     fn record_index_routing(
-        &mut self, target_id: i64, schema: &SchemaDescriptor, per_worker_batches: &[OwnedBatch],
+        &mut self, target_id: i64, schema: &SchemaDescriptor, per_worker_batches: &[Batch],
     ) {
         let cat = unsafe { &mut *self.catalog };
         let n_idx = cat.get_index_circuit_count(target_id);
@@ -674,7 +674,7 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     pub fn fan_out_ingest(
-        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         self.maybe_checkpoint()?;
         self.write_ingest(target_id, batch, mode)?;
@@ -697,7 +697,7 @@ impl MasterDispatcher {
     }
 
     pub fn fan_out_push(
-        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let n = batch.count;
@@ -721,7 +721,7 @@ impl MasterDispatcher {
             let pk_col = &[schema.pk_index];
             let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
             self.record_index_routing(target_id, &schema, &sub_batches);
-            let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
+            let refs: Vec<Option<&Batch>> = sub_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             self.write_group(target_id, push_flags, &refs, &schema, &col_names,
@@ -745,14 +745,14 @@ impl MasterDispatcher {
             for si in 0..preloadable.len() {
                 let vid = preloadable[si].0;
                 let preload_batches = &all_batches[si + 1];
-                let refs: Vec<Option<&OwnedBatch>> = preload_batches.iter()
+                let refs: Vec<Option<&Batch>> = preload_batches.iter()
                     .map(|b| if b.count > 0 { Some(b) } else { None })
                     .collect();
                 self.write_group(vid, FLAG_PRELOADED_EXCHANGE, &refs, &schema,
                                 &col_names, 0, 0, 0, -1)?;
             }
 
-            let refs: Vec<Option<&OwnedBatch>> = pk_batches.iter()
+            let refs: Vec<Option<&Batch>> = pk_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             self.write_group(target_id, push_flags, &refs, &schema,
@@ -777,7 +777,7 @@ impl MasterDispatcher {
         self.collect_acks_and_relay(source_id)
     }
 
-    pub fn fan_out_scan(&mut self, target_id: i64) -> Result<Option<OwnedBatch>, String> {
+    pub fn fan_out_scan(&mut self, target_id: i64) -> Result<Option<Batch>, String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0)?;
@@ -792,7 +792,7 @@ impl MasterDispatcher {
 
     pub fn fan_out_seek(
         &mut self, target_id: i64, pk_lo: u64, pk_hi: u64,
-    ) -> Result<Option<OwnedBatch>, String> {
+    ) -> Result<Option<Batch>, String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         let pk = crate::util::make_pk(pk_lo, pk_hi);
@@ -801,7 +801,7 @@ impl MasterDispatcher {
             self.num_workers,
         );
 
-        let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+        let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
         self.write_group(target_id, FLAG_SEEK, &empty, &schema, &col_names,
                         pk_lo, pk_hi, 0, worker as i32)?;
         self.signal_one(worker);
@@ -813,7 +813,7 @@ impl MasterDispatcher {
         }
         Ok(decoded.data_batch.and_then(|b| {
             if b.count > 0 {
-                let mut result = OwnedBatch::empty(schema.num_columns as usize - 1);
+                let mut result = Batch::empty(schema.num_columns as usize - 1);
                 result.schema = Some(schema);
                 result.append_batch(&b, 0, b.count);
                 Some(result)
@@ -825,14 +825,14 @@ impl MasterDispatcher {
 
     pub fn fan_out_seek_by_index(
         &mut self, target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
-    ) -> Result<Option<OwnedBatch>, String> {
+    ) -> Result<Option<Batch>, String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
 
         let cached_worker = self.router.worker_for_index_key(target_id as u32, col_idx, key_lo);
         if cached_worker >= 0 {
             let w = cached_worker as usize;
-            let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+            let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
             self.write_group(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
                             key_lo, key_hi, col_idx as u64, cached_worker)?;
             self.signal_one(w);
@@ -846,7 +846,7 @@ impl MasterDispatcher {
         }
 
         // Cache miss: broadcast
-        let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+        let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
         self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
                             key_lo, key_hi, col_idx as u64)?;
         let results = self.wait_all_workers()?;
@@ -862,7 +862,7 @@ impl MasterDispatcher {
         Ok(None)
     }
 
-    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
@@ -1070,7 +1070,7 @@ impl MasterDispatcher {
     /// `batch` on `table_id` into the corresponding filters. No-op for
     /// filters that are not yet warm (warmup will pick them up), and
     /// for index circuits that are not unique.
-    pub(crate) fn unique_filter_ingest_batch(&mut self, table_id: i64, batch: &OwnedBatch) {
+    pub(crate) fn unique_filter_ingest_batch(&mut self, table_id: i64, batch: &Batch) {
         let (_schema, descs) = match self.unique_index_descriptors(table_id) {
             Some(x) => x,
             None => return,
@@ -1133,7 +1133,7 @@ impl MasterDispatcher {
                     )?;
                 }
                 CheckPayload::Partitioned(batches) => {
-                    let refs: Vec<Option<&OwnedBatch>> = batches.iter()
+                    let refs: Vec<Option<&Batch>> = batches.iter()
                         .map(|b| if b.count > 0 { Some(b) } else { None })
                         .collect();
                     self.write_group(
@@ -1206,7 +1206,7 @@ impl MasterDispatcher {
     /// `mode` controls SQL semantics: `Error` rejects the batch on any
     /// PK/unique conflict; `Update` allows retract-and-insert.
     pub fn validate_all_distributed(
-        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         // Snapshot catalog metadata up front.
         let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = {
@@ -1641,10 +1641,10 @@ impl MasterDispatcher {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<OwnedBatch> {
+fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<Batch> {
     decoded.data_batch.and_then(|b| {
         if b.count > 0 {
-            let mut result = OwnedBatch::empty(schema.num_columns as usize - 1);
+            let mut result = Batch::empty(schema.num_columns as usize - 1);
             result.schema = Some(*schema);
             result.append_batch(&b, 0, b.count);
             Some(result)
@@ -1669,9 +1669,9 @@ fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
     }
 }
 
-fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]) -> OwnedBatch {
+fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let mut batch = OwnedBatch::with_schema(*schema, lo_list.len());
+    let mut batch = Batch::with_schema(*schema, lo_list.len());
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
     for k in 0..lo_list.len() {
         batch.ensure_row_capacity();
@@ -1708,9 +1708,9 @@ mod unique_filter_tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> OwnedBatch {
+    fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
         // rows: (pk, weight, null_word, payload_col1_i64_value)
-        let mut batch = OwnedBatch::with_schema(schema, rows.len().max(1));
+        let mut batch = Batch::with_schema(schema, rows.len().max(1));
         for &(pk, weight, null_word, payload_val) in rows {
             let lo = [payload_val];
             let hi = [0u64];

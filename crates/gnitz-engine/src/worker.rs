@@ -22,7 +22,7 @@ use crate::ipc::{
     FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
     SalReader, SalMessage, W2mWriter,
 };
-use crate::storage::OwnedBatch;
+use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -31,16 +31,16 @@ use crate::storage::OwnedBatch;
 /// A DDL_SYNC message received during an exchange wait, decoded eagerly.
 struct DeferredDdl {
     target_id: i64,
-    batch: OwnedBatch,
+    batch: Batch,
 }
 
 struct WorkerExchangeHandler {
-    stash: HashMap<i64, OwnedBatch>,
+    stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
 }
 
 impl WorkerExchangeHandler {
-    fn stash_preloaded(&mut self, view_id: i64, batch: OwnedBatch) {
+    fn stash_preloaded(&mut self, view_id: i64, batch: Batch) {
         self.stash.insert(view_id, batch);
     }
 
@@ -50,12 +50,12 @@ impl WorkerExchangeHandler {
         sal_reader: &SalReader,
         w2m_writer: &W2mWriter,
         view_id: i64,
-        batch: &OwnedBatch,
+        batch: &Batch,
         source_id: i64,
         read_cursor: &mut u64,
         expected_epoch: u32,
         master_pid: i32,
-    ) -> OwnedBatch {
+    ) -> Batch {
         if let Some(stashed) = self.stash.remove(&view_id) {
             return stashed;
         }
@@ -105,7 +105,7 @@ impl WorkerExchangeHandler {
                         }
                     }
                     let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
-                    return OwnedBatch::with_schema(empty_schema, 0);
+                    return Batch::with_schema(empty_schema, 0);
                 }
 
                 // Not an exchange relay. Defer DDL_SYNC; discard others.
@@ -141,9 +141,9 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
     fn do_exchange(
         &mut self,
         view_id: i64,
-        batch: &OwnedBatch,
+        batch: &Batch,
         source_id: i64,
-    ) -> OwnedBatch {
+    ) -> Batch {
         self.handler.do_exchange_impl(
             self.sal_reader, self.w2m_writer,
             view_id, batch, source_id,
@@ -165,7 +165,7 @@ pub struct WorkerProcess {
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
     exchange: WorkerExchangeHandler,
-    pending_deltas: HashMap<i64, OwnedBatch>,
+    pending_deltas: HashMap<i64, Batch>,
     read_cursor: u64,
     expected_epoch: u32,
 }
@@ -268,7 +268,7 @@ impl WorkerProcess {
                     if let Some(batch_box) = decoded.data_batch {
                         self.exchange.stash_preloaded(vid, *batch_box);
                     } else if let Some(schema) = decoded.schema {
-                        self.exchange.stash_preloaded(vid, OwnedBatch::with_schema(schema, 0));
+                        self.exchange.stash_preloaded(vid, Batch::with_schema(schema, 0));
                     }
                 }
             }
@@ -430,7 +430,7 @@ impl WorkerProcess {
         });
     }
 
-    fn send_response(&self, target_id: u64, result: Option<&OwnedBatch>, schema: Option<&SchemaDescriptor>) {
+    fn send_response(&self, target_id: u64, result: Option<&Batch>, schema: Option<&SchemaDescriptor>) {
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
@@ -463,7 +463,7 @@ impl WorkerProcess {
     }
 
     fn handle_push(
-        &mut self, target_id: i64, batch: OwnedBatch,
+        &mut self, target_id: i64, batch: Batch,
     ) -> Result<(), String> {
         // Filter to only rows belonging to this worker's partitions.
         let batch = self.filter_my_partition(batch);
@@ -489,7 +489,7 @@ impl WorkerProcess {
     }
 
     /// Filter a broadcast batch to only rows belonging to this worker's partitions.
-    fn filter_my_partition(&self, batch: OwnedBatch) -> OwnedBatch {
+    fn filter_my_partition(&self, batch: Batch) -> Batch {
         let schema = match batch.schema {
             Some(s) => s,
             None => return batch,
@@ -512,12 +512,12 @@ impl WorkerProcess {
             return batch;
         }
         if indices.is_empty() {
-            return OwnedBatch::with_schema(schema, 0);
+            return Batch::with_schema(schema, 0);
         }
 
         // Vectorized scatter: one bulk copy per column, no per-row overhead.
         let mb = batch.as_mem_batch();
-        OwnedBatch::from_indexed_rows(&mb, &indices, &schema)
+        Batch::from_indexed_rows(&mb, &indices, &schema)
     }
 
     fn handle_tick(&mut self, target_id: i64) -> Result<(), String> {
@@ -529,7 +529,7 @@ impl WorkerProcess {
             }
             let schema = self.cat().get_schema_desc(target_id)
                 .ok_or_else(|| format!("no schema for tid={}", target_id))?;
-            OwnedBatch::with_schema(schema, 0)
+            Batch::with_schema(schema, 0)
         };
         self.evaluate_dag(target_id, delta);
         Ok(())
@@ -548,7 +548,7 @@ impl WorkerProcess {
     fn handle_has_pk(
         &mut self,
         target_id: i64,
-        batch: Option<OwnedBatch>,
+        batch: Option<Batch>,
         col_hint: i32,
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
@@ -565,7 +565,7 @@ impl WorkerProcess {
                 .and_then(|b| b.schema)
                 .or_else(|| self.cat().get_schema_desc(target_id))
                 .ok_or_else(|| format!("no schema for tid={}", target_id))?;
-            let mut result = OwnedBatch::with_schema(schema, n);
+            let mut result = Batch::with_schema(schema, n);
             if let Some(ref b) = batch {
                 let table = unsafe { &mut *index_handle };
                 for i in 0..n {
@@ -578,7 +578,7 @@ impl WorkerProcess {
             let schema = self.cat().get_schema_desc(target_id)
                 .ok_or_else(|| format!("no schema for tid={}", target_id))?;
             let ptable_handle = self.cat().get_ptable_handle(target_id);
-            let mut result = OwnedBatch::with_schema(schema, n);
+            let mut result = Batch::with_schema(schema, n);
             if let Some(ref b) = batch {
                 for i in 0..n {
                     let exists = if let Some(pt_ptr) = ptable_handle {
@@ -606,7 +606,7 @@ impl WorkerProcess {
     }
 
     /// Run multi-worker DAG evaluation with the exchange context.
-    fn evaluate_dag(&mut self, source_id: i64, delta: OwnedBatch) {
+    fn evaluate_dag(&mut self, source_id: i64, delta: Batch) {
         let dag = self.cat().get_dag_ptr();
         let master_pid = self.master_pid;
         let mut ctx = WorkerExchangeCtx {
@@ -641,12 +641,12 @@ enum DispatchResult {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedBatch helper: append_row_from_batch with specified weight
+// Batch helper: append_row_from_batch with specified weight
 // ---------------------------------------------------------------------------
 
-impl OwnedBatch {
+impl Batch {
     /// Append a single row from another batch, with a caller-specified weight.
-    fn append_row_from_batch(&mut self, src: &OwnedBatch, row: usize, weight: i64) {
+    fn append_row_from_batch(&mut self, src: &Batch, row: usize, weight: i64) {
         if row >= src.count { return; }
         let pk = src.get_pk(row);
         let (lo, hi) = crate::util::split_pk(pk);
@@ -731,7 +731,7 @@ mod tests {
     fn test_exchange_handler_stash_and_retrieve() {
         let mut handler = make_handler();
         let schema = test_schema();
-        let batch = OwnedBatch::with_schema(schema, 0);
+        let batch = Batch::with_schema(schema, 0);
         handler.stash_preloaded(42, batch);
         assert!(handler.stash.contains_key(&42));
         let retrieved = handler.stash.remove(&42);
@@ -743,8 +743,8 @@ mod tests {
     fn test_exchange_handler_stash_overwrite() {
         let mut handler = make_handler();
         let schema = test_schema();
-        let batch1 = OwnedBatch::with_schema(schema, 0);
-        let mut batch2 = OwnedBatch::with_schema(schema, 1);
+        let batch1 = Batch::with_schema(schema, 0);
+        let mut batch2 = Batch::with_schema(schema, 1);
         // Add a row to batch2 to distinguish
         batch2.extend_pk_lo(&100u64.to_le_bytes());
         batch2.extend_pk_hi(&0u64.to_le_bytes());
@@ -762,9 +762,9 @@ mod tests {
     #[test]
     fn test_pending_deltas_accumulation() {
         let schema = test_schema();
-        let mut pending: HashMap<i64, OwnedBatch> = HashMap::new();
+        let mut pending: HashMap<i64, Batch> = HashMap::new();
 
-        let mut b1 = OwnedBatch::with_schema(schema, 1);
+        let mut b1 = Batch::with_schema(schema, 1);
         b1.extend_pk_lo(&1u64.to_le_bytes());
         b1.extend_pk_hi(&0u64.to_le_bytes());
         b1.extend_weight(&1i64.to_le_bytes());
@@ -772,7 +772,7 @@ mod tests {
         b1.extend_col(0, &10u64.to_le_bytes());
         b1.count = 1;
 
-        let mut b2 = OwnedBatch::with_schema(schema, 1);
+        let mut b2 = Batch::with_schema(schema, 1);
         b2.extend_pk_lo(&2u64.to_le_bytes());
         b2.extend_pk_hi(&0u64.to_le_bytes());
         b2.extend_weight(&1i64.to_le_bytes());
@@ -792,8 +792,8 @@ mod tests {
     // -- filter_my_partition tests ----------------------------------------
 
     /// Build a batch with the given PK values (pk_lo only, pk_hi=0).
-    fn make_batch(schema: SchemaDescriptor, pks: &[u64]) -> OwnedBatch {
-        let mut b = OwnedBatch::with_schema(schema, pks.len());
+    fn make_batch(schema: SchemaDescriptor, pks: &[u64]) -> Batch {
+        let mut b = Batch::with_schema(schema, pks.len());
         for &pk in pks {
             b.extend_pk_lo(&pk.to_le_bytes());
             b.extend_pk_hi(&0u64.to_le_bytes());
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn test_filter_my_partition_empty_batch() {
         let schema = test_schema();
-        let batch = OwnedBatch::with_schema(schema, 0);
+        let batch = Batch::with_schema(schema, 0);
         let wp = WorkerProcess {
             worker_id: 0,
             num_workers: 4,
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_filter_my_partition_no_schema_passthrough() {
-        let mut batch = OwnedBatch::empty(1);
+        let mut batch = Batch::empty(1);
         batch.extend_pk_lo(&1u64.to_le_bytes());
         batch.extend_pk_hi(&0u64.to_le_bytes());
         batch.extend_weight(&1i64.to_le_bytes());

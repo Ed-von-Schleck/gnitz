@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::schema::SchemaDescriptor;
-use super::memtable::OwnedBatch;
+use super::batch::Batch;
 use super::merge;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
@@ -116,7 +116,7 @@ impl PartitionedTable {
             if local >= num_live {
                 continue;
             }
-            let sub_batch = OwnedBatch::from_indexed_rows(
+            let sub_batch = Batch::from_indexed_rows(
                 &batch, &part_indices[p], &self.schema,
             );
             self.tables[local].ingest_owned_batch(sub_batch)?;
@@ -156,7 +156,7 @@ impl PartitionedTable {
             return self.tables[0].create_cursor();
         }
 
-        let mut all_snapshots: Vec<Arc<OwnedBatch>> = Vec::new();
+        let mut all_snapshots: Vec<Arc<Batch>> = Vec::new();
         let mut all_shard_arcs: Vec<Arc<MappedShard>> = Vec::new();
 
         for table in &mut self.tables {

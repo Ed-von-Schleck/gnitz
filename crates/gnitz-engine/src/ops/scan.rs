@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{OwnedBatch, ReadCursor};
+use crate::storage::{Batch, ReadCursor};
 
 use super::util::append_cursor_row_to_batch;
 
@@ -9,7 +9,7 @@ use super::util::append_cursor_row_to_batch;
 // Scan trace (source operator)
 // ---------------------------------------------------------------------------
 
-/// Scan rows from a ReadCursor into an OwnedBatch.
+/// Scan rows from a ReadCursor into an Batch.
 ///
 /// Faithfully ports source.py:14-45.  Skips zero-weight rows (defense-in-depth:
 /// individual shard entries may carry non-zero weights that cancel at merge level).
@@ -20,7 +20,7 @@ pub fn op_scan_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
     chunk_limit: i32,
-) -> OwnedBatch {
+) -> Batch {
     // Fast path: bulk drain for single-source cursors without ghosts
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
     if let Some(batch) = cursor.drain_single_source(limit, schema) {
@@ -29,7 +29,7 @@ pub fn op_scan_trace(
 
     // Fallback: row-at-a-time scan
     let cap = if chunk_limit > 0 { chunk_limit as usize } else { 64 };
-    let mut output = OwnedBatch::with_schema(*schema, cap);
+    let mut output = Batch::with_schema(*schema, cap);
     output.sorted = true;       // cursor produces sorted order
     output.consolidated = true; // cursor merges → consolidated
 
@@ -57,7 +57,7 @@ pub fn op_scan_trace(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -75,9 +75,9 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
             b.extend_pk_hi(&0u64.to_le_bytes());
@@ -124,7 +124,7 @@ mod tests {
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(OwnedBatch::empty(1));
+        let empty = Arc::new(Batch::empty(1));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let out = op_scan_trace(ch.cursor_mut(), &schema, 10);

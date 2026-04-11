@@ -2,17 +2,17 @@
 
 use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{write_to_owned_batch, OwnedBatch, MemBatch, ReadCursor, sort_and_consolidate};
+use crate::storage::{write_to_batch, Batch, MemBatch, ReadCursor, sort_and_consolidate};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
 // String relocation helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a German String from a MemBatch into the output OwnedBatch at
+/// Copy a German String from a MemBatch into the output Batch at
 /// payload column `out_pi` (current row position).
 pub(super) fn write_string_from_batch(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     out_pi: usize,
     batch: &MemBatch,
     row: usize,
@@ -57,14 +57,14 @@ pub fn write_string_from_raw(
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub(super) fn consolidate_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
+pub(super) fn consolidate_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     if batch.consolidated || batch.count == 0 {
         return batch.clone_batch();
     }
     let mb = batch.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
     let mut consolidated =
-        write_to_owned_batch(schema, batch.count, blob_cap, |writer| {
+        write_to_batch(schema, batch.count, blob_cap, |writer| {
             sort_and_consolidate(&mb, schema, writer);
         });
     consolidated.sorted = true;
@@ -78,9 +78,9 @@ pub(super) fn signum(x: i64) -> i64 {
     if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
 }
 
-/// Append a row from a ReadCursor to an OwnedBatch.
+/// Append a row from a ReadCursor to an Batch.
 pub(super) fn append_cursor_row_to_batch(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     cursor: &ReadCursor,
     schema: &SchemaDescriptor,
 ) {

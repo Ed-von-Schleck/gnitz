@@ -992,7 +992,7 @@ pub fn eval_with_emit(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -1019,8 +1019,8 @@ mod tests {
     fn make_int_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, u64, &[i64])],
-    ) -> OwnedBatch {
-        let mut batch = OwnedBatch::with_schema(*schema, rows.len().max(1));
+    ) -> Batch {
+        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
         batch.count = 0;
         for &(pk, weight, null_word, cols) in rows {
             batch.extend_pk_lo(&pk.to_le_bytes());
@@ -1277,7 +1277,7 @@ mod tests {
     fn test_string_eq_const() {
         let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
         // Build a batch with a short string "hello"
-        let mut batch = OwnedBatch::with_schema(schema, 1);
+        let mut batch = Batch::with_schema(schema, 1);
         batch.count = 0;
         batch.extend_pk_lo(&1u64.to_le_bytes());
         batch.extend_pk_hi(&0u64.to_le_bytes());
@@ -1574,7 +1574,7 @@ mod tests {
     #[test]
     fn test_string_lt_le_const() {
         let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
-        let mut batch = OwnedBatch::with_schema(schema, 1);
+        let mut batch = Batch::with_schema(schema, 1);
         batch.count = 0;
         batch.extend_pk_lo(&1u64.to_le_bytes());
         batch.extend_pk_hi(&0u64.to_le_bytes());
@@ -1616,7 +1616,7 @@ mod tests {
     fn test_string_col_eq_col() {
         // Schema: pk(U64), str_a(STRING), str_b(STRING)
         let schema = make_schema(3, 0, &[(8, 8), (11, 16), (11, 16)]);
-        let mut batch = OwnedBatch::with_schema(schema, 2);
+        let mut batch = Batch::with_schema(schema, 2);
         batch.count = 0;
 
         // Row 0: str_a="abc", str_b="abc" (equal)

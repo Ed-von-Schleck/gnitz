@@ -456,7 +456,7 @@ impl<'a> ReadCursor<'a> {
         self.entries[self.current_entry_idx].source.blob_slice().len()
     }
 
-    /// Bulk-drain a single-source cursor into an OwnedBatch, bypassing
+    /// Bulk-drain a single-source cursor into an Batch, bypassing
     /// per-row iteration. Returns `None` for multi-source cursors or
     /// sources with ghosts, signaling the caller to fall back to row-at-a-time.
     ///
@@ -465,7 +465,7 @@ impl<'a> ReadCursor<'a> {
         &mut self,
         limit: usize,
         schema: &SchemaDescriptor,
-    ) -> Option<super::memtable::OwnedBatch> {
+    ) -> Option<super::batch::Batch> {
         if !self.valid || self.entries.len() != 1 {
             return None;
         }
@@ -497,7 +497,7 @@ impl<'a> ReadCursor<'a> {
 
                 let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
                 let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
-                let mut out = unsafe { super::memtable::OwnedBatch::from_regions(&ptrs, &sizes, row_count, npc) };
+                let mut out = unsafe { super::batch::Batch::from_regions(&ptrs, &sizes, row_count, npc) };
                 out.sorted = true;
                 out.consolidated = true;
                 out.schema = Some(*schema);
@@ -558,10 +558,10 @@ pub fn create_read_cursor<'a>(
 // CursorHandle — wraps ReadCursor + optional owned snapshot data
 // ---------------------------------------------------------------------------
 
-use super::memtable::OwnedBatch;
+use super::batch::Batch;
 
 /// FFI-visible cursor handle.  Owns the ReadCursor and, when created from
-/// snapshots, keeps the `Arc<OwnedBatch>` references alive so the cursor's
+/// snapshots, keeps the `Arc<Batch>` references alive so the cursor's
 /// borrowed `MemBatch` slices remain valid.
 ///
 /// Field order matters: `cursor` is dropped before `_owned_snapshots`,
@@ -569,7 +569,7 @@ use super::memtable::OwnedBatch;
 /// data is freed.
 pub struct CursorHandle<'a> {
     pub(crate) cursor: ReadCursor<'a>,
-    _owned_snapshots: Vec<Arc<OwnedBatch>>,
+    _owned_snapshots: Vec<Arc<Batch>>,
 }
 
 impl<'a> CursorHandle<'a> {
@@ -583,7 +583,7 @@ impl<'a> CursorHandle<'a> {
 
     /// Build a CursorHandle from Rust-owned in-memory snapshots (no shards).
     pub fn from_owned(
-        snapshots: &[Arc<OwnedBatch>],
+        snapshots: &[Arc<Batch>],
         schema: crate::schema::SchemaDescriptor,
     ) -> CursorHandle<'static> {
         create_cursor_from_snapshots(snapshots, &[], schema)
@@ -597,14 +597,14 @@ impl<'a> CursorHandle<'a> {
 
 /// Build a CursorHandle from Rust-owned snapshots + shard Arcs.
 ///
-/// Each snapshot's `Arc<OwnedBatch>` is cloned into the handle to keep the
+/// Each snapshot's `Arc<Batch>` is cloned into the handle to keep the
 /// data alive.  `MemBatch` views are created with transmuted `'static`
 /// lifetime — sound because the `Arc` clones in `_owned_snapshots` guarantee
 /// the data outlives the cursor (dropped after it).
 /// Each `Arc<MappedShard>` is cloned into `CursorSource::Shard`, keeping the
 /// mmap alive for the cursor's lifetime without raw pointer aliasing.
 pub fn create_cursor_from_snapshots(
-    snapshots: &[Arc<OwnedBatch>],
+    snapshots: &[Arc<Batch>],
     shard_arcs: &[Arc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> CursorHandle<'static> {

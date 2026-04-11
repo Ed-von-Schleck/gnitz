@@ -9,7 +9,7 @@ use crate::schema::{
     type_code, SchemaDescriptor, SHORT_STRING_THRESHOLD,
 };
 use crate::expr::{self, EmitTarget, ExprProgram};
-use crate::storage::{OwnedBatch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 use crate::util::read_u32_le;
 
 // ---------------------------------------------------------------------------
@@ -45,10 +45,10 @@ impl ScalarFuncKind {
     /// Batch-level map: populate output batch from input batch.
     pub fn evaluate_map_batch(
         &self,
-        in_batch: &OwnedBatch,
+        in_batch: &Batch,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
-    ) -> OwnedBatch {
+    ) -> Batch {
         let ScalarFuncKind::Plan(p) = self;
         p.execute_map(in_batch, in_schema, out_schema)
     }
@@ -66,8 +66,8 @@ fn payload_to_col(payload: usize, pk_index: usize) -> usize {
 
 /// Copy a single column from `in_batch` to `output`.
 fn copy_column(
-    in_batch: &OwnedBatch,
-    output: &mut OwnedBatch,
+    in_batch: &Batch,
+    output: &mut Batch,
     cm: &ColMove,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
@@ -362,18 +362,18 @@ impl Plan {
     /// Execute map: system column clone → col_moves → NullPerm → compute.
     pub fn execute_map(
         &self,
-        in_batch: &OwnedBatch,
+        in_batch: &Batch,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = in_batch.count;
         let out_npc = out_schema.num_columns as usize - 1;
         if n == 0 {
-            return OwnedBatch::empty(out_npc);
+            return Batch::empty(out_npc);
         }
 
         let out_pki = out_schema.pk_index as usize;
-        let mut output = OwnedBatch::with_schema(*out_schema, n);
+        let mut output = Batch::with_schema(*out_schema, n);
         output.count = n;
 
         // System columns
@@ -457,8 +457,8 @@ mod tests {
     fn make_int_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, u64, &[i64])],
-    ) -> OwnedBatch {
-        let mut batch = OwnedBatch::with_schema(*schema, rows.len().max(1));
+    ) -> Batch {
+        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, weight, null_word, cols) in rows {
             batch.extend_pk_lo(&pk.to_le_bytes());
             batch.extend_pk_hi(&0u64.to_le_bytes());
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn test_empty_batch() {
         let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
-        let batch = OwnedBatch::empty(1);
+        let batch = Batch::empty(1);
 
         let func = ScalarFuncKind::Plan(Plan::from_projection(
             &[1], &[type_code::I64], schema.pk_index,

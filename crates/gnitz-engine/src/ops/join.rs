@@ -2,7 +2,7 @@
 
 use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{write_to_owned_batch, OwnedBatch, MemBatch, ReadCursor, scatter_copy};
+use crate::storage::{write_to_batch, Batch, MemBatch, ReadCursor, scatter_copy};
 
 use super::util::{consolidate_owned, write_string_from_batch, write_string_from_raw};
 
@@ -12,15 +12,15 @@ use super::util::{consolidate_owned, write_string_from_batch, write_string_from_
 
 /// Emit delta rows whose key has NO positive-weight match in the trace.
 pub fn op_anti_join_delta_trace(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
     let consolidated = consolidate_owned(delta, schema);
     let n = consolidated.count;
     if n == 0 {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
@@ -55,13 +55,13 @@ pub fn op_anti_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let mb = consolidated.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
     let mut output =
-        write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
+        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &[], writer);
         });
     output.sorted = true;
@@ -76,15 +76,15 @@ pub fn op_anti_join_delta_trace(
 
 /// Emit delta rows whose key HAS a positive-weight match in the trace.
 pub fn op_semi_join_delta_trace(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
     let consolidated = consolidate_owned(delta, schema);
     let n = consolidated.count;
     if n == 0 {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let trace_len = cursor.estimated_length();
@@ -126,13 +126,13 @@ pub fn op_semi_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let mb = consolidated.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
     let mut output =
-        write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
+        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &[], writer);
         });
     output.sorted = true;
@@ -142,10 +142,10 @@ pub fn op_semi_join_delta_trace(
 }
 
 fn semi_join_dt_swapped(
-    consolidated: &OwnedBatch,
+    consolidated: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
     let n = consolidated.count;
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
@@ -180,13 +180,13 @@ fn semi_join_dt_swapped(
     }
 
     if emit_indices.is_empty() {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let mb = consolidated.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
     let mut output =
-        write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
+        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &[], writer);
         });
     // Swapped order: output is in trace key order, which is sorted
@@ -201,11 +201,11 @@ fn semi_join_dt_swapped(
 
 /// Join delta rows against trace. Output schema: [left_PK, left_payload..., right_payload...].
 pub fn op_join_delta_trace(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
@@ -213,7 +213,7 @@ pub fn op_join_delta_trace(
     let consolidated = consolidate_owned(delta, left_schema);
     let n = consolidated.count;
     if n == 0 {
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     let trace_len = cursor.estimated_length();
@@ -225,21 +225,21 @@ pub fn op_join_delta_trace(
 }
 
 fn join_dt_merge_walk(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
     let n = delta.count;
     if n == 0 {
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     let delta_mb = delta.as_mem_batch();
-    let mut output = OwnedBatch::empty(out_npc);
+    let mut output = Batch::empty(out_npc);
 
     let pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
     let mut prev_pk = pks[0];
@@ -280,18 +280,18 @@ fn join_dt_merge_walk(
 }
 
 fn join_dt_swapped(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
     let n = delta.count;
 
     let delta_mb = delta.as_mem_batch();
-    let mut output = OwnedBatch::empty(out_npc);
+    let mut output = Batch::empty(out_npc);
     let delta_pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
 
     while cursor.valid {
@@ -325,11 +325,11 @@ fn join_dt_swapped(
 
 /// Left outer join: like inner join, but unmatched delta rows emit null-filled right side.
 pub fn op_join_delta_trace_outer(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
@@ -337,11 +337,11 @@ pub fn op_join_delta_trace_outer(
     let consolidated = consolidate_owned(delta, left_schema);
     let n = consolidated.count;
     if n == 0 {
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = OwnedBatch::empty(out_npc);
+    let mut output = Batch::empty(out_npc);
 
     let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut prev_pk = pks[0];
@@ -396,7 +396,7 @@ pub fn op_join_delta_trace_outer(
 /// Copy left-side payload columns from a MemBatch into the output.
 /// Shared by all join row writers (inner, outer, DD).
 fn write_left_payload(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     left_batch: &MemBatch,
     left_row: usize,
     left_null: u64,
@@ -428,7 +428,7 @@ fn write_left_payload(
 /// Left columns come from the delta MemBatch. Right columns come from the
 /// cursor's current row, accessed via `col_ptr()` / `blob_ptr()`.
 fn write_join_row(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     left_batch: &MemBatch,
     left_row: usize,
     right_cursor: &ReadCursor,
@@ -495,7 +495,7 @@ fn write_join_row(
 
 /// Write one null-filled join output row: left columns from batch, right columns all NULL.
 fn write_join_row_null_right(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     left_batch: &MemBatch,
     left_row: usize,
     weight: i64,
@@ -547,29 +547,29 @@ fn write_join_row_null_right(
 /// Emit batch_a rows whose (PK, payload) has NO positive-weight match in batch_b.
 /// For SQL EXCEPT: a row is excluded only if B has a matching (PK, payload), not just PK.
 pub fn op_anti_join_delta_delta(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     filter_join_dd_with_payload(batch_a, batch_b, schema)
 }
 
 /// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
 pub fn op_semi_join_delta_delta(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     filter_join_dd(batch_a, batch_b, schema, true)
 }
 
 /// Payload-aware anti-join DD: excludes A rows only when B has a matching
 /// (PK, payload) with positive weight. Used for SQL EXCEPT.
 fn filter_join_dd_with_payload(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
     let ca = consolidate_owned(batch_a, schema);
     let cb = consolidate_owned(batch_b, schema);
@@ -577,7 +577,7 @@ fn filter_join_dd_with_payload(
     let n_b = cb.count;
 
     if n_a == 0 {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
     if n_b == 0 {
         gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
@@ -590,7 +590,7 @@ fn filter_join_dd_with_payload(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
-    let mut output = OwnedBatch::empty(npc);
+    let mut output = Batch::empty(npc);
 
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
@@ -638,11 +638,11 @@ fn filter_join_dd_with_payload(
 /// `emit_on_match=false` → anti-join (unused after payload-aware split),
 /// `emit_on_match=true` → semi-join.
 fn filter_join_dd(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     schema: &SchemaDescriptor,
     emit_on_match: bool,
-) -> OwnedBatch {
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
     let ca = consolidate_owned(batch_a, schema);
     let cb = consolidate_owned(batch_b, schema);
@@ -650,12 +650,12 @@ fn filter_join_dd(
     let n_b = cb.count;
 
     if n_a == 0 {
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
     if n_b == 0 {
         if emit_on_match {
             gnitz_debug!("op_semi_join_dd: a={} b=0 out=0", n_a);
-            return OwnedBatch::empty(npc);
+            return Batch::empty(npc);
         } else {
             gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
             return ca;
@@ -666,7 +666,7 @@ fn filter_join_dd(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
-    let mut output = OwnedBatch::empty(npc);
+    let mut output = Batch::empty(npc);
 
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
@@ -712,11 +712,11 @@ fn filter_join_dd(
 /// Output schema: [left_PK, left_payload..., right_payload...].
 /// Weight = w_a * w_b (wrapping). Zero-weight pairs are skipped.
 pub fn op_join_delta_delta(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
@@ -728,14 +728,14 @@ pub fn op_join_delta_delta(
 
     if n_a == 0 || n_b == 0 {
         gnitz_debug!("op_join_dd: a={} b={} out=0", n_a, n_b);
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
-    let mut output = OwnedBatch::empty(out_npc);
+    let mut output = Batch::empty(out_npc);
 
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
@@ -791,7 +791,7 @@ pub fn op_join_delta_delta(
 
 /// Write one composite join output row where both sides come from MemBatch.
 fn write_join_row_from_batches(
-    output: &mut OwnedBatch,
+    output: &mut Batch,
     left_batch: &MemBatch,
     left_row: usize,
     right_batch: &MemBatch,
@@ -852,7 +852,7 @@ fn write_join_row_from_batches(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -883,9 +883,9 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -903,9 +903,9 @@ mod tests {
     fn make_batch_str(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, &str)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, s) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -934,7 +934,7 @@ mod tests {
         b
     }
 
-    fn read_str_payload(batch: &OwnedBatch, col: usize, row: usize) -> String {
+    fn read_str_payload(batch: &Batch, col: usize, row: usize) -> String {
         let off = row * 16;
         let gs = &batch.col_data(col)[off..off + 16];
         let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
@@ -949,7 +949,7 @@ mod tests {
         }
     }
 
-    fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
+    fn get_payload_i64(b: &Batch, row: usize) -> i64 {
         crate::util::read_i64_le(b.col_data(0), row * 8)
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
         // a has weight=0 after consolidation wouldn't happen, but test the skip
         let a = make_batch(&ls, &[(1, 2, 10)]);
         // b has a pair that nets to zero weight after consolidation
-        let mut b = OwnedBatch::with_schema(rs, 2);
+        let mut b = Batch::with_schema(rs, 2);
 
         for &(pk, w, val) in &[(1u64, 1i64, 100i64), (1u64, -1i64, 100i64)] {
             b.extend_pk_lo(&pk.to_le_bytes());
@@ -1183,7 +1183,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
-        let mut delta = OwnedBatch::with_schema(schema, 2);
+        let mut delta = Batch::with_schema(schema, 2);
         for (pk, w, val) in [(1u64, 2i64, 10i64), (1u64, 3i64, 10i64)] {
             delta.extend_pk_lo(&pk.to_le_bytes());
             delta.extend_pk_hi(&0u64.to_le_bytes());

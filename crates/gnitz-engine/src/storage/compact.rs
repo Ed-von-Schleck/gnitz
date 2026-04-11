@@ -5,7 +5,7 @@ use std::ffi::CStr;
 
 use super::columnar;
 use super::heap::MergeHeap;
-use super::memtable::OwnedBatch;
+use super::batch::Batch;
 use crate::schema::SchemaDescriptor;
 use super::shard_reader::MappedShard;
 #[cfg(test)]
@@ -247,7 +247,7 @@ pub fn compact_shards(
     schema: &SchemaDescriptor,
     table_id: u32,
 ) -> i32 {
-    let mut batch = OwnedBatch::with_schema(*schema, 1024);
+    let mut batch = Batch::with_schema(*schema, 1024);
     let mut blob_cache: HashMap<(u64, usize), usize> = HashMap::new();
     if let Err(e) = open_and_merge(input_files, schema, |key, weight, shard, row| {
         batch.append_row_from_source(key, weight, shard, row, &mut blob_cache);
@@ -270,8 +270,8 @@ pub fn merge_and_route(
     let num_guards = guard_keys.len();
     let out_dir_str = output_dir.to_str().unwrap_or("");
 
-    let mut batches: Vec<OwnedBatch> = (0..num_guards)
-        .map(|_| OwnedBatch::with_schema(*schema, 256))
+    let mut batches: Vec<Batch> = (0..num_guards)
+        .map(|_| Batch::with_schema(*schema, 256))
         .collect();
     let mut blob_caches: Vec<HashMap<(u64, usize), usize>> = (0..num_guards)
         .map(|_| HashMap::new())
@@ -340,7 +340,7 @@ mod tests {
     // Helper: build a minimal shard file in memory and write to disk
     fn write_test_shard(path: &str, pks: &[u64], weights: &[i64], schema: &SchemaDescriptor) {
         let pk_index = schema.pk_index as usize;
-        let mut batch = OwnedBatch::with_schema(*schema, pks.len());
+        let mut batch = Batch::with_schema(*schema, pks.len());
 
         for i in 0..pks.len() {
             batch.extend_pk_lo(&pks[i].to_le_bytes());
@@ -752,7 +752,7 @@ mod tests {
         schema.columns[1] = SchemaColumn { type_code: TYPE_STRING, size: 16, nullable: 0, _pad: 0 };
 
         // Build shard with short strings
-        let mut batch = OwnedBatch::with_schema(schema, 3);
+        let mut batch = Batch::with_schema(schema, 3);
         for pk in [1u64, 2, 3] {
             batch.extend_pk_lo(&pk.to_le_bytes());
             batch.extend_pk_hi(&0u64.to_le_bytes());
@@ -809,7 +809,7 @@ mod tests {
         schema.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 1, _pad: 0 };
 
         // Build shard: key 1 = non-null (42), key 2 = null
-        let mut batch = OwnedBatch::with_schema(schema, 2);
+        let mut batch = Batch::with_schema(schema, 2);
         // Row 1: non-null
         batch.extend_pk_lo(&1u64.to_le_bytes());
         batch.extend_pk_hi(&0u64.to_le_bytes());
@@ -872,7 +872,7 @@ mod tests {
         rows: &[(u64, i64, i64, i64)],
         schema: &SchemaDescriptor,
     ) {
-        let mut batch = OwnedBatch::with_schema(*schema, rows.len());
+        let mut batch = Batch::with_schema(*schema, rows.len());
         for &(pk, w, c1, c2) in rows {
             batch.extend_pk_lo(&pk.to_le_bytes());
             batch.extend_pk_hi(&0u64.to_le_bytes());

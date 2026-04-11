@@ -2,7 +2,7 @@
 //! Also includes PK promotion for reindex (GROUP BY).
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
-use crate::storage::{OwnedBatch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 use crate::scalar_func::ScalarFuncKind;
 use crate::xxh;
 
@@ -14,18 +14,18 @@ use crate::xxh;
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
 pub fn op_filter(
-    batch: &OwnedBatch,
+    batch: &Batch,
     func: &ScalarFuncKind,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let n = batch.count;
     if n == 0 {
         let npc = schema.num_columns as usize - 1;
-        return OwnedBatch::empty(npc);
+        return Batch::empty(npc);
     }
 
     let mb = batch.as_mem_batch();
-    let mut output = OwnedBatch::with_schema(*schema, n);
+    let mut output = Batch::with_schema(*schema, n);
 
     let mut range_start: isize = -1;
     for i in 0..n {
@@ -59,15 +59,15 @@ pub fn op_filter(
 /// Map: transform batch via scalar function.
 /// If reindex_col >= 0, computes new PK from that column value (GROUP BY).
 pub fn op_map(
-    batch: &OwnedBatch,
+    batch: &Batch,
     func: &ScalarFuncKind,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     reindex_col: i32,
-) -> OwnedBatch {
+) -> Batch {
     if batch.count == 0 {
         let out_npc = out_schema.num_columns as usize - 1;
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     if reindex_col < 0 {
@@ -99,12 +99,12 @@ pub fn op_map(
 }
 
 /// Negate: flip the sign of every weight.
-pub fn op_negate(batch: &OwnedBatch) -> OwnedBatch {
+pub fn op_negate(batch: &Batch) -> Batch {
     if batch.count == 0 {
-        return OwnedBatch::empty(batch.num_payload_cols());
+        return Batch::empty(batch.num_payload_cols());
     }
 
-    let mut output = OwnedBatch::empty(batch.num_payload_cols());
+    let mut output = Batch::empty(batch.num_payload_cols());
     output.schema = batch.schema;
     output.append_batch_negated(batch, 0, batch.count);
 
@@ -122,10 +122,10 @@ pub fn op_negate(batch: &OwnedBatch) -> OwnedBatch {
 /// Union: algebraic addition of two Z-Set streams.
 /// When both inputs are sorted, performs O(N) merge preserving sort order.
 pub fn op_union(
-    batch_a: &OwnedBatch,
-    batch_b: Option<&OwnedBatch>,
+    batch_a: &Batch,
+    batch_b: Option<&Batch>,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let b = match batch_b {
         Some(b) if b.count > 0 => b,
         _ => {
@@ -147,7 +147,7 @@ pub fn op_union(
     }
 
     // Unsorted: concatenate
-    let mut output = OwnedBatch::with_schema(*schema, batch_a.count + b.count);
+    let mut output = Batch::with_schema(*schema, batch_a.count + b.count);
     output.append_batch(batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
     output.sorted = false;
@@ -158,13 +158,13 @@ pub fn op_union(
 
 /// Sorted merge of two sorted batches with contiguous-run batching.
 fn op_union_merge(
-    batch_a: &OwnedBatch,
-    batch_b: &OwnedBatch,
+    batch_a: &Batch,
+    batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let n_a = batch_a.count;
     let n_b = batch_b.count;
-    let mut output = OwnedBatch::with_schema(*schema, n_a + n_b);
+    let mut output = Batch::with_schema(*schema, n_a + n_b);
 
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
@@ -273,17 +273,17 @@ fn op_union_merge(
 /// Used in LEFT JOIN decomposition to convert anti-join output (left-only rows)
 /// into null-filled outer join rows.
 pub fn op_null_extend(
-    batch: &OwnedBatch,
+    batch: &Batch,
     in_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
-) -> OwnedBatch {
+) -> Batch {
     let in_npc = in_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = in_npc + right_npc;
     let n = batch.count;
 
     if n == 0 {
-        return OwnedBatch::empty(out_npc);
+        return Batch::empty(out_npc);
     }
 
     // Build a merged schema for the output batch.
@@ -305,7 +305,7 @@ pub fn op_null_extend(
         columns: out_columns,
     };
 
-    let mut output = OwnedBatch::with_schema(out_schema, n);
+    let mut output = Batch::with_schema(out_schema, n);
     output.count = n;
 
     // Copy system columns
@@ -436,7 +436,7 @@ pub(super) fn promote_col_to_pk(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -454,9 +454,9 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
             b.extend_pk_hi(&0u64.to_le_bytes());
@@ -470,7 +470,7 @@ mod tests {
         b
     }
 
-    fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
+    fn get_payload_i64(b: &Batch, row: usize) -> i64 {
         crate::util::read_i64_le(b.col_data(0), row * 8)
     }
 
@@ -612,7 +612,7 @@ mod tests {
         use crate::scalar_func::{Plan, ScalarFuncKind};
 
         let schema = make_schema_u64_i64();
-        let empty_batch = OwnedBatch::empty(1);
+        let empty_batch = Batch::empty(1);
 
         let func = ScalarFuncKind::Plan(Plan::from_projection(
             &[1], &[type_code::I64], schema.pk_index,

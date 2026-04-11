@@ -895,7 +895,7 @@ fn test_enforce_unique_pk() {
     let table_ptr = &mut table as *mut Table;
     dag.register_table(100, StoreHandle::Borrowed(table_ptr), schema, 0, true, tdir.clone());
 
-    let make_row = |pk: u64, val: u64, w: i64| -> OwnedBatch {
+    let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(pk, 0, w);
         bb.put_u64(val);

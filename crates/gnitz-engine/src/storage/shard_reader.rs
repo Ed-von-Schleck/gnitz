@@ -427,20 +427,20 @@ impl MappedShard {
         -1
     }
 
-    /// Bulk-copy a contiguous slice of rows into an OwnedBatch.
+    /// Bulk-copy a contiguous slice of rows into an Batch.
     /// Bypasses per-row cursor overhead entirely — one memcpy per column.
     pub(crate) fn slice_to_owned_batch(
         &self,
         start: usize,
         row_count: usize,
         schema: &crate::schema::SchemaDescriptor,
-    ) -> super::memtable::OwnedBatch {
-        use super::memtable::OwnedBatch;
+    ) -> super::batch::Batch {
+        use super::batch::Batch;
 
         let npc = schema.num_columns as usize - 1;
 
         if row_count == 0 {
-            let mut batch = OwnedBatch::empty(npc);
+            let mut batch = Batch::empty(npc);
             batch.schema = Some(*schema);
             return batch;
         }
@@ -501,18 +501,18 @@ impl MappedShard {
         let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
         let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
 
-        let mut batch = unsafe { OwnedBatch::from_regions(&ptrs, &sizes, row_count, npc) };
+        let mut batch = unsafe { Batch::from_regions(&ptrs, &sizes, row_count, npc) };
         batch.sorted = true;
         batch.consolidated = true;
         batch.schema = Some(*schema);
         batch
     }
 
-    /// Bulk-copy all rows into an OwnedBatch.
+    /// Bulk-copy all rows into an Batch.
     pub(crate) fn to_owned_batch(
         &self,
         schema: &crate::schema::SchemaDescriptor,
-    ) -> super::memtable::OwnedBatch {
+    ) -> super::batch::Batch {
         self.slice_to_owned_batch(0, self.count, schema)
     }
 }

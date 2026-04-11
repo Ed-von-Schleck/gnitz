@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::ipc_sys;
 use crate::sys;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
-use crate::storage::{OwnedBatch, wal};
+use crate::storage::{Batch, wal};
 use crate::util::align8;
 
 // ---------------------------------------------------------------------------
@@ -107,11 +107,11 @@ const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
     sd
 };
 
-/// Convert a SchemaDescriptor + column names into a META_SCHEMA OwnedBatch.
-fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> OwnedBatch {
+/// Convert a SchemaDescriptor + column names into a META_SCHEMA Batch.
+fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> Batch {
     let ncols = schema.num_columns as usize;
     let meta = META_SCHEMA_DESC;
-    let mut batch = OwnedBatch::with_schema(meta, ncols);
+    let mut batch = Batch::with_schema(meta, ncols);
 
     for ci in 0..ncols {
         let col = &schema.columns[ci];
@@ -143,8 +143,8 @@ fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> OwnedBatch
     batch
 }
 
-/// Convert a META_SCHEMA OwnedBatch back into a SchemaDescriptor + column names.
-fn batch_to_schema(batch: &OwnedBatch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
+/// Convert a META_SCHEMA Batch back into a SchemaDescriptor + column names.
+fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
     if batch.count == 0 {
         return Err("empty schema batch");
     }
@@ -218,7 +218,7 @@ pub fn encode_wire(
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
-    data_batch: Option<&OwnedBatch>,
+    data_batch: Option<&Batch>,
 ) -> Vec<u8> {
     let sz = wire_size(status, error_msg, schema, col_names, data_batch);
     let mut buf = vec![0u8; sz];
@@ -234,7 +234,7 @@ pub fn encode_wire(
 const MAX_REGIONS_TOTAL: usize = 69;
 
 /// Compute the WAL block size for a given batch without allocating.
-fn batch_wal_block_size(batch: &OwnedBatch) -> usize {
+fn batch_wal_block_size(batch: &Batch) -> usize {
     let nr = batch.num_regions_total();
     let mut sizes = [0u32; MAX_REGIONS_TOTAL];
     for i in 0..nr {
@@ -271,7 +271,7 @@ pub fn wire_size(
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
-    data_batch: Option<&OwnedBatch>,
+    data_batch: Option<&Batch>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
@@ -300,7 +300,7 @@ pub fn wire_size(
 
 /// Encode a WAL block for a batch into `out[offset..]`. Returns new offset.
 fn encode_batch_to_wal_into(
-    out: &mut [u8], offset: usize, batch: &OwnedBatch, table_id: u32,
+    out: &mut [u8], offset: usize, batch: &Batch, table_id: u32,
 ) -> usize {
     let nr = batch.num_regions_total();
     let mut ptrs = [std::ptr::null::<u8>(); MAX_REGIONS_TOTAL];
@@ -336,7 +336,7 @@ pub fn encode_wire_into(
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
-    data_batch: Option<&OwnedBatch>,
+    data_batch: Option<&Batch>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
@@ -353,7 +353,7 @@ pub fn encode_wire_into(
     // Control block
     let ctrl_batch = {
         let cs = CONTROL_SCHEMA_DESC;
-        let mut b = OwnedBatch::with_schema(cs, 1);
+        let mut b = Batch::with_schema(cs, 1);
         let has_error = !error_msg.is_empty();
         let null_word: u64 = if has_error { 0 } else { 1u64 << 7 };
         b.extend_pk_lo(&0u64.to_le_bytes());
@@ -417,11 +417,11 @@ pub struct DecodedWire {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
     pub col_names: Vec<Vec<u8>>,
-    pub data_batch: Option<Box<OwnedBatch>>,
+    pub data_batch: Option<Box<Batch>>,
 }
 
-/// Decode a WAL block from raw bytes into an OwnedBatch.
-fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<OwnedBatch, &'static str> {
+/// Decode a WAL block from raw bytes into an Batch.
+fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
     let npc = schema.num_columns as usize - 1; // payload cols
     let expected_regions = 4 + npc + 1; // pk_lo, pk_hi, weight, nulls, payload cols, blob
 
@@ -460,7 +460,7 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<OwnedBatch
     }
 
     let mut batch = unsafe {
-        OwnedBatch::from_regions(&ptrs, &region_sizes, count as usize, npc)
+        Batch::from_regions(&ptrs, &region_sizes, count as usize, npc)
     };
     batch.schema = Some(*schema);
     Ok(batch)
@@ -1032,7 +1032,7 @@ impl SalWriter {
         &mut self,
         target_id: u32,
         flags: u32,
-        worker_batches: &[Option<&OwnedBatch>],
+        worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
         seek_pk_lo: u64,
@@ -1089,7 +1089,7 @@ impl SalWriter {
         &mut self,
         target_id: u32,
         flags: u32,
-        batch: Option<&OwnedBatch>,
+        batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
         seek_pk_lo: u64,
@@ -2013,9 +2013,9 @@ mod tests {
     }
 
     /// Helper: build a simple 1-row batch.
-    fn make_simple_batch(pk: u64, val: u64) -> OwnedBatch {
+    fn make_simple_batch(pk: u64, val: u64) -> Batch {
         let sd = simple_schema();
-        let mut b = OwnedBatch::with_schema(sd, 1);
+        let mut b = Batch::with_schema(sd, 1);
         b.extend_pk_lo(&pk.to_le_bytes());
         b.extend_pk_hi(&0u64.to_le_bytes());
         b.extend_weight(&1i64.to_le_bytes());
@@ -2162,7 +2162,7 @@ mod tests {
     #[test]
     fn test_encode_decode_string_column() {
         let sd = string_schema();
-        let mut batch = OwnedBatch::with_schema(sd, 2);
+        let mut batch = Batch::with_schema(sd, 2);
 
         // Row 1: short string
         batch.extend_pk_lo(&1u64.to_le_bytes());

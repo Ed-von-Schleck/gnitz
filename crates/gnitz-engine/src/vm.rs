@@ -3,7 +3,7 @@
 //! One FFI call per epoch instead of ~20 (one per opcode).
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{OwnedBatch, CursorHandle, Table};
+use crate::storage::{Batch, CursorHandle, Table};
 use crate::storage::ReadCursor;
 use crate::ops::{self, AggDescriptor, GiDesc, AviDesc};
 use crate::scalar_func::ScalarFuncKind;
@@ -620,7 +620,7 @@ pub struct Register {
     pub kind: RegisterKind,
     pub schema: SchemaDescriptor,
     /// Delta: current batch.  Trace: unused (empty).
-    pub batch: OwnedBatch,
+    pub batch: Batch,
     /// Trace: current cursor.  Borrowed each epoch.  Delta: None.
     pub cursor_ptr: *mut CursorHandle<'static>,
 }
@@ -636,9 +636,9 @@ impl RegisterFile {
         let mut registers = Vec::with_capacity(metas.len());
         for m in metas {
             let batch = if m.schema.num_columns > 0 {
-                OwnedBatch::with_schema(m.schema, if m.kind == RegisterKind::Delta { 16 } else { 0 })
+                Batch::with_schema(m.schema, if m.kind == RegisterKind::Delta { 16 } else { 0 })
             } else {
-                OwnedBatch::empty(0)
+                Batch::empty(0)
             };
             registers.push(Register {
                 kind: m.kind,
@@ -707,12 +707,12 @@ impl RegisterFile {
 pub fn execute_epoch(
     program: &Program,
     regfile: &mut RegisterFile,
-    input_batch: OwnedBatch,
+    input_batch: Batch,
     input_reg: u16,
     output_reg: u16,
     cursor_handles: &[*mut libc::c_void],
     owned_trace_reg_ids: &[(u16, usize)],
-) -> Result<Option<OwnedBatch>, i32> {
+) -> Result<Option<Batch>, i32> {
     gnitz_debug!("vm: execute_epoch input_count={} input_reg={} output_reg={} instrs={}",
         input_batch.count, input_reg, output_reg, program.instructions.len());
 
@@ -758,7 +758,7 @@ pub fn execute_epoch(
 
             Instr::Delay { src, state_reg, dst } => {
                 let npc = reg!(*src).batch.num_payload_cols();
-                let curr = std::mem::replace(&mut reg_mut!(*src).batch, OwnedBatch::empty(npc));
+                let curr = std::mem::replace(&mut reg_mut!(*src).batch, Batch::empty(npc));
                 let prev = std::mem::replace(&mut reg_mut!(*state_reg).batch, curr);
                 reg_mut!(*dst).batch = prev;
             }
@@ -1080,7 +1080,7 @@ pub fn execute_epoch(
     let out = &mut regfile.registers[output_reg as usize];
     if out.batch.count > 0 {
         let npc = out.batch.num_payload_cols();
-        let result = std::mem::replace(&mut out.batch, OwnedBatch::empty(npc));
+        let result = std::mem::replace(&mut out.batch, Batch::empty(npc));
         Ok(Some(result))
     } else {
         Ok(None)
@@ -1119,9 +1119,9 @@ mod tests {
     }
 
     /// Create a batch from (pk_lo, pk_hi, weight, col0_i64) tuples.
-    fn make_batch(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> OwnedBatch {
+    fn make_batch(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(schema, n);
+        let mut b = Batch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0) in rows {
             b.extend_pk_lo(&pk_lo.to_le_bytes());
             b.extend_pk_hi(&pk_hi.to_le_bytes());
@@ -1136,9 +1136,9 @@ mod tests {
     }
 
     /// Create a batch with two I64 payload columns.
-    fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64, i64)]) -> OwnedBatch {
+    fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(schema, n);
+        let mut b = Batch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0, c1) in rows {
             b.extend_pk_lo(&pk_lo.to_le_bytes());
             b.extend_pk_hi(&pk_hi.to_le_bytes());
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     /// Extract rows from a batch as (pk_lo, weight, col0_i64) tuples.
-    fn extract_rows(b: &OwnedBatch) -> Vec<(u64, i64, i64)> {
+    fn extract_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
         let mut rows = Vec::new();
         for i in 0..b.count {
             let pk_lo = u64::from_le_bytes(b.pk_lo_data()[i*8..(i+1)*8].try_into().unwrap());

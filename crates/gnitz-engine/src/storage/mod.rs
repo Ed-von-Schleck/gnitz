@@ -15,6 +15,7 @@ mod shard_file;
 mod shard_reader;
 mod shard_index;
 mod merge;
+mod batch;
 mod memtable;
 mod read_cursor;
 mod table;
@@ -25,7 +26,7 @@ pub(crate) mod batch_pool;
 pub use table::Table;
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_arena_size};
 pub use read_cursor::CursorHandle;
-pub use memtable::{OwnedBatch, write_to_owned_batch};
+pub use batch::{Batch, write_to_batch};
 pub use merge::{MemBatch, scatter_copy, sort_and_consolidate};
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────

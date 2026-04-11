@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use super::columnar;
 use crate::schema::SchemaDescriptor;
-use super::memtable::{self, MemTable, OwnedBatch};
+use super::memtable::{self, MemTable};
+use super::batch::{self, Batch};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
@@ -113,12 +114,12 @@ impl Table {
 
     /// Sort `batch` by (PK, payload) if it is not already marked sorted.
     /// Returns the batch unchanged if `batch.sorted` or `batch.count <= 1`.
-    fn sort_batch_if_needed(&self, batch: OwnedBatch) -> OwnedBatch {
+    fn sort_batch_if_needed(&self, batch: Batch) -> Batch {
         if batch.sorted || batch.count <= 1 {
             return batch;
         }
         let mb = batch.as_mem_batch();
-        let mut sorted = memtable::write_to_owned_batch(
+        let mut sorted = batch::write_to_batch(
             &self.schema, batch.count, batch.blob.len().max(1),
             |w| super::merge::sort_only(&mb, &self.schema, w),
         );
@@ -131,9 +132,9 @@ impl Table {
     // Ingest
     // ------------------------------------------------------------------
 
-    /// Ingest an already-constructed OwnedBatch into the memtable.
+    /// Ingest an already-constructed Batch into the memtable.
     /// Used by PartitionedTable after hash-routing.
-    pub fn ingest_owned_batch(&mut self, batch: OwnedBatch) -> Result<(), i32> {
+    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), i32> {
         if batch.count == 0 {
             return Ok(());
         }
@@ -201,7 +202,7 @@ impl Table {
         force_ephemeral: bool,
     ) -> Result<(), i32> {
         let batch = unsafe {
-            OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
+            Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
         let batch = self.sort_batch_if_needed(batch);
         let durable = !force_ephemeral && self.durable;
@@ -215,7 +216,7 @@ impl Table {
             Err(code) if code == memtable::ERR_CAPACITY => {
                 self.flush_inner(durable)?;
                 let batch2 = unsafe {
-                    OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
+                    Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
                 };
                 let batch2 = self.sort_batch_if_needed(batch2);
                 self.memtable.upsert_sorted_batch(batch2)?;
@@ -308,7 +309,7 @@ impl Table {
     }
 
     /// Get a memtable snapshot handle (for PartitionedTable cursor gathering).
-    pub fn get_snapshot(&mut self) -> Arc<OwnedBatch> {
+    pub fn get_snapshot(&mut self) -> Arc<Batch> {
         self.memtable.get_snapshot()
     }
 
@@ -474,7 +475,7 @@ impl Table {
 
     /// Upsert a pre-sorted batch directly into the memtable (no WAL).
     /// Used by the accumulator flush path.
-    pub fn memtable_upsert_sorted_batch(&mut self, batch: OwnedBatch) -> Result<(), i32> {
+    pub fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), i32> {
         self.memtable.upsert_sorted_batch(batch)
     }
 
@@ -806,7 +807,7 @@ mod tests {
     }
 
     /// `ingest_owned_batch` must sort the batch before WAL write and memtable
-    /// insert, even when the incoming OwnedBatch has sorted=false (reverse order).
+    /// insert, even when the incoming Batch has sorted=false (reverse order).
     #[test]
     fn test_ingest_owned_batch_unsorted() {
         let dir = tempfile::tempdir().unwrap();
@@ -819,7 +820,7 @@ mod tests {
 
         // Build a reverse-sorted batch (PK order: 30, 20, 10)
         let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
-        let batch = unsafe { OwnedBatch::from_regions(&ptrs, &sizes, count as usize, 1) };
+        let batch = unsafe { Batch::from_regions(&ptrs, &sizes, count as usize, 1) };
         // from_regions sets sorted=false
         assert!(!batch.sorted);
 
@@ -849,7 +850,7 @@ mod tests {
         let (fill_ptrs, fill_sizes, fill_count) =
             make_regions(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let mut fill_batch = unsafe {
-            OwnedBatch::from_regions(&fill_ptrs, &fill_sizes, fill_count as usize, 1)
+            Batch::from_regions(&fill_ptrs, &fill_sizes, fill_count as usize, 1)
         };
         fill_batch.sorted = true;
         t.memtable_upsert_sorted_batch(fill_batch).unwrap();

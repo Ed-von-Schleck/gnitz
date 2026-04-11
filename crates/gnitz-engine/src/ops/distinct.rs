@@ -1,7 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{write_to_owned_batch, OwnedBatch, ReadCursor, scatter_copy};
+use crate::storage::{write_to_batch, Batch, ReadCursor, scatter_copy};
 
 use super::util::{consolidate_owned, signum, compare_cursor_payload_to_batch_row};
 
@@ -14,17 +14,17 @@ use super::util::{consolidate_owned, signum, compare_cursor_payload_to_batch_row
 /// Returns `(output_batch, consolidated_delta)`.
 /// The consolidated delta is returned so the caller can feed it to `ingest_batch`.
 pub fn op_distinct(
-    delta: &OwnedBatch,
+    delta: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> (OwnedBatch, OwnedBatch) {
+) -> (Batch, Batch) {
     let npc = schema.num_columns as usize - 1;
 
     // 1. Consolidate delta
     let consolidated = consolidate_owned(delta, schema);
     let n = consolidated.count;
     if n == 0 {
-        return (OwnedBatch::empty(npc), consolidated);
+        return (Batch::empty(npc), consolidated);
     }
 
     // 2. Walk consolidated, collect emitting indices and weights
@@ -77,13 +77,13 @@ pub fn op_distinct(
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
-        return (OwnedBatch::empty(npc), consolidated);
+        return (Batch::empty(npc), consolidated);
     }
 
     let mb = consolidated.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
     let mut output =
-        write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
+        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &emit_weights, writer);
         });
     output.sorted = true;
@@ -101,7 +101,7 @@ pub fn op_distinct(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::storage::OwnedBatch;
+    use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -119,9 +119,9 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> OwnedBatch {
+    ) -> Batch {
         let n = rows.len();
-        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
             b.extend_pk_lo(&pk.to_le_bytes());
             b.extend_pk_hi(&0u64.to_le_bytes());
@@ -143,7 +143,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
-        let empty = Arc::new(OwnedBatch::empty(1));
+        let empty = Arc::new(Batch::empty(1));
         let mut ch = CursorHandle::from_owned(&[empty.clone()], schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
@@ -173,7 +173,7 @@ mod tests {
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(OwnedBatch::empty(1));
+        let empty = Arc::new(Batch::empty(1));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);

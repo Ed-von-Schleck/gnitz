@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
-use crate::storage::{OwnedBatch, CursorHandle, Table, PartitionedTable};
+use crate::storage::{Batch, CursorHandle, Table, PartitionedTable};
 use crate::ops;
 use crate::vm;
 
@@ -167,9 +167,9 @@ pub trait ExchangeCallback {
     fn do_exchange(
         &mut self,
         view_id: i64,
-        batch: &OwnedBatch,
+        batch: &Batch,
         source_id: i64,
-    ) -> OwnedBatch;
+    ) -> Batch;
 }
 
 // ---------------------------------------------------------------------------
@@ -770,9 +770,9 @@ impl DagEngine {
     pub fn execute_epoch(
         &mut self,
         view_id: i64,
-        input: OwnedBatch,
+        input: Batch,
         source_id: i64,
-    ) -> Option<OwnedBatch> {
+    ) -> Option<Batch> {
         // We need to compile (or fetch cached plan) then execute.
         // Since we need &mut self for get_program but also need to borrow
         // plan fields, we first ensure compilation, then work with the cached plan.
@@ -826,8 +826,8 @@ impl DagEngine {
     pub fn execute_post_epoch(
         &mut self,
         view_id: i64,
-        input: OwnedBatch,
-    ) -> Option<OwnedBatch> {
+        input: Batch,
+    ) -> Option<Batch> {
         if !self.cache.contains_key(&view_id) {
             if let Some(plan) = self.compile_view_internal(view_id) {
                 self.cache.insert(view_id, plan);
@@ -861,13 +861,13 @@ impl DagEngine {
     /// 1. unique_pk enforcement (retract existing, dedup intra-batch)
     /// 2. store.ingest_batch
     /// 3. index projection
-    pub fn ingest_to_family(&mut self, table_id: i64, batch: OwnedBatch) -> i32 {
+    pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) -> i32 {
         self.ingest_returning_effective(table_id, batch).0
     }
 
     /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
     /// For unique_pk tables, falls back to cloning + `ingest_returning_effective`.
-    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &OwnedBatch) -> i32 {
+    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> i32 {
         let entry = match self.tables.get(&table_id) {
             Some(e) => e,
             None => return -1,
@@ -919,8 +919,8 @@ impl DagEngine {
 
     /// Ingest a batch and return the effective batch (after unique_pk enforcement).
     /// The effective batch is what downstream views need to see.
-    /// Returns (rc, Option<OwnedBatch>).
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: OwnedBatch) -> (i32, Option<OwnedBatch>) {
+    /// Returns (rc, Option<Batch>).
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> (i32, Option<Batch>) {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
@@ -1004,7 +1004,7 @@ impl DagEngine {
 
     /// Full single-worker DAG evaluation.
     /// Port of `executor.py:evaluate_dag()` (no exchange handler path).
-    pub fn evaluate_dag(&mut self, source_id: i64, delta: OwnedBatch) -> i32 {
+    pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
         gnitz_debug!("dag: evaluate_dag source_id={} delta_count={} tables={}",
             source_id, delta.count, self.tables.len());
         // 1. Get dep_map
@@ -1023,7 +1023,7 @@ impl DagEngine {
             depth: i32,
             view_id: i64,
             source_id: i64,
-            batch: OwnedBatch,
+            batch: Batch,
         }
 
         let mut pending: Vec<PendingEntry> = Vec::new();
@@ -1142,7 +1142,7 @@ impl DagEngine {
     pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
         &mut self,
         source_id: i64,
-        delta: OwnedBatch,
+        delta: Batch,
         exchange: &mut E,
     ) -> i32 {
         self.get_dep_map();
@@ -1159,7 +1159,7 @@ impl DagEngine {
             depth: i32,
             view_id: i64,
             source_id: i64,
-            batch: OwnedBatch,
+            batch: Batch,
         }
 
         let mut pending: Vec<PendingEntry> = Vec::new();
@@ -1219,7 +1219,7 @@ impl DagEngine {
                         batch.schema = Some(exchange_schema);
                         batch
                     }
-                    None => OwnedBatch::with_schema(exchange_schema, 0),
+                    None => Batch::with_schema(exchange_schema, 0),
                 };
 
                 if skip_exchange {
@@ -1292,7 +1292,7 @@ impl DagEngine {
                             depth: dep_depth,
                             view_id: dep_id,
                             source_id: view_id,
-                            batch: OwnedBatch::with_schema(dep_schema, 0),
+                            batch: Batch::with_schema(dep_schema, 0),
                         });
                     }
                     pending_pos.insert((dep_id, view_id), new_idx);
@@ -1352,9 +1352,9 @@ impl DagEngine {
     fn execute_epoch_for_dag(
         &mut self,
         view_id: i64,
-        input: OwnedBatch,
+        input: Batch,
         source_id: i64,
-    ) -> Option<OwnedBatch> {
+    ) -> Option<Batch> {
         // Ensure plan is compiled
         if !self.cache.contains_key(&view_id) {
             if let Some(plan) = self.compile_view_internal(view_id) {
@@ -1382,9 +1382,9 @@ impl DagEngine {
         &mut self,
         view_id: i64,
         is_pre: bool,
-        input: OwnedBatch,
+        input: Batch,
         source_id: i64,
-    ) -> Option<OwnedBatch> {
+    ) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
 
         let (in_reg, out_reg, num_regs) = if is_pre {
@@ -1441,13 +1441,13 @@ impl DagEngine {
         &self,
         table: &mut Table,
         schema: &SchemaDescriptor,
-        batch: OwnedBatch,
-    ) -> OwnedBatch {
+        batch: Batch,
+    ) -> Batch {
         if batch.count == 0 {
             return batch;
         }
 
-        let mut effective = OwnedBatch::with_schema(*schema, batch.count * 2);
+        let mut effective = Batch::with_schema(*schema, batch.count * 2);
         // Track seen PKs for intra-batch dedup: pk u128 → last position
         let mut seen: HashMap<u128, usize> = HashMap::new();
 
@@ -1488,13 +1488,13 @@ impl DagEngine {
         &self,
         ptable: &mut PartitionedTable,
         schema: &SchemaDescriptor,
-        batch: OwnedBatch,
-    ) -> OwnedBatch {
+        batch: Batch,
+    ) -> Batch {
         if batch.count == 0 {
             return batch;
         }
 
-        let mut effective = OwnedBatch::with_schema(*schema, batch.count * 2);
+        let mut effective = Batch::with_schema(*schema, batch.count * 2);
         let mut seen: HashMap<u128, usize> = HashMap::new();
 
         for row in 0..batch.count {
@@ -1544,11 +1544,11 @@ impl DagEngine {
     /// Batch-level index projection (pure Rust, no FFI).
     /// Port of `gnitz_batch_project_index` logic.
     pub(crate) fn batch_project_index(
-        src: &OwnedBatch,
+        src: &Batch,
         source_col_idx: u32,
         src_schema: &SchemaDescriptor,
         idx_schema: &SchemaDescriptor,
-    ) -> OwnedBatch {
+    ) -> Batch {
         let src_pk_index = src_schema.pk_index as usize;
         let source_col = source_col_idx as usize;
         let is_pk_col = source_col == src_pk_index;
@@ -1565,7 +1565,7 @@ impl DagEngine {
         let out_payload_col_idx = if idx_schema.pk_index == 0 { 1usize } else { 0usize };
         let out_payload_size = idx_schema.columns[out_payload_col_idx].size as usize;
 
-        let mut out = OwnedBatch::with_schema(*idx_schema, src.count.max(1));
+        let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
 
         for row in 0..src.count {
             let weight = src.get_weight(row);
