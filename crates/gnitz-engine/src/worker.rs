@@ -99,8 +99,8 @@ impl WorkerExchangeHandler {
                 if msg.flags == FLAG_EXCHANGE_RELAY {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
-                            if let Some(batch_box) = decoded.data_batch {
-                                return *batch_box;
+                            if let Some(batch) = decoded.data_batch {
+                                return batch;
                             }
                         }
                     }
@@ -112,10 +112,10 @@ impl WorkerExchangeHandler {
                 if msg.flags & FLAG_DDL_SYNC != 0 {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
-                            if let Some(batch_box) = decoded.data_batch {
+                            if let Some(batch) = decoded.data_batch {
                                 self.deferred.push(DeferredDdl {
                                     target_id: msg.target_id as i64,
-                                    batch: *batch_box,
+                                    batch,
                                 });
                             }
                         }
@@ -265,8 +265,8 @@ impl WorkerProcess {
             let vid = target_id;
             if let Some(data) = wire_data {
                 if let Ok(decoded) = ipc::decode_wire(data) {
-                    if let Some(batch_box) = decoded.data_batch {
-                        self.exchange.stash_preloaded(vid, *batch_box);
+                    if let Some(batch) = decoded.data_batch {
+                        self.exchange.stash_preloaded(vid, batch);
                     } else if let Some(schema) = decoded.schema {
                         self.exchange.stash_preloaded(vid, Batch::with_schema(schema, 0));
                     }
@@ -315,7 +315,7 @@ impl WorkerProcess {
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
 
         // Extract batch (consumes decoded)
-        let batch = decoded.and_then(|d| d.data_batch.map(|b| *b));
+        let batch = decoded.and_then(|d| d.data_batch);
 
         if flags & FLAG_SHUTDOWN != 0 {
             self.shutdown();

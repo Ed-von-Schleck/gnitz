@@ -92,8 +92,7 @@ fn recover_from_sal(
 
         // Decode wire data and extract batch
         if let Ok(decoded) = ipc::decode_wire(data) {
-            if let Some(batch) = decoded.data_batch {
-                let owned = *batch;
+            if let Some(owned) = decoded.data_batch {
                 if owned.count > 0 {
                     // Use the unique_pk-aware replay path so retractions
                     // correctly cancel existing rows instead of being

@@ -61,7 +61,7 @@ impl ExchangeAccumulator {
             .or_insert_with(|| vec![None; nw]);
         let count = self.counts.entry(vid).or_insert(0);
 
-        payloads[w] = decoded.data_batch.map(|b| *b);
+        payloads[w] = decoded.data_batch;
         if let Some(schema) = decoded.schema {
             self.schemas.insert(vid, schema);
         }

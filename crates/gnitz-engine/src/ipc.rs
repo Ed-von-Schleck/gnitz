@@ -417,7 +417,7 @@ pub struct DecodedWire {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
     pub col_names: Vec<Vec<u8>>,
-    pub data_batch: Option<Box<Batch>>,
+    pub data_batch: Option<Batch>,
 }
 
 /// Decode a WAL block from raw bytes into an Batch.
@@ -444,26 +444,113 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'s
         return Err("WAL block region count mismatch");
     }
 
-    // Build region pointers into the data buffer
+    // Build region pointers into the data buffer.
+    // Stack arrays (MAX_REGIONS_TOTAL) avoid two Vec allocs per call.
     let nr = num_regions as usize;
-    let mut ptrs = Vec::with_capacity(nr);
-    let mut region_sizes = Vec::with_capacity(nr);
+    let mut ptrs = [std::ptr::null::<u8>(); MAX_REGIONS_TOTAL];
+    let mut region_sizes = [0u32; MAX_REGIONS_TOTAL];
     for i in 0..nr {
         let off = offsets[i] as usize;
         let sz = sizes[i] as usize;
+        region_sizes[i] = sizes[i];
         if sz > 0 && off + sz <= data.len() {
-            ptrs.push(unsafe { data.as_ptr().add(off) });
-        } else {
-            ptrs.push(std::ptr::null());
+            ptrs[i] = unsafe { data.as_ptr().add(off) };
         }
-        region_sizes.push(sizes[i]);
     }
 
     let mut batch = unsafe {
-        Batch::from_regions(&ptrs, &region_sizes, count as usize, npc)
+        Batch::from_regions(&ptrs[..nr], &region_sizes[..nr], count as usize, npc)
     };
     batch.schema = Some(*schema);
     Ok(batch)
+}
+
+/// Decode the control WAL block directly into [`DecodedControl`] without
+/// constructing a [`Batch`].
+///
+/// The control block always uses [`CONTROL_SCHEMA_DESC`]: 9 columns,
+/// pk_index=0, exactly 1 row. That gives a fixed region layout:
+///
+///   [0]=pk_lo   [1]=pk_hi   [2]=weight   [3]=null_bmp
+///   [4]=status  [5]=client_id  [6]=target_id  [7]=flags
+///   [8]=seek_pk_lo  [9]=seek_pk_hi  [10]=seek_col_idx
+///   [11]=error_msg (16-byte German string)  [12]=blob
+fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
+    // 4 fixed + 8 payload + 1 blob = 13. Keep in sync with CONTROL_SCHEMA_DESC.
+    const EXPECTED_REGIONS: usize = 13;
+    const _: () = assert!(
+        {
+            let npc = CONTROL_SCHEMA_DESC.num_columns as usize - 1;
+            4 + npc + 1 == EXPECTED_REGIONS
+        },
+        "EXPECTED_REGIONS out of sync with CONTROL_SCHEMA_DESC",
+    );
+
+    let mut lsn = 0u64;
+    let mut tid = 0u32;
+    let mut count = 0u32;
+    let mut num_regions = 0u32;
+    let mut blob_size = 0u64;
+    let mut offsets = [0u64; EXPECTED_REGIONS];
+    let mut sizes   = [0u32; EXPECTED_REGIONS];
+
+    let rc = wal::validate_and_parse(
+        data, &mut lsn, &mut tid, &mut count, &mut num_regions,
+        &mut blob_size, &mut offsets, &mut sizes, EXPECTED_REGIONS as u32,
+    );
+    if rc != wal::WAL_OK {
+        return Err("control block invalid");
+    }
+    if count != 1 {
+        return Err("control block must have 1 row");
+    }
+    if num_regions as usize != EXPECTED_REGIONS {
+        return Err("control block region count mismatch");
+    }
+
+    // Read 8 bytes from region `r` as a little-endian u64.
+    let read8 = |r: usize| -> Result<u64, &'static str> {
+        let off = offsets[r] as usize;
+        if off + 8 > data.len() {
+            return Err("control field truncated");
+        }
+        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+    };
+
+    let null_bmp     = read8(3)?;
+    let status       = read8(4)? as u32;
+    let client_id    = read8(5)?;
+    let target_id    = read8(6)?;
+    let flags        = read8(7)?;
+    let seek_pk_lo   = read8(8)?;
+    let seek_pk_hi   = read8(9)?;
+    let seek_col_idx = read8(10)?;
+
+    // Payload col 7 = error_msg (nullable STRING). Null bit 7 of null_bmp.
+    let error_is_null = (null_bmp & (1u64 << 7)) != 0;
+    let error_msg = if error_is_null {
+        Vec::new()
+    } else {
+        let off = offsets[11] as usize;
+        if off + 16 > data.len() {
+            return Err("error_msg region truncated");
+        }
+        let mut st = [0u8; 16];
+        st.copy_from_slice(&data[off..off + 16]);
+        let blob_off = offsets[12] as usize;
+        let blob_sz  = sizes[12] as usize;
+        let blob = if blob_sz > 0 && blob_off + blob_sz <= data.len() {
+            &data[blob_off..blob_off + blob_sz]
+        } else {
+            &[]
+        };
+        decode_german_string(&st, blob)
+    };
+
+    Ok(DecodedControl {
+        status, client_id, target_id, flags,
+        seek_pk_lo, seek_pk_hi, seek_col_idx, error_msg,
+    })
 }
 
 /// Decode a full IPC wire message from raw bytes.
@@ -480,34 +567,9 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
         return Err("control block truncated");
     }
 
-    let cs = CONTROL_SCHEMA_DESC;
-    let ctrl_batch = decode_wal_block(&data[..ctrl_size], &cs)?;
+    let control = decode_control_block(&data[..ctrl_size])?;
 
-    // Extract control fields
-    let status = u64::from_le_bytes(ctrl_batch.col_data(0)[0..8].try_into().unwrap()) as u32;
-    let client_id = u64::from_le_bytes(ctrl_batch.col_data(1)[0..8].try_into().unwrap());
-    let target_id = u64::from_le_bytes(ctrl_batch.col_data(2)[0..8].try_into().unwrap());
-    let flags = u64::from_le_bytes(ctrl_batch.col_data(3)[0..8].try_into().unwrap());
-    let seek_pk_lo = u64::from_le_bytes(ctrl_batch.col_data(4)[0..8].try_into().unwrap());
-    let seek_pk_hi = u64::from_le_bytes(ctrl_batch.col_data(5)[0..8].try_into().unwrap());
-    let seek_col_idx = u64::from_le_bytes(ctrl_batch.col_data(6)[0..8].try_into().unwrap());
-
-    // error_msg: payload col 7, null bit 7
-    let null_word = u64::from_le_bytes(ctrl_batch.null_bmp_data()[0..8].try_into().unwrap());
-    let error_is_null = (null_word & (1u64 << 7)) != 0;
-    let error_msg = if error_is_null {
-        Vec::new()
-    } else {
-        let mut st = [0u8; 16];
-        st.copy_from_slice(&ctrl_batch.col_data(7)[0..16]);
-        decode_german_string(&st, &ctrl_batch.blob)
-    };
-
-    let control = DecodedControl {
-        status, client_id, target_id, flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx, error_msg,
-    };
-
+    let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data = (flags & FLAG_HAS_DATA) != 0;
 
@@ -557,7 +619,7 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
         if (flags & FLAG_BATCH_CONSOLIDATED) != 0 {
             batch.consolidated = true;
         }
-        Some(Box::new(batch))
+        Some(batch)
     } else {
         None
     };

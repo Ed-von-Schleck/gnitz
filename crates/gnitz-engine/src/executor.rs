@@ -225,7 +225,7 @@ impl ServerExecutor {
     // -- Data operations (direct catalog calls, no FFI) -----------------------
 
     fn handle_push(
-        &mut self, target_id: i64, in_batch: Option<Box<Batch>>,
+        &mut self, target_id: i64, in_batch: Option<Batch>,
         mode: WireConflictMode,
     ) -> Result<(Option<Arc<Batch>>, u64), String> {
         if target_id >= FIRST_USER_TABLE_ID {
@@ -252,9 +252,9 @@ impl ServerExecutor {
         // System table path
         if let Some(batch) = in_batch {
             if batch.count > 0 {
-                self.cat().ingest_to_family(target_id, &*batch)?;
+                self.cat().ingest_to_family(target_id, &batch)?;
                 let dag = self.cat().get_dag_ptr();
-                unsafe { &mut *dag }.evaluate_dag(target_id, *batch);
+                unsafe { &mut *dag }.evaluate_dag(target_id, batch);
                 self.ingest_lsn += 1;
                 self.last_tick_lsn = self.ingest_lsn;
                 return Ok((None, self.ingest_lsn));
@@ -999,7 +999,7 @@ impl ServerExecutor {
                 let disp = self.disp();
                 disp.validate_all_distributed(target_id, &batch, mode)?;
             }
-            pending.add(fd, client_id, target_id, *batch, mode);
+            pending.add(fd, client_id, target_id, batch, mode);
             if self.t_first_pending.is_none() {
                 self.t_first_pending = Some(Instant::now());
             }
