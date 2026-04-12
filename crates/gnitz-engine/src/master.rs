@@ -891,12 +891,8 @@ impl MasterDispatcher {
     // Async tick API
     // -----------------------------------------------------------------------
 
-    pub fn start_tick_async(&mut self, target_id: i64) -> Result<(), String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
-
-        self.async_acks_per_worker = 1;
+    fn begin_async_collection(&mut self, acks_per_worker: usize) {
+        self.async_acks_per_worker = acks_per_worker;
         self.async_remaining = self.num_workers;
         for w in 0..self.num_workers {
             self.async_collected[w] = false;
@@ -905,6 +901,14 @@ impl MasterDispatcher {
         }
         self.acc.clear();
         self.async_active = true;
+    }
+
+    pub fn start_tick_async(&mut self, target_id: i64) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+
+        self.begin_async_collection(1);
         Ok(())
     }
 
@@ -935,16 +939,7 @@ impl MasterDispatcher {
         // Single signal after all writes — one eventfd kick for N ticks.
         self.signal_all();
 
-        let n = tids.len();
-        self.async_acks_per_worker = n;
-        self.async_remaining = self.num_workers;
-        for w in 0..self.num_workers {
-            self.async_collected[w] = false;
-            self.async_acks_collected[w] = 0;
-            self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
-        }
-        self.acc.clear();
-        self.async_active = true;
+        self.begin_async_collection(tids.len());
         Ok(())
     }
 

@@ -1601,38 +1601,4 @@ mod tests {
         assert!(valid.is_empty(), "all tids dropped: valid list must be empty");
     }
 
-    // -----------------------------------------------------------------------
-    // poll_tick_active: double reset_w2m_cursors regression
-    // -----------------------------------------------------------------------
-
-    /// Verify that poll_tick_active no longer calls reset_w2m_cursors in the
-    /// error handler.  The test is structural: it asserts that the error path
-    /// sets pre_written = None and returns done=true, which causes the caller
-    /// to fall through to the single reset_w2m_cursors call in the success
-    /// path.  Full integration is covered by E2E tests.
-    ///
-    /// This is a compile-time / code-structure check: if the code compiled
-    /// and the executor handles the error path (done=true without early
-    /// reset), `poll_tick_active` will reach the single `reset_w2m_cursors`
-    /// call below the done check.  The absence of a double-call is verified
-    /// by code review; this test documents the invariant.
-    #[test]
-    fn test_poll_tick_active_error_path_no_double_reset_documented() {
-        // The double reset_w2m_cursors was removed from the error handler in
-        // poll_tick_active.  The single call at the bottom of the done path
-        // now handles both success and error cases.
-        //
-        // Code path (error):
-        //   poll_tick_progress() → Err(e)
-        //   → pre_written = None
-        //   → done = true                    ← no reset_w2m_cursors here
-        //   → (falls through to done block)
-        //   → complete_pre_written skipped   ← pre_written is None
-        //   → reset_w2m_cursors()            ← single call
-        //   → tick_state = Idle
-        //
-        // This test is intentionally documentation-only (no runtime assertion
-        // is possible without the full IPC stack).
-        let _ = "documented";
-    }
 }
