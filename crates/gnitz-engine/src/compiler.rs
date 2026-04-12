@@ -1078,11 +1078,12 @@ fn create_expr_predicate(
     num_regs: i64,
     result_reg: i64,
     const_strings: Vec<Vec<u8>>,
+    pk_index: u32,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let prog = ExprProgram::new(code, num_regs as u32, result_reg as u32, const_strings);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog)));
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -1232,7 +1233,7 @@ fn emit_node(
                 let result_reg = node_params.get(&PARAM_EXPR_RESULT_REG).copied().unwrap_or(0);
                 let code = extract_map_code(&node_params);
                 let const_strings = extract_const_strings(&graph.str_params, nid);
-                create_expr_predicate(code, num_regs, result_reg, const_strings, owned_expr_progs, owned_funcs)
+                create_expr_predicate(code, num_regs, result_reg, const_strings, in_schema.pk_index, owned_expr_progs, owned_funcs)
             } else {
                 null_func_ptr()
             };

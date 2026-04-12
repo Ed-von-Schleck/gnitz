@@ -557,7 +557,7 @@ mod tests {
             17, 2, 0, 1,    // CMP_GT r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog));
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -574,9 +574,9 @@ mod tests {
             3i64, 0, 1, 0,  // LOAD_CONST r0 = 1 (always true)
         ];
         let prog = ExprProgram::new(code, 1, 0, vec![]);
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog));
-
         let schema = make_schema_u64_i64();
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
+
         let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         batch.consolidated = true;
 

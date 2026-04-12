@@ -2233,7 +2233,7 @@ mod tests {
         };
 
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::scalar_func::Plan::from_predicate(prog),
+            crate::scalar_func::Plan::from_predicate(prog, schema.pk_index),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 

@@ -22,6 +22,7 @@ gnitz_wire::cast_consts! { pub i64;
     EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
     EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
     EXPR_EMIT_NULL,
+    EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PK_INT,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,11 +102,55 @@ impl ExprProgram {
 }
 
 /// Compute the 4-byte prefix of a string for German String comparison.
+///
+/// Stored as big-endian so that a single integer comparison (`<`/`>`) is
+/// equivalent to lexicographic byte comparison of the first four characters.
+/// Both sides (column struct and const) zero-pad unused bytes, so the
+/// comparison is correct for any string length without masking.
 fn compute_prefix(s: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     let n = s.len().min(4);
     buf[..n].copy_from_slice(&s[..n]);
-    u32::from_le_bytes(buf)
+    u32::from_be_bytes(buf)
+}
+
+impl ExprProgram {
+    /// Rewrite LOAD_COL_INT/FLOAT bytecode instructions to use physical payload
+    /// indices, eliminating the runtime pk_index branch in the interpreter loop.
+    ///
+    /// - `LOAD_COL_INT` with logical index == pk_index  → `LOAD_PK_INT`
+    /// - `LOAD_COL_INT` with logical index != pk_index  → `LOAD_PAYLOAD_INT` with physical index
+    /// - `LOAD_COL_FLOAT` (PK is never float)           → `LOAD_PAYLOAD_FLOAT` with physical index
+    ///
+    /// Must be called once per program, before the first call to `eval_predicate`
+    /// or `eval_with_emit`. Called automatically by `Plan::from_predicate` and
+    /// `Plan::from_map`.
+    pub fn resolve_column_indices(&mut self, pk_index: u32) {
+        let pki = pk_index as i64;
+        for i in 0..self.num_instrs as usize {
+            let base = i * 4;
+            let op = self.code[base];
+            let a1 = self.code[base + 2];
+            match op {
+                EXPR_LOAD_COL_INT => {
+                    if a1 == pki {
+                        self.code[base] = EXPR_LOAD_PK_INT;
+                    } else {
+                        let phys = if a1 < pki { a1 } else { a1 - 1 };
+                        self.code[base] = EXPR_LOAD_PAYLOAD_INT;
+                        self.code[base + 2] = phys;
+                    }
+                }
+                EXPR_LOAD_COL_FLOAT => {
+                    // PK columns are always integer types; no PK case here.
+                    let phys = if a1 < pki { a1 } else { a1 - 1 };
+                    self.code[base] = EXPR_LOAD_PAYLOAD_FLOAT;
+                    self.code[base + 2] = phys;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,14 +239,14 @@ fn compare_col_string_vs_const(
     let c_len = const_len as usize;
     let min_len = col_len.min(c_len);
 
-    // Compare prefix bytes (first 4 bytes)
-    let limit = min_len.min(4);
-    let col_prefix = &struct_bytes[4..4 + limit];
-    let const_prefix_bytes = const_prefix.to_le_bytes();
-    for i in 0..limit {
-        if col_prefix[i] != const_prefix_bytes[i] {
-            return col_prefix[i].cmp(&const_prefix_bytes[i]);
-        }
+    // Single big-endian integer comparison of the 4-byte prefix.
+    // Both sides zero-pad bytes beyond their actual length, so no masking
+    // is needed: short strings naturally sort below longer ones with the
+    // same prefix, and the zero padding never causes false equality when
+    // lengths differ (the trailing length comparison resolves that).
+    let col_pfx = u32::from_be_bytes(struct_bytes[4..8].try_into().unwrap());
+    if col_pfx != const_prefix {
+        return col_pfx.cmp(&const_prefix);
     }
 
     if min_len <= 4 {
@@ -229,8 +274,8 @@ fn col_string_equals_const(
     if col_len != c_len {
         return false;
     }
-    // Compare prefix
-    let col_prefix = read_u32_le(struct_bytes, 4);
+    // Prefix comparison using the same BE encoding as compute_prefix.
+    let col_prefix = u32::from_be_bytes(struct_bytes[4..8].try_into().unwrap());
     if col_prefix != const_prefix {
         return false;
     }
@@ -254,17 +299,31 @@ pub fn eval_predicate(
 ) -> (i64, bool) {
     let pki = pk_index as usize;
     let null_word = batch.get_null_word(row);
-    let mut regs = [0i64; MAX_REGS];
+    let mut regs: [i64; MAX_REGS] = [0; MAX_REGS];
     let mut null_mask: u64 = 0;
 
-    for i in 0..prog.num_instrs as usize {
-        let base = i * 4;
-        let op = prog.code[base];
-        let dst = prog.code[base + 1] as usize;
-        let a1 = prog.code[base + 2];
-        let a2 = prog.code[base + 3];
+    // chunks_exact(4) lets LLVM prove each access is in-bounds, eliminating
+    // the per-element bounds checks that the indexed loop cannot avoid.
+    for instr in prog.code.chunks_exact(4) {
+        let op  = instr[0];
+        let dst = instr[1] as usize;
+        let a1  = instr[2];
+        let a2  = instr[3];
 
         match op {
+            // Resolved opcodes: emitted by resolve_column_indices.
+            // Physical payload index is already in a1 — no pk_index branch.
+            EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
+                let pi = a1 as usize;
+                null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
+                let ptr = batch.get_col_ptr(row, pi, 8);
+                regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+            }
+            EXPR_LOAD_PK_INT => {
+                null_mask &= !(1u64 << dst);
+                regs[dst] = batch.get_pk(row) as i64;
+            }
+            // Legacy opcodes: used by unresolved programs (e.g. direct tests).
             EXPR_LOAD_COL_INT => {
                 let ci = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
@@ -619,22 +678,33 @@ pub fn eval_with_emit(
     emit_targets: &[EmitTarget],
 ) -> (i64, bool, u64) {
     let pki = pk_index as usize;
-    let mut regs = [0i64; MAX_REGS];
+    let mut regs: [i64; MAX_REGS] = [0; MAX_REGS];
     let mut null_mask: u64 = 0;
     let mut emit_null_mask: u64 = 0;
     let mut emit_idx: usize = 0;
 
-    for i in 0..prog.num_instrs as usize {
-        let base = i * 4;
-        let op = prog.code[base];
-        let dst = prog.code[base + 1] as usize;
-        let a1 = prog.code[base + 2];
-        let a2 = prog.code[base + 3];
+    for instr in prog.code.chunks_exact(4) {
+        let op  = instr[0];
+        let dst = instr[1] as usize;
+        let a1  = instr[2];
+        let a2  = instr[3];
 
         match op {
             EXPR_COPY_COL | EXPR_EMIT_NULL => {
                 // Handled at batch level
             }
+            // Resolved opcodes (set by resolve_column_indices):
+            EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
+                let pi = a1 as usize;
+                null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
+                let ptr = batch.get_col_ptr(row, pi, 8);
+                regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+            }
+            EXPR_LOAD_PK_INT => {
+                null_mask &= !(1u64 << dst);
+                regs[dst] = batch.get_pk(row) as i64;
+            }
+            // Legacy opcodes:
             EXPR_LOAD_COL_INT => {
                 let ci = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
@@ -842,21 +912,28 @@ pub fn eval_with_emit(
                 regs[dst] = float_to_bits(regs[a1 as usize] as f64);
             }
             EXPR_EMIT => {
-                if emit_idx < emit_targets.len() {
-                    let et = &emit_targets[emit_idx];
-                    let ptr = unsafe { et.base.add(row * et.stride) };
-                    if (null_mask >> a1) & 1 != 0 {
-                        unsafe {
-                            std::ptr::write_unaligned(ptr as *mut i64, 0);
-                        }
-                        emit_null_mask |= 1u64 << et.payload_col;
-                    } else {
-                        unsafe {
-                            std::ptr::write_unaligned(ptr as *mut i64, regs[a1 as usize]);
-                        }
+                // The number of EXPR_EMIT instructions is statically determined
+                // by the bytecode. Silent-skip on overflow is worse than a panic
+                // (it silently corrupts output). Assert in debug; panic via
+                // indexing in release if the invariant is ever broken.
+                debug_assert!(
+                    emit_idx < emit_targets.len(),
+                    "EXPR_EMIT: emit_idx {} >= emit_targets.len() {}",
+                    emit_idx, emit_targets.len()
+                );
+                let et = &emit_targets[emit_idx];
+                let ptr = unsafe { et.base.add(row * et.stride) };
+                if (null_mask >> a1) & 1 != 0 {
+                    unsafe {
+                        std::ptr::write_unaligned(ptr as *mut i64, 0);
                     }
-                    emit_idx += 1;
+                    emit_null_mask |= 1u64 << et.payload_col;
+                } else {
+                    unsafe {
+                        std::ptr::write_unaligned(ptr as *mut i64, regs[a1 as usize]);
+                    }
                 }
+                emit_idx += 1;
             }
             EXPR_STR_COL_EQ_CONST => {
                 null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
@@ -1737,5 +1814,175 @@ mod tests {
         // With num_regs=0, result should be (0, true) — sentinel
         assert_eq!(val, 0);
         assert!(is_null);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fix 2: resolve_column_indices
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_column_indices_pk_at_col0() {
+        // Schema: pk=col0(U64), col1=I64, col2=I64
+        let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+        let batch = make_int_batch(&schema, &[(42, 1, 0, &[10, 20])]);
+        let mb = batch.as_mem_batch();
+
+        // LOAD_COL_INT of pk column → LOAD_PK_INT
+        let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0]; // col 0 = pk
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(0);
+        assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
+        let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert_eq!(val, 42);
+        assert!(!is_null);
+
+        // LOAD_COL_INT of col1 (logical 1) → LOAD_PAYLOAD_INT, physical 0
+        let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(0);
+        assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
+        assert_eq!(prog.code[2], 0); // physical payload index
+        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+        assert_eq!(val, 10);
+
+        // LOAD_COL_INT of col2 (logical 2) → LOAD_PAYLOAD_INT, physical 1
+        let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(0);
+        assert_eq!(prog.code[2], 1);
+        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+        assert_eq!(val, 20);
+    }
+
+    #[test]
+    fn test_resolve_column_indices_pk_at_middle() {
+        // Schema: col0=I64, pk=col1(U64), col2=I64
+        // Physical payload layout: [col0=payload0, col2=payload1]
+        let schema = make_schema(3, 1, &[(9, 8), (8, 8), (9, 8)]);
+        let batch = make_int_batch(&schema, &[(99, 1, 0, &[5, 7])]);
+        let mb = batch.as_mem_batch();
+
+        // col0 (logical 0, before pk) → physical 0
+        let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0];
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(1);
+        assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
+        assert_eq!(prog.code[2], 0);
+        let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+        assert_eq!(val, 5);
+
+        // col1 (logical 1 = pk) → LOAD_PK_INT
+        let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(1);
+        assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
+        let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+        assert_eq!(val, 99);
+
+        // col2 (logical 2, after pk) → physical 1
+        let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
+        let mut prog = ExprProgram::new(code, 1, 0, vec![]);
+        prog.resolve_column_indices(1);
+        assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
+        assert_eq!(prog.code[2], 1);
+        let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+        assert_eq!(val, 7);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fix 3: German string prefix big-endian ordering
+    // ---------------------------------------------------------------------------
+
+    /// Build a 16-byte inline German String struct for use in test batches.
+    fn make_german_string(s: &[u8]) -> [u8; 16] {
+        assert!(s.len() <= 12, "test helper only handles inline strings (≤ 12 bytes)");
+        let mut gs = [0u8; 16];
+        gs[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+        let pfx = s.len().min(4);
+        gs[4..4 + pfx].copy_from_slice(&s[..pfx]);
+        if s.len() > 4 {
+            gs[8..8 + (s.len() - 4)].copy_from_slice(&s[4..]);
+        }
+        gs
+    }
+
+    #[test]
+    fn test_string_prefix_ordering() {
+        // Schema: pk=col0(U64), col1=STRING
+        let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+
+        // (col_string, const_string, expected_lt)
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (b"abc",   b"abd",    true),  // differ at prefix byte 2
+            (b"abd",   b"abc",    false), // reversed
+            (b"a",     b"b",      true),  // single-char, differ at byte 0
+            (b"abcd",  b"abce",   true),  // differ at prefix byte 3 (boundary)
+            (b"abcde", b"abcdf",  true),  // differ at byte 4 (beyond prefix)
+            (b"hello", b"world",  true),  // differ at byte 0
+            (b"he",    b"hello",  true),  // col shorter, same available bytes
+            (b"hello", b"he",     false), // col longer
+            (b"",      b"a",      true),  // empty < non-empty
+            (b"a",     b"",       false), // non-empty > empty
+            (b"abcd",  b"abcd",   false), // equal 4-byte strings, not lt
+            (b"abcde", b"abcde",  false), // equal 5-byte strings, not lt
+        ];
+
+        for &(col_s, const_s, expected_lt) in cases {
+            let gs = make_german_string(col_s);
+            let mut batch = Batch::with_schema(schema, 1);
+            batch.count = 0;
+            batch.extend_pk_lo(&1u64.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &gs);
+            batch.count = 1;
+            let mb = batch.as_mem_batch();
+
+            let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
+            let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
+            let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+            assert_eq!(
+                val != 0, expected_lt,
+                "STR_COL_LT_CONST: {:?} < {:?} expected {}, got {}",
+                col_s, const_s, expected_lt, val != 0
+            );
+        }
+    }
+
+    #[test]
+    fn test_string_prefix_le_ordering() {
+        // Spot-check LE (≤) to cover the equality boundary
+        let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (b"abc",  b"abc",  true),  // equal → le
+            (b"abc",  b"abd",  true),  // less → le
+            (b"abd",  b"abc",  false), // greater → not le
+            (b"abcd", b"abcd", true),  // equal 4-byte (prefix boundary)
+            (b"he",   b"he",   true),  // equal short
+        ];
+
+        for &(col_s, const_s, expected_le) in cases {
+            let gs = make_german_string(col_s);
+            let mut batch = Batch::with_schema(schema, 1);
+            batch.count = 0;
+            batch.extend_pk_lo(&1u64.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &gs);
+            batch.count = 1;
+            let mb = batch.as_mem_batch();
+
+            let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
+            let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
+            let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+            assert_eq!(
+                val != 0, expected_le,
+                "STR_COL_LE_CONST: {:?} <= {:?} expected {}, got {}",
+                col_s, const_s, expected_le, val != 0
+            );
+        }
     }
 }

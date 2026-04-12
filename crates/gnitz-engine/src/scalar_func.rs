@@ -223,7 +223,10 @@ impl Plan {
     }
 
     /// Filter via interpreted expression (replaces ExprPredicate).
-    pub fn from_predicate(prog: ExprProgram) -> Self {
+    /// `pk_index` is used to resolve logical column indices to physical payload
+    /// indices once at construction time, removing the branch from the hot loop.
+    pub fn from_predicate(mut prog: ExprProgram, pk_index: u32) -> Self {
+        prog.resolve_column_indices(pk_index);
         filter_only(FilterKernel::Interpreted(prog))
     }
 
@@ -249,7 +252,8 @@ impl Plan {
     }
 
     /// Map plan from ExprProgram bytecode (replaces ExprMap + MapAnalysis).
-    pub fn from_map(prog: ExprProgram, pk_index: u32) -> Self {
+    pub fn from_map(mut prog: ExprProgram, pk_index: u32) -> Self {
+        prog.resolve_column_indices(pk_index);
         let mut copy_src_cols = Vec::new();
         let mut copy_out_payloads = Vec::new();
         let mut copy_type_codes = Vec::new();
