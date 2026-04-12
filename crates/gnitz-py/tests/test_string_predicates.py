@@ -153,6 +153,35 @@ class TestStringPredicates:
         finally:
             _cleanup(client, sn)
 
+    def test_view_string_lt_prefix_byte_order(self, client):
+        # Regression for LE-vs-BE prefix encoding.
+        # "ba" > "ac" lexicographically (b > a at byte 0), so "ba" must NOT
+        # pass a `name < 'ac'` filter.  With LE integer comparison the prefix
+        # of "ba" (0x6162) is numerically less than "ac" (0x6361), which would
+        # incorrectly admit "ba".  BE comparison gives the right result.
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(100) NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t WHERE name < 'ac'",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 'ba'), (2, 'ab'), (3, 'ac'), (4, 'aa')",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = _scan_dicts(client, vid)
+            names = sorted([r["name"] for r in rows])
+            # "ab" < "ac" and "aa" < "ac"; "ba" >= "ac" and "ac" == "ac"
+            assert names == ["aa", "ab"], f"expected ['aa','ab'], got {names}"
+        finally:
+            _cleanup(client, sn)
+
     def test_view_string_null_filtered(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

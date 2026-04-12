@@ -69,6 +69,12 @@ impl ExprProgram {
         result_reg: u32,
         const_strings: Vec<Vec<u8>>,
     ) -> Self {
+        assert_eq!(
+            code.len() % 4,
+            0,
+            "ExprProgram: code length {} is not a multiple of 4",
+            code.len()
+        );
         let num_instrs = code.len() as u32 / 4;
         assert!(
             num_regs as usize <= MAX_REGS,
@@ -127,25 +133,23 @@ impl ExprProgram {
     /// `Plan::from_map`.
     pub fn resolve_column_indices(&mut self, pk_index: u32) {
         let pki = pk_index as i64;
-        for i in 0..self.num_instrs as usize {
-            let base = i * 4;
-            let op = self.code[base];
-            let a1 = self.code[base + 2];
+        for instr in self.code.chunks_exact_mut(4) {
+            let op = instr[0];
+            let a1 = instr[2];
             match op {
                 EXPR_LOAD_COL_INT => {
                     if a1 == pki {
-                        self.code[base] = EXPR_LOAD_PK_INT;
+                        instr[0] = EXPR_LOAD_PK_INT;
                     } else {
                         let phys = if a1 < pki { a1 } else { a1 - 1 };
-                        self.code[base] = EXPR_LOAD_PAYLOAD_INT;
-                        self.code[base + 2] = phys;
+                        instr[0] = EXPR_LOAD_PAYLOAD_INT;
+                        instr[2] = phys;
                     }
                 }
                 EXPR_LOAD_COL_FLOAT => {
-                    // PK columns are always integer types; no PK case here.
                     let phys = if a1 < pki { a1 } else { a1 - 1 };
-                    self.code[base] = EXPR_LOAD_PAYLOAD_FLOAT;
-                    self.code[base + 2] = phys;
+                    instr[0] = EXPR_LOAD_PAYLOAD_FLOAT;
+                    instr[2] = phys;
                 }
                 _ => {}
             }
@@ -1906,6 +1910,20 @@ mod tests {
         gs
     }
 
+    /// Build a 1-row batch with the given schema, containing `s` as the first payload column.
+    fn make_single_string_batch(schema: SchemaDescriptor, s: &[u8]) -> Batch {
+        let gs = make_german_string(s);
+        let mut batch = Batch::with_schema(schema, 1);
+        batch.count = 0;
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &gs);
+        batch.count = 1;
+        batch
+    }
+
     #[test]
     fn test_string_prefix_ordering() {
         // Schema: pk=col0(U64), col1=STRING
@@ -1925,20 +1943,18 @@ mod tests {
             (b"a",     b"",       false), // non-empty > empty
             (b"abcd",  b"abcd",   false), // equal 4-byte strings, not lt
             (b"abcde", b"abcde",  false), // equal 5-byte strings, not lt
+            // LE-vs-BE regression: "ba" > "ac" because 'b'>'a' at byte 0.
+            // With LE integer comparison, from_le("ba")=0x6162 < from_le("ac")=0x6361,
+            // which would wrongly return true. BE comparison gives the correct false.
+            (b"ba",    b"ac",     false),
+            (b"ac",    b"ba",     true),
+            (b"ba",    b"ab",     false), // byte 0 same first char but reversed positions
+            (b"ab",    b"ba",     true),
         ];
 
         for &(col_s, const_s, expected_lt) in cases {
-            let gs = make_german_string(col_s);
-            let mut batch = Batch::with_schema(schema, 1);
-            batch.count = 0;
-            batch.extend_pk_lo(&1u64.to_le_bytes());
-            batch.extend_pk_hi(&0u64.to_le_bytes());
-            batch.extend_weight(&1i64.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &gs);
-            batch.count = 1;
+            let batch = make_single_string_batch(schema, col_s);
             let mb = batch.as_mem_batch();
-
             let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
             let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
             let (val, _) = eval_predicate(&prog, &mb, 0, 0);
@@ -1961,20 +1977,14 @@ mod tests {
             (b"abd",  b"abc",  false), // greater → not le
             (b"abcd", b"abcd", true),  // equal 4-byte (prefix boundary)
             (b"he",   b"he",   true),  // equal short
+            // LE-vs-BE regression: "ba" > "ac", so "ba" <= "ac" must be false.
+            (b"ba",   b"ac",   false),
+            (b"ac",   b"ba",   true),
         ];
 
         for &(col_s, const_s, expected_le) in cases {
-            let gs = make_german_string(col_s);
-            let mut batch = Batch::with_schema(schema, 1);
-            batch.count = 0;
-            batch.extend_pk_lo(&1u64.to_le_bytes());
-            batch.extend_pk_hi(&0u64.to_le_bytes());
-            batch.extend_weight(&1i64.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &gs);
-            batch.count = 1;
+            let batch = make_single_string_batch(schema, col_s);
             let mb = batch.as_mem_batch();
-
             let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
             let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
             let (val, _) = eval_predicate(&prog, &mb, 0, 0);
