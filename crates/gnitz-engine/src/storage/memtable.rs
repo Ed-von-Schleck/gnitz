@@ -149,6 +149,9 @@ impl MemTable {
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
+            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
+                continue;
+            }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
                 total_w += run.get_weight(lo);
@@ -203,6 +206,9 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
+            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
+                continue;
+            }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
                 let ord = columnar::compare_rows(
@@ -231,6 +237,9 @@ impl MemTable {
         // avoiding any aliasing issue when find_weight_for_row also borrows self.runs.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for (ri, run) in self.runs.iter().enumerate() {
+            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
+                continue;
+            }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
                 candidates.push((ri, lo));
