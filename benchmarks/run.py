@@ -124,7 +124,7 @@ def main():
     output_dir = RESULTS_DIR / ts
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prune_old_results(keep=3)
+    prune_old_results(keep=10)
 
     for workers in workers_list:
         for clients in clients_list:
