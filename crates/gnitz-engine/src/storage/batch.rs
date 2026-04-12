@@ -376,7 +376,13 @@ impl Batch {
             // then copy_within would shift regions to new offsets (copy #2).
             // Bypass that by scatter-copying directly into a fresh buffer.
             let mut new_data = if new_total >= HUGEPAGE_THRESHOLD {
-                alloc_large_zeroed(new_total)
+                // Zeroing is not needed: the scatter-copy loop below fills
+                // every live byte, and all accessors are bounded by `count`.
+                // We still want THP backing for large buffers.
+                let mut v = Vec::with_capacity(new_total);
+                unsafe { v.set_len(new_total); }
+                crate::sys::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
+                v
             } else {
                 match super::batch_pool::acquire_buf() {
                     Some(mut buf) if buf.capacity() >= new_total => {
