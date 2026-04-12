@@ -584,8 +584,10 @@ impl ServerExecutor {
     /// TickState::Active so that encoding + fdatasync run concurrently with
     /// worker tick evaluation.  Phase B (complete_pre_written) runs after the
     /// tick completes.
-    fn pre_write_pushes(&mut self, mut entries: Vec<PendingEntry>) {
-        if entries.is_empty() { return; }
+    /// Returns `Some(entries)` if checkpoint failed so the caller can re-insert
+    /// them into `pending` for a later synchronous flush.
+    fn pre_write_pushes(&mut self, mut entries: Vec<PendingEntry>) -> Option<Vec<PendingEntry>> {
+        if entries.is_empty() { return None; }
 
         entries.sort_by_key(|e| (e.target_id, e.mode.as_u8()));
 
@@ -593,10 +595,10 @@ impl ServerExecutor {
         {
             let disp = self.disp();
             if let Err(_e) = disp.maybe_checkpoint() {
-                // Can't send errors here (no transport). Drop the pre-write;
-                // entries will be re-flushed after the tick via the normal
-                // path. This is rare (checkpoint only when SAL is nearly full).
-                return;
+                // No transport here to send errors; return the entries so the
+                // caller re-inserts them into pending and flushes them
+                // synchronously after the tick via the normal path.
+                return Some(entries);
             }
         }
 
@@ -651,6 +653,7 @@ impl ServerExecutor {
         }
 
         self.pre_written = Some(PreWritten { groups, entries });
+        None
     }
 
     /// Phase B of push overlap: signal workers, collect push ACKs, wait
@@ -1388,7 +1391,13 @@ impl ServerExecutor {
                         // in pending until the tick completes.
                         self.t_first_pending = None;
                         let entries = pending.drain_all();
-                        self.pre_write_pushes(entries);
+                        if let Some(returned) = self.pre_write_pushes(entries) {
+                            // Checkpoint failed; re-insert so they flush
+                            // synchronously after the tick via the normal path.
+                            for e in returned {
+                                pending.add(e.fd, e.client_id, e.target_id, e.batch, e.mode);
+                            }
+                        }
                     }
                 }
             }
@@ -1445,4 +1454,114 @@ fn validate_schema_match(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::SchemaDescriptor;
+
+    /// Build a minimal one-row U64 batch (PK-only schema).
+    fn one_row_batch(pk: u64) -> Batch {
+        let schema = SchemaDescriptor::minimal_u64();
+        let mut b = Batch::with_schema(schema, 1);
+        // minimal_u64 has a single PK column and no non-PK columns.
+        unsafe { b.append_row_simple(pk as u128, 1, 0, &[], &[], &[], &[]) };
+        b
+    }
+
+    fn make_entry(target_id: i64, rows: u64) -> PendingEntry {
+        PendingEntry {
+            fd: -1,
+            client_id: rows,
+            target_id,
+            batch: one_row_batch(rows),
+            mode: WireConflictMode::Update,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PendingBatch invariants
+    // -----------------------------------------------------------------------
+
+    /// drain_all empties the batch and zeroes row_count.
+    #[test]
+    fn test_pending_batch_drain_clears() {
+        let mut pb = PendingBatch::new();
+        pb.add(-1, 0, 1, one_row_batch(1), WireConflictMode::Update);
+        pb.add(-1, 1, 1, one_row_batch(2), WireConflictMode::Update);
+        assert_eq!(pb.row_count, 2);
+
+        let drained = pb.drain_all();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(pb.row_count, 0);
+        assert!(pb.is_empty());
+    }
+
+    /// Re-inserting drained entries via add() fully restores row_count.
+    /// This is the exact code path used at the pre_write_pushes call site
+    /// when the checkpoint fails and entries must be returned to pending.
+    #[test]
+    fn test_pending_batch_drain_and_reinsert_restores_row_count() {
+        let mut pb = PendingBatch::new();
+        for i in 0..5u64 {
+            pb.add(-1, i, 1, one_row_batch(i), WireConflictMode::Update);
+        }
+        let original_row_count = pb.row_count;
+        assert_eq!(original_row_count, 5);
+
+        // Simulate what happens at the call site when pre_write_pushes
+        // returns Some(entries) due to checkpoint failure.
+        let returned = pb.drain_all();
+        assert_eq!(pb.row_count, 0, "drain_all must zero row_count");
+
+        for e in returned {
+            pb.add(e.fd, e.client_id, e.target_id, e.batch, e.mode);
+        }
+        assert_eq!(pb.row_count, original_row_count,
+            "re-inserting drained entries must restore row_count");
+        assert_eq!(pb.by_tid.values().map(|v| v.len()).sum::<usize>(), 5,
+            "re-inserting drained entries must restore entry count");
+    }
+
+    /// row_count tracks batch.count, not the number of PendingEntry structs.
+    #[test]
+    fn test_pending_batch_row_count_tracks_batch_rows() {
+        let mut pb = PendingBatch::new();
+        // One entry with 1 row.
+        pb.add(-1, 0, 1, one_row_batch(1), WireConflictMode::Update);
+        assert_eq!(pb.row_count, 1);
+
+        // A second entry on a different target still contributes.
+        pb.add(-1, 1, 2, one_row_batch(2), WireConflictMode::Update);
+        assert_eq!(pb.row_count, 2);
+
+        let _ = pb.drain_all();
+        assert_eq!(pb.row_count, 0);
+    }
+
+    /// Cross-check that make_entry produces the expected row count.
+    #[test]
+    fn test_pending_batch_multi_entry_round_trip() {
+        let entries: Vec<PendingEntry> = (0..8).map(|i| make_entry(1, i)).collect();
+        let total_rows: usize = entries.iter().map(|e| e.batch.count).sum();
+
+        let mut pb = PendingBatch::new();
+        for e in entries {
+            pb.add(e.fd, e.client_id, e.target_id, e.batch, e.mode);
+        }
+        assert_eq!(pb.row_count, total_rows);
+
+        // Drain and re-insert — round trip must be lossless.
+        let returned = pb.drain_all();
+        assert_eq!(returned.len(), 8);
+        for e in returned {
+            pb.add(e.fd, e.client_id, e.target_id, e.batch, e.mode);
+        }
+        assert_eq!(pb.row_count, total_rows);
+    }
 }
