@@ -516,6 +516,23 @@ impl<'a> ReadCursor<'a> {
         self.find_next_non_ghost();
         Some(batch)
     }
+
+    /// If this cursor is backed by exactly one `MemBatch` source, returns a
+    /// reference to that batch and the current row position (`entry.position`).
+    /// Returns `None` for multi-source or shard-backed cursors.
+    ///
+    /// Used by the bulk retraction path in the catalog to avoid per-row overhead
+    /// when copying a contiguous range of rows from a single in-memory source.
+    pub(crate) fn single_mem_batch(&self) -> Option<(&MemBatch<'_>, usize)> {
+        if !self.valid || self.entries.len() != 1 {
+            return None;
+        }
+        let entry = &self.entries[0];
+        match &entry.source {
+            CursorSource::Batch(b) => Some((b, entry.position)),
+            CursorSource::Shard(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

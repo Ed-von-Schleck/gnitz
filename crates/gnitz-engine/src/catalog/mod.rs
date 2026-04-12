@@ -829,6 +829,19 @@ fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, 
     batch
 }
 
+/// Returns true if any non-PK payload column has STRING type, meaning bulk
+/// copy would require out-of-line blob relocation and must fall back.
+fn schema_has_string_columns(schema: &SchemaDescriptor) -> bool {
+    let pk_index = schema.pk_index as usize;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pk_index { continue; }
+        if schema.columns[ci].type_code == type_code::STRING {
+            return true;
+        }
+    }
+    false
+}
+
 /// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
 /// emitting each as a retraction (weight=-1). Exploits U128 sort order
 /// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
@@ -839,6 +852,27 @@ fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u6
         Err(_) => return batch,
     };
     cursor.cursor.seek(crate::util::make_pk(0, pk_hi));
+
+    // Bulk path: single consolidated MemBatch source, no out-of-line strings.
+    // Consolidated MemBatch rows always have positive weight (no ghosts), so
+    // the weight>0 filter is trivially satisfied and we can copy the range in
+    // one pass per column instead of one call to copy_cursor_row_with_weight
+    // per row.
+    if !schema_has_string_columns(schema) {
+        if let Some((src, start)) = cursor.cursor.single_mem_batch() {
+            // Find the end of the contiguous pk_hi == pk_hi run (sorted by pk).
+            let mut end = start;
+            while end < src.count
+                && crate::util::read_u64_le(src.pk_hi, end * 8) == pk_hi
+            {
+                end += 1;
+            }
+            batch.append_mem_batch_range(src, start, end, -1);
+            return batch;
+        }
+    }
+
+    // Row-at-a-time fallback for multi-source cursors or schemas with strings.
     while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);

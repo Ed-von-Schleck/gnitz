@@ -466,6 +466,45 @@ impl Batch {
             .copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
     }
 
+    /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`, writing
+    /// `weight_override` into the weight column instead of the source weights.
+    ///
+    /// One `copy_from_slice` per column region replaces the per-row extend loop
+    /// used by `copy_cursor_row_with_weight`. The caller must ensure the source
+    /// has no out-of-line string blobs (i.e. no STRING-typed payload columns with
+    /// long values that require blob-offset relocation).
+    ///
+    /// Preconditions:
+    /// - `start <= end <= src.count`
+    /// - `self` has the same schema (column count and strides) as `src`
+    pub(crate) fn append_mem_batch_range(
+        &mut self,
+        src: &MemBatch<'_>,
+        start: usize,
+        end: usize,
+        weight_override: i64,
+    ) {
+        let n = end - start;
+        if n == 0 { return; }
+        self.reserve_rows(n);
+        self.bulk_copy_region(0, src.pk_lo, start, end);
+        self.bulk_copy_region(1, src.pk_hi, start, end);
+        // Fill weight region with the constant override value.
+        {
+            let dst_off = self.offsets[2] as usize + self.count * 8;
+            let w_bytes = weight_override.to_le_bytes();
+            let dest = &mut self.data[dst_off..dst_off + n * 8];
+            for chunk in dest.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&w_bytes);
+            }
+        }
+        self.bulk_copy_region(3, src.null_bmp, start, end);
+        for pi in 0..src.col_data.len() {
+            self.bulk_copy_region(4 + pi, src.col_data[pi], start, end);
+        }
+        self.count += n;
+    }
+
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     /// Create a borrowed `MemBatch` view over this batch's data.
