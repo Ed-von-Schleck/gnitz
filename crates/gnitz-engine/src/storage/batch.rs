@@ -370,14 +370,31 @@ impl Batch {
         let new_cap = (self.capacity as usize * 2).max(8).max(self.count + n);
         let (new_offsets, new_total) = compute_offsets(&self.strides, nr, new_cap);
 
-        // Hugepage-friendly fast path: if the new buffer crosses the 2MB
-        // threshold and the current buffer doesn't already have a >=2MB
-        // allocation behind it, do an out-of-place grow into a fresh
-        // alloc_large_zeroed buffer. This (a) routes the allocation through
-        // madvise(MADV_HUGEPAGE), and (b) lets us copy regions directly into
-        // their NEW offsets, skipping the in-place shift loop.
-        if new_total >= HUGEPAGE_THRESHOLD && self.data.capacity() < HUGEPAGE_THRESHOLD {
-            let mut new_data = alloc_large_zeroed(new_total);
+        if new_total > self.data.capacity() {
+            // Out-of-place grow.  Vec::reserve on a too-small buffer triggers
+            // realloc, which copies ALL old bytes to a new allocation (copy #1),
+            // then copy_within would shift regions to new offsets (copy #2).
+            // Bypass that by scatter-copying directly into a fresh buffer.
+            let mut new_data = if new_total >= HUGEPAGE_THRESHOLD {
+                alloc_large_zeroed(new_total)
+            } else {
+                match super::batch_pool::acquire_buf() {
+                    Some(mut buf) if buf.capacity() >= new_total => {
+                        unsafe { buf.set_len(new_total); }
+                        buf
+                    }
+                    other => {
+                        // Return undersized buffer to pool if we got one.
+                        if let Some(buf) = other {
+                            super::batch_pool::recycle_buf(buf);
+                        }
+                        let mut v = Vec::with_capacity(new_total);
+                        unsafe { v.set_len(new_total); }
+                        v
+                    }
+                }
+            };
+
             for i in 0..nr {
                 let len = self.count * self.strides[i] as usize;
                 if len == 0 { continue; }
@@ -386,32 +403,44 @@ impl Batch {
                 new_data[new_off..new_off + len]
                     .copy_from_slice(&self.data[old_off..old_off + len]);
             }
-            // Old buffer is dropped here; its Drop returns it to batch_pool.
-            self.data = new_data;
-            self.offsets = new_offsets;
-            self.capacity = new_cap as u32;
-            return;
-        }
 
-        // In-place grow. Reserve capacity without zero-init; slack is never read
-        // (every accessor on Batch is bounded by `count`, not `capacity`).
-        // SAFETY: bytes in [old_len..new_total) are uninit until the shift loop
-        // and future appends populate the live regions. No accessor reads slack.
-        let additional = new_total.saturating_sub(self.data.len());
-        self.data.reserve(additional);
-        unsafe { self.data.set_len(new_total); }
-
-        // Move columns backwards to avoid overlap (new offsets >= old offsets).
-        for i in (0..nr).rev() {
-            let old_start = self.offsets[i] as usize;
-            let new_start = new_offsets[i] as usize;
-            let data_len = self.count * self.strides[i] as usize;
-            if old_start != new_start && data_len > 0 {
-                self.data.copy_within(old_start..old_start + data_len, new_start);
+            let old_data = std::mem::replace(&mut self.data, new_data);
+            super::batch_pool::recycle_buf(old_data);
+        } else {
+            // Vec already has sufficient capacity (e.g. cleared batch being
+            // refilled).  copy_within shifts regions in one pass.
+            unsafe { self.data.set_len(new_total); }
+            for i in (0..nr).rev() {
+                let old_start = self.offsets[i] as usize;
+                let new_start = new_offsets[i] as usize;
+                let data_len = self.count * self.strides[i] as usize;
+                if old_start != new_start && data_len > 0 {
+                    self.data.copy_within(old_start..old_start + data_len, new_start);
+                }
             }
         }
         self.offsets = new_offsets;
         self.capacity = new_cap as u32;
+    }
+
+    /// Extend the data buffer to accommodate a newly-discovered column stride.
+    ///
+    /// Called mid-row by `extend_region`/`fill_col_zero` when a payload column's
+    /// stride is set for the first time.  Row capacity (in rows) is unchanged —
+    /// only the byte total increases because the new stride adds bytes per row.
+    /// Realloc preserves all buffer content, including any partially-written row
+    /// data at position `count`.  Offsets for pre-existing regions are unchanged
+    /// (same capacity), so no copy_within is needed.
+    fn grow_for_new_stride(&mut self) {
+        let nr = self.num_regions as usize;
+        let cap = self.capacity as usize;
+        let (new_offsets, new_total) = compute_offsets(&self.strides, nr, cap);
+        if new_total > self.data.len() {
+            let additional = new_total - self.data.len();
+            self.data.reserve(additional);
+            unsafe { self.data.set_len(new_total); }
+        }
+        self.offsets = new_offsets;
     }
 
     /// Write data into region `r` at the current row position.
@@ -421,7 +450,7 @@ impl Batch {
     fn extend_region(&mut self, r: usize, src: &[u8]) {
         if self.strides[r] == 0 && !src.is_empty() {
             self.strides[r] = src.len() as u8;
-            self.capacity = 0; // force realloc to include this region
+            self.grow_for_new_stride();
         }
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
@@ -447,7 +476,7 @@ impl Batch {
         let r = 4 + pi;
         if self.strides[r] == 0 && nbytes > 0 {
             self.strides[r] = nbytes as u8;
-            self.capacity = 0;
+            self.grow_for_new_stride();
         }
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();

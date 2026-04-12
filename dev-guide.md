@@ -188,3 +188,10 @@ Workflow: `make bench` → change → commit → `make bench` → compare `summa
    is in the new code.
 5. **Verify your fix is in the binary.** `make e2e` rebuilds both the
    server and the Python extension before running tests.
+
+## Claude Code memory policy
+
+Never save code-specific details (function names, file paths, invariants,
+fix recipes) to Claude Code memory. Code changes; memories become stale
+and cause more problems than they solve. If something matters, put it in
+the code (comments, doc strings, assertions) or in this guide.
