@@ -793,12 +793,21 @@ impl ServerExecutor {
         data: &[u8],
         pending: &mut PendingBatch,
     ) {
-        let decoded = match ipc::decode_wire(data) {
-            Ok(d) => d,
-            Err(e) => {
-                let msg = format!("decode error: {}", e);
-                self.send_error_response(transport, fd, msg.as_bytes(), 0, 0);
-                return;
+        let decoded = {
+            // Hot path: peek target_id, skip schema decode if cached.
+            let target_id = ipc::peek_target_id(data).unwrap_or(-1);
+            let result = if let Some(&cached) = self.schema_cache.get(&target_id) {
+                ipc::decode_wire_with_schema(data, &cached)
+            } else {
+                ipc::decode_wire(data)
+            };
+            match result {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("decode error: {}", e);
+                    self.send_error_response(transport, fd, msg.as_bytes(), 0, 0);
+                    return;
+                }
             }
         };
 

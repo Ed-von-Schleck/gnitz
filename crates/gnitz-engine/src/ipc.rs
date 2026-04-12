@@ -89,13 +89,12 @@ const META_SCHEMA_DESC: SchemaDescriptor = {
     sd
 };
 
-// `schema_to_batch` / `batch_to_schema` hardcode the 4-column META_SCHEMA
-// layout (extend_col / col_data with literal indices 0..2). If anyone
-// ever bumps `META_SCHEMA_DESC.num_columns`, this compile-time check
-// fails and forces both converter functions to be updated in lockstep.
+// `schema_to_batch` / `decode_schema_block` hardcode the 4-column META_SCHEMA
+// layout. If anyone ever bumps `META_SCHEMA_DESC.num_columns`, this
+// compile-time check fails and forces the converter functions to be updated.
 const _: () = assert!(
     META_SCHEMA_DESC.num_columns == 4,
-    "META_SCHEMA layout changed; update schema_to_batch and batch_to_schema",
+    "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
 );
 
 /// CONTROL_SCHEMA: 8 U64 cols + 1 nullable String.
@@ -144,6 +143,8 @@ fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> Batch {
 }
 
 /// Convert a META_SCHEMA Batch back into a SchemaDescriptor + column names.
+/// Only used by tests (production decode uses `decode_schema_block` instead).
+#[cfg(test)]
 fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
     if batch.count == 0 {
         return Err("empty schema batch");
@@ -416,7 +417,6 @@ pub struct DecodedControl {
 pub struct DecodedWire {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
-    pub col_names: Vec<Vec<u8>>,
     pub data_batch: Option<Batch>,
 }
 
@@ -553,8 +553,143 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     })
 }
 
+/// Decode the META_SCHEMA WAL block directly into a [`SchemaDescriptor`]
+/// without constructing a [`Batch`] or decoding column names.
+///
+/// META_SCHEMA_DESC layout (4 columns, pk_index=0, N rows = N table columns):
+///   [0]=pk_lo  [1]=pk_hi  [2]=weight  [3]=null_bmp
+///   [4]=type_code (u64)  [5]=flags (u64)  [6]=name (STRING, skipped)  [7]=blob (skipped)
+fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
+    // 4 fixed + 3 payload + 1 blob = 8. Keep in sync with META_SCHEMA_DESC.
+    const EXPECTED_REGIONS: usize = 8;
+    const _: () = assert!(
+        {
+            let npc = META_SCHEMA_DESC.num_columns as usize - 1;
+            4 + npc + 1 == EXPECTED_REGIONS
+        },
+        "EXPECTED_REGIONS out of sync with META_SCHEMA_DESC",
+    );
+
+    let mut lsn = 0u64;
+    let mut tid = 0u32;
+    let mut count = 0u32;
+    let mut num_regions = 0u32;
+    let mut blob_size = 0u64;
+    let mut offsets = [0u64; EXPECTED_REGIONS];
+    let mut sizes   = [0u32; EXPECTED_REGIONS];
+
+    let rc = wal::validate_and_parse(
+        data, &mut lsn, &mut tid, &mut count, &mut num_regions,
+        &mut blob_size, &mut offsets, &mut sizes, EXPECTED_REGIONS as u32,
+    );
+    if rc != wal::WAL_OK {
+        return Err("schema block invalid");
+    }
+    if count == 0 {
+        return Err("empty schema block");
+    }
+    if count > 64 {
+        return Err("schema exceeds 64-column limit");
+    }
+    if num_regions as usize != EXPECTED_REGIONS {
+        return Err("schema block region count mismatch");
+    }
+
+    // Region [4] = type_code (u64 per row), Region [5] = flags (u64 per row)
+    let type_off = offsets[4] as usize;
+    let flags_off = offsets[5] as usize;
+    let n = count as usize;
+
+    if type_off + n * 8 > data.len() {
+        return Err("type_code region truncated");
+    }
+    if flags_off + n * 8 > data.len() {
+        return Err("flags region truncated");
+    }
+
+    let mut sd = SchemaDescriptor {
+        num_columns: count as u32,
+        pk_index: 0,
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+    };
+    let mut pk_found = false;
+
+    for i in 0..n {
+        let off8 = i * 8;
+        let tc = u64::from_le_bytes(
+            data[type_off + off8..type_off + off8 + 8].try_into().unwrap()
+        ) as u8;
+        let fl = u64::from_le_bytes(
+            data[flags_off + off8..flags_off + off8 + 8].try_into().unwrap()
+        );
+
+        let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
+        let is_pk = (fl & META_FLAG_IS_PK) != 0;
+
+        sd.columns[i] = SchemaColumn {
+            type_code: tc,
+            size: type_size(tc),
+            nullable: if is_nullable { 1 } else { 0 },
+            _pad: 0,
+        };
+
+        if is_pk {
+            if pk_found {
+                return Err("multiple PK columns");
+            }
+            sd.pk_index = i as u32;
+            pk_found = true;
+        }
+    }
+    if !pk_found {
+        return Err("no PK column");
+    }
+
+    Ok(sd)
+}
+
+/// Peek at just the `target_id` from a wire message's control block.
+///
+/// Stack-only, 0 allocations. Returns `Err` only on corrupt/truncated input.
+pub fn peek_target_id(data: &[u8]) -> Result<i64, &'static str> {
+    if data.len() < wal::HEADER_SIZE {
+        return Err("IPC payload too small");
+    }
+    let ctrl_size = u32::from_le_bytes(
+        data[16..20].try_into().map_err(|_| "bad control size")?
+    ) as usize;
+    if ctrl_size > data.len() {
+        return Err("control block truncated");
+    }
+    let ctrl = decode_control_block(&data[..ctrl_size])?;
+    Ok(ctrl.target_id as i64)
+}
+
+/// Decode a wire message using a caller-provided schema, skipping schema
+/// block decode entirely.
+///
+/// The schema block bytes are still present on the wire (protocol requires
+/// FLAG_HAS_SCHEMA when FLAG_HAS_DATA is set), but this function only reads
+/// the block SIZE to advance the offset — it does not parse the contents.
+pub fn decode_wire_with_schema(data: &[u8], schema: &SchemaDescriptor) -> Result<DecodedWire, &'static str> {
+    decode_wire_impl(data, Some(schema))
+}
+
 /// Decode a full IPC wire message from raw bytes.
 pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
+    decode_wire_impl(data, None)
+}
+
+/// Shared decode implementation.
+///
+/// When `schema_hint` is `Some`, the schema block is skipped (only its SIZE
+/// is read to advance the offset) and the provided descriptor is used to
+/// decode the data block. When `None`, the schema block is parsed via
+/// `decode_schema_block`.
+fn decode_wire_impl(
+    data: &[u8],
+    schema_hint: Option<&SchemaDescriptor>,
+) -> Result<DecodedWire, &'static str> {
     if data.len() < wal::HEADER_SIZE {
         return Err("IPC payload too small");
     }
@@ -579,7 +714,6 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
 
     let mut off = ctrl_size;
     let mut wire_schema: Option<SchemaDescriptor> = None;
-    let mut col_names: Vec<Vec<u8>> = Vec::new();
 
     if has_schema {
         if off + wal::HEADER_SIZE > data.len() {
@@ -592,11 +726,11 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
             return Err("schema block truncated");
         }
 
-        let meta = META_SCHEMA_DESC;
-        let schema_batch = decode_wal_block(&data[off..off + schema_size], &meta)?;
-        let (sd, names) = batch_to_schema(&schema_batch)?;
-        wire_schema = Some(sd);
-        col_names = names;
+        if let Some(hint) = schema_hint {
+            wire_schema = Some(*hint);
+        } else {
+            wire_schema = Some(decode_schema_block(&data[off..off + schema_size])?);
+        }
         off += schema_size;
     }
 
@@ -624,7 +758,7 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
         None
     };
 
-    Ok(DecodedWire { control, schema: wire_schema, col_names, data_batch })
+    Ok(DecodedWire { control, schema: wire_schema, data_batch })
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,9 +2259,6 @@ mod tests {
         assert_eq!(s.pk_index, 0);
         assert_eq!(s.columns[0].type_code, type_code::U64);
         assert_eq!(s.columns[1].type_code, type_code::U64);
-        assert_eq!(decoded.col_names.len(), 2);
-        assert_eq!(decoded.col_names[0], b"id");
-        assert_eq!(decoded.col_names[1], b"value");
         assert!(decoded.data_batch.is_none());
     }
 
