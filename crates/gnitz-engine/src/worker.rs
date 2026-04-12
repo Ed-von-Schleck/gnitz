@@ -34,9 +34,17 @@ struct DeferredDdl {
     batch: Batch,
 }
 
+/// A FLAG_PUSH message received during an exchange wait, decoded eagerly.
+/// Replayed after the tick ACK so push ACKs follow tick ACKs on W2M.
+struct DeferredPush {
+    target_id: i64,
+    batch: Batch,
+}
+
 struct WorkerExchangeHandler {
     stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
+    deferred_pushes: Vec<DeferredPush>,
 }
 
 impl WorkerExchangeHandler {
@@ -108,12 +116,24 @@ impl WorkerExchangeHandler {
                     return Batch::with_schema(empty_schema, 0);
                 }
 
-                // Not an exchange relay. Defer DDL_SYNC; discard others.
+                // Not an exchange relay. Defer DDL_SYNC and FLAG_PUSH;
+                // discard others.
                 if msg.flags & FLAG_DDL_SYNC != 0 {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
                             if let Some(batch) = decoded.data_batch {
                                 self.deferred.push(DeferredDdl {
+                                    target_id: msg.target_id as i64,
+                                    batch,
+                                });
+                            }
+                        }
+                    }
+                } else if msg.flags & FLAG_PUSH != 0 {
+                    if let Some(data) = msg.wire_data {
+                        if let Ok(decoded) = ipc::decode_wire(data) {
+                            if let Some(batch) = decoded.data_batch {
+                                self.deferred_pushes.push(DeferredPush {
                                     target_id: msg.target_id as i64,
                                     batch,
                                 });
@@ -186,7 +206,7 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -294,7 +314,14 @@ impl WorkerProcess {
 
         let result = self.dispatch_inner(flags, target_id, decoded);
         match result {
-            DispatchResult::Continue => false,
+            DispatchResult::Continue => {
+                // Replay any FLAG_PUSH messages stashed during exchange.
+                // This runs AFTER the tick ACK (sent inside dispatch_inner),
+                // so push ACKs follow tick ACKs on W2M — the master reads
+                // them in the correct order.
+                self.replay_deferred_pushes();
+                false
+            }
             DispatchResult::Shutdown => true,
             DispatchResult::Error(msg) => {
                 self.send_error(&msg);
@@ -628,6 +655,19 @@ impl WorkerProcess {
         }
     }
 
+    /// Replay FLAG_PUSH messages that were stashed during do_exchange_impl.
+    /// Called after the tick ACK is sent so push ACKs follow tick ACKs on W2M.
+    fn replay_deferred_pushes(&mut self) {
+        let pushes = std::mem::take(&mut self.exchange.deferred_pushes);
+        if pushes.is_empty() { return; }
+        for p in pushes {
+            match self.handle_push(p.target_id, p.batch) {
+                Ok(()) => self.send_ack(p.target_id as u64, 0),
+                Err(msg) => self.send_error(&msg),
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         let _ = self.handle_flush_all();
         unsafe { libc::_exit(0); }
@@ -724,7 +764,7 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new() }
+        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new(), deferred_pushes: Vec::new() }
     }
 
     #[test]
@@ -821,7 +861,7 @@ mod tests {
                 catalog: std::ptr::null_mut(),
                 sal_reader: unsafe { std::mem::zeroed() },
                 w2m_writer: unsafe { std::mem::zeroed() },
-                exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() },
+                exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
                 pending_deltas: HashMap::new(),
                 read_cursor: 0,
                 expected_epoch: 1,
@@ -849,7 +889,7 @@ mod tests {
             catalog: std::ptr::null_mut(),
             sal_reader: unsafe { std::mem::zeroed() },
             w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -875,7 +915,7 @@ mod tests {
             catalog: std::ptr::null_mut(),
             sal_reader: unsafe { std::mem::zeroed() },
             w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,

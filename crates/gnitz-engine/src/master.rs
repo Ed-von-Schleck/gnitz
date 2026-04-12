@@ -381,13 +381,18 @@ impl MasterDispatcher {
         self.sal.sync_and_signal_all()
     }
 
-    fn signal_all(&self) { self.sal.signal_all(); }
+    pub(crate) fn signal_all(&self) { self.sal.signal_all(); }
     fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
     pub(crate) fn sync(&self) -> i32 { self.sal.sync() }
 
     /// Signal workers + submit async fdatasync.
     pub(crate) fn signal_and_submit_fsync(&mut self, async_fsync: &mut ipc::AsyncFsync) {
         self.sal.signal_all();
+        async_fsync.submit();
+    }
+
+    /// Submit async fdatasync without signaling workers.
+    pub(crate) fn submit_fsync(&self, async_fsync: &mut ipc::AsyncFsync) {
         async_fsync.submit();
     }
 
@@ -941,8 +946,35 @@ impl MasterDispatcher {
     }
 
     fn finish_async_tick(&mut self) {
-        self.reset_w2m_cursors();
+        // Note: does NOT reset W2M cursors. The caller is responsible for
+        // calling reset_w2m_cursors() after it has finished reading any
+        // remaining W2M data (e.g. push ACKs that follow tick ACKs).
         self.async_active = false;
+    }
+
+    /// Collect one push ACK per worker using the W2M read cursors left
+    /// behind by poll_tick_progress.  This lets the caller read push ACKs
+    /// that workers appended to W2M *after* their tick ACKs.
+    pub(crate) fn collect_acks_continuing(&mut self) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut remaining = nw;
+        let mut collected = vec![false; nw];
+        while remaining > 0 {
+            self.w2m.poll(1000);
+            for w in 0..nw {
+                if collected[w] { continue; }
+                if let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
+                    self.async_w2m_rcs[w] = new_rc;
+                    if decoded.control.status != 0 {
+                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                        return Err(format!("worker {}: {}", w, msg));
+                    }
+                    collected[w] = true;
+                    remaining -= 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

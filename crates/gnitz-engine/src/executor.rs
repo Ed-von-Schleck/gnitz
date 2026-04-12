@@ -134,6 +134,15 @@ struct GroupInfo {
     current_lsn: u64,
 }
 
+/// State for push groups that were pre-written to the SAL during an async
+/// tick.  Phase A (SAL write + fdatasync submit) runs overlapped with worker
+/// tick evaluation; Phase B (signal + ACK collection + client response) runs
+/// after the tick completes.
+struct PreWritten {
+    groups: Vec<GroupInfo>,
+    entries: Vec<PendingEntry>,
+}
+
 // ---------------------------------------------------------------------------
 // ServerExecutor
 // ---------------------------------------------------------------------------
@@ -167,6 +176,9 @@ pub struct ServerExecutor {
 
     // Async fdatasync: overlaps fsync with worker ACK collection
     async_fsync: ipc::AsyncFsync,
+
+    // Push groups pre-written to SAL during async tick (Phase A of overlap).
+    pre_written: Option<PreWritten>,
 }
 
 // Safety: ServerExecutor is single-threaded (master process event loop).
@@ -195,6 +207,7 @@ impl ServerExecutor {
             pending_ddl_responses: Vec::with_capacity(8),
             schema_cache: HashMap::new(),
             async_fsync,
+            pre_written: None,
         }
     }
 
@@ -566,6 +579,198 @@ impl ServerExecutor {
         }
     }
 
+    /// Phase A of push overlap: write push groups to SAL + submit async
+    /// fdatasync, but do NOT signal workers or collect ACKs.  Called during
+    /// TickState::Active so that encoding + fdatasync run concurrently with
+    /// worker tick evaluation.  Phase B (complete_pre_written) runs after the
+    /// tick completes.
+    fn pre_write_pushes(&mut self, mut entries: Vec<PendingEntry>) {
+        if entries.is_empty() { return; }
+
+        entries.sort_by_key(|e| (e.target_id, e.mode.as_u8()));
+
+        // Phase 0: checkpoint.  Can block — same as flush_pending_pushes.
+        {
+            let disp = self.disp();
+            if let Err(_e) = disp.maybe_checkpoint() {
+                // Can't send errors here (no transport). Drop the pre-write;
+                // entries will be re-flushed after the tick via the normal
+                // path. This is rare (checkpoint only when SAL is nearly full).
+                return;
+            }
+        }
+
+        // Phase 1: merge + write_ingest to SAL (no signal).
+        let n = entries.len();
+        let mut groups: Vec<GroupInfo> = Vec::new();
+        let mut run_start = 0;
+
+        while run_start < n {
+            let target_id = entries[run_start].target_id;
+            let mode = entries[run_start].mode;
+            let mut run_end = run_start + 1;
+            while run_end < n
+                && entries[run_end].target_id == target_id
+                && entries[run_end].mode == mode
+            {
+                run_end += 1;
+            }
+
+            let merged_count;
+            let merged = {
+                let schema = self.get_schema_desc(target_id);
+                let total_rows: usize = entries[run_start..run_end]
+                    .iter()
+                    .map(|e| e.batch.count)
+                    .sum();
+                let mut m = Batch::with_schema(schema, total_rows.max(1));
+                for k in run_start..run_end {
+                    let b = &entries[k].batch;
+                    m.append_batch(b, 0, b.count);
+                }
+                merged_count = m.count;
+                m
+            };
+
+            let error = {
+                let disp = self.disp();
+                disp.write_ingest(target_id, &merged, mode).err()
+            };
+
+            groups.push(GroupInfo {
+                start: run_start, end: run_end, target_id,
+                merged_count, error, current_lsn: 0,
+            });
+            run_start = run_end;
+        }
+
+        let any_written = groups.iter().any(|g| g.error.is_none());
+        if any_written {
+            let disp = unsafe { &mut *self.dispatcher };
+            disp.submit_fsync(&mut self.async_fsync);
+        }
+
+        self.pre_written = Some(PreWritten { groups, entries });
+    }
+
+    /// Phase B of push overlap: signal workers, collect push ACKs, wait
+    /// fdatasync, and send client responses.  Called after the async tick
+    /// completes — the W2M read cursors from tick collection are still valid
+    /// (finish_async_tick does not reset them).
+    fn complete_pre_written(&mut self, transport: &mut Transport<IoUringRing>) {
+        let pre = match self.pre_written.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let PreWritten { mut groups, entries } = pre;
+
+        let any_written = groups.iter().any(|g| g.error.is_none());
+        if any_written {
+            // Signal workers so they drain the pre-written SAL groups.
+            {
+                let disp = unsafe { &mut *self.dispatcher };
+                disp.signal_all();
+            }
+
+            // Collect one push ACK round per group, using the W2M cursors
+            // left behind by poll_tick_progress (positioned after tick ACKs).
+            let mut any_success = false;
+            for gi in 0..groups.len() {
+                if groups[gi].error.is_some() { continue; }
+                let disp = self.disp();
+                match disp.collect_acks_continuing() {
+                    Ok(()) => {
+                        self.ingest_lsn += 1;
+                        groups[gi].current_lsn = self.ingest_lsn;
+                        let tid = groups[gi].target_id;
+                        let mc = groups[gi].merged_count;
+                        if !self.tick_rows.contains_key(&tid) {
+                            self.tick_tids.push(tid);
+                            self.tick_rows.insert(tid, 0);
+                        }
+                        *self.tick_rows.get_mut(&tid).unwrap() += mc;
+                        any_success = true;
+                    }
+                    Err(e) => {
+                        for gj in gi..groups.len() {
+                            if groups[gj].error.is_none() {
+                                groups[gj].error = Some(e.clone());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if any_success {
+                self.t_last_push = Some(Instant::now());
+            }
+
+            // Wait for fdatasync (submitted in pre_write_pushes, ran during
+            // tick). Crash-stop on failure — same policy as flush_pending_pushes.
+            let fsync_rc = self.async_fsync.wait_complete();
+            if fsync_rc < 0 {
+                gnitz_fatal_abort!("SAL fdatasync (pre-written) failed rc={}", fsync_rc);
+            }
+
+            // Update unique-index filters.
+            for g in &groups {
+                let disp = unsafe { &mut *self.dispatcher };
+                if g.error.is_some() {
+                    disp.unique_filter_invalidate_table(g.target_id);
+                    continue;
+                }
+                for k in g.start..g.end {
+                    disp.unique_filter_ingest_batch(g.target_id, &entries[k].batch);
+                }
+            }
+        }
+
+        // Send client responses.
+        for g in &groups {
+            let schema = self.get_schema_desc(g.target_id);
+            let col_names_owned = if g.error.is_none() {
+                Some(self.cat().get_column_names(g.target_id))
+            } else {
+                None
+            };
+            let ok_refs: Option<Vec<&[u8]>> = col_names_owned.as_ref().map(|names|
+                names.iter().map(|s| s.as_bytes()).collect()
+            );
+            let sz = if g.error.is_some() {
+                ipc::wire_size(STATUS_ERROR, g.error.as_ref().unwrap().as_bytes(), Some(&schema), None, None)
+            } else {
+                ipc::wire_size(STATUS_OK, b"", Some(&schema), Some(ok_refs.as_ref().unwrap()), None)
+            };
+            for k in g.start..g.end {
+                let e = &entries[k];
+                let rc = if let Some(ref err_msg) = g.error {
+                    transport.send_encoded(e.fd, sz, |buf| {
+                        ipc::encode_wire_into(
+                            buf, 0,
+                            g.target_id as u64, e.client_id,
+                            0, 0, 0, 0,
+                            STATUS_ERROR, err_msg.as_bytes(),
+                            Some(&schema), None, None,
+                        )
+                    })
+                } else {
+                    transport.send_encoded(e.fd, sz, |buf| {
+                        ipc::encode_wire_into(
+                            buf, 0,
+                            g.target_id as u64, e.client_id,
+                            0, g.current_lsn, 0, 0,
+                            STATUS_OK, b"",
+                            Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
+                        )
+                    })
+                };
+                if rc < 0 {
+                    transport.close_fd(e.fd);
+                }
+            }
+        }
+    }
+
     fn send_batch_errors(
         &mut self,
         transport: &mut Transport<IoUringRing>,
@@ -685,6 +890,10 @@ impl ServerExecutor {
                 Ok(d) => d,
                 Err(e) => {
                     gnitz_warn!("poll_tick_progress error: {}", e);
+                    // On error, discard any pre-written state — we can't
+                    // safely collect push ACKs from a failed tick.
+                    self.pre_written = None;
+                    self.disp().reset_w2m_cursors();
                     true
                 }
             }
@@ -697,6 +906,14 @@ impl ServerExecutor {
         gnitz_debug!("async tick complete");
         self.last_tick_lsn = self.ingest_lsn;
 
+        // Complete pre-written pushes (Phase B) before resetting W2M.
+        // The W2M read cursors from poll_tick_progress are positioned after
+        // tick ACKs; push ACKs follow them in the W2M ring.
+        if self.pre_written.is_some() {
+            self.complete_pre_written(transport);
+        }
+        self.disp().reset_w2m_cursors();
+
         // More tids queued?
         if !self.tick_queue_tids.is_empty() {
             self.start_next_async_tick();
@@ -706,7 +923,8 @@ impl ServerExecutor {
         // All ticks complete — transition to IDLE
         self.tick_state = TickState::Idle;
 
-        // Flush pushes accumulated during the tick
+        // Flush pushes accumulated during the tick (any that arrived after
+        // the pre-write, or all of them if pre-write wasn't triggered).
         if !pending.is_empty() {
             let entries = pending.drain_all();
             self.flush_pending_pushes(transport, entries);
@@ -1159,10 +1377,19 @@ impl ServerExecutor {
 
                 Transport::<IoUringRing>::free_recv(ptr);
 
-                if pending.row_count >= MAX_PENDING_ROWS && self.tick_state != TickState::Active {
-                    self.t_first_pending = None;
-                    let entries = pending.drain_all();
-                    self.flush_pending_pushes(transport, entries);
+                if pending.row_count >= MAX_PENDING_ROWS {
+                    if self.tick_state != TickState::Active {
+                        self.t_first_pending = None;
+                        let entries = pending.drain_all();
+                        self.flush_pending_pushes(transport, entries);
+                    } else if self.pre_written.is_none() {
+                        // Tick active: pre-write to SAL (Phase A overlap).
+                        // Only one pre-write per tick — further pushes buffer
+                        // in pending until the tick completes.
+                        self.t_first_pending = None;
+                        let entries = pending.drain_all();
+                        self.pre_write_pushes(entries);
+                    }
                 }
             }
 
