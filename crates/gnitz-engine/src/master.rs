@@ -246,15 +246,13 @@ pub struct MasterDispatcher {
     router: PartitionRouter,
     // Async tick state
     async_remaining: usize,
-    async_collected: Vec<bool>,
-    /// Number of tick ACKs expected from each worker in the current batch.
-    /// 1 for a single-table tick (start_tick_async), N for an N-table batch
-    /// (start_ticks_async_batch).  poll_tick_progress counts ACKs per worker
-    /// against this value before marking a worker as fully collected.
-    async_acks_per_worker: usize,
-    /// Per-worker count of non-exchange (i.e. tick ACK) messages received
-    /// during the current async tick batch.
-    async_acks_collected: Vec<usize>,
+    /// Per-worker countdown of tick ACKs still outstanding in the current batch.
+    /// Initialised to N (the number of ticks in the batch) by begin_async_collection;
+    /// decremented on each non-exchange ACK; a worker is collected when it reaches 0.
+    /// Replacing the previous (async_collected, async_acks_per_worker,
+    /// async_acks_collected) triple with a single countdown eliminates redundant
+    /// state and removes the per-tick overhead for the common N=1 case.
+    async_acks_remaining: Vec<usize>,
     async_w2m_rcs: Vec<u64>,
     acc: ExchangeAccumulator,
     async_active: bool,
@@ -282,9 +280,7 @@ impl MasterDispatcher {
             catalog,
             router: PartitionRouter::new(),
             async_remaining: 0,
-            async_collected: vec![false; num_workers],
-            async_acks_per_worker: 1,
-            async_acks_collected: vec![0; num_workers],
+            async_acks_remaining: vec![0; num_workers],
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
@@ -892,11 +888,9 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     fn begin_async_collection(&mut self, acks_per_worker: usize) {
-        self.async_acks_per_worker = acks_per_worker;
         self.async_remaining = self.num_workers;
         for w in 0..self.num_workers {
-            self.async_collected[w] = false;
-            self.async_acks_collected[w] = 0;
+            self.async_acks_remaining[w] = acks_per_worker;
             self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
         }
         self.acc.clear();
@@ -953,7 +947,7 @@ impl MasterDispatcher {
         self.w2m.poll(1);
 
         for w in 0..nw {
-            if self.async_collected[w] { continue; }
+            if self.async_acks_remaining[w] == 0 { continue; }
             while let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
                 self.async_w2m_rcs[w] = new_rc;
 
@@ -978,11 +972,9 @@ impl MasterDispatcher {
                         self.finish_async_tick();
                         return Err(format!("worker {}: {}", w, msg));
                     }
-                    // Count this ACK.  A worker is done when it has sent
-                    // async_acks_per_worker ACKs (one per tick in the batch).
-                    self.async_acks_collected[w] += 1;
-                    if self.async_acks_collected[w] >= self.async_acks_per_worker {
-                        self.async_collected[w] = true;
+                    // One ACK received; worker is collected when its countdown hits 0.
+                    self.async_acks_remaining[w] -= 1;
+                    if self.async_acks_remaining[w] == 0 {
                         self.async_remaining -= 1;
                     }
                     break;

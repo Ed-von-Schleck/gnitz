@@ -678,16 +678,13 @@ impl WorkerProcess {
     /// before any push ACKs — the master's collect_acks_continuing depends on
     /// that ordering.
     ///
-    /// Uses a loop rather than a single drain to handle cascades: if processing
-    /// deferred tick B causes B's own exchange wait to see TICK[C] and stash it,
-    /// the next loop iteration catches TICK[C].  Terminates when no more deferred
-    /// ticks remain (normally one pass for N-table batches, since all N ticks are
-    /// already in the SAL before the first signal and are consumed during A's
-    /// exchange wait).
+    /// The while loop handles cascades: if processing deferred tick B causes
+    /// B's own exchange wait to stash TICK[C], the next iteration catches it.
+    /// For the common single-table case (deferred_ticks always empty) the
+    /// is_empty() check short-circuits with no allocation.
     fn replay_deferred_ticks(&mut self) {
-        loop {
+        while !self.exchange.deferred_ticks.is_empty() {
             let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
-            if ticks.is_empty() { break; }
             for tid in ticks {
                 match self.handle_tick(tid) {
                     Ok(()) => self.send_ack(tid as u64, 0),

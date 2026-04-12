@@ -862,18 +862,15 @@ impl ServerExecutor {
         // Drain first to release the borrow on tick_queue_tids before calling
         // self.cat() in the filter — the compiler cannot see that drain() and
         // cat() access disjoint fields.
-        let all_tids: Vec<i64> = self.tick_queue_tids.drain(..).collect();
-        let valid_tids: Vec<i64> = all_tids.into_iter()
-            .filter(|&tid| self.cat().has_id(tid))
-            .collect();
+        let mut tids: Vec<i64> = self.tick_queue_tids.drain(..).collect();
+        tids.retain(|&tid| self.cat().has_id(tid));
 
-        if valid_tids.is_empty() {
+        if tids.is_empty() {
             return;
         }
 
         self.tick_state = TickState::Active;
-        let disp = self.disp();
-        if let Err(e) = disp.start_ticks_async_batch(&valid_tids) {
+        if let Err(e) = self.disp().start_ticks_async_batch(&tids) {
             gnitz_warn!("start_ticks_async_batch error: {}", e);
             self.tick_state = TickState::Idle;
         }
