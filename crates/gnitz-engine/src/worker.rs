@@ -45,6 +45,14 @@ struct WorkerExchangeHandler {
     stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
     deferred_pushes: Vec<DeferredPush>,
+    /// FLAG_TICK messages encountered inside `do_exchange_impl` while waiting
+    /// for a FLAG_EXCHANGE_RELAY.  In a multi-table batched tick, the master
+    /// writes TICK[A], TICK[B], TICK[C] to the SAL before signalling once.
+    /// When the worker is blocked waiting for A's relay, it sees TICK[B] and
+    /// TICK[C] in the SAL. They are stashed here and replayed (via
+    /// `replay_deferred_ticks`) after the current tick's ACK is sent, so the
+    /// master receives ACK[A], ACK[B], ACK[C] in order.
+    deferred_ticks: Vec<i64>,
 }
 
 impl WorkerExchangeHandler {
@@ -116,8 +124,8 @@ impl WorkerExchangeHandler {
                     return Batch::with_schema(empty_schema, 0);
                 }
 
-                // Not an exchange relay. Defer DDL_SYNC and FLAG_PUSH;
-                // discard others.
+                // Not an exchange relay. Defer DDL_SYNC, FLAG_PUSH, and
+                // FLAG_TICK; discard others.
                 if msg.flags & FLAG_DDL_SYNC != 0 {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
@@ -140,6 +148,12 @@ impl WorkerExchangeHandler {
                             }
                         }
                     }
+                } else if msg.flags & FLAG_TICK != 0 {
+                    // A tick for another table arrived while waiting for this
+                    // exchange relay (multi-table batched tick scenario).
+                    // Stash the target_id; replay_deferred_ticks processes it
+                    // after the current tick's ACK is sent.
+                    self.deferred_ticks.push(msg.target_id as i64);
                 }
             }
         }
@@ -206,7 +220,7 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -315,10 +329,14 @@ impl WorkerProcess {
         let result = self.dispatch_inner(flags, target_id, decoded);
         match result {
             DispatchResult::Continue => {
+                // Replay deferred ticks BEFORE deferred pushes so all tick
+                // ACKs land on W2M before any push ACKs. The master counts
+                // N tick ACKs per worker via poll_tick_progress, then reads
+                // push ACKs via collect_acks_continuing — this ordering is
+                // required for that to work correctly.
+                self.replay_deferred_ticks();
                 // Replay any FLAG_PUSH messages stashed during exchange.
-                // This runs AFTER the tick ACK (sent inside dispatch_inner),
-                // so push ACKs follow tick ACKs on W2M — the master reads
-                // them in the correct order.
+                // This runs AFTER all tick ACKs are sent.
                 self.replay_deferred_pushes();
                 false
             }
@@ -655,6 +673,30 @@ impl WorkerProcess {
         }
     }
 
+    /// Replay FLAG_TICK messages stashed during do_exchange_impl (batched tick).
+    /// Called before replay_deferred_pushes so all tick ACKs reach the master
+    /// before any push ACKs — the master's collect_acks_continuing depends on
+    /// that ordering.
+    ///
+    /// Uses a loop rather than a single drain to handle cascades: if processing
+    /// deferred tick B causes B's own exchange wait to see TICK[C] and stash it,
+    /// the next loop iteration catches TICK[C].  Terminates when no more deferred
+    /// ticks remain (normally one pass for N-table batches, since all N ticks are
+    /// already in the SAL before the first signal and are consumed during A's
+    /// exchange wait).
+    fn replay_deferred_ticks(&mut self) {
+        loop {
+            let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
+            if ticks.is_empty() { break; }
+            for tid in ticks {
+                match self.handle_tick(tid) {
+                    Ok(()) => self.send_ack(tid as u64, 0),
+                    Err(msg) => self.send_error(&msg),
+                }
+            }
+        }
+    }
+
     /// Replay FLAG_PUSH messages that were stashed during do_exchange_impl.
     /// Called after the tick ACK is sent so push ACKs follow tick ACKs on W2M.
     fn replay_deferred_pushes(&mut self) {
@@ -764,7 +806,7 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new(), deferred_pushes: Vec::new() }
+        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() }
     }
 
     #[test]
@@ -861,7 +903,7 @@ mod tests {
                 catalog: std::ptr::null_mut(),
                 sal_reader: unsafe { std::mem::zeroed() },
                 w2m_writer: unsafe { std::mem::zeroed() },
-                exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
+                exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() },
                 pending_deltas: HashMap::new(),
                 read_cursor: 0,
                 expected_epoch: 1,
@@ -889,7 +931,7 @@ mod tests {
             catalog: std::ptr::null_mut(),
             sal_reader: unsafe { std::mem::zeroed() },
             w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -915,12 +957,96 @@ mod tests {
             catalog: std::ptr::null_mut(),
             sal_reader: unsafe { std::mem::zeroed() },
             w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 1);
+    }
+
+    // -- deferred_ticks tests ------------------------------------------------
+
+    /// WorkerExchangeHandler initialises with an empty deferred_ticks list.
+    #[test]
+    fn test_deferred_ticks_init_empty() {
+        let h = make_handler();
+        assert!(h.deferred_ticks.is_empty());
+    }
+
+    /// Ticks stashed in deferred_ticks are drained in FIFO order, exactly once.
+    /// This mirrors the `std::mem::take` pattern inside replay_deferred_ticks.
+    #[test]
+    fn test_deferred_ticks_stash_and_drain_fifo() {
+        let mut h = make_handler();
+        h.deferred_ticks.push(101);
+        h.deferred_ticks.push(202);
+        h.deferred_ticks.push(303);
+        assert_eq!(h.deferred_ticks.len(), 3);
+
+        let drained = std::mem::take(&mut h.deferred_ticks);
+        assert_eq!(drained, vec![101, 202, 303], "FIFO order must be preserved");
+        assert!(h.deferred_ticks.is_empty(), "take must leave source empty");
+
+        // A second take on an already-empty list returns an empty vec.
+        let empty = std::mem::take(&mut h.deferred_ticks);
+        assert!(empty.is_empty());
+    }
+
+    /// replay_deferred_ticks is a no-op (no panic) when deferred_ticks is empty.
+    /// Uses catalog=null because no actual tick processing is triggered.
+    #[test]
+    fn test_replay_deferred_ticks_noop_when_empty() {
+        let mut wp = WorkerProcess {
+            worker_id: 0,
+            num_workers: 1,
+            master_pid: 0,
+            catalog: std::ptr::null_mut(),
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer: unsafe { std::mem::zeroed() },
+            exchange: WorkerExchangeHandler {
+                stash: HashMap::new(),
+                deferred: Vec::new(),
+                deferred_pushes: Vec::new(),
+                deferred_ticks: Vec::new(),
+            },
+            pending_deltas: HashMap::new(),
+            read_cursor: 0,
+            expected_epoch: 1,
+        };
+        // deferred_ticks is empty: the inner loop must break immediately.
+        wp.replay_deferred_ticks();
+        assert!(wp.exchange.deferred_ticks.is_empty());
+    }
+
+    /// Simulates the cascade scenario at the data-structure level: the first
+    /// pass of replay_deferred_ticks takes [B, C], and if processing B were
+    /// to stash D into deferred_ticks, the loop would pick it up in pass 2.
+    /// We can't call handle_tick without a real catalog, so we directly
+    /// exercise the take-and-repopulate cycle that makes the loop correct.
+    #[test]
+    fn test_deferred_ticks_cascade_loop_terminates() {
+        // Step 1: deferred_ticks has [B, C] after A's exchange wait.
+        let mut h = make_handler();
+        h.deferred_ticks.push(200); // B
+        h.deferred_ticks.push(300); // C
+
+        // Step 2: first pass of the loop drains [B, C].
+        let pass1 = std::mem::take(&mut h.deferred_ticks);
+        assert_eq!(pass1, vec![200, 300]);
+        assert!(h.deferred_ticks.is_empty());
+
+        // Step 3: processing B's exchange causes D to be stashed (simulated).
+        h.deferred_ticks.push(400); // D (stashed during B's exchange)
+
+        // Step 4: second pass picks up D.
+        let pass2 = std::mem::take(&mut h.deferred_ticks);
+        assert_eq!(pass2, vec![400]);
+        assert!(h.deferred_ticks.is_empty());
+
+        // Step 5: third pass: empty → loop terminates.
+        let pass3 = std::mem::take(&mut h.deferred_ticks);
+        assert!(pass3.is_empty(), "loop must terminate when no more deferred ticks");
     }
 }

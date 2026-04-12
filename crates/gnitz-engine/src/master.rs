@@ -247,6 +247,14 @@ pub struct MasterDispatcher {
     // Async tick state
     async_remaining: usize,
     async_collected: Vec<bool>,
+    /// Number of tick ACKs expected from each worker in the current batch.
+    /// 1 for a single-table tick (start_tick_async), N for an N-table batch
+    /// (start_ticks_async_batch).  poll_tick_progress counts ACKs per worker
+    /// against this value before marking a worker as fully collected.
+    async_acks_per_worker: usize,
+    /// Per-worker count of non-exchange (i.e. tick ACK) messages received
+    /// during the current async tick batch.
+    async_acks_collected: Vec<usize>,
     async_w2m_rcs: Vec<u64>,
     acc: ExchangeAccumulator,
     async_active: bool,
@@ -275,6 +283,8 @@ impl MasterDispatcher {
             router: PartitionRouter::new(),
             async_remaining: 0,
             async_collected: vec![false; num_workers],
+            async_acks_per_worker: 1,
+            async_acks_collected: vec![0; num_workers],
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
@@ -886,9 +896,51 @@ impl MasterDispatcher {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
 
+        self.async_acks_per_worker = 1;
         self.async_remaining = self.num_workers;
         for w in 0..self.num_workers {
             self.async_collected[w] = false;
+            self.async_acks_collected[w] = 0;
+            self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
+        }
+        self.acc.clear();
+        self.async_active = true;
+        Ok(())
+    }
+
+    /// Write N FLAG_TICK groups to the SAL and signal all workers once.
+    /// Workers process the ticks sequentially, sending one ACK per tick.
+    /// `poll_tick_progress` collects N ACKs per worker (N × num_workers total)
+    /// before declaring the batch complete.
+    ///
+    /// Exchange relays for all tables are handled inline by `poll_tick_progress`
+    /// exactly as for a single tick: the ExchangeAccumulator is keyed by
+    /// view_id, so relays for different tables are demuxed automatically.
+    ///
+    /// # Panics (debug)
+    /// Panics if `tids` is empty — callers must filter to non-empty slices.
+    pub fn start_ticks_async_batch(&mut self, tids: &[i64]) -> Result<(), String> {
+        debug_assert!(!tids.is_empty(), "start_ticks_async_batch called with empty tids");
+        self.maybe_checkpoint()?;
+
+        // Write all FLAG_TICK groups without signalling between them.
+        // If write_broadcast fails mid-way, the partial writes are harmless:
+        // no signal has been sent yet, so workers will not process them.
+        // The next maybe_checkpoint (FLAG_FLUSH) resets worker epochs,
+        // invalidating any unread SAL entries from this failed batch.
+        for &tid in tids {
+            let (schema, col_names) = self.get_schema_and_names(tid);
+            self.write_broadcast(tid, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+        }
+        // Single signal after all writes — one eventfd kick for N ticks.
+        self.signal_all();
+
+        let n = tids.len();
+        self.async_acks_per_worker = n;
+        self.async_remaining = self.num_workers;
+        for w in 0..self.num_workers {
+            self.async_collected[w] = false;
+            self.async_acks_collected[w] = 0;
             self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
         }
         self.acc.clear();
@@ -931,8 +983,13 @@ impl MasterDispatcher {
                         self.finish_async_tick();
                         return Err(format!("worker {}: {}", w, msg));
                     }
-                    self.async_collected[w] = true;
-                    self.async_remaining -= 1;
+                    // Count this ACK.  A worker is done when it has sent
+                    // async_acks_per_worker ACKs (one per tick in the batch).
+                    self.async_acks_collected[w] += 1;
+                    if self.async_acks_collected[w] >= self.async_acks_per_worker {
+                        self.async_collected[w] = true;
+                        self.async_remaining -= 1;
+                    }
                     break;
                 }
             }
