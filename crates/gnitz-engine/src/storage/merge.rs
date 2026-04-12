@@ -383,6 +383,15 @@ pub fn merge_batches(
 /// identical (PK, payload) rows, drop ghosts (net weight == 0).
 ///
 /// Uses Rust's stable sort on an index array — no tournament tree needed.
+/// Key-pointer entry: the 16-byte PK travels with the row index so the sort
+/// comparator reads the key from the element being positioned, not from a
+/// separate array at a random offset.
+#[derive(Copy, Clone)]
+struct SortEntry {
+    pk: u128,
+    idx: u32,
+}
+
 pub fn sort_and_consolidate(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
@@ -393,25 +402,24 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    let pks: Vec<u128> = (0..n).map(|i| batch.get_pk(i)).collect();
+    let mut entries: Vec<SortEntry> = (0..n as u32)
+        .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
+        .collect();
 
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&a, &b| {
-        match pks[a].cmp(&pks[b]) {
-            Ordering::Equal => columnar::compare_rows(schema, batch, a, batch, b),
-            ord => ord,
-        }
+    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
+        Ordering::Equal => columnar::compare_rows(schema, batch, a.idx as usize, batch, b.idx as usize),
+        ord => ord,
     });
 
-    let mut pending_idx = indices[0];
-    let mut pending_pk = pks[pending_idx];
+    let mut pending_idx = entries[0].idx as usize;
+    let mut pending_pk = entries[0].pk;
     let mut pending_weight = batch.get_weight(pending_idx);
 
     for pos in 1..n {
-        let cur_idx = indices[pos];
-        let cur_pk = pks[cur_idx];
+        let e = entries[pos];
+        let cur_idx = e.idx as usize;
 
-        let same_group = cur_pk == pending_pk
+        let same_group = e.pk == pending_pk
             && columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx)
                 == Ordering::Equal;
 
@@ -422,7 +430,7 @@ pub fn sort_and_consolidate(
                 writer.write_row(batch, pending_idx, pending_weight);
             }
             pending_idx = cur_idx;
-            pending_pk = cur_pk;
+            pending_pk = e.pk;
             pending_weight = batch.get_weight(cur_idx);
         }
     }
@@ -468,14 +476,17 @@ pub fn sort_only(
         return;
     }
 
-    let pks: Vec<u128> = (0..n).map(|i| batch.get_pk(i)).collect();
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&a, &b| match pks[a].cmp(&pks[b]) {
-        Ordering::Equal => columnar::compare_rows(schema, batch, a, batch, b),
+    let mut entries: Vec<SortEntry> = (0..n as u32)
+        .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
+        .collect();
+
+    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
+        Ordering::Equal => columnar::compare_rows(schema, batch, a.idx as usize, batch, b.idx as usize),
         ord => ord,
     });
 
-    for &idx in &indices {
+    for e in &entries {
+        let idx = e.idx as usize;
         writer.write_row(batch, idx, batch.get_weight(idx));
     }
 }
