@@ -963,14 +963,16 @@ mod tests {
 
     #[test]
     fn test_filter_my_partition_no_schema_passthrough() {
-        let mut batch = Batch::empty(1);
+        let schema = test_schema();
+        let mut batch = Batch::with_schema(schema, 1);
         batch.extend_pk_lo(&1u64.to_le_bytes());
         batch.extend_pk_hi(&0u64.to_le_bytes());
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.extend_col(0, &1u64.to_le_bytes());
         batch.count = 1;
-        // No schema → batch returned unchanged.
+        // filter_my_partition short-circuits when schema is None.
+        batch.schema = None;
         let wp = WorkerProcess {
             worker_id: 0,
             num_workers: 4,

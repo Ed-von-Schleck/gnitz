@@ -615,14 +615,13 @@ mod tests {
 
     #[test]
     fn batch_append_batch_from_empty_exceeds_initial_capacity() {
-        // Regression: bulk append into an empty() batch must not spin when n > initial capacity.
+        // Regression: bulk append into an empty_with_schema() batch must not
+        // spin when n >> initial capacity (which is 0).
         let schema = make_u64_i64_schema();
         let rows: Vec<(u64, i64, i64)> = (1u64..=200).map(|i| (i, 1i64, (i * 10) as i64)).collect();
         let src = make_batch(&schema, &rows);
 
-        let ncols = schema.num_columns as usize - 1;
-        let mut dst = Batch::empty(ncols);
-        dst.schema = Some(schema);
+        let mut dst = Batch::empty_with_schema(&schema);
 
         dst.append_batch(&src, 0, src.count);
 

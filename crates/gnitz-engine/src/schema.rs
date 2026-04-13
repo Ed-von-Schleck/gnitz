@@ -130,6 +130,51 @@ pub(crate) fn blob_cache_lookup(
     None
 }
 
+/// Copy a 16-byte German string cell and (for long strings) migrate the
+/// out-of-line payload from `src_blob` into `dst_blob`.
+///
+/// The returned 16-byte cell is ready to write into the output column buffer.
+/// Short strings (≤ SHORT_STRING_THRESHOLD) are copied inline — `src_blob` is
+/// unused for them.
+///
+/// When `cache` is `Some`, the appended blob data is deduplicated via
+/// `blob_cache_lookup`; the returned offset may point to an existing copy.
+///
+/// **Malformed-input fallback:** if the long-string header declares a region
+/// `[old_offset, old_offset + length)` that overruns `src_blob.len()`, the
+/// cell is rewritten to an empty string (length = 0) rather than triggering
+/// an out-of-bounds read. This keeps trusted in-memory callers panic-free
+/// even when fed corrupted data that slipped past validation.
+pub(crate) fn relocate_german_string_vec(
+    src_cell: &[u8],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    cache: Option<&mut HashMap<(u64, usize), usize>>,
+) -> [u8; 16] {
+    let (mut dest, is_long) = prep_german_string_copy(src_cell);
+    if !is_long {
+        return dest;
+    }
+    let length = u32::from_le_bytes(src_cell[0..4].try_into().unwrap()) as usize;
+    let old_offset = u64::from_le_bytes(src_cell[8..16].try_into().unwrap()) as usize;
+    if old_offset.saturating_add(length) > src_blob.len() {
+        // Malformed: emit an empty string. prep_german_string_copy already
+        // zero-initialized dest and left dest[8..16] == 0 for long strings;
+        // overwriting the length to 0 makes this a valid short empty string.
+        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
+        return dest;
+    }
+    let src_data = &src_blob[old_offset..old_offset + length];
+    let new_offset = dst_blob.len();
+    let off = match cache {
+        Some(cache) => blob_cache_lookup(src_data, cache, dst_blob, new_offset)
+            .unwrap_or_else(|| { dst_blob.extend_from_slice(src_data); new_offset }),
+        None => { dst_blob.extend_from_slice(src_data); new_offset },
+    };
+    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+    dest
+}
+
 pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::decode_german_string;
 

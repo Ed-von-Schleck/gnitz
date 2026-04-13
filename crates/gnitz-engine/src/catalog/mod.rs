@@ -1239,7 +1239,7 @@ impl CatalogEngine {
     fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Arc<Batch> {
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
-            None => return Arc::new(Batch::empty(schema.num_columns as usize - 1)),
+            None => return Arc::new(Batch::empty_with_schema(schema)),
         };
 
         // Extract single-Table handle (Single, Borrowed, or 1-partition Partitioned)
@@ -1282,7 +1282,7 @@ impl CatalogEngine {
                     let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                     match ptbl.create_cursor() {
                         Ok(c) => c,
-                        Err(_) => return Arc::new(Batch::empty(schema.num_columns as usize - 1)),
+                        Err(_) => return Arc::new(Batch::empty_with_schema(schema)),
                     }
                 }
                 _ => unreachable!(),

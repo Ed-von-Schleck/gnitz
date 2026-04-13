@@ -63,11 +63,6 @@ impl MergeHeap {
         self.heap.is_empty()
     }
 
-    #[inline]
-    pub fn min_idx(&self) -> usize {
-        self.heap[0].idx
-    }
-
     /// Sift down operating on heap/pos_map directly — avoids &mut self borrow conflicts.
     #[inline]
     pub fn sift_down_static(

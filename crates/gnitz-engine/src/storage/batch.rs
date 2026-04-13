@@ -56,34 +56,33 @@ pub(super) fn relocate_string_cell(
     dst: &mut [u8],
     dst_blob: &mut Vec<u8>,
 ) {
-    let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_struct);
-    if is_long {
-        let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
-        let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-        if old_off.saturating_add(length) > src_blob.len() {
-            dest[0..4].copy_from_slice(&0u32.to_le_bytes());
-        } else {
-            let new_off = dst_blob.len();
-            dst_blob.extend_from_slice(&src_blob[old_off..old_off + length]);
-            dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
-        }
-    }
+    let dest = crate::schema::relocate_german_string_vec(src_struct, src_blob, dst_blob, None);
     dst[..16].copy_from_slice(&dest);
+}
+
+/// Append payload strides from `schema` into `strides` starting at `start`.
+/// Returns the next free index (i.e. `start + num_payload_cols`).
+fn fill_payload_strides(
+    schema: &SchemaDescriptor,
+    strides: &mut [u8; MAX_BATCH_REGIONS],
+    start: usize,
+) -> usize {
+    let pk = schema.pk_index as usize;
+    let mut idx = start;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pk { continue; }
+        strides[idx] = schema.columns[ci].size;
+        idx += 1;
+    }
+    idx
 }
 
 /// Build a strides array from a SchemaDescriptor.
 pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
-    let pk_index = schema.pk_index as usize;
     let mut strides = [0u8; MAX_BATCH_REGIONS];
     strides[0] = 8; strides[1] = 8; strides[2] = 8; strides[3] = 8;
-    let mut pi = 0;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index { continue; }
-        strides[4 + pi] = schema.columns[ci].size;
-        pi += 1;
-    }
-    let nr = (4 + pi) as u8;
-    (strides, nr)
+    let nr = fill_payload_strides(schema, &mut strides, 4);
+    (strides, nr as u8)
 }
 
 /// Owned columnar batch.  All fixed-stride column data lives in a single
@@ -110,7 +109,12 @@ pub struct Batch {
 impl Batch {
     // ── Constructors ────────────────────────────────────────────────────
 
-    /// Create an empty batch with the given number of payload columns.
+    /// Create an empty, zero-allocation placeholder batch with only the four
+    /// fixed regions (pk_lo/pk_hi/weight/null_bmp) described.  Payload strides
+    /// remain zero, so the batch is NOT safe to populate via `extend_*` or
+    /// `append_batch` — use `empty_with_schema` or `with_schema` for that.
+    ///
+    /// Intended for zero-row return values and swap-placeholder slots.
     pub fn empty(num_payload_cols: usize) -> Self {
         let nr = 4 + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
@@ -121,6 +125,54 @@ impl Batch {
             offsets: [0u32; MAX_BATCH_REGIONS],
             strides,
             num_regions: nr as u8,
+            capacity: 0,
+            count: 0,
+            sorted: true,
+            consolidated: true,
+            schema: None,
+        }
+    }
+
+    /// Zero-allocation empty batch with strides pre-filled from `schema`.
+    ///
+    /// Use this — not `empty(npc)` — when the caller intends to populate the
+    /// batch via `extend_*`, `append_batch`, or similar.  Strides and
+    /// `schema` are set up front so no one-shot realloc fires on the first
+    /// column write.
+    pub fn empty_with_schema(schema: &SchemaDescriptor) -> Self {
+        let (strides, nr) = strides_from_schema(schema);
+        Batch {
+            data: Vec::new(),
+            blob: Vec::new(),
+            offsets: [0u32; MAX_BATCH_REGIONS],
+            strides,
+            num_regions: nr,
+            capacity: 0,
+            count: 0,
+            sorted: true,
+            consolidated: true,
+            schema: Some(*schema),
+        }
+    }
+
+    /// Zero-allocation empty batch whose payload columns are `left_schema`'s
+    /// non-PK columns followed by `right_schema`'s non-PK columns.  Used for
+    /// join outputs ([left_PK, left_payload..., right_payload...]), which
+    /// have no single `SchemaDescriptor` in the engine.
+    pub fn empty_joined(
+        left_schema: &SchemaDescriptor,
+        right_schema: &SchemaDescriptor,
+    ) -> Self {
+        let mut strides = [0u8; MAX_BATCH_REGIONS];
+        strides[0] = 8; strides[1] = 8; strides[2] = 8; strides[3] = 8;
+        let mid = fill_payload_strides(left_schema, &mut strides, 4);
+        let out_idx = fill_payload_strides(right_schema, &mut strides, mid);
+        Batch {
+            data: Vec::new(),
+            blob: Vec::new(),
+            offsets: [0u32; MAX_BATCH_REGIONS],
+            strides,
+            num_regions: out_idx as u8,
             capacity: 0,
             count: 0,
             sorted: true,
@@ -339,24 +391,6 @@ impl Batch {
 
     // ── Extend methods (building batches row-by-row) ────────────────────
 
-    /// Initialize strides from schema if they're unset (batch created via empty()).
-    fn init_strides_from_schema(&mut self) {
-        if self.strides[4] != 0 || self.num_payload_cols() == 0 { return; }
-        if let Some(schema) = self.schema {
-            let (s, nr) = strides_from_schema(&schema);
-            self.strides = s;
-            self.num_regions = nr;
-        }
-    }
-
-    /// Copy strides from another batch if ours are unset.
-    fn init_strides_from_batch(&mut self, src: &Batch) {
-        if self.strides[4] != 0 || self.num_payload_cols() == 0 { return; }
-        let nr = src.num_regions as usize;
-        self.strides[..nr].copy_from_slice(&src.strides[..nr]);
-        self.num_regions = src.num_regions;
-    }
-
     /// Ensure the data buffer has room for at least one more row.
     pub(crate) fn ensure_row_capacity(&mut self) {
         self.reserve_rows(1);
@@ -364,7 +398,6 @@ impl Batch {
 
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
     pub(crate) fn reserve_rows(&mut self, n: usize) {
-        self.init_strides_from_schema();
         if self.count + n <= self.capacity as usize { return; }
         let nr = self.num_regions as usize;
         let new_cap = (self.capacity as usize * 2).max(8).max(self.count + n);
@@ -429,35 +462,11 @@ impl Batch {
         self.capacity = new_cap as u32;
     }
 
-    /// Extend the data buffer to accommodate a newly-discovered column stride.
-    ///
-    /// Called mid-row by `extend_region`/`fill_col_zero` when a payload column's
-    /// stride is set for the first time.  Row capacity (in rows) is unchanged —
-    /// only the byte total increases because the new stride adds bytes per row.
-    /// Realloc preserves all buffer content, including any partially-written row
-    /// data at position `count`.  Offsets for pre-existing regions are unchanged
-    /// (same capacity), so no copy_within is needed.
-    fn grow_for_new_stride(&mut self) {
-        let nr = self.num_regions as usize;
-        let cap = self.capacity as usize;
-        let (new_offsets, new_total) = compute_offsets(&self.strides, nr, cap);
-        if new_total > self.data.len() {
-            let additional = new_total - self.data.len();
-            self.data.reserve(additional);
-            unsafe { self.data.set_len(new_total); }
-        }
-        self.offsets = new_offsets;
-    }
-
     /// Write data into region `r` at the current row position.
-    /// Auto-grows capacity if needed.  Auto-infers stride from the first write
-    /// (for batches created via `empty()` where strides are initially 0).
+    /// Auto-grows capacity if needed.  Strides must be set at construction —
+    /// use `empty_with_schema`, `empty_joined`, or `with_schema`.
     #[inline]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
-        if self.strides[r] == 0 && !src.is_empty() {
-            self.strides[r] = src.len() as u8;
-            self.grow_for_new_stride();
-        }
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
@@ -480,10 +489,6 @@ impl Batch {
     #[inline]
     pub fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
         let r = 4 + pi;
-        if self.strides[r] == 0 && nbytes > 0 {
-            self.strides[r] = nbytes as u8;
-            self.grow_for_new_stride();
-        }
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
@@ -699,26 +704,7 @@ impl Batch {
                 self.fill_col_zero(pi, col_size);
             } else if is_string && col_size == 16 {
                 let src = std::slice::from_raw_parts(*ptr, 16);
-                let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-                let mut dest = [0u8; 16];
-                dest[0..8].copy_from_slice(&src[0..8]);
-                if length <= crate::schema::SHORT_STRING_THRESHOLD {
-                    let sfx = if length > 4 { length - 4 } else { 0 };
-                    if sfx > 0 { dest[8..8 + sfx].copy_from_slice(&src[8..8 + sfx]); }
-                } else {
-                    let old_off = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
-                    if old_off.saturating_add(length) <= blob_src.len() {
-                        let new_off = self.blob.len();
-                        self.blob.extend_from_slice(&blob_src[old_off..old_off + length]);
-                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
-                    } else {
-                        // Malformed wire data: emit an empty string rather
-                        // than silently substituting unrelated bytes. Matches
-                        // relocate_string_cell. dest[8..16] is already zero
-                        // from the initializer above.
-                        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
-                    }
-                }
+                let dest = crate::schema::relocate_german_string_vec(src, blob_src, &mut self.blob, None);
                 self.extend_col(pi, &dest);
             } else {
                 let src = std::slice::from_raw_parts(*ptr, col_size);
@@ -806,10 +792,11 @@ impl Batch {
     }
 
     /// Bulk-copy rows [start, end) from another Batch (same schema).
+    ///
+    /// `self` must have strides pre-set (see `empty_with_schema` / `with_schema`).
     pub fn append_batch(&mut self, src: &Batch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
         if start >= end { return; }
-        self.init_strides_from_batch(src);
         self.sorted = false;
         self.consolidated = false;
         self.append_rows_inner(src, start, end, false);
@@ -819,7 +806,6 @@ impl Batch {
     pub fn append_batch_negated(&mut self, src: &Batch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
         if start >= end { return; }
-        self.init_strides_from_batch(src);
         self.sorted = false;
         self.consolidated = false;
         self.append_rows_inner(src, start, end, true);
@@ -835,7 +821,6 @@ impl Batch {
     pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
         let end = end.min(src.count);
         if start >= end { return; }
-        self.init_strides_from_batch(src);
         let n = end - start;
         self.reserve_rows(n);
         // All four system regions
@@ -1087,27 +1072,9 @@ impl Batch {
                 self.fill_col_zero(pi, cs);
             } else if col.type_code == crate::schema::type_code::STRING {
                 let src_struct = source.get_col_ptr(row, pi, cs);
-                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_struct);
-                if is_long {
-                    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
-                    let old_offset = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-                    if old_offset.saturating_add(length) > src_blob.len() {
-                        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
-                    } else {
-                        let src_data = &src_blob[old_offset..old_offset + length];
-                        let new_offset = self.blob.len();
-                        let off = match crate::schema::blob_cache_lookup(
-                            src_data, blob_cache, &self.blob, new_offset,
-                        ) {
-                            Some(cached) => cached,
-                            None => {
-                                self.blob.extend_from_slice(src_data);
-                                new_offset
-                            }
-                        };
-                        dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
-                    }
-                }
+                let dest = crate::schema::relocate_german_string_vec(
+                    src_struct, src_blob, &mut self.blob, Some(blob_cache),
+                );
                 self.extend_col(pi, &dest);
             } else {
                 self.extend_col(pi, source.get_col_ptr(row, pi, cs));

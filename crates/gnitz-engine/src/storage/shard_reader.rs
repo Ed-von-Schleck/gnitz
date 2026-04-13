@@ -440,9 +440,7 @@ impl MappedShard {
         let npc = schema.num_columns as usize - 1;
 
         if row_count == 0 {
-            let mut batch = Batch::empty(npc);
-            batch.schema = Some(*schema);
-            return batch;
+            return Batch::empty_with_schema(schema);
         }
 
         let data = self.data();

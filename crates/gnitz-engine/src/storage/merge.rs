@@ -266,10 +266,49 @@ impl<'a> DirectWriter<'a> {
 // merge_batches: the main entry point
 // ---------------------------------------------------------------------------
 
+/// PK + payload comparison used by both the heap ordering and the equal-group
+/// collection.  Recreated per-iteration by callers to avoid long-lived
+/// borrows of `cursors`.
+fn merge_entry_cmp<'c>(
+    cursors: &'c [MemBatchCursor],
+    batches: &'c [MemBatch],
+    schema: &'c SchemaDescriptor,
+) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> Ordering + 'c {
+    move |a, b| {
+        let key_ord = a.key.cmp(&b.key);
+        if key_ord != Ordering::Equal {
+            return key_ord;
+        }
+        let bi = cursors[a.idx].batch_idx;
+        let bj = cursors[b.idx].batch_idx;
+        let ri = cursors[a.idx].position;
+        let rj = cursors[b.idx].position;
+        columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj)
+    }
+}
+
+/// Less-than variant of `merge_entry_cmp` — used as the heap's ordering
+/// predicate.  Returns a new closure each call so callers can keep
+/// borrow-checker lifetimes tight around cursor mutations.
+fn merge_entry_less<'c>(
+    cursors: &'c [MemBatchCursor],
+    batches: &'c [MemBatch],
+    schema: &'c SchemaDescriptor,
+) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
+    move |a, b| merge_entry_cmp(cursors, batches, schema)(a, b).is_lt()
+}
+
 /// Perform N-way merge + consolidation of MemBatch slices into a DirectWriter.
 ///
 /// Rows with the same (PK, payload) have their weights summed.
 /// Rows whose net weight is zero are dropped.
+///
+/// Two levels of group accumulation are needed:
+///   * `collect_min_indices` batches together all cursors whose current
+///     position shares the minimum (PK, payload).
+///   * `has_pending` carries the running sum across heap iterations so
+///     intra-cursor duplicates (consecutive same-(PK, payload) rows inside
+///     a single sorted input batch) are also folded into one output row.
 pub fn merge_batches(
     batches: &[MemBatch],
     schema: &SchemaDescriptor,
@@ -280,32 +319,9 @@ pub fn merge_batches(
         return;
     }
 
-    let mut cursors: Vec<MemBatchCursor> = Vec::with_capacity(n);
-    for i in 0..n {
-        cursors.push(MemBatchCursor::new(i, batches[i].count));
-    }
-
-    // Helper: PK + payload comparison for heap ordering.
-    // Uses a macro-like inline closure pattern to avoid long-lived borrows of `cursors`.
-    fn make_less<'c>(
-        cursors: &'c [MemBatchCursor],
-        batches: &'c [MemBatch],
-        schema: &'c SchemaDescriptor,
-    ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
-        move |a, b| {
-            if a.key != b.key {
-                return a.key < b.key;
-            }
-            let ci = a.idx;
-            let cj = b.idx;
-            let bi = cursors[ci].batch_idx;
-            let bj = cursors[cj].batch_idx;
-            let ri = cursors[ci].position;
-            let rj = cursors[cj].position;
-            let cmp_result = columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj);
-            cmp_result == Ordering::Less
-        }
-    }
+    let mut cursors: Vec<MemBatchCursor> = (0..n)
+        .map(|i| MemBatchCursor::new(i, batches[i].count))
+        .collect();
 
     let mut tree = MergeHeap::build(
         cursors.len(),
@@ -316,9 +332,13 @@ pub fn merge_batches(
                 None
             }
         },
-        &make_less(&cursors, batches, schema),
+        &merge_entry_less(&cursors, batches, schema),
     );
 
+    let mut advance_buf: Vec<usize> = Vec::with_capacity(n);
+
+    // Pending-group state: holds the running (PK, payload) and accumulated
+    // weight for the group currently being folded.
     let mut has_pending = false;
     let mut pending_batch: usize = 0;
     let mut pending_row: usize = 0;
@@ -326,43 +346,61 @@ pub fn merge_batches(
     let mut pending_weight: i64 = 0;
 
     while !tree.is_empty() {
-        let ci = tree.min_idx();
-        let bi = cursors[ci].batch_idx;
-        let ri = cursors[ci].position;
-        let cur_pk = batches[bi].get_pk(ri);
-        let cur_weight = batches[bi].get_weight(ri);
+        let num_min = {
+            let cmp = merge_entry_cmp(&cursors, batches, schema);
+            tree.collect_min_indices(&cmp)
+        };
+        if num_min == 0 {
+            break;
+        }
+
+        let mut group_weight: i64 = 0;
+        for i in 0..num_min {
+            let ei = tree.min_indices[i];
+            let bi = cursors[ei].batch_idx;
+            let ri = cursors[ei].position;
+            group_weight += batches[bi].get_weight(ri);
+        }
+
+        // Snapshot the group's entry indices before mutating the heap.
+        advance_buf.clear();
+        advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
+
+        let exemplar = advance_buf[0];
+        let cur_batch = cursors[exemplar].batch_idx;
+        let cur_row = cursors[exemplar].position;
+        let cur_pk = batches[cur_batch].get_pk(cur_row);
 
         let same_group = has_pending
             && cur_pk == pending_pk
             && columnar::compare_rows(
                 schema,
-                &batches[pending_batch],
-                pending_row,
-                &batches[bi],
-                ri,
+                &batches[pending_batch], pending_row,
+                &batches[cur_batch], cur_row,
             ) == Ordering::Equal;
 
         if same_group {
-            pending_weight += cur_weight;
+            pending_weight += group_weight;
         } else {
             if has_pending && pending_weight != 0 {
                 writer.write_row(&batches[pending_batch], pending_row, pending_weight);
             }
-            pending_batch = bi;
-            pending_row = ri;
+            pending_batch = cur_batch;
+            pending_row = cur_row;
             pending_pk = cur_pk;
-            pending_weight = cur_weight;
+            pending_weight = group_weight;
             has_pending = true;
         }
 
-        // Advance the min cursor, then re-create the less closure
-        cursors[ci].advance();
-        let new_key = if cursors[ci].is_valid() {
-            Some(cursors[ci].peek_key(batches))
-        } else {
-            None
-        };
-        tree.advance(ci, new_key, &make_less(&cursors, batches, schema));
+        for &ei in &advance_buf {
+            cursors[ei].advance();
+            let new_key = if cursors[ei].is_valid() {
+                Some(cursors[ei].peek_key(batches))
+            } else {
+                None
+            };
+            tree.advance(ei, new_key, &merge_entry_less(&cursors, batches, schema));
+        }
     }
 
     if has_pending && pending_weight != 0 {

@@ -239,7 +239,7 @@ fn join_dt_merge_walk(
     }
 
     let delta_mb = delta.as_mem_batch();
-    let mut output = Batch::empty(out_npc);
+    let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
     let mut prev_pk = pks[0];
@@ -285,13 +285,10 @@ fn join_dt_swapped(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
-    let out_npc = left_npc + right_npc;
     let n = delta.count;
 
     let delta_mb = delta.as_mem_batch();
-    let mut output = Batch::empty(out_npc);
+    let mut output = Batch::empty_joined(left_schema, right_schema);
     let delta_pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
 
     while cursor.valid {
@@ -341,7 +338,7 @@ pub fn op_join_delta_trace_outer(
     }
 
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = Batch::empty(out_npc);
+    let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut prev_pk = pks[0];
@@ -590,7 +587,7 @@ fn filter_join_dd_with_payload(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
-    let mut output = Batch::empty(npc);
+    let mut output = Batch::empty_with_schema(schema);
 
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
@@ -666,7 +663,7 @@ fn filter_join_dd(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
-    let mut output = Batch::empty(npc);
+    let mut output = Batch::empty_with_schema(schema);
 
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
@@ -735,7 +732,7 @@ pub fn op_join_delta_delta(
     let mb_b = cb.as_mem_batch();
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
-    let mut output = Batch::empty(out_npc);
+    let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;

@@ -530,7 +530,6 @@ pub fn op_reduce(
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
     let num_out_cols = output_schema.num_columns as usize;
-    let out_npc = num_out_cols - 1;
     let in_pki = input_schema.pk_index as usize;
 
 
@@ -550,10 +549,8 @@ pub fn op_reduce(
 
     let n = working.count;
     if n == 0 {
-        let empty_fin = finalize_out_schema.map(|fs| {
-            Batch::empty(fs.num_columns as usize - 1)
-        });
-        return (Batch::empty(out_npc), empty_fin);
+        let empty_fin = finalize_out_schema.map(|fs| Batch::empty_with_schema(fs));
+        return (Batch::empty_with_schema(output_schema), empty_fin);
     }
 
     // group_by_pk detection
@@ -1131,13 +1128,12 @@ pub fn op_gather_reduce(
 ) -> Batch {
     let num_aggs = agg_descs.len();
     let num_out_cols = partial_schema.num_columns as usize;
-    let out_npc = num_out_cols - 1;
 
     // Sort without consolidation
     let sorted = sort_owned(partial_batch, partial_schema);
     let n = sorted.count;
     if n == 0 {
-        return Batch::empty(out_npc);
+        return Batch::empty_with_schema(partial_schema);
     }
 
     let smb = sorted.as_mem_batch();

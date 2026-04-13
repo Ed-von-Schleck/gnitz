@@ -836,8 +836,7 @@ impl MasterDispatcher {
         }
         Ok(decoded.data_batch.and_then(|b| {
             if b.count > 0 {
-                let mut result = Batch::empty(schema.num_columns as usize - 1);
-                result.schema = Some(schema);
+                let mut result = Batch::with_schema(schema, b.count);
                 result.append_batch(&b, 0, b.count);
                 Some(result)
             } else {
@@ -1738,8 +1737,7 @@ impl MasterDispatcher {
 fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<Batch> {
     decoded.data_batch.and_then(|b| {
         if b.count > 0 {
-            let mut result = Batch::empty(schema.num_columns as usize - 1);
-            result.schema = Some(*schema);
+            let mut result = Batch::with_schema(*schema, b.count);
             result.append_batch(&b, 0, b.count);
             Some(result)
         } else {
