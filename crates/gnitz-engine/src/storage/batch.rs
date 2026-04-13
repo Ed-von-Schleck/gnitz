@@ -187,11 +187,27 @@ impl Batch {
         let (strides, nr) = strides_from_schema(&schema);
         let (offsets, total_size) = compute_offsets(&strides, nr as usize, cap);
 
-        let data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-            buf.resize(total_size, 0);
-            buf
+        // Invariant: `data` is fully zero-filled on return.  Some callers
+        // (null-extend, scalar-func EMIT_NULL) leave payload columns unwritten
+        // and depend on that.  Undersized pool buffers are recycled rather
+        // than grown in place: Vec::reserve on a too-small buffer copies the
+        // old contents forward before zeroing, which is slower than a fresh
+        // zeroed allocation.
+        let data = if total_size >= HUGEPAGE_THRESHOLD {
+            let mut v = vec![0u8; total_size];
+            crate::sys::madvise_hugepage(v.as_mut_ptr(), total_size);
+            v
         } else {
-            vec![0u8; total_size]
+            match super::batch_pool::acquire_buf() {
+                Some(mut buf) if buf.capacity() >= total_size => {
+                    buf.resize(total_size, 0);
+                    buf
+                }
+                other => {
+                    if let Some(buf) = other { super::batch_pool::recycle_buf(buf); }
+                    vec![0u8; total_size]
+                }
+            }
         };
 
         Batch {
