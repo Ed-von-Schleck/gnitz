@@ -199,6 +199,9 @@ pub struct WorkerProcess {
     pending_deltas: HashMap<i64, Batch>,
     read_cursor: u64,
     expected_epoch: u32,
+    // Per-target schema cache: skip the 512-byte schema block parse on hot paths.
+    // Populated lazily from decoded.schema on first non-DDL message per target.
+    schema_cache: HashMap<i64, SchemaDescriptor>,
 }
 
 impl WorkerProcess {
@@ -221,6 +224,7 @@ impl WorkerProcess {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
+            schema_cache: HashMap::new(),
         }
     }
 
@@ -316,9 +320,30 @@ impl WorkerProcess {
             wire_data = next.wire_data;
         }
 
-        // Decode wire data if present
+        // Decode wire data if present. For DDL_SYNC the payload carries catalog
+        // schema (not the target table's data schema), so always do a full decode.
+        // For FLAG_HAS_PK (unique/FK checks) the schema block is the index or
+        // parent-table schema, which can differ from the cached user-table schema
+        // for the same target_id — always do a full decode for these too.
+        // For all other messages, skip schema-block parsing when we have a cached
+        // descriptor — decode_wire_with_schema reads only the block size to advance
+        // the offset.
         let decoded = if let Some(data) = wire_data {
-            ipc::decode_wire(data).ok()
+            if flags & (FLAG_DDL_SYNC | FLAG_HAS_PK) == 0 {
+                if let Some(&schema) = self.schema_cache.get(&target_id) {
+                    ipc::decode_wire_with_schema(data, &schema).ok()
+                } else {
+                    let d = ipc::decode_wire(data).ok();
+                    if let Some(ref d) = d {
+                        if let Some(s) = d.schema {
+                            self.schema_cache.insert(target_id, s);
+                        }
+                    }
+                    d
+                }
+            } else {
+                ipc::decode_wire(data).ok()
+            }
         } else {
             None
         };
@@ -901,6 +926,7 @@ mod tests {
                 pending_deltas: HashMap::new(),
                 read_cursor: 0,
                 expected_epoch: 1,
+                schema_cache: HashMap::new(),
             };
             let filtered = wp.filter_my_partition(batch.clone_batch());
             // Every row in the filtered batch must belong to this worker.
@@ -929,6 +955,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
+            schema_cache: HashMap::new(),
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 0);
@@ -955,6 +982,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
+            schema_cache: HashMap::new(),
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 1);
@@ -1003,6 +1031,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
+            schema_cache: HashMap::new(),
         };
         // deferred_ticks is empty: the inner loop must break immediately.
         wp.replay_deferred_ticks();

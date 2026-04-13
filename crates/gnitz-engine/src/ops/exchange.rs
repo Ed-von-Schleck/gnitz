@@ -1,5 +1,7 @@
 //! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter.
 
+use std::cell::RefCell;
+
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch, partition_for_key};
 
@@ -8,6 +10,24 @@ use super::util::{extract_group_key, payload_idx};
 // ---------------------------------------------------------------------------
 // Exchange repartitioning
 // ---------------------------------------------------------------------------
+
+// Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
+// steady-state repartition/scatter ops allocate nothing for routing tables.
+thread_local! {
+    static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
+}
+
+/// Build a 256-entry partition→worker lookup table, hoisting the division out
+/// of the per-row loop. `partition_for_key` always returns values in 0..=255.
+#[inline]
+fn build_w_map(num_workers: usize) -> [usize; 256] {
+    let mut map = [0usize; 256];
+    let chunk = 256 / num_workers;
+    for p in 0..256 {
+        map[p] = (p / chunk).min(num_workers - 1);
+    }
+    map
+}
 
 #[inline]
 fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
@@ -125,24 +145,31 @@ pub fn op_repartition_batch(
     let npc = schema.num_columns as usize - 1;
     let n = batch.count;
     let mb = batch.as_mem_batch();
+    let w_map = build_w_map(num_workers);
 
-    let mut worker_indices: Vec<Vec<u32>> = (0..num_workers).map(|_| Vec::new()).collect();
-    for i in 0..n {
-        let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-        let w = worker_for_partition(partition, num_workers);
-        worker_indices[w].push(i as u32);
-    }
-
-    let mut result: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
-    for w in 0..num_workers {
-        if !worker_indices[w].is_empty() {
-            result[w] = Some(Batch::from_indexed_rows(&mb, &worker_indices[w], schema));
+    SCATTER_INDICES.with(|pool| {
+        let mut worker_indices = pool.borrow_mut();
+        if worker_indices.len() < num_workers {
+            worker_indices.resize_with(num_workers, Vec::new);
         }
-    }
-    result
-        .into_iter()
-        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
-        .collect()
+        for w in 0..num_workers { worker_indices[w].clear(); }
+
+        for i in 0..n {
+            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+            worker_indices[w_map[partition]].push(i as u32);
+        }
+
+        let mut result: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
+        for w in 0..num_workers {
+            if !worker_indices[w].is_empty() {
+                result[w] = Some(Batch::from_indexed_rows(&mb, &worker_indices[w], schema));
+            }
+        }
+        result
+            .into_iter()
+            .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
+            .collect()
+    })
 }
 
 pub fn op_repartition_batches(
@@ -153,29 +180,36 @@ pub fn op_repartition_batches(
 ) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
     let npc = schema.num_columns as usize - 1;
+    let w_map = build_w_map(num_workers);
     let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
-    for src_opt in sources {
-        let src = match src_opt {
-            Some(s) if s.count > 0 => *s,
-            _ => continue,
-        };
-        let mb = src.as_mem_batch();
-        let mut worker_indices: Vec<Vec<u32>> = (0..num_workers).map(|_| Vec::new()).collect();
-        for i in 0..src.count {
-            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-            let w = worker_for_partition(partition, num_workers);
-            worker_indices[w].push(i as u32);
+    SCATTER_INDICES.with(|pool| {
+        let mut worker_indices = pool.borrow_mut();
+        if worker_indices.len() < num_workers {
+            worker_indices.resize_with(num_workers, Vec::new);
         }
-        for w in 0..num_workers {
-            if !worker_indices[w].is_empty() {
-                let d = dest[w].get_or_insert_with(|| {
-                    Batch::with_schema(*schema, worker_indices[w].len())
-                });
-                d.append_indexed_rows(&mb, &worker_indices[w], schema);
+
+        for src_opt in sources {
+            let src = match src_opt {
+                Some(s) if s.count > 0 => *s,
+                _ => continue,
+            };
+            let mb = src.as_mem_batch();
+            for w in 0..num_workers { worker_indices[w].clear(); }
+            for i in 0..src.count {
+                let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+                worker_indices[w_map[partition]].push(i as u32);
+            }
+            for w in 0..num_workers {
+                if !worker_indices[w].is_empty() {
+                    let d = dest[w].get_or_insert_with(|| {
+                        Batch::with_schema(*schema, worker_indices[w].len())
+                    });
+                    d.append_indexed_rows(&mb, &worker_indices[w], schema);
+                }
             }
         }
-    }
+    });
 
     dest.into_iter()
         .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
@@ -195,6 +229,7 @@ pub fn op_repartition_batches_merged(
     );
     let npc = schema.num_columns as usize - 1;
     let n = sources.len();
+    let w_map = build_w_map(num_workers);
     let mut cursors: Vec<usize> = vec![0; n];
     let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
@@ -240,7 +275,7 @@ pub fn op_repartition_batches_merged(
         let src_idx = cursors[min_w];
         let mb = mem_batches[min_w].as_ref().unwrap();
         let partition = hash_row_for_partition(mb, src_idx, col_indices, schema);
-        let dw = worker_for_partition(partition, num_workers);
+        let dw = w_map[partition];
 
         let d = dest[dw].get_or_insert_with(|| Batch::with_schema(*schema, 16));
         d.append_batch(src, src_idx, src_idx + 1);
@@ -304,48 +339,55 @@ pub fn op_multi_scatter(
     let npc = schema.num_columns as usize - 1;
     let pki = schema.pk_index as usize;
     let mb = batch.as_mem_batch();
+    let w_map = build_w_map(num_workers);
+    let needed = n_specs * num_workers;
 
-    let mut flat_indices: Vec<Vec<u32>> = (0..n_specs * num_workers).map(|_| Vec::new()).collect();
-
-    for i in 0..n {
-        for si in 0..n_specs {
-            let partition = hash_row_for_partition(&mb, i, col_specs[si], schema);
-            let w = worker_for_partition(partition, num_workers);
-            flat_indices[si * num_workers + w].push(i as u32);
+    SCATTER_INDICES.with(|pool| {
+        let mut flat_indices = pool.borrow_mut();
+        if flat_indices.len() < needed {
+            flat_indices.resize_with(needed, Vec::new);
         }
-    }
+        for slot in flat_indices[..needed].iter_mut() { slot.clear(); }
 
-    let mut results: Vec<Vec<Batch>> = (0..n_specs)
-        .map(|_| (0..num_workers).map(|_| Batch::empty(npc)).collect())
-        .collect();
-
-    for si in 0..n_specs {
-        for w in 0..num_workers {
-            let indices = &flat_indices[si * num_workers + w];
-            if !indices.is_empty() {
-                results[si][w] = Batch::from_indexed_rows(&mb, indices, schema);
+        for i in 0..n {
+            for si in 0..n_specs {
+                let partition = hash_row_for_partition(&mb, i, col_specs[si], schema);
+                flat_indices[si * num_workers + w_map[partition]].push(i as u32);
             }
         }
-    }
 
-    // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source
-    for si in 0..n_specs {
-        let spec = col_specs[si];
-        if spec.len() == 1 && spec[0] as usize == pki && (batch.sorted || batch.consolidated) {
+        let mut results: Vec<Vec<Batch>> = (0..n_specs)
+            .map(|_| (0..num_workers).map(|_| Batch::empty(npc)).collect())
+            .collect();
+
+        for si in 0..n_specs {
             for w in 0..num_workers {
-                if results[si][w].count > 0 {
-                    if batch.sorted {
-                        results[si][w].sorted = true;
-                    }
-                    if batch.consolidated {
-                        results[si][w].consolidated = true;
+                let indices = &flat_indices[si * num_workers + w];
+                if !indices.is_empty() {
+                    results[si][w] = Batch::from_indexed_rows(&mb, indices, schema);
+                }
+            }
+        }
+
+        // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source
+        for si in 0..n_specs {
+            let spec = col_specs[si];
+            if spec.len() == 1 && spec[0] as usize == pki && (batch.sorted || batch.consolidated) {
+                for w in 0..num_workers {
+                    if results[si][w].count > 0 {
+                        if batch.sorted {
+                            results[si][w].sorted = true;
+                        }
+                        if batch.consolidated {
+                            results[si][w].consolidated = true;
+                        }
                     }
                 }
             }
         }
-    }
 
-    results
+        results
+    })
 }
 
 // ---------------------------------------------------------------------------

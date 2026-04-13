@@ -100,14 +100,14 @@ impl PendingBatch {
     }
 
     fn is_empty(&self) -> bool {
-        self.by_tid.is_empty()
+        self.row_count == 0
     }
 
     fn drain_all(&mut self) -> Vec<PendingEntry> {
         let total: usize = self.by_tid.values().map(|v| v.len()).sum();
         let mut out = Vec::with_capacity(total);
-        for (_tid, mut v) in self.by_tid.drain() {
-            out.append(&mut v);
+        for v in self.by_tid.values_mut() {
+            out.append(v); // moves items, retains v's capacity in the map for next cycle
         }
         self.row_count = 0;
         out
@@ -171,6 +171,10 @@ pub struct ServerExecutor {
     // Schema descriptor cache (table IDs are monotonic, never reused)
     schema_cache: HashMap<i64, SchemaDescriptor>,
 
+    // Column name bytes cache: avoids re-cloning Vec<String> and re-encoding
+    // to bytes on every client response. Populated lazily alongside schema_cache.
+    col_names_cache: HashMap<i64, Vec<Vec<u8>>>,
+
     // Async fdatasync: overlaps fsync with worker ACK collection
     async_fsync: ipc::AsyncFsync,
 
@@ -203,6 +207,7 @@ impl ServerExecutor {
             deferred_requests: Vec::with_capacity(8),
             pending_ddl_responses: Vec::with_capacity(8),
             schema_cache: HashMap::new(),
+            col_names_cache: HashMap::new(),
             async_fsync,
             pre_written: None,
         }
@@ -309,14 +314,20 @@ impl ServerExecutor {
         schema: &SchemaDescriptor,
         seek_pk_lo: u64,
     ) {
-        let col_names_owned;
-        let col_name_refs: Vec<&[u8]>;
         let col_names_opt;
+        let mut name_refs_arr = [&[] as &[u8]; 64];
 
         if status == STATUS_OK {
-            col_names_owned = self.cat().get_column_names(target_id);
-            col_name_refs = col_names_owned.iter().map(|s| s.as_bytes()).collect();
-            col_names_opt = Some(col_name_refs.as_slice());
+            if !self.col_names_cache.contains_key(&target_id) {
+                let names = self.cat().get_column_names(target_id);
+                let bytes: Vec<Vec<u8>> = names.into_iter().map(|n| n.into_bytes()).collect();
+                self.col_names_cache.insert(target_id, bytes);
+            }
+            let cached = self.col_names_cache.get(&target_id).unwrap();
+            for (i, n) in cached.iter().enumerate() {
+                name_refs_arr[i] = n.as_slice();
+            }
+            col_names_opt = Some(&name_refs_arr[..cached.len()]);
         } else {
             col_names_opt = None;
         }

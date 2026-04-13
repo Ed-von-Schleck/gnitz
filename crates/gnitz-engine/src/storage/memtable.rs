@@ -232,34 +232,26 @@ impl MemTable {
     /// sequence where the old payload has been cancelled but the new payload
     /// is still positive.
     pub fn find_positive_payload_row(&mut self, key: u128) -> bool {
-        // Pass 1: collect all PK-matching (run_idx, row_idx) pairs.
-        // The iterator borrow on self.runs is fully dropped before pass 2,
-        // avoiding any aliasing issue when find_weight_for_row also borrows self.runs.
-        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        // Single pass: for each PK-matching row, compute its net weight immediately.
+        // find_weight_for_row takes &self, so it can overlap with the iterator's
+        // immutable borrow of self.runs. Mutable writes to self.found_* touch
+        // disjoint fields and are fine under NLL.
         for (ri, run) in self.runs.iter().enumerate() {
             if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
                 continue;
             }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
-                candidates.push((ri, lo));
+                let net_w = self.find_weight_for_row(key, &run.as_mem_batch(), lo);
+                if net_w > 0 {
+                    self.found_run = ri;
+                    self.found_row = lo;
+                    self.has_found = true;
+                    return true;
+                }
                 lo += 1;
             }
         }
-
-        // Pass 2: for each candidate, compute net (PK, payload) weight.
-        // The first candidate with positive net weight is the live row.
-        for &(ri, row_idx) in &candidates {
-            let mb = self.runs[ri].as_mem_batch();
-            let net_w = self.find_weight_for_row(key, &mb, row_idx);
-            if net_w > 0 {
-                self.found_run = ri;
-                self.found_row = row_idx;
-                self.has_found = true;
-                return true;
-            }
-        }
-
         self.has_found = false;
         false
     }

@@ -259,6 +259,11 @@ pub struct MasterDispatcher {
     /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
     /// unique-index broadcasts. See the UniqueFilter comment block above.
     unique_filters: HashMap<(i64, u32), UniqueFilter>,
+
+    // Cache: table_id → (schema, col_name_bytes).
+    // Avoids re-cloning Vec<String> from the catalog cache and re-encoding
+    // to bytes on every fan-out. Populated lazily; table schemas are immutable.
+    schema_names_cache: HashMap<i64, (SchemaDescriptor, Vec<Vec<u8>>)>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -285,6 +290,7 @@ impl MasterDispatcher {
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
             unique_filters: HashMap::new(),
+            schema_names_cache: HashMap::new(),
         }
     }
 
@@ -293,12 +299,16 @@ impl MasterDispatcher {
     }
 
     fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Vec<Vec<u8>>) {
+        if let Some(cached) = self.schema_names_cache.get(&target_id) {
+            return (cached.0, cached.1.clone());
+        }
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(target_id).unwrap_or_else(|| {
             panic!("master: no schema for target_id={}", target_id);
         });
         let names = cat.get_column_names(target_id);
         let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
+        self.schema_names_cache.insert(target_id, (schema, name_bytes.clone()));
         (schema, name_bytes)
     }
 
@@ -1227,7 +1237,13 @@ impl MasterDispatcher {
         // messages in submission order, so the k-th response from worker
         // w belongs to check[k].
         let nw = self.num_workers;
-        let mut results: Vec<HashSet<u128>> = (0..num_checks).map(|_| HashSet::new()).collect();
+        let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
+            let cap = match &check.payload {
+                CheckPayload::Broadcast(b) => b.count,
+                CheckPayload::Partitioned(bs) => bs.iter().map(|b| b.count).sum(),
+            };
+            HashSet::with_capacity(cap)
+        }).collect();
         let mut responses_collected = vec![0usize; nw];
         let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
         let mut total_remaining = nw * num_checks;

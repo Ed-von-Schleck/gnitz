@@ -608,7 +608,9 @@ impl Batch {
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
         let (packed_offsets, packed_size) = compute_offsets(&self.strides, nr, self.count);
-        let mut new_data = Vec::with_capacity(packed_size);
+        let mut new_data = super::batch_pool::acquire_buf().unwrap_or_default();
+        new_data.clear();
+        new_data.reserve(packed_size);
         // SAFETY: we'll fill all `packed_size` bytes immediately below.
         unsafe { new_data.set_len(packed_size); }
         for i in 0..nr {
@@ -618,9 +620,12 @@ impl Batch {
             let dst_off = packed_offsets[i] as usize;
             new_data[dst_off..dst_off + len].copy_from_slice(&self.data[src_off..src_off + len]);
         }
+        let mut new_blob = super::batch_pool::acquire_buf().unwrap_or_default();
+        new_blob.clear();
+        new_blob.extend_from_slice(&self.blob);
         Batch {
             data: new_data,
-            blob: self.blob.clone(),
+            blob: new_blob,
             offsets: packed_offsets,
             strides: self.strides,
             num_regions: self.num_regions,
