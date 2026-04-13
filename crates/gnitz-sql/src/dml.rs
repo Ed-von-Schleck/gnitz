@@ -1,6 +1,6 @@
 use sqlparser::ast::{
     Query, SetExpr, Values, Expr, Value, SelectItem,
-    Statement, TableObject, BinaryOperator,
+    Statement, TableObject, BinaryOperator, UnaryOperator,
     FromTable, Assignment, AssignmentTarget,
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
@@ -123,9 +123,9 @@ pub fn execute_insert(
     let n = rows.len();
 
     for row in rows {
-        let pk_val = extract_pk_value(row, &schema)?;
-        batch.pk_lo.push(pk_val);
-        batch.pk_hi.push(0);
+        let (pk_lo, pk_hi) = extract_pk_value(row, &schema)?;
+        batch.pk_lo.push(pk_lo);
+        batch.pk_hi.push(pk_hi);
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
@@ -404,15 +404,29 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
     }
 }
 
-fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u64, GnitzSqlError> {
+/// Extract the primary key from a VALUES row, returning (pk_lo, pk_hi).
+///
+/// For U128 PKs the 128-bit value is split into (lo, hi) halves.
+/// For all other numeric PK types hi is always 0.
+fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<(u64, u64), GnitzSqlError> {
     let pk_expr = row.get(schema.pk_index).ok_or_else(|| {
         GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
     })?;
     match pk_expr {
         Expr::Value(vws) => match &vws.value {
-            Value::Number(n, _) => n.parse::<u64>().map_err(|_| {
-                GnitzSqlError::Bind(format!("PK value is not a valid u64: {}", n))
-            }),
+            Value::Number(n, _) => {
+                if schema.columns[schema.pk_index].type_code == TypeCode::U128 {
+                    let val = n.parse::<u128>().map_err(|_| {
+                        GnitzSqlError::Bind(format!("PK value is not a valid u128: {}", n))
+                    })?;
+                    Ok((val as u64, (val >> 64) as u64))
+                } else {
+                    let val = n.parse::<u64>().map_err(|_| {
+                        GnitzSqlError::Bind(format!("PK value is not a valid u64: {}", n))
+                    })?;
+                    Ok((val, 0))
+                }
+            }
             _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
         },
         _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
@@ -428,6 +442,13 @@ fn append_value_to_col(
     tc:       TypeCode,
     val_expr: &Expr,
 ) -> Result<(), GnitzSqlError> {
+    // sqlparser parses negative number literals as UnaryOp(Minus, Number(...)).
+    // Unwrap here so the rest of the function sees a plain Value::Number.
+    let (val_expr, negated) = match val_expr {
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
+        e => (e, false),
+    };
+
     match val_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Null => {
@@ -442,6 +463,14 @@ fn append_value_to_col(
                 Ok(())
             }
             Value::Number(n, _) => {
+                // Build the effective numeric string with optional leading minus.
+                let neg_buf;
+                let n: &str = if negated {
+                    neg_buf = format!("-{}", n);
+                    &neg_buf
+                } else {
+                    n.as_str()
+                };
                 match col {
                     ColData::Fixed(buf) => {
                         match tc {
@@ -575,6 +604,8 @@ fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<(u64, u64)> {
 }
 
 /// Extracts (col_idx, key_lo, key_hi) from `col = integer_literal`. Does NOT check index existence.
+///
+/// For U128 columns the 128-bit literal is split into (lo, hi); for all other types hi is 0.
 fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
@@ -589,8 +620,13 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)>
                 if let Value::Number(n, _) = &vws.value { n } else { return None; }
             } else { return None; };
             let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
-            let key_lo = n_str.parse::<u64>().ok()?;
-            Some((col_idx, key_lo, 0u64))
+            if schema.columns[col_idx].type_code == TypeCode::U128 {
+                let val = n_str.parse::<u128>().ok()?;
+                Some((col_idx, val as u64, (val >> 64) as u64))
+            } else {
+                let key_lo = n_str.parse::<u64>().ok()?;
+                Some((col_idx, key_lo, 0u64))
+            }
         }
         _ => None,
     }
@@ -700,7 +736,8 @@ fn eval_expr(
                     "residual filter on string column not supported".to_string()
                 )),
                 ColData::U128s(_) => Err(GnitzSqlError::Unsupported(
-                    "residual filter on U128 column not supported".to_string()
+                    "residual filter on U128 column not supported; \
+                     use a primary-key seek or CREATE INDEX for equality lookups".to_string()
                 )),
             }
         }
