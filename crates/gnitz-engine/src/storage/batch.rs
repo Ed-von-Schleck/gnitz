@@ -828,7 +828,7 @@ impl Batch {
     /// German String structs are copied as-is; their heap offsets remain valid
     /// because both batches share the same blob content.
     pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
-        let end = if end > src.count { src.count } else { end };
+        let end = end.min(src.count);
         if start >= end { return; }
         self.init_strides_from_batch(src);
         let n = end - start;

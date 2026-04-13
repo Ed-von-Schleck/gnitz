@@ -37,6 +37,14 @@ pub fn op_filter(
         output.blob = batch.blob.clone();
     }
 
+    let append_range = |out: &mut Batch, start: usize, end: usize| {
+        if blob_passthrough {
+            out.append_batch_no_blob_reloc(batch, start, end);
+        } else {
+            out.append_batch(batch, start, end);
+        }
+    };
+
     let mut range_start: isize = -1;
     for i in 0..n {
         if func.evaluate_predicate(&mb, i, schema) {
@@ -45,21 +53,13 @@ pub fn op_filter(
             }
         } else {
             if range_start >= 0 {
-                if blob_passthrough {
-                    output.append_batch_no_blob_reloc(batch, range_start as usize, i);
-                } else {
-                    output.append_batch(batch, range_start as usize, i);
-                }
+                append_range(&mut output, range_start as usize, i);
                 range_start = -1;
             }
         }
     }
     if range_start >= 0 {
-        if blob_passthrough {
-            output.append_batch_no_blob_reloc(batch, range_start as usize, n);
-        } else {
-            output.append_batch(batch, range_start as usize, n);
-        }
+        append_range(&mut output, range_start as usize, n);
     }
 
     if batch.consolidated {

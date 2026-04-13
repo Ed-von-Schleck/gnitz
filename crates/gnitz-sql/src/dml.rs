@@ -404,6 +404,12 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
     }
 }
 
+/// Split a u128 into (lo, hi) halves for the pk_lo/pk_hi representation.
+#[inline]
+fn u128_lo_hi(v: u128) -> (u64, u64) {
+    (v as u64, (v >> 64) as u64)
+}
+
 /// Extract the primary key from a VALUES row, returning (pk_lo, pk_hi).
 ///
 /// For U128 PKs the 128-bit value is split into (lo, hi) halves.
@@ -419,7 +425,7 @@ fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<(u64, u64), GnitzSq
                     let val = n.parse::<u128>().map_err(|_| {
                         GnitzSqlError::Bind(format!("PK value is not a valid u128: {}", n))
                     })?;
-                    Ok((val as u64, (val >> 64) as u64))
+                    Ok(u128_lo_hi(val))
                 } else {
                     let val = n.parse::<u64>().map_err(|_| {
                         GnitzSqlError::Bind(format!("PK value is not a valid u64: {}", n))
@@ -622,7 +628,8 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)>
             let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
             if schema.columns[col_idx].type_code == TypeCode::U128 {
                 let val = n_str.parse::<u128>().ok()?;
-                Some((col_idx, val as u64, (val >> 64) as u64))
+                let (lo, hi) = u128_lo_hi(val);
+                Some((col_idx, lo, hi))
             } else {
                 let key_lo = n_str.parse::<u64>().ok()?;
                 Some((col_idx, key_lo, 0u64))
