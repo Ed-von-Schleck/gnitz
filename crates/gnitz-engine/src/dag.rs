@@ -1,6 +1,6 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
@@ -1022,6 +1022,7 @@ impl DagEngine {
         let mut pending: Vec<PendingEntry> = Vec::new();
         // pending_pos: (view_id, source_id) → index in pending
         let mut pending_pos: HashMap<(i64, i64), usize> = HashMap::new();
+        let mut dirty_views: HashSet<i64> = HashSet::new();
 
         for &vid in &view_ids {
             let depth = match self.tables.get(&vid) {
@@ -1070,8 +1071,7 @@ impl DagEngine {
 
             // Ingest into view store (borrow — no clone)
             self.ingest_by_ref(view_id, &out_delta);
-            // Flush
-            let _ = self.flush(view_id);
+            dirty_views.insert(view_id);
 
             // Queue dependents
             let dep_view_ids: Vec<i64> = self.dep_map
@@ -1116,6 +1116,11 @@ impl DagEngine {
             crate::storage::batch_pool::recycle(out_delta);
         }
 
+        // Flush each modified view trace exactly once after the full DAG settles.
+        for vid in dirty_views {
+            let _ = self.flush(vid);
+        }
+
         0
     }
 
@@ -1157,6 +1162,7 @@ impl DagEngine {
 
         let mut pending: Vec<PendingEntry> = Vec::new();
         let mut pending_pos: HashMap<(i64, i64), usize> = HashMap::new();
+        let mut dirty_views: HashSet<i64> = HashSet::new();
 
         for &vid in &view_ids {
             let depth = match self.tables.get(&vid) {
@@ -1246,7 +1252,7 @@ impl DagEngine {
             if has_output {
                 let out = out_delta.as_ref().unwrap();
                 self.ingest_by_ref(view_id, out);
-                let _ = self.flush(view_id);
+                dirty_views.insert(view_id);
             }
 
             // Multi-worker: ALWAYS queue dependents (even empty output)
@@ -1299,6 +1305,11 @@ impl DagEngine {
             if let Some(batch) = out_delta {
                 crate::storage::batch_pool::recycle(batch);
             }
+        }
+
+        // Flush each modified view trace exactly once after the full DAG settles.
+        for vid in dirty_views {
+            let _ = self.flush(vid);
         }
 
         0

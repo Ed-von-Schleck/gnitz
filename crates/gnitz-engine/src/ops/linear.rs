@@ -27,6 +27,16 @@ pub fn op_filter(
     let mb = batch.as_mem_batch();
     let mut output = Batch::with_schema(*schema, n);
 
+    // If the batch has out-of-line string data, pre-clone the blob so that
+    // 16-byte string structs can be copied verbatim (no per-row relocation).
+    // Offsets inside the structs remain valid because both blobs are identical.
+    let blob_passthrough = !batch.blob.is_empty()
+        && (0..schema.num_columns as usize)
+            .any(|ci| schema.columns[ci].type_code == type_code::STRING);
+    if blob_passthrough {
+        output.blob = batch.blob.clone();
+    }
+
     let mut range_start: isize = -1;
     for i in 0..n {
         if func.evaluate_predicate(&mb, i, schema) {
@@ -35,13 +45,21 @@ pub fn op_filter(
             }
         } else {
             if range_start >= 0 {
-                output.append_batch(batch, range_start as usize, i);
+                if blob_passthrough {
+                    output.append_batch_no_blob_reloc(batch, range_start as usize, i);
+                } else {
+                    output.append_batch(batch, range_start as usize, i);
+                }
                 range_start = -1;
             }
         }
     }
     if range_start >= 0 {
-        output.append_batch(batch, range_start as usize, n);
+        if blob_passthrough {
+            output.append_batch_no_blob_reloc(batch, range_start as usize, n);
+        } else {
+            output.append_batch(batch, range_start as usize, n);
+        }
     }
 
     if batch.consolidated {
@@ -104,9 +122,16 @@ pub fn op_negate(batch: &Batch) -> Batch {
         return Batch::empty(batch.num_payload_cols());
     }
 
-    let mut output = Batch::empty(batch.num_payload_cols());
-    output.schema = batch.schema;
-    output.append_batch_negated(batch, 0, batch.count);
+    // clone_batch copies all column regions and the blob verbatim — no
+    // per-string relocation is needed since we keep the same blob content.
+    let mut output = batch.clone_batch();
+    // Negate weights in-place.
+    let weights = output.weight_data_mut();
+    for i in 0..batch.count {
+        let off = i * 8;
+        let w = i64::from_le_bytes(weights[off..off + 8].try_into().unwrap());
+        weights[off..off + 8].copy_from_slice(&(-w).to_le_bytes());
+    }
 
     if batch.consolidated {
         output.sorted = true;

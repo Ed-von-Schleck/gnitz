@@ -820,6 +820,36 @@ impl Batch {
         self.append_rows_inner(src, start, end, true);
     }
 
+    /// Bulk-copy rows [start, end) verbatim — no string blob relocation.
+    ///
+    /// # Precondition
+    /// `self.blob` must already equal `src.blob` (e.g. assigned with
+    /// `self.blob = src.blob.clone()` before the first call).  The 16-byte
+    /// German String structs are copied as-is; their heap offsets remain valid
+    /// because both batches share the same blob content.
+    pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
+        let end = if end > src.count { src.count } else { end };
+        if start >= end { return; }
+        self.init_strides_from_batch(src);
+        let n = end - start;
+        self.reserve_rows(n);
+        // All four system regions
+        self.bulk_copy_region(0, &src.data[src.offsets[0] as usize..], start, end);
+        self.bulk_copy_region(1, &src.data[src.offsets[1] as usize..], start, end);
+        self.bulk_copy_region(2, &src.data[src.offsets[2] as usize..], start, end);
+        self.bulk_copy_region(3, &src.data[src.offsets[3] as usize..], start, end);
+        // Payload columns — string structs copied verbatim (blob already shared)
+        let npc = self.num_payload_cols();
+        for pi in 0..npc {
+            if self.strides[4 + pi] > 0 {
+                self.bulk_copy_region(4 + pi, &src.data[src.offsets[4 + pi] as usize..], start, end);
+            }
+        }
+        self.count += n;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
     fn append_rows_inner(&mut self, src: &Batch, start: usize, end: usize, negate: bool) {
         let n = end - start;
         self.reserve_rows(n);
