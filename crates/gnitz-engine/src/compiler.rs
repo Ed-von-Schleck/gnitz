@@ -1,8 +1,5 @@
 //! Circuit compiler: reads system tables, builds a DBSP circuit graph,
 //! runs annotation + optimization passes, and emits VM instructions.
-//!
-//! Replaces `gnitz/catalog/program_cache.py::compile_from_graph` (~1400 lines
-//! of Python) with a single entry point.
 
 use std::collections::{HashMap, HashSet};
 
@@ -112,104 +109,11 @@ pub struct ExternalTable {
     pub schema: SchemaDescriptor,
 }
 
-/// Result of compilation, returned as a flat i64 buffer.
-///
-/// All values are stored as i64 for alignment simplicity. Pointers are
-/// cast to i64 (safe on 64-bit). Layout:
-///
-/// ```text
-/// [0]  pre_vm         (pointer as i64)
-/// [1]  post_vm        (pointer as i64, 0 if no exchange)
-/// [2]  pre_num_regs
-/// [3]  post_num_regs
-/// [4]  pre_in_reg
-/// [5]  pre_out_reg
-/// [6]  post_in_reg
-/// [7]  post_out_reg
-/// [8]  skip_exchange   (0 or 1)
-/// [9]  num_shard_cols
-/// [10..18] shard_cols  (8 slots)
-/// [18] num_source_regs
-/// [19..35] source_reg_tids  (16 slots)
-/// [35..51] source_reg_ids   (16 slots, as i64)
-/// [51] num_join_shard_entries
-/// [52..68] join_shard_tids  (16 slots)
-/// [68..84] join_shard_cols  (16 slots, as i64)
-/// [84] num_co_partitioned
-/// [85..101] co_partitioned_tids (16 slots)
-/// [101] num_ext_trace_regs
-/// [102..165] ext_trace_reg_ids (63 slots, as i64)
-/// [165..228] ext_trace_table_ids (63 slots)
-/// [228] pre_etr_count (how many ext_trace_regs belong to the pre-plan)
-/// [229] (reserved)
-/// [230] error_code
-/// [231] exchange_schema_num_cols (0 if no exchange)
-/// [232] exchange_schema_pk_index
-/// [233..297] exchange col descriptors: (type_code << 16 | size << 8 | nullable) per col, 64 slots
-/// Total: 297 i64 values
-/// ```
-pub const COMPILE_RESULT_SLOTS: usize = 297;
-
-pub struct CompileResult {
-    pub buf: [i64; COMPILE_RESULT_SLOTS],
-}
-
-// Slot offsets
-const CR_PRE_VM: usize = 0;
-const CR_POST_VM: usize = 1;
-const CR_PRE_NUM_REGS: usize = 2;
-const CR_POST_NUM_REGS: usize = 3;
-const CR_PRE_IN_REG: usize = 4;
-const CR_PRE_OUT_REG: usize = 5;
-const CR_POST_IN_REG: usize = 6;
-const CR_POST_OUT_REG: usize = 7;
-const CR_SKIP_EXCHANGE: usize = 8;
-const CR_NUM_SHARD_COLS: usize = 9;
-const CR_SHARD_COLS: usize = 10;       // 8 slots
-const CR_NUM_SOURCE_REGS: usize = 18;
-const CR_SOURCE_REG_TIDS: usize = 19;  // 16 slots
-const CR_SOURCE_REG_IDS: usize = 35;   // 16 slots
-const CR_NUM_JSM: usize = 51;
-const CR_JSM_TIDS: usize = 52;         // 16 slots
-const CR_JSM_COLS: usize = 68;         // 16 slots
-const CR_NUM_COP: usize = 84;
-const CR_COP_TIDS: usize = 85;         // 16 slots
-const CR_NUM_ETR: usize = 101;
-const CR_ETR_REG_IDS: usize = 102;     // 63 slots
-const CR_ETR_TABLE_IDS: usize = 165;   // 63 slots
-const CR_PRE_ETR_COUNT: usize = 228;   // how many ext_trace_regs belong to pre-plan
-const CR_ERROR_CODE: usize = 230;
-
-impl CompileResult {
-    pub fn error(code: i32) -> Self {
-        let mut r = Self::empty();
-        r.buf[CR_ERROR_CODE] = code as i64;
-        r
-    }
-
-    fn empty() -> Self {
-        CompileResult {
-            buf: [0i64; 297],
-        }
-    }
-
-    fn set_pre_vm(&mut self, vm: Box<VmHandle>) {
-        self.buf[CR_PRE_VM] = Box::into_raw(vm) as i64;
-    }
-    fn set_post_vm(&mut self, vm: Box<VmHandle>) {
-        self.buf[CR_POST_VM] = Box::into_raw(vm) as i64;
-    }
-}
-
 // ---------------------------------------------------------------------------
-// CompileOutput — typed compilation result for internal Rust consumers
+// CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
-/// Rich, typed output from `compile_view`.  Used directly by DagEngine to
-/// build `CachedPlan` without going through the flat i64 buffer.
-///
-/// The existing FFI path calls `to_result_buffer()` to produce the legacy
-/// `CompileResult` for FFI callers.
+/// Output from `compile_view`, consumed directly by DagEngine to build `CachedPlan`.
 pub struct CompileOutput {
     pub pre_vm: Box<VmHandle>,
     pub post_vm: Option<Box<VmHandle>>,
@@ -230,84 +134,6 @@ pub struct CompileOutput {
     pub post_ext_trace_regs: Vec<(u16, i64)>,
 }
 
-impl CompileOutput {
-    /// Convert to the flat i64[297] buffer expected by the existing FFI path.
-    /// **Consumes** self: VmHandle ownership transfers into the buffer as raw
-    /// pointers (freed via `gnitz_vm_program_free`).
-    pub fn to_result_buffer(self) -> CompileResult {
-        let mut result = CompileResult::empty();
-
-        result.set_pre_vm(self.pre_vm);
-        result.buf[CR_PRE_NUM_REGS] = self.pre_num_regs as i64;
-        result.buf[CR_PRE_IN_REG] = self.pre_in_reg as i64;
-        result.buf[CR_PRE_OUT_REG] = self.pre_out_reg as i64;
-
-        if let Some(post_vm) = self.post_vm {
-            result.set_post_vm(post_vm);
-            result.buf[CR_POST_NUM_REGS] = self.post_num_regs as i64;
-            result.buf[CR_POST_IN_REG] = self.post_in_reg as i64;
-            result.buf[CR_POST_OUT_REG] = self.post_out_reg as i64;
-        }
-
-        result.buf[CR_SKIP_EXCHANGE] = if self.skip_exchange { 1 } else { 0 };
-
-        // Shard cols
-        let nsc = self.shard_cols.len().min(8);
-        result.buf[CR_NUM_SHARD_COLS] = nsc as i64;
-        for (i, &sc) in self.shard_cols.iter().take(8).enumerate() {
-            result.buf[CR_SHARD_COLS + i] = sc as i64;
-        }
-
-        // Source reg map
-        let mut si = 0;
-        for (&tid, &reg) in &self.source_reg_map {
-            if si < 16 {
-                result.buf[CR_SOURCE_REG_TIDS + si] = tid;
-                result.buf[CR_SOURCE_REG_IDS + si] = reg as i64;
-                si += 1;
-            }
-        }
-        result.buf[CR_NUM_SOURCE_REGS] = si as i64;
-
-        // Join shard map
-        let mut ji = 0;
-        for (&tid, cols) in &self.join_shard_map {
-            if ji < 16 && !cols.is_empty() {
-                result.buf[CR_JSM_TIDS + ji] = tid;
-                result.buf[CR_JSM_COLS + ji] = cols[0] as i64;
-                ji += 1;
-            }
-        }
-        result.buf[CR_NUM_JSM] = ji as i64;
-
-        // Co-partitioned
-        let mut ci = 0;
-        for &tid in self.co_partitioned.iter() {
-            if ci < 16 {
-                result.buf[CR_COP_TIDS + ci] = tid;
-                ci += 1;
-            }
-        }
-        result.buf[CR_NUM_COP] = ci as i64;
-
-        // Ext trace regs
-        let pre_etr_count = self.pre_ext_trace_regs.len();
-        populate_ext_trace_regs(&mut result, &self.pre_ext_trace_regs, &self.post_ext_trace_regs);
-        result.buf[CR_PRE_ETR_COUNT] = pre_etr_count as i64;
-
-        // Exchange schema
-        if let Some(ref ex_schema) = self.exchange_in_schema {
-            result.buf[231] = ex_schema.num_columns as i64;
-            result.buf[232] = ex_schema.pk_index as i64;
-            for i in 0..ex_schema.num_columns as usize {
-                let c = &ex_schema.columns[i];
-                result.buf[233 + i] = ((c.type_code as i64) << 16) | ((c.size as i64) << 8) | (c.nullable as i64);
-            }
-        }
-
-        result
-    }
-}
 
 // ---------------------------------------------------------------------------
 // System table reading
@@ -2018,9 +1844,7 @@ fn build_plan(
 // Top-level compile_view entry point
 // ---------------------------------------------------------------------------
 
-/// Compile a circuit for a single view.  Returns a rich `CompileOutput`
-/// that DagEngine can consume directly, or that the FFI path can convert
-/// to a flat buffer via `to_result_buffer()`.
+/// Compile a circuit for a single view.
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
@@ -2227,17 +2051,6 @@ pub unsafe fn compile_view(
     }
 }
 
-fn populate_ext_trace_regs(result: &mut CompileResult, pre: &[(u16, i64)], post: &[(u16, i64)]) {
-    let mut i = 0;
-    for &(reg_id, tid) in pre.iter().chain(post.iter()) {
-        if i < 63 {
-            result.buf[CR_ETR_REG_IDS + i] = reg_id as i64;
-            result.buf[CR_ETR_TABLE_IDS + i] = tid;
-            i += 1;
-        }
-    }
-    result.buf[CR_NUM_ETR] = i as i64;
-}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -17,7 +17,6 @@ fn payload_idx(col_idx: usize, pk_index: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Promote a column value to u64 for GroupIndex composite keys.
-/// Ports group_index.py:26-42.
 fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> u64 {
     let pi = payload_idx(col_idx, pk_index);
     let cs = match col_type_code {
@@ -33,7 +32,6 @@ fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize
 }
 
 /// Promote an aggregate column value to an order-preserving u64 for AVI keys.
-/// Ports group_index.py:169-192.
 fn promote_agg_col_to_u64_ordered(
     mb: &MemBatch,
     row: usize,
@@ -206,8 +204,7 @@ fn make_avi_schema() -> SchemaDescriptor {
 /// Integrate a delta batch into a target table, optionally populating
 /// GroupIndex and AggValueIndex secondary indexes.
 ///
-/// Ports interpreter.py:171-221.  The Rust Table handles memtable capacity
-/// internally (flush-on-overflow), so no explicit MemTableFullError retry.
+/// The Rust Table handles memtable capacity internally (flush-on-overflow).
 pub fn op_integrate_with_indexes(
     batch: &Batch,
     target_table: Option<&mut crate::storage::Table>,
@@ -233,7 +230,7 @@ pub fn op_integrate_with_indexes(
     let mb = batch.as_mem_batch();
     let pki = input_schema.pk_index as usize;
 
-    // Phase 2: GroupIndex population (interpreter.py:175-199)
+    // GroupIndex population
     if let Some(gi_desc) = gi {
         let gi_schema = make_gi_schema();
         let mut gi_batch = Batch::with_schema(gi_schema, batch.count);
@@ -244,7 +241,7 @@ pub fn op_integrate_with_indexes(
         let gi_pi = payload_idx(gi_col, pki);
 
         for row in 0..batch.count {
-            // Skip null group column (interpreter.py:184)
+            // Skip null group column
             let null_word = mb.get_null_word(row);
             if (null_word >> gi_pi) & 1 != 0 {
                 continue;
@@ -279,7 +276,7 @@ pub fn op_integrate_with_indexes(
         }
     }
 
-    // Phase 3: AggValueIndex population (interpreter.py:200-221)
+    // AggValueIndex population
     if let Some(avi_desc) = avi {
         let avi_schema = make_avi_schema();
         let mut avi_batch = Batch::with_schema(avi_schema, batch.count);
@@ -290,7 +287,7 @@ pub fn op_integrate_with_indexes(
         let avi_pi = payload_idx(avi_col, pki);
 
         for row in 0..batch.count {
-            // Skip null agg column (interpreter.py:208)
+            // Skip null agg column
             let null_word = mb.get_null_word(row);
             if (null_word >> avi_pi) & 1 != 0 {
                 continue;

@@ -11,8 +11,8 @@ use super::util::append_cursor_row_to_batch;
 
 /// Scan rows from a ReadCursor into an Batch.
 ///
-/// Faithfully ports source.py:14-45.  Skips zero-weight rows (defense-in-depth:
-/// individual shard entries may carry non-zero weights that cancel at merge level).
+/// Skips zero-weight rows (defense-in-depth: individual shard entries may carry
+/// non-zero weights that cancel at merge level).
 /// The cursor is left at the next unscanned position.
 ///
 /// `chunk_limit <= 0` means scan everything until cursor exhaustion.
@@ -38,7 +38,7 @@ pub fn op_scan_trace(
         if chunk_limit > 0 && scanned >= chunk_limit {
             break;
         }
-        // Skip zero-weight rows (source.py:37)
+        // Skip zero-weight rows
         if cursor.current_weight != 0 {
             append_cursor_row_to_batch(&mut output, cursor, schema);
             scanned += 1;

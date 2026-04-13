@@ -1,11 +1,8 @@
-//! Worker process event loop (Rust port of gnitz/server/worker.py).
+//! Worker process event loop.
 //!
 //! Owns a subset of partitions for every user table. Receives requests from
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
-//!
-//! Eliminates ~20 FFI round-trips per message dispatch compared to the
-//! original Python implementation.
 
 use std::collections::HashMap;
 use std::sync::Arc;

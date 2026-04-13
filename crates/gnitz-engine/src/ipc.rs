@@ -1,7 +1,5 @@
 //! IPC transport layer: atomics, SAL (shared append-only log), W2M (worker→master),
 //! and wire protocol encode/decode.
-//!
-//! Replaces gnitz/server/ipc.py transport + wire protocol logic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,7 +10,7 @@ use crate::storage::{Batch, wal};
 use crate::util::align8;
 
 // ---------------------------------------------------------------------------
-// Constants (must match ipc.py)
+// Constants
 // ---------------------------------------------------------------------------
 
 pub const MAX_WORKERS: usize = 64;

@@ -1,7 +1,7 @@
 //! Logging module for gnitz-engine.
 //!
 //! Log format: `secs.millis tag LEVEL msg` on stderr (fd 2).
-//! Log level is set once at startup via FFI. Levels:
+//! Log levels:
 //!   0 = QUIET  (error/warn only)
 //!   1 = NORMAL (+ info)
 //!   2 = DEBUG  (+ debug)
@@ -17,7 +17,7 @@ pub const QUIET: u32 = 0;
 pub const NORMAL: u32 = 1;
 pub const DEBUG: u32 = 2;
 
-/// Set the log level and process tag. Called from FFI or tests.
+/// Set the log level and process tag.
 pub fn init(level: u32, tag: &[u8]) {
     LEVEL.store(level.min(DEBUG), Ordering::Relaxed);
     let len = tag.len().min(3);

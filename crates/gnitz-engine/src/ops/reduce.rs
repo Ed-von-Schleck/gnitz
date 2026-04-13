@@ -10,7 +10,7 @@ use super::util::{
 };
 
 // ---------------------------------------------------------------------------
-// Aggregate opcodes (matches gnitz/dbsp/functions.py)
+// Aggregate opcodes
 // ---------------------------------------------------------------------------
 
 const AGG_COUNT: u8 = 1;
@@ -19,7 +19,7 @@ const AGG_MIN: u8 = 3;
 const AGG_MAX: u8 = 4;
 const AGG_COUNT_NON_NULL: u8 = 5;
 
-/// Descriptor for one aggregate function, passed across FFI.
+/// Descriptor for one aggregate function.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {

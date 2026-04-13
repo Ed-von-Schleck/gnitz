@@ -1,8 +1,7 @@
 //! Server bootstrap: single entry point for server startup.
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
-//! runs SAL recovery, and enters the executor event loop. After this module,
-//! main.py is reduced to arg parsing + one FFI call.
+//! runs SAL recovery, and enters the executor event loop.
 
 use std::collections::HashMap;
 
@@ -18,7 +17,7 @@ use crate::master::MasterDispatcher;
 use crate::worker::WorkerProcess;
 
 // ---------------------------------------------------------------------------
-// Partition assignment (mirrors gnitz/dbsp/ops/exchange.py)
+// Partition assignment
 // ---------------------------------------------------------------------------
 
 const NUM_PARTITIONS: u32 = 256;

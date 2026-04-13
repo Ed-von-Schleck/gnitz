@@ -2,9 +2,6 @@
 //! Catalog engine: DDL operations, system table management, hook processing,
 //! and entity registry.
 //!
-//! Consolidates identifiers.py, index_circuit.py, metadata.py,
-//! loader.py, hooks.py, engine.py, and most of registry.py / system_tables.py.
-//!
 //! The CatalogEngine wraps DagEngine and adds:
 //! - EntityRegistry (name → ID mapping, FK constraints, index tracking)
 //! - System table definitions and bootstrap
@@ -140,7 +137,7 @@ impl BatchBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Identifier validation (port of identifiers.py)
+// Identifier validation
 // ---------------------------------------------------------------------------
 
 fn is_valid_ident_char(ch: u8) -> bool {
@@ -173,7 +170,7 @@ fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str,
 }
 
 // ---------------------------------------------------------------------------
-// Index key type promotion (port of index_circuit.py get_index_key_type)
+// Index key type promotion
 // ---------------------------------------------------------------------------
 
 fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
@@ -1465,7 +1462,7 @@ impl CatalogEngine {
         String::from_utf8(bytes).unwrap_or_default()
     }
 
-    // -- Registry query methods (used by server code via FFI) ----------------
+    // -- Registry query methods -----------------------------------------------
 
     pub fn has_id(&self, table_id: i64) -> bool {
         self.dag.tables.contains_key(&table_id)
@@ -2573,7 +2570,7 @@ impl CatalogEngine {
         }
     }
 
-    /// Get mutable DagEngine pointer (for FFI — returns raw pointer to self.dag).
+    /// Get a raw mutable pointer to the DagEngine.
     pub fn get_dag_ptr(&mut self) -> *mut DagEngine {
         &mut self.dag as *mut DagEngine
     }
@@ -2894,7 +2891,7 @@ impl CatalogEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Public types used by FFI and tests
+// Public types
 // ---------------------------------------------------------------------------
 
 /// Column definition for create_table.

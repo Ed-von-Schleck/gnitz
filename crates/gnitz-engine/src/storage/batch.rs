@@ -156,7 +156,7 @@ impl Batch {
         }
     }
 
-    /// Construct by copying data in from FFI region pointers.
+    /// Construct by copying data in from region pointers.
     ///
     /// Region layout: pk_lo, pk_hi, weight, null_bmp,
     /// payload_col_0 .. payload_col_{N-1}, blob.

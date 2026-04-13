@@ -15,7 +15,6 @@ fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
     (partition / chunk).min(num_workers - 1)
 }
 
-/// Public wrapper for FFI use.
 pub fn worker_for_partition_pub(partition: usize, num_workers: usize) -> usize {
     worker_for_partition(partition, num_workers)
 }

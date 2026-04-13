@@ -183,7 +183,7 @@ EphemeralTable). `integrate_op` adds each tick's delta.
 Cursors see the net state through two-tier consolidation:
 
 1. **MemTableCursor**: reads from `get_consolidated_snapshot()` — N-way
-   merge of sorted runs via `_merge_runs_to_consolidated()` (Rust FFI).
+   merge of sorted runs via `merge_runs_to_consolidated()`.
 2. **UnifiedCursor**: merges MemTable snapshot + shard cursors on-the-fly
    via tournament tree, summing weights of matching (PK, payload) entries,
    dropping ghosts.
@@ -201,7 +201,7 @@ Three paths. All MUST sort by (PK, payload):
 Sorts by (PK, payload) via `compare_indices`, walks sorted index
 accumulating weights, drops ghosts. Returns self if already consolidated.
 
-### 4b. N-way merge: `_merge_runs_to_consolidated()` (Rust FFI)
+### 4b. N-way merge: `merge_runs_to_consolidated()`
 
 Merges N sorted batches via min-heap (tournament tree) ordered by
 **(PK, payload)**. Pending-group algorithm accumulates weight when

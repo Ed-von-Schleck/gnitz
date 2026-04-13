@@ -371,11 +371,6 @@ pub fn merge_batches(
 }
 
 // ---------------------------------------------------------------------------
-// FFI entry point helper: parse flat region arrays into MemBatches + DirectWriter
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
 // Single-batch sort + consolidation
 // ---------------------------------------------------------------------------
 
@@ -491,7 +486,7 @@ pub fn sort_only(
     }
 }
 
-/// Parse a single batch from flat region arrays (single-batch FFI variant).
+/// Parse a single batch from flat region arrays.
 pub unsafe fn parse_single_batch_from_regions<'a>(
     in_ptrs: &[*const u8],
     in_sizes: &[u32],

@@ -1,6 +1,4 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
-//!
-//! One FFI call per epoch instead of ~20 (one per opcode).
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, CursorHandle, Table};
@@ -95,7 +93,6 @@ pub struct IntegrateAvi {
 
 // ---------------------------------------------------------------------------
 // ProgramBuilder — constructs a Program via incremental add_*() calls.
-// Serialization bridge (replaces instructions.py + runtime.py).
 // ---------------------------------------------------------------------------
 
 pub struct ProgramBuilder {
@@ -1925,7 +1922,6 @@ mod tests {
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // Agg descriptors: SUM of payload col 1 (schema col 2)
-        // AGG_SUM = 1 (from functions.py)
         let agg_descs = [AggDescriptor {
             col_idx: 2,  // schema col index
             agg_op: 1,   // AGG_SUM
@@ -2135,7 +2131,6 @@ mod tests {
         unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
     }
 
-    /// Ports compile_graph_test.py::test_anti_semi_complement.
     /// Anti-join + semi-join should partition the input: |anti| + |semi| == |input|.
     #[test]
     fn test_anti_semi_complement() {
@@ -2207,7 +2202,6 @@ mod tests {
         table.close();
     }
 
-    /// Ports compile_graph_test.py::test_filter_with_expr.
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
     #[test]
     fn test_filter_with_expr() {
@@ -2266,7 +2260,6 @@ mod tests {
         unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
     }
 
-    /// Ports compile_graph_test.py::test_reduce_multi_agg.
     /// Multi-agg reduce: COUNT + SUM on same column in one pass.
     #[test]
     fn test_reduce_multi_agg() {
@@ -2295,7 +2288,6 @@ mod tests {
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
-        // AGG_COUNT = 1, AGG_SUM = 2 (matching opcodes.py and ops.rs)
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column

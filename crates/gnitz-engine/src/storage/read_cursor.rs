@@ -221,7 +221,7 @@ impl<'a> ReadCursorEntry<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// ReadCursor — the opaque handle exposed via FFI
+// ReadCursor
 // ---------------------------------------------------------------------------
 
 pub struct ReadCursor<'a> {
@@ -535,10 +535,6 @@ impl<'a> ReadCursor<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public constructors for FFI
-// ---------------------------------------------------------------------------
-
 /// Build a ReadCursor from batch regions + shard Arcs.
 pub fn create_read_cursor<'a>(
     batch_regions: &[MemBatch<'a>],
@@ -577,9 +573,8 @@ pub fn create_read_cursor<'a>(
 
 use super::batch::Batch;
 
-/// FFI-visible cursor handle.  Owns the ReadCursor and, when created from
-/// snapshots, keeps the `Arc<Batch>` references alive so the cursor's
-/// borrowed `MemBatch` slices remain valid.
+/// Owns the ReadCursor and, when created from snapshots, keeps the `Arc<Batch>`
+/// references alive so the cursor's borrowed `MemBatch` slices remain valid.
 ///
 /// Field order matters: `cursor` is dropped before `_owned_snapshots`,
 /// ensuring the cursor's borrowed slices are invalidated before the backing

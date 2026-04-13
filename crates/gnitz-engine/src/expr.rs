@@ -1,7 +1,6 @@
 //! Expression bytecode interpreter for SQL scalar functions.
 //!
 //! Evaluates compiled expression programs against columnar batch rows.
-//! Port of gnitz/dbsp/expr.py — same bytecode format, same semantics.
 
 use crate::schema::{
     compare_german_strings, german_string_tail,

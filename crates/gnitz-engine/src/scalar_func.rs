@@ -20,7 +20,7 @@ pub enum ScalarFuncKind {
     Plan(Plan),
 }
 
-// Function opcodes (must match functions.py)
+// Function opcodes
 const OP_EQ: u8 = 1;
 const OP_GT: u8 = 2;
 const OP_LT: u8 = 3;

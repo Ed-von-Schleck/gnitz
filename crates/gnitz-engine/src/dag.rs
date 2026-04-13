@@ -1,10 +1,4 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
-//!
-//! Consolidates `program_cache.py` (803 lines), the `evaluate_dag` loop
-//! in `executor.py`, and the `ingest_to_family` pipeline in `registry.py`
-//! for user tables.
-//!
-//! Single-worker hot path: **1 FFI call per epoch** instead of ~5 per view.
 
 use std::collections::HashMap;
 
@@ -1003,7 +997,6 @@ impl DagEngine {
     // ── evaluate_dag (single-worker) ────────────────────────────────────
 
     /// Full single-worker DAG evaluation.
-    /// Port of `executor.py:evaluate_dag()` (no exchange handler path).
     pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
         gnitz_debug!("dag: evaluate_dag source_id={} delta_count={} tables={}",
             source_id, delta.count, self.tables.len());
@@ -1541,8 +1534,7 @@ impl DagEngine {
         effective
     }
 
-    /// Batch-level index projection (pure Rust, no FFI).
-    /// Port of `gnitz_batch_project_index` logic.
+    /// Batch-level index projection.
     pub(crate) fn batch_project_index(
         src: &Batch,
         source_col_idx: u32,

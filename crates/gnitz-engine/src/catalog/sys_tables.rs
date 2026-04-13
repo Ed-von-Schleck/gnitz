@@ -5,7 +5,7 @@
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
 // ---------------------------------------------------------------------------
-// Constants — must match gnitz/catalog/system_tables.py
+// Constants
 // ---------------------------------------------------------------------------
 
 pub(crate) const SYSTEM_SCHEMA_ID: i64 = 1;

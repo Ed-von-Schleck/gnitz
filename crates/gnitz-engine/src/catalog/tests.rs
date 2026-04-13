@@ -879,8 +879,7 @@ fn test_edge_cases_extended() {
 
 /// Test unique_pk enforcement via a single-partition Table (system table range).
 /// DagEngine.enforce_unique_pk only operates on Single stores; PartitionedTable
-/// unique_pk is handled by the ingest layer. E2E test_unique_pk.py
-/// covers the full-stack partitioned case.
+/// unique_pk is handled by the ingest layer.
 #[test]
 fn test_enforce_unique_pk() {
     let dir = temp_dir("enforce_upk");
@@ -941,8 +940,8 @@ fn test_enforce_unique_pk() {
     // Note: cross-batch upsert (retract stored row + insert new) requires
     // the _enforce_unique_pk path which emits the stored retraction.
     // DagEngine.enforce_unique_pk calls retract_pk but doesn't emit
-    // the retraction into the effective batch. Full-stack upsert is
-    // tested by E2E test_unique_pk.py (8 tests).
+    // the retraction into the effective batch. Full-stack upsert is covered
+    // by the E2E suite.
 
     dag.close();
     let _ = fs::remove_dir_all(&dir);

@@ -1,8 +1,5 @@
 //! Server executor: client-facing event loop that dispatches DML/DDL,
 //! manages tick coalescing, and coordinates multi-worker fan-out.
-//!
-//! Replaces gnitz/server/executor.py (955 LOC). The entire event loop
-//! runs in Rust — no FFI round-trips on the request path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -235,7 +232,7 @@ impl ServerExecutor {
         desc
     }
 
-    // -- Data operations (direct catalog calls, no FFI) -----------------------
+    // -- Data operations -------------------------------------------------------
 
     fn handle_push(
         &mut self, target_id: i64, in_batch: Option<Batch>,
