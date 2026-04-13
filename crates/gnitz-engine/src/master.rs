@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
@@ -261,9 +262,9 @@ pub struct MasterDispatcher {
     unique_filters: HashMap<(i64, u32), UniqueFilter>,
 
     // Cache: table_id → (schema, col_name_bytes).
-    // Avoids re-cloning Vec<String> from the catalog cache and re-encoding
-    // to bytes on every fan-out. Populated lazily; table schemas are immutable.
-    schema_names_cache: HashMap<i64, (SchemaDescriptor, Vec<Vec<u8>>)>,
+    // Shared via Rc so cache hits cost a refcount bump, not a deep clone of
+    // the name bytes. Populated lazily; table schemas are immutable.
+    schema_names_cache: HashMap<i64, (SchemaDescriptor, Rc<[Vec<u8>]>)>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -298,18 +299,19 @@ impl MasterDispatcher {
         self.sal.reset(write_cursor, epoch);
     }
 
-    fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Vec<Vec<u8>>) {
-        if let Some(cached) = self.schema_names_cache.get(&target_id) {
-            return (cached.0, cached.1.clone());
-        }
-        let cat = unsafe { &mut *self.catalog };
-        let schema = cat.get_schema_desc(target_id).unwrap_or_else(|| {
-            panic!("master: no schema for target_id={}", target_id);
+    fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<[Vec<u8>]>) {
+        let cat_ptr = self.catalog;
+        let entry = self.schema_names_cache.entry(target_id).or_insert_with(|| {
+            let cat = unsafe { &mut *cat_ptr };
+            let schema = cat.get_schema_desc(target_id)
+                .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
+            let names: Rc<[Vec<u8>]> = cat.get_column_names(target_id)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+            (schema, names)
         });
-        let names = cat.get_column_names(target_id);
-        let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
-        self.schema_names_cache.insert(target_id, (schema, name_bytes.clone()));
-        (schema, name_bytes)
+        (entry.0, Rc::clone(&entry.1))
     }
 
     // -----------------------------------------------------------------------
