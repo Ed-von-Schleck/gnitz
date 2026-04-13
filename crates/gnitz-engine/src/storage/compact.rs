@@ -131,13 +131,10 @@ fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
 // Shared merge infrastructure
 // ---------------------------------------------------------------------------
 
-/// Payload-aware less-than predicate used for the merge heap ordering.
-/// Ordering by PK then full payload guarantees equal (PK, payload) entries
-/// surface adjacently at the root, which `open_and_merge`'s pending-group
-/// drain relies on for O(1) consolidation.
-///
-/// Recreated per-call so the captured borrow of `cursors` stays scoped to a
-/// single heap operation, leaving `cursors` free to be mutated between ops.
+/// Payload-aware less-than predicate used for both the merge heap ordering
+/// and the equal-group collection in `collect_min_indices`.  Recreated per
+/// call so the captured borrow of `cursors` stays scoped to a single heap
+/// operation, leaving `cursors` free to be mutated between operations.
 fn shard_entry_less<'a>(
     cursors: &'a [ShardCursor],
     shards: &'a [MappedShard],
@@ -155,12 +152,31 @@ fn shard_entry_less<'a>(
     }
 }
 
+/// Equality predicate for `collect_min_indices`: PK must match exactly,
+/// then full payload comparison.  Cheap u128 prune fires first so payload
+/// comparison only runs on key-collision candidates.
+fn shard_entry_eq<'a>(
+    cursors: &'a [ShardCursor],
+    shards: &'a [MappedShard],
+    schema: &'a SchemaDescriptor,
+) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'a {
+    move |a, b| {
+        a.key == b.key
+            && columnar::compare_rows(
+                schema,
+                &shards[cursors[a.idx].shard_idx], cursors[a.idx].position,
+                &shards[cursors[b.idx].shard_idx], cursors[b.idx].position,
+            ) == std::cmp::Ordering::Equal
+    }
+}
+
 /// Open input shards, build cursors and heap, run N-way merge loop.
 /// Calls `emit(key, net_weight, shard, row)` for each non-ghost consolidated row.
 ///
-/// The payload-aware heap ordering (`shard_entry_less`) ensures equal
-/// (PK, payload) entries appear consecutively at the heap minimum, so the
-/// pending-group drain below accumulates their weights in O(1) per step.
+/// `collect_min_indices` pulls the entire equal-(PK, payload) group at the
+/// heap root in one DFS, then the fused inner loop sums weights and advances
+/// cursors+heap in a single pass — one cursor read per entry, no snapshot
+/// vec, no per-call allocation after warmup.
 fn open_and_merge(
     input_files: &[&CStr],
     schema: &SchemaDescriptor,
@@ -190,51 +206,42 @@ fn open_and_merge(
         &shard_entry_less(&cursors, &shards, schema),
     );
 
-    let mut has_pending = false;
-    let mut pending_shard_idx: usize = 0;
-    let mut pending_row: usize = 0;
-    let mut pending_key: u128 = 0;
-    let mut pending_weight: i64 = 0;
+    let mut group: Vec<usize> = Vec::with_capacity(cursors.len());
 
     while !tree.is_empty() {
-        let ci = tree.min_idx();
-        let si = cursors[ci].shard_idx;
-        let row = cursors[ci].position;
-        let cur_key = shards[si].get_pk(row);
-        let cur_weight = shards[si].get_weight(row);
-
-        let same_group = has_pending
-            && cur_key == pending_key
-            && columnar::compare_rows(
-                schema,
-                &shards[pending_shard_idx], pending_row,
-                &shards[si], row,
-            ) == std::cmp::Ordering::Equal;
-
-        if same_group {
-            pending_weight += cur_weight;
-        } else {
-            if has_pending && pending_weight != 0 {
-                emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
-            }
-            pending_shard_idx = si;
-            pending_row = row;
-            pending_key = cur_key;
-            pending_weight = cur_weight;
-            has_pending = true;
+        let num_min = tree.collect_min_indices(
+            &mut group,
+            &shard_entry_eq(&cursors, &shards, schema),
+        );
+        if num_min == 0 {
+            break;
         }
 
-        cursors[ci].advance(&shards[si]);
-        let new_key = if cursors[ci].is_valid() {
-            Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
-        } else {
-            None
-        };
-        tree.advance(ci, new_key, &shard_entry_less(&cursors, &shards, schema));
-    }
+        // Exemplar: first entry in the group carries the (key, shard, row)
+        // we'll emit if net weight is non-zero.
+        let exemplar_ei = group[0];
+        let exemplar_si = cursors[exemplar_ei].shard_idx;
+        let exemplar_row = cursors[exemplar_ei].position;
+        let key = shards[exemplar_si].get_pk(exemplar_row);
 
-    if has_pending && pending_weight != 0 {
-        emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
+        // Fused loop: sum weights + advance cursor + advance heap per entry.
+        let mut net_weight: i64 = 0;
+        for &ei in &group {
+            let si = cursors[ei].shard_idx;
+            let row = cursors[ei].position;
+            net_weight += shards[si].get_weight(row);
+            cursors[ei].advance(&shards[si]);
+            let new_key = if cursors[ei].is_valid() {
+                Some(cursors[ei].peek_key(&shards[cursors[ei].shard_idx]))
+            } else {
+                None
+            };
+            tree.advance(ei, new_key, &shard_entry_less(&cursors, &shards, schema));
+        }
+
+        if net_weight != 0 {
+            emit(key, net_weight, &shards[exemplar_si], exemplar_row);
+        }
     }
 
     Ok(())
