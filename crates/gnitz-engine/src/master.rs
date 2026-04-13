@@ -595,11 +595,11 @@ impl MasterDispatcher {
         let mut w2m_rc = W2M_HEADER_SIZE as u64;
         let result = (|| -> Result<DecodedWire, String> {
             loop {
-                self.w2m.wait_one(worker, 1000);
                 if let Some((decoded, new_rc)) = self.w2m.try_read(worker, w2m_rc) {
                     w2m_rc = new_rc;
                     return Ok(decoded);
                 }
+                self.w2m.wait_one(worker, 1000);
             }
         })();
         self.w2m.reset_one(worker);
