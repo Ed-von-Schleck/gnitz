@@ -512,13 +512,12 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         return Err("control block region count mismatch");
     }
 
-    // Read 8 bytes from region `r` as a little-endian u64.
     let read8 = |r: usize| -> Result<u64, &'static str> {
         let off = offsets[r] as usize;
         if off + 8 > data.len() {
             return Err("control field truncated");
         }
-        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+        Ok(crate::util::read_u64_le(data, off))
     };
 
     let null_bmp     = read8(ctrl::REGION_NULL_BMP)?;

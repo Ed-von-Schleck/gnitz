@@ -235,8 +235,7 @@ impl WorkerProcess {
     // ── Main event loop ────────────────────────────────────────────────
 
     pub fn run(&mut self) -> i32 {
-        // Startup ACK is unsolicited (no master request triggered it),
-        // so we use the reserved request_id=0 ("untagged") slot.
+        // Startup ACK is unsolicited; request_id=0 is the reserved untagged slot.
         self.send_ack(0, 0, 0);
 
         loop {
@@ -350,9 +349,8 @@ impl WorkerProcess {
             None
         };
 
-        // Capture the request_id before `decoded` is moved into dispatch_inner.
-        // The reactor on the master side keys reply wakers by this id, so every
-        // W2M reply triggered by this message must echo it back.
+        // Captured before `decoded` moves into dispatch_inner so the reply
+        // helpers can echo it back.
         let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
 
         let result = self.dispatch_inner(flags, target_id, decoded, request_id);
@@ -724,7 +722,6 @@ impl WorkerProcess {
             let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
             for tid in ticks {
                 // Deferred ticks lose their original request_id when stashed.
-                // Stage 2+ will preserve it; for now use the unsolicited slot.
                 match self.handle_tick(tid) {
                     Ok(()) => self.send_ack(tid as u64, 0, 0),
                     Err(msg) => self.send_error(&msg, 0),

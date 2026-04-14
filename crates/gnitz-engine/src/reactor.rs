@@ -1,32 +1,22 @@
 //! Single-threaded io_uring reactor.
 //!
-//! Provides three primitives — `block_on`, `spawn`, and `timer` — plus a
-//! reply-routing API (`await_reply` / `register_reply_waker`) that Stage 2+
-//! uses to suspend SELECT futures on master-allocated `request_id`s.
+//! Provides `block_on`, `spawn`, `timer`, and a reply-routing API
+//! (`await_reply` / `register_reply_waker`). The reactor owns its own
+//! `IoUringRing`, separate from the executor's transport ring.
 //!
-//! The reactor owns its own `IoUringRing` (separate from the executor's
-//! transport ring) so the two cannot interfere; Stage 7 unifies them.
+//! Design notes:
 //!
-//! Design choices:
-//!
-//! - `Rc<ReactorShared>` — the reactor is inherently single-threaded
-//!   (master process event loop), and futures need a clonable handle to
-//!   register wakers / submit ops.
-//! - Run queue is `Arc<Mutex<VecDeque<usize>>>`. The waker vtable requires
-//!   `Send + Sync`, but in practice the waker is only used from the same
-//!   thread; the `Arc<Mutex<…>>` pays a small atomic refcount cost that
-//!   matters less than getting the API surface right.
-//! - Task indices are `slab::Slab` keys; wakers carry the index plus a
-//!   handle to the run queue and the waker registry, so wake from outside
-//!   `poll` works without needing a mutable borrow on the reactor.
-//! - Timers are kept in a `BinaryHeap` on the reactor itself, NOT as
-//!   io_uring `Timeout` SQEs. The reactor passes the soonest deadline to
-//!   `submit_and_wait_timeout` so the kernel wakes us at the right time;
-//!   that avoids the lifetime hazard around `Timespec` storage.
-//! - CQE `user_data` uses an 8-bit kind tag in the high byte and a 56-bit
-//!   id in the low bits. The reactor owns its own ring, so this scheme
-//!   does not collide with `gnitz_transport::ring::make_udata` (which is
-//!   used by the executor's separate transport ring).
+//! - Run queue is `Arc<Mutex<VecDeque<usize>>>`. The `Waker` vtable
+//!   requires `Send + Sync`; the master process is single-threaded so
+//!   the mutex never contends, but its presence is API-forced.
+//! - Timers are kept in a `BinaryHeap`, NOT as io_uring `Timeout` SQEs.
+//!   The reactor passes the soonest deadline to `submit_and_wait_timeout`
+//!   so the kernel wakes at the right time; this avoids the lifetime
+//!   hazard around storing `Timespec` for the kernel to dereference later.
+//! - CQE `user_data` packs an 8-bit kind tag in the high byte and a
+//!   56-bit id in the low bits. Distinct from
+//!   `gnitz_transport::ring::make_udata` (which packs an fd), and safe
+//!   from collisions because the reactor owns its own ring.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -110,15 +100,12 @@ struct ReactorShared {
     reply_wakers: RefCell<HashMap<u64, Waker>>,
     /// Min-heap of pending timer deadlines.
     timers: RefCell<BinaryHeap<TimerEntry>>,
-    /// For test-only injection of CQEs (`inject_reply_cqe`, etc.).
     #[cfg(test)]
     injected_cqes: RefCell<VecDeque<Cqe>>,
-    /// Monotonic source for `alloc_request_id`. Wraps in u64 — wrap is not
-    /// reachable in any realistic deployment.
     next_request_id: Cell<u64>,
-    /// True while a panic from a polled future is being unwound; the
-    /// reactor catches it and drops the offending task instead of aborting.
-    /// Used by tests to assert "panic doesn't crash the reactor".
+    /// Set when a polled future panics (and was caught + dropped). Tests
+    /// observe this; production never reads it but the field stays for
+    /// the catch_unwind path to write into.
     last_task_panicked: Cell<bool>,
 }
 
@@ -223,9 +210,7 @@ impl Reactor {
     }
 
     /// Register `w` to fire when a CQE with `(KIND_REPLY, req_id)` arrives.
-    /// Replaces any waker previously registered for the same id. Kept
-    /// `pub(crate)` because Stage 2's `await_reply` machinery will need
-    /// to call it from outside the `ReplyFuture` impl.
+    /// Replaces any waker previously registered for the same id.
     #[allow(dead_code)]
     pub(crate) fn register_reply_waker(&self, req_id: u64, w: Waker) {
         self.inner.reply_wakers.borrow_mut().insert(req_id, w);
@@ -294,20 +279,18 @@ impl Reactor {
         }
     }
 
-    /// Poll a single task in place: borrows the slab mutably for just
-    /// the call, then releases the borrow. The waker captured at spawn
-    /// time targets the same slab key, so subsequent wakes still find
-    /// the task.
+    /// Poll a single task. The future is moved out of the slab for the
+    /// duration of the poll (so it does not hold the slab borrow), then
+    /// reinserted at the SAME key on Pending — slab reuses the lowest
+    /// free key first, and `poll_task` runs synchronously inside `tick`,
+    /// so no concurrent spawn can claim the slot. The waker captured at
+    /// spawn time keys on `key`; without the same-key reinsert it would
+    /// miss the next wake.
     fn poll_task(&self, key: usize) {
         let waker = match self.inner.task_wakers.borrow().get(&key).cloned() {
             Some(w) => w,
             None => return,
         };
-        // The future's poll may register itself with our reply_wakers /
-        // timers RefCells. It must NOT spawn another task or modify the
-        // tasks slab — currently no Stage 1 user does. We pop the future
-        // out, poll it without holding the slab borrow, and reinsert if
-        // it returned Pending.
         let mut task = match self.inner.tasks.borrow_mut().try_remove(key) {
             Some(t) => t,
             None => return,
@@ -321,27 +304,10 @@ impl Reactor {
                 self.inner.task_wakers.borrow_mut().remove(&key);
             }
             Ok(Poll::Pending) => {
-                // Reinsert at the SAME key: the waker captured `key` and
-                // would otherwise miss a re-poll after wake.
                 let mut tasks = self.inner.tasks.borrow_mut();
                 let new_key = tasks.insert(task);
-                if new_key != key {
-                    // Slab does not preserve keys across remove + insert
-                    // in general. If this fires the run-queue plumbing
-                    // and the per-task waker map are out of sync. Update
-                    // both atomically: remove the new entry, reinsert at
-                    // the original key, and rebuild the waker.
-                    let task = tasks.remove(new_key);
-                    // Ensure the original slot is free, then place the
-                    // task back via `insert`. Slab reuses the lowest
-                    // free key first, so this works as long as we did
-                    // not concurrently spawn — which we don't, since
-                    // poll_task runs synchronously inside `tick`.
-                    debug_assert!(!tasks.contains(key));
-                    let placed = tasks.insert(task);
-                    debug_assert_eq!(placed, key,
-                        "slab key drift: spawned a new task during poll?");
-                }
+                debug_assert_eq!(new_key, key,
+                    "slab key drift: poll spawned a new task while reinserting");
             }
             Err(_) => {
                 self.inner.task_wakers.borrow_mut().remove(&key);
@@ -365,28 +331,18 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn dispatch_cqe(&self, cqe: Cqe) {
+    fn dispatch_cqe(&self, cqe: Cqe) {
         let kind = udata_kind(cqe.user_data);
         let id = udata_id(cqe.user_data);
-        match kind {
-            KIND_REPLY => {
-                if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
-                    w.wake();
-                }
-            }
-            _ => {
-                // Other kinds will be wired in Stage 2+ (POLL_EVENTFD,
-                // FSYNC). For Stage 1 we silently ignore them; the
-                // reactor still runs to completion.
+        if kind == KIND_REPLY {
+            if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
+                w.wake();
             }
         }
+        // Other kinds (TIMEOUT, FSYNC, POLL_EVENTFD) are unused by Stage 1
+        // and silently dropped; future stages will route them.
     }
 
-    /// Compute the wait timeout for the next blocking submit, in
-    /// milliseconds. Returns 0 if the run queue is non-empty (don't
-    /// block at all), or `i32::MAX` if there is nothing to wait on
-    /// (block until a CQE arrives — this is fine because the only
-    /// way a CQE arrives is from io_uring ops we submitted).
     fn next_block_deadline_ms(&self) -> i32 {
         if !self.inner.run_queue.lock().unwrap().is_empty() {
             return 0;
@@ -416,9 +372,8 @@ impl Reactor {
         }
     }
 
-    /// Test-only: inject a synthetic CQE so unit tests can exercise reply
-    /// routing without a real worker. The CQE is dispatched on the next
-    /// `tick` call.
+    /// Test-only: inject a synthetic CQE for reply-routing tests.
+    /// Dispatched on the next `tick` (or via `drain_injected_cqes`).
     #[cfg(test)]
     pub fn inject_reply_cqe(&self, req_id: u64) {
         self.inner.injected_cqes.borrow_mut().push_back(Cqe {
@@ -519,12 +474,10 @@ struct ReplyFuture {
 impl Future for ReplyFuture {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // If the reply already arrived (waker fired before we polled)
-        // there is no entry — but also no signal that we got it. The
-        // reactor wakes us either way; once polled here we re-register
-        // and wait again. To avoid spurious blocking, we treat "not
-        // currently registered AND we previously registered" as ready.
-        // Stage 2 will replace this with an explicit "delivered" flag.
+        // "Registered earlier AND no longer in the map" is the only
+        // signal we have that the reply already fired (dispatch_cqe
+        // removes the waker on wake). Without this, the second poll
+        // would re-register and block forever after a delivered reply.
         if self.registered
             && !self.inner.reply_wakers.borrow().contains_key(&self.req_id)
         {
@@ -541,15 +494,9 @@ impl Future for ReplyFuture {
 // TickIdleBarrier
 // ---------------------------------------------------------------------------
 //
-// Stage 2 replaces `executor.deferred_requests` with reactor-spawned tasks
-// that wait on this barrier. `wait()` returns immediately if the barrier
-// is in the "idle" state; otherwise the future suspends until `notify_all`
-// is called (which the executor invokes when `tick_state` transitions
-// `Active → Idle`).
-//
-// Single-threaded by construction; uses a `RefCell` instead of a `Mutex`.
-// `Rc<TickIdleBarrier>` is shared between the executor and every spawned
-// task; cloning is cheap.
+// `wait()` returns immediately when the barrier is in the idle state;
+// otherwise the future suspends until `notify_all` is called. Single-
+// threaded by construction (uses `RefCell`, not `Mutex`).
 
 pub struct TickIdleBarrier {
     /// True when no tick is currently active. `wait()` returns immediately
@@ -933,8 +880,7 @@ mod tests {
 
     /// `register_reply_waker` overrides any earlier registration for the
     /// same id (the more recent caller wins), so a stale waker does not
-    /// fire by mistake. Drives just the CQE-dispatch path so the run
-    /// queue is observable post-wake.
+    /// fire by mistake.
     #[test]
     fn register_reply_waker_replaces() {
         let r = make_reactor();
@@ -943,12 +889,8 @@ mod tests {
         let w2 = make_waker(100, Arc::clone(&waker_q));
         r.register_reply_waker(42, w1);
         r.register_reply_waker(42, w2);
-        // Dispatch the CQE directly so the test observes the run queue
-        // BEFORE `tick` would drain it into `poll_task`.
-        r.dispatch_cqe(Cqe {
-            user_data: udata(KIND_REPLY, 42),
-            res: 0, flags: 0,
-        });
+        r.inject_reply_cqe(42);
+        r.drain_injected_cqes();
         let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
         assert!(q.contains(&100), "second waker (key=100) must win");
         assert!(!q.contains(&99), "first waker (key=99) must have been replaced");

@@ -48,23 +48,24 @@ enum TickState {
 // Deferred reply: result of a SELECT spawned as a reactor task
 // ---------------------------------------------------------------------------
 //
-// The reactor task computes the SELECT result asynchronously (after waiting
-// on TickIdleBarrier). It then pushes a `DeferredReply` into a shared queue;
-// the executor's main loop drains the queue and sends the encoded response
-// to the client via `transport`. Going through a queue keeps the spawned
-// task `Send + 'static` without requiring `transport` to be shareable.
+// Going through a shared queue keeps the spawned task `Send + 'static`
+// without requiring `transport` to be shareable.
 
 struct DeferredReply {
     fd: i32,
     client_id: u64,
     target_id: i64,
-    /// `STATUS_OK` on success; `STATUS_ERROR` carries an `error_msg`.
     status: u32,
     error_msg: String,
-    /// Result batch — `Some` only on STATUS_OK with a non-empty result.
     result: Option<Arc<Batch>>,
-    /// LSN observed when the SELECT executed; non-zero for scans only.
     lsn: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredKind {
+    SeekByIndex,
+    Seek,
+    Scan,
 }
 
 struct PendingDdlResponse {
@@ -176,11 +177,10 @@ pub struct ServerExecutor {
     tick_state: TickState,
     tick_queue_tids: Vec<i64>,
 
-    // Reactor for spawned SELECT tasks. Replaces `deferred_requests`
-    // from earlier versions: SELECTs that arrive during an active tick
-    // are spawned as reactor tasks that await `tick_idle_barrier`,
-    // run the sync fan-out, and push results into `deferred_replies`
-    // for the main loop to send back to clients.
+    // SELECTs that arrive during an active tick are spawned as reactor
+    // tasks; each task awaits `tick_idle_barrier`, runs the sync fan-out,
+    // and pushes a result into `deferred_replies` for the main loop to
+    // ship back to the client.
     reactor: Rc<Reactor>,
     tick_idle_barrier: Rc<TickIdleBarrier>,
     deferred_replies: Rc<RefCell<Vec<DeferredReply>>>,
@@ -910,32 +910,21 @@ impl ServerExecutor {
         }
     }
 
-    /// Spawn a SELECT-family request that arrived during an active tick
-    /// as a reactor task. The task awaits `tick_idle_barrier`, runs the
-    /// sync fan-out against the catalog/dispatcher, and pushes its result
-    /// into `deferred_replies` for the main loop to ship to the client.
-    ///
-    /// The dispatcher is captured as a raw pointer (the executor itself
-    /// holds it as `*mut`) wrapped in a `Send`-marker; this matches the
-    /// existing `unsafe { &mut *self.dispatcher }` pattern used throughout
-    /// `executor.rs` and is safe in practice because the master process
-    /// is single-threaded and the borrow is taken only when the task is
-    /// being polled (which itself runs synchronously inside the main
-    /// loop's `reactor.poll_nonblocking()` call).
+    /// Spawn a SELECT that arrived during an active tick as a reactor task.
+    /// The catalog/dispatcher are captured as raw pointers wrapped in a
+    /// `Send` marker; safe because the master is single-threaded and
+    /// `reactor.poll_nonblocking()` runs synchronously inside the main
+    /// event loop.
     fn spawn_deferred_select(
         &mut self,
         fd: i32,
         client_id: u64,
         target_id: i64,
-        select_flag: u64,
+        kind: DeferredKind,
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
     ) {
-        // Wrap the raw pointers so the spawned future captures `Send`
-        // values. The executor's main loop is the only thing that
-        // touches these pointers, and reactor.poll_nonblocking() runs
-        // *inside* that loop, so there is no real concurrency.
         struct DispPtr(*mut MasterDispatcher);
         unsafe impl Send for DispPtr {}
         struct CatPtr(*mut CatalogEngine);
@@ -945,48 +934,41 @@ impl ServerExecutor {
         let cat_ptr = CatPtr(self.catalog);
         let barrier = Rc::clone(&self.tick_idle_barrier);
         let replies = Rc::clone(&self.deferred_replies);
-        let last_tick_lsn_at_dispatch = self.last_tick_lsn;
+        let scan_lsn = self.last_tick_lsn;
 
         self.reactor.spawn(async move {
-            // Wait for the in-flight tick to complete so the SELECT sees
-            // a consistent view of the data.
             barrier.wait().await;
-
-            // Re-read the latest LSN observed after the barrier wake
-            // (the tick advanced it). For SCAN we want the post-tick LSN;
-            // for SEEK we use lsn=0 (today's behavior).
-            let _ = last_tick_lsn_at_dispatch; // kept for parity with old path
 
             let disp = unsafe { &mut *disp_ptr.0 };
             let cat = unsafe { &mut *cat_ptr.0 };
             let is_user_table = target_id >= FIRST_USER_TABLE_ID;
 
-            let reply = if select_flag == FLAG_SEEK_BY_INDEX {
-                let result = if is_user_table {
-                    disp.fan_out_seek_by_index(
-                        target_id, seek_col_idx as u32, seek_pk_lo, seek_pk_hi,
-                    )
-                } else {
-                    Ok(cat.seek_by_index(target_id, seek_col_idx as u32,
-                        seek_pk_lo, seek_pk_hi).unwrap_or(None))
-                };
-                build_deferred_reply(fd, client_id, target_id, 0, result)
-            } else if select_flag == FLAG_SEEK {
-                let result = if is_user_table {
-                    disp.fan_out_seek(target_id, seek_pk_lo, seek_pk_hi)
-                } else {
-                    Ok(cat.seek_family(target_id, seek_pk_lo, seek_pk_hi)
-                        .unwrap_or(None))
-                };
-                build_deferred_reply(fd, client_id, target_id, 0, result)
-            } else {
-                // Deferred SCAN. Only spawned for user tables (see
-                // dispatch_payload). The LSN snapshot taken at dispatch
-                // time matches the legacy `process_deferred_requests`
-                // behavior (which also captured the post-tick LSN).
-                let result = disp.fan_out_scan(target_id);
-                build_deferred_reply(fd, client_id, target_id,
-                    last_tick_lsn_at_dispatch, result)
+            let reply = match kind {
+                DeferredKind::SeekByIndex => {
+                    let result = if is_user_table {
+                        disp.fan_out_seek_by_index(
+                            target_id, seek_col_idx as u32, seek_pk_lo, seek_pk_hi,
+                        )
+                    } else {
+                        Ok(cat.seek_by_index(target_id, seek_col_idx as u32,
+                            seek_pk_lo, seek_pk_hi).unwrap_or(None))
+                    };
+                    build_deferred_reply(fd, client_id, target_id, 0, result)
+                }
+                DeferredKind::Seek => {
+                    let result = if is_user_table {
+                        disp.fan_out_seek(target_id, seek_pk_lo, seek_pk_hi)
+                    } else {
+                        Ok(cat.seek_family(target_id, seek_pk_lo, seek_pk_hi)
+                            .unwrap_or(None))
+                    };
+                    build_deferred_reply(fd, client_id, target_id, 0, result)
+                }
+                DeferredKind::Scan => {
+                    // dispatch_payload only spawns SCAN for user tables.
+                    let result = disp.fan_out_scan(target_id);
+                    build_deferred_reply(fd, client_id, target_id, scan_lsn, result)
+                }
             };
 
             replies.borrow_mut().push(reply);
@@ -1033,9 +1015,6 @@ impl ServerExecutor {
         debug_assert!(self.tick_queue_tids.is_empty(),
             "tick_queue_tids must be empty after start_all_async_ticks");
         self.tick_state = TickState::Idle;
-        // Wake every reactor task that was suspended on the barrier.
-        // Their continuations run on the next reactor.poll_nonblocking call
-        // in run_loop and their results land in `deferred_replies`.
         self.tick_idle_barrier.notify_all();
 
         // Flush pushes accumulated during the tick (any that arrived after
@@ -1135,16 +1114,12 @@ impl ServerExecutor {
             }
         }
 
-        // During TICK_ACTIVE, defer reads that need consistent view state
-        // by spawning them as reactor tasks. The task awaits the barrier
-        // (wakes when tick_state transitions Active → Idle), runs the sync
-        // fan-out, and pushes its result into `deferred_replies`. The
-        // executor's main loop drains that queue post-poll and sends each
-        // reply via `transport`.
+        // During TICK_ACTIVE, defer reads (so they see the post-tick state)
+        // by spawning them as reactor tasks awaiting `tick_idle_barrier`.
         if self.tick_state == TickState::Active {
             if flags & FLAG_SEEK_BY_INDEX != 0 {
                 self.spawn_deferred_select(
-                    fd, client_id, target_id, FLAG_SEEK_BY_INDEX,
+                    fd, client_id, target_id, DeferredKind::SeekByIndex,
                     decoded.control.seek_pk_lo,
                     decoded.control.seek_pk_hi,
                     decoded.control.seek_col_idx,
@@ -1153,7 +1128,7 @@ impl ServerExecutor {
             }
             if flags & FLAG_SEEK != 0 {
                 self.spawn_deferred_select(
-                    fd, client_id, target_id, FLAG_SEEK,
+                    fd, client_id, target_id, DeferredKind::Seek,
                     decoded.control.seek_pk_lo,
                     decoded.control.seek_pk_hi,
                     0,
@@ -1165,7 +1140,7 @@ impl ServerExecutor {
                 && decoded.data_batch.as_ref().map_or(true, |b| b.count == 0)
             {
                 self.spawn_deferred_select(
-                    fd, client_id, target_id, 0, 0, 0, 0,
+                    fd, client_id, target_id, DeferredKind::Scan, 0, 0, 0,
                 );
                 return Ok(());
             }
@@ -1473,31 +1448,23 @@ impl ServerExecutor {
                 self.check_and_fire_pending_ticks_async();
             }
 
-            // Drive any reactor-spawned tasks (deferred SELECTs that
-            // resumed after the tick-idle barrier fired). This must run
-            // AFTER poll_tick_active so the barrier transition has
-            // already woken any pending awaiters.
+            // Must run AFTER poll_tick_active so any barrier transition
+            // has woken pending awaiters.
             if self.reactor.has_pending_tasks() {
                 self.reactor.poll_nonblocking();
             }
-
-            // Ship any deferred-SELECT replies that the reactor tasks
-            // produced. Drained per-iteration so clients see results
-            // promptly without waiting for the next transport.poll wake.
             self.flush_deferred_replies(transport);
         }
     }
 
-    /// Send all queued `DeferredReply`s to their clients via `transport`.
-    /// Called from the run loop after `reactor.poll_nonblocking()`.
     fn flush_deferred_replies(&mut self, transport: &mut Transport<IoUringRing>) {
-        let queued: Vec<DeferredReply> = {
-            let mut q = self.deferred_replies.borrow_mut();
-            if q.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *q)
-        };
+        // `drain(..)` preserves the source Vec's capacity across iterations;
+        // `mem::take` would reset it to 0 every time and re-allocate on the
+        // next push.
+        let queued: Vec<DeferredReply> = self.deferred_replies.borrow_mut().drain(..).collect();
+        if queued.is_empty() {
+            return;
+        }
         for r in queued {
             if r.status == STATUS_ERROR {
                 self.send_error_response(

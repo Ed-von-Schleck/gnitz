@@ -6,14 +6,11 @@ use crate::ring::{Cqe, Ring};
 pub struct IoUringRing {
     ring: IoUring,
     sq_entries: u32,
-    /// Timespec values handed to outstanding `prep_timeout` SQEs. The
-    /// kernel reads from these pointers when the timer fires (which can
-    /// happen long after `submit()` returns), so the storage must live
-    /// at least until the corresponding CQE is observed. We keep them
-    /// here for the lifetime of the ring; the per-call cost is 16 bytes
-    /// per Timespec, and Stage 1's reactor does not call `prep_timeout`
-    /// (it uses a `BinaryHeap` + `submit_and_wait_timeout`), so the
-    /// production growth path is unused.
+    /// Owns Timespec values for outstanding `prep_timeout` SQEs. The
+    /// kernel reads these pointers when the timer fires (which can be
+    /// long after `submit()` returns), so the storage must outlive the
+    /// CQE. Bounded only by the ring's lifetime — see the
+    /// `debug_assert!` in `prep_timeout`.
     timer_specs: Vec<Box<types::Timespec>>,
 }
 
@@ -88,6 +85,10 @@ impl Ring for IoUringRing {
         );
         let ts_ptr: *const types::Timespec = &*ts;
         self.timer_specs.push(ts);
+        // Catches accidental hot-path use of prep_timeout in debug builds.
+        // Production growth is bounded only by the ring's lifetime.
+        debug_assert!(self.timer_specs.len() < 1024,
+            "prep_timeout leak: {} live Timespecs", self.timer_specs.len());
         let entry = opcode::Timeout::new(ts_ptr)
             .build()
             .user_data(user_data);
