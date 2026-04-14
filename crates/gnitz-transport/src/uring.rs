@@ -6,13 +6,26 @@ use crate::ring::{Cqe, Ring};
 pub struct IoUringRing {
     ring: IoUring,
     sq_entries: u32,
+    /// Timespec values handed to outstanding `prep_timeout` SQEs. The
+    /// kernel reads from these pointers when the timer fires (which can
+    /// happen long after `submit()` returns), so the storage must live
+    /// at least until the corresponding CQE is observed. We keep them
+    /// here for the lifetime of the ring; the per-call cost is 16 bytes
+    /// per Timespec, and Stage 1's reactor does not call `prep_timeout`
+    /// (it uses a `BinaryHeap` + `submit_and_wait_timeout`), so the
+    /// production growth path is unused.
+    timer_specs: Vec<Box<types::Timespec>>,
 }
 
 impl IoUringRing {
     pub fn new(entries: u32) -> std::io::Result<Self> {
         let ring = IoUring::new(entries)?;
         let sq_entries = ring.params().sq_entries();
-        Ok(IoUringRing { ring, sq_entries })
+        Ok(IoUringRing {
+            ring,
+            sq_entries,
+            timer_specs: Vec::new(),
+        })
     }
 
     /// Ensure at least 1 SQ slot is available. If the SQ is full,
@@ -49,6 +62,33 @@ impl Ring for IoUringRing {
     fn prep_accept(&mut self, fd: i32, user_data: u64) {
         self.ensure_sq_room();
         let entry = opcode::AcceptMulti::new(types::Fd(fd))
+            .build()
+            .user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
+    fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64) {
+        self.ensure_sq_room();
+        let entry = opcode::PollAdd::new(types::Fd(fd), mask)
+            .build()
+            .user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
+    fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64) {
+        self.ensure_sq_room();
+        let ts = Box::new(
+            types::Timespec::new()
+                .sec(timeout_ns / 1_000_000_000)
+                .nsec((timeout_ns % 1_000_000_000) as u32),
+        );
+        let ts_ptr: *const types::Timespec = &*ts;
+        self.timer_specs.push(ts);
+        let entry = opcode::Timeout::new(ts_ptr)
             .build()
             .user_data(user_data);
         unsafe {

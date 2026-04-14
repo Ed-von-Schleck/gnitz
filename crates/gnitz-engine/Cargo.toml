@@ -14,6 +14,7 @@ xorf = { version = "0.12", default-features = false }
 libc = "0.2"
 gnitz-transport = { path = "../gnitz-transport" }
 io-uring = "0.7"
+slab = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

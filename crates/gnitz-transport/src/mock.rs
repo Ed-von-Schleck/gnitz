@@ -21,6 +21,15 @@ pub enum PrepRecord {
         fd: i32,
         user_data: u64,
     },
+    PollAdd {
+        fd: i32,
+        mask: u32,
+        user_data: u64,
+    },
+    Timeout {
+        timeout_ns: u64,
+        user_data: u64,
+    },
 }
 
 // Safety: PrepRecord contains raw pointers but MockRing is only used in
@@ -102,6 +111,18 @@ impl Ring for MockRing {
         self.ensure_sq_room();
         self.pending += 1;
         self.prepped.push(PrepRecord::Accept { fd, user_data });
+    }
+
+    fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64) {
+        self.ensure_sq_room();
+        self.pending += 1;
+        self.prepped.push(PrepRecord::PollAdd { fd, mask, user_data });
+    }
+
+    fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64) {
+        self.ensure_sq_room();
+        self.pending += 1;
+        self.prepped.push(PrepRecord::Timeout { timeout_ns, user_data });
     }
 
     fn submit_and_wait_timeout(

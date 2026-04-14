@@ -42,6 +42,16 @@ pub trait Ring {
     fn prep_send(&mut self, fd: i32, buf: *const u8, len: u32, user_data: u64);
     fn prep_accept(&mut self, fd: i32, user_data: u64);
 
+    /// Submit a `PollAdd` op for `fd` with `mask` (POLLIN/POLLOUT bits).
+    /// One-shot: a single CQE is delivered when the fd becomes ready,
+    /// then the op is consumed. Re-arm by submitting another `prep_poll_add`.
+    fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64);
+
+    /// Submit a relative `Timeout` op that fires after `timeout_ns` nanoseconds.
+    /// One-shot: a single CQE is delivered (with `res = -ETIME` on natural
+    /// expiry) when the timer expires.
+    fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64);
+
     /// Submit pending SQEs and optionally wait for completions.
     ///
     /// - `min_complete > 0, timeout_ms > 0`: block until ≥min_complete CQEs
