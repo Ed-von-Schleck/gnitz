@@ -3,6 +3,8 @@
 //! Replaces the duplicated TournamentTree (compact.rs, merge.rs) and
 //! CursorTree (read_cursor.rs) with a single `MergeHeap`.
 
+use std::cmp::Ordering;
+
 pub struct HeapNode {
     pub key: u128,
     pub idx: usize,
@@ -11,6 +13,7 @@ pub struct HeapNode {
 pub struct MergeHeap {
     pub heap: Vec<HeapNode>,
     pub pos_map: Vec<i32>,
+    pub min_indices: Vec<usize>,
 }
 
 #[inline]
@@ -43,7 +46,11 @@ impl MergeHeap {
             }
         }
 
-        let mut h = MergeHeap { heap, pos_map };
+        let mut h = MergeHeap {
+            heap,
+            pos_map,
+            min_indices: Vec::with_capacity(8),
+        };
         let size = h.heap.len();
         for i in (0..size / 2).rev() {
             Self::sift_down_static(&mut h.heap, &mut h.pos_map, i, &less);
@@ -54,6 +61,11 @@ impl MergeHeap {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
+    }
+
+    #[inline]
+    pub fn min_idx(&self) -> usize {
+        self.heap[0].idx
     }
 
     /// Sift down operating on heap/pos_map directly — avoids &mut self borrow conflicts.
@@ -149,48 +161,38 @@ impl MergeHeap {
         }
     }
 
-    /// Collect entry indices for all heap nodes equal to the root into `out`.
-    ///
-    /// The closure receives `(candidate_node, root_node)` and returns true
-    /// when the candidate is in the same equal-group as the root.  Callers
-    /// pre-filter by key in the closure (cheap u128 compare) before falling
-    /// back to a payload comparison.
-    ///
-    /// Borrows `&self` so the caller can interleave `advance` calls with
-    /// reads of `out` (the snapshot lives on the caller's stack, not in the
-    /// heap struct).  Reuses the caller-supplied vec — clear is amortized,
-    /// no allocation in steady state.
+    /// Collect all entries equal to the root into `min_indices`.
+    /// `eq_root(node_at_idx, root_node)` compares a heap node to the root
+    /// and returns `Ordering::Equal` if the entry should be included.
     pub fn collect_min_indices(
-        &self,
-        out: &mut Vec<usize>,
-        eq_root: &impl Fn(&HeapNode, &HeapNode) -> bool,
+        &mut self,
+        eq_root: &impl Fn(&HeapNode, &HeapNode) -> Ordering,
     ) -> usize {
-        out.clear();
-        let heap = &self.heap;
-        let n = heap.len();
-        if n == 0 {
+        self.min_indices.clear();
+        if self.heap.is_empty() {
             return 0;
         }
-        // Root is always equal to itself — push it without calling eq_root.
-        out.push(heap[0].idx);
-        // DFS over remaining heap nodes; subtree-prune wherever the
-        // payload-aware comparison rejects (heap order alone doesn't suffice
-        // when payload-equal nodes can sit anywhere under the root).
+        let heap = &self.heap;
         let mut stack = [0usize; 64];
-        let mut sp = 0;
-        if 1 < n { stack[sp] = 1; sp += 1; }
-        if 2 < n { stack[sp] = 2; sp += 1; }
+        let mut sp = 1;
+        stack[0] = 0;
         while sp > 0 {
             sp -= 1;
             let idx = stack[sp];
-            if eq_root(&heap[idx], &heap[0]) {
-                out.push(heap[idx].idx);
+            if idx == 0 || eq_root(&heap[idx], &heap[0]) == Ordering::Equal {
+                self.min_indices.push(heap[idx].idx);
+                let right = 2 * idx + 2;
+                if right < heap.len() {
+                    stack[sp] = right;
+                    sp += 1;
+                }
                 let left = 2 * idx + 1;
-                let right = left + 1;
-                if right < n { stack[sp] = right; sp += 1; }
-                if left < n { stack[sp] = left; sp += 1; }
+                if left < heap.len() {
+                    stack[sp] = left;
+                    sp += 1;
+                }
             }
         }
-        out.len()
+        self.min_indices.len()
     }
 }

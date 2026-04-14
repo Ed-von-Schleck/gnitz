@@ -236,11 +236,8 @@ pub struct ReadCursor<'a> {
     pub current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
-    /// Indices of entries belonging to the currently-emitted equal-(PK,
-    /// payload) group.  Filled by `find_next_non_ghost` before returning
-    /// `valid = true`; consumed by the next `advance()` to move those
-    /// cursors forward.  Reused across calls — no per-step allocation.
-    pending_group: Vec<usize>,
+    // Reusable buffer for advance indices
+    advance_buf: Vec<usize>,
 }
 
 impl<'a> ReadCursor<'a> {
@@ -279,7 +276,7 @@ impl<'a> ReadCursor<'a> {
             current_null_word: 0,
             current_entry_idx: 0,
             current_row: 0,
-            pending_group: Vec::with_capacity(n),
+            advance_buf: Vec::with_capacity(n),
         };
         cursor.find_next_non_ghost();
         cursor
@@ -307,10 +304,9 @@ impl<'a> ReadCursor<'a> {
         }
 
         if let Some(ref mut tree) = self.tree {
-            // pending_group was populated by the previous find_next_non_ghost
-            // and identifies the cursors that contributed to the row we just
-            // emitted.  Advance each one and re-sift the heap.
-            for &ei in &self.pending_group {
+            self.advance_buf.clear();
+            self.advance_buf.extend_from_slice(&tree.min_indices);
+            for &ei in &self.advance_buf {
                 self.entries[ei].advance();
                 let new_key = if self.entries[ei].is_valid() {
                     Some(self.entries[ei].peek_key())
@@ -356,23 +352,21 @@ impl<'a> ReadCursor<'a> {
         let schema = &self.schema;
 
         while !tree.is_empty() {
-            let num_min = {
-                let eq_root = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                    entry_cmp(&self.entries, schema, a, b) == Ordering::Equal
-                };
-                tree.collect_min_indices(&mut self.pending_group, &eq_root)
+            let eq_root = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> Ordering {
+                entry_cmp(&self.entries, schema, a, b)
             };
+            let num_min = tree.collect_min_indices(&eq_root);
             if num_min == 0 {
                 break;
             }
 
             let mut net_weight: i64 = 0;
-            for &ei in &self.pending_group {
-                net_weight += self.entries[ei].weight();
+            for i in 0..num_min {
+                net_weight += self.entries[tree.min_indices[i]].weight();
             }
 
             if net_weight != 0 {
-                let exemplar = self.pending_group[0];
+                let exemplar = tree.min_indices[0];
                 let pos = self.entries[exemplar].position;
                 self.valid = true;
                 let pk = self.entries[exemplar].source.get_pk(pos);
@@ -385,12 +379,10 @@ impl<'a> ReadCursor<'a> {
                 return;
             }
 
-            // Ghost group (net weight 0).  Advance these cursors in place
-            // here — caller never sees this group, so we can't defer to
-            // advance().  Reads pending_group while mutating entries; safe
-            // because pending_group is owned by ReadCursor, not the heap.
-            for i in 0..self.pending_group.len() {
-                let ei = self.pending_group[i];
+            self.advance_buf.clear();
+            self.advance_buf
+                .extend_from_slice(&tree.min_indices[..num_min]);
+            for &ei in &self.advance_buf {
                 self.entries[ei].advance();
                 let new_key = if self.entries[ei].is_valid() {
                     Some(self.entries[ei].peek_key())
