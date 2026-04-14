@@ -31,6 +31,8 @@ use gnitz_transport::ring::{Cqe, Ring};
 use gnitz_transport::uring::IoUringRing;
 use slab::Slab;
 
+use crate::ipc::{DecodedWire, W2mReceiver, W2M_HEADER_SIZE};
+
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
 // ---------------------------------------------------------------------------
@@ -98,6 +100,13 @@ struct ReactorShared {
     task_wakers: RefCell<HashMap<usize, Waker>>,
     /// Reply wakers keyed by request_id; populated by `await_reply`.
     reply_wakers: RefCell<HashMap<u64, Waker>>,
+    parked_replies: RefCell<HashMap<u64, DecodedWire>>,
+    w2m: RefCell<Option<Rc<W2mReceiver>>>,
+    in_flight: RefCell<Vec<usize>>,
+    /// Independent of the dispatcher's `async_w2m_rcs`: the two are used
+    /// in disjoint time windows (reactor only between barrier notify
+    /// and the next sync W2M op).
+    w2m_cursors: RefCell<Vec<u64>>,
     /// Min-heap of pending timer deadlines.
     timers: RefCell<BinaryHeap<TimerEntry>>,
     #[cfg(test)]
@@ -125,6 +134,10 @@ impl Reactor {
             run_queue: Arc::new(Mutex::new(VecDeque::new())),
             task_wakers: RefCell::new(HashMap::new()),
             reply_wakers: RefCell::new(HashMap::new()),
+            parked_replies: RefCell::new(HashMap::new()),
+            w2m: RefCell::new(None),
+            in_flight: RefCell::new(Vec::new()),
+            w2m_cursors: RefCell::new(Vec::new()),
             timers: RefCell::new(BinaryHeap::new()),
             #[cfg(test)]
             injected_cqes: RefCell::new(VecDeque::new()),
@@ -199,13 +212,45 @@ impl Reactor {
         }
     }
 
-    /// Future that completes when a W2M reply with `req_id` arrives.
-    /// Stage 2 uses this to suspend SELECT-family futures.
-    pub fn await_reply(&self, req_id: u64) -> impl Future<Output = ()> {
+    /// Future that resolves to the decoded W2M reply for `req_id`.
+    pub fn await_reply(&self, req_id: u64) -> impl Future<Output = DecodedWire> {
         ReplyFuture {
             req_id,
-            registered: false,
             inner: Rc::clone(&self.inner),
+        }
+    }
+
+    /// Arm POLL_ADD on every worker eventfd and stash the W2M handle.
+    /// Re-arms on each one-shot firing, so the wiring lasts the
+    /// lifetime of the executor.
+    pub fn attach_w2m(&self, w2m: Rc<W2mReceiver>) {
+        let nw = w2m.num_workers();
+        *self.inner.in_flight.borrow_mut() = vec![0; nw];
+        *self.inner.w2m_cursors.borrow_mut() = vec![W2M_HEADER_SIZE as u64; nw];
+        let efds: Vec<i32> = w2m.efds().to_vec();
+        *self.inner.w2m.borrow_mut() = Some(w2m);
+        for (w, &efd) in efds.iter().enumerate() {
+            self.arm_poll_eventfd(efd, w as u64);
+        }
+    }
+
+    fn arm_poll_eventfd(&self, fd: i32, worker_id: u64) {
+        self.inner.ring.borrow_mut().prep_poll_add(
+            fd, libc::POLLIN as u32, udata(KIND_POLL_EVENTFD, worker_id),
+        );
+    }
+
+    /// Must be called immediately after submitting a SAL message that
+    /// will produce a reply on worker `w`; `drain_w2m_for_worker` uses
+    /// this to decide when the W2M ring for that worker is drained.
+    pub fn increment_in_flight(&self, w: usize) {
+        self.inner.in_flight.borrow_mut()[w] += 1;
+    }
+
+    /// Drive the reactor until the task slab is empty. Blocks.
+    pub fn block_until_idle(&self) {
+        while !self.inner.tasks.borrow().is_empty() {
+            self.tick(true);
         }
     }
 
@@ -334,13 +379,80 @@ impl Reactor {
     fn dispatch_cqe(&self, cqe: Cqe) {
         let kind = udata_kind(cqe.user_data);
         let id = udata_id(cqe.user_data);
-        if kind == KIND_REPLY {
-            if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
-                w.wake();
+        match kind {
+            KIND_REPLY => {
+                if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
+                    w.wake();
+                }
+            }
+            KIND_POLL_EVENTFD => {
+                self.drain_w2m_for_worker(id as usize);
+                // POLL_ADD is one-shot — re-arm.
+                let efd = self.inner.w2m.borrow().as_ref()
+                    .map(|w2m| w2m.efds()[id as usize]);
+                if let Some(efd) = efd {
+                    self.arm_poll_eventfd(efd, id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Decode every unread W2M message for worker `w` and route each
+    /// through `route_reply`. The mmap read + cursor snap live here;
+    /// the pure bookkeeping lives in `route_reply` so it can be
+    /// exercised directly from unit tests.
+    fn drain_w2m_for_worker(&self, w: usize) {
+        let w2m = Rc::clone(
+            self.inner.w2m.borrow().as_ref()
+                .expect("drain_w2m_for_worker called before attach_w2m"),
+        );
+        // A sync path may have called `reset_one` behind our back; if our
+        // cursor advanced past the new write_cursor we would otherwise
+        // sit past end-of-ring forever.
+        {
+            let wc = w2m.write_cursor(w);
+            let mut cursors = self.inner.w2m_cursors.borrow_mut();
+            if cursors[w] > wc {
+                cursors[w] = W2M_HEADER_SIZE as u64;
             }
         }
-        // Other kinds (TIMEOUT, FSYNC, POLL_EVENTFD) are unused by Stage 1
-        // and silently dropped; future stages will route them.
+        loop {
+            let cursor = self.inner.w2m_cursors.borrow()[w];
+            let (decoded, new_rc) = match w2m.try_read(w, cursor) {
+                Some(v) => v,
+                None => break,
+            };
+            self.inner.w2m_cursors.borrow_mut()[w] = new_rc;
+
+            if self.route_reply(w, decoded) {
+                w2m.reset_one(w);
+                self.inner.w2m_cursors.borrow_mut()[w] = W2M_HEADER_SIZE as u64;
+            }
+        }
+    }
+
+    /// Park `decoded` for its awaiter and update bookkeeping. Returns
+    /// `true` iff this reply drained the last outstanding request for
+    /// `w` (caller resets the ring). Unrouted replies are logged and
+    /// dropped — they do not decrement `in_flight`, since we did not
+    /// track them in the first place.
+    fn route_reply(&self, w: usize, decoded: DecodedWire) -> bool {
+        let req_id = decoded.control.request_id;
+        let waker = self.inner.reply_wakers.borrow_mut().remove(&req_id);
+        match waker {
+            Some(waker) => {
+                self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
+                waker.wake();
+                let mut inflight = self.inner.in_flight.borrow_mut();
+                inflight[w] = inflight[w].saturating_sub(1);
+                inflight[w] == 0
+            }
+            None => {
+                crate::gnitz_warn!("reactor: unrouted W2M reply req_id={}", req_id);
+                false
+            }
+        }
     }
 
     fn next_block_deadline_ms(&self) -> i32 {
@@ -381,6 +493,35 @@ impl Reactor {
             res: 0,
             flags: 0,
         });
+    }
+
+    /// Test-only: park a synthetic `DecodedWire` for `req_id` and wake
+    /// any matching awaiter.
+    #[cfg(test)]
+    pub fn inject_parked_reply(&self, req_id: u64, decoded: DecodedWire) {
+        self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
+        if let Some(waker) = self.inner.reply_wakers.borrow_mut().remove(&req_id) {
+            waker.wake();
+        }
+    }
+
+    /// Test-only: size `in_flight` / `w2m_cursors` without a real W2M
+    /// ring so `route_reply` can be driven directly.
+    #[cfg(test)]
+    pub fn test_init_state(&self, num_workers: usize) {
+        *self.inner.in_flight.borrow_mut() = vec![0; num_workers];
+        *self.inner.w2m_cursors.borrow_mut() = vec![W2M_HEADER_SIZE as u64; num_workers];
+    }
+
+    /// Test-only: drive `route_reply` with a synthetic decoded wire.
+    #[cfg(test)]
+    pub fn test_route_reply(&self, w: usize, decoded: DecodedWire) -> bool {
+        self.route_reply(w, decoded)
+    }
+
+    #[cfg(test)]
+    pub fn in_flight_len(&self, w: usize) -> usize {
+        self.inner.in_flight.borrow()[w]
     }
 
     #[cfg(test)]
@@ -467,25 +608,17 @@ impl Future for TimerFuture {
 
 struct ReplyFuture {
     req_id: u64,
-    registered: bool,
     inner: Rc<ReactorShared>,
 }
 
 impl Future for ReplyFuture {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // "Registered earlier AND no longer in the map" is the only
-        // signal we have that the reply already fired (dispatch_cqe
-        // removes the waker on wake). Without this, the second poll
-        // would re-register and block forever after a delivered reply.
-        if self.registered
-            && !self.inner.reply_wakers.borrow().contains_key(&self.req_id)
-        {
-            return Poll::Ready(());
+    type Output = DecodedWire;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<DecodedWire> {
+        if let Some(decoded) = self.inner.parked_replies.borrow_mut().remove(&self.req_id) {
+            return Poll::Ready(decoded);
         }
         self.inner.reply_wakers.borrow_mut()
             .insert(self.req_id, cx.waker().clone());
-        self.registered = true;
         Poll::Pending
     }
 }
@@ -660,68 +793,38 @@ mod tests {
         assert_eq!(order.borrow().as_slice(), &[1, 2]);
     }
 
-    /// Inject a synthetic reply CQE; an `await_reply` future for the
-    /// matching `req_id` must resolve.
+    /// A parked DecodedWire must be returned to the awaiter on resume.
     #[test]
     fn reply_waker_dispatch() {
         let r = make_reactor();
-        let inner = Rc::clone(&r.inner);
-        // Schedule a tick that will inject the CQE, simulating the
-        // worker writing a reply.
-        let inject_inner = Rc::clone(&inner);
-        let _bg = r.spawn(async move {
-            // Yield once so the awaiter has registered first.
-            YieldOnce::new().await;
-            inject_inner.injected_cqes.borrow_mut().push_back(Cqe {
-                user_data: udata(KIND_REPLY, 7),
-                res: 0,
-                flags: 0,
-            });
-        });
+        let got: Rc<StdCell<u64>> = Rc::new(StdCell::new(0));
+        let got2 = Rc::clone(&got);
+        let reply_fut = r.await_reply(7);
+        r.inject_parked_reply(7, synthetic_decoded_wire(7));
         r.block_on(async move {
-            ReplyFuture {
-                req_id: 7,
-                registered: false,
-                inner,
-            }.await;
+            got2.set(reply_fut.await.control.request_id);
         });
+        assert_eq!(got.get(), 7);
     }
 
-    /// A reply for a *different* req_id must not wake an unrelated awaiter.
-    /// Times out via a guard timer rather than blocking forever.
+    /// A reply for a different req_id must not wake an unrelated awaiter:
+    /// the guard timer must win the race.
     #[test]
     fn reply_waker_no_spurious() {
         let r = make_reactor();
-        // Inject a reply for req_id=8, await req_id=7 with a 50ms guard.
-        let inner = Rc::clone(&r.inner);
-        let bg_inner = Rc::clone(&inner);
-        r.spawn(async move {
-            YieldOnce::new().await;
-            bg_inner.injected_cqes.borrow_mut().push_back(Cqe {
-                user_data: udata(KIND_REPLY, 8),
-                res: 0,
-                flags: 0,
-            });
-        });
+        r.inject_parked_reply(8, synthetic_decoded_wire(8));
         let resolved: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-        let r2 = resolved.clone();
-        let timer_inner = Rc::clone(&inner);
-        let reply_inner = Rc::clone(&inner);
+        let r2 = Rc::clone(&resolved);
+        let timer_inner = Rc::clone(&r.inner);
+        let reply_fut = r.await_reply(7);
         r.block_on(async move {
-            // Race the 7-awaiter against a 50ms timer; the timer must win.
             let timer = TimerFuture {
                 deadline: Instant::now() + Duration::from_millis(50),
                 registered: false,
                 inner: timer_inner,
             };
-            let reply = ReplyFuture {
-                req_id: 7,
-                registered: false,
-                inner: reply_inner,
-            };
-            select_two(timer, reply, &r2).await;
+            select_reply_or_timer(timer, reply_fut, &r2).await;
         });
-        // Guard timer wins → reply did NOT spuriously wake.
         assert!(!resolved.get(), "reply for req_id=8 must not wake req_id=7 awaiter");
     }
 
@@ -935,26 +1038,121 @@ mod tests {
     /// Race a timer and a reply future. Sets `flag` to true if the reply
     /// resolved first, leaves it false if the timer won. Polls both each
     /// tick; the first to return Ready wins.
-    fn select_two<'a, A, B>(
-        a: A, b: B, flag: &'a Rc<StdCell<bool>>,
+    fn select_reply_or_timer<'a, T, R>(
+        timer: T, reply: R, flag: &'a Rc<StdCell<bool>>,
     ) -> impl Future<Output = ()> + 'a
     where
-        A: Future<Output = ()> + 'a,
-        B: Future<Output = ()> + 'a,
+        T: Future<Output = ()> + 'a,
+        R: Future<Output = DecodedWire> + 'a,
     {
         async move {
-            let mut a = Box::pin(a);
-            let mut b = Box::pin(b);
+            let mut timer = Box::pin(timer);
+            let mut reply = Box::pin(reply);
             std::future::poll_fn(move |cx| {
-                if a.as_mut().poll(cx).is_ready() {
+                if timer.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());
                 }
-                if b.as_mut().poll(cx).is_ready() {
+                if reply.as_mut().poll(cx).is_ready() {
                     flag.set(true);
                     return Poll::Ready(());
                 }
                 Poll::Pending
             }).await
         }
+    }
+
+    /// Build a minimal `DecodedWire` for tests — only `request_id` is
+    /// load-bearing; every other field is zeroed / empty.
+    fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
+        use crate::ipc::DecodedControl;
+        DecodedWire {
+            control: DecodedControl {
+                status: 0,
+                client_id: 0,
+                target_id: 0,
+                flags: 0,
+                seek_pk_lo: 0,
+                seek_pk_hi: 0,
+                seek_col_idx: 0,
+                request_id: req_id,
+                error_msg: Vec::new(),
+            },
+            schema: None,
+            data_batch: None,
+        }
+    }
+
+    /// `block_until_idle` must drive spawned tasks to completion.
+    #[test]
+    fn block_until_idle_completes() {
+        let r = make_reactor();
+        let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        let done2 = Rc::clone(&done);
+        let reply = r.await_reply(99);
+        r.spawn(async move {
+            let _ = reply.await;
+            done2.set(true);
+        });
+        r.inject_parked_reply(99, synthetic_decoded_wire(99));
+        r.block_until_idle();
+        assert!(done.get());
+        assert_eq!(r.task_count(), 0);
+    }
+
+    /// Routed reply: pops the waker, parks the wire, decrements
+    /// `in_flight`, and reports `should_reset` when the counter hits 0.
+    #[test]
+    fn route_reply_routed_path_decrements_and_signals_reset() {
+        let r = make_reactor();
+        r.test_init_state(2);
+        r.increment_in_flight(1);
+
+        // Register a waker for req_id=42.
+        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
+        r.register_reply_waker(42, waker);
+
+        let should_reset = r.test_route_reply(1, synthetic_decoded_wire(42));
+
+        assert!(should_reset, "in_flight back to 0 must signal reset");
+        assert_eq!(r.in_flight_len(1), 0);
+        assert!(r.inner.parked_replies.borrow().contains_key(&42));
+        assert!(!r.inner.reply_wakers.borrow().contains_key(&42));
+    }
+
+    /// Routed reply with outstanding siblings must NOT signal reset.
+    /// Guards against premature ring resets when multiple async ops
+    /// target the same worker.
+    #[test]
+    fn route_reply_leaves_reset_deferred_while_in_flight() {
+        let r = make_reactor();
+        r.test_init_state(1);
+        r.increment_in_flight(0);
+        r.increment_in_flight(0);
+        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
+        r.register_reply_waker(5, waker);
+
+        let should_reset = r.test_route_reply(0, synthetic_decoded_wire(5));
+
+        assert!(!should_reset);
+        assert_eq!(r.in_flight_len(0), 1);
+    }
+
+    /// Unrouted reply (no waker): must NOT decrement `in_flight` —
+    /// decrementing untracked requests would corrupt the ring-reset
+    /// signal for legitimate outstanding ones.
+    #[test]
+    fn route_reply_unrouted_does_not_touch_in_flight() {
+        let r = make_reactor();
+        r.test_init_state(1);
+        r.increment_in_flight(0);
+        // No waker registered for req_id=7.
+
+        let should_reset = r.test_route_reply(0, synthetic_decoded_wire(7));
+
+        assert!(!should_reset);
+        assert_eq!(r.in_flight_len(0), 1,
+            "unrouted reply must leave tracked in_flight untouched");
+        assert!(r.inner.parked_replies.borrow().is_empty(),
+            "unrouted replies must not leak into parked_replies");
     }
 }

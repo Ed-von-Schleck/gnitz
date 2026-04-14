@@ -934,44 +934,54 @@ impl ServerExecutor {
         let cat_ptr = CatPtr(self.catalog);
         let barrier = Rc::clone(&self.tick_idle_barrier);
         let replies = Rc::clone(&self.deferred_replies);
+        let reactor = Rc::clone(&self.reactor);
         let scan_lsn = self.last_tick_lsn;
 
         self.reactor.spawn(async move {
             barrier.wait().await;
 
-            let disp = unsafe { &mut *disp_ptr.0 };
-            let cat = unsafe { &mut *cat_ptr.0 };
             let is_user_table = target_id >= FIRST_USER_TABLE_ID;
-
-            let reply = match kind {
-                DeferredKind::SeekByIndex => {
-                    let result = if is_user_table {
-                        disp.fan_out_seek_by_index(
-                            target_id, seek_col_idx as u32, seek_pk_lo, seek_pk_hi,
-                        )
-                    } else {
-                        Ok(cat.seek_by_index(target_id, seek_col_idx as u32,
-                            seek_pk_lo, seek_pk_hi).unwrap_or(None))
-                    };
-                    build_deferred_reply(fd, client_id, target_id, 0, result)
-                }
-                DeferredKind::Seek => {
-                    let result = if is_user_table {
-                        disp.fan_out_seek(target_id, seek_pk_lo, seek_pk_hi)
-                    } else {
-                        Ok(cat.seek_family(target_id, seek_pk_lo, seek_pk_hi)
-                            .unwrap_or(None))
-                    };
-                    build_deferred_reply(fd, client_id, target_id, 0, result)
-                }
-                DeferredKind::Scan => {
+            let (lsn, result) = match kind {
+                DeferredKind::SeekByIndex => (0, if is_user_table {
+                    resolve_async(
+                        crate::master::MasterDispatcher::fan_out_seek_by_index_async(
+                            disp_ptr.0, &reactor, target_id,
+                            seek_col_idx as u32, seek_pk_lo, seek_pk_hi,
+                        ).await,
+                        || unsafe {
+                            (&mut *disp_ptr.0).fan_out_seek_by_index(
+                                target_id, seek_col_idx as u32, seek_pk_lo, seek_pk_hi,
+                            )
+                        },
+                    )
+                } else {
+                    let cat = unsafe { &mut *cat_ptr.0 };
+                    Ok(cat.seek_by_index(target_id, seek_col_idx as u32,
+                        seek_pk_lo, seek_pk_hi).unwrap_or(None))
+                }),
+                DeferredKind::Seek => (0, if is_user_table {
+                    crate::master::MasterDispatcher::fan_out_seek_async(
+                        disp_ptr.0, &reactor, target_id, seek_pk_lo, seek_pk_hi,
+                    ).await.map_err(|e| match e {
+                        crate::master::FanOutError::Worker(msg) => msg,
+                        // Seek has no fallback: pk routing is always cached.
+                        crate::master::FanOutError::NeedsSyncFallback => unreachable!(),
+                    })
+                } else {
+                    let cat = unsafe { &mut *cat_ptr.0 };
+                    Ok(cat.seek_family(target_id, seek_pk_lo, seek_pk_hi)
+                        .unwrap_or(None))
+                }),
+                DeferredKind::Scan => (scan_lsn, resolve_async(
                     // dispatch_payload only spawns SCAN for user tables.
-                    let result = disp.fan_out_scan(target_id);
-                    build_deferred_reply(fd, client_id, target_id, scan_lsn, result)
-                }
+                    crate::master::MasterDispatcher::fan_out_scan_async(
+                        disp_ptr.0, &reactor, target_id,
+                    ).await,
+                    || unsafe { (&mut *disp_ptr.0).fan_out_scan(target_id) },
+                )),
             };
 
-            replies.borrow_mut().push(reply);
+            replies.borrow_mut().push(build_deferred_reply(fd, client_id, target_id, lsn, result));
         });
     }
 
@@ -1016,6 +1026,11 @@ impl ServerExecutor {
             "tick_queue_tids must be empty after start_all_async_ticks");
         self.tick_state = TickState::Idle;
         self.tick_idle_barrier.notify_all();
+
+        // Deferred SELECTs must complete before any subsequent sync W2M
+        // op runs: the reactor owns the W2M ring during this window.
+        self.reactor.block_until_idle();
+        self.flush_deferred_replies(transport);
 
         // Flush pushes accumulated during the tick (any that arrived after
         // the pre-write, or all of them if pre-write wasn't triggered).
@@ -1332,6 +1347,7 @@ impl ServerExecutor {
 
         let sal_fd = unsafe { &*dispatcher }.sal_fd();
         let mut exec = ServerExecutor::new(catalog, dispatcher, sal_fd);
+        exec.reactor.attach_w2m(unsafe { &*dispatcher }.w2m_handle());
         exec.run_loop(&mut transport);
         0
     }
@@ -1447,13 +1463,6 @@ impl ServerExecutor {
             } else {
                 self.check_and_fire_pending_ticks_async();
             }
-
-            // Must run AFTER poll_tick_active so any barrier transition
-            // has woken pending awaiters.
-            if self.reactor.has_pending_tasks() {
-                self.reactor.poll_nonblocking();
-            }
-            self.flush_deferred_replies(transport);
         }
     }
 
@@ -1486,6 +1495,22 @@ impl ServerExecutor {
 // ---------------------------------------------------------------------------
 // Deferred-reply helper used by spawn_deferred_select
 // ---------------------------------------------------------------------------
+
+/// Project a `FanOutError` outcome onto a plain `Result<Option<Batch>, String>`,
+/// invoking `sync` only when the async path requested a sync fallback.
+fn resolve_async<F>(
+    async_result: Result<Option<Batch>, crate::master::FanOutError>,
+    sync: F,
+) -> Result<Option<Batch>, String>
+where
+    F: FnOnce() -> Result<Option<Batch>, String>,
+{
+    match async_result {
+        Ok(r) => Ok(r),
+        Err(crate::master::FanOutError::NeedsSyncFallback) => sync(),
+        Err(crate::master::FanOutError::Worker(e)) => Err(e),
+    }
+}
 
 fn build_deferred_reply(
     fd: i32,

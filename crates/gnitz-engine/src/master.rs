@@ -237,11 +237,21 @@ fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndex
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
+/// Result of an async fan-out attempt.
+///
+/// `NeedsSyncFallback` is a first-class success signal, not an error:
+/// the operation couldn't run truly-async (broadcast reply routing is
+/// not wired in Stage 2) and must be retried on the sync path.
+pub enum FanOutError {
+    Worker(String),
+    NeedsSyncFallback,
+}
+
 pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: Vec<i32>,
     sal: SalWriter,
-    w2m: W2mReceiver,
+    w2m: Rc<W2mReceiver>,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
@@ -282,7 +292,7 @@ impl MasterDispatcher {
             num_workers,
             worker_pids,
             sal,
-            w2m,
+            w2m: Rc::new(w2m),
             catalog,
             router: PartitionRouter::new(),
             async_remaining: 0,
@@ -441,6 +451,12 @@ impl MasterDispatcher {
 
     pub(crate) fn reset_w2m_cursors(&self) {
         self.w2m.reset_all();
+    }
+
+    /// Expose the shared W2M handle so the executor can attach it to the
+    /// reactor for async fan-out reply routing.
+    pub fn w2m_handle(&self) -> Rc<W2mReceiver> {
+        Rc::clone(&self.w2m)
     }
 
     /// Wait for one response from each worker. ALWAYS resets W2M cursors.
@@ -828,8 +844,7 @@ impl MasterDispatcher {
             self.num_workers,
         );
 
-        let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
-        self.write_group(target_id, FLAG_SEEK, &empty, &schema, &col_names,
+        self.write_group(target_id, FLAG_SEEK, &[], &schema, &col_names,
                         pk_lo, pk_hi, 0, 0, worker as i32)?;
         self.signal_one(worker);
 
@@ -858,8 +873,7 @@ impl MasterDispatcher {
         let cached_worker = self.router.worker_for_index_key(target_id as u32, col_idx, key_lo);
         if cached_worker >= 0 {
             let w = cached_worker as usize;
-            let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
-            self.write_group(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
+            self.write_group(target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
                             key_lo, key_hi, col_idx as u64, 0, cached_worker)?;
             self.signal_one(w);
 
@@ -872,8 +886,7 @@ impl MasterDispatcher {
         }
 
         // Cache miss: broadcast
-        let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
-        self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
+        self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
                             key_lo, key_hi, col_idx as u64, 0)?;
         let results = self.wait_all_workers()?;
         for decoded_opt in results {
@@ -886,6 +899,53 @@ impl MasterDispatcher {
             }
         }
         Ok(None)
+    }
+
+    // Async fan-outs take `*mut Self` instead of `&mut self` because the
+    // exclusive borrow must end before `.await`: other reactor tasks
+    // re-enter the dispatcher in the meantime. Only call from inside a
+    // reactor task driven by `block_until_idle`.
+
+    pub async fn fan_out_seek_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        target_id: i64, pk_lo: u64, pk_hi: u64,
+    ) -> Result<Option<Batch>, FanOutError> {
+        let worker = unsafe {
+            let pk = crate::util::make_pk(pk_lo, pk_hi);
+            worker_for_partition_pub(partition_for_key(pk), (*disp_ptr).num_workers)
+        };
+        single_worker_async(disp_ptr, reactor, target_id, FLAG_SEEK,
+                            worker, pk_lo, pk_hi, 0, "seek").await
+    }
+
+    pub async fn fan_out_seek_by_index_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
+    ) -> Result<Option<Batch>, FanOutError> {
+        let worker = unsafe {
+            let cached = (*disp_ptr).router.worker_for_index_key(
+                target_id as u32, col_idx, key_lo,
+            );
+            if cached < 0 { return Err(FanOutError::NeedsSyncFallback); }
+            cached as usize
+        };
+        single_worker_async(disp_ptr, reactor, target_id, FLAG_SEEK_BY_INDEX,
+                            worker, key_lo, key_hi, col_idx as u64, "seek_by_index").await
+    }
+
+    pub async fn fan_out_scan_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        target_id: i64,
+    ) -> Result<Option<Batch>, FanOutError> {
+        // Broadcast reply routing (one req_id, N replies) needs the
+        // per-worker req_id slot that Stage 2 does not thread through.
+        if unsafe { (*disp_ptr).num_workers } != 1 {
+            return Err(FanOutError::NeedsSyncFallback);
+        }
+        single_worker_async(disp_ptr, reactor, target_id, 0, 0, 0, 0, 0, "scan").await
     }
 
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch) -> Result<(), String> {
@@ -1737,6 +1797,40 @@ impl MasterDispatcher {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Common body for every single-worker async fan-out. Submits the SAL
+/// message, signals the worker, yields, and returns the decoded reply.
+/// The closures in the public wrappers compute the worker; everything
+/// else is here so there is a single place to maintain the unsafe
+/// borrow-and-release pattern.
+async fn single_worker_async(
+    disp_ptr: *mut MasterDispatcher,
+    reactor: &crate::reactor::Reactor,
+    target_id: i64,
+    flags: u32,
+    worker: usize,
+    seek_pk_lo: u64, seek_pk_hi: u64, seek_col_idx: u64,
+    op_name: &'static str,
+) -> Result<Option<Batch>, FanOutError> {
+    let (schema, req_id) = unsafe {
+        let disp = &mut *disp_ptr;
+        disp.maybe_checkpoint().map_err(FanOutError::Worker)?;
+        let (schema, col_names) = disp.get_schema_and_names(target_id);
+        let req_id = reactor.alloc_request_id();
+        disp.write_group(target_id, flags, &[], &schema, &col_names,
+                         seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)
+            .map_err(FanOutError::Worker)?;
+        reactor.increment_in_flight(worker);
+        disp.signal_one(worker);
+        (schema, req_id)
+    };
+    let decoded = reactor.await_reply(req_id).await;
+    if decoded.control.status != 0 {
+        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+        return Err(FanOutError::Worker(format!("worker {}: {}: {}", worker, op_name, msg)));
+    }
+    Ok(extract_single_batch(&schema, decoded))
+}
 
 fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<Batch> {
     decoded.data_batch.and_then(|b| {
