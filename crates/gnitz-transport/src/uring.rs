@@ -76,6 +76,17 @@ impl Ring for IoUringRing {
         }
     }
 
+    fn prep_fsync(&mut self, fd: i32, user_data: u64) {
+        self.ensure_sq_room();
+        let entry = opcode::Fsync::new(types::Fd(fd))
+            .flags(types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
     fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64) {
         self.ensure_sq_room();
         let ts = Box::new(

@@ -101,6 +101,10 @@ struct ReactorShared {
     /// Reply wakers keyed by request_id; populated by `await_reply`.
     reply_wakers: RefCell<HashMap<u64, Waker>>,
     parked_replies: RefCell<HashMap<u64, DecodedWire>>,
+    /// Fsync CQE results keyed by the id the reactor assigned in
+    /// `submit_fsync`. `block_on_fsync` drains entries out; a future
+    /// async variant will replace this with a waker map.
+    parked_fsync_results: RefCell<HashMap<u64, i32>>,
     w2m: RefCell<Option<Rc<W2mReceiver>>>,
     in_flight: RefCell<Vec<usize>>,
     /// Independent of the dispatcher's `async_w2m_rcs`: the two are used
@@ -135,6 +139,7 @@ impl Reactor {
             task_wakers: RefCell::new(HashMap::new()),
             reply_wakers: RefCell::new(HashMap::new()),
             parked_replies: RefCell::new(HashMap::new()),
+            parked_fsync_results: RefCell::new(HashMap::new()),
             w2m: RefCell::new(None),
             in_flight: RefCell::new(Vec::new()),
             w2m_cursors: RefCell::new(Vec::new()),
@@ -245,6 +250,44 @@ impl Reactor {
     /// this to decide when the W2M ring for that worker is drained.
     pub fn increment_in_flight(&self, w: usize) {
         self.inner.in_flight.borrow_mut()[w] += 1;
+    }
+
+    /// Submit an fdatasync on `fd`. The SQE is immediately flushed to the
+    /// kernel so the fsync can overlap with subsequent CPU work — this is
+    /// load-bearing for the `pre_write_pushes` Phase-A / tick-evaluation
+    /// overlap.  Returns the id used to track completion; pass it to
+    /// `block_on_fsync` to retrieve the result code.
+    pub fn submit_fsync(&self, fd: i32) -> u64 {
+        // Fsync IDs share the reply counter; the KIND_FSYNC tag in udata
+        // prevents collisions with KIND_REPLY ids.
+        let id = self.alloc_request_id();
+        {
+            let mut ring = self.inner.ring.borrow_mut();
+            ring.prep_fsync(fd, udata(KIND_FSYNC, id));
+            let _ = ring.submit_and_wait_timeout(0, 0);
+        }
+        id
+    }
+
+    /// Block until the fsync submitted under `id` completes; returns the
+    /// CQE `res` (0 on success, negative errno on failure).
+    ///
+    /// Callers MUST invoke this only after all sync W2M draining for the
+    /// current tick window has completed — during the wait, `tick(true)`
+    /// drains CQEs including `KIND_POLL_EVENTFD`, which calls
+    /// `drain_w2m_for_worker` on the shared W2M ring.  Stage 3 is safe
+    /// because at every call site the `tick_idle_barrier` is still active
+    /// (deferred-SELECT wakers are parked on it, so reply_wakers is empty
+    /// for their req_ids) and any W2M replies the reactor reads fall into
+    /// the unrouted path.  Stage 4's committer task will weaken this
+    /// invariant.
+    pub fn block_on_fsync(&self, id: u64) -> i32 {
+        loop {
+            if let Some(rc) = self.inner.parked_fsync_results.borrow_mut().remove(&id) {
+                return rc;
+            }
+            self.tick(true);
+        }
     }
 
     /// Drive the reactor until the task slab is empty. Blocks.
@@ -364,7 +407,8 @@ impl Reactor {
     /// Look at all CQEs pending in the ring. For each:
     ///   - KIND_REPLY: wake the registered reply waker (if any).
     ///   - KIND_TIMEOUT: ignored (timer waking is handled by the heap).
-    ///   - KIND_FSYNC / KIND_POLL_EVENTFD: not used in Stage 1.
+    ///   - KIND_FSYNC: park the CQE `res` for `block_on_fsync`.
+    ///   - KIND_POLL_EVENTFD: drain the associated W2M ring and re-arm.
     fn drain_cqes_into_wakers(&self) {
         let mut buf = [Cqe::default(); 64];
         loop {
@@ -393,6 +437,9 @@ impl Reactor {
                 if let Some(efd) = efd {
                     self.arm_poll_eventfd(efd, id);
                 }
+            }
+            KIND_FSYNC => {
+                self.inner.parked_fsync_results.borrow_mut().insert(id, cqe.res);
             }
             _ => {}
         }
@@ -484,13 +531,14 @@ impl Reactor {
         }
     }
 
-    /// Test-only: inject a synthetic CQE for reply-routing tests.
-    /// Dispatched on the next `tick` (or via `drain_injected_cqes`).
+    /// Test-only: inject a synthetic CQE tagged with `kind` and `id`,
+    /// with `rc` as the CQE `res`. Dispatched on the next `tick` (or via
+    /// `drain_injected_cqes`).
     #[cfg(test)]
-    pub fn inject_reply_cqe(&self, req_id: u64) {
+    pub fn inject_cqe(&self, kind: u64, id: u64, rc: i32) {
         self.inner.injected_cqes.borrow_mut().push_back(Cqe {
-            user_data: udata(KIND_REPLY, req_id),
-            res: 0,
+            user_data: udata(kind, id),
+            res: rc,
             flags: 0,
         });
     }
@@ -992,7 +1040,7 @@ mod tests {
         let w2 = make_waker(100, Arc::clone(&waker_q));
         r.register_reply_waker(42, w1);
         r.register_reply_waker(42, w2);
-        r.inject_reply_cqe(42);
+        r.inject_cqe(KIND_REPLY, 42, 0);
         r.drain_injected_cqes();
         let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
         assert!(q.contains(&100), "second waker (key=100) must win");
@@ -1155,4 +1203,104 @@ mod tests {
         assert!(r.inner.parked_replies.borrow().is_empty(),
             "unrouted replies must not leak into parked_replies");
     }
+
+    /// Dispatching a KIND_FSYNC CQE parks the CQE `res` verbatim under
+    /// the request id — both success (rc=0) and failure (rc<0), since
+    /// the caller's `rc < 0` fatal-abort branch depends on it.
+    #[test]
+    fn fsync_dispatch_parks_rc_verbatim() {
+        let r = make_reactor();
+        for rc in [0, -5] {
+            r.inject_cqe(KIND_FSYNC, 42, rc);
+            r.drain_injected_cqes();
+            let parked = r.inner.parked_fsync_results.borrow_mut().remove(&42);
+            assert_eq!(parked, Some(rc));
+        }
+    }
+
+    /// End-to-end with a real io_uring: submit fdatasync on a memfd,
+    /// block until complete, expect rc=0.  Also asserts
+    /// `parked_fsync_results` is drained afterwards (catches leaks).
+    #[test]
+    fn fsync_real_memfd_roundtrip() {
+        let r = make_reactor();
+        let fd = crate::ipc_sys::memfd_create(b"reactor_fsync_ok");
+        let id = r.submit_fsync(fd);
+        let rc = r.block_on_fsync(id);
+        unsafe { libc::close(fd); }
+        assert_eq!(rc, 0, "fdatasync on a fresh memfd should succeed");
+        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
+            "block_on_fsync must remove the parked result");
+    }
+
+    /// Submitting fdatasync on an fd that is not in the process's fd
+    /// table returns a negative rc (typically -EBADF) from the kernel.
+    /// Direct replacement for the deleted fork-based ipc test.
+    ///
+    /// Uses `i32::MAX` rather than `close(real_fd); submit(real_fd)` so
+    /// the test is race-free under the parallel test runner — a freshly
+    /// closed fd number can be reallocated by another thread before our
+    /// SQE reaches the kernel, masking the expected EBADF.
+    #[test]
+    fn fsync_real_bad_fd_returns_negative() {
+        let r = make_reactor();
+        let id = r.submit_fsync(i32::MAX);
+        let rc = r.block_on_fsync(id);
+        assert!(rc < 0, "fdatasync on a bogus fd must return rc<0, got {}", rc);
+    }
+
+    /// `submit_fsync` flushes the SQE to the kernel before returning.
+    /// Without the eager submit the CQE would only arrive on the next
+    /// `tick`, defeating the Phase-A / tick-evaluation overlap.
+    #[test]
+    fn fsync_submit_flushes_sqe_before_returning() {
+        let r = make_reactor();
+        let fd = crate::ipc_sys::memfd_create(b"reactor_fsync_flush");
+        let id = r.submit_fsync(fd);
+
+        // Spin briefly (no further ticks driven from outside) until the
+        // CQE either arrives in the ring or we time out.  The kernel
+        // completes fdatasync on a memfd in microseconds, so ~100 ms
+        // gives generous headroom for scheduler jitter without flakiness.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut got: Option<i32> = None;
+        while Instant::now() < deadline {
+            r.drain_cqes_into_wakers();
+            if let Some(rc) = r.inner.parked_fsync_results.borrow_mut().remove(&id) {
+                got = Some(rc);
+                break;
+            }
+        }
+        unsafe { libc::close(fd); }
+        assert_eq!(got, Some(0),
+            "fsync CQE must be available without driving another tick — \
+             submit_fsync should flush the SQE eagerly");
+    }
+
+    /// The KIND_REPLY / KIND_FSYNC tags in `user_data` are what keep
+    /// shared-id spaces from colliding.  With matching ids (42) but
+    /// different kinds, each dispatch path must land in its own map.
+    #[test]
+    fn fsync_and_reply_udata_kinds_do_not_collide() {
+        let r = make_reactor();
+        // Register a reply waker so KIND_REPLY's dispatch path has
+        // something to pop.
+        let waker = make_waker(7, Arc::clone(&r.inner.run_queue));
+        r.register_reply_waker(42, waker);
+
+        r.inject_cqe(KIND_REPLY, 42, 0);
+        r.inject_cqe(KIND_FSYNC, 42, -11);
+        r.drain_injected_cqes();
+
+        let q: Vec<usize> = r.inner.run_queue.lock().unwrap()
+            .iter().copied().collect();
+        assert!(q.contains(&7),
+            "KIND_REPLY dispatch must wake the reply waker for id=42");
+        assert!(!r.inner.reply_wakers.borrow().contains_key(&42),
+            "reply waker must be consumed by KIND_REPLY dispatch");
+        let fsync_rc = r.inner.parked_fsync_results.borrow_mut().remove(&42);
+        assert_eq!(fsync_rc, Some(-11),
+            "KIND_FSYNC dispatch must park its own rc under the same id");
+    }
+
 }

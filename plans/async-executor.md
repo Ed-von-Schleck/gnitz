@@ -18,6 +18,24 @@ ordering wrong.
 
 ---
 
+## Implementation Status
+
+| Stage | Status | Landed in |
+|---|---|---|
+| 0 — W2M request IDs | ✅ done | `8b5a186` |
+| 1 — Reactor primitive | ✅ done | `716075e` |
+| 2 — Async SELECT (pk_seek + cached index_seek + single-worker scan) | ✅ done | `6abb21c`, `308df12`, `2cca343` |
+| 3 — Async fdatasync via reactor | ⏳ pending | — |
+| 4 — Async group commit (committer task) | ⏳ pending | — |
+| 5 — Async pipelined checks + validation | ⏳ pending | — |
+| 6 — Async tick pipeline | ⏳ pending | — |
+| 7 — Delete main-loop timeout math | ⏳ pending | — |
+
+See `### Lessons from Stages 0-2` below for constraints discovered on the
+way that Stage 3+ authors should internalize before planning their work.
+
+---
+
 ## The Nine Manual-Async Mechanisms (current state)
 
 Each of these exists because some part of the master's work needs to overlap
@@ -53,12 +71,19 @@ only allowed during `Active`, deferred requests are processed when returning to
 `process_deferred_requests`, `start_all_async_ticks`, and the main loop
 (~100 LoC).
 
-### 4. `deferred_requests: Vec<DeferredRequest>` queue
+### 4. `deferred_requests: Vec<DeferredRequest>` queue ✅ eliminated (Stage 2)
 
 SELECT / seek / scan requests that arrive while DML is pending must wait until
 DML commits (to see committed state). Rather than blocking the dispatch of
 new client messages, the current code queues them and processes after pending
 drains. This is a manual "await on prior commits" point (~80 LoC).
+
+*Replaced by reactor tasks awaiting `tick_idle_barrier`; `deferred_requests` /
+`process_deferred_requests` deleted in `6abb21c`. The matching "truly async"
+fan-outs for cached paths (pk_seek, cached index_seek, single-worker scan)
+land in `2cca343`. Cache-miss seek_by_index and multi-worker scan still
+fall back to the sync path — see Stage 5 for the broadcast routing that
+removes the fallback.*
 
 ### 5. Main-loop timeout math
 
@@ -90,7 +115,7 @@ Two drain paths, two `is_empty` checks, two lifecycle rules. ~200 LoC combined.
 handle errors, reset cursors." ~200 LoC total. All are variants of
 `try_join_all(worker_replies)` with different error-handling shapes.
 
-### 8. Cursor-position correlation + cursor management
+### 8. Cursor-position correlation + cursor management 🔄 partially eliminated
 
 The W2M wire protocol carries no request ID. Correlation is by *position in
 the W2M ring*: the k-th message at worker W corresponds to SAL message K in
@@ -98,6 +123,11 @@ submission order. This is a clever sync-era optimization, but it spreads
 correlation concerns across every `collect_*` call site: cursor state must be
 threaded, reset points are rule-governed, and any reordering breaks
 correctness silently.
+
+*Request IDs in the wire format (Stage 0) + reactor-owned drain (Stage 2)
+give req_id-based routing for async paths. Sync paths still use
+cursor-position correlation through their own `async_w2m_rcs` cursor vec;
+`collect_*` is still present. Full elimination happens after Stage 5.*
 
 ### 9. Worker-side response stashing and replay (`worker.rs`)
 
@@ -448,6 +478,90 @@ easy; diminishing returns relative to the simplicity gain.
 favor of a dedicated `committer` task and a dedicated `reader` task (or: reads
 just dispatch directly without queuing, since they can now suspend).
 
+### Lessons from Stages 0-2
+
+Constraints discovered during Stages 0-2. Each lesson is actionable for
+Stage 3+ authors; the reactor does NOT currently enforce any of these in
+code, so overlooking them will silently break later stages.
+
+**L1. Raw-pointer-through-public-API is the signature of choice for async
+dispatcher methods.** The three `fan_out_*_async` fns take `*mut MasterDispatcher`,
+not `&mut self`: the exclusive borrow must end at the `.await` point so
+other reactor tasks can re-enter the dispatcher to deliver their own
+replies. This is D1-NM applied to a concrete API. Stage 3+ async fns on
+the dispatcher must follow the same pattern. See `master.rs:single_worker_async`.
+
+**L2. W2M cursor desync: reactor and sync paths share the ring.** Sync
+paths (push validation, tick collection, checkpoint) still drain W2M
+through the dispatcher's `async_w2m_rcs` + `reset_one` / `reset_all`. The
+reactor owns its own `w2m_cursors`. They are supposed to be used in
+disjoint time windows — but Stage 2's sync fallback (runs INSIDE a
+reactor task via `resolve_async`) violates that. Symptoms: reactor's
+cursor sits past the new `write_cursor` after a sync `reset_one`, future
+drains miss every message. **Mitigation:** defensive snap in
+`drain_w2m_for_worker` — if `cursor > write_cursor`, reset cursor to
+`W2M_HEADER_SIZE`. Stage 5+ must either (a) keep the defensive snap, or
+(b) make the reactor the sole W2M owner (requires full async migration of
+validate / tick / checkpoint). Do not remove the snap until option (b)
+lands.
+
+**L3. `in_flight` must only count tracked replies.** `route_reply`
+decrements `in_flight[w]` ONLY when a waker was found. Unrouted replies
+are logged (`unrouted W2M reply req_id=…`) and dropped without touching
+the counter. If you ever decrement on unrouted, a stray reply from the
+sync path triggers a premature `reset_one` while a legitimate async reply
+is still in flight — the ring gets wiped, the awaiter waits forever. The
+three `route_reply_*` tests in `reactor.rs` pin this invariant.
+
+**L4. Bookkeeping must be unit-testable separately from the I/O shell.**
+Stage 2's initial implementation had the `in_flight` bug because the only
+tests available were happy-path `inject_parked_reply`, which skips the
+bookkeeping. Splitting `drain_w2m_for_worker` → pure `route_reply(w, decoded)
+-> should_reset` + I/O shell makes bookkeeping testable without a real
+`W2mReceiver`. Stage 3+ should apply the same split to any new
+drain/route machinery.
+
+**L5. Sentinel strings in `Err(String)` are a footgun.** An early Stage 2
+draft used `"__async_scan_fallback__"` smuggled through `Err(String)` to
+signal "fall back to sync." A worker error containing those characters
+would silently trigger a fallback. Replace with a real enum. Stage 2's
+current shape: `enum FanOutError { Worker(String), NeedsSyncFallback }`.
+For future async ops that need any "first-class non-error success
+branch" (e.g. "need a tick before retrying", "batch full"), model it as
+an enum variant, not an error string.
+
+**L6. Broadcast reply routing is the missing primitive blocking full
+async migration.** Stage 2 ships truly-async only for single-worker
+messages. Multi-worker broadcasts (cache-miss index_seek, multi-worker
+scan, ticks, group-commit ACKs) still use sync `wait_all_workers`.
+The plan's wire protocol reserves `u64::MAX` for broadcasts and
+mentions `pending_broadcasts: Slab<BroadcastState>`, but that machinery
+is not built yet.
+
+Two paths to build it, in order of complexity:
+- **Per-worker req_ids at write time.** Extend `SalWriter::write_group_direct`
+  to accept `&[u64]` of per-worker req_ids instead of one. Each worker
+  echoes its own slot's req_id; master allocates N distinct req_ids for
+  one broadcast and parks N `ReplyFuture`s. Cleanest for Stage 5's
+  `execute_pipeline` which already issues distinct checks.
+- **Broadcast-set slab.** One req_id, multiple awaited replies. The
+  reactor tracks a "broadcast set" keyed by req_id; `drain_w2m_for_worker`
+  increments a counter; the future resolves when all workers answer.
+  Simpler wire format (1 req_id), more reactor state.
+
+Stage 4 (committer) and Stage 6 (async tick) are broadcast-heavy and
+will force the decision. Land the choice in whichever of those arrives
+first.
+
+**L7. Don't interleave sync and async W2M paths within the same tick
+window.** The `resolve_async` → sync-fallback pattern in Stage 2's
+`spawn_deferred_select` only works because the defensive cursor snap
+(L2) + the "unrouted no-decrement" rule (L3) defuse the resulting race.
+Stage 3+ should strongly prefer a design where a given tick window is
+*either* reactor-driven *or* sync-driven for all its W2M traffic, not a
+mix. If broadcast routing (L6) is in place, the mix disappears
+naturally.
+
 **Rationale:** PendingBatch and deferred_requests are manual queues for
 "things to do later." A task that's `.await`-ing on an event *is* a deferred
 computation — no queue needed, the scheduler holds the continuation.
@@ -622,44 +736,38 @@ Each stage is a distinct commit (or PR), can be tested and benchmarked in
 isolation, and leaves the tree in a working state. Later stages can be
 reverted without undoing earlier ones.
 
-### Stage 0: W2M request IDs (wire + plumbing)
+### Stage 0: W2M request IDs ✅ done (`8b5a186`)
 
-- Add `request_id: u64` to W2M control block encode/decode
-- Master: thread req_id through every `write_group` / `write_broadcast` /
-  `send_to_workers` (default: 0)
-- Worker: echo req_id in `send_response` / `send_ack`
-- No behavior change. All tests pass.
+Wire + plumbing added. Workers echo the req_id; master threads a default
+of `0` through every `write_group` / `write_broadcast` / `send_to_workers`.
+No behavior change at the time of landing.
 
-**LoC:** ~100 added, 0 removed. One commit.
+### Stage 1: Reactor primitive ✅ done (`716075e`)
 
-### Stage 1: Reactor primitive
+`crates/gnitz-engine/src/reactor.rs` with `spawn` / `block_on` / `tick` /
+`await_reply` / `timer` / `TickIdleBarrier`. Single-threaded, owns its
+own `IoUringRing`. Unit-tested in isolation.
 
-- New module `gnitz-engine/src/reactor.rs`
-- Implements: spawn, wait_one_cqe, register_reply_waker, timer, poll_ready_tasks
-- Not yet used anywhere. Unit-tested in isolation.
+### Stage 2: Async SELECT (pk_seek + cached index_seek + single-worker scan) ✅ done
 
-**LoC:** ~500 added. One commit.
+Landed across `6abb21c` (executor skeleton + `deferred_requests` removal),
+`308df12` (cleanups), and `2cca343` (truly async fan-outs + W2M reactor
+ownership + bookkeeping fix).
 
-### Stage 2: Async SELECT (pk_seek / index_seek / scan)
+**What works:** Deferred SELECTs are spawned as reactor tasks that await
+`tick_idle_barrier`. After `notify_all()`, the executor calls
+`reactor.block_until_idle()`; the reactor owns W2M drain via `POLL_ADD`
+on per-worker eventfds, parks replies by `request_id`, wakes `ReplyFuture`.
+Truly async: pk_seek; cached index_seek; single-worker scan.
 
-Port the simplest operation first. No group commit interaction, no phase
-ordering.
+**What's still sync (scope-cut, see Stage 5):** cache-miss index_seek and
+multi-worker scan — the async fan-outs return `FanOutError::NeedsSyncFallback`,
+the executor's `resolve_async` helper falls back to the sync `fan_out_*`.
+Need per-worker req_id slots in `write_group_direct` + a "broadcast reply
+set" slab in the reactor to remove the fallback.
 
-- `fan_out_seek(pk_lo, pk_hi) -> impl Future<Output = Result<Option<Batch>>>`
-- `fan_out_seek_by_index(...)`: similar
-- `fan_out_scan(...)`: similar
-- Executor's read path: replace `disp.fan_out_seek(...)?` in
-  `process_deferred_requests` with `.await`
-- Main loop: add reactor polling; W2M eventfds register POLL_ADD SQEs
-- `deferred_requests` queue removed
-
-**Invariant preserved:** A SELECT still sees state up to the most recent
-committed group. The `.await` after prior commit completion enforces this.
-
-**Benchmark gate:** pk_seek/index_seek throughput equal to or better than
-current baseline. (Expected: small improvement from eliminating eager poll().)
-
-**LoC:** ~-120 (delete deferred_requests), ~+80 (async fan_out_seek).
+**Non-obvious choices** — read `### Lessons from Stages 0-2` below before
+touching Stage 3+.
 
 ### Stage 3: Async fdatasync via reactor
 

@@ -151,6 +151,10 @@ struct GroupInfo {
 struct PreWritten {
     groups: Vec<GroupInfo>,
     entries: Vec<PendingEntry>,
+    /// Reactor-assigned fsync id. `Some` iff any group wrote successfully
+    /// (i.e., an fdatasync was submitted); invariant enforced in
+    /// `pre_write_pushes`.
+    fsync_id: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +199,8 @@ pub struct ServerExecutor {
     // to bytes on every client response. Populated lazily alongside schema_cache.
     col_names_cache: HashMap<i64, Vec<Vec<u8>>>,
 
-    // Async fdatasync: overlaps fsync with worker ACK collection
-    async_fsync: ipc::AsyncFsync,
+    // SAL fd; passed to `reactor.submit_fsync` on each push-path fdatasync.
+    sal_fd: i32,
 
     // Push groups pre-written to SAL during async tick (Phase A of overlap).
     pre_written: Option<PreWritten>,
@@ -211,8 +215,6 @@ impl ServerExecutor {
         dispatcher: *mut MasterDispatcher,
         sal_fd: i32,
     ) -> Self {
-        let async_fsync = ipc::AsyncFsync::new(sal_fd)
-            .expect("Failed to create AsyncFsync io_uring");
         let reactor = Rc::new(Reactor::new(64)
             .expect("Failed to create reactor io_uring"));
         ServerExecutor {
@@ -232,7 +234,7 @@ impl ServerExecutor {
             pending_ddl_responses: Vec::with_capacity(8),
             schema_cache: HashMap::new(),
             col_names_cache: HashMap::new(),
-            async_fsync,
+            sal_fd,
             pre_written: None,
         }
     }
@@ -500,11 +502,13 @@ impl ServerExecutor {
         // then wait for fsync before ACKing clients.
         if any_written {
             let nw = self.disp().num_workers();
-            // Signal workers immediately, submit async fdatasync in parallel.
-            {
+            // Signal workers immediately, submit async fdatasync in parallel
+            // through the reactor so it overlaps with ACK collection below.
+            let fsync_id = {
                 let disp = unsafe { &mut *self.dispatcher };
-                disp.signal_and_submit_fsync(&mut self.async_fsync);
-            }
+                disp.signal_all();
+                self.reactor.submit_fsync(self.sal_fd)
+            };
 
             // Collect ACKs (blocking) — workers process while fsync runs.
             let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
@@ -544,7 +548,14 @@ impl ServerExecutor {
             // Workers already see the SAL via atomics and have committed.
             // If fdatasync fails, ACKing the client would split-brain the
             // system (worker durable, master not). Crash-stop instead.
-            let fsync_rc = self.async_fsync.wait_complete();
+            //
+            // W2M interleave invariant: all sync W2M reads above are
+            // complete, and `tick_idle_barrier` is still active (no
+            // `notify_all` yet), so any W2M replies the reactor reads
+            // during `block_on_fsync` fall into the unrouted path (logged,
+            // cursor advanced, in_flight untouched). Do NOT move a
+            // barrier `notify_all` above this call.
+            let fsync_rc = self.reactor.block_on_fsync(fsync_id);
             if fsync_rc < 0 {
                 gnitz_fatal_abort!("SAL fdatasync (async) failed rc={}", fsync_rc);
             }
@@ -679,12 +690,13 @@ impl ServerExecutor {
         }
 
         let any_written = groups.iter().any(|g| g.error.is_none());
-        if any_written {
-            let disp = unsafe { &mut *self.dispatcher };
-            disp.submit_fsync(&mut self.async_fsync);
-        }
+        let fsync_id = if any_written {
+            Some(self.reactor.submit_fsync(self.sal_fd))
+        } else {
+            None
+        };
 
-        self.pre_written = Some(PreWritten { groups, entries });
+        self.pre_written = Some(PreWritten { groups, entries, fsync_id });
         None
     }
 
@@ -697,7 +709,7 @@ impl ServerExecutor {
             Some(p) => p,
             None => return,
         };
-        let PreWritten { mut groups, entries } = pre;
+        let PreWritten { mut groups, entries, fsync_id } = pre;
 
         let any_written = groups.iter().any(|g| g.error.is_none());
         if any_written {
@@ -742,7 +754,15 @@ impl ServerExecutor {
 
             // Wait for fdatasync (submitted in pre_write_pushes, ran during
             // tick). Crash-stop on failure — same policy as flush_pending_pushes.
-            let fsync_rc = self.async_fsync.wait_complete();
+            //
+            // W2M interleave invariant: sync W2M draining via
+            // `collect_acks_continuing` above is complete and
+            // `tick_idle_barrier` is still active; `block_on_fsync` only
+            // sees unrouted W2M replies, which the reactor logs + drops.
+            // Do NOT move a barrier `notify_all` above this call.
+            let fsync_rc = self.reactor.block_on_fsync(
+                fsync_id.expect("any_written implies fsync submitted"),
+            );
             if fsync_rc < 0 {
                 gnitz_fatal_abort!("SAL fdatasync (pre-written) failed rc={}", fsync_rc);
             }

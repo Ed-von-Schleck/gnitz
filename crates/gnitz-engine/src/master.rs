@@ -9,7 +9,6 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
-use crate::ipc;
 use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
@@ -415,17 +414,6 @@ impl MasterDispatcher {
     pub(crate) fn signal_all(&self) { self.sal.signal_all(); }
     fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
     pub(crate) fn sync(&self) -> i32 { self.sal.sync() }
-
-    /// Signal workers + submit async fdatasync.
-    pub(crate) fn signal_and_submit_fsync(&mut self, async_fsync: &mut ipc::AsyncFsync) {
-        self.sal.signal_all();
-        async_fsync.submit();
-    }
-
-    /// Submit async fdatasync without signaling workers.
-    pub(crate) fn submit_fsync(&self, async_fsync: &mut ipc::AsyncFsync) {
-        async_fsync.submit();
-    }
 
     pub(crate) fn sal_fd(&self) -> i32 { self.sal.sal_fd() }
 

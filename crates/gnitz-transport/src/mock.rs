@@ -26,6 +26,10 @@ pub enum PrepRecord {
         mask: u32,
         user_data: u64,
     },
+    Fsync {
+        fd: i32,
+        user_data: u64,
+    },
     Timeout {
         timeout_ns: u64,
         user_data: u64,
@@ -117,6 +121,12 @@ impl Ring for MockRing {
         self.ensure_sq_room();
         self.pending += 1;
         self.prepped.push(PrepRecord::PollAdd { fd, mask, user_data });
+    }
+
+    fn prep_fsync(&mut self, fd: i32, user_data: u64) {
+        self.ensure_sq_room();
+        self.pending += 1;
+        self.prepped.push(PrepRecord::Fsync { fd, user_data });
     }
 
     fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64) {

@@ -47,6 +47,11 @@ pub trait Ring {
     /// then the op is consumed. Re-arm by submitting another `prep_poll_add`.
     fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64);
 
+    /// Submit an `Fsync` op with the `DATASYNC` flag on `fd`.
+    /// One-shot: a single CQE is delivered when the kernel's fdatasync
+    /// completes; the CQE's `res` is the fdatasync return code.
+    fn prep_fsync(&mut self, fd: i32, user_data: u64);
+
     /// Submit a relative `Timeout` op that fires after `timeout_ns` nanoseconds.
     /// One-shot: a single CQE is delivered (with `res = -ETIME` on natural
     /// expiry) when the timer expires.
