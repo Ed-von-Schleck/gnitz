@@ -16,7 +16,8 @@ pub const FLAG_ALLOCATE_INDEX_ID:  u64 = 512;
 
 /// Logical header decoded from the IPC control WAL block.
 ///
-/// Fields align with CONTROL_SCHEMA column indices; no wire-format struct.
+/// Fields align with CONTROL_SCHEMA column indices defined in
+/// `gnitz_wire::control`; no wire-format struct.
 #[derive(Clone, Debug)]
 pub struct Header {
     pub status:     u32,
@@ -26,6 +27,12 @@ pub struct Header {
     pub seek_pk_lo: u64,
     pub seek_pk_hi: u64,
     pub seek_col_idx: u64,
+    /// Master-allocated reply-routing key. Clients send 0; the master
+    /// sets a per-request value when fanning out to workers, and workers
+    /// echo it back in their W2M reply. Reserved values:
+    ///   0        — unsolicited / untagged
+    ///   u64::MAX — broadcast reply
+    pub request_id: u64,
 }
 
 impl Header {
@@ -41,6 +48,7 @@ impl Default for Header {
         Header {
             status: 0, target_id: 0, client_id: 0, flags: 0,
             seek_pk_lo: 0, seek_pk_hi: 0, seek_col_idx: 0,
+            request_id: 0,
         }
     }
 }

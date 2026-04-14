@@ -95,12 +95,20 @@ const _: () = assert!(
     "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
 );
 
-/// CONTROL_SCHEMA: 8 U64 cols + 1 nullable String.
+/// CONTROL_SCHEMA: 9 U64 cols + 1 nullable String. The exact column layout,
+/// payload indices, null-bit positions, and region count are defined in
+/// `gnitz_wire::control` so the server (this crate) and the client
+/// (`gnitz-protocol`) cannot drift.
 const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
-    let mut sd = SchemaDescriptor { num_columns: 9, pk_index: 0, columns: [ZERO_COL; 64] };
+    let mut sd = SchemaDescriptor {
+        num_columns: gnitz_wire::control::NUM_COLUMNS as u32,
+        pk_index: 0,
+        columns: [ZERO_COL; 64],
+    };
     sd.columns[0] = U64_COL; sd.columns[1] = U64_COL; sd.columns[2] = U64_COL;
     sd.columns[3] = U64_COL; sd.columns[4] = U64_COL; sd.columns[5] = U64_COL;
-    sd.columns[6] = U64_COL; sd.columns[7] = U64_COL; sd.columns[8] = STR_COL_NULL;
+    sd.columns[6] = U64_COL; sd.columns[7] = U64_COL; sd.columns[8] = U64_COL;
+    sd.columns[9] = STR_COL_NULL;
     sd
 };
 
@@ -213,6 +221,7 @@ pub fn encode_wire(
     seek_pk_lo: u64,
     seek_pk_hi: u64,
     seek_col_idx: u64,
+    request_id: u64,
     status: u32,
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
@@ -223,7 +232,7 @@ pub fn encode_wire(
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0, target_id, client_id, flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx,
+        seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
         status, error_msg, schema, col_names, data_batch,
     );
     buf
@@ -331,6 +340,7 @@ pub fn encode_wire_into(
     seek_pk_lo: u64,
     seek_pk_hi: u64,
     seek_col_idx: u64,
+    request_id: u64,
     status: u32,
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
@@ -351,27 +361,29 @@ pub fn encode_wire_into(
 
     // Control block
     let ctrl_batch = {
+        use gnitz_wire::control as ctrl;
         let cs = CONTROL_SCHEMA_DESC;
         let mut b = Batch::with_schema(cs, 1);
         let has_error = !error_msg.is_empty();
-        let null_word: u64 = if has_error { 0 } else { 1u64 << 7 };
+        let null_word: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
         b.extend_pk_lo(&0u64.to_le_bytes());
         b.extend_pk_hi(&0u64.to_le_bytes());
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&null_word.to_le_bytes());
-        b.extend_col(0, &(status as u64).to_le_bytes());
-        b.extend_col(1, &client_id.to_le_bytes());
-        b.extend_col(2, &target_id.to_le_bytes());
-        b.extend_col(3, &wire_flags.to_le_bytes());
-        b.extend_col(4, &seek_pk_lo.to_le_bytes());
-        b.extend_col(5, &seek_pk_hi.to_le_bytes());
-        b.extend_col(6, &seek_col_idx.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_STATUS,       &(status as u64).to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_CLIENT_ID,    &client_id.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_TARGET_ID,    &target_id.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_FLAGS,        &wire_flags.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_SEEK_PK_LO,   &seek_pk_lo.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_SEEK_PK_HI,   &seek_pk_hi.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_SEEK_COL_IDX, &seek_col_idx.to_le_bytes());
+        b.extend_col(ctrl::PAYLOAD_REQUEST_ID,   &request_id.to_le_bytes());
         let error_st = if has_error {
             encode_german_string(error_msg, &mut b.blob)
         } else {
             [0u8; 16]
         };
-        b.extend_col(7, &error_st);
+        b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
         b.count = 1;
         b
     };
@@ -408,6 +420,7 @@ pub struct DecodedControl {
     pub seek_pk_lo: u64,
     pub seek_pk_hi: u64,
     pub seek_col_idx: u64,
+    pub request_id: u64,
     pub error_msg: Vec<u8>,
 }
 
@@ -464,18 +477,11 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'s
 }
 
 /// Decode the control WAL block directly into [`DecodedControl`] without
-/// constructing a [`Batch`].
-///
-/// The control block always uses [`CONTROL_SCHEMA_DESC`]: 9 columns,
-/// pk_index=0, exactly 1 row. That gives a fixed region layout:
-///
-///   [0]=pk_lo   [1]=pk_hi   [2]=weight   [3]=null_bmp
-///   [4]=status  [5]=client_id  [6]=target_id  [7]=flags
-///   [8]=seek_pk_lo  [9]=seek_pk_hi  [10]=seek_col_idx
-///   [11]=error_msg (16-byte German string)  [12]=blob
+/// constructing a [`Batch`]. Region indices and null-bit positions come from
+/// `gnitz_wire::control`; see that module for the schema layout.
 fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    // 4 fixed + 8 payload + 1 blob = 13. Keep in sync with CONTROL_SCHEMA_DESC.
-    const EXPECTED_REGIONS: usize = 13;
+    use gnitz_wire::control as ctrl;
+    const EXPECTED_REGIONS: usize = ctrl::NUM_REGIONS;
     const _: () = assert!(
         {
             let npc = CONTROL_SCHEMA_DESC.num_columns as usize - 1;
@@ -515,28 +521,28 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
     };
 
-    let null_bmp     = read8(3)?;
-    let status       = read8(4)? as u32;
-    let client_id    = read8(5)?;
-    let target_id    = read8(6)?;
-    let flags        = read8(7)?;
-    let seek_pk_lo   = read8(8)?;
-    let seek_pk_hi   = read8(9)?;
-    let seek_col_idx = read8(10)?;
+    let null_bmp     = read8(ctrl::REGION_NULL_BMP)?;
+    let status       = read8(ctrl::REGION_STATUS)? as u32;
+    let client_id    = read8(ctrl::REGION_CLIENT_ID)?;
+    let target_id    = read8(ctrl::REGION_TARGET_ID)?;
+    let flags        = read8(ctrl::REGION_FLAGS)?;
+    let seek_pk_lo   = read8(ctrl::REGION_SEEK_PK_LO)?;
+    let seek_pk_hi   = read8(ctrl::REGION_SEEK_PK_HI)?;
+    let seek_col_idx = read8(ctrl::REGION_SEEK_COL_IDX)?;
+    let request_id   = read8(ctrl::REGION_REQUEST_ID)?;
 
-    // Payload col 7 = error_msg (nullable STRING). Null bit 7 of null_bmp.
-    let error_is_null = (null_bmp & (1u64 << 7)) != 0;
+    let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let error_msg = if error_is_null {
         Vec::new()
     } else {
-        let off = offsets[11] as usize;
+        let off = offsets[ctrl::REGION_ERROR_MSG] as usize;
         if off + 16 > data.len() {
             return Err("error_msg region truncated");
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[off..off + 16]);
-        let blob_off = offsets[12] as usize;
-        let blob_sz  = sizes[12] as usize;
+        let blob_off = offsets[ctrl::REGION_BLOB] as usize;
+        let blob_sz  = sizes[ctrl::REGION_BLOB] as usize;
         let blob = if blob_sz > 0 && blob_off + blob_sz <= data.len() {
             &data[blob_off..blob_off + blob_sz]
         } else {
@@ -547,7 +553,7 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 
     Ok(DecodedControl {
         status, client_id, target_id, flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx, error_msg,
+        seek_pk_lo, seek_pk_hi, seek_col_idx, request_id, error_msg,
     })
 }
 
@@ -1232,6 +1238,7 @@ impl SalWriter {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
         unicast_worker: i32,
     ) -> Result<(), String> {
         self.prefault_ahead();
@@ -1265,7 +1272,7 @@ impl SalWriter {
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
                     slot, 0, target_id as u64, 0, flags as u64,
-                    seek_pk_lo, seek_pk_hi, seek_col_idx,
+                    seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
                 );
                 debug_assert_eq!(written, wsz);
@@ -1289,6 +1296,7 @@ impl SalWriter {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
@@ -1315,7 +1323,7 @@ impl SalWriter {
             let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
             let written = encode_wire_into(
                 slot0, 0, target_id as u64, 0, flags as u64,
-                seek_pk_lo, seek_pk_hi, seek_col_idx,
+                seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
                 STATUS_OK, b"", Some(schema), col_names_opt, batch,
             );
             debug_assert_eq!(written, wsz);
@@ -2224,7 +2232,7 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_no_data() {
         let wire = encode_wire(
-            42, 7, 0x100, 10, 20, 3,
+            42, 7, 0x100, 10, 20, 3, 0,
             STATUS_OK, b"",
             None, None, None,
         );
@@ -2235,6 +2243,7 @@ mod tests {
         assert_eq!(decoded.control.seek_pk_lo, 10);
         assert_eq!(decoded.control.seek_pk_hi, 20);
         assert_eq!(decoded.control.seek_col_idx, 3);
+        assert_eq!(decoded.control.request_id, 0);
         assert_eq!(decoded.control.status, STATUS_OK);
         assert!(decoded.control.error_msg.is_empty());
         assert!(decoded.schema.is_none());
@@ -2246,7 +2255,7 @@ mod tests {
         let sd = simple_schema();
         let names: Vec<&[u8]> = vec![b"id", b"value"];
         let wire = encode_wire(
-            1, 0, 0, 0, 0, 0,
+            1, 0, 0, 0, 0, 0, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), None,
         );
@@ -2266,7 +2275,7 @@ mod tests {
         let batch = make_simple_batch(100, 999);
         let names: Vec<&[u8]> = vec![b"id", b"val"];
         let wire = encode_wire(
-            5, 0, 0, 0, 0, 0,
+            5, 0, 0, 0, 0, 0, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
@@ -2289,13 +2298,78 @@ mod tests {
     #[test]
     fn test_encode_decode_error_msg() {
         let wire = encode_wire(
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
             STATUS_ERROR, b"something went wrong",
             None, None, None,
         );
         let decoded = decode_wire(&wire).unwrap();
         assert_eq!(decoded.control.status, STATUS_ERROR);
         assert_eq!(decoded.control.error_msg, b"something went wrong");
+    }
+
+    /// request_id round-trips through encode→decode for a non-zero value,
+    /// covering the new payload column 7 introduced for reactor reply routing.
+    #[test]
+    fn test_encode_decode_request_id_nonzero() {
+        let req_id: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let wire = encode_wire(
+            42, 7, 0, 0, 0, 0, req_id,
+            STATUS_OK, b"",
+            None, None, None,
+        );
+        let decoded = decode_wire(&wire).unwrap();
+        assert_eq!(decoded.control.request_id, req_id);
+    }
+
+    /// `u64::MAX` is the reserved broadcast-reply request_id; verify it
+    /// round-trips intact (no sign-extension or truncation).
+    #[test]
+    fn test_encode_decode_request_id_max() {
+        let wire = encode_wire(
+            1, 2, 3, 4, 5, 6, u64::MAX,
+            STATUS_OK, b"",
+            None, None, None,
+        );
+        let decoded = decode_wire(&wire).unwrap();
+        assert_eq!(decoded.control.request_id, u64::MAX);
+    }
+
+    /// request_id must survive the error-message path: the new null bit
+    /// shifted from position 7 to 8, so the error decode must read the right
+    /// bit and the request_id field must still be populated.
+    #[test]
+    fn test_encode_decode_request_id_with_error() {
+        let req_id: u64 = 0x1122_3344_5566_7788;
+        let wire = encode_wire(
+            10, 20, 30, 40, 50, 60, req_id,
+            STATUS_ERROR, b"boom",
+            None, None, None,
+        );
+        let decoded = decode_wire(&wire).unwrap();
+        assert_eq!(decoded.control.status, STATUS_ERROR);
+        assert_eq!(decoded.control.request_id, req_id);
+        assert_eq!(decoded.control.error_msg, b"boom");
+    }
+
+    /// `wire_size` must include the new request_id payload column. The
+    /// roundtrip equality is a stronger check than a literal byte count
+    /// since it catches both under-sized and over-sized buffers.
+    #[test]
+    fn test_wire_size_includes_request_id() {
+        let sz = wire_size(STATUS_OK, b"", None, None, None);
+        let wire = encode_wire(
+            0, 0, 0, 0, 0, 0, 0xAAAA_BBBB_CCCC_DDDD,
+            STATUS_OK, b"",
+            None, None, None,
+        );
+        assert_eq!(sz, wire.len());
+        let sz2 = wire_size(STATUS_ERROR, b"err", None, None, None);
+        let wire2 = encode_wire(
+            0, 0, 0, 0, 0, 0, u64::MAX,
+            STATUS_ERROR, b"err",
+            None, None, None,
+        );
+        assert_eq!(sz2, wire2.len());
     }
 
     #[test]
@@ -2323,7 +2397,7 @@ mod tests {
         let batch = make_simple_batch(1, 2);
         let names: Vec<&[u8]> = vec![b"a", b"b"];
         let mut wire = encode_wire(
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
@@ -2378,7 +2452,7 @@ mod tests {
 
         let names: Vec<&[u8]> = vec![b"id", b"val", b"name"];
         let wire = encode_wire(
-            10, 0, 0, 0, 0, 0,
+            10, 0, 0, 0, 0, 0, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
@@ -2403,25 +2477,25 @@ mod tests {
     fn wire_size_matches_encode() {
         // No data
         let sz = wire_size(STATUS_OK, b"", None, None, None);
-        let wire = encode_wire(42, 7, 0x100, 10, 20, 3, STATUS_OK, b"", None, None, None);
+        let wire = encode_wire(42, 7, 0x100, 10, 20, 3, 0, STATUS_OK, b"", None, None, None);
         assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
 
         // With schema only
         let sd = simple_schema();
         let names: Vec<&[u8]> = vec![b"id", b"val"];
         let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), None);
-        let wire = encode_wire(1, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
+        let wire = encode_wire(1, 0, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
         assert_eq!(sz, wire.len(), "wire_size mismatch (schema only)");
 
         // With data
         let batch = make_simple_batch(100, 999);
         let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
-        let wire = encode_wire(5, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+        let wire = encode_wire(5, 0, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
         assert_eq!(sz, wire.len(), "wire_size mismatch (with data)");
 
         // With error message
         let sz = wire_size(STATUS_ERROR, b"something went wrong", None, None, None);
-        let wire = encode_wire(0, 0, 0, 0, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
+        let wire = encode_wire(0, 0, 0, 0, 0, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
         assert_eq!(sz, wire.len(), "wire_size mismatch (error msg)");
     }
 
@@ -2435,7 +2509,7 @@ mod tests {
         let mut buf = vec![0u8; sz];
         let written = encode_wire_into(
             &mut buf, 0,
-            5, 0, 0, 0, 0, 0,
+            5, 0, 0, 0, 0, 0, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
@@ -2459,7 +2533,7 @@ mod tests {
         let names: Vec<&[u8]> = vec![b"id", b"val"];
 
         let wire = encode_wire(
-            10, 3, 0x200, 5, 6, 7,
+            10, 3, 0x200, 5, 6, 7, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
@@ -2468,12 +2542,29 @@ mod tests {
         let mut buf = vec![0u8; sz];
         let written = encode_wire_into(
             &mut buf, 0,
-            10, 3, 0x200, 5, 6, 7,
+            10, 3, 0x200, 5, 6, 7, 0,
             STATUS_OK, b"",
             Some(&sd), Some(&names), Some(&batch),
         );
         assert_eq!(written, wire.len());
         assert_eq!(buf, wire, "encode_wire_into should produce identical bytes");
+    }
+
+    /// Truncating a wire buffer below the new region-14 extent must surface
+    /// as a decode error rather than an out-of-bounds read. Stage 0 widens
+    /// the control schema, so we explicitly exercise the new minimum size.
+    #[test]
+    fn test_decode_truncated_control_block_returns_err() {
+        let wire = encode_wire(
+            1, 2, 3, 4, 5, 6, 7,
+            STATUS_OK, b"",
+            None, None, None,
+        );
+        // Drop the last 32 bytes — well past where region 13 (blob) starts.
+        let truncated = &wire[..wire.len().saturating_sub(32)];
+        let result = decode_wire(truncated);
+        assert!(result.is_err(),
+            "decode should reject truncated control block, got Ok");
     }
 
     /// Verify that `gnitz_fatal_abort!` on an `AsyncFsync` failure terminates

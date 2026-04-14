@@ -78,7 +78,7 @@ impl WorkerExchangeHandler {
         w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u64, 0, 0, STATUS_OK, &[],
+                source_id as u64, 0, 0, 0, STATUS_OK, &[],
                 schema.as_ref(), None, Some(batch),
             );
         });
@@ -235,7 +235,9 @@ impl WorkerProcess {
     // ── Main event loop ────────────────────────────────────────────────
 
     pub fn run(&mut self) -> i32 {
-        self.send_ack(0, 0);
+        // Startup ACK is unsolicited (no master request triggered it),
+        // so we use the reserved request_id=0 ("untagged") slot.
+        self.send_ack(0, 0, 0);
 
         loop {
             let ready = self.sal_reader.wait(1000);
@@ -348,7 +350,12 @@ impl WorkerProcess {
             None
         };
 
-        let result = self.dispatch_inner(flags, target_id, decoded);
+        // Capture the request_id before `decoded` is moved into dispatch_inner.
+        // The reactor on the master side keys reply wakers by this id, so every
+        // W2M reply triggered by this message must echo it back.
+        let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
+
+        let result = self.dispatch_inner(flags, target_id, decoded, request_id);
         match result {
             DispatchResult::Continue => {
                 // Replay deferred ticks BEFORE deferred pushes so all tick
@@ -364,7 +371,7 @@ impl WorkerProcess {
             }
             DispatchResult::Shutdown => true,
             DispatchResult::Error(msg) => {
-                self.send_error(&msg);
+                self.send_error(&msg, request_id);
                 false
             }
         }
@@ -375,6 +382,7 @@ impl WorkerProcess {
         flags: u32,
         target_id: i64,
         decoded: Option<ipc::DecodedWire>,
+        request_id: u64,
     ) -> DispatchResult {
         // Extract control fields before consuming decoded
         let seek_pk_lo = decoded.as_ref().map(|d| d.control.seek_pk_lo).unwrap_or(0);
@@ -393,8 +401,8 @@ impl WorkerProcess {
             self.read_cursor = 0;
             self.expected_epoch += 1;
             match self.handle_flush_all() {
-                Ok(()) => self.send_ack(0, FLAG_CHECKPOINT),
-                Err(msg) => self.send_error(&msg),
+                Ok(()) => self.send_ack(0, FLAG_CHECKPOINT, request_id),
+                Err(msg) => self.send_error(&msg, request_id),
             }
             return DispatchResult::Continue;
         }
@@ -416,13 +424,13 @@ impl WorkerProcess {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
-            self.send_ack(target_id as u64, 0);
+            self.send_ack(target_id as u64, 0, request_id);
             return DispatchResult::Continue;
         }
 
         if flags & FLAG_HAS_PK != 0 {
             let col_hint = seek_col_idx as i32;
-            match self.handle_has_pk(target_id, batch, col_hint) {
+            match self.handle_has_pk(target_id, batch, col_hint, request_id) {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -438,7 +446,7 @@ impl WorkerProcess {
                     }
                 }
             }
-            self.send_ack(target_id as u64, 0);
+            self.send_ack(target_id as u64, 0, request_id);
             return DispatchResult::Continue;
         }
 
@@ -447,7 +455,7 @@ impl WorkerProcess {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
-            self.send_ack(target_id as u64, 0);
+            self.send_ack(target_id as u64, 0, request_id);
             return DispatchResult::Continue;
         }
 
@@ -456,7 +464,7 @@ impl WorkerProcess {
             match self.cat().seek_by_index(target_id, col_idx, seek_pk_lo, seek_pk_hi) {
                 Ok(result) => {
                     let schema = self.cat().get_schema_desc(target_id);
-                    self.send_response(target_id as u64, result.as_ref(), schema.as_ref());
+                    self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
                 }
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -467,7 +475,7 @@ impl WorkerProcess {
             match self.cat().seek_family(target_id, seek_pk_lo, seek_pk_hi) {
                 Ok(result) => {
                     let schema = self.cat().get_schema_desc(target_id);
-                    self.send_response(target_id as u64, result.as_ref(), schema.as_ref());
+                    self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
                 }
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -478,7 +486,7 @@ impl WorkerProcess {
         match self.cat().scan_family(target_id) {
             Ok(result) => {
                 let schema = self.cat().get_schema_desc(target_id);
-                self.send_response(target_id as u64, Some(&*result), schema.as_ref());
+                self.send_response(target_id as u64, Some(&*result), schema.as_ref(), request_id);
             }
             Err(msg) => return DispatchResult::Error(msg),
         }
@@ -487,34 +495,40 @@ impl WorkerProcess {
 
     // ── W2M response helpers ───────────────────────────────────────────
 
-    fn send_ack(&self, target_id: u64, flags: u32) {
+    fn send_ack(&self, target_id: u64, flags: u32, request_id: u64) {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, flags as u64,
-                0, 0, 0, STATUS_OK, &[], None, None, None,
+                0, 0, 0, request_id, STATUS_OK, &[], None, None, None,
             );
         });
     }
 
-    fn send_response(&self, target_id: u64, result: Option<&Batch>, schema: Option<&SchemaDescriptor>) {
+    fn send_response(
+        &self,
+        target_id: u64,
+        result: Option<&Batch>,
+        schema: Option<&SchemaDescriptor>,
+        request_id: u64,
+    ) {
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, 0,
-                0, 0, 0, STATUS_OK, &[],
+                0, 0, 0, request_id, STATUS_OK, &[],
                 schema, None, result,
             );
         });
     }
 
-    fn send_error(&self, error_msg: &str) {
+    fn send_error(&self, error_msg: &str, request_id: u64) {
         let msg = error_msg.as_bytes();
         let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, 0, 0, 0,
-                0, 0, 0, STATUS_ERROR, msg, None, None, None,
+                0, 0, 0, request_id, STATUS_ERROR, msg, None, None, None,
             );
         });
     }
@@ -617,6 +631,7 @@ impl WorkerProcess {
         target_id: i64,
         batch: Option<Batch>,
         col_hint: i32,
+        request_id: u64,
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
@@ -640,7 +655,7 @@ impl WorkerProcess {
                     result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
                 }
             }
-            self.send_response(target_id as u64, Some(&result), Some(&schema));
+            self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
         } else {
             let schema = self.cat().get_schema_desc(target_id)
                 .ok_or_else(|| format!("no schema for tid={}", target_id))?;
@@ -656,7 +671,7 @@ impl WorkerProcess {
                     result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
                 }
             }
-            self.send_response(target_id as u64, Some(&result), Some(&schema));
+            self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
         }
         Ok(())
     }
@@ -708,9 +723,11 @@ impl WorkerProcess {
         while !self.exchange.deferred_ticks.is_empty() {
             let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
             for tid in ticks {
+                // Deferred ticks lose their original request_id when stashed.
+                // Stage 2+ will preserve it; for now use the unsolicited slot.
                 match self.handle_tick(tid) {
-                    Ok(()) => self.send_ack(tid as u64, 0),
-                    Err(msg) => self.send_error(&msg),
+                    Ok(()) => self.send_ack(tid as u64, 0, 0),
+                    Err(msg) => self.send_error(&msg, 0),
                 }
             }
         }
@@ -723,8 +740,8 @@ impl WorkerProcess {
         if pushes.is_empty() { return; }
         for p in pushes {
             match self.handle_push(p.target_id, p.batch) {
-                Ok(()) => self.send_ack(p.target_id as u64, 0),
-                Err(msg) => self.send_error(&msg),
+                Ok(()) => self.send_ack(p.target_id as u64, 0, 0),
+                Err(msg) => self.send_error(&msg, 0),
             }
         }
     }
@@ -1038,6 +1055,79 @@ mod tests {
         // deferred_ticks is empty: the inner loop must break immediately.
         wp.replay_deferred_ticks();
         assert!(wp.exchange.deferred_ticks.is_empty());
+    }
+
+    /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
+    /// `send_response`, `send_error`) must echo the inbound request_id back
+    /// on the W2M region so the master reactor can route it. We fake out the
+    /// W2M writer with a real anonymous mmap, fire each helper with a
+    /// distinct id, then read the messages back through `decode_wire` and
+    /// assert the ids round-trip.
+    #[test]
+    fn test_send_helpers_echo_request_id() {
+        use crate::ipc;
+        const REGION_SIZE: usize = 1 << 20;
+        // mmap an anonymous region; eventfd_create gives a real fd that
+        // accepts eventfd_signal calls without disturbing anything.
+        let region_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                REGION_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            )
+        };
+        assert_ne!(region_ptr, libc::MAP_FAILED);
+        let region_ptr = region_ptr as *mut u8;
+        // Init read cursor at W2M_HEADER_SIZE.
+        unsafe { *(region_ptr as *mut u64) = ipc::W2M_HEADER_SIZE as u64; }
+
+        let efd = crate::ipc_sys::eventfd_create();
+        assert!(efd >= 0);
+        let w2m_writer = ipc::W2mWriter::new(region_ptr, REGION_SIZE as u64, efd);
+
+        let wp = WorkerProcess {
+            worker_id: 0,
+            num_workers: 1,
+            master_pid: 0,
+            catalog: std::ptr::null_mut(),
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer,
+            exchange: make_handler(),
+            pending_deltas: HashMap::new(),
+            read_cursor: 0,
+            expected_epoch: 1,
+            schema_cache: HashMap::new(),
+        };
+
+        let req_ack: u64 = 42;
+        let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
+        let req_err: u64 = u64::MAX;
+        wp.send_ack(7, 0, req_ack);
+        let schema = test_schema();
+        wp.send_response(8, None, Some(&schema), req_resp);
+        wp.send_error("boom", req_err);
+
+        // Decode the three messages back from the region and check ids.
+        let mut rc = ipc::W2M_HEADER_SIZE as u64;
+        let mut decoded_ids = Vec::new();
+        for _ in 0..3 {
+            let (new_rc, sz, data_ptr) = unsafe {
+                ipc::w2m_read(region_ptr as *const u8, rc, REGION_SIZE as u64)
+            };
+            assert!(sz > 0, "expected a message at cursor {}", rc);
+            let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
+            let decoded = ipc::decode_wire(data).expect("decode_wire");
+            decoded_ids.push(decoded.control.request_id);
+            rc = new_rc;
+        }
+        assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
+
+        unsafe {
+            libc::munmap(region_ptr as *mut libc::c_void, REGION_SIZE);
+            libc::close(efd);
+        }
     }
 
     /// Simulates the cascade scenario at the data-structure level: the first

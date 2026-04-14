@@ -282,6 +282,88 @@ pub const fn align8(n: usize) -> usize {
 pub const SHORT_STRING_THRESHOLD: usize = 12;
 
 // ---------------------------------------------------------------------------
+// IPC control-block wire layout
+// ---------------------------------------------------------------------------
+//
+// The control WAL block carries the per-message header. Both `gnitz-engine`
+// (server) and `gnitz-protocol` (client) build/parse this block; the column
+// indices, payload indices, and null-bit positions live here so the two
+// implementations cannot drift.
+//
+// Schema (10 columns, pk_index = 0):
+//   col  0: msg_idx       U64   (PK placeholder; always 0)
+//   col  1: status        U64
+//   col  2: client_id     U64
+//   col  3: target_id     U64
+//   col  4: flags         U64
+//   col  5: seek_pk_lo    U64
+//   col  6: seek_pk_hi    U64
+//   col  7: seek_col_idx  U64
+//   col  8: request_id    U64    -- reactor reply-routing key
+//   col  9: error_msg     STRING (nullable)
+//
+// Reserved request_id values:
+//   0          -- "unsolicited"/"untagged" (pre-reactor reply path)
+//   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
+//   other      -- master-allocated, monotonic per request
+pub mod control {
+    /// Total number of columns in CONTROL_SCHEMA.
+    pub const NUM_COLUMNS: usize = 10;
+
+    // Schema column indices (the column number, including the PK placeholder).
+    pub const COL_MSG_IDX:      usize = 0;
+    pub const COL_STATUS:       usize = 1;
+    pub const COL_CLIENT_ID:    usize = 2;
+    pub const COL_TARGET_ID:    usize = 3;
+    pub const COL_FLAGS:        usize = 4;
+    pub const COL_SEEK_PK_LO:   usize = 5;
+    pub const COL_SEEK_PK_HI:   usize = 6;
+    pub const COL_SEEK_COL_IDX: usize = 7;
+    pub const COL_REQUEST_ID:   usize = 8;
+    pub const COL_ERROR_MSG:    usize = 9;
+
+    /// Payload index = schema column index − 1 (PK at col 0 is excluded
+    /// from the payload). Used by encoders that index payload columns
+    /// directly (server) and by null-bitmap callers (both sides).
+    pub const PAYLOAD_STATUS:       usize = COL_STATUS - 1;
+    pub const PAYLOAD_CLIENT_ID:    usize = COL_CLIENT_ID - 1;
+    pub const PAYLOAD_TARGET_ID:    usize = COL_TARGET_ID - 1;
+    pub const PAYLOAD_FLAGS:        usize = COL_FLAGS - 1;
+    pub const PAYLOAD_SEEK_PK_LO:   usize = COL_SEEK_PK_LO - 1;
+    pub const PAYLOAD_SEEK_PK_HI:   usize = COL_SEEK_PK_HI - 1;
+    pub const PAYLOAD_SEEK_COL_IDX: usize = COL_SEEK_COL_IDX - 1;
+    pub const PAYLOAD_REQUEST_ID:   usize = COL_REQUEST_ID - 1;
+    pub const PAYLOAD_ERROR_MSG:    usize = COL_ERROR_MSG - 1;
+
+    /// Null-bit position for `error_msg` in the row null bitmap.
+    /// Equals the payload index of the column.
+    pub const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
+
+    /// WAL region count for a CONTROL_SCHEMA block: 4 fixed regions
+    /// (pk_lo, pk_hi, weight, null_bmp) + (NUM_COLUMNS - 1) payload columns
+    /// + 1 blob region.
+    pub const NUM_REGIONS: usize = 4 + (NUM_COLUMNS - 1) + 1;
+
+    // Region indices for offsets/sizes arrays returned by wal::validate_and_parse.
+    // Offsets 0..3 are the fixed regions; offsets 4..(4+NUM_PAYLOAD-1) line up
+    // with payload columns (in payload order), and the last region is the blob.
+    pub const REGION_PK_LO:        usize = 0;
+    pub const REGION_PK_HI:        usize = 1;
+    pub const REGION_WEIGHT:       usize = 2;
+    pub const REGION_NULL_BMP:     usize = 3;
+    pub const REGION_STATUS:       usize = 4 + PAYLOAD_STATUS;
+    pub const REGION_CLIENT_ID:    usize = 4 + PAYLOAD_CLIENT_ID;
+    pub const REGION_TARGET_ID:    usize = 4 + PAYLOAD_TARGET_ID;
+    pub const REGION_FLAGS:        usize = 4 + PAYLOAD_FLAGS;
+    pub const REGION_SEEK_PK_LO:   usize = 4 + PAYLOAD_SEEK_PK_LO;
+    pub const REGION_SEEK_PK_HI:   usize = 4 + PAYLOAD_SEEK_PK_HI;
+    pub const REGION_SEEK_COL_IDX: usize = 4 + PAYLOAD_SEEK_COL_IDX;
+    pub const REGION_REQUEST_ID:   usize = 4 + PAYLOAD_REQUEST_ID;
+    pub const REGION_ERROR_MSG:    usize = 4 + PAYLOAD_ERROR_MSG;
+    pub const REGION_BLOB:         usize = NUM_REGIONS - 1;
+}
+
+// ---------------------------------------------------------------------------
 // German string codec
 // ---------------------------------------------------------------------------
 

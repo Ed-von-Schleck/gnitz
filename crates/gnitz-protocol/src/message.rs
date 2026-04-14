@@ -17,6 +17,7 @@ pub struct Message {
     pub seek_pk_lo:   u64,
     pub seek_pk_hi:   u64,
     pub seek_col_idx: u64,
+    pub request_id:   u64,
     pub schema:       Option<Schema>,     // derived from schema_batch (avoids re-deriving)
     pub schema_batch: Option<ZSetBatch>,
     pub data_batch:   Option<ZSetBatch>,
@@ -25,30 +26,16 @@ pub struct Message {
 
 // ── CONTROL_SCHEMA ────────────────────────────────────────────────────────────
 //
-// 9 columns (pk_index = 0):
-//   col 0: msg_idx     (U64, PK)
-//   col 1: status      (U64)
-//   col 2: client_id   (U64)
-//   col 3: target_id   (U64)
-//   col 4: flags       (U64)
-//   col 5: seek_pk_lo  (U64)
-//   col 6: seek_pk_hi  (U64)
-//   col 7: seek_col_idx(U64)
-//   col 8: error_msg   (String, nullable)
-//
-// payload_idx for col i (pk_index=0): i - 1.
-// So col 8 has payload_idx = 7; null bit 7 set means no error.
-
-const CTRL_COL_STATUS:     usize = 1;
-const CTRL_COL_CLIENT_ID:  usize = 2;
-const CTRL_COL_TARGET_ID:  usize = 3;
-const CTRL_COL_FLAGS:      usize = 4;
-const CTRL_COL_SEEK_PK_LO: usize = 5;
-const CTRL_COL_SEEK_PK_HI: usize = 6;
-const CTRL_COL_SEEK_COL:   usize = 7;
-const CTRL_COL_ERROR_MSG:  usize = 8;
+// Schema layout (column indices, payload indices, region indices, null-bit
+// positions) lives in `gnitz_wire::control`. This module builds the schema
+// using those indices so the client and the server can never disagree on
+// the wire format.
 
 fn control_schema() -> &'static Schema {
+    use gnitz_wire::control as ctrl;
+    // Compile-time check: this builder must match NUM_COLUMNS.
+    const _: () = assert!(ctrl::NUM_COLUMNS == 10,
+        "control_schema column list out of sync with gnitz_wire::control::NUM_COLUMNS");
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
@@ -60,22 +47,24 @@ fn control_schema() -> &'static Schema {
             ColumnDef { name: "seek_pk_lo".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "seek_pk_hi".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "seek_col_idx".into(),type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "error_msg".into(),   type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "request_id".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "error_msg".into(),   type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     })
 }
 
 /// Encode a `Header` + optional error message into a control WAL block.
-/// When `error_msg` is empty the error_msg column is NULL (null bit 7 set).
+/// When `error_msg` is empty the error_msg column is NULL.
 pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>, ProtocolError> {
+    use gnitz_wire::control as ctrl;
     let cs = control_schema();
 
-    // payload_idx for col 8 = 8 - 1 = 7
     let has_error = !error_msg.is_empty();
-    let nulls_val: u64 = if has_error { 0 } else { 1u64 << 7 };
+    let nulls_val: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
 
-    let u64_vals: [u64; 7] = [
+    // U64 payload columns in payload-index order (status..request_id).
+    let u64_vals: [u64; 8] = [
         header.status as u64,
         header.client_id,
         header.target_id,
@@ -83,16 +72,19 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
         header.seek_pk_lo,
         header.seek_pk_hi,
         header.seek_col_idx,
+        header.request_id,
     ];
+    debug_assert_eq!(u64_vals.len(), ctrl::PAYLOAD_ERROR_MSG,
+        "u64 payload count must equal PAYLOAD_ERROR_MSG");
 
-    let mut ctrl_bytes = [0u8; 56];
+    let mut ctrl_bytes = [0u8; 64];
     for (i, &v) in u64_vals.iter().enumerate() {
         ctrl_bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
     }
 
-    let mut columns: Vec<ColData> = Vec::with_capacity(9);
+    let mut columns: Vec<ColData> = Vec::with_capacity(ctrl::NUM_COLUMNS);
     columns.push(ColData::Fixed(vec![]));   // col 0: pk placeholder
-    for i in 0..7 {
+    for i in 0..u64_vals.len() {
         columns.push(ColData::Fixed(ctrl_bytes[i * 8..(i + 1) * 8].to_vec()));
     }
     columns.push(ColData::Strings(vec![
@@ -113,6 +105,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
 /// Decode a control WAL block, returning `(Header, error_msg)`.
 /// `error_msg` is empty when the null bit for error_msg is set.
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolError> {
+    use gnitz_wire::control as ctrl;
     let cs = control_schema();
     let (batch, tid, _lsn) = decode_wal_block(data, cs)?;
 
@@ -141,31 +134,34 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
         }
     }
 
-    let status     = read_u64_col(&batch, CTRL_COL_STATUS)?    as u32;
-    let client_id  = read_u64_col(&batch, CTRL_COL_CLIENT_ID)?;
-    let target_id  = read_u64_col(&batch, CTRL_COL_TARGET_ID)?;
-    let flags      = read_u64_col(&batch, CTRL_COL_FLAGS)?;
-    let seek_pk_lo = read_u64_col(&batch, CTRL_COL_SEEK_PK_LO)?;
-    let seek_pk_hi = read_u64_col(&batch, CTRL_COL_SEEK_PK_HI)?;
-    let seek_col_idx = read_u64_col(&batch, CTRL_COL_SEEK_COL)?;
+    let status       = read_u64_col(&batch, ctrl::COL_STATUS)? as u32;
+    let client_id    = read_u64_col(&batch, ctrl::COL_CLIENT_ID)?;
+    let target_id    = read_u64_col(&batch, ctrl::COL_TARGET_ID)?;
+    let flags        = read_u64_col(&batch, ctrl::COL_FLAGS)?;
+    let seek_pk_lo   = read_u64_col(&batch, ctrl::COL_SEEK_PK_LO)?;
+    let seek_pk_hi   = read_u64_col(&batch, ctrl::COL_SEEK_PK_HI)?;
+    let seek_col_idx = read_u64_col(&batch, ctrl::COL_SEEK_COL_IDX)?;
+    let request_id   = read_u64_col(&batch, ctrl::COL_REQUEST_ID)?;
 
-    // payload_idx for col 8 = 7; null bit set → no error string
-    let is_null = (batch.nulls[0] & (1u64 << 7)) != 0;
+    let is_null = (batch.nulls[0] & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let error_msg = if is_null {
         String::new()
     } else {
-        match &batch.columns[CTRL_COL_ERROR_MSG] {
+        match &batch.columns[ctrl::COL_ERROR_MSG] {
             ColData::Strings(v) => match &v[0] {
                 Some(s) => s.clone(),
                 None    => String::new(),
             },
             _ => return Err(ProtocolError::DecodeError(
-                "control block col 8 is not Strings".into()
+                "control block error_msg column is not Strings".into()
             )),
         }
     };
 
-    let header = Header { status, target_id, client_id, flags, seek_pk_lo, seek_pk_hi, seek_col_idx };
+    let header = Header {
+        status, target_id, client_id, flags,
+        seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
+    };
     Ok((header, error_msg))
 }
 
@@ -192,6 +188,7 @@ pub fn encode_message(
     let ctrl_hdr = Header {
         status: STATUS_OK, target_id, client_id, flags: flags_out,
         seek_pk_lo, seek_pk_hi, seek_col_idx,
+        request_id: 0,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "")?;
     let schema_block = if has_schema {
@@ -307,6 +304,7 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
         seek_pk_lo:   ctrl_header.seek_pk_lo,
         seek_pk_hi:   ctrl_header.seek_pk_hi,
         seek_col_idx: ctrl_header.seek_col_idx,
+        request_id:   ctrl_header.request_id,
         schema,
         schema_batch,
         data_batch,
@@ -351,6 +349,7 @@ mod tests {
             seek_pk_lo: 42,
             seek_pk_hi: 99,
             seek_col_idx: 7,
+            request_id: 0xCAFE_BABE_DEAD_F00D,
         };
 
         let encoded = encode_control_block(&h, "test error").unwrap();
@@ -363,6 +362,7 @@ mod tests {
         assert_eq!(decoded.seek_pk_lo, h.seek_pk_lo);
         assert_eq!(decoded.seek_pk_hi, h.seek_pk_hi);
         assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
+        assert_eq!(decoded.request_id, h.request_id);
         assert_eq!(err, "test error");
     }
 
@@ -372,6 +372,20 @@ mod tests {
         let encoded = encode_control_block(&h, "").unwrap();
         let (_, err) = decode_control_block(&encoded).unwrap();
         assert_eq!(err, "");
+    }
+
+    /// `request_id` round-trips for the reserved sentinel values: 0 (untagged),
+    /// u64::MAX (broadcast), and an arbitrary mid-range value. Catches both
+    /// sign-extension bugs and the new-column-index drift between client and
+    /// server.
+    #[test]
+    fn test_request_id_roundtrip_reserved_values() {
+        for &req_id in &[0u64, u64::MAX, 0x1234_5678_DEAD_BEEFu64] {
+            let h = Header { request_id: req_id, ..Header::default() };
+            let encoded = encode_control_block(&h, "").unwrap();
+            let (decoded, _) = decode_control_block(&encoded).unwrap();
+            assert_eq!(decoded.request_id, req_id);
+        }
     }
 
     // ── send/recv message roundtrips ────────────────────────────────────────

@@ -330,6 +330,7 @@ impl MasterDispatcher {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
         unicast_worker: i32,
     ) -> Result<(), String> {
         let mut name_refs = [&[] as &[u8]; 64];
@@ -345,7 +346,7 @@ impl MasterDispatcher {
         self.sal.write_group_direct(
             target_id as u32, flags, worker_batches,
             schema, col_names_opt,
-            seek_pk_lo, seek_pk_hi, seek_col_idx, unicast_worker,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id, unicast_worker,
         )
     }
 
@@ -360,6 +361,7 @@ impl MasterDispatcher {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
     ) -> Result<(), String> {
         let mut name_refs = [&[] as &[u8]; 64];
         for (i, n) in col_names.iter().enumerate().take(64) {
@@ -373,7 +375,7 @@ impl MasterDispatcher {
 
         self.sal.write_broadcast_direct(
             target_id as u32, flags, batch, schema, col_names_opt,
-            seek_pk_lo, seek_pk_hi, seek_col_idx,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
         )
     }
 
@@ -388,9 +390,10 @@ impl MasterDispatcher {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
     ) -> Result<(), String> {
         self.write_broadcast(target_id, flags, batch, schema, col_names,
-                            seek_pk_lo, seek_pk_hi, seek_col_idx)?;
+                            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id)?;
         self.signal_all();
         Ok(())
     }
@@ -428,9 +431,10 @@ impl MasterDispatcher {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
+        request_id: u64,
     ) -> Result<(), String> {
         self.write_group(target_id, flags, worker_batches, schema, col_names,
-                         seek_pk_lo, seek_pk_hi, seek_col_idx, -1)?;
+                         seek_pk_lo, seek_pk_hi, seek_col_idx, request_id, -1)?;
         self.signal_all();
         Ok(())
     }
@@ -491,7 +495,7 @@ impl MasterDispatcher {
             target_id,
             FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT,
             Some(batch), &schema, &col_names,
-            0, 0, mode.as_u8() as u64,
+            0, 0, mode.as_u8() as u64, 0,
         )
     }
 
@@ -621,7 +625,7 @@ impl MasterDispatcher {
 
     fn do_checkpoint(&mut self) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
-        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
+        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0, 0)?;
         self.collect_acks()?;
 
         // Flush system tables before resetting SAL — their data lives in
@@ -669,7 +673,7 @@ impl MasterDispatcher {
         let refs: Vec<Option<&Batch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
-        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes, 0, 0, 0)
+        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes, 0, 0, 0, 0)
     }
 
     fn record_index_routing(
@@ -713,7 +717,7 @@ impl MasterDispatcher {
     pub fn fan_out_tick(&mut self, target_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
         self.collect_acks_and_relay(target_id)?;
         gnitz_debug!("fan_out_tick tid={}", target_id);
         Ok(())
@@ -748,7 +752,7 @@ impl MasterDispatcher {
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             self.write_group(target_id, push_flags, &refs, &schema, &col_names,
-                            0, 0, mode_byte, -1)?;
+                            0, 0, mode_byte, 0, -1)?;
             let rc = self.sync_and_signal_all();
             if rc < 0 {
                 return Err(format!("fdatasync failed rc={}", rc));
@@ -772,14 +776,14 @@ impl MasterDispatcher {
                     .map(|b| if b.count > 0 { Some(b) } else { None })
                     .collect();
                 self.write_group(vid, FLAG_PRELOADED_EXCHANGE, &refs, &schema,
-                                &col_names, 0, 0, 0, -1)?;
+                                &col_names, 0, 0, 0, 0, -1)?;
             }
 
             let refs: Vec<Option<&Batch>> = pk_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             self.write_group(target_id, push_flags, &refs, &schema,
-                            &col_names, 0, 0, mode_byte, -1)?;
+                            &col_names, 0, 0, mode_byte, 0, -1)?;
 
             let rc = self.sync_and_signal_all();
             if rc < 0 {
@@ -796,14 +800,14 @@ impl MasterDispatcher {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         self.send_broadcast(source_id, FLAG_BACKFILL, None, &schema, &col_names,
-                           view_id as u64, 0, 0)?;
+                           view_id as u64, 0, 0, 0)?;
         self.collect_acks_and_relay(source_id)
     }
 
     pub fn fan_out_scan(&mut self, target_id: i64) -> Result<Option<Batch>, String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0)?;
+        self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0, 0)?;
         let result = self.collect_responses(&schema)?;
         gnitz_debug!("fan_out_scan tid={} result_rows={}", target_id, result.count);
         if result.count == 0 {
@@ -826,7 +830,7 @@ impl MasterDispatcher {
 
         let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
         self.write_group(target_id, FLAG_SEEK, &empty, &schema, &col_names,
-                        pk_lo, pk_hi, 0, worker as i32)?;
+                        pk_lo, pk_hi, 0, 0, worker as i32)?;
         self.signal_one(worker);
 
         let decoded = self.collect_one(worker)?;
@@ -856,7 +860,7 @@ impl MasterDispatcher {
             let w = cached_worker as usize;
             let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
             self.write_group(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
-                            key_lo, key_hi, col_idx as u64, cached_worker)?;
+                            key_lo, key_hi, col_idx as u64, 0, cached_worker)?;
             self.signal_one(w);
 
             let decoded = self.collect_one(w)?;
@@ -870,7 +874,7 @@ impl MasterDispatcher {
         // Cache miss: broadcast
         let empty: Vec<Option<&Batch>> = vec![None; self.num_workers];
         self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
-                            key_lo, key_hi, col_idx as u64)?;
+                            key_lo, key_hi, col_idx as u64, 0)?;
         let results = self.wait_all_workers()?;
         for decoded_opt in results {
             if let Some(decoded) = decoded_opt {
@@ -888,7 +892,7 @@ impl MasterDispatcher {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
-                            0, 0, 0)?;
+                            0, 0, 0, 0)?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.count);
         Ok(())
@@ -911,7 +915,7 @@ impl MasterDispatcher {
     pub fn start_tick_async(&mut self, target_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
 
         self.begin_async_collection(1);
         Ok(())
@@ -939,7 +943,7 @@ impl MasterDispatcher {
         // invalidating any unread SAL entries from this failed batch.
         for &tid in tids {
             let (schema, col_names) = self.get_schema_and_names(tid);
-            self.write_broadcast(tid, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+            self.write_broadcast(tid, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
         }
         // Single signal after all writes — one eventfd kick for N ticks.
         self.signal_all();
@@ -1051,7 +1055,7 @@ impl MasterDispatcher {
 
     pub fn shutdown_workers(&mut self) {
         let schema = SchemaDescriptor::minimal_u64();
-        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
+        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0, 0);
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid > 0 {
@@ -1216,7 +1220,7 @@ impl MasterDispatcher {
                 CheckPayload::Broadcast(batch) => {
                     self.write_broadcast(
                         check.target_id, check.flags, Some(batch),
-                        &check.schema, &[], 0, 0, check.col_hint,
+                        &check.schema, &[], 0, 0, check.col_hint, 0,
                     )?;
                 }
                 CheckPayload::Partitioned(batches) => {
@@ -1225,7 +1229,7 @@ impl MasterDispatcher {
                         .collect();
                     self.write_group(
                         check.target_id, check.flags, &refs,
-                        &check.schema, &[], 0, 0, check.col_hint, -1,
+                        &check.schema, &[], 0, 0, check.col_hint, 0, -1,
                     )?;
                 }
             }

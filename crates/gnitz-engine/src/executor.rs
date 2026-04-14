@@ -337,7 +337,7 @@ impl ServerExecutor {
             ipc::encode_wire_into(
                 buf, 0,
                 target_id as u64, client_id,
-                0, seek_pk_lo, 0, 0,
+                0, seek_pk_lo, 0, 0, 0,
                 status, error_msg,
                 Some(schema), col_names_opt, result,
             )
@@ -356,7 +356,7 @@ impl ServerExecutor {
             ipc::encode_wire_into(
                 buf, 0,
                 new_id as u64, client_id,
-                0, 0, 0, 0,
+                0, 0, 0, 0, 0,
                 STATUS_OK, b"",
                 None, None, None,
             )
@@ -377,7 +377,7 @@ impl ServerExecutor {
             ipc::encode_wire_into(
                 buf, 0,
                 target_id as u64, client_id,
-                0, 0, 0, 0,
+                0, 0, 0, 0, 0,
                 STATUS_ERROR, error_msg,
                 Some(&schema), None, None,
             )
@@ -564,7 +564,7 @@ impl ServerExecutor {
                         ipc::encode_wire_into(
                             buf, 0,
                             g.target_id as u64, e.client_id,
-                            0, 0, 0, 0,
+                            0, 0, 0, 0, 0,
                             STATUS_ERROR, err_msg.as_bytes(),
                             Some(&schema), None, None,
                         )
@@ -574,7 +574,7 @@ impl ServerExecutor {
                         ipc::encode_wire_into(
                             buf, 0,
                             g.target_id as u64, e.client_id,
-                            0, g.current_lsn, 0, 0,
+                            0, g.current_lsn, 0, 0, 0,
                             STATUS_OK, b"",
                             Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
                         )
@@ -759,7 +759,7 @@ impl ServerExecutor {
                         ipc::encode_wire_into(
                             buf, 0,
                             g.target_id as u64, e.client_id,
-                            0, 0, 0, 0,
+                            0, 0, 0, 0, 0,
                             STATUS_ERROR, err_msg.as_bytes(),
                             Some(&schema), None, None,
                         )
@@ -769,7 +769,7 @@ impl ServerExecutor {
                         ipc::encode_wire_into(
                             buf, 0,
                             g.target_id as u64, e.client_id,
-                            0, g.current_lsn, 0, 0,
+                            0, g.current_lsn, 0, 0, 0,
                             STATUS_OK, b"",
                             Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
                         )
@@ -798,7 +798,7 @@ impl ServerExecutor {
                 ipc::encode_wire_into(
                     buf, 0,
                     e.target_id as u64, e.client_id,
-                    0, 0, 0, 0,
+                    0, 0, 0, 0, 0,
                     STATUS_ERROR, err_msg.as_bytes(),
                     Some(&schema), None, None,
                 )
@@ -1051,7 +1051,7 @@ impl ServerExecutor {
             ipc::encode_wire_into(
                 buf, 0,
                 target_id as u64, client_id,
-                0, 0, 0, 0,
+                0, 0, 0, 0, 0,
                 STATUS_ERROR, err_msg.as_bytes(),
                 Some(&schema), None, None,
             )
