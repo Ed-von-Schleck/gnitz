@@ -538,6 +538,77 @@ impl Future for ReplyFuture {
 }
 
 // ---------------------------------------------------------------------------
+// TickIdleBarrier
+// ---------------------------------------------------------------------------
+//
+// Stage 2 replaces `executor.deferred_requests` with reactor-spawned tasks
+// that wait on this barrier. `wait()` returns immediately if the barrier
+// is in the "idle" state; otherwise the future suspends until `notify_all`
+// is called (which the executor invokes when `tick_state` transitions
+// `Active → Idle`).
+//
+// Single-threaded by construction; uses a `RefCell` instead of a `Mutex`.
+// `Rc<TickIdleBarrier>` is shared between the executor and every spawned
+// task; cloning is cheap.
+
+pub struct TickIdleBarrier {
+    /// True when no tick is currently active. `wait()` returns immediately
+    /// in this state; setters flip it back to false when a tick begins.
+    idle: Cell<bool>,
+    wakers: RefCell<Vec<Waker>>,
+}
+
+impl TickIdleBarrier {
+    pub fn new() -> Self {
+        TickIdleBarrier {
+            idle: Cell::new(true),
+            wakers: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Mark the barrier as "tick active". Calls to `wait()` will suspend
+    /// until the next `notify_all`.
+    pub fn set_active(&self) {
+        self.idle.set(false);
+    }
+
+    /// Mark the barrier as "tick idle" and wake every suspended waiter.
+    pub fn notify_all(&self) {
+        self.idle.set(true);
+        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
+        for w in wakers {
+            w.wake();
+        }
+    }
+
+    /// Future that resolves when the barrier is in the idle state.
+    /// Returns immediately on the first poll if a tick is not active.
+    pub fn wait<'a>(self: &'a Rc<Self>) -> impl Future<Output = ()> + 'a {
+        BarrierFuture { barrier: Rc::clone(self) }
+    }
+}
+
+impl Default for TickIdleBarrier {
+    fn default() -> Self { Self::new() }
+}
+
+struct BarrierFuture {
+    barrier: Rc<TickIdleBarrier>,
+}
+
+impl Future for BarrierFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.barrier.idle.get() {
+            Poll::Ready(())
+        } else {
+            self.barrier.wakers.borrow_mut().push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -756,6 +827,64 @@ mod tests {
         std::panic::set_hook(prev);
         assert!(r.last_task_panicked());
         assert_eq!(r.task_count(), 0);
+    }
+
+    /// `TickIdleBarrier::wait()` returns immediately when the barrier is
+    /// in the idle state (the common-case fast path for SELECTs that
+    /// arrive when no tick is running).
+    #[test]
+    fn tick_idle_barrier_wait_returns_immediately_when_idle() {
+        let r = make_reactor();
+        let barrier = Rc::new(TickIdleBarrier::new());
+        let b = Rc::clone(&barrier);
+        let start = Instant::now();
+        r.block_on(async move {
+            b.wait().await;
+        });
+        assert!(start.elapsed() < Duration::from_millis(50),
+            "idle barrier wait should not block");
+    }
+
+    /// `notify_all` wakes every suspended waiter. Each spawned task races
+    /// the barrier against a 200ms guard timer; if the barrier wins, the
+    /// task's index is recorded.
+    #[test]
+    fn tick_idle_barrier_wakes_all_waiters() {
+        let r = make_reactor();
+        let barrier = Rc::new(TickIdleBarrier::new());
+        barrier.set_active();
+        let woken: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+
+        for i in 0u32..3 {
+            let b = Rc::clone(&barrier);
+            let w = Rc::clone(&woken);
+            r.spawn(async move {
+                b.wait().await;
+                w.borrow_mut().push(i);
+            });
+        }
+
+        // Trigger the wake from a separate task that fires after a short
+        // delay (so the awaiters have time to register).
+        let b_notify = Rc::clone(&barrier);
+        let inner = Rc::clone(&r.inner);
+        r.block_on(async move {
+            TimerFuture {
+                deadline: Instant::now() + Duration::from_millis(20),
+                registered: false,
+                inner,
+            }.await;
+            b_notify.notify_all();
+        });
+
+        // Drain remaining tasks.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while r.has_pending_tasks() && Instant::now() < deadline {
+            r.tick(true);
+        }
+        let mut got: Vec<u32> = woken.borrow().clone();
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2], "all 3 waiters must wake");
     }
 
     /// A timer in the past resolves on the very first poll instead of
