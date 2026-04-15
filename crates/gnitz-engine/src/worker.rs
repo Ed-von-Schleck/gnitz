@@ -31,159 +31,32 @@ struct DeferredDdl {
     batch: Batch,
 }
 
-/// A FLAG_PUSH message received during an exchange wait, decoded eagerly.
-/// Replayed after the tick ACK so push ACKs follow tick ACKs on W2M.
-struct DeferredPush {
-    target_id: i64,
-    batch: Batch,
-    /// Original request_id from the deferred message — propagated so the
-    /// replayed ACK can be routed by the master reactor instead of
-    /// arriving as an unrouted reply (which would advance write_cursor
-    /// without decrementing in_flight, breaking the W2M reset gate).
-    req_id: u64,
-}
-
 struct WorkerExchangeHandler {
     stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
-    deferred_pushes: Vec<DeferredPush>,
-    /// FLAG_TICK messages encountered inside `do_exchange_impl` while waiting
-    /// for a FLAG_EXCHANGE_RELAY.  In a multi-table batched tick, the master
-    /// writes TICK[A], TICK[B], TICK[C] to the SAL before signalling once.
-    /// When the worker is blocked waiting for A's relay, it sees TICK[B] and
-    /// TICK[C] in the SAL. They are stashed here and replayed (via
-    /// `replay_deferred_ticks`) after the current tick's ACK is sent, so the
-    /// master receives ACK[A], ACK[B], ACK[C] in order. The req_id is the
-    /// original FLAG_TICK request id so the replayed ACK is routable.
-    deferred_ticks: Vec<(i64, u64)>,
+    /// FLAG_EXCHANGE_RELAY messages whose `view_id` doesn't match the innermost
+    /// exchange wait. Populated when the worker is blocked inside
+    /// `do_exchange_wait(view_A)` and observes `RELAY[view_B]` in the SAL
+    /// (produced by an exchange a nested inline tick started).  Each nested
+    /// wait checks this map before reading the SAL so relays routed out of
+    /// order still reach the wait that asked for them.
+    pending_relays: HashMap<i64, Batch>,
 }
 
 impl WorkerExchangeHandler {
     fn stash_preloaded(&mut self, view_id: i64, batch: Batch) {
         self.stash.insert(view_id, batch);
     }
-
-    /// Perform exchange IPC: send pre-exchange output to master, receive relay.
-    /// `tick_request_id` is echoed on the FLAG_EXCHANGE wire so the master
-    /// can correlate the exchange with its originating tick; the
-    /// accumulator itself keys by view_id.
-    fn do_exchange_impl(
-        &mut self,
-        sal_reader: &SalReader,
-        w2m_writer: &W2mWriter,
-        view_id: i64,
-        batch: &Batch,
-        source_id: i64,
-        read_cursor: &mut u64,
-        expected_epoch: u32,
-        master_pid: i32,
-        tick_request_id: u64,
-    ) -> Batch {
-        if let Some(stashed) = self.stash.remove(&view_id) {
-            return stashed;
-        }
-
-        let schema = batch.schema;
-        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch));
-        w2m_writer.send_encoded(sz, |buf| {
-            ipc::encode_wire_into(
-                buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u64, 0, 0, tick_request_id, STATUS_OK, &[],
-                schema.as_ref(), None, Some(batch),
-            );
-        });
-
-        // Blocking loop: wait for exchange relay (FLAG_EXCHANGE_RELAY) from master.
-        // Drain all available entries before re-waiting so that interleaved
-        // DDL broadcasts don't stall the exchange (each broadcast consumes
-        // the eventfd signal, and re-waiting would block for up to 30 s).
-        loop {
-            sal_reader.wait(30000);
-
-            // If the master died (killed or gnitz_fatal_abort) while we
-            // were waiting, exit like the main run loop does. Without
-            // this, do_exchange_impl would spin on 30 s waits forever.
-            // Can't call self.shutdown() here because do_exchange_impl
-            // borrows self; _exit(0) matches the shutdown end state.
-            if master_pid != 0 && unsafe { libc::getppid() } != master_pid {
-                unsafe { libc::_exit(0); }
-            }
-
-            loop {
-                let (msg, new_cursor) = match sal_reader.try_read(*read_cursor) {
-                    Some(v) => v,
-                    None => break, // no more entries — back to outer wait
-                };
-                if msg.epoch != expected_epoch {
-                    break;
-                }
-                *read_cursor = new_cursor;
-
-                if msg.flags == FLAG_EXCHANGE_RELAY {
-                    if let Some(data) = msg.wire_data {
-                        if let Ok(decoded) = ipc::decode_wire(data) {
-                            if let Some(batch) = decoded.data_batch {
-                                return batch;
-                            }
-                        }
-                    }
-                    let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
-                    return Batch::with_schema(empty_schema, 0);
-                }
-
-                // Not an exchange relay. Defer DDL_SYNC, FLAG_PUSH, and
-                // FLAG_TICK; discard others.
-                if msg.flags & FLAG_DDL_SYNC != 0 {
-                    if let Some(data) = msg.wire_data {
-                        if let Ok(decoded) = ipc::decode_wire(data) {
-                            if let Some(batch) = decoded.data_batch {
-                                self.deferred.push(DeferredDdl {
-                                    target_id: msg.target_id as i64,
-                                    batch,
-                                });
-                            }
-                        }
-                    }
-                } else if msg.flags & FLAG_PUSH != 0 {
-                    if let Some(data) = msg.wire_data {
-                        if let Ok(decoded) = ipc::decode_wire(data) {
-                            let push_req_id = decoded.control.request_id;
-                            if let Some(batch) = decoded.data_batch {
-                                self.deferred_pushes.push(DeferredPush {
-                                    target_id: msg.target_id as i64,
-                                    batch,
-                                    req_id: push_req_id,
-                                });
-                            }
-                        }
-                    }
-                } else if msg.flags & FLAG_TICK != 0 {
-                    // A tick for another table arrived while waiting for this
-                    // exchange relay (multi-table batched tick scenario).
-                    // Stash the (tid, req_id) so replay_deferred_ticks can
-                    // ACK with the correct id.
-                    let tick_req_id = msg.wire_data
-                        .and_then(|d| ipc::decode_wire(d).ok())
-                        .map(|d| d.control.request_id)
-                        .unwrap_or(0);
-                    self.deferred_ticks.push((msg.target_id as i64, tick_req_id));
-                }
-            }
-        }
-    }
 }
 
-/// Wrapper that carries channel handles, read_cursor, and expected_epoch from
-/// WorkerProcess into the ExchangeCallback trait. `tick_request_id` is the
-/// request_id of the FLAG_TICK (or other) message that triggered the DAG
-/// evaluation; threaded through so FLAG_EXCHANGE replies echo it.
+/// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess`.
+/// Holds a mutable reference to the worker so `do_exchange` can re-enter
+/// the worker's handlers (`handle_push`, `handle_tick`) inline when those
+/// messages arrive mid-wait. `tick_request_id` is the id of the message
+/// that kicked off this DAG evaluation; echoed on FLAG_EXCHANGE so the
+/// master's accumulator stays routable.
 struct WorkerExchangeCtx<'a> {
-    handler: &'a mut WorkerExchangeHandler,
-    sal_reader: &'a SalReader,
-    w2m_writer: &'a W2mWriter,
-    read_cursor: &'a mut u64,
-    expected_epoch: u32,
-    master_pid: i32,
+    worker: &'a mut WorkerProcess,
     tick_request_id: u64,
 }
 
@@ -194,12 +67,7 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
         batch: &Batch,
         source_id: i64,
     ) -> Batch {
-        self.handler.do_exchange_impl(
-            self.sal_reader, self.w2m_writer,
-            view_id, batch, source_id,
-            self.read_cursor, self.expected_epoch,
-            self.master_pid, self.tick_request_id,
-        )
+        self.worker.do_exchange_wait(view_id, batch, source_id, self.tick_request_id)
     }
 }
 
@@ -242,8 +110,7 @@ impl WorkerProcess {
             exchange: WorkerExchangeHandler {
                 stash: HashMap::new(),
                 deferred: Vec::new(),
-                deferred_pushes: Vec::new(),
-                deferred_ticks: Vec::new(),
+                pending_relays: HashMap::new(),
             },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
@@ -379,18 +246,7 @@ impl WorkerProcess {
 
         let result = self.dispatch_inner(flags, target_id, decoded, request_id);
         match result {
-            DispatchResult::Continue => {
-                // Replay deferred ticks BEFORE deferred pushes so all tick
-                // ACKs land on W2M before any push ACKs. Per-worker req_ids
-                // make the master's reply routing order-independent at the
-                // request level, but this replay ordering is still the
-                // simplest way to keep tick's ExchangeAccumulator in sync.
-                self.replay_deferred_ticks();
-                // Replay any FLAG_PUSH messages stashed during exchange.
-                // This runs AFTER all tick ACKs are sent.
-                self.replay_deferred_pushes();
-                false
-            }
+            DispatchResult::Continue => false,
             DispatchResult::Shutdown => true,
             DispatchResult::Error(msg) => {
                 self.send_error(&msg, request_id);
@@ -712,18 +568,12 @@ impl WorkerProcess {
     /// Run multi-worker DAG evaluation with the exchange context.
     /// `request_id` is the master's request id of the message that
     /// triggered this evaluation (FLAG_TICK / FLAG_PUSH / FLAG_BACKFILL);
-    /// echoed by `do_exchange_impl` so the master accumulator's wakers
+    /// echoed by `do_exchange_wait` so the master accumulator's wakers
     /// stay routable.
     fn evaluate_dag(&mut self, source_id: i64, delta: Batch, request_id: u64) {
         let dag = self.cat().get_dag_ptr();
-        let master_pid = self.master_pid;
         let mut ctx = WorkerExchangeCtx {
-            handler: &mut self.exchange,
-            sal_reader: &self.sal_reader,
-            w2m_writer: &self.w2m_writer,
-            read_cursor: &mut self.read_cursor,
-            expected_epoch: self.expected_epoch,
-            master_pid,
+            worker: self,
             tick_request_id: request_id,
         };
         unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, &mut ctx);
@@ -737,35 +587,126 @@ impl WorkerProcess {
         }
     }
 
-    /// Replay FLAG_TICK messages stashed during do_exchange_impl (batched tick).
-    /// Called before replay_deferred_pushes so all tick ACKs reach the master
-    /// before any push ACKs — preserves tick's exchange-relay demux order.
-    ///
-    /// The while loop handles cascades: if processing deferred tick B causes
-    /// B's own exchange wait to stash TICK[C], the next iteration catches it.
-    /// For the common single-table case (deferred_ticks always empty) the
-    /// is_empty() check short-circuits with no allocation.
-    fn replay_deferred_ticks(&mut self) {
-        while !self.exchange.deferred_ticks.is_empty() {
-            let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
-            for (tid, req_id) in ticks {
-                match self.handle_tick(tid, req_id) {
-                    Ok(()) => self.send_ack(tid as u64, 0, req_id),
-                    Err(msg) => self.send_error(&msg, req_id),
-                }
-            }
+    /// Send FLAG_EXCHANGE to the master and block until its FLAG_EXCHANGE_RELAY
+    /// for `view_id` comes back on the SAL. Messages that arrive mid-wait are
+    /// dispatched inline — handle_push, handle_tick — so ACKs flow back through
+    /// the master reactor in their natural arrival order, routed by req_id.
+    /// Relays whose view_id does not match the innermost wait are parked in
+    /// `pending_relays`; the next nested wait to ask for them will pick them
+    /// up without re-reading the SAL.
+    fn do_exchange_wait(
+        &mut self,
+        view_id: i64,
+        batch: &Batch,
+        source_id: i64,
+        tick_request_id: u64,
+    ) -> Batch {
+        if let Some(stashed) = self.exchange.stash.remove(&view_id) {
+            return stashed;
         }
-    }
 
-    /// Replay FLAG_PUSH messages that were stashed during do_exchange_impl.
-    /// Called after the tick ACK is sent so push ACKs follow tick ACKs on W2M.
-    fn replay_deferred_pushes(&mut self) {
-        let pushes = std::mem::take(&mut self.exchange.deferred_pushes);
-        if pushes.is_empty() { return; }
-        for p in pushes {
-            match self.handle_push(p.target_id, p.batch, p.req_id) {
-                Ok(()) => self.send_ack(p.target_id as u64, 0, p.req_id),
-                Err(msg) => self.send_error(&msg, p.req_id),
+        let schema = batch.schema;
+        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch));
+        self.w2m_writer.send_encoded(sz, |buf| {
+            ipc::encode_wire_into(
+                buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
+                source_id as u64, 0, 0, tick_request_id, STATUS_OK, &[],
+                schema.as_ref(), None, Some(batch),
+            );
+        });
+
+        let master_pid = self.master_pid;
+        let expected_epoch = self.expected_epoch;
+
+        loop {
+            if let Some(b) = self.exchange.pending_relays.remove(&view_id) {
+                return b;
+            }
+
+            self.sal_reader.wait(30000);
+
+            // If the master died (killed or gnitz_fatal_abort) while we
+            // were waiting, exit like the main run loop does.
+            if master_pid != 0 && unsafe { libc::getppid() } != master_pid {
+                unsafe { libc::_exit(0); }
+            }
+
+            loop {
+                if let Some(b) = self.exchange.pending_relays.remove(&view_id) {
+                    return b;
+                }
+
+                let (msg_flags, msg_target, msg_wire) = {
+                    let (msg, new_cursor) = match self.sal_reader.try_read(self.read_cursor) {
+                        Some(v) => v,
+                        None => break, // no more entries — back to outer wait
+                    };
+                    if msg.epoch != expected_epoch {
+                        break;
+                    }
+                    self.read_cursor = new_cursor;
+                    (msg.flags, msg.target_id as i64, msg.wire_data)
+                };
+
+                if msg_flags == FLAG_EXCHANGE_RELAY {
+                    let relay_batch = msg_wire
+                        .and_then(|d| ipc::decode_wire(d).ok())
+                        .and_then(|d| d.data_batch)
+                        .unwrap_or_else(|| {
+                            let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
+                            Batch::with_schema(empty_schema, 0)
+                        });
+                    if msg_target == view_id {
+                        return relay_batch;
+                    }
+                    self.exchange.pending_relays.insert(msg_target, relay_batch);
+                    continue;
+                }
+
+                if msg_flags & FLAG_DDL_SYNC != 0 {
+                    if let Some(data) = msg_wire {
+                        if let Ok(decoded) = ipc::decode_wire(data) {
+                            if let Some(batch) = decoded.data_batch {
+                                self.exchange.deferred.push(DeferredDdl {
+                                    target_id: msg_target,
+                                    batch,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if msg_flags & FLAG_PUSH != 0 {
+                    let decoded = msg_wire.and_then(|d| ipc::decode_wire(d).ok());
+                    let req_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
+                    let push_batch = decoded.and_then(|d| d.data_batch);
+                    let push_err = if let Some(b) = push_batch {
+                        if b.count > 0 {
+                            self.handle_push(msg_target, b, req_id).err()
+                        } else { None }
+                    } else { None };
+                    if let Some(e) = push_err {
+                        self.send_error(&e, req_id);
+                    } else {
+                        self.send_ack(msg_target as u64, 0, req_id);
+                    }
+                    continue;
+                }
+
+                if msg_flags & FLAG_TICK != 0 {
+                    let req_id = msg_wire
+                        .and_then(|d| ipc::decode_wire(d).ok())
+                        .map(|d| d.control.request_id)
+                        .unwrap_or(0);
+                    match self.handle_tick(msg_target, req_id) {
+                        Ok(()) => self.send_ack(msg_target as u64, 0, req_id),
+                        Err(e) => self.send_error(&e, req_id),
+                    }
+                    continue;
+                }
+
+                // Unknown/uninteresting flag — discard.
             }
         }
     }
@@ -869,8 +810,7 @@ mod tests {
         WorkerExchangeHandler {
             stash: HashMap::new(),
             deferred: Vec::<DeferredDdl>::new(),
-            deferred_pushes: Vec::new(),
-            deferred_ticks: Vec::new(),
+            pending_relays: HashMap::new(),
         }
     }
 
@@ -1036,55 +976,28 @@ mod tests {
         assert_eq!(result.count, 1);
     }
 
-    // -- deferred_ticks tests ------------------------------------------------
+    // -- pending_relays tests ------------------------------------------------
 
-    /// WorkerExchangeHandler initialises with an empty deferred_ticks list.
+    /// Relays arriving for a different view_id while an outer exchange waits
+    /// are parked in `pending_relays`; the next nested wait to ask for that
+    /// view_id pulls them from the queue instead of re-reading the SAL.
     #[test]
-    fn test_deferred_ticks_init_empty() {
-        let h = make_handler();
-        assert!(h.deferred_ticks.is_empty());
-    }
-
-    /// Ticks stashed in deferred_ticks are drained in FIFO order, exactly once.
-    /// This mirrors the `std::mem::take` pattern inside replay_deferred_ticks.
-    #[test]
-    fn test_deferred_ticks_stash_and_drain_fifo() {
+    fn test_pending_relays_queue_and_drain() {
         let mut h = make_handler();
-        h.deferred_ticks.push((101, 1001));
-        h.deferred_ticks.push((202, 1002));
-        h.deferred_ticks.push((303, 1003));
-        assert_eq!(h.deferred_ticks.len(), 3);
+        let schema = test_schema();
+        let mut batch_b = Batch::with_schema(schema, 0);
+        batch_b.count = 7;
+        let mut batch_c = Batch::with_schema(schema, 0);
+        batch_c.count = 9;
+        h.pending_relays.insert(200, batch_b);
+        h.pending_relays.insert(300, batch_c);
 
-        let drained = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(drained, vec![(101, 1001), (202, 1002), (303, 1003)],
-            "FIFO order must be preserved with req_ids intact");
-        assert!(h.deferred_ticks.is_empty(), "take must leave source empty");
-
-        // A second take on an already-empty list returns an empty vec.
-        let empty = std::mem::take(&mut h.deferred_ticks);
-        assert!(empty.is_empty());
-    }
-
-    /// replay_deferred_ticks is a no-op (no panic) when deferred_ticks is empty.
-    /// Uses catalog=null because no actual tick processing is triggered.
-    #[test]
-    fn test_replay_deferred_ticks_noop_when_empty() {
-        let mut wp = WorkerProcess {
-            worker_id: 0,
-            num_workers: 1,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            read_cursor: 0,
-            expected_epoch: 1,
-            schema_cache: HashMap::new(),
-        };
-        // deferred_ticks is empty: the inner loop must break immediately.
-        wp.replay_deferred_ticks();
-        assert!(wp.exchange.deferred_ticks.is_empty());
+        // Nested wait for view 200 finds its relay without touching the SAL.
+        let b = h.pending_relays.remove(&200).expect("view 200 relay queued");
+        assert_eq!(b.count, 7);
+        assert!(!h.pending_relays.contains_key(&200));
+        // Unrelated view 300 remains parked for its own wait.
+        assert!(h.pending_relays.contains_key(&300));
     }
 
     /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
@@ -1160,33 +1073,4 @@ mod tests {
         }
     }
 
-    /// Simulates the cascade scenario at the data-structure level: the first
-    /// pass of replay_deferred_ticks takes [B, C], and if processing B were
-    /// to stash D into deferred_ticks, the loop would pick it up in pass 2.
-    /// We can't call handle_tick without a real catalog, so we directly
-    /// exercise the take-and-repopulate cycle that makes the loop correct.
-    #[test]
-    fn test_deferred_ticks_cascade_loop_terminates() {
-        // Step 1: deferred_ticks has [B, C] after A's exchange wait.
-        let mut h = make_handler();
-        h.deferred_ticks.push((200, 2200)); // B
-        h.deferred_ticks.push((300, 3300)); // C
-
-        // Step 2: first pass of the loop drains [B, C].
-        let pass1 = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(pass1, vec![(200, 2200), (300, 3300)]);
-        assert!(h.deferred_ticks.is_empty());
-
-        // Step 3: processing B's exchange causes D to be stashed (simulated).
-        h.deferred_ticks.push((400, 4400)); // D (stashed during B's exchange)
-
-        // Step 4: second pass picks up D.
-        let pass2 = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(pass2, vec![(400, 4400)]);
-        assert!(h.deferred_ticks.is_empty());
-
-        // Step 5: third pass: empty → loop terminates.
-        let pass3 = std::mem::take(&mut h.deferred_ticks);
-        assert!(pass3.is_empty(), "loop must terminate when no more deferred ticks");
-    }
 }

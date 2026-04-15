@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use io_uring::{opcode, types, IoUring};
 
 use crate::ring::{Cqe, Ring};
@@ -9,9 +11,9 @@ pub struct IoUringRing {
     /// Owns Timespec values for outstanding `prep_timeout` SQEs. The
     /// kernel reads these pointers when the timer fires (which can be
     /// long after `submit()` returns), so the storage must outlive the
-    /// CQE. Bounded only by the ring's lifetime — see the
-    /// `debug_assert!` in `prep_timeout`.
-    timer_specs: Vec<Box<types::Timespec>>,
+    /// CQE. Keyed by the SQE's `user_data` so we can drop the Box when
+    /// the matching CQE is drained.
+    timer_specs: HashMap<u64, Box<types::Timespec>>,
 }
 
 impl IoUringRing {
@@ -21,7 +23,7 @@ impl IoUringRing {
         Ok(IoUringRing {
             ring,
             sq_entries,
-            timer_specs: Vec::new(),
+            timer_specs: HashMap::new(),
         })
     }
 
@@ -95,11 +97,7 @@ impl Ring for IoUringRing {
                 .nsec((timeout_ns % 1_000_000_000) as u32),
         );
         let ts_ptr: *const types::Timespec = &*ts;
-        self.timer_specs.push(ts);
-        // Catches accidental hot-path use of prep_timeout in debug builds.
-        // Production growth is bounded only by the ring's lifetime.
-        debug_assert!(self.timer_specs.len() < 1024,
-            "prep_timeout leak: {} live Timespecs", self.timer_specs.len());
+        self.timer_specs.insert(user_data, ts);
         let entry = opcode::Timeout::new(ts_ptr)
             .build()
             .user_data(user_data);
@@ -119,10 +117,17 @@ impl Ring for IoUringRing {
             return Ok(0); // no-op fast path
         }
 
-        if min_complete == 0 || timeout_ms <= 0 {
+        if min_complete == 0 || timeout_ms == 0 {
             // Submit only, no wait
             match self.ring.submit() {
                 Ok(n) => Ok(n as i32),
+                Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+            }
+        } else if timeout_ms < 0 {
+            // Block indefinitely until min_complete CQEs arrive
+            match self.ring.submitter().submit_and_wait(min_complete as usize) {
+                Ok(n) => Ok(n as i32),
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => Ok(0),
                 Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
             }
         } else {
@@ -146,17 +151,30 @@ impl Ring for IoUringRing {
 
     fn drain_cqes(&mut self, out: &mut [Cqe]) -> usize {
         let mut count = 0;
-        let cq = self.ring.completion();
-        for cqe in cq {
-            if count >= out.len() {
-                break;
+        let mut timer_udatas: Vec<u64> = Vec::new();
+        {
+            let cq = self.ring.completion();
+            for cqe in cq {
+                if count >= out.len() {
+                    break;
+                }
+                let udata = cqe.user_data();
+                out[count] = Cqe {
+                    user_data: udata,
+                    res: cqe.result(),
+                    flags: cqe.flags(),
+                };
+                // If this CQE was produced by a `prep_timeout` SQE, record
+                // its user_data so we can drop the owning Box after the CQ
+                // iterator (and its borrow on self.ring) is released.
+                if self.timer_specs.contains_key(&udata) {
+                    timer_udatas.push(udata);
+                }
+                count += 1;
             }
-            out[count] = Cqe {
-                user_data: cqe.user_data(),
-                res: cqe.result(),
-                flags: cqe.flags(),
-            };
-            count += 1;
+        }
+        for udata in timer_udatas {
+            self.timer_specs.remove(&udata);
         }
         count
     }

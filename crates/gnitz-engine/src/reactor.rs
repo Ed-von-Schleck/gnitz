@@ -9,17 +9,19 @@
 //! - Run queue is `Arc<Mutex<VecDeque<usize>>>`. The `Waker` vtable
 //!   requires `Send + Sync`; the master process is single-threaded so
 //!   the mutex never contends, but its presence is API-forced.
-//! - Timers are kept in a `BinaryHeap`, NOT as io_uring `Timeout` SQEs.
-//!   The reactor passes the soonest deadline to `submit_and_wait_timeout`
-//!   so the kernel wakes at the right time; this avoids the lifetime
-//!   hazard around storing `Timespec` for the kernel to dereference later.
+//! - Timers are `io_uring Timeout` SQEs. `TimerFuture::poll` submits a
+//!   `prep_timeout` SQE on first poll; the resulting CQE wakes the
+//!   registered waker. A cancelled timer's CQE is silently discarded by
+//!   `dispatch_cqe`. `IoUringRing::timer_specs` keys each `Box<Timespec>`
+//!   by the SQE's `user_data` and drops it when the matching CQE is
+//!   drained, so the map size is bounded by in-flight timers.
 //! - CQE `user_data` packs an 8-bit kind tag in the high byte and a
 //!   56-bit id in the low bits. Distinct from
 //!   `gnitz_transport::ring::make_udata` (which packs an fd), and safe
 //!   from collisions because the reactor owns its own ring.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -157,34 +159,6 @@ pub const fn udata_id(u: u64) -> u64 { u & ID_MASK }
 // Reactor
 // ---------------------------------------------------------------------------
 
-/// Heap-ordered timer entry: earlier deadlines come first.
-struct TimerEntry {
-    deadline: Instant,
-    waker: Waker,
-    /// Set true by `TimerFuture::Drop` when the future is dropped before
-    /// its deadline elapses. The reactor's timer loop pops cancelled
-    /// entries without firing the waker. Without this, `select2` against
-    /// a long deadline would leak entries on every iteration.
-    cancelled: Rc<Cell<bool>>,
-}
-
-impl PartialEq for TimerEntry {
-    fn eq(&self, other: &Self) -> bool { self.deadline == other.deadline }
-}
-impl Eq for TimerEntry {}
-impl PartialOrd for TimerEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for TimerEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap is a max-heap; flip ordering so the earliest deadline
-        // is the largest element (and gets popped first).
-        other.deadline.cmp(&self.deadline)
-    }
-}
-
 /// Backing store for one async task.
 struct Task {
     future: Pin<Box<dyn Future<Output = ()>>>,
@@ -219,8 +193,12 @@ struct ReactorShared {
     /// Per-worker W2M read cursor. The reactor is the sole W2M reader,
     /// so this is the only cursor for each ring.
     w2m_cursors: RefCell<Vec<u64>>,
-    /// Min-heap of pending timer deadlines.
-    timers: RefCell<BinaryHeap<TimerEntry>>,
+    /// Per-timer wakers keyed by timer_id. Each entry holds the waker to
+    /// fire when the io_uring Timeout CQE arrives and a cancellation flag
+    /// shared with the owning TimerFuture. If the future is dropped before
+    /// the CQE, the flag is set and dispatch_cqe silently discards it.
+    timer_wakers: RefCell<HashMap<u64, (Waker, Rc<Cell<bool>>)>>,
+    next_timer_id: Cell<u64>,
     #[cfg(test)]
     injected_cqes: RefCell<VecDeque<Cqe>>,
     next_request_id: Cell<u64>,
@@ -299,7 +277,8 @@ impl Reactor {
             w2m: RefCell::new(None),
             in_flight: RefCell::new(Vec::new()),
             w2m_cursors: RefCell::new(Vec::new()),
-            timers: RefCell::new(BinaryHeap::new()),
+            timer_wakers: RefCell::new(HashMap::new()),
+            next_timer_id: Cell::new(0),
             #[cfg(test)]
             injected_cqes: RefCell::new(VecDeque::new()),
             next_request_id: Cell::new(1),
@@ -623,10 +602,9 @@ impl Reactor {
 
     /// Single iteration of the event loop:
     ///   1. drain CQEs (waking reply / timeout / fsync wakers)
-    ///   2. fire elapsed timers
-    ///   3. poll all tasks in the run queue (each polled at most once)
-    ///   4. submit pending SQEs; if `block` and the run queue is now
-    ///      empty, sleep until the next CQE or the soonest timer.
+    ///   2. poll all tasks in the run queue (each polled at most once)
+    ///   3. submit pending SQEs; if `block` and the run queue is now
+    ///      empty, sleep until the next CQE.
     fn tick(&self, block: bool) {
         // 1. CQEs (no syscall — reads memory-mapped CQ).
         self.drain_cqes_into_wakers();
@@ -634,20 +612,7 @@ impl Reactor {
         self.drain_injected_cqes();
         self.reap_closing_conns();
 
-        // 2. Timers. Skip entries cancelled by `TimerFuture::Drop`.
-        let now = Instant::now();
-        loop {
-            let due = {
-                let timers = self.inner.timers.borrow();
-                timers.peek().map(|e| e.deadline <= now).unwrap_or(false)
-            };
-            if !due { break; }
-            let entry = self.inner.timers.borrow_mut().pop().unwrap();
-            if entry.cancelled.get() { continue; }
-            entry.waker.wake();
-        }
-
-        // 3. Drain the run queue. Snapshot first so wakes during poll
+        // 2. Drain the run queue. Snapshot first so wakes during poll
         // schedule for the *next* tick rather than re-entering this one.
         let ready: Vec<usize> = {
             let mut q = self.inner.run_queue.lock().unwrap();
@@ -657,7 +622,7 @@ impl Reactor {
             self.poll_task(key);
         }
 
-        // 4. Submit pending SQEs and optionally block until the next event.
+        // 3. Submit pending SQEs and optionally block until the next event.
         // Skip blocking when there is nothing to drive (slab empty) or when
         // a wake fired during this tick (run_queue non-empty); otherwise we
         // would sleep past the natural completion of the loop.
@@ -665,9 +630,10 @@ impl Reactor {
             && !self.inner.tasks.borrow().is_empty()
             && self.inner.run_queue.lock().unwrap().is_empty();
         if should_block {
-            let timeout_ms = self.next_block_deadline_ms();
+            // Block indefinitely — outstanding timer SQEs guarantee a CQE
+            // will arrive when the soonest timer fires.
             let _ = self.inner.ring.borrow_mut()
-                .submit_and_wait_timeout(1, timeout_ms);
+                .submit_and_wait_timeout(1, -1);
         } else {
             let _ = self.inner.ring.borrow_mut()
                 .submit_and_wait_timeout(0, 0);
@@ -709,7 +675,7 @@ impl Reactor {
 
     /// Look at all CQEs pending in the ring. For each:
     ///   - KIND_REPLY: wake the registered reply waker (if any).
-    ///   - KIND_TIMEOUT: ignored (timer waking is handled by the heap).
+    ///   - KIND_TIMEOUT: wake the registered timer waker (if not cancelled).
     ///   - KIND_FSYNC: wake the fsync waker and park `res`.
     ///   - KIND_POLL_EVENTFD: drain the associated W2M ring and re-arm.
     fn drain_cqes_into_wakers(&self) {
@@ -730,6 +696,11 @@ impl Reactor {
             KIND_REPLY => {
                 if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
                     w.wake();
+                }
+            }
+            KIND_TIMEOUT => {
+                if let Some((w, cancelled)) = self.inner.timer_wakers.borrow_mut().remove(&id) {
+                    if !cancelled.get() { w.wake(); }
                 }
             }
             KIND_POLL_EVENTFD => {
@@ -1004,24 +975,6 @@ impl Reactor {
         }
     }
 
-    fn next_block_deadline_ms(&self) -> i32 {
-        if !self.inner.run_queue.lock().unwrap().is_empty() {
-            return 0;
-        }
-        let now = Instant::now();
-        let next = self.inner.timers.borrow()
-            .peek()
-            .map(|e| e.deadline);
-        match next {
-            None => 1000,  // arbitrary fallback when no timers
-            Some(d) if d <= now => 0,
-            Some(d) => {
-                let dur = d.duration_since(now);
-                dur.as_millis().min(i32::MAX as u128) as i32
-            }
-        }
-    }
-
     #[cfg(test)]
     fn drain_injected_cqes(&self) {
         loop {
@@ -1135,13 +1088,12 @@ fn make_waker(key: usize, queue: Arc<Mutex<VecDeque<usize>>>) -> Waker {
 
 struct TimerFuture {
     deadline: Instant,
-    registered: bool,
-    /// Shared with the heap entry; flipped to true on Drop so the reactor
-    /// can skip the entry when it pops. Bounded leak otherwise: every
-    /// `select2(rx.recv(), reactor.timer(deadline))` whose `recv` arm
-    /// wins drops the timer mid-flight, and without cancellation each
-    /// dropped TimerFuture leaves a stale entry in the heap until its
-    /// deadline elapses.
+    /// Set to Some(id) on first poll, when the io_uring Timeout SQE is
+    /// submitted. None means the future was never polled (no SQE in
+    /// flight).
+    timer_id: Option<u64>,
+    /// Shared with the timer_wakers entry; flipped to true on Drop so
+    /// dispatch_cqe silently discards the CQE without waking the task.
     cancelled: Rc<Cell<bool>>,
     inner: Rc<ReactorShared>,
 }
@@ -1150,7 +1102,7 @@ impl TimerFuture {
     fn new(deadline: Instant, inner: Rc<ReactorShared>) -> Self {
         TimerFuture {
             deadline,
-            registered: false,
+            timer_id: None,
             cancelled: Rc::new(Cell::new(false)),
             inner,
         }
@@ -1160,16 +1112,27 @@ impl TimerFuture {
 impl Future for TimerFuture {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
+        let now = Instant::now();
+        if now >= self.deadline {
             return Poll::Ready(());
         }
-        if !self.registered {
-            self.inner.timers.borrow_mut().push(TimerEntry {
-                deadline: self.deadline,
-                waker: cx.waker().clone(),
-                cancelled: Rc::clone(&self.cancelled),
-            });
-            self.registered = true;
+        if self.timer_id.is_none() {
+            // First poll: submit the io_uring Timeout SQE and register the
+            // waker. The SQE is flushed to the kernel by tick's
+            // submit_and_wait_timeout call at the end of the same tick.
+            let id = self.inner.next_timer_id.get();
+            self.inner.next_timer_id.set(id.wrapping_add(1));
+            let ns = self.deadline.duration_since(now).as_nanos() as u64;
+            self.inner.ring.borrow_mut().prep_timeout(ns, udata(KIND_TIMEOUT, id));
+            self.inner.timer_wakers.borrow_mut()
+                .insert(id, (cx.waker().clone(), Rc::clone(&self.cancelled)));
+            self.timer_id = Some(id);
+        } else {
+            // Re-poll: update the waker in case it changed.
+            let id = self.timer_id.unwrap();
+            if let Some(entry) = self.inner.timer_wakers.borrow_mut().get_mut(&id) {
+                entry.0 = cx.waker().clone();
+            }
         }
         Poll::Pending
     }
@@ -1177,7 +1140,10 @@ impl Future for TimerFuture {
 
 impl Drop for TimerFuture {
     fn drop(&mut self) {
-        if self.registered {
+        if self.timer_id.is_some() {
+            // Signal dispatch_cqe to discard the CQE without waking.
+            // No SQE cancellation is needed: the CQE will arrive and be
+            // silently dropped by the KIND_TIMEOUT handler.
             self.cancelled.set(true);
         }
     }
@@ -2757,11 +2723,11 @@ mod tests {
         assert_eq!(v.get(), 7);
     }
 
-    /// A dropped TimerFuture must mark its heap entry cancelled so the
-    /// reactor's timer loop skips it. Verified by registering a timer,
-    /// dropping the future, then running ticks and asserting the heap
-    /// drains the cancelled entry without firing it (the waker key 999
-    /// must not appear in the run queue).
+    /// A dropped TimerFuture must set the cancellation flag so the
+    /// KIND_TIMEOUT CQE handler discards the wake. Verified by registering
+    /// a timer, dropping the future, then running ticks and asserting the
+    /// CQE is consumed without firing the waker (key 999 must not appear
+    /// in the run queue).
     #[test]
     fn timer_future_drop_cancels_heap_entry() {
         let r = make_reactor();
@@ -2775,10 +2741,10 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let pinned = Pin::new(&mut tf);
         let _ = pinned.poll(&mut cx);
-        assert_eq!(r.inner.timers.borrow().len(), 1);
+        assert_eq!(r.inner.timer_wakers.borrow().len(), 1);
         drop(tf);
-        // Drive ticks past the deadline; the cancelled entry must be popped
-        // without waking key=999.
+        // Drive ticks past the deadline; the cancelled CQE must be
+        // discarded without waking key=999.
         std::thread::sleep(Duration::from_millis(20));
         for _ in 0..4 { r.tick(false); }
         let q: Vec<usize> = r.inner.run_queue.lock().unwrap()

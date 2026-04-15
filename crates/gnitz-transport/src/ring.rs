@@ -61,6 +61,8 @@ pub trait Ring {
     ///
     /// - `min_complete > 0, timeout_ms > 0`: block until ≥min_complete CQEs
     ///   or timeout expires.
+    /// - `min_complete > 0, timeout_ms = -1`: block indefinitely until
+    ///   ≥min_complete CQEs arrive (no timeout bound).
     /// - `min_complete = 0, timeout_ms = 0`: submit only, return immediately.
     ///   When no SQEs are pending, this is a no-op (0 syscalls).
     fn submit_and_wait_timeout(
