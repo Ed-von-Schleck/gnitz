@@ -481,14 +481,7 @@ impl MasterDispatcher {
         let schema = SchemaDescriptor::minimal_u64();
         self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0, 0)?;
         self.collect_acks()?;
-
-        // Flush system tables before resetting SAL — their data lives in
-        // SAL entries that are about to be discarded.
-        let cat = unsafe { &mut *self.catalog };
-        cat.flush_all_system_tables();
-
-        self.sal.checkpoint_reset();
-        gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
+        self.checkpoint_post_ack();
         Ok(())
     }
 
@@ -1369,9 +1362,11 @@ impl MasterDispatcher {
         )
     }
 
-    /// Mirror of `do_checkpoint`'s post-broadcast bookkeeping: flush
-    /// system tables and reset the SAL cursor. Called by the committer
-    /// after collecting FLAG_FLUSH ACKs.
+    /// Post-ACK checkpoint cleanup: flush system tables before resetting
+    /// the SAL cursor (their data lives in SAL entries about to be
+    /// discarded), then advance the epoch. Called by both the bootstrap
+    /// sync path (`do_checkpoint`) and the async committer after it
+    /// collects FLAG_FLUSH ACKs.
     pub(crate) fn checkpoint_post_ack(&mut self) {
         let cat = unsafe { &mut *self.catalog };
         cat.flush_all_system_tables();
