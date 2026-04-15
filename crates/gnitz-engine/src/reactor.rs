@@ -30,9 +30,102 @@ use std::time::Instant;
 use gnitz_transport::ring::{Cqe, Ring, CQE_F_MORE};
 use gnitz_transport::uring::IoUringRing;
 
-use crate::ipc::{DecodedWire, W2mReceiver, W2M_HEADER_SIZE};
+use crate::ipc::{DecodedWire, FLAG_EXCHANGE, W2mReceiver, W2M_HEADER_SIZE, W2M_REGION_SIZE};
+use crate::schema::SchemaDescriptor;
+use crate::storage::Batch;
 
 pub mod io;
+
+// ---------------------------------------------------------------------------
+// ExchangeAccumulator (used by the reactor's FLAG_EXCHANGE demux branch)
+// ---------------------------------------------------------------------------
+
+/// Per-view accumulator for FLAG_EXCHANGE replies. When the reactor's
+/// `route_reply` sees a FLAG_EXCHANGE wire on worker `w`, it calls
+/// `process` instead of consuming the waker; once every worker has
+/// reported for a given view_id, `process` returns a `PendingRelay` that
+/// the relay task picks up and writes back to SAL.
+///
+/// Keyed by `decoded.control.target_id` (the view_id), NOT by req_id or
+/// source tid: a single tick on one source tid can drive exchanges for
+/// multiple views in DAG order; their relays demux independently.
+///
+/// Failure mode: if a worker dies mid-exchange, its view entries stay
+/// in the accumulator and the tick's `join_all` parks forever. This is
+/// fine because `worker_watcher` (executor.rs) triggers reactor
+/// shutdown on any worker crash, tearing down all parked tasks.
+pub struct ExchangeAccumulator {
+    payloads:   HashMap<i64, Vec<Option<Batch>>>,
+    counts:     HashMap<i64, usize>,
+    schemas:    HashMap<i64, SchemaDescriptor>,
+    source_ids: HashMap<i64, i64>,
+    nw: usize,
+}
+
+/// One completed exchange ready for relay.  The relay task owns this:
+/// it acquires the catalog read lock + SAL-writer mutex, calls
+/// `MasterDispatcher::relay_exchange`, then releases both.
+pub struct PendingRelay {
+    pub view_id:   i64,
+    pub payloads:  Vec<Option<Batch>>,
+    pub schema:    SchemaDescriptor,
+    pub source_id: i64,
+}
+
+impl ExchangeAccumulator {
+    pub fn new(nw: usize) -> Self {
+        ExchangeAccumulator {
+            payloads:   HashMap::new(),
+            counts:     HashMap::new(),
+            schemas:    HashMap::new(),
+            source_ids: HashMap::new(),
+            nw,
+        }
+    }
+
+    /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once
+    /// every worker has reported for the same view_id; `None` while the
+    /// view is still accumulating.  Logs (and drops) an exchange wire
+    /// missing its schema instead of producing a malformed relay.
+    pub fn process(&mut self, w: usize, decoded: DecodedWire) -> Option<PendingRelay> {
+        let vid = decoded.control.target_id as i64;
+        let ex_source_id = decoded.control.seek_pk_lo as i64;
+        let nw = self.nw;
+
+        let payloads = self.payloads
+            .entry(vid)
+            .or_insert_with(|| vec![None; nw]);
+        let count = self.counts.entry(vid).or_insert(0);
+
+        payloads[w] = decoded.data_batch;
+        if let Some(schema) = decoded.schema {
+            self.schemas.insert(vid, schema);
+        }
+        if ex_source_id > 0 {
+            self.source_ids.insert(vid, ex_source_id);
+        }
+        *count += 1;
+
+        if *count == nw {
+            let schema = match self.schemas.remove(&vid) {
+                Some(s) => s,
+                None => {
+                    crate::gnitz_warn!("exchange: no schema received for view_id={}", vid);
+                    self.payloads.remove(&vid);
+                    self.counts.remove(&vid);
+                    self.source_ids.remove(&vid);
+                    return None;
+                }
+            };
+            let source_id = self.source_ids.remove(&vid).unwrap_or(0);
+            let payloads_vec = self.payloads.remove(&vid).unwrap();
+            self.counts.remove(&vid);
+            Some(PendingRelay { view_id: vid, payloads: payloads_vec, schema, source_id })
+        } else {
+            None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
@@ -68,6 +161,11 @@ pub const fn udata_id(u: u64) -> u64 { u & ID_MASK }
 struct TimerEntry {
     deadline: Instant,
     waker: Waker,
+    /// Set true by `TimerFuture::Drop` when the future is dropped before
+    /// its deadline elapses. The reactor's timer loop pops cancelled
+    /// entries without firing the waker. Without this, `select2` against
+    /// a long deadline would leak entries on every iteration.
+    cancelled: Rc<Cell<bool>>,
 }
 
 impl PartialEq for TimerEntry {
@@ -118,9 +216,8 @@ struct ReactorShared {
     parked_fsync_results: RefCell<HashMap<u64, i32>>,
     w2m: RefCell<Option<Rc<W2mReceiver>>>,
     in_flight: RefCell<Vec<usize>>,
-    /// Independent of the dispatcher's `async_w2m_rcs`: the two are used
-    /// in disjoint time windows (reactor only between barrier notify
-    /// and the next sync W2M op).
+    /// Per-worker W2M read cursor. The reactor is the sole W2M reader,
+    /// so this is the only cursor for each ring.
     w2m_cursors: RefCell<Vec<u64>>,
     /// Min-heap of pending timer deadlines.
     timers: RefCell<BinaryHeap<TimerEntry>>,
@@ -171,6 +268,12 @@ struct ReactorShared {
     last_task_panicked: Cell<bool>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
+    /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
+    /// it feeds it here. Once the accumulator has heard from every
+    /// worker for a view_id, it produces a PendingRelay and the reactor
+    /// dispatches it to the relay task via `relay_tx`.
+    exchange_acc: RefCell<ExchangeAccumulator>,
+    relay_tx: RefCell<Option<mpsc::Sender<PendingRelay>>>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -215,24 +318,18 @@ impl Reactor {
             #[cfg(test)]
             last_task_panicked: Cell::new(false),
             shutdown: Cell::new(false),
+            exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
+            relay_tx: RefCell::new(None),
         });
         Ok(Reactor { inner })
     }
 
-    /// Reset the reactor's W2M reader cursors. Call alongside
-    /// `SalWriter::reset_w2m_cursors` so the reactor's auto-drain reads
-    /// from the start of the ring on the next CQE.
-    pub fn reset_w2m_cursors(&self) {
-        let mut cursors = self.inner.w2m_cursors.borrow_mut();
-        for c in cursors.iter_mut() {
-            *c = W2M_HEADER_SIZE as u64;
-        }
-        // Also clear the in_flight counter: sync paths that bypass
-        // `increment_in_flight` can leave it nonzero after a ring reset,
-        // which would otherwise prevent future `route_reply` from
-        // signalling a reset.
-        let mut inflight = self.inner.in_flight.borrow_mut();
-        for i in inflight.iter_mut() { *i = 0; }
+    /// Wire the relay channel sender into the reactor.  Called from the
+    /// executor before spawning the tick + relay tasks.  When
+    /// `route_reply` sees the accumulator complete a view, it sends the
+    /// `PendingRelay` here for the relay task to write back to SAL.
+    pub fn attach_relay_tx(&self, tx: mpsc::Sender<PendingRelay>) {
+        *self.inner.relay_tx.borrow_mut() = Some(tx);
     }
 
     /// Request reactor shutdown — the next `block_until_shutdown` tick
@@ -305,11 +402,7 @@ impl Reactor {
     /// Future that completes at `deadline`. The reactor wakes the task
     /// when its main loop sees that the soonest deadline has passed.
     pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
-        TimerFuture {
-            deadline,
-            registered: false,
-            inner: Rc::clone(&self.inner),
-        }
+        TimerFuture::new(deadline, Rc::clone(&self.inner))
     }
 
     /// Future that resolves to the decoded W2M reply for `req_id`.
@@ -327,6 +420,7 @@ impl Reactor {
         let nw = w2m.num_workers();
         *self.inner.in_flight.borrow_mut() = vec![0; nw];
         *self.inner.w2m_cursors.borrow_mut() = vec![W2M_HEADER_SIZE as u64; nw];
+        *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(nw);
         let efds: Vec<i32> = w2m.efds().to_vec();
         *self.inner.w2m.borrow_mut() = Some(w2m);
         for (w, &efd) in efds.iter().enumerate() {
@@ -540,7 +634,7 @@ impl Reactor {
         self.drain_injected_cqes();
         self.reap_closing_conns();
 
-        // 2. Timers.
+        // 2. Timers. Skip entries cancelled by `TimerFuture::Drop`.
         let now = Instant::now();
         loop {
             let due = {
@@ -549,6 +643,7 @@ impl Reactor {
             };
             if !due { break; }
             let entry = self.inner.timers.borrow_mut().pop().unwrap();
+            if entry.cancelled.get() { continue; }
             entry.waker.wake();
         }
 
@@ -792,9 +887,12 @@ impl Reactor {
     }
 
     /// Decode every unread W2M message for worker `w` and route each
-    /// through `route_reply`. The mmap read + cursor snap live here;
-    /// the pure bookkeeping lives in `route_reply` so it can be
-    /// exercised directly from unit tests.
+    /// through `route_reply`. After draining, if the worker has no
+    /// outstanding routed requests AND its cursor has crossed the
+    /// reset threshold, atomically reset the worker's write_cursor
+    /// (mmap header) and the reactor's read cursor. Safe because the
+    /// reactor is the sole W2M reader: there are no other readers
+    /// whose unread data could be stranded.
     fn drain_w2m_for_worker(&self, w: usize) {
         let w2m = Rc::clone(
             self.inner.w2m.borrow().as_ref()
@@ -810,16 +908,6 @@ impl Reactor {
                 libc::read(efd, &mut v as *mut u64 as *mut libc::c_void, 8);
             }
         }
-        // A sync path may have called `reset_one` behind our back; if our
-        // cursor advanced past the new write_cursor we would otherwise
-        // sit past end-of-ring forever.
-        {
-            let wc = w2m.write_cursor(w);
-            let mut cursors = self.inner.w2m_cursors.borrow_mut();
-            if cursors[w] > wc {
-                cursors[w] = W2M_HEADER_SIZE as u64;
-            }
-        }
         loop {
             let cursor = self.inner.w2m_cursors.borrow()[w];
             let (decoded, new_rc) = match w2m.try_read(w, cursor) {
@@ -827,8 +915,48 @@ impl Reactor {
                 None => break,
             };
             self.inner.w2m_cursors.borrow_mut()[w] = new_rc;
-            // Ring reset is tick_loop's job — see async-invariants §III.1.
             self.route_reply(w, decoded);
+        }
+        self.maybe_reset_w2m_for_worker(w, &w2m);
+    }
+
+    /// W2M ring reset for `w`. Gated on:
+    /// 1. `in_flight[w] == 0` — no routed requests outstanding for `w`,
+    ///    so worker `w` has no reply to write.  Combined with the
+    ///    single-threaded master + reactor-as-sole-reader, this closes
+    ///    the race where a worker's reply could land at a cursor that
+    ///    we are about to zero.
+    /// 2. cursor crossed `RESET_THRESHOLD` (~half the region) — avoids
+    ///    chatty reset traffic for low-volume workloads.
+    ///
+    /// Hard safety: warn at 3/4 region, fatal abort at 7/8. The abort
+    /// is a backstop for sustained mixed load where in_flight rarely
+    /// hits 0 and the cursor climbs.
+    fn maybe_reset_w2m_for_worker(&self, w: usize, w2m: &Rc<W2mReceiver>) {
+        const RESET_THRESHOLD: u64 = (W2M_REGION_SIZE as u64) / 2;
+        const WARN_THRESHOLD:  u64 = (W2M_REGION_SIZE as u64) * 3 / 4;
+        const FATAL_THRESHOLD: u64 = (W2M_REGION_SIZE as u64) * 7 / 8;
+
+        let cursor = self.inner.w2m_cursors.borrow()[w];
+        let empty = self.inner.in_flight.borrow()[w] == 0;
+
+        if empty && cursor > RESET_THRESHOLD {
+            // No outstanding requests for w; worker w has no pending
+            // replies to write. Atomically reset worker's write_cursor
+            // (mmap header) and reactor's read cursor.
+            w2m.reset_one_unsafe(w);
+            self.inner.w2m_cursors.borrow_mut()[w] = W2M_HEADER_SIZE as u64;
+            return;
+        }
+
+        if cursor > FATAL_THRESHOLD {
+            crate::gnitz_fatal_abort!(
+                "W2M region near exhaustion for worker={} cursor={} (in_flight={}; reset gate could not fire under sustained traffic)",
+                w, cursor, self.inner.in_flight.borrow()[w]);
+        } else if cursor > WARN_THRESHOLD {
+            crate::gnitz_warn!(
+                "W2M region 3/4 full for worker={} cursor={} in_flight={}",
+                w, cursor, self.inner.in_flight.borrow()[w]);
         }
     }
 
@@ -837,7 +965,28 @@ impl Reactor {
     /// `w` (caller resets the ring). Unrouted replies are logged and
     /// dropped — they do not decrement `in_flight`, since we did not
     /// track them in the first place.
+    ///
+    /// FLAG_EXCHANGE replies are demuxed into `exchange_acc` instead of
+    /// being routed via the waker map: the worker is still mid-tick
+    /// (waiting for FLAG_EXCHANGE_RELAY), so its tick req_id's waker
+    /// must remain parked. When the accumulator completes a view, the
+    /// resulting PendingRelay is enqueued on `relay_tx` for the relay
+    /// task. See async-invariants III.3b.
     fn route_reply(&self, w: usize, decoded: DecodedWire) -> bool {
+        let flags = decoded.control.flags as u32;
+        if flags & FLAG_EXCHANGE != 0 {
+            let pending = self.inner.exchange_acc.borrow_mut().process(w, decoded);
+            if let Some(relay) = pending {
+                if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
+                    tx.send(relay);
+                } else {
+                    crate::gnitz_warn!("reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
+                        relay.view_id);
+                }
+            }
+            return false;
+        }
+
         let req_id = decoded.control.request_id;
         let waker = self.inner.reply_wakers.borrow_mut().remove(&req_id);
         match waker {
@@ -925,16 +1074,6 @@ impl Reactor {
         self.inner.in_flight.borrow()[w]
     }
 
-    /// True when no `await_reply`-style request is outstanding on any
-    /// worker. The tick task gates its W2M reset on this to avoid
-    /// resetting `write_cursor` while a scan / validate / push ACK is
-    /// mid-flight — a reset between the worker's atomic_store (of the
-    /// write_cursor) and the reactor's drain would strand the data past
-    /// the new write_cursor, masking it from subsequent `try_read`s.
-    pub fn all_in_flight_zero(&self) -> bool {
-        self.inner.in_flight.borrow().iter().all(|&n| n == 0)
-    }
-
     #[cfg(test)]
     pub fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
@@ -997,7 +1136,25 @@ fn make_waker(key: usize, queue: Arc<Mutex<VecDeque<usize>>>) -> Waker {
 struct TimerFuture {
     deadline: Instant,
     registered: bool,
+    /// Shared with the heap entry; flipped to true on Drop so the reactor
+    /// can skip the entry when it pops. Bounded leak otherwise: every
+    /// `select2(rx.recv(), reactor.timer(deadline))` whose `recv` arm
+    /// wins drops the timer mid-flight, and without cancellation each
+    /// dropped TimerFuture leaves a stale entry in the heap until its
+    /// deadline elapses.
+    cancelled: Rc<Cell<bool>>,
     inner: Rc<ReactorShared>,
+}
+
+impl TimerFuture {
+    fn new(deadline: Instant, inner: Rc<ReactorShared>) -> Self {
+        TimerFuture {
+            deadline,
+            registered: false,
+            cancelled: Rc::new(Cell::new(false)),
+            inner,
+        }
+    }
 }
 
 impl Future for TimerFuture {
@@ -1010,10 +1167,19 @@ impl Future for TimerFuture {
             self.inner.timers.borrow_mut().push(TimerEntry {
                 deadline: self.deadline,
                 waker: cx.waker().clone(),
+                cancelled: Rc::clone(&self.cancelled),
             });
             self.registered = true;
         }
         Poll::Pending
+    }
+}
+
+impl Drop for TimerFuture {
+    fn drop(&mut self) {
+        if self.registered {
+            self.cancelled.set(true);
+        }
     }
 }
 
@@ -1031,71 +1197,6 @@ impl Future for ReplyFuture {
         self.inner.reply_wakers.borrow_mut()
             .insert(self.req_id, cx.waker().clone());
         Poll::Pending
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TickIdleBarrier
-// ---------------------------------------------------------------------------
-//
-// `wait()` returns immediately when the barrier is in the idle state;
-// otherwise the future suspends until `notify_all` is called. Single-
-// threaded by construction (uses `RefCell`, not `Mutex`).
-
-pub struct TickIdleBarrier {
-    /// True when no tick is currently active. `wait()` returns immediately
-    /// in this state; setters flip it back to false when a tick begins.
-    idle: Cell<bool>,
-    wakers: RefCell<Vec<Waker>>,
-}
-
-impl TickIdleBarrier {
-    pub fn new() -> Self {
-        TickIdleBarrier {
-            idle: Cell::new(true),
-            wakers: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// Mark the barrier as "tick active". Calls to `wait()` will suspend
-    /// until the next `notify_all`.
-    pub fn set_active(&self) {
-        self.idle.set(false);
-    }
-
-    /// Mark the barrier as "tick idle" and wake every suspended waiter.
-    pub fn notify_all(&self) {
-        self.idle.set(true);
-        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
-        for w in wakers {
-            w.wake();
-        }
-    }
-
-    /// Future that resolves when the barrier is in the idle state.
-    /// Returns immediately on the first poll if a tick is not active.
-    pub fn wait<'a>(self: &'a Rc<Self>) -> impl Future<Output = ()> + 'a {
-        BarrierFuture { barrier: Rc::clone(self) }
-    }
-}
-
-impl Default for TickIdleBarrier {
-    fn default() -> Self { Self::new() }
-}
-
-struct BarrierFuture {
-    barrier: Rc<TickIdleBarrier>,
-}
-
-impl Future for BarrierFuture {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.barrier.idle.get() {
-            Poll::Ready(())
-        } else {
-            self.barrier.wakers.borrow_mut().push(cx.waker().clone());
-            Poll::Pending
-        }
     }
 }
 
@@ -1615,6 +1716,38 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// select2
+// ---------------------------------------------------------------------------
+
+/// Result of `select2`: which side resolved first.
+pub enum Either<A, B> {
+    A(A),
+    B(B),
+}
+
+/// Race two futures; return whichever completes first.  The loser is
+/// dropped — its `Drop` impl is responsible for releasing any registered
+/// state (e.g. `TimerFuture::Drop` flips the cancellation bit on its
+/// heap entry so the timer loop skips it).
+pub async fn select2<A, B>(a: A, b: B) -> Either<A::Output, B::Output>
+where
+    A: Future,
+    B: Future,
+{
+    let mut a = Box::pin(a);
+    let mut b = Box::pin(b);
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(v) = a.as_mut().poll(cx) {
+            return Poll::Ready(Either::A(v));
+        }
+        if let Poll::Ready(v) = b.as_mut().poll(cx) {
+            return Poll::Ready(Either::B(v));
+        }
+        Poll::Pending
+    }).await
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1667,11 +1800,10 @@ mod tests {
         let inner = Rc::clone(&r.inner);
         let start = Instant::now();
         r.block_on(async move {
-            TimerFuture {
-                deadline: Instant::now() + Duration::from_millis(50),
-                registered: false,
+            TimerFuture::new(
+                Instant::now() + Duration::from_millis(50),
                 inner,
-            }.await;
+            ).await;
         });
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50),
@@ -1692,20 +1824,18 @@ mod tests {
         let order2 = Rc::clone(&order);
 
         r.spawn(async move {
-            TimerFuture {
-                deadline: Instant::now() + Duration::from_millis(100),
-                registered: false,
-                inner: inner2,
-            }.await;
+            TimerFuture::new(
+                Instant::now() + Duration::from_millis(100),
+                inner2,
+            ).await;
             order2.borrow_mut().push(2);
         });
 
         r.block_on(async move {
-            TimerFuture {
-                deadline: Instant::now() + Duration::from_millis(20),
-                registered: false,
-                inner: inner1,
-            }.await;
+            TimerFuture::new(
+                Instant::now() + Duration::from_millis(20),
+                inner1,
+            ).await;
             order1.borrow_mut().push(1);
         });
 
@@ -1744,11 +1874,10 @@ mod tests {
         let timer_inner = Rc::clone(&r.inner);
         let reply_fut = r.await_reply(7);
         r.block_on(async move {
-            let timer = TimerFuture {
-                deadline: Instant::now() + Duration::from_millis(50),
-                registered: false,
-                inner: timer_inner,
-            };
+            let timer = TimerFuture::new(
+                Instant::now() + Duration::from_millis(50),
+                timer_inner,
+            );
             select_reply_or_timer(timer, reply_fut, &r2).await;
         });
         assert!(!resolved.get(), "reply for req_id=8 must not wake req_id=7 awaiter");
@@ -1805,64 +1934,6 @@ mod tests {
         assert_eq!(r.task_count(), 0);
     }
 
-    /// `TickIdleBarrier::wait()` returns immediately when the barrier is
-    /// in the idle state (the common-case fast path for SELECTs that
-    /// arrive when no tick is running).
-    #[test]
-    fn tick_idle_barrier_wait_returns_immediately_when_idle() {
-        let r = make_reactor();
-        let barrier = Rc::new(TickIdleBarrier::new());
-        let b = Rc::clone(&barrier);
-        let start = Instant::now();
-        r.block_on(async move {
-            b.wait().await;
-        });
-        assert!(start.elapsed() < Duration::from_millis(50),
-            "idle barrier wait should not block");
-    }
-
-    /// `notify_all` wakes every suspended waiter. Each spawned task races
-    /// the barrier against a 200ms guard timer; if the barrier wins, the
-    /// task's index is recorded.
-    #[test]
-    fn tick_idle_barrier_wakes_all_waiters() {
-        let r = make_reactor();
-        let barrier = Rc::new(TickIdleBarrier::new());
-        barrier.set_active();
-        let woken: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-
-        for i in 0u32..3 {
-            let b = Rc::clone(&barrier);
-            let w = Rc::clone(&woken);
-            r.spawn(async move {
-                b.wait().await;
-                w.borrow_mut().push(i);
-            });
-        }
-
-        // Trigger the wake from a separate task that fires after a short
-        // delay (so the awaiters have time to register).
-        let b_notify = Rc::clone(&barrier);
-        let inner = Rc::clone(&r.inner);
-        r.block_on(async move {
-            TimerFuture {
-                deadline: Instant::now() + Duration::from_millis(20),
-                registered: false,
-                inner,
-            }.await;
-            b_notify.notify_all();
-        });
-
-        // Drain remaining tasks.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while r.has_pending_tasks() && Instant::now() < deadline {
-            r.tick(true);
-        }
-        let mut got: Vec<u32> = woken.borrow().clone();
-        got.sort();
-        assert_eq!(got, vec![0, 1, 2], "all 3 waiters must wake");
-    }
-
     /// A timer in the past resolves on the very first poll instead of
     /// hanging the reactor.
     #[test]
@@ -1871,11 +1942,10 @@ mod tests {
         let inner = Rc::clone(&r.inner);
         let start = Instant::now();
         r.block_on(async move {
-            TimerFuture {
-                deadline: Instant::now() - Duration::from_secs(1),
-                registered: false,
+            TimerFuture::new(
+                Instant::now() - Duration::from_secs(1),
                 inner,
-            }.await;
+            ).await;
         });
         assert!(start.elapsed() < Duration::from_millis(100),
             "past-deadline timer must not block");
@@ -2360,105 +2430,6 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // `all_in_flight_zero` — gate used by `tick_loop` before W2M reset.
-    //
-    // Regression guard: the tick task must not reset W2M while the
-    // reactor still has a scan/push response routing for any worker.
-    // The reset zeroes `write_cursor`; data written past that offset
-    // becomes invisible to `try_read`, which returns `None` when
-    // `write_cursor <= read_cursor`. Symptom: a concurrent scan's
-    // response got stranded at offset ~128 and the client hung.
-    // ─────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn all_in_flight_zero_true_on_fresh_reactor() {
-        let r = make_reactor();
-        r.test_init_state(4);
-        assert!(r.all_in_flight_zero(),
-            "fresh reactor with zeroed counters must report all-zero");
-    }
-
-    #[test]
-    fn all_in_flight_zero_false_when_any_worker_pending() {
-        let r = make_reactor();
-        r.test_init_state(4);
-        r.increment_in_flight(2);
-        assert!(!r.all_in_flight_zero(),
-            "any nonzero in_flight slot must block the all-zero gate");
-    }
-
-    #[test]
-    fn all_in_flight_zero_tracks_route_reply_decrement() {
-        // Walk the full lifecycle: submit N requests, route replies one
-        // by one, assert the gate flips only when the LAST reply routes.
-        let r = make_reactor();
-        r.test_init_state(2);
-
-        // Two requests on worker 0, one on worker 1 — N = 3 total pending.
-        let waker0 = make_waker(0, Arc::clone(&r.inner.run_queue));
-        let waker1 = make_waker(1, Arc::clone(&r.inner.run_queue));
-        let waker2 = make_waker(2, Arc::clone(&r.inner.run_queue));
-        r.register_reply_waker(100, waker0);
-        r.register_reply_waker(101, waker1);
-        r.register_reply_waker(102, waker2);
-        r.increment_in_flight(0);
-        r.increment_in_flight(0);
-        r.increment_in_flight(1);
-
-        assert!(!r.all_in_flight_zero(), "3 pending");
-        r.test_route_reply(0, synthetic_decoded_wire(100));
-        assert!(!r.all_in_flight_zero(), "2 pending");
-        r.test_route_reply(1, synthetic_decoded_wire(102));
-        assert!(!r.all_in_flight_zero(), "1 pending on worker 0");
-        r.test_route_reply(0, synthetic_decoded_wire(101));
-        assert!(r.all_in_flight_zero(), "gate flips on last reply");
-    }
-
-    /// Unrouted replies (req_id=0, e.g. FLAG_TICK broadcast ACKs) MUST
-    /// NOT touch the gate.  Otherwise a tick ACK draining through the
-    /// reactor would flip `all_in_flight_zero` → true while a scan's
-    /// routed reply is still pending, and `tick_loop` would reset W2M
-    /// prematurely — the exact race that hung
-    /// `test_no_rows_lost_with_view_during_checkpoints`.
-    #[test]
-    fn all_in_flight_zero_ignores_unrouted_tick_acks() {
-        let r = make_reactor();
-        r.test_init_state(2);
-        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
-        r.register_reply_waker(145, waker);
-        r.increment_in_flight(0);
-
-        // Worker 1 sends 4 unrouted FLAG_TICK ACKs (req_id=0, no waker).
-        for _ in 0..4 {
-            r.test_route_reply(1, synthetic_decoded_wire(0));
-        }
-        assert!(!r.all_in_flight_zero(),
-            "unrouted tick ACKs must not flip the gate — worker 0's \
-             routed reply is still pending");
-
-        // Now route the real reply; gate flips.
-        r.test_route_reply(0, synthetic_decoded_wire(145));
-        assert!(r.all_in_flight_zero());
-    }
-
-    /// `reactor.reset_w2m_cursors` zeros the in_flight counters.  The
-    /// tick task only calls this after `all_in_flight_zero` returns
-    /// true, but the reset itself must leave the gate in the true
-    /// state (invariant for the next cycle).
-    #[test]
-    fn reset_w2m_cursors_clears_in_flight() {
-        let r = make_reactor();
-        r.test_init_state(4);
-        r.increment_in_flight(0);
-        r.increment_in_flight(2);
-        assert!(!r.all_in_flight_zero());
-        r.reset_w2m_cursors();
-        assert!(r.all_in_flight_zero(),
-            "reset_w2m_cursors must zero in_flight so the next cycle \
-             starts with the gate open");
-    }
-
-    // ─────────────────────────────────────────────────────────────────
     // KIND_SEND CQE dispatch + SendFuture lifecycle.
     //
     // Regression guards for:
@@ -2670,5 +2641,174 @@ mod tests {
                  would leave the client blocked waiting for bytes that never \
                  arrive");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // FLAG_EXCHANGE demux + W2M reset gating + select2 +
+    // sal_writer_excl + TimerFuture::Drop.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Inject a synthetic FLAG_EXCHANGE wire for `view_id` on worker `w`.
+    /// `req_id` is echoed back from the worker side; the accumulator
+    /// keys by view_id, not req_id.
+    fn synthetic_exchange_wire(view_id: i64, req_id: u64) -> DecodedWire {
+        use crate::ipc::{DecodedControl, FLAG_EXCHANGE};
+        DecodedWire {
+            control: DecodedControl {
+                status: 0,
+                client_id: 0,
+                target_id: view_id as u64,
+                flags: FLAG_EXCHANGE as u64,
+                seek_pk_lo: 0,
+                seek_pk_hi: 0,
+                seek_col_idx: 0,
+                request_id: req_id,
+                error_msg: Vec::new(),
+            },
+            schema: Some(SchemaDescriptor::minimal_u64()),
+            data_batch: None,
+        }
+    }
+
+    /// FLAG_EXCHANGE replies must NOT consume the registered tick waker
+    /// or decrement in_flight. The tick worker is still mid-DAG and the
+    /// final ACK will arrive separately.
+    #[test]
+    fn route_reply_flag_exchange_does_not_wake() {
+        let r = make_reactor();
+        r.test_init_state(2);
+        *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(2);
+        // Simulate a parked tick waker for req_id=42 + an outstanding
+        // request on worker 0.
+        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
+        r.register_reply_waker(42, waker);
+        r.increment_in_flight(0);
+
+        // FLAG_EXCHANGE wire with the same req_id MUST be demuxed via the
+        // accumulator instead of consuming the tick waker.
+        let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
+        let _ = r.test_route_reply(0, exch);
+
+        assert!(r.inner.reply_wakers.borrow().contains_key(&42),
+            "FLAG_EXCHANGE must NOT consume the tick waker");
+        assert_eq!(r.in_flight_len(0), 1,
+            "FLAG_EXCHANGE must NOT decrement in_flight");
+        assert!(r.inner.parked_replies.borrow().is_empty(),
+            "FLAG_EXCHANGE must NOT park the wire for await_reply");
+    }
+
+    /// Once every worker has reported FLAG_EXCHANGE for the same
+    /// view_id, the accumulator produces a PendingRelay and dispatches
+    /// it to the registered relay_tx.
+    #[test]
+    fn route_reply_flag_exchange_completes_view_dispatches_relay() {
+        let r = make_reactor();
+        let (tx, mut rx) = mpsc::unbounded::<PendingRelay>();
+        r.attach_relay_tx(tx);
+        // Manually size accumulator + in_flight for nw=2.
+        r.test_init_state(2);
+        *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(2);
+
+        // Two parked tick wakers; in_flight is 1 per worker.
+        let w0 = make_waker(0, Arc::clone(&r.inner.run_queue));
+        let w1 = make_waker(1, Arc::clone(&r.inner.run_queue));
+        r.register_reply_waker(10, w0);
+        r.register_reply_waker(11, w1);
+        r.increment_in_flight(0);
+        r.increment_in_flight(1);
+
+        // Worker 0's FLAG_EXCHANGE: accumulator partial (no relay yet).
+        let _ = r.test_route_reply(0, synthetic_exchange_wire(99, 10));
+        assert!(rx.try_recv().is_none(),
+            "single-worker FLAG_EXCHANGE must not produce a relay");
+        // Worker 1's FLAG_EXCHANGE: accumulator complete → relay enqueued.
+        let _ = r.test_route_reply(1, synthetic_exchange_wire(99, 11));
+        let relay = rx.try_recv().expect("complete view must produce a relay");
+        assert_eq!(relay.view_id, 99);
+        assert_eq!(relay.payloads.len(), 2);
+        // Final ACKs (no FLAG_EXCHANGE) for the same req_ids should now
+        // wake their tick wakers and decrement in_flight.
+        let _ = r.test_route_reply(0, synthetic_decoded_wire(10));
+        let _ = r.test_route_reply(1, synthetic_decoded_wire(11));
+        assert_eq!(r.in_flight_len(0), 0);
+        assert_eq!(r.in_flight_len(1), 0);
+    }
+
+    /// `select2` returns whichever future completes first; the loser is
+    /// dropped. With a pre-resolved future and an unresolved one, the
+    /// pre-resolved must win.
+    #[test]
+    fn select2_pre_resolved_wins() {
+        let r = make_reactor();
+        let inner = Rc::clone(&r.inner);
+        let v: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
+        let v2 = Rc::clone(&v);
+        r.block_on(async move {
+            let ready = async { 7u32 };
+            let never = TimerFuture::new(
+                Instant::now() + Duration::from_secs(60),
+                inner,
+            );
+            match select2(ready, never).await {
+                Either::A(x) => v2.set(x),
+                Either::B(()) => panic!("timer should not have fired"),
+            }
+        });
+        assert_eq!(v.get(), 7);
+    }
+
+    /// A dropped TimerFuture must mark its heap entry cancelled so the
+    /// reactor's timer loop skips it. Verified by registering a timer,
+    /// dropping the future, then running ticks and asserting the heap
+    /// drains the cancelled entry without firing it (the waker key 999
+    /// must not appear in the run queue).
+    #[test]
+    fn timer_future_drop_cancels_heap_entry() {
+        let r = make_reactor();
+        let inner = Rc::clone(&r.inner);
+        let waker = make_waker(999, Arc::clone(&r.inner.run_queue));
+        // Build a TimerFuture, poll once to register, then drop it.
+        let mut tf = TimerFuture::new(
+            Instant::now() + Duration::from_millis(10),
+            inner,
+        );
+        let mut cx = Context::from_waker(&waker);
+        let pinned = Pin::new(&mut tf);
+        let _ = pinned.poll(&mut cx);
+        assert_eq!(r.inner.timers.borrow().len(), 1);
+        drop(tf);
+        // Drive ticks past the deadline; the cancelled entry must be popped
+        // without waking key=999.
+        std::thread::sleep(Duration::from_millis(20));
+        for _ in 0..4 { r.tick(false); }
+        let q: Vec<usize> = r.inner.run_queue.lock().unwrap()
+            .iter().copied().collect();
+        assert!(!q.contains(&999),
+            "cancelled timer must not wake its original waker");
+    }
+
+    /// AsyncMutex serialises tasks: even when several tasks race on
+    /// `lock().await` only one runs the critical section at a time.
+    /// Mirrors sal_writer_excl's role for III.3b.
+    #[test]
+    fn sal_writer_excl_serializes_tasks() {
+        let r = make_reactor();
+        let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        for i in 0u32..3 {
+            let m = Rc::clone(&mutex);
+            let ord = Rc::clone(&order);
+            r.spawn(async move {
+                let g = m.lock().await;
+                let len = ord.borrow().len();
+                ord.borrow_mut().push(i);
+                // Fail loudly if any other task entered the section while
+                // this one held the lock.
+                assert_eq!(ord.borrow().len(), len + 1);
+                drop(g);
+            });
+        }
+        r.block_until_idle();
+        assert_eq!(order.borrow().len(), 3);
     }
 }

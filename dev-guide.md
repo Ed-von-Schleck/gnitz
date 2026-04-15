@@ -46,14 +46,42 @@ When adding a new constraint, validation rule, or invariant:
 GNITZ_WORKERS=4 GNITZ_LOG_LEVEL=debug uv run pytest tests/test_joins.py -x
 ```
 
-Master log: `~/git/gnitz/tmp/server_debug.log`
-Worker logs: `~/git/gnitz/tmp/last_worker_N.log`
-
 Log format: `<epoch>.<ms> <tag> <level> <message>` — tags: `M` (master), `W0`–`WN`.
 
 For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before committing.
 
-Live tail: `tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log`
+### Where test logs go
+
+Server stderr (master process): always written to `~/git/gnitz/tmp/server_debug.log`
+(see `tests/conftest.py`). Pytest's `-s` flag does NOT capture this — it lives
+on disk regardless of pytest's stdout/stderr capture mode.
+
+Worker logs: workers write to `<data_dir>/worker_<N>.log` inside the per-test
+tmpdir. The conftest copies them to `~/git/gnitz/tmp/last_worker_N.log` on
+session teardown — those are the canonical post-mortem files.
+
+Live tail (during a long-running test): `tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log`
+
+Pre-existing logs from the previous session are overwritten on the next test
+run, so save copies before re-running if you need them.
+
+### Using tests for debugging
+
+1. **Reproduce the failure on a single test** with `pytest tests/foo.py::test_bar -v`.
+   Always pass `GNITZ_WORKERS=4` — multi-worker bugs hide at W=1.
+2. **Re-run a few times** to check determinism. Flaky failures often point to
+   a race that the deterministic single-test run will mask.
+3. **Read both logs side-by-side** — the master log shows what was
+   dispatched; the worker log shows what was processed. Discrepancies in
+   ordering between them are usually the smoking gun.
+4. **Add temporary `gnitz_info!` lines** at the suspected boundary
+   (handler entry, SAL emit, ACK reply). `make server pyext` then re-run.
+   Strip them before committing.
+5. **Use the debug binary** (the default `make server` output). Release
+   builds clamp corrupt values silently and hide the real failure mode.
+6. **Test logs survive the session**, code state does NOT — if you want
+   to attach a log to a bug report, copy it out of `~/git/gnitz/tmp/`
+   before the next test run overwrites it.
 
 ## SAL durability contract
 

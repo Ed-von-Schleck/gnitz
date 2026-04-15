@@ -4,7 +4,7 @@
 //! sequence for every user-table INSERT/UPSERT. Receives commit
 //! requests via `mpsc` and batches them with a debounce timer.
 //!
-//! Design notes (Stage 4):
+//! Design notes:
 //!
 //! - **One committer per master process.**  Single-threaded: everything
 //!   lives on the reactor. Borrows `*mut MasterDispatcher` to call into
@@ -17,10 +17,6 @@
 //!   FLAG_FLUSH group with per-worker req_ids, awaits ACKs, runs the
 //!   post-ACK bookkeeping (flush system tables + reset epoch), then
 //!   proceeds with the push batch.
-//! - **Active-tick branch.**  When the tick state machine is in
-//!   `Active`, the committer defers to the legacy Phase A/B helpers on
-//!   `ServerExecutor` (passed by raw pointer). Stage 6 deletes this
-//!   fork once tick becomes an async task.
 //! - **Barrier.**  A `Barrier` request flushes any in-flight batch and
 //!   signals via a oneshot — used by DDL to drain the committer before
 //!   catalog mutation.
@@ -28,7 +24,7 @@
 use std::rc::Rc;
 use crate::ipc::WireConflictMode;
 use crate::master::{self, MasterDispatcher, first_worker_error};
-use crate::reactor::{self, Reactor, mpsc, oneshot, TickIdleBarrier};
+use crate::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
 use crate::storage::Batch;
 use crate::util::guard_panic;
 
@@ -62,7 +58,10 @@ pub struct Shared {
     pub reactor: Rc<Reactor>,
     pub disp_ptr: *mut MasterDispatcher,
     pub sal_fd: i32,
-    pub tick_barrier: Rc<TickIdleBarrier>,
+    /// SAL-writer exclusivity (III.3b). The committer holds this for
+    /// the entire checkpoint + commit emission window so a concurrent
+    /// tick task or DDL broadcast cannot interleave a SAL group.
+    pub sal_writer_excl: Rc<AsyncMutex<()>>,
     /// Monotonic LSN incremented on each successful commit; exposed to
     /// handlers via the `done` oneshot and shared with the executor so
     /// SCAN/SEEK responses report the same value.
@@ -92,8 +91,11 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             continue;
         }
 
-        // Gate against sync-tick W2M drain.
-        shared.tick_barrier.wait().await;
+        // Hold SAL-writer exclusivity for the checkpoint + commit emission
+        // window. Released before `done.send` so handlers that proceed on
+        // the LSN can race with the next batch's emission.  Tick task,
+        // relay task, and DDL all gate on the same mutex (III.3b).
+        let _sal_excl = shared.sal_writer_excl.lock().await;
 
         // Checkpoint first (may flush system tables + reset SAL epoch).
         if unsafe { (*shared.disp_ptr).sal_needs_checkpoint() } {
@@ -107,6 +109,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
 
         // Commit the batched pushes.
         commit_pushes(&shared, pushes).await;
+        drop(_sal_excl);
 
         for b in barrier_senders { let _ = b.send(()); }
     }

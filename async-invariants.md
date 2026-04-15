@@ -81,15 +81,15 @@ reactor polls other tasks during the wait.
 Tracks requests the reactor is routing via `await_reply`, NOT
 arbitrary SAL writes.
 
-- Incremented in the same sync window as the SQE submit.
+- Incremented in the same sync window as the SQE submit (BEFORE
+  `signal_all`, so the worker cannot reply until the counter is live).
 - Decremented by `route_reply` when a waker is present.
 - Unrouted replies (req_id == 0 from broadcasts) do NOT decrement.
+- FLAG_EXCHANGE wires also do NOT decrement: their tick req_id's
+  waker stays parked until the final post-DAG ACK arrives.
 
-`reset_w2m_cursors` also zeros `in_flight` so the next cycle starts
-clean. While the Stage-4 sync tick still reads W2M, the tick task
-gates its reset on `all_in_flight_zero()` so no routed reply is
-orphaned by a `write_cursor` rewind. Once every path uses routed
-req_ids (Stage 6), this gate is unnecessary.
+The reactor is the sole W2M reader. `drain_w2m_for_worker`
+takes care of ring resets in-place (see III.5).
 
 ### III.2 SAL write cursor
 
@@ -111,8 +111,22 @@ concurrent SAL writer. An intermediate write between FLAG_FLUSH and
 (re-read at a cursor position the master already reused).
 
 No async path (`fan_out_*_async`, `execute_pipeline_async`,
-`broadcast_ddl`, `start_ticks_async_batch`, `single_worker_async`)
+`broadcast_ddl`, `tick_loop_async`, `single_worker_async`)
 may call `maybe_checkpoint`. See the doc comment on `maybe_checkpoint`.
+
+### III.3b SAL-writer exclusivity
+
+Tick, commit, DDL, and relay each acquire a single reactor-wide
+`sal_writer_excl: Rc<AsyncMutex<()>>` for the duration of any
+contiguous SAL group-emission sequence. The mutex is non-reentrant:
+no holder may `.await` on anything that could recursively re-acquire
+it.
+
+Replaces the deleted `TickIdleBarrier`. Without it, the committer's
+`FLAG_FLUSH` could be written between a tick's `FLAG_TICK` group and
+the relay's `FLAG_EXCHANGE_RELAY` group; workers bump
+`expected_epoch` on FLUSH and silently drop the relay, leaving
+`do_exchange_impl` blocked on a 30 s wait forever.
 
 ### III.4 Per-fd state lifecycle
 
@@ -129,6 +143,18 @@ sentinels from the previous incarnation:
   `recv().await` still sees EOF.
 - Outstanding SEND SQEs must complete before fd close — use
   `conn.send_inflight`.
+
+### III.5 W2M per-worker ring reset
+
+`Reactor::drain_w2m_for_worker` is the sole W2M reader; it owns the
+per-worker ring reset. After draining replies, if `in_flight[w] == 0`
+AND the cursor has crossed `RESET_THRESHOLD` (~half the region), the
+reactor calls `W2mReceiver::reset_one_unsafe(w)` and zeros its read
+cursor.
+
+Hard safety: warn at 3/4 region, fatal abort at 7/8. The abort is a
+backstop for sustained mixed load where `in_flight[w]` rarely hits
+zero and the cursor would otherwise overflow.
 
 ---
 
@@ -174,8 +200,9 @@ Clients rely on INSERT LSN for read-after-write ordering.
 
 ### IV.6 Tick batch signalling
 
-`start_ticks_async_batch(tids)` writes N FLAG_TICK groups to SAL and
-signals ONCE. N signals would wake workers N times and serialise what
+`tick_loop_async` writes N FLAG_TICK groups to SAL (one per pending
+tid, with per-worker req_ids) and signals ONCE via `signal_all`.
+Multiple signals would wake workers N times and serialise what
 should be a concurrent broadcast.
 
 ---
@@ -210,7 +237,8 @@ and returns.
 
 Currently wrapped: `cat.ingest_to_family`, `dag.evaluate_dag`,
 `cat.validate_unique_indices`, `disp.broadcast_ddl`, the committer's
-`build_merged + write_commit_group`.
+`build_merged + write_commit_group`, the tick task's
+`write_tick_group + signal_all`, the relay task's `relay_exchange`.
 
 Not wrapped (latent): `cat.seek_family`, `cat.seek_by_index`,
 `cat.scan_family`, `checkpoint_post_ack`, `unique_filter_ingest_batch`.
@@ -231,16 +259,21 @@ Error-mode on unique PK), the INSERT handler holds the per-table
 same-table INSERTs so validation sees a consistent committed state.
 Unconstrained tables skip the lock.
 
-### V.7 Committer liveness
+### V.7 Committer / tick / relay liveness
 
 The committer task must never die without being replaced. A dead
 committer means `committer_tx` backs up, every push's `done.rx.await`
 hangs, and because handlers still hold the catalog read guard, DDL
 stalls too — full-server deadlock.
 
-Every sync call in the committer that could panic on
-malformed-but-decoded input must be wrapped in `catch_unwind`. On
-panic, the affected push returns an error; the committer keeps
+The same applies to `tick_loop_async` (handlers waiting on a
+`TickTrigger` would hang) and `relay_loop` (workers blocked in
+`do_exchange_impl` would time out at 30 s and the next tick would
+fail).
+
+Every sync call in these tasks that could panic on
+malformed-but-decoded input must be wrapped in `guard_panic`. On
+panic, the affected request returns an error; the task keeps
 running. See V.4 for the wrapping status.
 
 ---

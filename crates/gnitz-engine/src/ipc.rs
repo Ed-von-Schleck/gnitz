@@ -1566,17 +1566,15 @@ impl W2mReceiver {
         }
     }
 
-    /// Reset all W2M write cursors to W2M_HEADER_SIZE.
-    pub fn reset_all(&self) {
-        for w in 0..self.num_workers {
-            unsafe {
-                atomic_store_u64(self.region_ptrs[w], W2M_HEADER_SIZE as u64);
-            }
-        }
-    }
-
-    /// Reset one worker's W2M write cursor.
-    pub fn reset_one(&self, worker: usize) {
+    /// Reset one worker's W2M write cursor to `W2M_HEADER_SIZE`.
+    ///
+    /// SAFETY: Only safe when no worker reply for `worker` is in flight
+    /// — i.e. `reactor.in_flight[worker] == 0` and the master is not
+    /// currently routing replies for it. The reactor is the sole
+    /// W2M reader; resetting under the wrong conditions strands data
+    /// past the new write_cursor. Called only by
+    /// `Reactor::drain_w2m_for_worker` once both gates are confirmed.
+    pub(crate) fn reset_one_unsafe(&self, worker: usize) {
         unsafe {
             atomic_store_u64(self.region_ptrs[worker], W2M_HEADER_SIZE as u64);
         }

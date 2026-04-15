@@ -36,6 +36,11 @@ struct DeferredDdl {
 struct DeferredPush {
     target_id: i64,
     batch: Batch,
+    /// Original request_id from the deferred message — propagated so the
+    /// replayed ACK can be routed by the master reactor instead of
+    /// arriving as an unrouted reply (which would advance write_cursor
+    /// without decrementing in_flight, breaking the W2M reset gate).
+    req_id: u64,
 }
 
 struct WorkerExchangeHandler {
@@ -48,8 +53,9 @@ struct WorkerExchangeHandler {
     /// When the worker is blocked waiting for A's relay, it sees TICK[B] and
     /// TICK[C] in the SAL. They are stashed here and replayed (via
     /// `replay_deferred_ticks`) after the current tick's ACK is sent, so the
-    /// master receives ACK[A], ACK[B], ACK[C] in order.
-    deferred_ticks: Vec<i64>,
+    /// master receives ACK[A], ACK[B], ACK[C] in order. The req_id is the
+    /// original FLAG_TICK request id so the replayed ACK is routable.
+    deferred_ticks: Vec<(i64, u64)>,
 }
 
 impl WorkerExchangeHandler {
@@ -58,6 +64,9 @@ impl WorkerExchangeHandler {
     }
 
     /// Perform exchange IPC: send pre-exchange output to master, receive relay.
+    /// `tick_request_id` is echoed on the FLAG_EXCHANGE wire so the master
+    /// can correlate the exchange with its originating tick; the
+    /// accumulator itself keys by view_id.
     fn do_exchange_impl(
         &mut self,
         sal_reader: &SalReader,
@@ -68,6 +77,7 @@ impl WorkerExchangeHandler {
         read_cursor: &mut u64,
         expected_epoch: u32,
         master_pid: i32,
+        tick_request_id: u64,
     ) -> Batch {
         if let Some(stashed) = self.stash.remove(&view_id) {
             return stashed;
@@ -78,7 +88,7 @@ impl WorkerExchangeHandler {
         w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u64, 0, 0, 0, STATUS_OK, &[],
+                source_id as u64, 0, 0, tick_request_id, STATUS_OK, &[],
                 schema.as_ref(), None, Some(batch),
             );
         });
@@ -137,10 +147,12 @@ impl WorkerExchangeHandler {
                 } else if msg.flags & FLAG_PUSH != 0 {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
+                            let push_req_id = decoded.control.request_id;
                             if let Some(batch) = decoded.data_batch {
                                 self.deferred_pushes.push(DeferredPush {
                                     target_id: msg.target_id as i64,
                                     batch,
+                                    req_id: push_req_id,
                                 });
                             }
                         }
@@ -148,9 +160,13 @@ impl WorkerExchangeHandler {
                 } else if msg.flags & FLAG_TICK != 0 {
                     // A tick for another table arrived while waiting for this
                     // exchange relay (multi-table batched tick scenario).
-                    // Stash the target_id; replay_deferred_ticks processes it
-                    // after the current tick's ACK is sent.
-                    self.deferred_ticks.push(msg.target_id as i64);
+                    // Stash the (tid, req_id) so replay_deferred_ticks can
+                    // ACK with the correct id.
+                    let tick_req_id = msg.wire_data
+                        .and_then(|d| ipc::decode_wire(d).ok())
+                        .map(|d| d.control.request_id)
+                        .unwrap_or(0);
+                    self.deferred_ticks.push((msg.target_id as i64, tick_req_id));
                 }
             }
         }
@@ -158,7 +174,9 @@ impl WorkerExchangeHandler {
 }
 
 /// Wrapper that carries channel handles, read_cursor, and expected_epoch from
-/// WorkerProcess into the ExchangeCallback trait.
+/// WorkerProcess into the ExchangeCallback trait. `tick_request_id` is the
+/// request_id of the FLAG_TICK (or other) message that triggered the DAG
+/// evaluation; threaded through so FLAG_EXCHANGE replies echo it.
 struct WorkerExchangeCtx<'a> {
     handler: &'a mut WorkerExchangeHandler,
     sal_reader: &'a SalReader,
@@ -166,6 +184,7 @@ struct WorkerExchangeCtx<'a> {
     read_cursor: &'a mut u64,
     expected_epoch: u32,
     master_pid: i32,
+    tick_request_id: u64,
 }
 
 impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
@@ -179,7 +198,7 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
             self.sal_reader, self.w2m_writer,
             view_id, batch, source_id,
             self.read_cursor, self.expected_epoch,
-            self.master_pid,
+            self.master_pid, self.tick_request_id,
         )
     }
 }
@@ -220,7 +239,12 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() },
+            exchange: WorkerExchangeHandler {
+                stash: HashMap::new(),
+                deferred: Vec::new(),
+                deferred_pushes: Vec::new(),
+                deferred_ticks: Vec::new(),
+            },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -357,10 +381,10 @@ impl WorkerProcess {
         match result {
             DispatchResult::Continue => {
                 // Replay deferred ticks BEFORE deferred pushes so all tick
-                // ACKs land on W2M before any push ACKs. Stage-4 per-worker
-                // req_ids make the master's reply routing order-independent
-                // at the request level, but this replay ordering is still
-                // the simplest way to keep tick's ExchangeAccumulator in sync.
+                // ACKs land on W2M before any push ACKs. Per-worker req_ids
+                // make the master's reply routing order-independent at the
+                // request level, but this replay ordering is still the
+                // simplest way to keep tick's ExchangeAccumulator in sync.
                 self.replay_deferred_ticks();
                 // Replay any FLAG_PUSH messages stashed during exchange.
                 // This runs AFTER all tick ACKs are sent.
@@ -418,7 +442,7 @@ impl WorkerProcess {
         }
 
         if flags & FLAG_BACKFILL != 0 {
-            match self.handle_backfill(target_id) {
+            match self.handle_backfill(target_id, request_id) {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -438,7 +462,7 @@ impl WorkerProcess {
         if flags & FLAG_PUSH != 0 {
             if let Some(batch) = batch {
                 if batch.count > 0 {
-                    match self.handle_push(target_id, batch) {
+                    match self.handle_push(target_id, batch, request_id) {
                         Ok(()) => {}
                         Err(msg) => return DispatchResult::Error(msg),
                     }
@@ -449,7 +473,7 @@ impl WorkerProcess {
         }
 
         if flags & FLAG_TICK != 0 {
-            match self.handle_tick(target_id) {
+            match self.handle_tick(target_id, request_id) {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -542,7 +566,7 @@ impl WorkerProcess {
     }
 
     fn handle_push(
-        &mut self, target_id: i64, batch: Batch,
+        &mut self, target_id: i64, batch: Batch, request_id: u64,
     ) -> Result<(), String> {
         // Filter to only rows belonging to this worker's partitions.
         let batch = self.filter_my_partition(batch);
@@ -553,7 +577,7 @@ impl WorkerProcess {
         if target_id < FIRST_USER_TABLE_ID {
             self.cat().ingest_to_family(target_id, &batch)?;
             self.flush_family_best_effort(target_id);
-            self.evaluate_dag(target_id, batch);
+            self.evaluate_dag(target_id, batch, request_id);
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
             self.flush_family_best_effort(target_id);
@@ -599,7 +623,7 @@ impl WorkerProcess {
         Batch::from_indexed_rows(&mb, &indices, &schema)
     }
 
-    fn handle_tick(&mut self, target_id: i64) -> Result<(), String> {
+    fn handle_tick(&mut self, target_id: i64, request_id: u64) -> Result<(), String> {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
@@ -610,17 +634,17 @@ impl WorkerProcess {
                 .ok_or_else(|| format!("no schema for tid={}", target_id))?;
             Batch::with_schema(schema, 0)
         };
-        self.evaluate_dag(target_id, delta);
+        self.evaluate_dag(target_id, delta, request_id);
         Ok(())
     }
 
-    fn handle_backfill(&mut self, source_tid: i64) -> Result<(), String> {
+    fn handle_backfill(&mut self, source_tid: i64, request_id: u64) -> Result<(), String> {
         if !self.cat().has_id(source_tid) {
             return Ok(());
         }
         let local_batch = self.cat().scan_family(source_tid)?;
         let owned = Arc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
-        self.evaluate_dag(source_tid, owned);
+        self.evaluate_dag(source_tid, owned, request_id);
         Ok(())
     }
 
@@ -686,7 +710,11 @@ impl WorkerProcess {
     }
 
     /// Run multi-worker DAG evaluation with the exchange context.
-    fn evaluate_dag(&mut self, source_id: i64, delta: Batch) {
+    /// `request_id` is the master's request id of the message that
+    /// triggered this evaluation (FLAG_TICK / FLAG_PUSH / FLAG_BACKFILL);
+    /// echoed by `do_exchange_impl` so the master accumulator's wakers
+    /// stay routable.
+    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, request_id: u64) {
         let dag = self.cat().get_dag_ptr();
         let master_pid = self.master_pid;
         let mut ctx = WorkerExchangeCtx {
@@ -696,6 +724,7 @@ impl WorkerProcess {
             read_cursor: &mut self.read_cursor,
             expected_epoch: self.expected_epoch,
             master_pid,
+            tick_request_id: request_id,
         };
         unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.
@@ -719,11 +748,10 @@ impl WorkerProcess {
     fn replay_deferred_ticks(&mut self) {
         while !self.exchange.deferred_ticks.is_empty() {
             let ticks = std::mem::take(&mut self.exchange.deferred_ticks);
-            for tid in ticks {
-                // Deferred ticks lose their original request_id when stashed.
-                match self.handle_tick(tid) {
-                    Ok(()) => self.send_ack(tid as u64, 0, 0),
-                    Err(msg) => self.send_error(&msg, 0),
+            for (tid, req_id) in ticks {
+                match self.handle_tick(tid, req_id) {
+                    Ok(()) => self.send_ack(tid as u64, 0, req_id),
+                    Err(msg) => self.send_error(&msg, req_id),
                 }
             }
         }
@@ -735,9 +763,9 @@ impl WorkerProcess {
         let pushes = std::mem::take(&mut self.exchange.deferred_pushes);
         if pushes.is_empty() { return; }
         for p in pushes {
-            match self.handle_push(p.target_id, p.batch) {
-                Ok(()) => self.send_ack(p.target_id as u64, 0, 0),
-                Err(msg) => self.send_error(&msg, 0),
+            match self.handle_push(p.target_id, p.batch, p.req_id) {
+                Ok(()) => self.send_ack(p.target_id as u64, 0, p.req_id),
+                Err(msg) => self.send_error(&msg, p.req_id),
             }
         }
     }
@@ -838,7 +866,12 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new(), deferred_pushes: Vec::new(), deferred_ticks: Vec::new() }
+        WorkerExchangeHandler {
+            stash: HashMap::new(),
+            deferred: Vec::<DeferredDdl>::new(),
+            deferred_pushes: Vec::new(),
+            deferred_ticks: Vec::new(),
+        }
     }
 
     #[test]
@@ -1017,13 +1050,14 @@ mod tests {
     #[test]
     fn test_deferred_ticks_stash_and_drain_fifo() {
         let mut h = make_handler();
-        h.deferred_ticks.push(101);
-        h.deferred_ticks.push(202);
-        h.deferred_ticks.push(303);
+        h.deferred_ticks.push((101, 1001));
+        h.deferred_ticks.push((202, 1002));
+        h.deferred_ticks.push((303, 1003));
         assert_eq!(h.deferred_ticks.len(), 3);
 
         let drained = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(drained, vec![101, 202, 303], "FIFO order must be preserved");
+        assert_eq!(drained, vec![(101, 1001), (202, 1002), (303, 1003)],
+            "FIFO order must be preserved with req_ids intact");
         assert!(h.deferred_ticks.is_empty(), "take must leave source empty");
 
         // A second take on an already-empty list returns an empty vec.
@@ -1135,20 +1169,20 @@ mod tests {
     fn test_deferred_ticks_cascade_loop_terminates() {
         // Step 1: deferred_ticks has [B, C] after A's exchange wait.
         let mut h = make_handler();
-        h.deferred_ticks.push(200); // B
-        h.deferred_ticks.push(300); // C
+        h.deferred_ticks.push((200, 2200)); // B
+        h.deferred_ticks.push((300, 3300)); // C
 
         // Step 2: first pass of the loop drains [B, C].
         let pass1 = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(pass1, vec![200, 300]);
+        assert_eq!(pass1, vec![(200, 2200), (300, 3300)]);
         assert!(h.deferred_ticks.is_empty());
 
         // Step 3: processing B's exchange causes D to be stashed (simulated).
-        h.deferred_ticks.push(400); // D (stashed during B's exchange)
+        h.deferred_ticks.push((400, 4400)); // D (stashed during B's exchange)
 
         // Step 4: second pass picks up D.
         let pass2 = std::mem::take(&mut h.deferred_ticks);
-        assert_eq!(pass2, vec![400]);
+        assert_eq!(pass2, vec![(400, 4400)]);
         assert!(h.deferred_ticks.is_empty());
 
         // Step 5: third pass: empty → loop terminates.

@@ -1,15 +1,17 @@
-//! Server executor (Stage 4): async event loop built on the reactor.
+//! Server executor: fully async event loop built on the reactor.
 //!
 //! The master process owns a single `Reactor` that drives:
 //! - the accept socket (client connections),
 //! - all per-fd connection tasks (one per client),
 //! - the committer task (group commit + checkpoint + fsync),
-//! - the tick task (polls the existing sync tick state machine),
+//! - the tick task (event-driven, coalesces triggers),
+//! - the relay task (writes FLAG_EXCHANGE_RELAY groups),
 //! - the worker-crash watcher task.
 //!
-//! Sync tick code (`fan_out_tick`, `start_ticks_async_batch` +
-//! `poll_tick_progress`, `TickIdleBarrier`) is retained and driven from
-//! the tick task. Stage 6 retires it.
+//! Ticks allocate per-worker req_ids, write one FLAG_TICK group per
+//! pending tid, signal once, and `join_all` the ACKs through the
+//! reactor's reply routing. The reactor demuxes FLAG_EXCHANGE wires
+//! into an accumulator and hands completed views to the relay task.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,8 +22,10 @@ use std::time::{Duration, Instant};
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::committer::{self, CommitRequest};
 use crate::ipc::{self, STATUS_OK, STATUS_ERROR, WireConflictMode};
-use crate::master::MasterDispatcher;
-use crate::reactor::{AsyncMutex, AsyncRwLock, Reactor, TickIdleBarrier, mpsc, oneshot};
+use crate::master::{MasterDispatcher, first_worker_error};
+use crate::reactor::{
+    AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, mpsc, oneshot, select2,
+};
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 use crate::util::guard_panic;
@@ -29,7 +33,6 @@ use crate::util::guard_panic;
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
 const WORKER_WATCH_MS: u64 = 100;
-const TICK_POLL_MS: u64 = 1;
 
 const FLAG_ALLOCATE_TABLE_ID: u64  = 1;
 const FLAG_ALLOCATE_SCHEMA_ID: u64 = 2;
@@ -49,6 +52,19 @@ struct CatPtr(*mut CatalogEngine);
 unsafe impl Send for CatPtr {}
 unsafe impl Sync for CatPtr {}
 
+/// One tick request to `tick_loop_async`.
+pub enum TickTrigger {
+    /// Fire-and-forget trigger from INSERT when a tid crosses the row
+    /// coalesce threshold.  Tids come from `tick_rows` / `tick_tids`.
+    Auto,
+    /// Explicit drain requested by SCAN: forces the listed tids to tick
+    /// even if their `tick_rows` counter is empty, then signals `done`.
+    Drain {
+        tids: Vec<i64>,
+        done: oneshot::Sender<()>,
+    },
+}
+
 /// Shared executor state held by every task.
 pub struct Shared {
     pub reactor: Rc<Reactor>,
@@ -57,7 +73,14 @@ pub struct Shared {
     sal_fd: i32,
     committer_tx: mpsc::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
-    tick_barrier: Rc<TickIdleBarrier>,
+    /// SAL-writer exclusivity (III.3b). Held by committer (checkpoint +
+    /// commit emission), tick task (per-tid emission), relay task
+    /// (FLAG_EXCHANGE_RELAY), and DDL (broadcast_ddl + fsync).  Replaces
+    /// the deleted `TickIdleBarrier` semantics.
+    sal_writer_excl: Rc<AsyncMutex<()>>,
+    /// Tick trigger sender; senders include INSERT (auto-trigger on
+    /// threshold cross) and SCAN (explicit drain).
+    tick_tx: mpsc::Sender<TickTrigger>,
     /// Committer-owned counter; shared here so SCAN/SEEK handlers can
     /// report the same LSN the committer assigns.
     ingest_lsn: Rc<Cell<u64>>,
@@ -66,13 +89,6 @@ pub struct Shared {
     tick_rows: Rc<RefCell<HashMap<i64, usize>>>,
     tick_tids: Rc<RefCell<Vec<i64>>>,
     t_last_push: Rc<Cell<Option<Instant>>>,
-    /// Set by SCAN handlers so the tick task fires on its next poll.
-    force_tick: Rc<Cell<bool>>,
-    /// Monotonic counter incremented at the END of every tick cycle.
-    /// Used by SCAN to await "one tick cycle has completed since I
-    /// requested it" — `tick_barrier.wait()` alone returns immediately
-    /// when the barrier is idle and doesn't prove a tick ran.
-    tick_generation: Rc<Cell<u64>>,
     table_locks: RefCell<HashMap<i64, Rc<AsyncMutex<()>>>>,
     schema_cache: RefCell<HashMap<i64, SchemaDescriptor>>,
     col_names_cache: RefCell<HashMap<i64, Vec<Vec<u8>>>>,
@@ -127,6 +143,23 @@ impl Shared {
         *entry += rows;
         self.t_last_push.set(Some(Instant::now()));
     }
+
+    /// True iff some pending tid has crossed the row coalesce threshold.
+    /// Used by the INSERT handler to decide whether to send an immediate
+    /// tick trigger, and by the tick task to skip the deadline window.
+    fn any_threshold_crossed(&self) -> bool {
+        self.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS)
+    }
+
+    /// Drain `tick_rows` and `tick_tids`, returning the union of pending
+    /// tids in stable insertion order.
+    fn drain_tick_rows(&self) -> Vec<i64> {
+        let mut tids = self.tick_tids.borrow_mut();
+        let v = std::mem::take(&mut *tids);
+        self.tick_rows.borrow_mut().clear();
+        self.t_last_push.set(None);
+        v
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,22 +187,25 @@ impl ServerExecutor {
         reactor.attach_w2m(unsafe { &*dispatcher }.w2m_handle());
         reactor.attach_server_fd(server_fd);
 
-        let tick_barrier = Rc::new(TickIdleBarrier::new());
+        let sal_writer_excl = Rc::new(AsyncMutex::new(()));
         let ingest_lsn = Rc::new(Cell::new(0u64));
         let last_tick_lsn = Rc::new(Cell::new(0u64));
         let tick_rows: Rc<RefCell<HashMap<i64, usize>>> = Rc::new(RefCell::new(HashMap::new()));
         let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let t_last_push = Rc::new(Cell::new(None));
-        let force_tick = Rc::new(Cell::new(false));
-        let tick_generation = Rc::new(Cell::new(0u64));
 
         let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
+        let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
+        let (relay_tx, relay_rx) = mpsc::unbounded::<PendingRelay>();
+        // Wire the relay channel into the reactor so route_reply's
+        // FLAG_EXCHANGE accumulator can hand off completed views.
+        reactor.attach_relay_tx(relay_tx);
 
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp_ptr: dispatcher,
             sal_fd,
-            tick_barrier: Rc::clone(&tick_barrier),
+            sal_writer_excl: Rc::clone(&sal_writer_excl),
             ingest_lsn: Rc::clone(&ingest_lsn),
             num_workers,
         });
@@ -180,14 +216,13 @@ impl ServerExecutor {
             sal_fd,
             committer_tx,
             catalog_rwlock: Rc::new(AsyncRwLock::new()),
-            tick_barrier: Rc::clone(&tick_barrier),
+            sal_writer_excl: Rc::clone(&sal_writer_excl),
+            tick_tx,
             ingest_lsn: Rc::clone(&ingest_lsn),
             last_tick_lsn: Rc::clone(&last_tick_lsn),
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
             t_last_push: Rc::clone(&t_last_push),
-            force_tick: Rc::clone(&force_tick),
-            tick_generation: Rc::clone(&tick_generation),
             table_locks: RefCell::new(HashMap::new()),
             schema_cache: RefCell::new(HashMap::new()),
             col_names_cache: RefCell::new(HashMap::new()),
@@ -195,7 +230,8 @@ impl ServerExecutor {
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
         reactor.spawn(accept_loop(Rc::clone(&shared)));
-        reactor.spawn(tick_loop(Rc::clone(&shared)));
+        reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
+        reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
         reactor.spawn(worker_watcher(Rc::clone(&shared)));
 
         reactor.block_until_shutdown();
@@ -255,92 +291,158 @@ async fn worker_watcher(shared: Rc<Shared>) {
 }
 
 // ---------------------------------------------------------------------------
-// Tick loop
+// Tick loop (event-driven)
 // ---------------------------------------------------------------------------
 
-async fn tick_loop(shared: Rc<Shared>) {
+/// Drive ticks from a channel of `TickTrigger`s. Coalesces triggers
+/// inside a bounded deadline window, then issues one batched tick for
+/// the union of pending tids. Per IV.6, every per-(tid, worker) req_id
+/// is allocated up front, all groups are written, then a single
+/// `signal_all` fires.  ACKs are awaited via `join_all` through the
+/// reactor's reply routing.
+///
+/// V.7 liveness: the outer loop body is wrapped so a failure in one
+/// trigger only fails that trigger, not the loop. SAL emission is
+/// further guarded by `guard_panic` inside `run_tick`.
+async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
     loop {
-        shared.reactor.timer(
-            Instant::now() + Duration::from_millis(TICK_POLL_MS),
-        ).await;
-        let force = shared.force_tick.get();
-        if force { shared.force_tick.set(false); }
-        if !force && !should_fire(&shared) { continue; }
-
-        let tids: Vec<i64> = {
-            let mut tids = shared.tick_tids.borrow_mut();
-            let v = std::mem::take(&mut *tids);
-            shared.tick_rows.borrow_mut().clear();
-            shared.t_last_push.set(None);
-            v
+        let first = match rx.recv().await {
+            Some(t) => t,
+            None => return, // all senders dropped — clean shutdown
         };
-        // Empty / all-dropped tids still count as a completed tick
-        // cycle for any SCAN handler waiting on tick_generation — those
-        // scans don't need a tick to fire, only to observe that one
-        // loop iteration ran after their request.
-        if tids.is_empty() {
-            shared.tick_generation.set(shared.tick_generation.get() + 1);
-            continue;
+        let mut triggers = vec![first];
+
+        // Drain anything already queued.
+        while let Some(more) = rx.try_recv() {
+            triggers.push(more);
         }
 
-        let live_tids: Vec<i64> = tids.into_iter()
-            .filter(|&tid| shared.cat().has_id(tid))
-            .collect();
-        if live_tids.is_empty() {
-            shared.tick_generation.set(shared.tick_generation.get() + 1);
-            continue;
-        }
-
-        shared.tick_barrier.set_active();
-        if let Err(e) = shared.disp().start_ticks_async_batch(&live_tids) {
-            gnitz_warn!("start_ticks_async_batch error: {}", e);
-            shared.tick_barrier.notify_all();
-            shared.tick_generation.set(shared.tick_generation.get() + 1);
-            continue;
-        }
-
-        // Drive the existing sync tick state machine to completion, yielding
-        // to the reactor between polls.
-        loop {
-            match shared.disp().poll_tick_progress() {
-                Ok(true) => break,
-                Ok(false) => {
-                    shared.reactor.timer(
-                        Instant::now() + Duration::from_millis(TICK_POLL_MS),
-                    ).await;
-                }
-                Err(e) => {
-                    gnitz_warn!("poll_tick_progress error: {}", e);
-                    break;
+        // Honour the coalesce deadline only if no trigger is row-threshold
+        // urgent. Lets pipelined inserts batch into a single tick.
+        if !shared.any_threshold_crossed() {
+            let deadline = Instant::now() + Duration::from_millis(TICK_DEADLINE_MS);
+            loop {
+                let timer = shared.reactor.timer(deadline);
+                match select2(rx.recv(), timer).await {
+                    Either::A(Some(more)) => triggers.push(more),
+                    Either::A(None) => return, // channel closed mid-coalesce
+                    Either::B(()) => break,    // deadline elapsed
                 }
             }
         }
-        // W2M reset requires every reader to have drained: a worker's
-        // scan/push ACK written after its tick ACK would be orphaned
-        // by zeroing write_cursor. See async-invariants.md §III.1.
-        while !shared.reactor.all_in_flight_zero() {
-            shared.reactor.timer(
-                Instant::now() + Duration::from_millis(TICK_POLL_MS),
-            ).await;
+
+        // Build the tid set: union of drained tick_rows (in INSERT order)
+        // + explicit tids from SCAN triggers. The order is load-bearing:
+        // anti-join semantics (EXCEPT, NOT IN, etc.) rely on processing
+        // ticks in the order pushes arrived. Reordering causes the b-side
+        // trace to be empty when a-side ticks (and vice versa), leaking
+        // rows that should have cancelled.
+        let mut tids: Vec<i64> = shared.drain_tick_rows();
+        let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
+        if has_drain {
+            let mut seen: std::collections::HashSet<i64> = tids.iter().copied().collect();
+            for t in &triggers {
+                if let TickTrigger::Drain { tids: v, .. } = t {
+                    for &tid in v {
+                        if seen.insert(tid) { tids.push(tid); }
+                    }
+                }
+            }
         }
-        shared.disp().reset_w2m_cursors();
-        shared.reactor.reset_w2m_cursors();
-        shared.last_tick_lsn.set(shared.ingest_lsn.get());
-        shared.tick_generation.set(shared.tick_generation.get() + 1);
-        shared.tick_barrier.notify_all();
+        tids.retain(|&tid| shared.cat().has_id(tid));
+
+        // Run the tick. Errors are reported in logs; every Drain trigger's
+        // `done` is signalled regardless so callers don't hang.
+        if let Err(e) = run_tick(&shared, &tids).await {
+            gnitz_warn!("tick error: {}", e);
+        }
+        for t in triggers {
+            if let TickTrigger::Drain { done, .. } = t {
+                let _ = done.send(());
+            }
+        }
     }
 }
 
-fn should_fire(shared: &Rc<Shared>) -> bool {
-    let tr = shared.tick_rows.borrow();
-    if tr.is_empty() { return false; }
-    for (_tid, &rows) in tr.iter() {
-        if rows >= TICK_COALESCE_ROWS { return true; }
+/// Emit FLAG_TICK groups for every `tid` and await the per-worker ACKs.
+///
+/// Holds `catalog_rwlock.read()` while looking up schemas + writing SAL
+/// so DDL cannot mutate schemas mid-emission. Holds `sal_writer_excl`
+/// for the contiguous emission window (III.3b). Both are released
+/// before awaiting ACKs so other reactor work can proceed concurrently
+/// with worker DAG eval.
+async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
+    if tids.is_empty() { return Ok(()); }
+    let nw = unsafe { (*shared.dispatcher.0).num_workers() };
+
+    // Allocate every (tid, worker) req_id up front so the SAL emission
+    // sequence is fully prepared before we take any locks.
+    let req_ids: Vec<Vec<u64>> = tids.iter()
+        .map(|_| (0..nw).map(|_| shared.reactor.alloc_request_id()).collect())
+        .collect();
+
+    let _cat_read = shared.catalog_rwlock.read().await;
+    let _sal_excl = shared.sal_writer_excl.lock().await;
+
+    let emit_err = guard_panic("tick", || unsafe {
+        let disp = &mut *shared.dispatcher.0;
+        for (i, &tid) in tids.iter().enumerate() {
+            disp.write_tick_group(tid, &req_ids[i])?;
+        }
+        // Increment in_flight for every (tid, worker) BEFORE signal_all,
+        // matching dispatch_fanout / committer ordering.
+        for group in &req_ids {
+            for (w, _) in group.iter().enumerate() {
+                shared.reactor.increment_in_flight(w);
+            }
+        }
+        disp.signal_all();
+        Ok(())
+    });
+    drop(_sal_excl);
+    drop(_cat_read);
+    emit_err?;
+
+    let futs: Vec<_> = req_ids.iter().flatten()
+        .map(|&id| shared.reactor.await_reply(id))
+        .collect();
+    let replies = crate::reactor::join_all(futs).await;
+    if let Some(e) = first_worker_error("tick", &replies) {
+        return Err(e);
     }
-    if let Some(t) = shared.t_last_push.get() {
-        if t.elapsed().as_millis() as u64 >= TICK_DEADLINE_MS { return true; }
+    shared.last_tick_lsn.set(shared.ingest_lsn.get());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Relay loop
+// ---------------------------------------------------------------------------
+
+/// Consume completed `PendingRelay`s from the reactor's exchange
+/// accumulator and write FLAG_EXCHANGE_RELAY groups back through the
+/// dispatcher.  Lives in its own task so the SAL write happens outside
+/// the reactor's synchronous CQE handler — `relay_exchange` reads the
+/// catalog DAG (needs catalog_rwlock.read) and writes a SAL group
+/// (needs sal_writer_excl), neither of which can block-acquire from
+/// inside the reactor's tick.
+///
+/// V.7 liveness: the loop never exits on inner errors; only an
+/// unrecoverable channel close (all senders dropped) terminates it.
+async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
+    loop {
+        let relay = match rx.recv().await {
+            Some(r) => r,
+            None => return,
+        };
+        let _cat = shared.catalog_rwlock.read().await;
+        let _sal = shared.sal_writer_excl.lock().await;
+        let r = guard_panic("relay", || unsafe {
+            (*shared.dispatcher.0).relay_exchange(relay)
+        });
+        if let Err(e) = r {
+            gnitz_warn!("relay_exchange failed: {}", e);
+        }
     }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +557,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
             send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
             return;
         }
-        // L7: gate against sync-tick W2M drain.
-        shared.tick_barrier.wait().await;
         // Distributed validation (FK / unique indices + UPSERT).
         if let Err(e) = MasterDispatcher::validate_all_distributed_async(
             shared.dispatcher.0, &shared.reactor, target_id, &batch, mode,
@@ -476,6 +576,9 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
             Ok(Ok(lsn)) => {
                 // Successful commit: bump tick counter for this table.
                 shared.bump_tick_rows(target_id, batch_count);
+                if shared.any_threshold_crossed() {
+                    shared.tick_tx.send(TickTrigger::Auto);
+                }
                 let schema = shared.get_schema_desc(target_id);
                 send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn).await;
             }
@@ -508,8 +611,6 @@ async fn handle_seek(
         return;
     }
     let schema = shared.get_schema_desc(target_id);
-    // L7: don't race the sync-tick W2M drain.
-    shared.tick_barrier.wait().await;
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_async(
             shared.dispatcher.0, &shared.reactor, target_id, pk_lo, pk_hi,
@@ -538,7 +639,6 @@ async fn handle_seek_by_index(
         return;
     }
     let schema = shared.get_schema_desc(target_id);
-    shared.tick_barrier.wait().await;
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_by_index_async(
             shared.dispatcher.0, &shared.reactor, target_id, col_idx, key_lo, key_hi,
@@ -564,20 +664,22 @@ async fn handle_scan(
         return;
     }
     let schema = shared.get_schema_desc(target_id);
-    // Drain pending ticks (on source tables — views derive through the
-    // DAG). One gen-advance is insufficient: a push that landed after
-    // tick_tids was drained stays pending across that tick, so loop
-    // until tick_rows is empty.
+    // Drain pending ticks before reading: views derive from source-table
+    // pushes through the DAG (IV.2). Loop until `tick_rows` is empty —
+    // a push landing during the tick may add more rows; the outer
+    // is_empty() re-check closes the race.
     loop {
-        let pending = !shared.tick_rows.borrow().is_empty();
-        if !pending { break; }
-        let gen_before = shared.tick_generation.get();
-        shared.force_tick.set(true);
-        while shared.tick_generation.get() == gen_before {
-            shared.reactor.timer(
-                Instant::now() + Duration::from_millis(TICK_POLL_MS),
-            ).await;
-        }
+        let snapshot: Vec<i64> = {
+            let tr = shared.tick_rows.borrow();
+            if tr.is_empty() { break; }
+            tr.keys().copied().collect()
+        };
+        let (tx, rx) = oneshot::channel::<()>();
+        shared.tick_tx.send(TickTrigger::Drain {
+            tids: snapshot,
+            done: tx,
+        });
+        let _ = rx.await;
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
@@ -645,6 +747,10 @@ async fn handle_system_dml(
     let lsn = shared.ingest_lsn.get() + 1;
     shared.ingest_lsn.set(lsn);
 
+    // SAL emission window: acquire III.3b mutex to serialize against
+    // committer + tick + relay. Held across broadcast + fsync so a
+    // concurrent FLAG_FLUSH or FLAG_TICK group cannot interleave.
+    let _sal_excl = shared.sal_writer_excl.lock().await;
     let disp_ptr_raw = shared.dispatcher.0;
     let ddl_for_broadcast = ddl_clone;
     if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
@@ -656,6 +762,7 @@ async fn handle_system_dml(
     let t_bcast_done = Instant::now();
     let fsync_rc = shared.reactor.fsync(shared.sal_fd).await;
     let t_fsync_done = Instant::now();
+    drop(_sal_excl);
     if fsync_rc < 0 {
         gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
     }

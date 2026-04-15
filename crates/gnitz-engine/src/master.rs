@@ -15,80 +15,12 @@ use crate::ipc::{
     FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
     SalWriter, W2mReceiver, W2M_HEADER_SIZE,
 };
+use crate::reactor::PendingRelay;
 use crate::storage::{Batch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter,
     worker_for_partition_pub,
 };
-
-// ---------------------------------------------------------------------------
-// ExchangeAccumulator
-// ---------------------------------------------------------------------------
-
-struct ExchangeAccumulator {
-    payloads:   HashMap<i64, Vec<Option<Batch>>>,
-    counts:     HashMap<i64, usize>,
-    schemas:    HashMap<i64, SchemaDescriptor>,
-    source_ids: HashMap<i64, i64>,
-    nw: usize,
-}
-
-impl ExchangeAccumulator {
-    fn new(nw: usize) -> Self {
-        ExchangeAccumulator {
-            payloads:   HashMap::new(),
-            counts:     HashMap::new(),
-            schemas:    HashMap::new(),
-            source_ids: HashMap::new(),
-            nw,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.payloads.clear();
-        self.counts.clear();
-        self.schemas.clear();
-        self.source_ids.clear();
-    }
-
-    fn process(&mut self, w: usize, decoded: DecodedWire) -> Result<Option<PendingRelay>, String> {
-        let vid = decoded.control.target_id as i64;
-        let ex_source_id = decoded.control.seek_pk_lo as i64;
-        let nw = self.nw;
-
-        let payloads = self.payloads
-            .entry(vid)
-            .or_insert_with(|| vec![None; nw]);
-        let count = self.counts.entry(vid).or_insert(0);
-
-        payloads[w] = decoded.data_batch;
-        if let Some(schema) = decoded.schema {
-            self.schemas.insert(vid, schema);
-        }
-        if ex_source_id > 0 {
-            self.source_ids.insert(vid, ex_source_id);
-        }
-        *count += 1;
-
-        if *count == nw {
-            let schema = self.schemas.remove(&vid)
-                .ok_or_else(|| format!("exchange: no schema received for view_id={}", vid))?;
-            let source_id = self.source_ids.remove(&vid).unwrap_or(0);
-            let payloads_vec = self.payloads.remove(&vid).unwrap();
-            self.counts.remove(&vid);
-            Ok(Some(PendingRelay { view_id: vid, payloads: payloads_vec, schema, source_id }))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-struct PendingRelay {
-    view_id:   i64,
-    payloads:  Vec<Option<Batch>>,
-    schema:    SchemaDescriptor,
-    source_id: i64,
-}
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -244,18 +176,6 @@ pub struct MasterDispatcher {
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
-    // Async tick state
-    async_remaining: usize,
-    /// Per-worker countdown of tick ACKs still outstanding in the current batch.
-    /// Initialised to N (the number of ticks in the batch) by begin_async_collection;
-    /// decremented on each non-exchange ACK; a worker is collected when it reaches 0.
-    /// Replacing the previous (async_collected, async_acks_per_worker,
-    /// async_acks_collected) triple with a single countdown eliminates redundant
-    /// state and removes the per-tick overhead for the common N=1 case.
-    async_acks_remaining: Vec<usize>,
-    async_w2m_rcs: Vec<u64>,
-    acc: ExchangeAccumulator,
-    async_active: bool,
     /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
     /// unique-index broadcasts. See the UniqueFilter comment block above.
     unique_filters: HashMap<(i64, u32), UniqueFilter>,
@@ -284,11 +204,6 @@ impl MasterDispatcher {
             w2m: Rc::new(w2m),
             catalog,
             router: PartitionRouter::new(),
-            async_remaining: 0,
-            async_acks_remaining: vec![0; num_workers],
-            async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
-            acc: ExchangeAccumulator::new(num_workers),
-            async_active: false,
             unique_filters: HashMap::new(),
             schema_names_cache: HashMap::new(),
         }
@@ -450,17 +365,17 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub(crate) fn reset_w2m_cursors(&self) {
-        self.w2m.reset_all();
-    }
-
     /// Expose the shared W2M handle so the executor can attach it to the
     /// reactor for async fan-out reply routing.
     pub fn w2m_handle(&self) -> Rc<W2mReceiver> {
         Rc::clone(&self.w2m)
     }
 
-    /// Wait for one response from each worker. ALWAYS resets W2M cursors.
+    /// Wait for one response from each worker. Used only by bootstrap
+    /// `fan_out_backfill`; no other sync W2M callers exist. Bootstrap
+    /// runs before the reactor, so the per-worker W2M reset implemented
+    /// in `Reactor::drain_w2m_for_worker` does not yet apply — we still
+    /// need a local reset here.
     fn wait_all_workers(&mut self) -> Result<Vec<Option<DecodedWire>>, String> {
         let nw = self.num_workers;
         let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
@@ -487,7 +402,9 @@ impl MasterDispatcher {
             }
             Ok(())
         })();
-        self.reset_w2m_cursors();
+        for w in 0..nw {
+            self.w2m.reset_one_unsafe(w);
+        }
         err?;
         Ok(results)
     }
@@ -500,13 +417,15 @@ impl MasterDispatcher {
     pub(crate) fn num_workers(&self) -> usize { self.num_workers }
 
     /// Collect ACKs from all workers, relaying exchange messages inline.
+    /// Bootstrap-only: called by `fan_out_backfill` before the reactor
+    /// is up. Maintains its own ExchangeAccumulator since the reactor's
+    /// is not yet wired.
     fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
         let mut remaining = nw;
         let mut collected = vec![false; nw];
         let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
-
-        self.acc.clear();
+        let mut acc = crate::reactor::ExchangeAccumulator::new(nw);
 
         let err = (|| -> Result<(), String> {
             while remaining > 0 {
@@ -517,7 +436,7 @@ impl MasterDispatcher {
                         w2m_rcs[w] = new_rc;
 
                         if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
-                            if let Some(relay) = self.acc.process(w, decoded)? {
+                            if let Some(relay) = acc.process(w, decoded) {
                                 self.relay_exchange(relay)?;
                             }
                             break; // re-check write_cursor after relay
@@ -535,8 +454,9 @@ impl MasterDispatcher {
             }
             Ok(())
         })();
-        self.acc.clear();
-        self.reset_w2m_cursors();
+        for w in 0..nw {
+            self.w2m.reset_one_unsafe(w);
+        }
         err
     }
 
@@ -576,7 +496,7 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    fn relay_exchange(&mut self, relay: PendingRelay) -> Result<(), String> {
+    pub(crate) fn relay_exchange(&mut self, relay: PendingRelay) -> Result<(), String> {
         let remaining = self.sal.mmap_size() - self.sal.cursor();
         if remaining < (self.sal.mmap_size() >> 3) {
             return Err(format!(
@@ -815,108 +735,22 @@ impl MasterDispatcher {
     }
 
     // -----------------------------------------------------------------------
-    // Async tick API
+    // Tick group writer (used by the async tick task in executor.rs)
     // -----------------------------------------------------------------------
 
-    fn begin_async_collection(&mut self, acks_per_worker: usize) {
-        self.async_remaining = self.num_workers;
-        for w in 0..self.num_workers {
-            self.async_acks_remaining[w] = acks_per_worker;
-            self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
-        }
-        self.acc.clear();
-        self.async_active = true;
-    }
-
-    /// Write N FLAG_TICK groups to the SAL and signal all workers once.
-    /// Workers process the ticks sequentially, sending one ACK per tick.
-    /// `poll_tick_progress` collects N ACKs per worker (N × num_workers total)
-    /// before declaring the batch complete.
-    ///
-    /// Exchange relays for all tables are handled inline by `poll_tick_progress`
-    /// exactly as for a single tick: the ExchangeAccumulator is keyed by
-    /// view_id, so relays for different tables are demuxed automatically.
-    ///
-    /// # Panics (debug)
-    /// Panics if `tids` is empty — callers must filter to non-empty slices.
-    pub fn start_ticks_async_batch(&mut self, tids: &[i64]) -> Result<(), String> {
-        debug_assert!(!tids.is_empty(), "start_ticks_async_batch called with empty tids");
-        // Write all FLAG_TICK groups without signalling between them.
-        // If write_broadcast fails mid-way, the partial writes are harmless:
-        // no signal has been sent yet, so workers will not process them.
-        for &tid in tids {
-            let (schema, col_names) = self.get_schema_and_names(tid);
-            self.write_broadcast(tid, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
-        }
-        // Single signal after all writes — one eventfd kick for N ticks.
-        self.signal_all();
-
-        self.begin_async_collection(tids.len());
-        Ok(())
-    }
-
-    /// Non-blocking progress check. Returns true when tick is complete.
-    pub fn poll_tick_progress(&mut self) -> Result<bool, String> {
-        if !self.async_active {
-            return Ok(true);
-        }
-
-        let nw = self.num_workers;
-        self.w2m.poll(1);
-
-        for w in 0..nw {
-            if self.async_acks_remaining[w] == 0 { continue; }
-            while let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
-                self.async_w2m_rcs[w] = new_rc;
-
-                // Reactor-routed replies (push/validate/fan_out) share
-                // the ring; advance past them without counting.
-                if decoded.control.request_id != 0 {
-                    continue;
-                }
-
-                if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
-                    match self.acc.process(w, decoded) {
-                        Ok(Some(relay)) => {
-                            if let Err(e) = self.relay_exchange(relay) {
-                                self.finish_async_tick();
-                                return Err(e);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            self.finish_async_tick();
-                            return Err(e);
-                        }
-                    }
-                    break; // re-check write_cursor after relay
-                } else {
-                    if decoded.control.status != 0 {
-                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                        self.finish_async_tick();
-                        return Err(format!("worker {}: {}", w, msg));
-                    }
-                    self.async_acks_remaining[w] -= 1;
-                    if self.async_acks_remaining[w] == 0 {
-                        self.async_remaining -= 1;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if self.async_remaining == 0 {
-            self.finish_async_tick();
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn finish_async_tick(&mut self) {
-        // Note: does NOT reset W2M cursors. The caller is responsible for
-        // calling reset_w2m_cursors() after it has finished reading any
-        // remaining W2M data (e.g. push ACKs that follow tick ACKs).
-        self.async_active = false;
+    /// Write a FLAG_TICK group for `tid` with per-worker req_ids. Does
+    /// NOT signal — the caller batches multiple `write_tick_group` calls
+    /// followed by a single `signal_all` (IV.6). The underlying SAL
+    /// encoder reuses `write_group_with_req_ids`; per-worker slots all
+    /// carry the corresponding req_id from `req_ids[w]`.
+    pub(crate) fn write_tick_group(
+        &mut self, tid: i64, req_ids: &[u64],
+    ) -> Result<(), String> {
+        let (schema, col_names) = self.get_schema_and_names(tid);
+        self.write_group_with_req_ids(
+            tid, FLAG_TICK, &[], &schema, &col_names,
+            0, 0, 0, req_ids, -1,
+        )
     }
 
     // -----------------------------------------------------------------------
