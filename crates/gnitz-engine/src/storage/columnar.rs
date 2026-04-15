@@ -283,6 +283,75 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 0), Ordering::Equal);
     }
 
+    // ---------------------------------------------------------------------------
+    // German string comparator — direct tests (short, long, mixed lengths)
+    // ---------------------------------------------------------------------------
+
+    use crate::schema::SHORT_STRING_THRESHOLD;
+
+    /// Build a German string struct (len > SHORT_STRING_THRESHOLD) with its heap blob.
+    fn make_long_string(data: &[u8]) -> ([u8; 16], Vec<u8>) {
+        assert!(data.len() > SHORT_STRING_THRESHOLD);
+        let mut s = [0u8; 16];
+        s[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        s[4..8].copy_from_slice(&data[0..4]); // prefix
+        s[8..16].copy_from_slice(&0u64.to_le_bytes()); // heap_offset = 0
+        (s, data.to_vec())
+    }
+
+    #[test]
+    fn test_german_string_short() {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        // "abc" < "abd"
+        a[0..4].copy_from_slice(&3u32.to_le_bytes());
+        a[4] = b'a'; a[5] = b'b'; a[6] = b'c';
+        b[0..4].copy_from_slice(&3u32.to_le_bytes());
+        b[4] = b'a'; b[5] = b'b'; b[6] = b'd';
+        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
+
+        // Equal
+        b[6] = b'c';
+        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Equal);
+
+        // Shorter < longer with same prefix: "abc" < "abcz"
+        b[0..4].copy_from_slice(&4u32.to_le_bytes());
+        b[7] = b'z';
+        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
+    }
+
+    #[test]
+    fn test_german_string_long() {
+        // Long strings: equal except last byte
+        let data_a: Vec<u8> = b"hello_world_long_A".to_vec(); // len=18
+        let data_b_lt: Vec<u8> = b"hello_world_long_B".to_vec();
+        let (sa, blob_a) = make_long_string(&data_a);
+        let (sb_lt, blob_b_lt) = make_long_string(&data_b_lt);
+        assert_eq!(compare_german_strings(&sa, &blob_a, &sb_lt, &blob_b_lt), Ordering::Less);
+
+        // Equal long strings
+        let (sb_eq, blob_b_eq) = make_long_string(&data_a);
+        assert_eq!(compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq), Ordering::Equal);
+
+        // Prefix differs early → less
+        let data_b_prefix: Vec<u8> = b"aello_world_long_A".to_vec();
+        let (sb_prefix, blob_b_prefix) = make_long_string(&data_b_prefix);
+        assert_eq!(compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a), Ordering::Less);
+    }
+
+    #[test]
+    fn test_german_string_mixed_short_long() {
+        // Short (len=10) vs long (len=20) with same prefix; shorter < longer
+        let short_data = b"0123456789"; // len=10, ≤ SHORT_STRING_THRESHOLD → short
+        let mut s_short = [0u8; 16];
+        s_short[0..4].copy_from_slice(&10u32.to_le_bytes());
+        s_short[4..8].copy_from_slice(&short_data[0..4]);
+        s_short[8..14].copy_from_slice(&short_data[4..]);
+        let long_data: Vec<u8> = b"01234567890123456789".to_vec(); // len=20
+        let (s_long, blob_long) = make_long_string(&long_data);
+        assert_eq!(compare_german_strings(&s_short, &[], &s_long, &blob_long), Ordering::Less);
+    }
+
     /// Test STRING column comparison via compare_rows (short strings).
     #[test]
     fn test_compare_rows_string() {

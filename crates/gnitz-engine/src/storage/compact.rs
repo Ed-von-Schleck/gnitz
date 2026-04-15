@@ -337,7 +337,7 @@ pub fn merge_and_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, compare_german_strings};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
     use std::fs;
 
     // Helper: build a minimal shard file in memory and write to disk
@@ -500,82 +500,6 @@ mod tests {
         assert_eq!(merged.count, 3); // only keys 1, 3, 5
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    // Build a long German string struct (len > 12) and backing blob.
-    // The full `length` bytes are stored at blob[heap_offset..heap_offset+length].
-    // Bytes [0..4] of the string → prefix field at struct[4..8].
-    // Bytes [4..length] → blob[heap_offset+4..heap_offset+length].
-    fn make_long_string(data: &[u8]) -> ([u8; 16], Vec<u8>) {
-        assert!(data.len() > SHORT_STRING_THRESHOLD);
-        let mut s = [0u8; 16];
-        s[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        s[4..8].copy_from_slice(&data[0..4]);
-        // heap_offset = 0
-        s[8..16].copy_from_slice(&0u64.to_le_bytes());
-        let blob = data.to_vec();
-        (s, blob)
-    }
-
-    #[test]
-    fn test_string_comparison() {
-        // Short strings
-        let mut a = [0u8; 16];
-        let mut b = [0u8; 16];
-        // len=3, prefix="abc"
-        a[0..4].copy_from_slice(&3u32.to_le_bytes());
-        a[4] = b'a'; a[5] = b'b'; a[6] = b'c';
-        b[0..4].copy_from_slice(&3u32.to_le_bytes());
-        b[4] = b'a'; b[5] = b'b'; b[6] = b'd';
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), std::cmp::Ordering::Less);
-
-        // Equal strings
-        b[6] = b'c';
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), std::cmp::Ordering::Equal);
-
-        // Different length, same prefix
-        b[0..4].copy_from_slice(&4u32.to_le_bytes());
-        b[7] = b'z';
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), std::cmp::Ordering::Less);
-
-        // Long strings — equal except last byte (regression: off-by-4 in blob offset)
-        let data_a: Vec<u8> = b"hello_world_long_A".to_vec(); // len=18
-        let data_b_lt: Vec<u8> = b"hello_world_long_B".to_vec();
-        let (sa, blob_a) = make_long_string(&data_a);
-        let (sb_lt, blob_b_lt) = make_long_string(&data_b_lt);
-        assert_eq!(
-            compare_german_strings(&sa, &blob_a, &sb_lt, &blob_b_lt),
-            std::cmp::Ordering::Less,
-        );
-
-        // Long strings — equal (common same_group path)
-        let (sb_eq, blob_b_eq) = make_long_string(&data_a);
-        assert_eq!(
-            compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq),
-            std::cmp::Ordering::Equal,
-        );
-
-        // Long strings — prefix difference (early exit)
-        let data_b_prefix: Vec<u8> = b"aello_world_long_A".to_vec();
-        let (sb_prefix, blob_b_prefix) = make_long_string(&data_b_prefix);
-        assert_eq!(
-            compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a),
-            std::cmp::Ordering::Less,
-        );
-
-        // Mixed short (len=10) vs long (len=20) with same prefix
-        let short_data = b"0123456789"; // len=10, ≤ 12 → short
-        let mut s_short = [0u8; 16];
-        s_short[0..4].copy_from_slice(&10u32.to_le_bytes());
-        s_short[4..8].copy_from_slice(&short_data[0..4]);
-        s_short[8..14].copy_from_slice(&short_data[4..]);
-        let long_data: Vec<u8> = b"01234567890123456789".to_vec(); // len=20
-        let (s_long, blob_long) = make_long_string(&long_data);
-        // short ("0123456789") < long ("01234567890123456789") — same prefix, shorter len
-        assert_eq!(
-            compare_german_strings(&s_short, &[], &s_long, &blob_long),
-            std::cmp::Ordering::Less,
-        );
     }
 
     #[test]

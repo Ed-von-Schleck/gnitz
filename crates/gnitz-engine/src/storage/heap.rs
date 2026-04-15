@@ -196,3 +196,204 @@ impl MergeHeap {
         self.min_indices.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn less(a: &HeapNode, b: &HeapNode) -> bool { a.key < b.key }
+
+    fn eq_root(a: &HeapNode, root: &HeapNode) -> Ordering { a.key.cmp(&root.key) }
+
+    fn build(keys: &[Option<u128>]) -> MergeHeap {
+        MergeHeap::build(keys.len(), |i| keys[i], less)
+    }
+
+    /// After every mutation, verify that pos_map[entry] == the heap position
+    /// holding that entry, and heap[pos_map[entry]].idx == entry.
+    fn assert_pos_map_consistent(h: &MergeHeap, n: usize) {
+        for (hp, node) in h.heap.iter().enumerate() {
+            assert_eq!(h.pos_map[node.idx], hp as i32, "heap[{hp}].idx={} but pos_map[{}]={}", node.idx, node.idx, h.pos_map[node.idx]);
+        }
+        for i in 0..n {
+            let hp = h.pos_map[i];
+            if hp >= 0 {
+                assert_eq!(h.heap[hp as usize].idx, i, "pos_map[{i}]={hp} but heap[{hp}].idx={}", h.heap[hp as usize].idx);
+            }
+        }
+    }
+
+    // --- build ---
+
+    #[test]
+    fn build_empty() {
+        let h = build(&[]);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn build_single() {
+        let h = build(&[Some(42)]);
+        assert!(!h.is_empty());
+        assert_eq!(h.heap.len(), 1);
+        assert_eq!(h.heap[0].key, 42);
+        assert_eq!(h.min_idx(), 0);
+        assert_eq!(h.pos_map[0], 0);
+    }
+
+    #[test]
+    fn build_all_exhausted() {
+        let h = build(&[None, None, None]);
+        assert!(h.is_empty());
+        // All pos_map entries should be -1.
+        assert!(h.pos_map.iter().all(|&p| p == -1));
+    }
+
+    #[test]
+    fn build_some_exhausted() {
+        // Entries: 0→30, 1→None, 2→10.  Only 0 and 2 are valid.
+        let h = build(&[Some(30), None, Some(10)]);
+        assert_eq!(h.heap.len(), 2);
+        assert_eq!(h.heap[0].key, 10);  // min at root
+        assert_eq!(h.min_idx(), 2);     // entry 2 holds key=10
+        assert_eq!(h.pos_map[1], -1);   // exhausted entry
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    #[test]
+    fn build_min_at_root() {
+        // 5 entries in reverse order: keys 50,40,30,20,10
+        let h = build(&[Some(50), Some(40), Some(30), Some(20), Some(10)]);
+        assert_eq!(h.heap[0].key, 10);
+        assert_eq!(h.min_idx(), 4);
+        assert_pos_map_consistent(&h, 5);
+    }
+
+    // --- advance(Some) ---
+
+    #[test]
+    fn advance_some_sinks_below_sibling() {
+        // Heap built from keys 10, 20, 30; entry 0 at root (key=10).
+        // Advance entry 0 to key=25 — it should sink below 20 but stay above 30.
+        let mut h = build(&[Some(10), Some(20), Some(30)]);
+        assert_eq!(h.min_idx(), 0);
+
+        h.advance(0, Some(25), &less);
+
+        assert_eq!(h.heap[0].key, 20);
+        assert_eq!(h.min_idx(), 1);
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    #[test]
+    fn advance_some_to_max_sinks_to_leaf() {
+        let mut h = build(&[Some(1), Some(2), Some(3)]);
+        h.advance(0, Some(1000), &less);
+        assert_eq!(h.heap[0].key, 2);
+        assert_eq!(h.min_idx(), 1);
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    #[test]
+    fn advance_some_already_min_stays_root() {
+        // Advance root to a key still smaller than all others.
+        let mut h = build(&[Some(1), Some(5), Some(10)]);
+        h.advance(0, Some(3), &less);
+        assert_eq!(h.heap[0].key, 3);
+        assert_eq!(h.min_idx(), 0);
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    // --- advance(None) ---
+
+    #[test]
+    fn advance_none_removes_root() {
+        let mut h = build(&[Some(10), Some(20), Some(30)]);
+        h.advance(0, None, &less);
+
+        assert_eq!(h.heap.len(), 2);
+        assert_eq!(h.pos_map[0], -1);
+        assert_eq!(h.heap[0].key, 20);
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    #[test]
+    fn advance_none_removes_non_root() {
+        // Entry 2 (key=30) is a leaf; removing it should not disturb the root.
+        let mut h = build(&[Some(10), Some(20), Some(30)]);
+        h.advance(2, None, &less);
+
+        assert_eq!(h.heap.len(), 2);
+        assert_eq!(h.pos_map[2], -1);
+        assert_eq!(h.heap[0].key, 10);
+        assert_eq!(h.min_idx(), 0);
+        assert_pos_map_consistent(&h, 3);
+    }
+
+    #[test]
+    fn advance_none_single_entry() {
+        let mut h = build(&[Some(42)]);
+        h.advance(0, None, &less);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn advance_none_drains_all() {
+        // Drain a 4-entry heap one-by-one; heap invariant must hold at each step.
+        let mut h = build(&[Some(40), Some(10), Some(30), Some(20)]);
+        let mut n = 4;
+        let mut prev_min = 0u128;
+        while !h.is_empty() {
+            let min_key = h.heap[0].key;
+            assert!(min_key >= prev_min, "heap order violated: {min_key} < {prev_min}");
+            prev_min = min_key;
+            let entry = h.min_idx();
+            h.advance(entry, None, &less);
+            n -= 1;
+            assert_eq!(h.heap.len(), n);
+            // We can't call assert_pos_map_consistent with the original n=4 here
+            // because some entries' pos_map slots have been freed, so just check heap consistency.
+            for (hp, node) in h.heap.iter().enumerate() {
+                assert_eq!(h.pos_map[node.idx], hp as i32);
+            }
+        }
+    }
+
+    // --- collect_min_indices ---
+
+    #[test]
+    fn collect_min_indices_empty() {
+        let mut h = build(&[]);
+        assert_eq!(h.collect_min_indices(&eq_root), 0);
+        assert!(h.min_indices.is_empty());
+    }
+
+    #[test]
+    fn collect_min_indices_all_distinct() {
+        let mut h = build(&[Some(10), Some(20), Some(30)]);
+        assert_eq!(h.collect_min_indices(&eq_root), 1);
+        assert_eq!(h.min_indices, vec![0]); // only entry 0 (key=10)
+    }
+
+    #[test]
+    fn collect_min_indices_two_tied() {
+        // Entries 0 and 1 both have key=10; entry 2 has key=20.
+        let mut h = build(&[Some(10), Some(10), Some(20)]);
+        let n = h.collect_min_indices(&eq_root);
+        assert_eq!(n, 2);
+        let mut got = h.min_indices.clone();
+        got.sort();
+        assert_eq!(got, vec![0, 1]);
+    }
+
+    #[test]
+    fn collect_min_indices_all_equal() {
+        let mut h = build(&[Some(5), Some(5), Some(5), Some(5)]);
+        let n = h.collect_min_indices(&eq_root);
+        assert_eq!(n, 4);
+        let mut got = h.min_indices.clone();
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+}
