@@ -92,6 +92,19 @@ pub fn cstr_from_buf(buf: &[u8]) -> &str {
 
 pub use gnitz_wire::align8;
 
+/// Run `f` under `catch_unwind`. On panic, returns
+/// `Err("internal server error (panic in <op>)")`. Otherwise the closure's
+/// `Result` is returned unchanged. Used in async handlers and the committer
+/// task where a panic must not propagate (per async-invariants V.4 / V.7).
+pub fn guard_panic<T, F>(op: &'static str, f: F) -> Result<T, String>
+where F: FnOnce() -> Result<T, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err(format!("internal server error (panic in {})", op)),
+    }
+}
+
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
 /// Called once per process via `std::sync::Once`; safe to invoke from any test.
 pub fn raise_fd_limit_for_tests() {

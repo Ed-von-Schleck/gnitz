@@ -20,3 +20,4 @@ pub mod master;
 pub mod executor;
 pub mod bootstrap;
 pub mod reactor;
+pub mod committer;

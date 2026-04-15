@@ -1237,11 +1237,14 @@ impl SalWriter {
         seek_pk_lo: u64,
         seek_pk_hi: u64,
         seek_col_idx: u64,
-        request_id: u64,
+        req_ids: &[u64],
         unicast_worker: i32,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
+        assert_eq!(req_ids.len(), nw,
+            "write_group_direct: req_ids.len()={} != num_workers={}",
+            req_ids.len(), nw);
         let lsn = self.lsn;
         self.lsn += 1;
 
@@ -1271,7 +1274,7 @@ impl SalWriter {
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
                     slot, 0, target_id as u64, 0, flags as u64,
-                    seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
+                    seek_pk_lo, seek_pk_hi, seek_col_idx, req_ids[w],
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
                 );
                 debug_assert_eq!(written, wsz);

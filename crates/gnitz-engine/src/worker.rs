@@ -357,10 +357,10 @@ impl WorkerProcess {
         match result {
             DispatchResult::Continue => {
                 // Replay deferred ticks BEFORE deferred pushes so all tick
-                // ACKs land on W2M before any push ACKs. The master counts
-                // N tick ACKs per worker via poll_tick_progress, then reads
-                // push ACKs via collect_acks_continuing — this ordering is
-                // required for that to work correctly.
+                // ACKs land on W2M before any push ACKs. Stage-4 per-worker
+                // req_ids make the master's reply routing order-independent
+                // at the request level, but this replay ordering is still
+                // the simplest way to keep tick's ExchangeAccumulator in sync.
                 self.replay_deferred_ticks();
                 // Replay any FLAG_PUSH messages stashed during exchange.
                 // This runs AFTER all tick ACKs are sent.
@@ -710,8 +710,7 @@ impl WorkerProcess {
 
     /// Replay FLAG_TICK messages stashed during do_exchange_impl (batched tick).
     /// Called before replay_deferred_pushes so all tick ACKs reach the master
-    /// before any push ACKs — the master's collect_acks_continuing depends on
-    /// that ordering.
+    /// before any push ACKs — preserves tick's exchange-relay demux order.
     ///
     /// The while loop handles cascades: if processing deferred tick B causes
     /// B's own exchange wait to stash TICK[C], the next iteration catches it.

@@ -25,128 +25,37 @@ ordering wrong.
 | 0 — W2M request IDs | ✅ done | `8b5a186` |
 | 1 — Reactor primitive | ✅ done | `716075e` |
 | 2 — Async SELECT (pk_seek + cached index_seek + single-worker scan) | ✅ done | `6abb21c`, `308df12`, `2cca343` |
-| 3 — Async fdatasync via reactor | ⏳ pending | — |
-| 4 — Async group commit (committer task) | ⏳ pending | — |
-| 5 — Async pipelined checks + validation | ⏳ pending | — |
+| 3 — Async fdatasync via reactor | ✅ done | `6eeeb7a` |
+| 4 — Async committer + connection-loop + ring absorption (+ Stage 5 folded in) | ✅ done | pending commit |
+| 5 — Async pipelined checks + validation | ✅ folded into Stage 4 | pending commit |
 | 6 — Async tick pipeline | ⏳ pending | — |
 | 7 — Delete main-loop timeout math | ⏳ pending | — |
 
-See `### Lessons from Stages 0-2` below for constraints discovered on the
-way that Stage 3+ authors should internalize before planning their work.
+**See `### Lessons Learned` below** for constraints discovered on the way
+that Stage 6+ authors must internalize. Runtime invariants are documented
+separately in [`async-invariants.md`](../async-invariants.md) — read it
+before touching reactor / SAL / W2M code.
 
 ---
 
-## The Nine Manual-Async Mechanisms (current state)
+## Manual-Async Mechanisms — Status
 
-Each of these exists because some part of the master's work needs to overlap
-with some other part, or because the sync model's ordering invariants leak
-into other components. Each was implemented ad-hoc. Together they span ~900
-lines of bookkeeping.
+Summary of the nine mechanisms the refactor targets. Italic *historical*
+entries are for context; detail elided.
 
-### 1. `AsyncFsync` — a one-off io_uring mini-runtime
+| # | Mechanism | Status |
+|---|---|---|
+| 1 | `AsyncFsync` standalone io_uring | ✅ deleted (Stage 3) |
+| 2 | `pre_write_pushes` / `complete_pre_written` Phase A/B | ✅ deleted (Stage 4; overlap via committer task's `join!(fsync, acks)`) |
+| 3 | `TickState::{Idle, Active}` machine | ⏳ still present (Stage 6 deletes) |
+| 4 | `deferred_requests` queue | ✅ deleted (Stage 2) |
+| 5 | Main-loop timeout math | ⏳ still present (Stage 7 deletes) |
+| 6 | `PendingBatch` vs `deferred_requests` bifurcation | ✅ deleted (Stage 4 committer owns push batching) |
+| 7 | `collect_*` family for async paths | ✅ replaced by `reactor.await_reply` + `join_all` (Stage 4). Sync bootstrap still calls `collect_acks`. |
+| 8 | Cursor-position correlation | 🔄 partial: async paths route by req_id; Stage-4 sync tick still uses `async_w2m_rcs` cursor. Stage 6 finishes it. |
+| 9 | Worker-side stash-and-replay of deferred push/tick | ⏳ still present (Stage 6 deletes: req_id routing makes W2M arrival order irrelevant) |
 
-`ipc::AsyncFsync` opens its own io_uring instance solely to submit `fdatasync`
-non-blockingly. It has its own `submit()` / `wait_complete()` state and is
-threaded through `executor.rs` as a dedicated field. ~44 LoC of infrastructure
-to say "don't block on fsync."
-
-### 2. `pre_write_pushes` / `complete_pre_written` — manual Phase A/B overlap
-
-During tick evaluation (workers are CPU-busy), the master wants to write the
-next push group to SAL and submit its fdatasync *concurrently*. The current
-solution:
-
-- `pre_write_pushes`: encode group to SAL, submit async fsync, stash result in
-  `pre_written: Option<PreWritten>`
-- `complete_pre_written`: on tick completion, wait fsync, collect ACKs, reply
-  to clients
-
-~180 LoC implementing what is in essence `join!(tick_eval, pre_commit)`.
-
-### 3. `TickState::{Idle, Active}` machine
-
-Exists specifically to gate which overlap patterns are legal: pre-writes are
-only allowed during `Active`, deferred requests are processed when returning to
-`Idle`, etc. State transitions are threaded across `flush_pending_pushes`,
-`process_deferred_requests`, `start_all_async_ticks`, and the main loop
-(~100 LoC).
-
-### 4. `deferred_requests: Vec<DeferredRequest>` queue ✅ eliminated (Stage 2)
-
-SELECT / seek / scan requests that arrive while DML is pending must wait until
-DML commits (to see committed state). Rather than blocking the dispatch of
-new client messages, the current code queues them and processes after pending
-drains. This is a manual "await on prior commits" point (~80 LoC).
-
-*Replaced by reactor tasks awaiting `tick_idle_barrier`; `deferred_requests` /
-`process_deferred_requests` deleted in `6abb21c`. The matching "truly async"
-fan-outs for cached paths (pk_seek, cached index_seek, single-worker scan)
-land in `2cca343`. Cache-miss seek_by_index and multi-worker scan still
-fall back to the sync path — see Stage 5 for the broadcast routing that
-removes the fallback.*
-
-### 5. Main-loop timeout math
-
-```rust
-let timeout_ms = if tick_active { 1 }
-                 else { min(500, tick_deadline_remaining, flush_deadline_remaining) };
-```
-
-Exists because worker eventfds, tick deadlines, and flush deadlines are *not*
-registered with io_uring, so the main loop must periodically wake up to check
-them. ~30 LoC, plus the conceptual burden of "don't sleep longer than the
-nearest non-io_uring event."
-
-### 6. `PendingBatch` vs `deferred_requests` bifurcation
-
-Two parallel queuing systems with different semantics:
-
-- `PendingBatch` (INSERTs): grouped by target_id, drain-all semantics, feeds
-  group commit
-- `deferred_requests` (reads + some DDL): flat vec, processed after pending
-  drains
-
-Two drain paths, two `is_empty` checks, two lifecycle rules. ~200 LoC combined.
-
-### 7. The `collect_*` family
-
-`collect_one`, `collect_acks`, `collect_acks_at`, `wait_all_workers`, plus
-`execute_pipeline`'s inner drain loop — each hand-rolls "wait for N responses,
-handle errors, reset cursors." ~200 LoC total. All are variants of
-`try_join_all(worker_replies)` with different error-handling shapes.
-
-### 8. Cursor-position correlation + cursor management 🔄 partially eliminated
-
-The W2M wire protocol carries no request ID. Correlation is by *position in
-the W2M ring*: the k-th message at worker W corresponds to SAL message K in
-submission order. This is a clever sync-era optimization, but it spreads
-correlation concerns across every `collect_*` call site: cursor state must be
-threaded, reset points are rule-governed, and any reordering breaks
-correctness silently.
-
-*Request IDs in the wire format (Stage 0) + reactor-owned drain (Stage 2)
-give req_id-based routing for async paths. Sync paths still use
-cursor-position correlation through their own `async_w2m_rcs` cursor vec;
-`collect_*` is still present. Full elimination happens after Stage 5.*
-
-### 9. Worker-side response stashing and replay (`worker.rs`)
-
-Because cursor correlation (§8) forces a strict ordering on the W2M ring —
-*all* tick ACKs must precede *all* push ACKs in a batched tick — the worker
-cannot simply ACK a `FLAG_PUSH` it encounters mid-exchange. It must *stash*
-the push and replay it after the current tick's ACK. Same for `FLAG_TICK`
-messages encountered during exchange in a multi-table batched tick. Present
-in `worker.rs` as:
-
-- `DeferredPush` struct and `deferred_pushes: Vec<DeferredPush>` field
-- `deferred_ticks: Vec<i64>` field
-- Stash logic inside `do_exchange_impl` (~18 LoC)
-- `replay_deferred_pushes()` / `replay_deferred_ticks()` functions
-
-~80 LoC total, existing *purely* because the master needs a specific arrival
-order on the W2M ring. With request IDs (D3), the master routes replies by
-ID — W2M arrival order becomes irrelevant, workers ACK immediately in the
-order they receive messages, stashing vanishes.
+Remaining work is §3, §5, §8 (tick portion), §9 — all inside Stage 6 + Stage 7.
 
 ---
 
@@ -478,92 +387,121 @@ easy; diminishing returns relative to the simplicity gain.
 favor of a dedicated `committer` task and a dedicated `reader` task (or: reads
 just dispatch directly without queuing, since they can now suspend).
 
-### Lessons from Stages 0-2
+### Lessons Learned
 
-Constraints discovered during Stages 0-2. Each lesson is actionable for
-Stage 3+ authors; the reactor does NOT currently enforce any of these in
-code, so overlooking them will silently break later stages.
+Constraints discovered building Stages 0–4. Each lesson is actionable for
+Stage 6+ authors; the reactor does NOT enforce any of these in code, so
+overlooking them silently breaks. Runtime invariants live in
+[`async-invariants.md`](../async-invariants.md); lessons here are about
+*process* and *design choices*.
 
-**L1. Raw-pointer-through-public-API is the signature of choice for async
-dispatcher methods.** The three `fan_out_*_async` fns take `*mut MasterDispatcher`,
-not `&mut self`: the exclusive borrow must end at the `.await` point so
-other reactor tasks can re-enter the dispatcher to deliver their own
-replies. This is D1-NM applied to a concrete API. Stage 3+ async fns on
-the dispatcher must follow the same pattern. See `master.rs:single_worker_async`.
+**L1. Raw-pointer-through-public-API for async dispatcher methods.** Async
+dispatcher fns take `*mut MasterDispatcher`, not `&mut self` / `&self`: the
+exclusive borrow must end at the `.await` point so other reactor tasks can
+re-enter the dispatcher. D1-NM applied to a concrete API — see
+`master.rs:fan_out_*_async`. Stage 6 tick task must follow the same shape.
 
-**L2. W2M cursor desync: reactor and sync paths share the ring.** Sync
-paths (push validation, tick collection, checkpoint) still drain W2M
-through the dispatcher's `async_w2m_rcs` + `reset_one` / `reset_all`. The
-reactor owns its own `w2m_cursors`. They are supposed to be used in
-disjoint time windows — but Stage 2's sync fallback (runs INSIDE a
-reactor task via `resolve_async`) violates that. Symptoms: reactor's
-cursor sits past the new `write_cursor` after a sync `reset_one`, future
-drains miss every message. **Mitigation:** defensive snap in
-`drain_w2m_for_worker` — if `cursor > write_cursor`, reset cursor to
-`W2M_HEADER_SIZE`. Stage 5+ must either (a) keep the defensive snap, or
-(b) make the reactor the sole W2M owner (requires full async migration of
-validate / tick / checkpoint). Do not remove the snap until option (b)
-lands.
+**L2. `in_flight` must only count tracked replies.** `route_reply` decrements
+`in_flight[w]` ONLY when a waker was found. Unrouted replies (req_id == 0
+from tick/DDL broadcasts) are logged and dropped without touching the
+counter. Decrementing on unrouted would allow a stray reply from the sync
+tick path to trigger a premature `reset_one` while a legitimate async reply
+is still in flight. The `route_reply_*` tests in `reactor.rs` pin this.
 
-**L3. `in_flight` must only count tracked replies.** `route_reply`
-decrements `in_flight[w]` ONLY when a waker was found. Unrouted replies
-are logged (`unrouted W2M reply req_id=…`) and dropped without touching
-the counter. If you ever decrement on unrouted, a stray reply from the
-sync path triggers a premature `reset_one` while a legitimate async reply
-is still in flight — the ring gets wiped, the awaiter waits forever. The
-three `route_reply_*` tests in `reactor.rs` pin this invariant.
+**L3. Bookkeeping must be unit-testable separately from the I/O shell.**
+The Stage 2 `in_flight` bug hid behind happy-path `inject_parked_reply`
+tests that skipped the bookkeeping. Split the bookkeeping layer (pure
+`route_reply(w, decoded) -> should_reset`) from the I/O shell so it can be
+exercised without a real `W2mReceiver`. The test `all_in_flight_zero_*` set
+added in Stage 4 is the same pattern — invariant tests for reactor state
+that don't need real io_uring.
 
-**L4. Bookkeeping must be unit-testable separately from the I/O shell.**
-Stage 2's initial implementation had the `in_flight` bug because the only
-tests available were happy-path `inject_parked_reply`, which skips the
-bookkeeping. Splitting `drain_w2m_for_worker` → pure `route_reply(w, decoded)
--> should_reset` + I/O shell makes bookkeeping testable without a real
-`W2mReceiver`. Stage 3+ should apply the same split to any new
-drain/route machinery.
+**L4. Sentinel strings in `Err(String)` are a footgun.** A pre-Stage-2 draft
+used `"__async_scan_fallback__"` smuggled through `Err(String)` to signal
+"fall back to sync." A worker error containing those bytes would silently
+trigger a fallback. Use real enums. Stage 2 shipped
+`enum FanOutError { Worker(String), NeedsSyncFallback }`. Stage 4 deleted
+the fallback path entirely — `fan_out_*_async` just works now.
 
-**L5. Sentinel strings in `Err(String)` are a footgun.** An early Stage 2
-draft used `"__async_scan_fallback__"` smuggled through `Err(String)` to
-signal "fall back to sync." A worker error containing those characters
-would silently trigger a fallback. Replace with a real enum. Stage 2's
-current shape: `enum FanOutError { Worker(String), NeedsSyncFallback }`.
-For future async ops that need any "first-class non-error success
-branch" (e.g. "need a tick before retrying", "batch full"), model it as
-an enum variant, not an error string.
+**L5. Broadcast reply routing = per-worker req_ids.** Stages 4–5 resolved L6
+(formerly open): `SalWriter::write_group_with_req_ids(&[u64])` accepts N
+distinct req_ids (one per worker) at write time. Master allocates N,
+passes them through `encode_wire_into`'s per-slot path, and awaits N
+`ReplyFuture`s via `join_all`. No broadcast-set slab needed. Stage 6 tick
+uses the same pattern for FLAG_TICK ACKs — see IV.6 in async-invariants.
 
-**L6. Broadcast reply routing is the missing primitive blocking full
-async migration.** Stage 2 ships truly-async only for single-worker
-messages. Multi-worker broadcasts (cache-miss index_seek, multi-worker
-scan, ticks, group-commit ACKs) still use sync `wait_all_workers`.
-The plan's wire protocol reserves `u64::MAX` for broadcasts and
-mentions `pending_broadcasts: Slab<BroadcastState>`, but that machinery
-is not built yet.
+**L6. Shared-ring resets require every reader drained.** Stage 4's central
+bug: `W2M write_cursor` reset is safe only when *every* master-side reader
+has consumed its outstanding responses. The Stage 4 hybrid has two readers
+(reactor for req_id != 0, sync tick for req_id == 0); either reader
+independently thinking "I'm done" and resetting strands the other's data
+at an unreachable offset. The current gate (`tick_loop` waits for
+`reactor.all_in_flight_zero()` before `reset_w2m_cursors`) is the
+mitigation. **Stage 6 eliminates this by unifying all W2M reads through
+the reactor's req_id routing — single reader, no coordination needed,
+`all_in_flight_zero` / `reset_w2m_cursors` deleted.** See III.1 in
+async-invariants.
 
-Two paths to build it, in order of complexity:
-- **Per-worker req_ids at write time.** Extend `SalWriter::write_group_direct`
-  to accept `&[u64]` of per-worker req_ids instead of one. Each worker
-  echoes its own slot's req_id; master allocates N distinct req_ids for
-  one broadcast and parks N `ReplyFuture`s. Cleanest for Stage 5's
-  `execute_pipeline` which already issues distinct checks.
-- **Broadcast-set slab.** One req_id, multiple awaited replies. The
-  reactor tracks a "broadcast set" keyed by req_id; `drain_w2m_for_worker`
-  increments a counter; the future resolves when all workers answer.
-  Simpler wire format (1 req_id), more reactor state.
+**L7. Don't mix sync and async W2M paths within the same reactor window.**
+Whenever tick is sync and other paths are async, the shared ring becomes a
+coordination surface (L6). Stage 4 minimized the mix; Stage 6 finishes it.
+Until then, the "defensive snap" in `drain_w2m_for_worker` (if
+`cursor > write_cursor`, reset cursor to `W2M_HEADER_SIZE`) must remain.
 
-Stage 4 (committer) and Stage 6 (async tick) are broadcast-heavy and
-will force the decision. Land the choice in whichever of those arrives
-first.
+**L8. OP_SEND on stream sockets may return partial counts.** `IORING_OP_SEND`
+on AF_UNIX / TCP can return rc < len — the kernel accepts what fits in the
+208 KB socket buffer and stops. Scan responses for large tables (600 KB+
+in Stage 4's test) require `send_buffer` to loop on the remaining slice.
+Single-shot send silently truncates. See II.5 in async-invariants.
 
-**L7. Don't interleave sync and async W2M paths within the same tick
-window.** The `resolve_async` → sync-fallback pattern in Stage 2's
-`spawn_deferred_select` only works because the defensive cursor snap
-(L2) + the "unrouted no-decrement" rule (L3) defuse the resulting race.
-Stage 3+ should strongly prefer a design where a given tick window is
-*either* reactor-driven *or* sync-driven for all its W2M traffic, not a
-mix. If broadcast routing (L6) is in place, the mix disappears
-naturally.
+**L9. Socket-buffer flow control requires user-space buffering.** AF_UNIX
+default rmem = wmem = 208 KB. A server with only one outstanding RECV SQE
+per fd deadlocks under client pipelining (~320 messages of ~650 B each):
+kernel buffer fills, client's `send` blocks, client can't read responses.
+Current: `pending_recv: HashMap<fd, VecDeque<(ptr, len)>>`. A Stage-6
+rewrite that "simplifies" this to a single slot per fd will deadlock
+`test_pipeline_large`. See II.4 in async-invariants.
 
-**Rationale:** PendingBatch and deferred_requests are manual queues for
-"things to do later." A task that's `.await`-ing on an event *is* a deferred
+**L10. Checkpoint exclusivity.** The committer is the *sole* SAL
+checkpoint driver. Async paths (`fan_out_*_async`, validate, DDL, tick)
+must NOT call `maybe_checkpoint`. Concurrent FLAG_FLUSH races the
+committer's own and strands SAL writes across `sal.checkpoint_reset`. The
+doc comment on `maybe_checkpoint` enforces this. See III.3 in
+async-invariants.
+
+**L11. Committer liveness.** A panicking committer deadlocks the entire
+server: `committer_tx` backs up forever, INSERT handlers block on
+`done.rx.await`, catalog read guards are held → DDL stalls. Every sync
+call inside the committer that could panic on malformed-but-decoded input
+must be `catch_unwind`-wrapped. Current wrap: `build_merged +
+write_commit_group`. Unwrapped latents: `checkpoint_post_ack`,
+`unique_filter_ingest_batch`. See V.7 in async-invariants.
+
+**L12. Panic isolation across all async handlers.** `reactor.poll_task`
+wraps task futures in `catch_unwind` — a task panic kills the task, not
+the reactor. Sync calls from async handlers (catalog seeks, DAG evaluate,
+unique-filter validate, broadcast_ddl) that can panic on well-formed
+wire but malformed semantics must be wrapped inside the handler — send
+STATUS_ERROR, return. See V.4 in async-invariants.
+
+**L13. Per-fd state must clear on fd reuse.** Kernel reuses fd numbers.
+`register_conn(fd)` must clear `recv_closed[fd]` and `pending_recv[fd]`
+from the previous incarnation. Stage 4 bug: `recv_closed[fd] = true`
+persisted, new connection saw immediate EOF. See III.4 in async-invariants.
+
+**L14. SendFuture buffer lifetime under cancellation.** Memory referenced
+by an in-flight SEND SQE must outlive the CQE. If the outer future is
+cancelled mid-send, ownership must transfer to the reactor. Stage 4:
+`SendFuture::Drop` parks the buffer Rc in `send_buffers_in_flight`; the
+`KIND_SEND` handler removes it. Applies to any future holding kernel-
+visible memory. See II.2 in async-invariants.
+
+**L15. eventfd counter is NOT consumed by POLL_ADD.** Re-arming POLL_ADD
+without `read()`ing the eventfd spins the reactor in a tight loop.
+Symptom: one CPU at 100 %, no progress. See II.1 in async-invariants.
+
+**Rationale:** `PendingBatch` and `deferred_requests` were manual queues
+for "things to do later." A task `.await`-ing an event *is* a deferred
 computation — no queue needed, the scheduler holds the continuation.
 
 ---
@@ -596,95 +534,51 @@ Master side maintains:
 
 ---
 
-## Files Affected
+## Files Affected by Stage 6
 
-Inventoried against current tree. LoC counts are `wc -l` at HEAD; "mentions"
-is grep for the key concepts (`AsyncFsync|TickState|PendingBatch|deferred_requests|pre_writ|collect_one|collect_acks|wait_all_workers|fan_out_*|execute_pipeline|validate_all_distributed|wait_one|eventfd_wait`).
+Stages 0–4 have landed — see git log for the diffs. What remains for
+Stage 6:
 
-### Primary — rewritten substantially
+**`crates/gnitz-engine/src/executor.rs`** (~820 LoC today)
+- Delete: `tick_loop` (the sync-polling version), `tick_rows`, `tick_tids`,
+  `t_last_push`, `force_tick`, `tick_generation` on `Shared`; `bump_tick_rows`
+  helper; the scan-side drain loop in `handle_scan`.
+- Add: a tick task on `Shared` (`mpsc::Receiver<TickTrigger>`); new
+  `TickTrigger` type carrying tids + oneshot completion.
 
-**`crates/gnitz-engine/src/executor.rs`** — 1609 LoC, 67 concept mentions
-- Structs deleted: `PendingBatch`, `PreWritten`, `TickState`, `DeferredRequest`, `PendingDdlResponse`, `GroupInfo` (moves inside committer task).
-- `ServerExecutor` fields deleted: `deferred_requests`, `pending_ddl_responses`, `tick_state`, `tick_queue_tids`, `t_first_pending`, `pre_written`, `async_fsync`.
-- Functions deleted: `flush_pending_pushes`, `pre_write_pushes`, `complete_pre_written`, `process_deferred_requests`, `should_fire_ticks` (the main loop parts of it — policy moves into tick task), all the tick-state transitions.
-- `run_loop` rewritten as a reactor-driven main loop (~60 LoC).
-- `dispatch_message` becomes a task spawner.
-- **Delta: ~-300 LoC. Post-refactor ~1300 LoC.**
+**`crates/gnitz-engine/src/master.rs`** (~1700 LoC today)
+- Delete: `async_w2m_rcs`, `async_active`, `async_remaining`,
+  `async_acks_remaining`; `start_ticks_async_batch`, `poll_tick_progress`,
+  `begin_async_collection`, `finish_async_tick`, `reset_w2m_cursors`.
+- Add: `fn write_tick_group(&mut self, tid, req_ids: &[u64])` — mirror of
+  `write_commit_group`, but writes FLAG_TICK. `acc: ExchangeAccumulator`
+  moves into the tick task.
 
-**`crates/gnitz-engine/src/master.rs`** — 1916 LoC, 41 concept mentions
-- `MasterDispatcher` gains a reactor handle; `schema_names_cache` stays.
-- All `fan_out_*` functions become `async fn` (6 functions).
-- `execute_pipeline` and `validate_all_distributed` become `async fn`.
-- `collect_one`, `collect_acks`, `collect_acks_at`, `wait_all_workers` deleted entirely.
-- `signal_one`, `signal_all`, `write_group`, `write_broadcast`, `send_to_workers` retained; internal only.
-- Phase 1 / Phase 2 plan-and-interpret helpers stay synchronous (they're pure logic on already-fetched data).
-- **Delta: ~-200 LoC. Post-refactor ~1700 LoC.**
+**`crates/gnitz-engine/src/reactor.rs`** (~2550 LoC today, grew to absorb
+transport in Stage 4)
+- Delete: `TickIdleBarrier`, `reset_w2m_cursors`, `all_in_flight_zero`,
+  the defensive cursor-snap in `drain_w2m_for_worker` (once no sync path
+  resets), `pending_recv` rewind-on-reset special casing.
+- Surface stays otherwise identical.
 
-**`crates/gnitz-engine/src/ipc.rs`** — 2552 LoC, 18 concept mentions
-- W2M control block gains `request_id: u64` field (encode + decode).
-- `W2mReceiver`: `try_read`, `write_cursor`, region access primitives retained. `wait_one`, `poll` deleted — reactor owns the waiting.
-- `AsyncFsync` struct and its ~44 LoC of standalone io_uring plumbing deleted.
-- `SalWriter` unchanged except passing req_id through control-block encoding.
-- `decode_wire` / `decode_wire_with_schema` / `encode_wire_into`: extended to read/write the req_id; no structural change.
-- **Delta: ~-30 LoC. Post-refactor ~2520 LoC.**
+**`crates/gnitz-engine/src/ipc.rs`** (~2550 LoC today)
+- Delete: `W2mReceiver::reset_all`, `reset_one` (nothing resets the ring
+  once tick is reactor-routed).
 
-**`crates/gnitz-engine/src/ipc_sys.rs`** — 260 LoC, 10 concept mentions
-- `eventfd_wait` and `eventfd_wait_any` deleted; reactor uses io_uring `POLL_ADD` on eventfds instead.
-- `eventfd_create`, `eventfd_signal` retained (workers still need to signal via syscall; master-side wait moves to io_uring).
-- **Delta: ~-60 LoC. Post-refactor ~200 LoC.**
+**`crates/gnitz-engine/src/worker.rs`** (~1070 LoC today)
+- Delete: `DeferredPush` struct, `deferred_pushes` / `deferred_ticks` fields
+  on `WorkerExchangeHandler`, stash branches inside `do_exchange_impl`
+  (~18 LoC), `replay_deferred_pushes` / `replay_deferred_ticks` functions.
+  With req_id routing workers ACK in arrival order — no stashing.
 
-### Primary — new files
-
-**`crates/gnitz-engine/src/reactor.rs`** — new, ~500 LoC
-- Single-threaded reactor + task slab + waker registry + req-ID table.
-- Timer futures, CQE dispatch loop.
-- Public API: `spawn`, `block_on`, `await_reply(req_id)`, `await_fsync(id)`, `timer(deadline)`.
-- Unit-tested in isolation before any caller depends on it.
-
-### Secondary — worker.rs gains a real simplification
-
-**`crates/gnitz-engine/src/worker.rs`** — 1070 LoC
-- `send_response` / `send_ack`: echo the inbound request_id on the reply.
-- `dispatch`: decode req_id from inbound SAL message and thread it.
-- **Bonus structural simplification from D3:** the `DeferredPush` struct,
-  the `deferred_pushes` / `deferred_ticks` fields on `WorkerExchangeHandler`,
-  the push/tick stashing branches inside `do_exchange_impl` (~18 LoC), and
-  the `replay_deferred_pushes` / `replay_deferred_ticks` functions can all
-  be deleted. They exist purely because cursor-position correlation
-  requires a specific W2M arrival ordering. With request IDs the master
-  routes replies by ID, so workers ACK messages in arrival order without
-  stashing. (See §9 of the mechanism catalog.)
-- **Delta: ~-60 LoC.** Promoted from "minor" to real simplification.
-
-**`crates/gnitz-engine/src/bootstrap.rs`** — 485 LoC, 1 mention
-- Line 456 `dispatcher.collect_acks()` becomes part of an async fn at startup, called via `reactor.block_on`. **Delta: ~+5 LoC.**
-
-**`crates/gnitz-engine/src/main.rs`** — 81 LoC
-- Wrap the server entrypoint in `Reactor::new().block_on(run_server())`. **Delta: ~+10 LoC.**
-
-**`crates/gnitz-engine/src/lib.rs`** — 21 LoC
-- `pub mod reactor;`. **Delta: +1 LoC.**
-
-### Tests
-
-- In-module tests in `executor.rs` / `master.rs` that exercise `PendingBatch` or `collect_*` internals become obsolete — deletes alongside the code they test.
-- Integration tests in `crates/gnitz-core/tests/` go through the gnitz-core client and **should pass unchanged**. They are the primary regression surface.
-- Bench suite (`benchmarks/`) unchanged; serves as the performance-parity gate.
-
-### Total footprint
-
-| | before | after | Δ |
-|---|---|---|---|
-| executor.rs | 1609 | ~1300 | -300 |
-| master.rs | 1916 | ~1700 | -200 |
-| ipc.rs | 2552 | ~2520 | -30 |
-| ipc_sys.rs | 260 | ~200 | -60 |
-| worker.rs | 1070 | ~1010 | -60 |
-| reactor.rs (new) | 0 | ~500 | +500 |
-| bootstrap / main / lib | 587 | ~605 | +18 |
-| **gnitz-engine total** | ~7994 | ~7835 | **~-160** |
-
-Roughly 8000 LoC reviewed/modified out of ~56000 LoC in the repo (~14%). The LoC delta is small; the conceptual-complexity delta (nine mechanisms → one) is the point.
+**Tests to add:**
+- `reactor::tests::tick_task_*` — tick task honors per-tid req_ids,
+  broadcasts once, collects N ACKs per tid.
+- `reactor::tests::exchange_accumulator_*` — exchange relay dispatch via
+  req_id routing instead of cursor position.
+- Integration test for concurrent scan + writer (extract from
+  `tmp/test_concurrent_correctness.py` into `crates/gnitz-py/tests/
+  test_concurrent.py`).
 
 ---
 
@@ -738,247 +632,259 @@ reverted without undoing earlier ones.
 
 ### Stage 0: W2M request IDs ✅ done (`8b5a186`)
 
-Wire + plumbing added. Workers echo the req_id; master threads a default
-of `0` through every `write_group` / `write_broadcast` / `send_to_workers`.
-No behavior change at the time of landing.
+Wire protocol grew a `u64 request_id`; workers echo it. Default `0` for
+unroutable replies. No behavior change at landing.
 
 ### Stage 1: Reactor primitive ✅ done (`716075e`)
 
-`crates/gnitz-engine/src/reactor.rs` with `spawn` / `block_on` / `tick` /
-`await_reply` / `timer` / `TickIdleBarrier`. Single-threaded, owns its
-own `IoUringRing`. Unit-tested in isolation.
+`reactor.rs` — single-threaded, owns its own `IoUringRing`. Public surface:
+`spawn`, `block_on`, `block_until_idle`, `await_reply`, `timer`,
+`TickIdleBarrier`. Unit-tested in isolation.
 
-### Stage 2: Async SELECT (pk_seek + cached index_seek + single-worker scan) ✅ done
+### Stage 2: Async SELECT ✅ done (`6abb21c`, `308df12`, `2cca343`)
 
-Landed across `6abb21c` (executor skeleton + `deferred_requests` removal),
-`308df12` (cleanups), and `2cca343` (truly async fan-outs + W2M reactor
-ownership + bookkeeping fix).
+pk_seek, cached index_seek, single-worker scan are truly async: reactor
+owns W2M drain via `POLL_ADD` on eventfds, routes by req_id, wakes
+`ReplyFuture`. Cache-miss index_seek and multi-worker scan kept a
+`NeedsSyncFallback` path — removed in Stage 4.
 
-**What works:** Deferred SELECTs are spawned as reactor tasks that await
-`tick_idle_barrier`. After `notify_all()`, the executor calls
-`reactor.block_until_idle()`; the reactor owns W2M drain via `POLL_ADD`
-on per-worker eventfds, parks replies by `request_id`, wakes `ReplyFuture`.
-Truly async: pk_seek; cached index_seek; single-worker scan.
+### Stage 3: Async fdatasync via reactor ✅ done (`6eeeb7a`)
 
-**What's still sync (scope-cut, see Stage 5):** cache-miss index_seek and
-multi-worker scan — the async fan-outs return `FanOutError::NeedsSyncFallback`,
-the executor's `resolve_async` helper falls back to the sync `fan_out_*`.
-Need per-worker req_id slots in `write_group_direct` + a "broadcast reply
-set" slab in the reactor to remove the fallback.
+`ipc::AsyncFsync` deleted. Fsync submit is a reactor SQE + `await_fsync`.
 
-**Non-obvious choices** — read `### Lessons from Stages 0-2` below before
-touching Stage 3+.
+### Stage 4: Async committer + connection loop + ring absorption ✅ done
 
-### Stage 3: Async fdatasync via reactor
+Folded in Stage 5 (validate + pipelined checks). Landed as one atomic
+commit. Summary of what changed:
 
-- Delete `ipc::AsyncFsync` entirely
-- fsync-submit becomes a regular io_uring SQE with a reactor req_id
-- `committer` task `.await`s the fsync CQE
+- **`committer` task** (new: `crates/gnitz-engine/src/committer.rs`): owns
+  push batching, per-worker push-ACK collection, checkpoint, fsync.
+  Debounce via drain-only `try_recv` (no timer). `CommitRequest::Push`
+  and `CommitRequest::Barrier` (DDL drain).
+- **Per-connection tasks:** one `connection_loop(fd)` per client. Per-
+  session FIFO by construction (I2). No more `deferred_requests`.
+- **Reactor absorbs transport:** accept / recv / send SQEs live in the
+  reactor. `Transport` struct and the `gnitz-transport::transport`,
+  `conn`, `recv`, `send` modules deleted.
+- **Per-worker req_ids for broadcasts** (L5): `write_group_with_req_ids`
+  accepts `&[u64]`. Commit, validate, pipelined checks, cache-miss
+  index_seek, multi-worker scan all use it. `FanOutError::NeedsSyncFallback`
+  removed — `fan_out_*_async` always succeeds.
+- **DDL:** `catalog_rwlock` (writer-preference), `CommitRequest::Barrier`
+  drain, catalog mutation, signal DDL.
+- **I8 per-table lock:** `AsyncMutex` per constrained table held across
+  validate→commit→ack.
+- **Hand-rolled primitives:** `oneshot`, `mpsc`, `AsyncMutex`,
+  `AsyncRwLock`, `join_all`, `join2` in `reactor.rs`.
+- **`send_buffer` handles partial OP_SEND** (L8): loops on `rc < len`.
+- **Multi-message RECV buffering** (L9): per-fd `VecDeque<(ptr, len)>`.
 
-**Invariant preserved:** Client ack still follows successful fdatasync. The
-await point encodes this.
+**Not deleted (Stage 6's targets):** `TickIdleBarrier`, `tick_generation`,
+`tick_rows` / `tick_tids` / `force_tick`, `start_ticks_async_batch` +
+`poll_tick_progress` + `async_w2m_rcs`, `reset_w2m_cursors` on both
+dispatcher and reactor, `all_in_flight_zero` gate, `fan_out_backfill` sync
+path (bootstrap only), `collect_acks` (bootstrap), worker-side
+`DeferredPush` + `replay_deferred_*`.
 
-**LoC:** -80 (AsyncFsync), +10 (reactor call). Net -70.
+### Stage 5: Async pipelined checks + validation ✅ folded into Stage 4
 
-### Stage 4: Async group commit (committer task)
+`execute_pipeline_async` + `validate_all_distributed_async` landed with
+Stage 4. Every per-worker path uses req_id routing through the reactor.
 
-- New long-running task: `committer(rx: Receiver<CommitReq>) -> !`
-- Debounce: `select!(rx.recv(), sleep(FLUSH_DEADLINE))` — rediscovers the
-  same policy expressed explicitly
-- Each client INSERT flow sends a CommitReq and awaits completion
-- `PendingBatch` struct deleted
-- `pre_write_pushes` / `complete_pre_written` / `pre_written` field deleted
-  (overlap is expressed as `join!` in the tick task)
+### Stage 6: Async tick pipeline ⏳ pending
 
-**Invariants preserved:**
-- Group commit amortizes fsync over concurrent inserts (committer drains
-  up to N or until deadline).
-- **I8 (constraint checks see committed state):** per-table async mutex
-  held by the INSERT task across `validate_all_distributed.await` and the
-  oneshot reply from the committer. Only one validate→commit at a time per
-  constrained table — matches today's `flush_pending_for_tid` pre-flush.
-  Unconstrained tables skip the lock.
+**Goal:** tick becomes an async task. Eliminates the Stage-4 hybrid where
+one master-side reader (reactor) used req_id routing while a second
+(sync tick's `poll_tick_progress`) used cursor-position correlation on
+the same W2M ring. This is L6's root cause.
 
-**Subtle case:** DDL that bumps catalog state must drain the committer first
-(a "barrier"). Express as:
-```rust
-enum CommitRequest {
-    Push { /* ... */, done: oneshot::Sender<Result<()>> },
-    Barrier(oneshot::Sender<()>),       // signals when all prior pushes have committed
-}
+**What gets deleted:**
 
-async fn ddl_barrier(&self) {
-    let (tx, rx) = oneshot::channel();
-    self.committer_tx.send(CommitRequest::Barrier(tx)).await;
-    rx.await.unwrap();   // fires after the in-progress group's fsync completes
-}
-```
-The committer processes `Barrier` by finishing any in-flight group's fsync
-and then signalling the oneshot. No subsequent push is started until the
-barrier's sender drops, so the DDL can then safely mutate catalog state.
+- `TickState::Active`, `tick_barrier` (TickIdleBarrier), `tick_generation`
+  (and scan-side polling), `force_tick`, `tick_rows`, `tick_tids`,
+  `t_last_push` on `Shared`.
+- `start_ticks_async_batch`, `poll_tick_progress`, `begin_async_collection`,
+  `finish_async_tick` in `master.rs`.
+- `async_w2m_rcs: Vec<u64>` on the dispatcher.
+- `reset_w2m_cursors` on both dispatcher and reactor; `all_in_flight_zero`.
+- `W2mReceiver::reset_all` / `reset_one` (nothing resets the ring
+  anymore — all readers use reactor routing, growth is bounded by 1 GB
+  region size, checkpoint resets SAL not W2M).
+- Worker-side `DeferredPush`, `deferred_pushes`, `deferred_ticks`, stash
+  branches in `do_exchange_impl`, `replay_deferred_*` functions (§9 of
+  the mechanism catalog).
 
-**LoC:** -400 (PendingBatch + pre_write complex), +200 (committer + Barrier).
-Net -200.
+**What gets added:**
 
-### Stage 5: Async pipelined checks + validation
+- **Tick task**: one long-running async task, roughly:
+  ```rust
+  async fn tick_loop(shared: Rc<Shared>) {
+      let (tx, rx) = mpsc::unbounded::<TickTrigger>();
+      shared.tick_tx = tx;   // handlers send here instead of force_tick
+      loop {
+          let trigger = rx.recv().await;       // event-driven (fixes VI.6)
+          let tids = collect_pending_tids(&shared);
+          if tids.is_empty() {
+              trigger.notify.notify();         // wake any awaiters
+              continue;
+          }
+          run_tick(&shared, &tids).await;
+          trigger.notify.notify();
+      }
+  }
 
-- `execute_pipeline` becomes async: submits all check SAL writes, signals
-  once, awaits `try_join_all(req_ids)` for the replies
-- `validate_all_distributed` becomes async: Phase 1 `.await`, Phase 2 `.await`
-- `collect_one`, `collect_acks`, `collect_acks_at`, `wait_all_workers` deleted
+  async fn run_tick(shared: &Rc<Shared>, live_tids: &[i64]) {
+      let nw = shared.num_workers;
+      // Allocate per-worker req_ids per tid.
+      let req_ids: Vec<Vec<u64>> = live_tids.iter()
+          .map(|_| (0..nw).map(|_| reactor.alloc_request_id()).collect())
+          .collect();
+      unsafe {
+          let disp = &mut *shared.dispatcher.0;
+          for (i, &tid) in live_tids.iter().enumerate() {
+              disp.write_tick_group(tid, &req_ids[i])?;  // per-worker slots
+          }
+          disp.signal_all();
+          for rids in &req_ids {
+              for _ in rids { reactor.increment_in_flight(w); }  // track routed replies
+          }
+      }
+      // Await all ACKs concurrently via reactor routing.
+      let futs: Vec<_> = req_ids.iter().flatten()
+          .map(|&id| reactor.await_reply(id))
+          .collect();
+      let replies = reactor::join_all(futs).await;
+      // Exchange relays: workers send FLAG_EXCHANGE with the req_id they
+      // received; reactor routes them to a per-tid ExchangeAccumulator,
+      // which writes the relay when complete. No cursor-position tracking.
+      handle_exchanges(replies).await;  // may re-arm more req_ids
+  }
+  ```
+- **Handlers' "wait for tick" becomes a proper `.await`**, not a
+  `tick_generation` poll. Each `TickTrigger` carries a `oneshot::Sender`
+  that fires when this trigger's tick completes:
+  ```rust
+  async fn handle_scan(shared, fd, tid) {
+      // Capture pending tids AT ENTRY. Any later pushes are for future scans.
+      let pending_tids: Vec<i64> = shared.tick_rows.drain_snapshot();
+      if !pending_tids.is_empty() {
+          let (tx, rx) = oneshot::channel();
+          shared.tick_tx.send(TickTrigger { tids: pending_tids, done: tx });
+          rx.await;
+      }
+      fan_out_scan_async(...).await;
+  }
+  ```
+  **This fixes the scan/concurrent-writer slowness issue** (1–4 s under
+  sustained writes) observed in Stage 4 — the handler now awaits *its
+  specific tick's* completion rather than polling on the shared
+  `tick_generation` + `tick_rows.is_empty()` race.
+- **Exchange relay through reactor**: `FLAG_EXCHANGE` messages from
+  workers are routed by req_id to a per-tid `ExchangeAccumulator`. When
+  all workers have reported, the accumulator hands the merged batch to
+  the master, which writes `FLAG_EXCHANGE_RELAY` with new per-worker
+  req_ids and awaits those. No `acc.process` state threaded through
+  `poll_tick_progress`.
 
-**Invariant preserved:** Phase 1 → Phase 2 ordering is `await`. Per-check
-result aggregation is `try_join_all`.
+**Invariants that survive and must be preserved** (see async-invariants.md):
 
-**LoC:** -350 (collect family + execute_pipeline internals), +150 (async
-versions). Net -200.
+- **IV.2** *Tick before scan of a view* — handlers that scan views still
+  wait for any pending source-table tick.
+- **IV.6** *Tick batch signalling: one `signal_all` per batch.* Do NOT
+  split `run_tick` into per-tid futures each doing their own signal;
+  that's N eventfd writes instead of 1. The plan's original `tick_batch`
+  sketch (above in §End-State) has this comment; keep it.
+- **V.4 panic isolation** — tick's DAG evaluation wrapped in
+  `catch_unwind`. Also the tick task itself must be liveness-guarded
+  like the committer (L11).
 
-### Stage 6: Async tick pipeline
+**Non-obvious Stage 4 artifacts to preserve or rewire:**
 
-- Tick evaluation becomes a task; tick start / tick complete are await points
-- `TickState` enum deleted
-- Tick overlap with next group's SAL write/fsync expressed as `join!`
+- **`fan_out_backfill`** (bootstrap only, uses `collect_acks`
+  synchronously — fine, bootstrap runs before the reactor starts).
+- **`acc: ExchangeAccumulator`** on dispatcher — rehome into the tick
+  task's state.
+- **`relay_exchange`** signature + `op_relay_scatter` / 
+  `op_repartition_batches_merged` — pure compute, untouched.
+- **L7 "defensive cursor snap"** in `drain_w2m_for_worker` can be
+  deleted once no sync path calls `reset_one` anymore.
 
-**LoC:** -150 (TickState + transitions), +80 (async tick). Net -70.
+**LoC:** -300 (tick state machine + poll_tick_progress + async_w2m_rcs +
+worker stash/replay), +150 (tick task + exchange accumulator rewired).
+Net -150.
 
-### Stage 7: Delete main-loop timeout math
+### Stage 7: Delete main-loop timeout math ⏳ pending
 
-Now that every event source is an io_uring CQE (via POLL_ADD for worker
-eventfds and timer SQEs for deadlines), the main loop just
-`wait_one_cqe()` — no timeout computation, no periodic wakeups.
+After Stage 6, every event source is an io_uring CQE (POLL_ADD for worker
+eventfds, timer SQEs for deadlines, accept multi, RECV, SEND, fsync). The
+reactor's main loop is `wait_one_cqe()` — no timeout computation, no
+periodic wakeups, no 1-ms polls. Also deletes VI.6
+(`TICK_POLL_MS = 1` wakes 1000×/sec while idle).
 
 **LoC:** -30.
 
 ### Running total
 
-| Stage | Net LoC delta |
-|---|---|
-| 0 (req IDs) | +100 |
-| 1 (reactor) | +500 |
-| 2 (async SELECT) | -40 |
-| 3 (reactor fsync) | -70 |
-| 4 (committer) | -200 |
-| 5 (async checks) | -200 |
-| 6 (async tick) | -70 |
-| 7 (timeout math) | -30 |
-| **Total** | **~-10** |
+| Stage | Net LoC delta | Status |
+|---|---|---|
+| 0 (req IDs) | +100 | ✅ |
+| 1 (reactor) | +500 | ✅ |
+| 2 (async SELECT) | -40 | ✅ |
+| 3 (reactor fsync) | -70 | ✅ |
+| 4 (committer + ring absorption + Stage 5 folded in) | -400 | ✅ |
+| 5 (validate / pipelined checks async) | folded into 4 | ✅ |
+| 6 (async tick) | -150 | ⏳ |
+| 7 (timeout math) | -30 | ⏳ |
+| **Total projected** | **~-90** | |
 
-LoC is a weak metric; the story is that ~850 lines of manual-async plumbing
-disappear, replaced by ~500 lines of focused reactor + ~350 lines of async
-task bodies. The *conceptual* reduction is much larger — five mechanisms
-collapse into one.
+LoC is a weak metric; the real story is the conceptual collapse — nine
+manual-async mechanisms become one reactor + one task per long-running
+concern (accept, per-fd connection, committer, tick, worker-watcher).
 
 ---
 
-## Correctness Invariants to Preserve
+## Correctness Invariants
 
-These are load-bearing and must survive each stage's rewrite. Each is
-currently "accidentally true" because of sync execution; the async version
-must encode them explicitly.
+High-level invariants required at every stage (I1–I8 below). Low-level
+runtime invariants — eventfd semantics, ring-reset rules, per-fd
+lifecycle, panic isolation, committer liveness, tick batching, LSN wire
+contract — live in [`async-invariants.md`](../async-invariants.md).
+**Read that document before writing Stage 6 code.**
 
-**I1. Write serialization.** Only one writer to the SAL at any moment. In the
-async world: SAL writes happen from within tasks, but SAL append is
-non-blocking (mmap + cursor advance). The *order* of appends is the order
-tasks reach the write call. Since the reactor runs one task at a time, this
-is preserved trivially.
+**I1. Write serialization.** Only one writer to the SAL at any moment.
+Preserved: single-threaded reactor runs one task at a time; SAL append is
+non-blocking (mmap + cursor advance).
 
-**I2. Read-after-write within a client session.** If client C sends INSERT
-then SELECT, the SELECT sees the INSERT. Preserved because: (a) per-client
-messages arrive in FIFO order over the socket; (b) the handler is a task; (c)
-the task's `insert.await` completes after commit. The subsequent `.await` on
-the SELECT sees committed state.
+**I2. Read-after-write within a client session.** Per-`connection_loop`
+task structure (one task per fd, `recv.await` only fires after the
+previous `handle_message` returns) preserves FIFO. ✅ enforced in Stage 4.
 
 **I3. Phase 1 → Phase 2 dependency in validation.** Encoded as `.await`.
+✅ enforced by `validate_all_distributed_async`.
 
-**I4. fdatasync before ack.** Encoded as `join!(fsync, acks).await`; the client
-reply is sent *after* this resolves.
+**I4. fdatasync before ack.** `commit_pushes` resolves `join2(fsync,
+acks)` before sending oneshot ACK. ✅ enforced in Stage 4.
 
-**I5. Tick barrier for exchange.** All workers must evaluate the tick at the
-same logical timestamp. Tick firing is a broadcast; the tick task awaits all
-worker ACKs. Preserved.
+**I5. Tick barrier for exchange.** All workers evaluate tick at the same
+logical timestamp. Stage 6 preserves via one `signal_all` per tick batch
+(see IV.6 in async-invariants).
 
-**I6. Cross-client isolation.** SQL doesn't define concurrent INSERT of the
-same PK; today's implicit behavior is "first task to commit wins." This
-remains true because the committer serializes.
+**I6. Cross-client isolation.** Committer serializes all commits → "first
+task to commit wins." ✅ Stage 4.
 
-**I7. DDL exclusion.** DDL barriers drain the committer and block new task
-dispatch until DDL commits. Explicit in Stage 4.
+**I7. DDL exclusion.** `catalog_rwlock.write()` + `CommitRequest::Barrier`
+drain the committer before catalog mutation. ✅ Stage 4.
 
-**I8. Distributed validation sees committed state** *(load-bearing, almost
-missed)*. For constrained tables (FK, unique secondary, or Error-mode
-unique-PK), `validate_all_distributed` checks worker storage — which only
-reflects *committed* state. Two concurrent validates of INSERTs with the
-same PK would both see "PK not present," both pass, both commit, corrupting
-the table.
+**I8. Distributed validation sees committed state.** Per-table
+`AsyncMutex` held across `validate_all_distributed.await` +
+`committer.send` + `done.rx.await`, for constrained tables only (FK,
+unique index, or Error-mode on unique PK). Matches today's pre-flush
+semantics. ✅ Stage 4.
 
-Today's code prevents this with the pre-flush at `executor.rs:1205-1222`:
-before calling `validate_all_distributed` on a constrained table, the
-executor synchronously flushes any pending entries for that target_id —
-forcing prior clients' INSERTs on this table to reach worker storage before
-the current one validates. The comment on line 1201 ("*The pre-flush exists
-solely to give distributed validation fresh worker state*") names this
-invariant explicitly.
-
-**The async plan must encode this or it silently breaks data integrity.**
-
-Implementation: a per-table async mutex held across the validate→commit
-window for constrained tables. Only one task per (constrained) table can be
-between `validate_all_distributed.await` and commit completion at any time.
-Unconstrained tables skip the lock (matches today's `needs_flush == false`
-fast path — no pre-flush, multiple validates in flight is harmless because
-validate is a no-op).
-
-```rust
-struct MasterDispatcher {
-    // ... existing fields ...
-    // Per-table validate→commit serialization for constrained tables.
-    // Created lazily on first INSERT to a constrained table. Entry is an
-    // async mutex; held across validate+commit to enforce I8.
-    table_locks: HashMap<TableId, Rc<AsyncMutex<()>>>,
-}
-
-async fn handle_insert(&self, tid: TableId, batch: Batch, mode: WireConflictMode)
-    -> Result<()>
-{
-    let needs_lock = self.cat().get_fk_count(tid) > 0
-        || self.cat().get_fk_children_count(tid) > 0
-        || self.cat().has_any_unique_index(tid)
-        || (matches!(mode, WireConflictMode::Error) && self.cat().table_has_unique_pk(tid));
-
-    let _guard = if needs_lock {
-        Some(self.table_lock(tid).lock().await)
-    } else {
-        None
-    };
-
-    self.disp().validate_all_distributed(tid, &batch, mode).await?;
-
-    let (tx, rx) = oneshot::channel();
-    self.committer_tx.send(CommitRequest::Push { tid, batch, mode, done: tx }).await;
-    rx.await??;
-    // _guard drops here; next validate→commit for this tid can proceed.
-}
-```
-
-Performance characteristics exactly match today's:
-- Different tables: fully parallel (per-tid lock doesn't cross tables).
-- Same constrained table: one validate→commit at a time (same as today's
-  per-tid pre-flush serialization).
-- Same unconstrained table: no lock, full group-commit batching.
-
-**Note on committer batching:** the per-tid lock serializes *validate→commit*
-but does **not** prevent the committer from batching different tables'
-commits in one fsync. Client A's INSERT on T1 and client B's INSERT on T2
-run their validates concurrently, both send CommitRequest to the committer,
-committer batches both into one SAL group + one fsync, both reply on their
-oneshots, both clients ACK'd. Group commit benefit preserved.
-
-**Subtle case: cross-table FK races.** Today's code has a pre-existing race:
-INSERT into child table T2 and DELETE on parent table T1 use *different* tid
-locks and can interleave, potentially allowing an orphan child row. The
-async plan preserves this exact behavior (no better, no worse). Fixing it
-would require either a coarser lock or FK-aware dependency tracking — an
-orthogonal correctness concern, explicitly **out of scope** for this plan.
+**Subtle case: cross-table FK races.** INSERT on child T2 + DELETE on
+parent T1 use different tid locks and can interleave, allowing orphan
+child rows. This race is pre-existing, preserved by the refactor, and
+**out of scope**. Fixing it requires FK-aware dependency tracking.
 
 ---
 

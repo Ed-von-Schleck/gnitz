@@ -11,13 +11,13 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
 use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
-    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
     SalWriter, W2mReceiver, W2M_HEADER_SIZE,
 };
 use crate::storage::{Batch, partition_for_key};
 use crate::ops::{
-    PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
+    PartitionRouter, op_repartition_batch, op_relay_scatter,
     worker_for_partition_pub,
 };
 
@@ -236,16 +236,6 @@ fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndex
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
-/// Result of an async fan-out attempt.
-///
-/// `NeedsSyncFallback` is a first-class success signal, not an error:
-/// the operation couldn't run truly-async (broadcast reply routing is
-/// not wired in Stage 2) and must be retried on the sync path.
-pub enum FanOutError {
-    Worker(String),
-    NeedsSyncFallback,
-}
-
 pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: Vec<i32>,
@@ -329,6 +319,10 @@ impl MasterDispatcher {
 
     /// Encode per-worker data directly into SAL mmap.
     /// Does NOT fdatasync or signal.
+    ///
+    /// Sync callers pass `request_id=0` (or some single id) which is
+    /// replicated across all workers. Async callers use
+    /// `write_group_with_req_ids` to thread distinct per-worker ids.
     fn write_group(
         &mut self,
         target_id: i64,
@@ -340,6 +334,30 @@ impl MasterDispatcher {
         seek_pk_hi: u64,
         seek_col_idx: u64,
         request_id: u64,
+        unicast_worker: i32,
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut ids = [0u64; crate::ipc::MAX_WORKERS];
+        for w in 0..nw { ids[w] = request_id; }
+        self.write_group_with_req_ids(
+            target_id, flags, worker_batches, schema, col_names,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, &ids[..nw], unicast_worker,
+        )
+    }
+
+    /// Encode per-worker data with per-worker request ids. Used by async
+    /// fan-outs that need distinct ids per worker for reply routing.
+    fn write_group_with_req_ids(
+        &mut self,
+        target_id: i64,
+        flags: u32,
+        worker_batches: &[Option<&Batch>],
+        schema: &SchemaDescriptor,
+        col_names: &[Vec<u8>],
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+        req_ids: &[u64],
         unicast_worker: i32,
     ) -> Result<(), String> {
         let mut name_refs = [&[] as &[u8]; 64];
@@ -355,7 +373,7 @@ impl MasterDispatcher {
         self.sal.write_group_direct(
             target_id as u32, flags, worker_batches,
             schema, col_names_opt,
-            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id, unicast_worker,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, req_ids, unicast_worker,
         )
     }
 
@@ -407,13 +425,8 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub(crate) fn sync_and_signal_all(&self) -> i32 {
-        self.sal.sync_and_signal_all()
-    }
-
     pub(crate) fn signal_all(&self) { self.sal.signal_all(); }
     fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
-    pub(crate) fn sync(&self) -> i32 { self.sal.sync() }
 
     pub(crate) fn sal_fd(&self) -> i32 { self.sal.sal_fd() }
 
@@ -486,48 +499,6 @@ impl MasterDispatcher {
 
     pub(crate) fn num_workers(&self) -> usize { self.num_workers }
 
-    /// Write-only ingest: broadcast batch to all workers via SAL without
-    /// fdatasync/signal/collect.  Used by group-commit in flush_pending_pushes.
-    /// Workers filter their own partitions on receipt (Phase 2 broadcast).
-    /// `mode` is encoded into the control block so the worker knows whether
-    /// to run SQL-standard rejection or silent-upsert semantics.
-    pub(crate) fn write_ingest(
-        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
-    ) -> Result<(), String> {
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.write_broadcast(
-            target_id,
-            FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT,
-            Some(batch), &schema, &col_names,
-            0, 0, mode.as_u8() as u64, 0,
-        )
-    }
-
-    /// Collect one ACK per worker using caller-managed read cursors.
-    /// Does NOT reset W2M — the caller must call `reset_w2m_cursors()` after
-    /// all rounds of collection are done.
-    pub(crate) fn collect_acks_at(&mut self, w2m_rcs: &mut [u64]) -> Result<(), String> {
-        let nw = self.num_workers;
-        let mut remaining = nw;
-        let mut collected = vec![false; nw];
-        while remaining > 0 {
-            self.w2m.poll(1000);
-            for w in 0..nw {
-                if collected[w] { continue; }
-                if let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
-                    w2m_rcs[w] = new_rc;
-                    if decoded.control.status != 0 {
-                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                        return Err(format!("worker {}: {}", w, msg));
-                    }
-                    collected[w] = true;
-                    remaining -= 1;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Collect ACKs from all workers, relaying exchange messages inline.
     fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
@@ -569,57 +540,16 @@ impl MasterDispatcher {
         err
     }
 
-    /// Collect data responses from all workers, concatenate into one batch.
-    /// Pre-sums worker counts to allocate the destination buffer once via
-    /// `with_schema` (which goes through `batch_pool`), eliminating the
-    /// doubling-cascade `reserve_rows` grow loop.
-    fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<Batch, String> {
-        let results = self.wait_all_workers()?;
-
-        // Sum first so the buffer is allocated to its final size in one shot.
-        // Eliminates the doubling crawl through reserve_rows.
-        let total_rows: usize = results.iter()
-            .filter_map(|r| r.as_ref())
-            .filter_map(|d| d.data_batch.as_ref())
-            .map(|b| b.count)
-            .sum();
-
-        // with_schema goes through batch_pool::acquire_buf, so steady-state
-        // calls reuse a recycled Vec<u8> with no allocation.
-        let mut out = Batch::with_schema(*schema, total_rows.max(1));
-
-        for decoded_opt in &results {
-            if let Some(decoded) = decoded_opt {
-                if let Some(ref batch) = decoded.data_batch {
-                    if batch.count > 0 {
-                        out.append_batch(batch, 0, batch.count);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Collect a single response from one worker.
-    fn collect_one(&mut self, worker: usize) -> Result<DecodedWire, String> {
-        let mut w2m_rc = W2M_HEADER_SIZE as u64;
-        let result = (|| -> Result<DecodedWire, String> {
-            loop {
-                if let Some((decoded, new_rc)) = self.w2m.try_read(worker, w2m_rc) {
-                    w2m_rc = new_rc;
-                    return Ok(decoded);
-                }
-                self.w2m.wait_one(worker, 1000);
-            }
-        })();
-        self.w2m.reset_one(worker);
-        result
-    }
-
     // -----------------------------------------------------------------------
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
+    /// Invariant: callers must live on a path that owns SAL checkpoint
+    /// exclusivity. Today that is the bootstrap backfill and the
+    /// committer task. Async fan-out / tick / DDL paths must NOT call
+    /// this — a concurrent FLAG_FLUSH races the committer's own and
+    /// orphans SAL writes straddling `sal.checkpoint_reset`. See
+    /// async-invariants.md §III.3a.
     pub(crate) fn maybe_checkpoint(&mut self) -> Result<(), String> {
         if !self.sal.needs_checkpoint() {
             return Ok(());
@@ -704,189 +634,12 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    pub fn fan_out_ingest(
-        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
-    ) -> Result<(), String> {
-        self.maybe_checkpoint()?;
-        self.write_ingest(target_id, batch, mode)?;
-        let rc = self.sync_and_signal_all();
-        if rc < 0 {
-            return Err(format!("fdatasync failed rc={}", rc));
-        }
-        self.collect_acks()?;
-        gnitz_debug!("fan_out_ingest tid={} rows={}", target_id, batch.count);
-        Ok(())
-    }
-
-    pub fn fan_out_tick(&mut self, target_id: i64) -> Result<(), String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
-        self.collect_acks_and_relay(target_id)?;
-        gnitz_debug!("fan_out_tick tid={}", target_id);
-        Ok(())
-    }
-
-    pub fn fan_out_push(
-        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
-    ) -> Result<(), String> {
-        self.maybe_checkpoint()?;
-        let n = batch.count;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-
-        let preloadable = {
-            let cat = unsafe { &mut *self.catalog };
-            cat.dag.get_preloadable_views(target_id)
-        };
-
-        let use_preload = if !preloadable.is_empty() {
-            !(0..n).any(|i| batch.get_weight(i) < 0)
-        } else {
-            false
-        };
-
-        let push_flags = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
-        let mode_byte = mode.as_u8() as u64;
-
-        if !use_preload {
-            let pk_col = &[schema.pk_index];
-            let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
-            self.record_index_routing(target_id, &schema, &sub_batches);
-            let refs: Vec<Option<&Batch>> = sub_batches.iter()
-                .map(|b| if b.count > 0 { Some(b) } else { None })
-                .collect();
-            self.write_group(target_id, push_flags, &refs, &schema, &col_names,
-                            0, 0, mode_byte, 0, -1)?;
-            let rc = self.sync_and_signal_all();
-            if rc < 0 {
-                return Err(format!("fdatasync failed rc={}", rc));
-            }
-        } else {
-            let mut col_specs_owned: Vec<Vec<u32>> = Vec::with_capacity(preloadable.len() + 1);
-            col_specs_owned.push(vec![schema.pk_index]);
-            for (_vid, cols) in &preloadable {
-                col_specs_owned.push(cols.iter().map(|&c| c as u32).collect());
-            }
-            let col_specs: Vec<&[u32]> = col_specs_owned.iter().map(|v| v.as_slice()).collect();
-            let all_batches = op_multi_scatter(batch, &col_specs, &schema, self.num_workers);
-
-            let pk_batches = &all_batches[0];
-            self.record_index_routing(target_id, &schema, pk_batches);
-
-            for si in 0..preloadable.len() {
-                let vid = preloadable[si].0;
-                let preload_batches = &all_batches[si + 1];
-                let refs: Vec<Option<&Batch>> = preload_batches.iter()
-                    .map(|b| if b.count > 0 { Some(b) } else { None })
-                    .collect();
-                self.write_group(vid, FLAG_PRELOADED_EXCHANGE, &refs, &schema,
-                                &col_names, 0, 0, 0, 0, -1)?;
-            }
-
-            let refs: Vec<Option<&Batch>> = pk_batches.iter()
-                .map(|b| if b.count > 0 { Some(b) } else { None })
-                .collect();
-            self.write_group(target_id, push_flags, &refs, &schema,
-                            &col_names, 0, 0, mode_byte, 0, -1)?;
-
-            let rc = self.sync_and_signal_all();
-            if rc < 0 {
-                return Err(format!("fdatasync failed rc={}", rc));
-            }
-        }
-
-        self.collect_acks_and_relay(target_id)?;
-        gnitz_debug!("fan_out_push tid={} rows={} mode={:?}", target_id, n, mode);
-        Ok(())
-    }
-
     pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         self.send_broadcast(source_id, FLAG_BACKFILL, None, &schema, &col_names,
                            view_id as u64, 0, 0, 0)?;
         self.collect_acks_and_relay(source_id)
-    }
-
-    pub fn fan_out_scan(&mut self, target_id: i64) -> Result<Option<Batch>, String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0, 0)?;
-        let result = self.collect_responses(&schema)?;
-        gnitz_debug!("fan_out_scan tid={} result_rows={}", target_id, result.count);
-        if result.count == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub fn fan_out_seek(
-        &mut self, target_id: i64, pk_lo: u64, pk_hi: u64,
-    ) -> Result<Option<Batch>, String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        let pk = crate::util::make_pk(pk_lo, pk_hi);
-        let worker = worker_for_partition_pub(
-            partition_for_key(pk),
-            self.num_workers,
-        );
-
-        self.write_group(target_id, FLAG_SEEK, &[], &schema, &col_names,
-                        pk_lo, pk_hi, 0, 0, worker as i32)?;
-        self.signal_one(worker);
-
-        let decoded = self.collect_one(worker)?;
-        if decoded.control.status != 0 {
-            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-            return Err(format!("worker {}: seek: {}", worker, msg));
-        }
-        Ok(decoded.data_batch.and_then(|b| {
-            if b.count > 0 {
-                let mut result = Batch::with_schema(schema, b.count);
-                result.append_batch(&b, 0, b.count);
-                Some(result)
-            } else {
-                None
-            }
-        }))
-    }
-
-    pub fn fan_out_seek_by_index(
-        &mut self, target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
-    ) -> Result<Option<Batch>, String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-
-        let cached_worker = self.router.worker_for_index_key(target_id as u32, col_idx, key_lo);
-        if cached_worker >= 0 {
-            let w = cached_worker as usize;
-            self.write_group(target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
-                            key_lo, key_hi, col_idx as u64, 0, cached_worker)?;
-            self.signal_one(w);
-
-            let decoded = self.collect_one(w)?;
-            if decoded.control.status != 0 {
-                let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                return Err(format!("worker {}: seek_by_index: {}", w, msg));
-            }
-            return Ok(extract_single_batch(&schema, decoded));
-        }
-
-        // Cache miss: broadcast
-        self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
-                            key_lo, key_hi, col_idx as u64, 0)?;
-        let results = self.wait_all_workers()?;
-        for decoded_opt in results {
-            if let Some(decoded) = decoded_opt {
-                if let Some(ref batch) = decoded.data_batch {
-                    if batch.count > 0 {
-                        return Ok(extract_single_batch(&schema, decoded));
-                    }
-                }
-            }
-        }
-        Ok(None)
     }
 
     // Async fan-outs take `*mut Self` instead of `&mut self` because the
@@ -898,7 +651,7 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::reactor::Reactor,
         target_id: i64, pk_lo: u64, pk_hi: u64,
-    ) -> Result<Option<Batch>, FanOutError> {
+    ) -> Result<Option<Batch>, String> {
         let worker = unsafe {
             let pk = crate::util::make_pk(pk_lo, pk_hi);
             worker_for_partition_pub(partition_for_key(pk), (*disp_ptr).num_workers)
@@ -911,33 +664,148 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::reactor::Reactor,
         target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
-    ) -> Result<Option<Batch>, FanOutError> {
-        let worker = unsafe {
-            let cached = (*disp_ptr).router.worker_for_index_key(
+    ) -> Result<Option<Batch>, String> {
+        let cached = unsafe {
+            (*disp_ptr).router.worker_for_index_key(
                 target_id as u32, col_idx, key_lo,
-            );
-            if cached < 0 { return Err(FanOutError::NeedsSyncFallback); }
-            cached as usize
+            )
         };
-        single_worker_async(disp_ptr, reactor, target_id, FLAG_SEEK_BY_INDEX,
-                            worker, key_lo, key_hi, col_idx as u64, "seek_by_index").await
+        if cached >= 0 {
+            let worker = cached as usize;
+            return single_worker_async(
+                disp_ptr, reactor, target_id, FLAG_SEEK_BY_INDEX,
+                worker, key_lo, key_hi, col_idx as u64, "seek_by_index",
+            ).await;
+        }
+
+        // Cache miss: broadcast to all workers with per-worker req_ids.
+        let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+            let (schema, col_names) = disp.get_schema_and_names(target_id);
+            disp.write_group_with_req_ids(
+                target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
+                key_lo, key_hi, col_idx as u64, req_ids, -1,
+            )
+        }).await?;
+        if let Some(e) = first_worker_error("seek_by_index", &decoded_vec) {
+            return Err(e);
+        }
+        for decoded in decoded_vec {
+            if let Some(ref batch) = decoded.data_batch {
+                if batch.count > 0 {
+                    return Ok(extract_single_batch(&schema, decoded));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn fan_out_scan_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::reactor::Reactor,
         target_id: i64,
-    ) -> Result<Option<Batch>, FanOutError> {
-        // Broadcast reply routing (one req_id, N replies) needs the
-        // per-worker req_id slot that Stage 2 does not thread through.
-        if unsafe { (*disp_ptr).num_workers } != 1 {
-            return Err(FanOutError::NeedsSyncFallback);
+    ) -> Result<Option<Batch>, String> {
+        let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+            let (schema, col_names) = disp.get_schema_and_names(target_id);
+            disp.write_group_with_req_ids(
+                target_id, 0, &[], &schema, &col_names,
+                0, 0, 0, req_ids, -1,
+            )
+        }).await?;
+        if let Some(e) = first_worker_error("scan", &decoded_vec) {
+            return Err(e);
         }
-        single_worker_async(disp_ptr, reactor, target_id, 0, 0, 0, 0, 0, "scan").await
+        let total_rows: usize = decoded_vec.iter()
+            .filter_map(|d| d.data_batch.as_ref())
+            .map(|b| b.count)
+            .sum();
+        let mut out = Batch::with_schema(schema, total_rows.max(1));
+        for decoded in &decoded_vec {
+            if let Some(ref batch) = decoded.data_batch {
+                if batch.count > 0 {
+                    out.append_batch(batch, 0, batch.count);
+                }
+            }
+        }
+        if out.count == 0 { Ok(None) } else { Ok(Some(out)) }
+    }
+
+    /// Async version of `execute_pipeline`. Writes each check with
+    /// per-worker req_ids, signals once, and joins all replies.
+    async fn execute_pipeline_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        checks: Vec<PipelinedCheck>,
+    ) -> Result<Vec<HashSet<u128>>, String> {
+        let num_checks = checks.len();
+        if num_checks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (nw, mut all_req_ids): (usize, Vec<Vec<u64>>) = unsafe {
+            let disp = &mut *disp_ptr;
+            let nw = disp.num_workers;
+            let mut rids: Vec<Vec<u64>> = Vec::with_capacity(num_checks);
+            for _ in 0..num_checks {
+                rids.push((0..nw).map(|_| reactor.alloc_request_id()).collect());
+            }
+            for (idx, check) in checks.iter().enumerate() {
+                let refs: Vec<Option<&Batch>> = match &check.payload {
+                    CheckPayload::Broadcast(batch) => (0..nw).map(|_| Some(batch)).collect(),
+                    CheckPayload::Partitioned(batches) => batches.iter()
+                        .map(|b| if b.count > 0 { Some(b) } else { None })
+                        .collect(),
+                };
+                disp.write_group_with_req_ids(
+                    check.target_id, check.flags, &refs,
+                    &check.schema, &[], 0, 0, check.col_hint,
+                    &rids[idx], -1,
+                )?;
+            }
+            for _ in 0..num_checks {
+                for w in 0..nw { reactor.increment_in_flight(w); }
+            }
+            disp.signal_all();
+            (nw, rids)
+        };
+
+        // Flatten futures in (check_idx, worker) order.
+        let mut futs = Vec::with_capacity(num_checks * nw);
+        for rids in all_req_ids.drain(..) {
+            for rid in rids {
+                futs.push(reactor.await_reply(rid));
+            }
+        }
+        let decoded_vec: Vec<DecodedWire> = crate::reactor::join_all(futs).await;
+
+        let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
+            let cap = match &check.payload {
+                CheckPayload::Broadcast(b) => b.count,
+                CheckPayload::Partitioned(bs) => bs.iter().map(|b| b.count).sum(),
+            };
+            HashSet::with_capacity(cap)
+        }).collect();
+
+        if let Some(err) = first_worker_error("pipeline", &decoded_vec) {
+            return Err(err);
+        }
+        for check_idx in 0..num_checks {
+            for w in 0..nw {
+                let decoded = &decoded_vec[check_idx * nw + w];
+                if let Some(ref batch) = decoded.data_batch {
+                    for j in 0..batch.count {
+                        if batch.get_weight(j) == 1 {
+                            results[check_idx].insert(batch.get_pk(j));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch) -> Result<(), String> {
-        self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
                             0, 0, 0, 0)?;
@@ -960,15 +828,6 @@ impl MasterDispatcher {
         self.async_active = true;
     }
 
-    pub fn start_tick_async(&mut self, target_id: i64) -> Result<(), String> {
-        self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
-
-        self.begin_async_collection(1);
-        Ok(())
-    }
-
     /// Write N FLAG_TICK groups to the SAL and signal all workers once.
     /// Workers process the ticks sequentially, sending one ACK per tick.
     /// `poll_tick_progress` collects N ACKs per worker (N × num_workers total)
@@ -982,13 +841,9 @@ impl MasterDispatcher {
     /// Panics if `tids` is empty — callers must filter to non-empty slices.
     pub fn start_ticks_async_batch(&mut self, tids: &[i64]) -> Result<(), String> {
         debug_assert!(!tids.is_empty(), "start_ticks_async_batch called with empty tids");
-        self.maybe_checkpoint()?;
-
         // Write all FLAG_TICK groups without signalling between them.
         // If write_broadcast fails mid-way, the partial writes are harmless:
         // no signal has been sent yet, so workers will not process them.
-        // The next maybe_checkpoint (FLAG_FLUSH) resets worker epochs,
-        // invalidating any unread SAL entries from this failed batch.
         for &tid in tids {
             let (schema, col_names) = self.get_schema_and_names(tid);
             self.write_broadcast(tid, FLAG_TICK, None, &schema, &col_names, 0, 0, 0, 0)?;
@@ -1014,6 +869,12 @@ impl MasterDispatcher {
             while let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
                 self.async_w2m_rcs[w] = new_rc;
 
+                // Reactor-routed replies (push/validate/fan_out) share
+                // the ring; advance past them without counting.
+                if decoded.control.request_id != 0 {
+                    continue;
+                }
+
                 if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                     match self.acc.process(w, decoded) {
                         Ok(Some(relay)) => {
@@ -1035,7 +896,6 @@ impl MasterDispatcher {
                         self.finish_async_tick();
                         return Err(format!("worker {}: {}", w, msg));
                     }
-                    // One ACK received; worker is collected when its countdown hits 0.
                     self.async_acks_remaining[w] -= 1;
                     if self.async_acks_remaining[w] == 0 {
                         self.async_remaining -= 1;
@@ -1057,31 +917,6 @@ impl MasterDispatcher {
         // calling reset_w2m_cursors() after it has finished reading any
         // remaining W2M data (e.g. push ACKs that follow tick ACKs).
         self.async_active = false;
-    }
-
-    /// Collect one push ACK per worker using the W2M read cursors left
-    /// behind by poll_tick_progress.  This lets the caller read push ACKs
-    /// that workers appended to W2M *after* their tick ACKs.
-    pub(crate) fn collect_acks_continuing(&mut self) -> Result<(), String> {
-        let nw = self.num_workers;
-        let mut remaining = nw;
-        let mut collected = vec![false; nw];
-        while remaining > 0 {
-            self.w2m.poll(1000);
-            for w in 0..nw {
-                if collected[w] { continue; }
-                if let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
-                    self.async_w2m_rcs[w] = new_rc;
-                    if decoded.control.status != 0 {
-                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                        return Err(format!("worker {}: {}", w, msg));
-                    }
-                    collected[w] = true;
-                    remaining -= 1;
-                }
-            }
-        }
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1153,41 +988,6 @@ impl MasterDispatcher {
         if out.is_empty() { None } else { Some((schema, out)) }
     }
 
-    /// Warm up any unwarmed unique-index filters for `table_id`. A single
-    /// `fan_out_scan` on the main table is enough to seed all of them —
-    /// the indexed-column values are extracted from the scan result.
-    /// Idempotent: already-warm filters are left alone.
-    fn ensure_unique_filters_warm(&mut self, table_id: i64) -> Result<(), String> {
-        let (_schema, descs) = match self.unique_index_descriptors(table_id) {
-            Some(x) => x,
-            None => return Ok(()),
-        };
-        let missing: Vec<UniqueIndexDesc> = descs.into_iter()
-            .filter(|d| !self.unique_filters.contains_key(&(table_id, d.col_idx)))
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        // Seed empty filters for each missing one so that an empty table
-        // scan still produces a warm (empty) filter.
-        for d in &missing {
-            self.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
-        }
-
-        // One scan feeds all of them.
-        let scan_result = self.fan_out_scan(table_id)?;
-        if let Some(batch) = scan_result {
-            for d in &missing {
-                if let Some(filter) = self.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                    extract_into_filter(filter, &batch, d);
-                    if filter.capped { continue; }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// True if every key in `keys` is definitely absent from the filter
     /// for `(table_id, col_idx)`. Returns false if the filter is capped,
     /// not warm (caller is expected to warm it first), or contains any
@@ -1247,115 +1047,18 @@ impl MasterDispatcher {
     // at most 2 rounds: Phase 1 is fully independent; Phase 2 depends
     // on Phase 1's UPSERT-identification result.
 
-    /// Submit `checks` as a single pipelined burst; return per-check
-    /// aggregated result sets (union of PKs returned with weight=1 across
-    /// all workers). Drains all responses before returning even on error
-    /// to keep W2M cursors consistent for the next IPC round.
-    fn execute_pipeline(
-        &mut self, checks: &[PipelinedCheck],
-    ) -> Result<Vec<HashSet<u128>>, String> {
-        let num_checks = checks.len();
-        if num_checks == 0 {
-            return Ok(Vec::new());
-        }
 
-        // Reserve SAL capacity for the whole burst up front.
-        self.maybe_checkpoint()?;
-
-        // Write all SAL messages back-to-back (no signal between them).
-        for check in checks {
-            match &check.payload {
-                CheckPayload::Broadcast(batch) => {
-                    self.write_broadcast(
-                        check.target_id, check.flags, Some(batch),
-                        &check.schema, &[], 0, 0, check.col_hint, 0,
-                    )?;
-                }
-                CheckPayload::Partitioned(batches) => {
-                    let refs: Vec<Option<&Batch>> = batches.iter()
-                        .map(|b| if b.count > 0 { Some(b) } else { None })
-                        .collect();
-                    self.write_group(
-                        check.target_id, check.flags, &refs,
-                        &check.schema, &[], 0, 0, check.col_hint, 0, -1,
-                    )?;
-                }
-            }
-        }
-
-        // One signal for the whole burst.
-        self.signal_all();
-
-        // Drain num_checks * num_workers responses. Workers process SAL
-        // messages in submission order, so the k-th response from worker
-        // w belongs to check[k].
-        let nw = self.num_workers;
-        let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
-            let cap = match &check.payload {
-                CheckPayload::Broadcast(b) => b.count,
-                CheckPayload::Partitioned(bs) => bs.iter().map(|b| b.count).sum(),
-            };
-            HashSet::with_capacity(cap)
-        }).collect();
-        let mut responses_collected = vec![0usize; nw];
-        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
-        let mut total_remaining = nw * num_checks;
-        let mut first_error: Option<String> = None;
-
-        while total_remaining > 0 {
-            self.w2m.poll(1000);
-            for w in 0..nw {
-                while responses_collected[w] < num_checks {
-                    let (decoded, new_rc) = match self.w2m.try_read(w, w2m_rcs[w]) {
-                        Some(x) => x,
-                        None => break,
-                    };
-                    w2m_rcs[w] = new_rc;
-                    let check_idx = responses_collected[w];
-                    responses_collected[w] += 1;
-                    total_remaining -= 1;
-
-                    if decoded.control.status != 0 {
-                        if first_error.is_none() {
-                            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                            first_error = Some(format!("worker {}: {}", w, msg));
-                        }
-                        continue;
-                    }
-
-                    if let Some(ref batch) = decoded.data_batch {
-                        for j in 0..batch.count {
-                            if batch.get_weight(j) == 1 {
-                                results[check_idx].insert(batch.get_pk(j));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        self.reset_w2m_cursors();
-
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-        Ok(results)
-    }
-
-    /// Run all distributed validation for a user-table DML batch in at
-    /// most two pipelined rounds. Phase 1 issues the independent checks
-    /// (FK parent existence, FK child restrict, UPSERT PK identification).
-    /// Phase 2 issues the unique-index checks, which depend on the
-    /// UPSERT set from Phase 1.
-    ///
-    /// `mode` controls SQL semantics: `Error` rejects the batch on any
-    /// PK/unique conflict; `Update` allows retract-and-insert.
-    pub fn validate_all_distributed(
-        &mut self, target_id: i64, batch: &Batch, mode: WireConflictMode,
+    /// Async equivalent of `validate_all_distributed`. Identical semantics;
+    /// uses `execute_pipeline_async` + `fan_out_seek_by_index_async` so it
+    /// runs without blocking the reactor.
+    pub async fn validate_all_distributed_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
-        // Snapshot catalog metadata up front.
-        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = {
-            let cat = unsafe { &mut *self.catalog };
+        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, num_workers) = unsafe {
+            let disp = &mut *disp_ptr;
+            let cat = &mut *disp.catalog;
             let n_fk = cat.get_fk_count(target_id);
             let n_children = cat.get_fk_children_count(target_id);
             let n_circuits = cat.get_index_circuit_count(target_id);
@@ -1364,13 +1067,9 @@ impl MasterDispatcher {
             let source_schema = cat.get_schema_desc(target_id)
                 .ok_or_else(|| format!(
                     "validate_all_distributed: no schema for table {}", target_id))?;
-            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
+            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, disp.num_workers)
         };
 
-        // In Error mode on a unique_pk table we must also run the PK
-        // existence check even if no FK / unique-secondary-index
-        // validator would otherwise fire — a plain duplicate-PK INSERT
-        // needs to be rejected.
         let needs_pk_rejection = matches!(mode, WireConflictMode::Error) && unique_pk;
 
         if n_fk == 0 && n_children == 0 && !has_unique && !needs_pk_rejection {
@@ -1379,11 +1078,6 @@ impl MasterDispatcher {
 
         let pki = source_schema.pk_index as usize;
 
-        // One-pass aggregation over the batch: per-PK (net_weight,
-        // positive_row_count). Used by both the Error-mode intra-batch
-        // rejection check below and the Phase 1 UpsertPkId planning
-        // further down, avoiding a second walk of the batch. Allocated
-        // only when either consumer needs it.
         let pk_agg: HashMap<u128, (i64, u32)> = if has_unique || needs_pk_rejection {
             let mut m: HashMap<u128, (i64, u32)> = HashMap::with_capacity(batch.count);
             for i in 0..batch.count {
@@ -1398,13 +1092,15 @@ impl MasterDispatcher {
             HashMap::new()
         };
 
-        // Error-mode: reject any PK whose positive-row-count > 1 in
-        // this batch (e.g. `INSERT INTO t VALUES (1,10),(1,20)`).
         if needs_pk_rejection {
             for (&pk, &(_, pos_count)) in &pk_agg {
                 if pos_count > 1 {
-                    let pk_name = self.get_col_name(target_id, pki);
-                    let (sn, tn) = self.get_qualified_name_owned(target_id);
+                    let (pk_name, sn, tn) = unsafe {
+                        let disp = &mut *disp_ptr;
+                        (disp.get_col_name(target_id, pki),
+                         disp.get_qualified_name_owned(target_id).0,
+                         disp.get_qualified_name_owned(target_id).1)
+                    };
                     let key_str = format_pk_value(pk, &source_schema);
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
@@ -1418,10 +1114,10 @@ impl MasterDispatcher {
         let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p1_labels: Vec<P1Label> = Vec::new();
 
-        // FK parent existence (one per constraint with non-null referrers)
         for fi in 0..n_fk {
-            let (fk_col_idx, parent_table_id, col_type, parent_schema) = {
-                let cat = unsafe { &mut *self.catalog };
+            let (fk_col_idx, parent_table_id, col_type, parent_schema) = unsafe {
+                let disp = &mut *disp_ptr;
+                let cat = &mut *disp.catalog;
                 let (fk_col_idx, parent_table_id) = match cat.get_fk_constraint(target_id, fi) {
                     Some(c) => c,
                     None => continue,
@@ -1461,7 +1157,7 @@ impl MasterDispatcher {
             let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
             let pk_col = &[parent_schema.pk_index];
             let sub_batches = op_repartition_batch(
-                &check_batch, pk_col, &parent_schema, self.num_workers);
+                &check_batch, pk_col, &parent_schema, num_workers);
 
             p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
             p1_checks.push(PipelinedCheck {
@@ -1473,7 +1169,6 @@ impl MasterDispatcher {
             });
         }
 
-        // FK child restrict (one per child, DELETE side). Shared PK list.
         if n_children > 0 {
             let mut neg_pks: HashSet<u128> = HashSet::new();
             for i in 0..batch.count {
@@ -1481,8 +1176,6 @@ impl MasterDispatcher {
                     neg_pks.insert(batch.get_pk(i));
                 }
             }
-            // UPSERT handling: drop PKs that also appear with positive weight
-            // (retract + insert = UPDATE, not DELETE).
             for i in 0..batch.count {
                 if batch.get_weight(i) > 0 {
                     neg_pks.remove(&batch.get_pk(i));
@@ -1499,8 +1192,9 @@ impl MasterDispatcher {
                 }
 
                 for ci in 0..n_children {
-                    let (child_tid, fk_col_idx, idx_schema) = {
-                        let cat = unsafe { &mut *self.catalog };
+                    let (child_tid, fk_col_idx, idx_schema) = unsafe {
+                        let disp = &mut *disp_ptr;
+                        let cat = &mut *disp.catalog;
                         let (child_tid, fk_col_idx) = match cat.get_fk_child_info(target_id, ci) {
                             Some(info) => info,
                             None => continue,
@@ -1526,16 +1220,6 @@ impl MasterDispatcher {
             }
         }
 
-        // UPSERT PK identification — needed in two cases:
-        //   1. `has_unique` so Phase 2 can classify upsert rows.
-        //   2. `needs_pk_rejection`: Error-mode on a unique_pk table —
-        //      repurposed as the authoritative PK rejection broadcast.
-        //      Any PK already in the store is a SQL-standard violation.
-        //
-        // Intra-batch consolidation: only PKs with net_weight > 0 are
-        // checked against the store. This preserves z-set primitives
-        // (a +1 then -1 on the same PK is net zero and must not trigger
-        // an against-store conflict).
         if has_unique || needs_pk_rejection {
             let mut lo_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
             let mut hi_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
@@ -1550,7 +1234,7 @@ impl MasterDispatcher {
                 let check_batch = build_check_batch(&source_schema, &lo_list, &hi_list);
                 let pk_col = &[source_schema.pk_index];
                 let sub_batches = op_repartition_batch(
-                    &check_batch, pk_col, &source_schema, self.num_workers);
+                    &check_batch, pk_col, &source_schema, num_workers);
                 p1_labels.push(P1Label::UpsertPkId);
                 p1_checks.push(PipelinedCheck {
                     target_id,
@@ -1565,14 +1249,18 @@ impl MasterDispatcher {
         // ----- Phase 1 execute + interpret --------------------------------
         let mut existing_pks: HashSet<u128> = HashSet::new();
         if !p1_checks.is_empty() {
-            let mut p1_results = self.execute_pipeline(&p1_checks)?;
+            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, p1_checks).await?;
 
             for (idx, label) in p1_labels.iter().enumerate() {
                 match label {
                     P1Label::FkParent { parent_table_id, expected_count } => {
                         if p1_results[idx].len() < *expected_count {
-                            let (sn, tn) = self.get_qualified_name_owned(target_id);
-                            let (tsn, ttn) = self.get_qualified_name_owned(*parent_table_id);
+                            let (sn, tn, tsn, ttn) = unsafe {
+                                let disp = &mut *disp_ptr;
+                                let (s, t) = disp.get_qualified_name_owned(target_id);
+                                let (ts, tt) = disp.get_qualified_name_owned(*parent_table_id);
+                                (s, t, ts, tt)
+                            };
                             return Err(format!(
                                 "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
                                 sn, tn, tsn, ttn
@@ -1581,8 +1269,12 @@ impl MasterDispatcher {
                     }
                     P1Label::FkRestrict { child_tid } => {
                         if !p1_results[idx].is_empty() {
-                            let (sn, tn) = self.get_qualified_name_owned(target_id);
-                            let (csn, ctn) = self.get_qualified_name_owned(*child_tid);
+                            let (sn, tn, csn, ctn) = unsafe {
+                                let disp = &mut *disp_ptr;
+                                let (s, t) = disp.get_qualified_name_owned(target_id);
+                                let (cs, ct) = disp.get_qualified_name_owned(*child_tid);
+                                (s, t, cs, ct)
+                            };
                             return Err(format!(
                                 "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
                                 sn, tn, csn, ctn,
@@ -1591,14 +1283,16 @@ impl MasterDispatcher {
                     }
                     P1Label::UpsertPkId => {
                         existing_pks = std::mem::take(&mut p1_results[idx]);
-                        // Error mode: any existing PK in the result set is
-                        // a SQL-standard duplicate-key violation.
                         if matches!(mode, WireConflictMode::Error)
                             && !existing_pks.is_empty()
                         {
                             let conflict_pk = *existing_pks.iter().next().unwrap();
-                            let pk_name = self.get_col_name(target_id, pki);
-                            let (sn, tn) = self.get_qualified_name_owned(target_id);
+                            let (pk_name, sn, tn) = unsafe {
+                                let disp = &mut *disp_ptr;
+                                let pkn = disp.get_col_name(target_id, pki);
+                                let (s, t) = disp.get_qualified_name_owned(target_id);
+                                (pkn, s, t)
+                            };
                             let key_str = format_pk_value(conflict_pk, &source_schema);
                             return Err(format!(
                                 "duplicate key value violates unique constraint \"{}_{}_pkey\": Key ({})=({}) already exists",
@@ -1615,16 +1309,17 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        // Lazily warm the unique-index filters for this table. One scan
-        // seeds every filter; already-warm filters are left alone.
-        self.ensure_unique_filters_warm(target_id)?;
+        // Lazily warm the unique-index filters. In the async path this
+        // may trigger a scan; the scan is itself async.
+        Self::ensure_unique_filters_warm_async(disp_ptr, reactor, target_id).await?;
 
         let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p2_labels: Vec<P2Label> = Vec::new();
 
         for ci in 0..n_circuits {
-            let (col_idx, type_code, idx_schema) = {
-                let cat = unsafe { &mut *self.catalog };
+            let (col_idx, type_code, idx_schema) = unsafe {
+                let disp = &mut *disp_ptr;
+                let cat = &mut *disp.catalog;
                 let (col_idx, is_unique, type_code) = match cat.get_index_circuit_info(target_id, ci) {
                     Some(info) => info,
                     None => continue,
@@ -1671,14 +1366,13 @@ impl MasterDispatcher {
                 };
 
                 if existing_pks.contains(&pk_i) {
-                    // UPSERT row: unique-value conflict is OK iff it's held by pk_i itself.
                     upsert_keys.push((key_lo, key_hi, pk_i));
                     continue;
                 }
 
                 let key_pk = crate::util::make_pk(key_lo, key_hi);
                 if seen.contains(&key_pk) {
-                    let col_name = self.get_col_name(target_id, source_col);
+                    let col_name = unsafe { (*disp_ptr).get_col_name(target_id, source_col) };
                     return Err(format!(
                         "Unique index violation on column '{}': duplicate in batch", col_name));
                 }
@@ -1688,13 +1382,12 @@ impl MasterDispatcher {
             }
 
             if !check_lo.is_empty() {
-                // Consult the master-side filter first: if every new
-                // value is definitely absent, skip this index's broadcast.
                 let filter_keys: Vec<u128> = check_lo.iter().zip(check_hi.iter())
                     .map(|(&lo, &hi)| crate::util::make_pk(lo, hi))
                     .collect();
-                let skip_broadcast = self.unique_filter_all_absent(
-                    target_id, col_idx, &filter_keys);
+                let skip_broadcast = unsafe {
+                    (*disp_ptr).unique_filter_all_absent(target_id, col_idx, &filter_keys)
+                };
 
                 if !skip_broadcast {
                     let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
@@ -1724,18 +1417,17 @@ impl MasterDispatcher {
             }
         }
 
-        // ----- Phase 2 execute + interpret --------------------------------
         if p2_checks.is_empty() {
             return Ok(());
         }
 
-        let p2_results = self.execute_pipeline(&p2_checks)?;
+        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, p2_checks).await?;
 
         for (idx, label) in p2_labels.iter().enumerate() {
             match label {
                 P2Label::NonUpsert { source_col } => {
                     if !p2_results[idx].is_empty() {
-                        let col_name = self.get_col_name(target_id, *source_col);
+                        let col_name = unsafe { (*disp_ptr).get_col_name(target_id, *source_col) };
                         return Err(format!(
                             "Unique index violation on column '{}'", col_name));
                     }
@@ -1745,13 +1437,16 @@ impl MasterDispatcher {
                     for &(key_lo, key_hi, pk_i) in upsert_keys {
                         let key_pk = crate::util::make_pk(key_lo, key_hi);
                         if !occupied.contains(&key_pk) { continue; }
-                        // Value is occupied; confirm the holder is this same row.
-                        match self.fan_out_seek_by_index(target_id, *col_idx, key_lo, key_hi) {
+                        match Self::fan_out_seek_by_index_async(
+                            disp_ptr, reactor, target_id, *col_idx, key_lo, key_hi,
+                        ).await {
                             Err(e) => return Err(e),
                             Ok(None) => {}
                             Ok(Some(ref found)) if found.count > 0 => {
                                 if found.get_pk(0) != pk_i {
-                                    let col_name = self.get_col_name(target_id, *source_col);
+                                    let col_name = unsafe {
+                                        (*disp_ptr).get_col_name(target_id, *source_col)
+                                    };
                                     return Err(format!(
                                         "Unique index violation on column '{}'", col_name));
                                 }
@@ -1764,6 +1459,102 @@ impl MasterDispatcher {
         }
 
         Ok(())
+    }
+
+    /// Async version of `ensure_unique_filters_warm`. Identical to the
+    /// sync version except it invokes `fan_out_scan_async`.
+    async fn ensure_unique_filters_warm_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::reactor::Reactor,
+        table_id: i64,
+    ) -> Result<(), String> {
+        let (missing, _schema): (Vec<UniqueIndexDesc>, SchemaDescriptor) = unsafe {
+            let disp = &mut *disp_ptr;
+            let (schema, descs) = match disp.unique_index_descriptors(table_id) {
+                Some(x) => x,
+                None => return Ok(()),
+            };
+            let missing: Vec<UniqueIndexDesc> = descs.into_iter()
+                .filter(|d| !disp.unique_filters.contains_key(&(table_id, d.col_idx)))
+                .collect();
+            if missing.is_empty() { return Ok(()); }
+            for d in &missing {
+                disp.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
+            }
+            (missing, schema)
+        };
+
+        let scan_result = Self::fan_out_scan_async(disp_ptr, reactor, table_id).await?;
+        if let Some(batch) = scan_result {
+            unsafe {
+                let disp = &mut *disp_ptr;
+                for d in &missing {
+                    if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                        extract_into_filter(filter, &batch, d);
+                        if filter.capped { continue; }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit N push batches as a single SAL group write. Called from
+    /// the committer task. Returns (groups, req_ids, fsync_id) — the
+    /// caller awaits fsync + per-worker req_ids separately so they can
+    /// `join!` them.
+    pub(crate) fn write_commit_group(
+        &mut self,
+        target_id: i64, batch: &Batch, mode: WireConflictMode,
+        req_ids: &[u64],
+    ) -> Result<(), String> {
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        let pk_col = &[schema.pk_index];
+        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
+        self.record_index_routing(target_id, &schema, &sub_batches);
+        let refs: Vec<Option<&Batch>> = sub_batches.iter()
+            .map(|b| if b.count > 0 { Some(b) } else { None })
+            .collect();
+        self.write_group_with_req_ids(
+            target_id, FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT, &refs,
+            &schema, &col_names, 0, 0, mode.as_u8() as u64, req_ids, -1,
+        )
+    }
+
+    /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.
+    /// Does NOT sync/signal. Caller signals + awaits replies.
+    pub(crate) fn write_checkpoint_group(
+        &mut self, req_ids: &[u64],
+    ) -> Result<(), String> {
+        let schema = SchemaDescriptor::minimal_u64();
+        // One "slot" per worker with empty batch — each worker replies
+        // after flushing its system tables and advancing its epoch.
+        let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
+        self.write_group_with_req_ids(
+            0, FLAG_FLUSH, &refs, &schema, &[], 0, 0, 0, req_ids, -1,
+        )
+    }
+
+    /// Mirror of `do_checkpoint`'s post-broadcast bookkeeping: flush
+    /// system tables and reset the SAL cursor. Called by the committer
+    /// after collecting FLAG_FLUSH ACKs.
+    pub(crate) fn checkpoint_post_ack(&mut self) {
+        let cat = unsafe { &mut *self.catalog };
+        cat.flush_all_system_tables();
+        self.sal.checkpoint_reset();
+        gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
+    }
+
+    /// Accessor for the committer. True when the SAL write cursor has
+    /// crossed the configured checkpoint threshold.
+    pub fn sal_needs_checkpoint(&self) -> bool {
+        self.sal.needs_checkpoint()
+    }
+
+    /// Get the schema descriptor for a target_id. Panics if the table
+    /// has no schema (committer should only see tables that validated).
+    pub fn schema_desc_for(&mut self, target_id: i64) -> SchemaDescriptor {
+        self.get_schema_and_names(target_id).0
     }
 
     fn get_col_name(&mut self, target_id: i64, col_idx: usize) -> String {
@@ -1786,6 +1577,45 @@ impl MasterDispatcher {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Return the first `worker N: <op>: <msg>` error in `decoded` (worker-index
+/// order), or `None` if every reply has status 0. Shared by every fan-out
+/// site that emits per-worker req_ids and decodes their replies in order.
+pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
+    -> Option<String>
+{
+    for (w, d) in decoded.iter().enumerate() {
+        if d.control.status != 0 {
+            let msg = String::from_utf8_lossy(&d.control.error_msg);
+            return Some(format!("worker {}: {}: {}", w, op, msg));
+        }
+    }
+    None
+}
+
+/// Allocate `nw` per-worker request ids, run `submit`, increment in-flight
+/// counters, signal all workers, then await every reply via `join_all`.
+/// Centralises the write + signal + await sequence every async fan-out
+/// repeats. Returns decoded replies in worker order.
+pub(crate) async fn dispatch_fanout<F>(
+    disp_ptr: *mut MasterDispatcher,
+    reactor: &crate::reactor::Reactor,
+    submit: F,
+) -> Result<Vec<DecodedWire>, String>
+where
+    F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
+{
+    let nw = unsafe { (*disp_ptr).num_workers };
+    let req_ids: Vec<u64> = (0..nw).map(|_| reactor.alloc_request_id()).collect();
+    unsafe {
+        let disp = &mut *disp_ptr;
+        submit(disp, &req_ids)?;
+        for w in 0..nw { reactor.increment_in_flight(w); }
+        disp.signal_all();
+    }
+    let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
+    Ok(crate::reactor::join_all(futs).await)
+}
+
 /// Common body for every single-worker async fan-out. Submits the SAL
 /// message, signals the worker, yields, and returns the decoded reply.
 /// The closures in the public wrappers compute the worker; everything
@@ -1799,15 +1629,13 @@ async fn single_worker_async(
     worker: usize,
     seek_pk_lo: u64, seek_pk_hi: u64, seek_col_idx: u64,
     op_name: &'static str,
-) -> Result<Option<Batch>, FanOutError> {
+) -> Result<Option<Batch>, String> {
     let (schema, req_id) = unsafe {
         let disp = &mut *disp_ptr;
-        disp.maybe_checkpoint().map_err(FanOutError::Worker)?;
         let (schema, col_names) = disp.get_schema_and_names(target_id);
         let req_id = reactor.alloc_request_id();
         disp.write_group(target_id, flags, &[], &schema, &col_names,
-                         seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)
-            .map_err(FanOutError::Worker)?;
+                         seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)?;
         reactor.increment_in_flight(worker);
         disp.signal_one(worker);
         (schema, req_id)
@@ -1815,7 +1643,7 @@ async fn single_worker_async(
     let decoded = reactor.await_reply(req_id).await;
     if decoded.control.status != 0 {
         let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-        return Err(FanOutError::Worker(format!("worker {}: {}: {}", worker, op_name, msg)));
+        return Err(format!("worker {}: {}: {}", worker, op_name, msg));
     }
     Ok(extract_single_batch(&schema, decoded))
 }
