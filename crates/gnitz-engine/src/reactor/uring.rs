@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use io_uring::{opcode, types, IoUring};
 
-use crate::ring::{Cqe, Ring};
+use super::ring::{Cqe, Ring};
 
 /// Production Ring implementation wrapping the `io-uring` crate.
 pub struct IoUringRing {
