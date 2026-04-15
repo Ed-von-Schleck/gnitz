@@ -455,8 +455,13 @@ impl Batch {
                 if len == 0 { continue; }
                 let old_off = self.offsets[i] as usize;
                 let new_off = new_offsets[i] as usize;
-                new_data[new_off..new_off + len]
-                    .copy_from_slice(&self.data[old_off..old_off + len]);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.data.as_ptr().add(old_off),
+                        new_data.as_mut_ptr().add(new_off),
+                        len,
+                    );
+                }
             }
 
             let old_data = std::mem::replace(&mut self.data, new_data);
@@ -464,13 +469,19 @@ impl Batch {
         } else {
             // Vec already has sufficient capacity (e.g. cleared batch being
             // refilled).  copy_within shifts regions in one pass.
-            unsafe { self.data.set_len(new_total); }
-            for i in (0..nr).rev() {
-                let old_start = self.offsets[i] as usize;
-                let new_start = new_offsets[i] as usize;
-                let data_len = self.count * self.strides[i] as usize;
-                if old_start != new_start && data_len > 0 {
-                    self.data.copy_within(old_start..old_start + data_len, new_start);
+            unsafe {
+                self.data.set_len(new_total);
+                for i in (0..nr).rev() {
+                    let old_start = self.offsets[i] as usize;
+                    let new_start = new_offsets[i] as usize;
+                    let data_len = self.count * self.strides[i] as usize;
+                    if old_start != new_start && data_len > 0 {
+                        std::ptr::copy(
+                            self.data.as_ptr().add(old_start),
+                            self.data.as_mut_ptr().add(new_start),
+                            data_len,
+                        );
+                    }
                 }
             }
         }
@@ -615,7 +626,7 @@ impl Batch {
         for i in 0..4 + npc {
             let off = self.offsets[i] as usize;
             let len = self.count * self.strides[i] as usize;
-            ptrs.push(unsafe { self.data.as_ptr().add(off) });
+            ptrs.push(self.data[off..].as_ptr());
             sizes.push(len as u32);
         }
         ptrs.push(self.blob.as_ptr());
@@ -632,14 +643,23 @@ impl Batch {
         let mut new_data = super::batch_pool::acquire_buf().unwrap_or_default();
         new_data.clear();
         new_data.reserve(packed_size);
-        // SAFETY: we'll fill all `packed_size` bytes immediately below.
-        unsafe { new_data.set_len(packed_size); }
-        for i in 0..nr {
-            let stride = self.strides[i] as usize;
-            let len = self.count * stride;
-            let src_off = self.offsets[i] as usize;
-            let dst_off = packed_offsets[i] as usize;
-            new_data[dst_off..dst_off + len].copy_from_slice(&self.data[src_off..src_off + len]);
+        // SAFETY: copy_nonoverlapping fills all `packed_size` bytes below;
+        // src and dst are non-overlapping (different allocations).
+        unsafe {
+            new_data.set_len(packed_size);
+            for i in 0..nr {
+                let stride = self.strides[i] as usize;
+                let len = self.count * stride;
+                let src_off = self.offsets[i] as usize;
+                let dst_off = packed_offsets[i] as usize;
+                if len > 0 {
+                    std::ptr::copy_nonoverlapping(
+                        self.data.as_ptr().add(src_off),
+                        new_data.as_mut_ptr().add(dst_off),
+                        len,
+                    );
+                }
+            }
         }
         let mut new_blob = super::batch_pool::acquire_buf().unwrap_or_default();
         new_blob.clear();
@@ -1028,9 +1048,11 @@ impl Batch {
     pub fn region_ptr(&self, idx: usize) -> *const u8 {
         let npc = self.num_payload_cols();
         if idx < 4 + npc {
-            unsafe { self.data.as_ptr().add(self.offsets[idx] as usize) }
-        } else {
+            self.data[self.offsets[idx] as usize..].as_ptr()
+        } else if idx == 4 + npc {
             self.blob.as_ptr()
+        } else {
+            panic!("region_ptr: index {idx} out of range (num_regions_total = {})", 4 + npc + 1);
         }
     }
 
@@ -1050,7 +1072,7 @@ impl Batch {
         for i in 0..4 + npc {
             let off = self.offsets[i] as usize;
             let len = self.count * self.strides[i] as usize;
-            r.push((unsafe { self.data.as_ptr().add(off) }, len));
+            r.push((self.data[off..].as_ptr(), len));
         }
         r.push((self.blob.as_ptr(), self.blob.len()));
         r

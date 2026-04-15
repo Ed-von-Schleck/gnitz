@@ -556,11 +556,10 @@ impl Drop for Table {
 
 pub(crate) fn ensure_dir(dir: &str) -> Result<CString, i32> {
     let dir_c = CString::new(dir).map_err(|_| -1)?;
-    unsafe {
-        let rc = libc::mkdir(dir_c.as_ptr(), 0o755);
-        if rc < 0 && *libc::__errno_location() != libc::EEXIST {
-            return Err(-3);
-        }
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(-3),
     }
     Ok(dir_c)
 }

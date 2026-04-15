@@ -49,9 +49,27 @@ pub struct ManifestEntryRaw {
 
 const _: () = assert!(mem::size_of::<ManifestEntryRaw>() == ENTRY_SIZE_V3);
 
+impl Default for ManifestEntryRaw {
+    fn default() -> Self {
+        Self {
+            table_id:     0,
+            pk_min_lo:    0,
+            pk_min_hi:    0,
+            pk_max_lo:    0,
+            pk_max_hi:    0,
+            min_lsn:      0,
+            max_lsn:      0,
+            filename:     [0; 128],
+            level:        0,
+            guard_key_lo: 0,
+            guard_key_hi: 0,
+        }
+    }
+}
+
 impl ManifestEntryRaw {
     pub fn zeroed() -> Self {
-        unsafe { mem::zeroed() }
+        Self::default()
     }
 
     pub fn filename_str(&self) -> &str {
@@ -84,16 +102,21 @@ pub fn serialize(
     write_u64_le(out_buf, 16, count as u64);
     write_u64_le(out_buf, 24, global_max_lsn);
 
-    // Write entries as raw bytes
+    // Write entries field-by-field (symmetric with parse; immune to padding changes)
     for i in 0..count {
         let off = HEADER_SIZE + i * ENTRY_SIZE_V3;
-        let entry_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &entries[i] as *const ManifestEntryRaw as *const u8,
-                ENTRY_SIZE_V3,
-            )
-        };
-        out_buf[off..off + ENTRY_SIZE_V3].copy_from_slice(entry_bytes);
+        let e = &entries[i];
+        write_u64_le(out_buf, off,       e.table_id);
+        write_u64_le(out_buf, off +   8, e.pk_min_lo);
+        write_u64_le(out_buf, off +  16, e.pk_min_hi);
+        write_u64_le(out_buf, off +  24, e.pk_max_lo);
+        write_u64_le(out_buf, off +  32, e.pk_max_hi);
+        write_u64_le(out_buf, off +  40, e.min_lsn);
+        write_u64_le(out_buf, off +  48, e.max_lsn);
+        out_buf[off + 56..off + 184].copy_from_slice(&e.filename);
+        write_u64_le(out_buf, off + 184, e.level);
+        write_u64_le(out_buf, off + 192, e.guard_key_lo);
+        write_u64_le(out_buf, off + 200, e.guard_key_hi);
     }
 
     total as i64
