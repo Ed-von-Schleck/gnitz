@@ -1988,3 +1988,231 @@ fn test_drop_table_cleans_up_indices() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── Regression: drop_table must cascade to owned indices ─────────────
+// Bug 1.3: drop_table used to only retract sys_tables + sys_columns,
+// leaving sys_indices rows whose owner table no longer existed.  On the
+// next restart, replay_catalog would fail with "Index: owner table N
+// not found", leaving the database un-openable.
+
+#[test]
+fn test_drop_table_cascades_secondary_index() {
+    let dir = temp_dir("drop_table_cascade_sec");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("pk"), i64_col_def("val")];
+    let tid = engine.create_table("public.cascade_tbl", &cols, 0, true).unwrap();
+    engine.create_index("public.cascade_tbl", "val", false).unwrap();
+
+    let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
+    assert!(engine.index_by_name.contains_key(&idx_name));
+    let idx_records_before = count_records(&mut engine.sys_indices);
+    assert!(idx_records_before >= 1);
+
+    // Drop the table WITHOUT dropping the index first.
+    engine.drop_table("public.cascade_tbl").unwrap();
+
+    assert!(!engine.index_by_name.contains_key(&idx_name),
+            "in-memory index registry must forget the index");
+    assert!(!engine.dag.tables.contains_key(&tid));
+    assert_eq!(count_records(&mut engine.sys_indices), idx_records_before - 1,
+               "sys_indices must retract exactly one record");
+
+    // Reopen: before the fix, replay_catalog would fail here because
+    // the orphaned sys_indices row references tid which no longer exists.
+    engine.close();
+    drop(engine);
+    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    assert!(!engine2.index_by_name.contains_key(&idx_name));
+    engine2.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_drop_table_cascades_fk_index() {
+    let dir = temp_dir("drop_table_cascade_fk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_cols = vec![u64_col_def("pk"), u64_col_def("name")];
+    let parent_tid = engine.create_table("public.parent", &parent_cols, 0, true).unwrap();
+
+    let child_cols = vec![
+        u64_col_def("pk"),
+        ColumnDef {
+            name: "parent_ref".into(),
+            type_code: type_code::U64,
+            is_nullable: false,
+            fk_table_id: parent_tid,
+            fk_col_idx: 0,
+        },
+    ];
+    engine.create_table("public.child", &child_cols, 0, true).unwrap();
+
+    let fk_idx_name = make_fk_index_name("public", "child", "parent_ref");
+    assert!(engine.index_by_name.contains_key(&fk_idx_name),
+            "FK index must be auto-created with the child table");
+
+    // drop_index refuses to drop __fk_ indices, so drop_table is the only
+    // valid path for this cleanup. Before the fix: the on_index_delta
+    // hook's __fk_ guard blocked drop_table from cascading.
+    engine.drop_table("public.child").unwrap();
+    assert!(!engine.index_by_name.contains_key(&fk_idx_name),
+            "FK index must be removed by drop_table cascade");
+
+    // Reopen catalog — must succeed.
+    engine.close();
+    drop(engine);
+    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    assert!(!engine2.index_by_name.contains_key(&fk_idx_name));
+    engine2.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Regression: intra-batch modifications to the same PK ─────────────
+// Bug 1.1: enforce_unique_pk_partitioned calls ptable.retract_pk which
+// is read-only (sets found_source; doesn't mutate the store).  Calling
+// it twice for the same PK in one batch emitted the stored-row
+// retraction twice, driving downstream weights negative.  Additionally,
+// `seen` stored an effective-relative index but was fed to
+// append_batch_negated(&batch, ...), negating the wrong row once store
+// retractions shifted effective.count ahead of the batch row index.
+
+#[test]
+fn test_intra_batch_insert_then_delete_same_pk() {
+    // [(+1, pk=1, v=200), (-1, pk=1)] with store (pk=1, v=100) should
+    // net to "row (1, 100) retracted, nothing inserted".
+    let dir = temp_dir("intra_batch_ins_del");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    engine.dag.ingest_to_family(tid, bb.finish());
+    let _ = engine.dag.flush(tid);
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1, 0, -1); bb.put_u64(0); bb.end_row();
+    let effective = engine.ingest_returning_effective(tid, bb.finish()).unwrap();
+
+    // Count retractions of the stored (pk=1, val=100) row.  Must be
+    // exactly 1; the bug produced 2.
+    let mut retractions_of_100 = 0;
+    let col = effective.col_data(0);
+    for i in 0..effective.count {
+        if effective.get_pk(i) == 1 && effective.get_weight(i) == -1 {
+            let v = u64::from_le_bytes(col[i*8..i*8+8].try_into().unwrap());
+            if v == 100 { retractions_of_100 += 1; }
+        }
+    }
+    assert_eq!(retractions_of_100, 1,
+               "stored row (val=100) must be retracted exactly once; got {}",
+               retractions_of_100);
+
+    // Net weight per distinct (pk, val) in the effective batch should
+    // leave val=100 at -1 (cancels the stored +1) and val=200 at 0.
+    let mut net: HashMap<(u128, u64), i64> = HashMap::new();
+    for i in 0..effective.count {
+        let pk = effective.get_pk(i);
+        let v = u64::from_le_bytes(col[i*8..i*8+8].try_into().unwrap());
+        *net.entry((pk, v)).or_insert(0) += effective.get_weight(i);
+    }
+    assert_eq!(net.get(&(1u128, 100u64)).copied().unwrap_or(0), -1,
+               "val=100 must net to -1 (retract stored)");
+    assert_eq!(net.get(&(1u128, 200u64)).copied().unwrap_or(0), 0,
+               "val=200 must net to 0 (insert+delete cancel)");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_intra_batch_double_insert_same_pk() {
+    // [(+1, pk=1, v=A), (+1, pk=1, v=B)] with store (pk=1, v=old).
+    // Expected semantics: stored `old` retracted, `A` transient (+1/-1),
+    // `B` inserted.
+    let dir = temp_dir("intra_batch_dbl_ins");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(10); bb.end_row();
+    engine.dag.ingest_to_family(tid, bb.finish());
+    let _ = engine.dag.flush(tid);
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(1, 0, 1); bb.put_u64(30); bb.end_row();
+    let effective = engine.ingest_returning_effective(tid, bb.finish()).unwrap();
+
+    let col = effective.col_data(0);
+    let mut net: HashMap<(u128, u64), i64> = HashMap::new();
+    for i in 0..effective.count {
+        let pk = effective.get_pk(i);
+        let v = u64::from_le_bytes(col[i*8..i*8+8].try_into().unwrap());
+        *net.entry((pk, v)).or_insert(0) += effective.get_weight(i);
+    }
+
+    // Bug manifestations this test would have caught:
+    //   - double retraction bug: net(1, 10) would be -2, not -1.
+    //   - `seen` index bug: net(1, 20) would be +1 (A survives because
+    //     the wrong row got negated), and net(1, 30) net 0.
+    assert_eq!(net.get(&(1u128, 10u64)).copied().unwrap_or(0), -1,
+               "stored row v=10 retracted exactly once");
+    assert_eq!(net.get(&(1u128, 20u64)).copied().unwrap_or(0), 0,
+               "transient v=20 must net to 0 (inserted then superseded)");
+    assert_eq!(net.get(&(1u128, 30u64)).copied().unwrap_or(0), 1,
+               "final v=30 must net to +1");
+
+    // And the store after ingest should have a single row (1, 30).
+    let scan = engine.scan_family(tid).unwrap();
+    assert_eq!(scan.count, 1, "store must hold exactly one live row");
+    let scol = scan.col_data(0);
+    let live_val = u64::from_le_bytes(scol[0..8].try_into().unwrap());
+    assert_eq!(live_val, 30);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_intra_batch_same_pk_propagates_to_view() {
+    // End-to-end: a view watching the base table must see the correct
+    // net delta, not ghost negative-weight rows from double retraction.
+    let dir = temp_dir("intra_batch_view");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let out_cols = vec![
+        ("id".to_string(), type_code::U64),
+        ("val".to_string(), type_code::U64),
+    ];
+    let graph = make_passthrough_graph(tid, &out_cols);
+    let vid = engine.create_view("public.v", &graph, "").unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    engine.push_and_evaluate(tid, bb.finish()).unwrap();
+    assert_eq!(engine.scan_family(vid).unwrap().count, 1);
+
+    // Intra-batch: replace val 100 → 200 → 300.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1, 0, 1); bb.put_u64(300); bb.end_row();
+    engine.push_and_evaluate(tid, bb.finish()).unwrap();
+
+    let scan = engine.scan_family(vid).unwrap();
+    assert_eq!(scan.count, 1, "view must hold exactly one live row");
+    let col = scan.col_data(0);
+    let v = u64::from_le_bytes(col[0..8].try_into().unwrap());
+    assert_eq!(v, 300);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

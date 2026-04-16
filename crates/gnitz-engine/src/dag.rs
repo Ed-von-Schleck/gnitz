@@ -1452,8 +1452,10 @@ impl DagEngine {
         }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
-        // Track seen PKs for intra-batch dedup: pk u128 → last position
-        let mut seen: HashMap<u128, usize> = HashMap::new();
+        // pk → batch row index of the last +1 insertion in this batch.
+        // Must be a batch index (not effective index) because
+        // `append_batch_negated` below indexes into `batch`.
+        let mut seen: HashMap<u128, usize> = HashMap::with_capacity(batch.count);
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
@@ -1473,7 +1475,7 @@ impl DagEngine {
 
                 // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
-                seen.insert(pk, effective.count - 1);
+                seen.insert(pk, row);
             } else if w < 0 {
                 // Negative weight = deletion
                 effective.append_batch(&batch, row, row + 1);
@@ -1499,7 +1501,17 @@ impl DagEngine {
         }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
-        let mut seen: HashMap<u128, usize> = HashMap::new();
+        // pk → batch row index of the last +1 insertion in this batch.
+        // Must be a batch index (not effective index) because
+        // `append_batch_negated` below indexes into `batch`, and the
+        // effective batch may contain extra store-retraction rows that
+        // break any 1:1 correspondence with `row`.
+        let mut seen: HashMap<u128, usize> = HashMap::with_capacity(batch.count);
+        // pk set of store rows already retracted in this batch.
+        // `retract_pk` is read-only (sets `found_source` only), so calling
+        // it twice for the same PK would emit the stored-row retraction
+        // twice and drive downstream weights negative.
+        let mut store_retracted: HashSet<u128> = HashSet::with_capacity(batch.count);
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
@@ -1508,10 +1520,11 @@ impl DagEngine {
             if w > 0 {
                 // Check store for existing row with this PK
                 let (_existing_w, found) = ptable.retract_pk(pk);
-                if found {
+                if found && !store_retracted.contains(&pk) {
                     // Emit retraction of existing stored row so downstream views
-                    // see the removal of the old payload.
+                    // see the removal of the old payload — exactly once per PK.
                     effective.append_row_from_ptable_found(ptable, pk, -1);
+                    store_retracted.insert(pk);
                 }
 
                 // Intra-batch dedup: retract previous insertion of same PK
@@ -1521,13 +1534,15 @@ impl DagEngine {
 
                 // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
-                seen.insert(pk, effective.count - 1);
+                seen.insert(pk, row);
             } else if w < 0 {
                 // Negative weight = explicit retraction
                 let (_existing_w, found) = ptable.retract_pk(pk);
-                if found {
+                let store_hit = found && !store_retracted.contains(&pk);
+                if store_hit {
                     // Emit retraction using stored payload (the actual column data)
                     effective.append_row_from_ptable_found(ptable, pk, -1);
+                    store_retracted.insert(pk);
                 }
 
                 // Intra-batch dedup: if this PK was inserted earlier in this batch,

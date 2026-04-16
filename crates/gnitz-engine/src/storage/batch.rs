@@ -876,6 +876,15 @@ impl Batch {
     pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
         let end = end.min(src.count);
         if start >= end { return; }
+        // Weak guard for the precondition documented above: a differing
+        // blob length proves `self.blob` and `src.blob` aren't the same
+        // content, so verbatim copies of the 16-byte German String structs
+        // would leave dangling heap offsets in `self`.
+        debug_assert_eq!(
+            self.blob.len(), src.blob.len(),
+            "append_batch_no_blob_reloc: self.blob and src.blob must be identical (self={}, src={})",
+            self.blob.len(), src.blob.len(),
+        );
         let n = end - start;
         self.reserve_rows(n);
         // All four system regions

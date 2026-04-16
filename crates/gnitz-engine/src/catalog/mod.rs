@@ -14,7 +14,7 @@ mod sys_tables;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
 
@@ -1207,8 +1207,9 @@ impl CatalogEngine {
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
 
-                // Backfill index from source table
-                self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema);
+                // Backfill index from source table.  For is_unique, this
+                // also validates that no two rows share the same key.
+                self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
 
                 // Register with DagEngine — Box ownership transfers here
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
@@ -1218,9 +1219,9 @@ impl CatalogEngine {
                 self.index_by_id.insert(idx_id, name.clone());
             } else {
                 if self.index_by_name.contains_key(&name) {
-                    if name.contains("__fk_") {
-                        return Err("Forbidden: cannot drop internal FK index".into());
-                    }
+                    // Policy check ("__fk_" guard) lives at the user-facing
+                    // entry point `drop_index`; this hook executes for both
+                    // explicit drops and cascade drops from `drop_table`.
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
                     self.index_by_name.remove(&name);
                     self.index_by_id.remove(&idx_id);
@@ -1334,24 +1335,42 @@ impl CatalogEngine {
         is_unique: bool,
         idx_table: *mut Table,
         idx_schema: &SchemaDescriptor,
-    ) {
+    ) -> Result<(), String> {
         let entry = match self.dag.tables.get(&owner_id) {
             Some(e) => e,
-            None => return,
+            None => return Ok(()),
         };
         let owner_schema = entry.schema;
 
         // Scan source and project into index
         let scan = self.scan_store(owner_id, &owner_schema);
-        if scan.count == 0 { return; }
+        if scan.count == 0 { return Ok(()); }
 
         let projected = DagEngine::batch_project_index(&scan, col_idx, &owner_schema, idx_schema);
-        if projected.count > 0 {
-            let npc = projected.num_payload_cols();
-            let (ptrs, sizes) = projected.to_region_ptrs();
-            let table = unsafe { &mut *idx_table };
-            let _ = table.ingest_batch_from_regions(&ptrs, &sizes, projected.count as u32, npc);
+        if projected.count == 0 { return Ok(()); }
+
+        if is_unique {
+            // The projected batch's PK is the indexed column value, one row
+            // per source row with net weight +1.  For a unique index to be
+            // valid, every key must appear at most once.
+            let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
+            for row in 0..projected.count {
+                if projected.get_weight(row) <= 0 { continue; }
+                let key = projected.get_pk(row);
+                if !seen.insert(key) {
+                    return Err(format!(
+                        "cannot create unique index: column contains duplicate values (table_id={}, col_idx={})",
+                        owner_id, col_idx,
+                    ));
+                }
+            }
         }
+
+        let npc = projected.num_payload_cols();
+        let (ptrs, sizes) = projected.to_region_ptrs();
+        let table = unsafe { &mut *idx_table };
+        let _ = table.ingest_batch_from_regions(&ptrs, &sizes, projected.count as u32, npc);
+        Ok(())
     }
 
     // -- Read column definitions from sys_columns --------------------------
@@ -1759,6 +1778,11 @@ impl CatalogEngine {
 
         self.check_for_dependencies(tid, table_name)?;
 
+        // Cascade: retract every index owned by this table (secondary + FK).
+        // Must run before the table record is retracted so the
+        // `on_index_delta` hook can still resolve the owner if needed.
+        self.retract_indices_for_owner(tid)?;
+
         // Retract table record — cursor-based to match exact stored payload
         {
             let schema = table_tab_schema();
@@ -1776,6 +1800,32 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Retract every live index record whose owner_id matches `owner_id`.
+    /// Used by `drop_table` to prevent orphaned index rows that would
+    /// break `replay_catalog` on restart.
+    fn retract_indices_for_owner(&mut self, owner_id: i64) -> Result<(), String> {
+        let schema = idx_tab_schema();
+        let mut cursor = match self.sys_indices.create_cursor() {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let mut batch = Batch::with_schema(schema, 4);
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
+                if row_owner == owner_id {
+                    copy_cursor_row_with_weight(&cursor, &schema, &mut batch, -1);
+                }
+            }
+            cursor.cursor.advance();
+        }
+        if batch.count > 0 {
+            ingest_batch_into(&mut self.sys_indices, &batch);
+            self.on_index_delta(&batch)?;
+        }
+        Ok(())
+    }
+
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
 
     pub(crate) fn create_view(
@@ -1785,6 +1835,9 @@ impl CatalogEngine {
         sql_definition: &str,
     ) -> Result<i64, String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
+        if !self.schema_name_to_id.contains_key(schema_name) {
+            return Err("Schema does not exist".into());
+        }
         let qualified = format!("{}.{}", schema_name, view_name);
         if self.name_to_id.contains_key(&qualified) {
             return Err("View/Table already exists".into());
@@ -1900,7 +1953,10 @@ impl CatalogEngine {
         let index_name = make_secondary_index_name(schema_name, table_name, col_name);
         let index_id = self.allocate_index_id();
 
-        // Write index record (triggers hook)
+        // Write index record (triggers hook).  If the hook fails — most
+        // notably when is_unique and the source column contains duplicates —
+        // we retract the +1 so sys_indices stays consistent and the next
+        // restart's replay doesn't try to reconstruct a broken index.
         {
             let schema = idx_tab_schema();
             let mut bb = BatchBuilder::new(schema);
@@ -1914,7 +1970,19 @@ impl CatalogEngine {
             bb.end_row();
             let batch = bb.finish();
             ingest_batch_into(&mut self.sys_indices, &batch);
-            self.on_index_delta(&batch)?;
+            if let Err(e) = self.on_index_delta(&batch) {
+                let mut undo = BatchBuilder::new(schema);
+                undo.begin_row(index_id as u64, 0, -1);
+                undo.put_u64(owner_id as u64);
+                undo.put_u64(OWNER_KIND_TABLE as u64);
+                undo.put_u64(col_idx as u64);
+                undo.put_string(&index_name);
+                undo.put_u64(if is_unique { 1 } else { 0 });
+                undo.put_string("");
+                undo.end_row();
+                ingest_batch_into(&mut self.sys_indices, &undo.finish());
+                return Err(e);
+            }
         }
 
         self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
@@ -1922,6 +1990,9 @@ impl CatalogEngine {
     }
 
     pub fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
+        if index_name.contains("__fk_") {
+            return Err("Forbidden: cannot drop internal FK index".into());
+        }
         let idx_id = *self.index_by_name.get(index_name)
             .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
 
