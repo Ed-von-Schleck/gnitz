@@ -165,6 +165,21 @@ fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndex
 }
 
 // ---------------------------------------------------------------------------
+// RelayPrepared — output of prepare_relay, input of emit_relay
+// ---------------------------------------------------------------------------
+
+/// Materialised exchange relay: shard columns already resolved, payloads
+/// already scattered into per-worker batches. Only the SAL write is
+/// left, which `emit_relay` does synchronously under `sal_writer_excl`.
+pub(crate) struct RelayPrepared {
+    view_id: i64,
+    source_id: i64,
+    dest_batches: Vec<Batch>,
+    schema: SchemaDescriptor,
+    name_bytes: Rc<[Vec<u8>]>,
+}
+
+// ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
@@ -437,7 +452,8 @@ impl MasterDispatcher {
 
                         if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                             if let Some(relay) = acc.process(w, decoded) {
-                                self.relay_exchange(relay)?;
+                                let prep = self.prepare_relay(relay)?;
+                                self.emit_relay(prep)?;
                             }
                             break; // re-check write_cursor after relay
                         } else {
@@ -489,7 +505,12 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    pub(crate) fn relay_exchange(&mut self, relay: PendingRelay) -> Result<(), String> {
+    /// CPU-only first half of exchange relay: looks up shard columns via
+    /// the catalog DAG, scatters the payloads into per-worker batches,
+    /// and collects column names. No SAL write yet — `relay_loop` runs
+    /// this without `sal_writer_excl` so the lock covers only the
+    /// synchronous SAL write in `emit_relay`.
+    pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
         let remaining = self.sal.mmap_size() - self.sal.cursor();
         if remaining < (self.sal.mmap_size() >> 3) {
             return Err(format!(
@@ -513,14 +534,26 @@ impl MasterDispatcher {
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
         let dest_batches = op_relay_scatter(&sources, &col_indices, &schema, self.num_workers);
 
-        let cat = unsafe { &mut *self.catalog };
-        let names = cat.get_column_names(view_id);
-        let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
+        let (_, name_bytes) = self.get_schema_and_names(view_id);
 
+        Ok(RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes })
+    }
+
+    /// Synchronous second half: writes the FLAG_EXCHANGE_RELAY group to
+    /// SAL and signals workers. Caller holds `sal_writer_excl` for the
+    /// duration of this call; no awaits inside.
+    pub(crate) fn emit_relay(&mut self, prep: RelayPrepared) -> Result<(), String> {
+        let RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes } = prep;
         let refs: Vec<Option<&Batch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
-        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes, 0, 0, 0, 0)
+        // Echo `source_id` back via `seek_pk_lo` so the worker's
+        // `do_exchange_wait` can match on (view_id, source_id). Without
+        // this, a multi-source view (join over 2+ tables) can deliver
+        // the wrong source's relay to a waiting exchange and the worker
+        // demuxes against the wrong sharding columns.
+        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
+                              source_id as u64, 0, 0, 0)
     }
 
     fn record_index_routing(

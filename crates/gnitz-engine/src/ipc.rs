@@ -472,7 +472,7 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'s
     let mut batch = unsafe {
         Batch::from_regions(&ptrs[..nr], &region_sizes[..nr], count as usize, npc)
     };
-    batch.schema = Some(*schema);
+    batch.set_schema(*schema);
     Ok(batch)
 }
 

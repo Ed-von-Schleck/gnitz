@@ -287,7 +287,7 @@ pub fn op_repartition_batches_merged(
             Some(mut d) => {
                 d.sorted = true;
                 d.consolidated = false;
-                d.schema = Some(*schema);
+                d.set_schema(*schema);
                 d
             }
             None => Batch::empty(npc),

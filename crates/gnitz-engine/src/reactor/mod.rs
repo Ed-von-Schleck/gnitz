@@ -154,10 +154,6 @@ struct ReactorShared {
     /// Send results parked before their waker was installed (same pattern
     /// as parked_replies / parked_fsync_results).
     parked_send_results: RefCell<HashMap<u64, i32>>,
-    /// Set when a polled future panics (and was caught + dropped).
-    /// Test-only observability — production never reads it.
-    #[cfg(test)]
-    last_task_panicked: Cell<bool>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -208,8 +204,6 @@ impl Reactor {
             send_fd_for_id: RefCell::new(HashMap::new()),
             send_buffers_in_flight: RefCell::new(HashMap::new()),
             parked_send_results: RefCell::new(HashMap::new()),
-            #[cfg(test)]
-            last_task_panicked: Cell::new(false),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
@@ -568,22 +562,10 @@ impl Reactor {
             Some(t) => t,
             None => return,
         };
-        let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut cx = Context::from_waker(&waker);
-            task.future.as_mut().poll(&mut cx)
-        }));
-        match poll_result {
-            Ok(Poll::Ready(())) => {
-                self.inner.task_wakers.borrow_mut().remove(&key);
-            }
-            Ok(Poll::Pending) => {
-                self.inner.tasks.borrow_mut().insert(key, task);
-            }
-            Err(_) => {
-                self.inner.task_wakers.borrow_mut().remove(&key);
-                #[cfg(test)]
-                self.inner.last_task_panicked.set(true);
-            }
+        let mut cx = Context::from_waker(&waker);
+        match task.future.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => { self.inner.task_wakers.borrow_mut().remove(&key); }
+            Poll::Pending   => { self.inner.tasks.borrow_mut().insert(key, task); }
         }
     }
 
@@ -944,11 +926,6 @@ impl Reactor {
     #[cfg(test)]
     pub fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
-    }
-
-    #[cfg(test)]
-    pub fn last_task_panicked(&self) -> bool {
-        self.inner.last_task_panicked.get()
     }
 }
 
@@ -1341,24 +1318,18 @@ mod tests {
         assert!(polls.get() >= 1);
     }
 
-    /// Spawned task that panics during poll must not crash the reactor.
-    /// The slab entry is dropped and `last_task_panicked` is set.
+    /// Spawned task that panics during poll must propagate — no silent
+    /// swallow. The panic unwinds through `tick` (and up to the caller
+    /// in real use); tests observe it via `#[should_panic]`.
     #[test]
-    fn task_panic_does_not_crash_reactor() {
+    #[should_panic(expected = "boom")]
+    fn panic_in_spawned_task_propagates_not_swallowed() {
         let r = make_reactor();
-        // Suppress the panic-handler stderr noise so test output stays clean.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         r.spawn(async {
             panic!("boom");
         });
-        // Drive a few ticks; the panicking task should be removed.
-        for _ in 0..4 {
-            r.tick(false);
-        }
-        std::panic::set_hook(prev);
-        assert!(r.last_task_panicked());
-        assert_eq!(r.task_count(), 0);
+        // First tick polls the task and unwinds out of `poll_task` → `tick`.
+        r.tick(false);
     }
 
     /// A timer in the past resolves on the very first poll instead of
@@ -1502,6 +1473,55 @@ mod tests {
         }
         r.block_until_idle();
         assert_eq!(*order.borrow(), vec![0, 1, 2], "tasks must serialize");
+    }
+
+    /// Structural regression: a task that acquires the SAL writer mutex,
+    /// writes, drops the guard, then awaits must release the mutex
+    /// before that await — so a concurrent relay/tick task can acquire
+    /// it while the first task's await is outstanding (committer pattern:
+    /// emit under lock, `.await` outside).
+    #[test]
+    fn sal_writer_excl_not_held_across_commit_await() {
+        let r = make_reactor();
+        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        // One-shot channel used as a stand-in for "fsync CQE / worker
+        // ACK": the fake committer awaits `ack_rx`; the other task
+        // sends on `ack_tx` AFTER acquiring the mutex. If the committer
+        // was still holding the mutex, it would deadlock because
+        // neither would make progress.
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let commit_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        let relay_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        let m1 = Rc::clone(&mutex);
+        let cd = Rc::clone(&commit_done);
+        r.spawn(async move {
+            // Emit under lock: identical pattern to the new committer.
+            {
+                let _guard = m1.lock().await;
+                // ...SAL writes would go here...
+            }
+            // Lock dropped. Now wait for "fsync + ACK".
+            let _ = ack_rx.await;
+            cd.set(true);
+        });
+
+        let m2 = Rc::clone(&mutex);
+        let rd = Rc::clone(&relay_done);
+        r.spawn(async move {
+            // This future MUST make progress while the committer is
+            // awaiting ack_rx — proving the mutex was released.
+            let _guard = m2.lock().await;
+            rd.set(true);
+            // Unblock the committer by sending its ACK.
+            let _ = ack_tx.send(());
+        });
+
+        r.block_until_idle();
+        assert!(relay_done.get(),
+            "concurrent task must have acquired the mutex");
+        assert!(commit_done.get(),
+            "committer must complete after its ACK is delivered");
     }
 
     #[test]
@@ -2077,8 +2097,12 @@ mod tests {
 
     /// Inject a synthetic FLAG_EXCHANGE wire for `view_id` on worker `w`.
     /// `req_id` is echoed back from the worker side; the accumulator
-    /// keys by view_id, not req_id.
+    /// keys by `(view_id, source_id)`, not req_id.
     fn synthetic_exchange_wire(view_id: i64, req_id: u64) -> DecodedWire {
+        synthetic_exchange_wire_src(view_id, 0, req_id)
+    }
+
+    fn synthetic_exchange_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
         use crate::ipc::{DecodedControl, FLAG_EXCHANGE};
         DecodedWire {
             control: DecodedControl {
@@ -2086,7 +2110,7 @@ mod tests {
                 client_id: 0,
                 target_id: view_id as u64,
                 flags: FLAG_EXCHANGE as u64,
-                seek_pk_lo: 0,
+                seek_pk_lo: source_id as u64,
                 seek_pk_hi: 0,
                 seek_col_idx: 0,
                 request_id: req_id,
@@ -2159,6 +2183,57 @@ mod tests {
         let _ = r.test_route_reply(1, synthetic_decoded_wire(11));
         assert_eq!(r.in_flight_len(0), 0);
         assert_eq!(r.in_flight_len(1), 0);
+    }
+
+    /// A view with multiple input sources (e.g. join of two tables)
+    /// drives two distinct exchange rounds per tick — same view_id,
+    /// different source_ids. Keying the accumulator by (view_id,
+    /// source_id) keeps their payloads in disjoint map entries; the
+    /// relays come out one per round, each tagged with its own
+    /// source_id. Before the tuple key, round B's payloads
+    /// last-write-wins-overwrote round A's and the relay scattered with
+    /// source B's shard_cols over source A's data.
+    #[test]
+    fn accumulator_distinguishes_source_ids() {
+        let r = make_reactor();
+        let (tx, mut rx) = mpsc::unbounded::<PendingRelay>();
+        r.attach_relay_tx(tx);
+        r.test_init_state(4);
+        *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(4);
+
+        // Register one reply waker per worker to satisfy route_reply's
+        // parked-waker pre-flight check.
+        for w in 0..4 {
+            let waker = make_waker(w, Arc::clone(&r.inner.run_queue));
+            r.register_reply_waker(100 + w as u64, waker);
+            r.increment_in_flight(w);
+        }
+
+        // Interleave two rounds for the same view_id=100:
+        //   round A: (view_id=100, source_id=10), workers 0..4
+        //   round B: (view_id=100, source_id=20), workers 0..4
+        // Arrival order deliberately mixed; neither round is strictly
+        // before the other in wall-clock order.
+        let _ = r.test_route_reply(0, synthetic_exchange_wire_src(100, 10, 100));
+        let _ = r.test_route_reply(0, synthetic_exchange_wire_src(100, 20, 100));
+        let _ = r.test_route_reply(1, synthetic_exchange_wire_src(100, 20, 101));
+        let _ = r.test_route_reply(1, synthetic_exchange_wire_src(100, 10, 101));
+        let _ = r.test_route_reply(2, synthetic_exchange_wire_src(100, 10, 102));
+        let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 10, 103));
+        // Round A must now be complete (4 workers reported).
+        let ra = rx.try_recv().expect("round A should produce a relay");
+        assert_eq!(ra.view_id, 100);
+        assert_eq!(ra.source_id, 10);
+        assert_eq!(ra.payloads.len(), 4);
+        // Round B still incomplete — worker 2+3 haven't reported for src=20.
+        assert!(rx.try_recv().is_none(), "round B must not be ready yet");
+
+        let _ = r.test_route_reply(2, synthetic_exchange_wire_src(100, 20, 102));
+        let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 20, 103));
+        let rb = rx.try_recv().expect("round B should now produce a relay");
+        assert_eq!(rb.view_id, 100);
+        assert_eq!(rb.source_id, 20);
+        assert_eq!(rb.payloads.len(), 4);
     }
 
     /// `select2` returns whichever future completes first; the loser is

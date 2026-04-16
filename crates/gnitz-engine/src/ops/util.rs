@@ -59,7 +59,7 @@ pub(super) fn consolidate_owned(batch: &Batch, schema: &SchemaDescriptor) -> Bat
         });
     consolidated.sorted = true;
     consolidated.consolidated = true;
-    consolidated.schema = Some(*schema);
+    consolidated.set_schema(*schema);
     consolidated
 }
 

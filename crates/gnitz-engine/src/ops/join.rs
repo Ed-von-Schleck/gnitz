@@ -66,7 +66,7 @@ pub fn op_anti_join_delta_trace(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.schema = Some(*schema);
+    output.set_schema(*schema);
     output
 }
 
@@ -137,7 +137,7 @@ pub fn op_semi_join_delta_trace(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.schema = Some(*schema);
+    output.set_schema(*schema);
     output
 }
 
@@ -191,7 +191,7 @@ fn semi_join_dt_swapped(
         });
     // Swapped order: output is in trace key order, which is sorted
     output.sorted = true;
-    output.schema = Some(*schema);
+    output.set_schema(*schema);
     output
 }
 

@@ -1215,7 +1215,7 @@ impl DagEngine {
 
                 let pre_result = match self.execute_plan_phase(view_id, true, input, src_id) {
                     Some(mut batch) => {
-                        batch.schema = Some(exchange_schema);
+                        batch.set_schema(exchange_schema);
                         batch
                     }
                     None => Batch::with_schema(exchange_schema, 0),
@@ -1237,7 +1237,7 @@ impl DagEngine {
                     let mut input_with_schema = input;
                     if input_with_schema.schema.is_none() {
                         if let Some(entry) = self.tables.get(&src_id) {
-                            input_with_schema.schema = Some(entry.schema);
+                            input_with_schema.set_schema(entry.schema);
                         }
                     }
                     let exchanged = exchange.do_exchange(view_id, &input_with_schema, src_id);

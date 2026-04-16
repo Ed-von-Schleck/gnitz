@@ -500,7 +500,7 @@ impl<'a> ReadCursor<'a> {
                 let mut out = unsafe { super::batch::Batch::from_regions(&ptrs, &sizes, row_count, npc) };
                 out.sorted = true;
                 out.consolidated = true;
-                out.schema = Some(*schema);
+                out.set_schema(*schema);
                 out
             }
             CursorSource::Shard(s) => {

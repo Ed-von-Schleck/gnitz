@@ -88,7 +88,7 @@ pub fn op_distinct(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.schema = Some(*schema);
+    output.set_schema(*schema);
 
     (output, consolidated)
 }

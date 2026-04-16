@@ -9,3 +9,12 @@ members = [
     "gnitz-py",
     "gnitz-engine",
 ]
+
+# Release: panic aborts the process so reactor-task panics surface as a
+# backtrace on stderr instead of being silently dropped.  Dev keeps unwind
+# so `#[should_panic]` tests can observe them.
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "unwind"

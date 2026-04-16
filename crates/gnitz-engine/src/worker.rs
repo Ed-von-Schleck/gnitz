@@ -34,13 +34,20 @@ struct DeferredDdl {
 struct WorkerExchangeHandler {
     stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
-    /// FLAG_EXCHANGE_RELAY messages whose `view_id` doesn't match the innermost
-    /// exchange wait. Populated when the worker is blocked inside
-    /// `do_exchange_wait(view_A)` and observes `RELAY[view_B]` in the SAL
-    /// (produced by an exchange a nested inline tick started).  Each nested
-    /// wait checks this map before reading the SAL so relays routed out of
-    /// order still reach the wait that asked for them.
-    pending_relays: HashMap<i64, Batch>,
+    /// FLAG_TICK messages encountered inside `do_exchange_wait` while waiting
+    /// for a FLAG_EXCHANGE_RELAY. Stashed here and replayed (via
+    /// `replay_deferred_ticks`) after the current tick's ACK is sent, so the
+    /// master observes ACKs in SAL arrival order and a later tick cannot
+    /// re-enter `view_id` while an outer exchange for the same view is still
+    /// awaiting its relay. The req_id is the original FLAG_TICK request id
+    /// so the replayed ACK is routable.
+    deferred_ticks: Vec<(i64, u64)>,
+    /// FLAG_EXCHANGE_RELAY messages whose `(view_id, source_id)` doesn't
+    /// match the active exchange wait. Keyed by the tuple so a stashed
+    /// relay for one source never satisfies a wait for a different source
+    /// of the same view (which would drive the inline DAG re-entry with
+    /// the wrong sharding columns).
+    pending_relays: HashMap<(i64, i64), Batch>,
 }
 
 impl WorkerExchangeHandler {
@@ -110,6 +117,7 @@ impl WorkerProcess {
             exchange: WorkerExchangeHandler {
                 stash: HashMap::new(),
                 deferred: Vec::new(),
+                deferred_ticks: Vec::new(),
                 pending_relays: HashMap::new(),
             },
             pending_deltas: HashMap::new(),
@@ -246,7 +254,14 @@ impl WorkerProcess {
 
         let result = self.dispatch_inner(flags, target_id, decoded, request_id);
         match result {
-            DispatchResult::Continue => false,
+            DispatchResult::Continue => {
+                // Replay ticks deferred during any exchange wait now that the
+                // outer tick's ACK has been sent. Pushes are handled inline in
+                // `do_exchange_wait` (safe because user-table push only
+                // appends to `pending_deltas`) so we don't defer them.
+                self.replay_deferred_ticks();
+                false
+            }
             DispatchResult::Shutdown => true,
             DispatchResult::Error(msg) => {
                 self.send_error(&msg, request_id);
@@ -617,9 +632,10 @@ impl WorkerProcess {
 
         let master_pid = self.master_pid;
         let expected_epoch = self.expected_epoch;
+        let want_key = (view_id, source_id);
 
         loop {
-            if let Some(b) = self.exchange.pending_relays.remove(&view_id) {
+            if let Some(b) = self.exchange.pending_relays.remove(&want_key) {
                 return b;
             }
 
@@ -632,7 +648,7 @@ impl WorkerProcess {
             }
 
             loop {
-                if let Some(b) = self.exchange.pending_relays.remove(&view_id) {
+                if let Some(b) = self.exchange.pending_relays.remove(&want_key) {
                     return b;
                 }
 
@@ -649,17 +665,24 @@ impl WorkerProcess {
                 };
 
                 if msg_flags == FLAG_EXCHANGE_RELAY {
-                    let relay_batch = msg_wire
-                        .and_then(|d| ipc::decode_wire(d).ok())
+                    // source_id is echoed back via seek_pk_lo (see
+                    // master::relay_exchange). Decode once, before
+                    // taking the batch out.
+                    let decoded = msg_wire.and_then(|d| ipc::decode_wire(d).ok());
+                    let relay_source_id = decoded.as_ref()
+                        .map(|d| d.control.seek_pk_lo as i64)
+                        .unwrap_or(0);
+                    let relay_batch = decoded
                         .and_then(|d| d.data_batch)
                         .unwrap_or_else(|| {
                             let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
                             Batch::with_schema(empty_schema, 0)
                         });
-                    if msg_target == view_id {
+                    let relay_key = (msg_target, relay_source_id);
+                    if relay_key == want_key {
                         return relay_batch;
                     }
-                    self.exchange.pending_relays.insert(msg_target, relay_batch);
+                    self.exchange.pending_relays.insert(relay_key, relay_batch);
                     continue;
                 }
 
@@ -677,6 +700,26 @@ impl WorkerProcess {
                     continue;
                 }
 
+                // FLAG_TICK triggers evaluate_dag which can open more exchanges;
+                // running it inline would re-enter the same `view_id` with a
+                // different source and produce schema-mismatched relays.
+                // Defer + replay after the outer tick ACK (see
+                // `replay_deferred_ticks` in `dispatch_message`).
+                if msg_flags & FLAG_TICK != 0 {
+                    let tick_req_id = msg_wire
+                        .and_then(|d| ipc::decode_wire(d).ok())
+                        .map(|d| d.control.request_id)
+                        .unwrap_or(0);
+                    self.exchange.deferred_ticks.push((msg_target, tick_req_id));
+                    continue;
+                }
+
+                // FLAG_PUSH for user tables only appends to `pending_deltas`
+                // (no DAG eval, no exchange), so it's safe to handle inline —
+                // and it must be, because the master's committer holds
+                // `sal_writer_excl` while awaiting the push ACK, which would
+                // deadlock against the relay_loop that needs the same mutex
+                // to publish this exchange's relay.
                 if msg_flags & FLAG_PUSH != 0 {
                     let decoded = msg_wire.and_then(|d| ipc::decode_wire(d).ok());
                     let req_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
@@ -694,22 +737,69 @@ impl WorkerProcess {
                     continue;
                 }
 
-                if msg_flags & FLAG_TICK != 0 {
-                    let req_id = msg_wire
-                        .and_then(|d| ipc::decode_wire(d).ok())
-                        .map(|d| d.control.request_id)
-                        .unwrap_or(0);
-                    match self.handle_tick(msg_target, req_id) {
-                        Ok(()) => self.send_ack(msg_target as u64, 0, req_id),
-                        Err(e) => self.send_error(&e, req_id),
+                if msg_flags & FLAG_PRELOADED_EXCHANGE != 0 {
+                    if let Some(data) = msg_wire {
+                        if let Ok(decoded) = ipc::decode_wire(data) {
+                            if let Some(batch) = decoded.data_batch {
+                                self.exchange.stash_preloaded(msg_target, batch);
+                            } else if let Some(s) = decoded.schema {
+                                self.exchange.stash_preloaded(
+                                    msg_target,
+                                    Batch::with_schema(s, 0),
+                                );
+                            }
+                        }
                     }
                     continue;
                 }
 
-                // Unknown/uninteresting flag — discard.
+                // Read-only / control messages (SEEK, SEEK_BY_INDEX, HAS_PK,
+                // BACKFILL, FLUSH, SHUTDOWN) respond inline so clients don't
+                // block behind the current tick. Delegate to `dispatch_inner`
+                // so the same handlers as the main loop run.
+                //
+                // Skip unicast messages not for this worker (matches the
+                // filter in `dispatch_message`).
+                const BROADCAST_FLAGS: u32 = FLAG_SHUTDOWN | FLAG_FLUSH
+                    | FLAG_BACKFILL | FLAG_HAS_PK;
+                if msg_wire.is_none() && msg_flags & BROADCAST_FLAGS == 0 {
+                    continue;
+                }
+                let decoded = msg_wire.and_then(|d| ipc::decode_wire(d).ok());
+                let req_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
+                match self.dispatch_inner(msg_flags, msg_target, decoded, req_id) {
+                    DispatchResult::Continue => {}
+                    DispatchResult::Error(msg) => self.send_error(&msg, req_id),
+                    DispatchResult::Shutdown => {
+                        // dispatch_inner's FLAG_SHUTDOWN branch already called
+                        // libc::_exit — unreachable in practice.
+                        return Batch::with_schema(
+                            schema.unwrap_or(SchemaDescriptor::default()), 0,
+                        );
+                    }
+                }
             }
         }
     }
+
+    /// Replay FLAG_TICK messages deferred during an exchange wait. Runs
+    /// after the current tick's ACK has been sent so the master observes
+    /// ACKs in SAL arrival order. Each replayed tick may itself trigger
+    /// more exchanges and defer more ticks, so loop until the queue is
+    /// empty.
+    fn replay_deferred_ticks(&mut self) {
+        while !self.exchange.deferred_ticks.is_empty() {
+            let ticks: Vec<(i64, u64)> =
+                std::mem::take(&mut self.exchange.deferred_ticks);
+            for (target_id, req_id) in ticks {
+                match self.handle_tick(target_id, req_id) {
+                    Ok(()) => self.send_ack(target_id as u64, 0, req_id),
+                    Err(e) => self.send_error(&e, req_id),
+                }
+            }
+        }
+    }
+
 
     fn shutdown(&mut self) {
         let _ = self.handle_flush_all();
@@ -810,6 +900,7 @@ mod tests {
         WorkerExchangeHandler {
             stash: HashMap::new(),
             deferred: Vec::<DeferredDdl>::new(),
+            deferred_ticks: Vec::new(),
             pending_relays: HashMap::new(),
         }
     }
@@ -978,9 +1069,10 @@ mod tests {
 
     // -- pending_relays tests ------------------------------------------------
 
-    /// Relays arriving for a different view_id while an outer exchange waits
-    /// are parked in `pending_relays`; the next nested wait to ask for that
-    /// view_id pulls them from the queue instead of re-reading the SAL.
+    /// Relays arriving for a different (view_id, source_id) while an outer
+    /// exchange waits are parked in `pending_relays`; the next nested wait
+    /// to ask for that exact pair pulls them from the queue instead of
+    /// re-reading the SAL.
     #[test]
     fn test_pending_relays_queue_and_drain() {
         let mut h = make_handler();
@@ -989,15 +1081,42 @@ mod tests {
         batch_b.count = 7;
         let mut batch_c = Batch::with_schema(schema, 0);
         batch_c.count = 9;
-        h.pending_relays.insert(200, batch_b);
-        h.pending_relays.insert(300, batch_c);
+        h.pending_relays.insert((200, 0), batch_b);
+        h.pending_relays.insert((300, 0), batch_c);
 
         // Nested wait for view 200 finds its relay without touching the SAL.
-        let b = h.pending_relays.remove(&200).expect("view 200 relay queued");
+        let b = h.pending_relays.remove(&(200, 0)).expect("view 200 relay queued");
         assert_eq!(b.count, 7);
-        assert!(!h.pending_relays.contains_key(&200));
+        assert!(!h.pending_relays.contains_key(&(200, 0)));
         // Unrelated view 300 remains parked for its own wait.
-        assert!(h.pending_relays.contains_key(&300));
+        assert!(h.pending_relays.contains_key(&(300, 0)));
+    }
+
+    /// Two exchange rounds for the *same* view_id but different
+    /// source_ids (typical for a join view with multiple input tables)
+    /// must stash independently. Keying by view_id alone was the
+    /// root-cause bug — a relay for source A satisfied a wait for
+    /// source B.
+    #[test]
+    fn test_pending_relays_keyed_by_view_and_source() {
+        let mut h = make_handler();
+        let schema = test_schema();
+        let mut batch_a = Batch::with_schema(schema, 0);
+        batch_a.count = 3;
+        let mut batch_b = Batch::with_schema(schema, 0);
+        batch_b.count = 11;
+
+        // Same view_id=100, different source_ids 10 and 20.
+        h.pending_relays.insert((100, 10), batch_a);
+        h.pending_relays.insert((100, 20), batch_b);
+
+        // Retrieving one does NOT retrieve the other.
+        let a = h.pending_relays.remove(&(100, 10)).expect("(100,10) queued");
+        assert_eq!(a.count, 3);
+        assert!(h.pending_relays.contains_key(&(100, 20)),
+            "retrieving (100,10) must leave (100,20) in place");
+        let b = h.pending_relays.remove(&(100, 20)).expect("(100,20) queued");
+        assert_eq!(b.count, 11);
     }
 
     /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,

@@ -334,6 +334,32 @@ fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
+/// Scan `table` for rows whose `schema_col` equals `sid`, returning a
+/// `"schema.name"` qualified string for each hit via `id_to_qualified`.
+fn collect_for_schema(
+    table: &mut Table,
+    schema_col: usize,
+    sid: i64,
+    id_to_qualified: &HashMap<i64, (String, String)>,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    if let Ok(mut c) = table.create_cursor() {
+        while c.cursor.valid {
+            if c.cursor.current_weight > 0 {
+                let row_sid = cursor_read_u64(&c, schema_col) as i64;
+                if row_sid == sid {
+                    let eid = c.cursor.current_key_lo as i64;
+                    if let Some((sn, en)) = id_to_qualified.get(&eid) {
+                        result.push(format!("{}.{}", sn, en));
+                    }
+                }
+            }
+            c.cursor.advance();
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Helper: filesystem
 // ---------------------------------------------------------------------------
@@ -925,9 +951,8 @@ impl CatalogEngine {
                     if name == "_system" {
                         return Err("Forbidden: cannot drop system schema".into());
                     }
-                    if !self.schema_is_empty(&name) {
-                        return Err(format!("Cannot drop non-empty schema: {}", name));
-                    }
+                    // Caller (drop_schema) cascades dependents first, so
+                    // the schema is empty by the time this delta applies.
                     self.schema_name_to_id.remove(&name);
                     self.schema_id_to_name.remove(&sid);
                 }
@@ -1572,13 +1597,29 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Drop a schema and every table, view, and index it contains
+    /// (PostgreSQL's `DROP SCHEMA ... CASCADE` semantics).
     pub fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if !self.schema_name_to_id.contains_key(name) {
             return Err("Schema does not exist".into());
         }
+        if name == "_system" {
+            return Err("Forbidden: cannot drop system schema".into());
+        }
         let sid = self.get_schema_id(name);
 
+        // 1. Cascade: collect every view and table in the schema, then
+        //    drop them in dependency-aware order. Views first (they may
+        //    depend on tables + other views), retrying until stable to
+        //    handle view-on-view chains. Then tables (retry for FK
+        //    chains).
+        let (view_names, table_names) = self.collect_schema_members(sid);
+        self.drain_drop_targets(view_names, |catalog, q| catalog.drop_view(q))?;
+        self.drain_drop_targets(table_names, |catalog, q| catalog.drop_table(q))?;
+
+        // 2. Now the schema is guaranteed empty; emit the schema-drop
+        //    delta exactly as before.
         let schema = schema_tab_schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(sid as u64, 0, -1);
@@ -1589,6 +1630,51 @@ impl CatalogEngine {
         ingest_batch_into(&mut self.sys_schemas, &batch);
         self.on_schema_delta(&batch)?;
         Ok(())
+    }
+
+    /// Walk sys_views and sys_tables and collect qualified names for
+    /// every view/table whose schema_id matches `sid`. Views and tables
+    /// are returned separately because they must be dropped in order
+    /// (views first).
+    fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
+        let views = collect_for_schema(
+            &mut *self.sys_views, VIEWTAB_COL_SCHEMA_ID, sid, &self.id_to_qualified);
+        let tables = collect_for_schema(
+            &mut *self.sys_tables, TABLETAB_COL_SCHEMA_ID, sid, &self.id_to_qualified);
+        (views, tables)
+    }
+
+    /// Repeatedly attempt to drop each target; on dependency-related
+    /// errors, move the target to the back of the queue and retry.
+    /// Finishes when the queue is empty or no progress was made in a
+    /// full pass (then returns the last error).
+    fn drain_drop_targets<F>(
+        &mut self,
+        targets: Vec<String>,
+        mut drop_fn: F,
+    ) -> Result<(), String>
+    where F: FnMut(&mut Self, &str) -> Result<(), String>,
+    {
+        let mut pending: Vec<String> = targets;
+        loop {
+            if pending.is_empty() { return Ok(()); }
+            let before = pending.len();
+            let mut retry: Vec<String> = Vec::new();
+            let mut last_err: Option<String> = None;
+            for q in pending.drain(..) {
+                match drop_fn(self, &q) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        last_err = Some(e);
+                        retry.push(q);
+                    }
+                }
+            }
+            if retry.len() == before {
+                return Err(last_err.unwrap_or_else(|| "unknown cascade failure".into()));
+            }
+            pending = retry;
+        }
     }
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------
@@ -2141,7 +2227,7 @@ impl CatalogEngine {
             };
             // Clone batch for hooks (hooks need to read it after table borrows it)
             let mut batch_for_hooks = batch.clone();
-            batch_for_hooks.schema = Some(schema);
+            batch_for_hooks.set_schema(schema);
             ingest_batch_into(table, batch);
             self.fire_hooks(table_id, &batch_for_hooks)?;
             Ok(())

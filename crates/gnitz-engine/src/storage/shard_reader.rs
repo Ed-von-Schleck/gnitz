@@ -502,7 +502,7 @@ impl MappedShard {
         let mut batch = unsafe { Batch::from_regions(&ptrs, &sizes, row_count, npc) };
         batch.sorted = true;
         batch.consolidated = true;
-        batch.schema = Some(*schema);
+        batch.set_schema(*schema);
         batch
     }
 

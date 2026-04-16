@@ -178,14 +178,14 @@ fn test_edge_cases() {
     engine.create_table("public.tbl1", &cols, 0, true).unwrap();
     assert!(engine.create_table("public.tbl1", &cols, 0, true).is_err());
 
-    // 5. Drop non-empty schema
+    // 5. Drop non-empty schema cascades (PostgreSQL-style): the
+    //    contained table goes first, then the schema itself.
     engine.create_schema("my_schema").unwrap();
     engine.create_table("my_schema.tbl2", &cols, 0, true).unwrap();
-    assert!(engine.drop_schema("my_schema").is_err());
-    // 6. Drop table then drop schema
-    engine.drop_table("my_schema.tbl2").unwrap();
     engine.drop_schema("my_schema").unwrap();
     assert!(!engine.has_schema("my_schema"));
+    assert!(engine.get_by_name("my_schema", "tbl2").is_none(),
+        "cascade must drop the contained table");
 
     // 7. Unqualified name defaults to public
     let tid7 = engine.create_table("tbl3", &cols, 0, true).unwrap();

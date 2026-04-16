@@ -14,9 +14,16 @@ from pathlib import Path
 
 import pytest
 
+import gnitz
 from helpers.timing import get_all_results
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture
+def client(socket_path):
+    with gnitz.connect(socket_path) as conn:
+        yield conn
 
 
 def pytest_addoption(parser):
@@ -117,7 +124,27 @@ def server(request, results_dir):
     proc.kill()
     proc.wait()
     log_f.close()
-    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Preserve forensic evidence on failure. The SAL file is huge (~1 GB
+    # per worker) so drop it — but server.log and every worker_*.log go
+    # into results_dir next to the failing-test summary, so diagnosis
+    # doesn't require rerunning with GNITZ_KEEP_BENCH_TMPDIR.
+    if request.session.testsfailed == 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    else:
+        try:
+            shutil.copy(log_path, results_dir / f"server_{tmpdir.name}.log")
+            for wl in data_dir.glob("worker_*.log"):
+                shutil.copy(wl, results_dir / f"{tmpdir.name}_{wl.name}")
+        except OSError as e:
+            print(f"warning: failed to copy forensic logs: {e}")
+        # Drop the giant SAL mmap file(s) — logs are what we actually need.
+        for sal in data_dir.rglob("wal.sal"):
+            try:
+                sal.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

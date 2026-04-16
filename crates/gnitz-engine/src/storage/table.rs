@@ -124,7 +124,7 @@ impl Table {
             |w| super::merge::sort_only(&mb, &self.schema, w),
         );
         sorted.sorted = true;
-        sorted.schema = Some(self.schema);
+        sorted.set_schema(self.schema);
         sorted
     }
 

@@ -23,7 +23,7 @@
 
 use std::rc::Rc;
 use crate::ipc::WireConflictMode;
-use crate::master::{self, MasterDispatcher, first_worker_error};
+use crate::master::{MasterDispatcher, first_worker_error};
 use crate::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
 use crate::storage::Batch;
 use crate::util::guard_panic;
@@ -70,6 +70,12 @@ pub struct Shared {
 }
 
 /// The committer task loop. Returns when all senders drop (shutdown).
+///
+/// `sal_writer_excl` is held for the SAL emission window only — the
+/// write + signal + fsync-SQE-submit triple — and released BEFORE
+/// awaiting ACKs or the fsync CQE, so tick/relay tasks can make progress
+/// on other SAL writes during the wait. FLAG_FLUSH stays atomic with
+/// respect to other SAL writers because both phases re-acquire the lock.
 pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     loop {
         // Block for the first request, exit if no senders remain.
@@ -91,25 +97,21 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             continue;
         }
 
-        // Hold SAL-writer exclusivity for the checkpoint + commit emission
-        // window. Released before `done.send` so handlers that proceed on
-        // the LSN can race with the next batch's emission.  Tick task,
-        // relay task, and DDL all gate on the same mutex (III.3b).
-        let _sal_excl = shared.sal_writer_excl.lock().await;
-
-        // Checkpoint first (may flush system tables + reset SAL epoch).
+        // Phase 1 — checkpoint (if the SAL has crossed its threshold).
+        // Must complete fully (emit + ACKs + post_ack) before commit
+        // groups go out: workers bump their expected_epoch on FLAG_FLUSH,
+        // so commit groups written AFTER FLAG_FLUSH in the same epoch
+        // would be silently skipped by workers.
         if unsafe { (*shared.disp_ptr).sal_needs_checkpoint() } {
-            if let Err(e) = run_checkpoint(&shared).await {
-                // Fail every push in the batch with the checkpoint error.
+            if let Err(e) = run_checkpoint_phase(&shared).await {
                 for p in pushes { let _ = p.done.send(Err(e.clone())); }
                 for b in barrier_senders { let _ = b.send(()); }
                 continue;
             }
         }
 
-        // Commit the batched pushes.
+        // Phase 2 — commit the batched pushes.  Its own lock scope.
         commit_pushes(&shared, pushes).await;
-        drop(_sal_excl);
 
         for b in barrier_senders { let _ = b.send(()); }
     }
@@ -154,12 +156,27 @@ fn debounce_drain(
     (pushes, barrier_senders)
 }
 
-/// Emit a FLAG_FLUSH checkpoint group, await ACKs, run post-ACK cleanup.
-async fn run_checkpoint(shared: &Rc<Shared>) -> Result<(), String> {
+/// Emit a FLAG_FLUSH checkpoint group under `sal_writer_excl`, release the
+/// lock, await ACKs, then run post-ACK cleanup (flush system tables +
+/// advance SAL epoch).  The await deliberately happens AFTER the lock is
+/// dropped so a concurrent tick or relay can proceed on other SAL writes.
+async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
     let disp_ptr = shared.disp_ptr;
-    let decoded_vec = master::dispatch_fanout(disp_ptr, &shared.reactor, |disp, ids| {
-        disp.write_checkpoint_group(ids)
-    }).await?;
+    let nw = shared.num_workers;
+    let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
+
+    let reply_futs = {
+        let _sal_excl = shared.sal_writer_excl.lock().await;
+        unsafe {
+            let disp = &mut *disp_ptr;
+            disp.write_checkpoint_group(&req_ids)?;
+            for w in 0..nw { shared.reactor.increment_in_flight(w); }
+            disp.signal_all();
+        }
+        req_ids.iter().map(|&id| shared.reactor.await_reply(id)).collect::<Vec<_>>()
+    };
+
+    let decoded_vec = reactor::join_all(reply_futs).await;
     if let Some(e) = first_worker_error("checkpoint", &decoded_vec) {
         return Err(e);
     }
@@ -169,9 +186,11 @@ async fn run_checkpoint(shared: &Rc<Shared>) -> Result<(), String> {
     })
 }
 
-/// Commit one debounced batch of pushes. Writes each group to SAL,
-/// submits a single fdatasync + per-group ACK await, then responds
-/// to each pending push with its LSN.
+/// Commit one debounced batch of pushes. Emits every group's SAL writes
+/// under `sal_writer_excl` (alongside the signal + fsync SQE submit),
+/// releases the lock, THEN awaits the fsync CQE and worker ACKs. Post
+/// processing (unique-index filter + LSN assignment + `done.send`)
+/// happens outside the lock.
 async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
@@ -189,75 +208,114 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     let nw = shared.num_workers;
     let n = pushes.len();
     let mut groups: Vec<GroupInfo> = Vec::new();
-    let mut run_start = 0;
 
-    while run_start < n {
-        let tid = pushes[run_start].tid;
-        let mode = pushes[run_start].mode;
-        let mut run_end = run_start + 1;
-        while run_end < n && pushes[run_end].tid == tid && pushes[run_end].mode == mode {
-            run_end += 1;
-        }
-
-        let total_rows: usize = pushes[run_start..run_end]
-            .iter()
-            .map(|p| p.batch.count)
-            .sum();
-
-        let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
-
-        // Per V.7 the committer task must never die. Wrap the SAL-mutating
-        // closure (and the placeholder-schema fallback) so a panic on any
-        // malformed-but-decoded input fails just this group.
-        let disp_ptr = shared.disp_ptr;
-        let (merged, write_err) = match guard_panic("commit", || Ok(unsafe {
-            let disp = &mut *disp_ptr;
-            let schema = disp.schema_desc_for(tid);
-            let mut m = Batch::with_schema(schema, total_rows.max(1));
-            for k in run_start..run_end {
-                let b = &pushes[k].batch;
-                m.append_batch(b, 0, b.count);
+    // ------------------------------------------------------------------
+    // Phase A (no lock): build merged batches + req_id allocations.
+    // ------------------------------------------------------------------
+    {
+        let mut run_start = 0;
+        while run_start < n {
+            let tid = pushes[run_start].tid;
+            let mode = pushes[run_start].mode;
+            let mut run_end = run_start + 1;
+            while run_end < n && pushes[run_end].tid == tid && pushes[run_end].mode == mode {
+                run_end += 1;
             }
-            let err = disp.write_commit_group(tid, &m, mode, &req_ids).err();
-            (m, err)
-        })) {
-            Ok(pair) => pair,
-            Err(panic_msg) => {
-                let placeholder = guard_panic("commit_fallback_schema", || Ok(unsafe {
-                    Batch::with_schema((*disp_ptr).schema_desc_for(tid), 1)
-                }))
-                .unwrap_or_else(|_| Batch::with_schema(
-                    crate::schema::SchemaDescriptor::minimal_u64(), 1));
-                (placeholder, Some(panic_msg))
-            }
-        };
 
-        if write_err.is_none() {
-            for w in 0..nw { shared.reactor.increment_in_flight(w); }
+            let total_rows: usize = pushes[run_start..run_end]
+                .iter()
+                .map(|p| p.batch.count)
+                .sum();
+            let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
+
+            let disp_ptr = shared.disp_ptr;
+            let merged = match guard_panic("commit_merge", || Ok(unsafe {
+                let schema = (*disp_ptr).schema_desc_for(tid);
+                let mut m = Batch::with_schema(schema, total_rows.max(1));
+                for k in run_start..run_end {
+                    let b = &pushes[k].batch;
+                    m.append_batch(b, 0, b.count);
+                }
+                m
+            })) {
+                Ok(m) => m,
+                Err(panic_msg) => {
+                    let placeholder = guard_panic("commit_fallback_schema", || Ok(unsafe {
+                        Batch::with_schema((*disp_ptr).schema_desc_for(tid), 1)
+                    }))
+                    .unwrap_or_else(|_| Batch::with_schema(
+                        crate::schema::SchemaDescriptor::minimal_u64(), 1));
+                    groups.push(GroupInfo {
+                        start: run_start, end: run_end, tid, req_ids,
+                        merged: placeholder,
+                        write_err: Some(panic_msg), lsn: 0,
+                    });
+                    run_start = run_end;
+                    continue;
+                }
+            };
+
+            groups.push(GroupInfo {
+                start: run_start, end: run_end, tid, req_ids, merged,
+                write_err: None, lsn: 0,
+            });
+            run_start = run_end;
         }
-
-        groups.push(GroupInfo {
-            start: run_start, end: run_end, tid, req_ids, merged, write_err,
-            lsn: 0,
-        });
-        run_start = run_end;
     }
 
-    let any_written = groups.iter().any(|g| g.write_err.is_none());
+    // ------------------------------------------------------------------
+    // Phase B (under lock): emit SAL groups, signal, submit fsync SQE.
+    // Lock dropped immediately after; ACKs and fsync CQE are awaited
+    // outside so tick/relay/DDL tasks can make progress.
+    // ------------------------------------------------------------------
+    let (fsync_fut, reply_futs) = {
+        let _sal_excl = shared.sal_writer_excl.lock().await;
 
-    if any_written {
+        for g in groups.iter_mut() {
+            if g.write_err.is_some() { continue; }
+            let disp_ptr = shared.disp_ptr;
+            let mode = pushes[g.start].mode;
+            let err = guard_panic("commit_write", || Ok(unsafe {
+                (*disp_ptr).write_commit_group(g.tid, &g.merged, mode, &g.req_ids).err()
+            })).unwrap_or_else(|panic_msg| Some(panic_msg));
+            g.write_err = err;
+            if g.write_err.is_none() {
+                for w in 0..nw { shared.reactor.increment_in_flight(w); }
+            }
+        }
+
+        let any_written = groups.iter().any(|g| g.write_err.is_none());
+        if !any_written {
+            for g in &groups {
+                let e = g.write_err.as_ref().unwrap();
+                for p in pushes.drain(..g.end - g.start) {
+                    let _ = p.done.send(Err(e.clone()));
+                }
+            }
+            return;
+        }
+
         unsafe { (*shared.disp_ptr).signal_all(); }
 
+        // Submit fsync SQE (synchronous — returns a future). Return the
+        // awaitables; the .await happens after the lock is dropped.
+        let fsync_fut = shared.reactor.fsync(shared.sal_fd);
         let all_req_ids: Vec<u64> = groups.iter()
             .filter(|g| g.write_err.is_none())
             .flat_map(|g| g.req_ids.iter().copied())
             .collect();
-        let fsync = shared.reactor.fsync(shared.sal_fd);
         let reply_futs: Vec<_> = all_req_ids.iter()
             .map(|&id| shared.reactor.await_reply(id))
             .collect();
-        let acks = reactor::join_all(reply_futs);
-        let (fsync_rc, decoded_vec) = reactor::join2(fsync, acks).await;
+        (fsync_fut, reply_futs)
+    };
+
+    // ------------------------------------------------------------------
+    // Phase C (no lock): wait for fsync + per-group ACKs; post-process.
+    // ------------------------------------------------------------------
+    {
+        let (fsync_rc, decoded_vec) =
+            reactor::join2(fsync_fut, reactor::join_all(reply_futs)).await;
 
         if fsync_rc < 0 {
             crate::gnitz_fatal_abort!(
@@ -305,8 +363,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
 
     // Now send responses in original order.
     for g in &groups {
-        let drained: Vec<PendingPush> = pushes.drain(..g.end - g.start).collect();
-        for p in drained {
+        for p in pushes.drain(..g.end - g.start) {
             let result = match &g.write_err {
                 Some(e) => Err(e.clone()),
                 None => Ok(g.lsn),

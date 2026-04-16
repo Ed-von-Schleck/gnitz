@@ -43,30 +43,21 @@ class TestSchemaDDL:
         for n in names:
             client.drop_schema(n)
 
-    def test_drop_nonempty_schema(self, client):
-        """Dropping a non-empty schema raises GnitzError.
-
-        Due to DDL-as-DML semantics the schema retraction may be committed
-        before the hook fires, so the schema may already be gone from the
-        catalog after the error is returned.
-        """
+    def test_drop_nonempty_schema_cascades(self, client):
+        """Dropping a non-empty schema cascades (PostgreSQL DROP SCHEMA ... CASCADE
+        semantics): every contained table, view, and index is dropped first, then
+        the schema itself."""
         sn = "s" + _uid()
         client.create_schema(sn)
         cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                 gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
         tn = "t" + _uid()
         client.create_table(sn, tn, cols)
-        with pytest.raises(gnitz.GnitzError):
-            client.drop_schema(sn)
-        # Forgiving cleanup: schema may already be gone
-        try:
-            client.drop_table(sn, tn)
-        except Exception:
-            pass
-        try:
-            client.drop_schema(sn)
-        except Exception:
-            pass
+        # Cascade: this succeeds without an explicit drop_table first.
+        client.drop_schema(sn)
+        # Re-creating the same name must now work cleanly.
+        client.create_schema(sn)
+        client.drop_schema(sn)
 
     def test_drop_and_recreate_schema(self, client):
         """Recreated schema gets a strictly higher ID."""

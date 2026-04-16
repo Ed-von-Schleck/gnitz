@@ -107,6 +107,13 @@ fn copy_column(
     } else {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
         let stride = in_schema.columns[cm.src_ci].size as usize;
+        debug_assert!(
+            n * stride <= in_batch.col_data(in_pi).len(),
+            "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
+             (batch count={}, schema cols={}, payload cols={})",
+            n, stride, n * stride, in_pi, in_batch.col_data(in_pi).len(),
+            in_batch.count, in_schema.num_columns, in_batch.num_payload_cols(),
+        );
         output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
 }

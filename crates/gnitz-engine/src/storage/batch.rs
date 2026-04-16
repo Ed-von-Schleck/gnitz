@@ -308,6 +308,25 @@ impl Batch {
         }
     }
 
+    // ── Schema installation ─────────────────────────────────────────────
+
+    /// Install a schema on this batch after verifying its column count
+    /// matches the batch's physical payload regions. Every code path that
+    /// wants to mutate `batch.schema` from outside the constructors MUST go
+    /// through this helper: it turns a latent "batch shape != declared
+    /// shape" bug into a localized panic at the first assignment, instead
+    /// of a cryptic OOB slice panic 5 call-frames later (e.g. in
+    /// scalar_func::copy_column).
+    #[inline]
+    pub fn set_schema(&mut self, s: SchemaDescriptor) {
+        debug_assert_eq!(
+            self.num_payload_cols() + 1, s.num_columns as usize,
+            "Batch::set_schema: batch has {} payload cols, schema declares {}",
+            self.num_payload_cols(), s.num_columns as usize - 1
+        );
+        self.schema = Some(s);
+    }
+
     // ── Read accessors ──────────────────────────────────────────────────
 
     #[inline]

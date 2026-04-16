@@ -718,6 +718,20 @@ pub fn execute_epoch(
 
     // 2. Bind cursors and input batch
     regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
+    if input_batch.count > 0 {
+        // Only assert when the batch is non-empty: an empty batch is a
+        // structural no-op (every per-row loop short-circuits) and may
+        // legitimately carry a schema unrelated to the target register
+        // during DAG dispatch (a dep_map view with no matching rows).
+        // A mismatched schema with count>0 is the real chokepoint bug —
+        // that's what the plan's Change 3 was designed to catch.
+        if let Some(ref s) = input_batch.schema {
+            debug_assert_eq!(
+                s.num_columns, program.reg_meta[input_reg as usize].schema.num_columns,
+                "VM register {} schema/batch column-count mismatch", input_reg,
+            );
+        }
+    }
     regfile.registers[input_reg as usize].batch = input_batch;
 
     // Raw pointer to the register array.  All instructions access distinct
@@ -786,7 +800,7 @@ pub fn execute_epoch(
                 let result = if func_ptr.is_null() {
                     // NullPredicate: pass all rows unchanged
                     let mut out = in_batch.clone_batch();
-                    out.schema = Some(schema);
+                    out.set_schema(schema);
                     out.sorted = in_batch.sorted;
                     out.consolidated = in_batch.consolidated;
                     out
@@ -804,7 +818,7 @@ pub fn execute_epoch(
                 let result = if func_ptr.is_null() {
                     // Identity MAP: no transformation — copy batch with updated schema.
                     let mut out = reg!(*in_reg).batch.clone_batch();
-                    out.schema = Some(*out_schema);
+                    out.set_schema(*out_schema);
                     out
                 } else {
                     let func = unsafe { &*func_ptr };

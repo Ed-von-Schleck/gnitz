@@ -434,13 +434,24 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             Some(r) => r,
             None => return,
         };
-        let _cat = shared.catalog_rwlock.read().await;
-        let _sal = shared.sal_writer_excl.lock().await;
-        let r = guard_panic("relay", || unsafe {
-            (*shared.dispatcher.0).relay_exchange(relay)
-        });
-        if let Err(e) = r {
-            gnitz_warn!("relay_exchange failed: {}", e);
+        // Phase 1: CPU work + catalog read only — no SAL mutex.
+        let prep = {
+            let _cat = shared.catalog_rwlock.read().await;
+            match guard_panic("prepare_relay", || unsafe {
+                (*shared.dispatcher.0).prepare_relay(relay)
+            }) {
+                Ok(p) => p,
+                Err(e) => { gnitz_warn!("prepare_relay: {}", e); continue; }
+            }
+        };
+        // Phase 2: SAL write only — grab the mutex, no awaits inside.
+        {
+            let _sal = shared.sal_writer_excl.lock().await;
+            if let Err(e) = guard_panic("emit_relay", || unsafe {
+                (*shared.dispatcher.0).emit_relay(prep)
+            }) {
+                gnitz_warn!("emit_relay failed: {}", e);
+            }
         }
     }
 }
@@ -616,12 +627,8 @@ async fn handle_seek(
             shared.dispatcher.0, &shared.reactor, target_id, pk_lo, pk_hi,
         ).await
     } else {
-        // V.4 panic isolation: a panic would kill the connection task and
-        // leak the fd. Real seek errors are silently mapped to None.
         let cat_ptr = shared.catalog.0;
-        guard_panic("seek", || Ok(unsafe {
-            (*cat_ptr).seek_family(target_id, pk_lo, pk_hi).ok().flatten()
-        }))
+        unsafe { (*cat_ptr).seek_family(target_id, pk_lo, pk_hi) }
     };
     match result {
         Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await,
@@ -645,9 +652,7 @@ async fn handle_seek_by_index(
         ).await
     } else {
         let cat_ptr = shared.catalog.0;
-        guard_panic("seek_by_index", || Ok(unsafe {
-            (*cat_ptr).seek_by_index(target_id, col_idx, key_lo, key_hi).ok().flatten()
-        }))
+        unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key_lo, key_hi) }
     };
     match result {
         Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await,
@@ -747,22 +752,25 @@ async fn handle_system_dml(
     let lsn = shared.ingest_lsn.get() + 1;
     shared.ingest_lsn.set(lsn);
 
-    // SAL emission window: acquire III.3b mutex to serialize against
-    // committer + tick + relay. Held across broadcast + fsync so a
-    // concurrent FLAG_FLUSH or FLAG_TICK group cannot interleave.
-    let _sal_excl = shared.sal_writer_excl.lock().await;
-    let disp_ptr_raw = shared.dispatcher.0;
-    let ddl_for_broadcast = ddl_clone;
-    if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
-        (*disp_ptr_raw).broadcast_ddl(target_id, &ddl_for_broadcast)
-    }) {
-        send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
-        return;
-    }
+    // SAL emission window: acquire III.3b mutex to serialize the
+    // broadcast write against committer + tick + relay. Lock held ONLY
+    // across the synchronous broadcast + fsync SQE submit; the fsync
+    // .await happens after release so concurrent writers can proceed.
+    let fsync_fut = {
+        let _sal_excl = shared.sal_writer_excl.lock().await;
+        let disp_ptr_raw = shared.dispatcher.0;
+        let ddl_for_broadcast = ddl_clone;
+        if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
+            (*disp_ptr_raw).broadcast_ddl(target_id, &ddl_for_broadcast)
+        }) {
+            send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+            return;
+        }
+        shared.reactor.fsync(shared.sal_fd)
+    };
     let t_bcast_done = Instant::now();
-    let fsync_rc = shared.reactor.fsync(shared.sal_fd).await;
+    let fsync_rc = fsync_fut.await;
     let t_fsync_done = Instant::now();
-    drop(_sal_excl);
     if fsync_rc < 0 {
         gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
     }
