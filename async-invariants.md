@@ -205,6 +205,27 @@ tid, with per-worker req_ids) and signals ONCE via `signal_all`.
 Multiple signals would wake workers N times and serialise what
 should be a concurrent broadcast.
 
+### IV.7 Commit visibility vs. durability
+
+The committer pipelines `signal_all` before awaiting the fsync CQE:
+workers observe pushed data, process the DAG, and reply to ACKs while
+the SAL is still mid-fsync. The `done` oneshot to the INSERT handler
+is sent only after `join2(fsync_fut, reply_futs)` completes, so:
+
+- **Durability for the inserting client:** strict. The client cannot
+  observe its INSERT as `Ok(lsn)` until the fsync has returned.
+- **Isolation for concurrent readers:** a SCAN running on another
+  connection can observe rows whose committing INSERT has not yet
+  returned to its client. Those rows are durable iff the fsync
+  eventually succeeds; on fsync failure the engine aborts
+  (`gnitz_fatal_abort`), so there is no silent loss.
+
+Any change that tightens isolation (e.g. SCAN must block on the
+durable LSN) has to add a watermark the committer advances after
+fsync, and the SCAN path has to await it. Any change that weakens
+durability (e.g. `done` sent before fsync) breaks the guarantee
+clients rely on for read-after-write.
+
 ---
 
 ## V. Async scheduling

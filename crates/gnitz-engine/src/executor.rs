@@ -319,11 +319,19 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 
         // Honour the coalesce deadline only if no trigger is row-threshold
         // urgent. Lets pipelined inserts batch into a single tick.
+        //
+        // The timer is pinned outside the inner loop so every iteration
+        // re-polls the same TimerFuture — its SQE is submitted once on
+        // first poll and re-used across all `rx.recv()` wake-ups. The
+        // previous shape (`let timer = …` inside the loop) allocated a
+        // fresh TimerFuture per iteration and submitted a new SQE every
+        // time `rx.recv()` resolved Pending-then-Ready, which was
+        // unnecessary kernel churn.
         if !shared.any_threshold_crossed() {
             let deadline = Instant::now() + Duration::from_millis(TICK_DEADLINE_MS);
+            let mut timer = Box::pin(shared.reactor.timer(deadline));
             loop {
-                let timer = shared.reactor.timer(deadline);
-                match select2(rx.recv(), timer).await {
+                match select2(rx.recv(), timer.as_mut()).await {
                     Either::A(Some(more)) => triggers.push(more),
                     Either::A(None) => return, // channel closed mid-coalesce
                     Either::B(()) => break,    // deadline elapsed

@@ -1321,16 +1321,28 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Async version of `ensure_unique_filters_warm`. Identical to the
-    /// sync version except it invokes `fan_out_scan_async`.
+    /// Async version of `ensure_unique_filters_warm`. Feeds each worker's
+    /// scan reply directly into the filter(s) instead of concatenating
+    /// them into a single master-side `Batch` the way `fan_out_scan_async`
+    /// does — on a table with tens of millions of rows the concatenation
+    /// step would peak at ~2× the total scan size and risk OOM.
+    ///
+    /// We intentionally go through `join_all` rather than awaiting each
+    /// `await_reply` serially: `join_all`'s first poll registers every
+    /// `req_id`'s waker before any worker reply can arrive, while a
+    /// serial await would register them one at a time and `route_reply`
+    /// would drop any reply whose waker isn't yet in `reply_wakers`
+    /// (and forget to decrement `in_flight[w]`, stalling the W2M ring).
+    /// The peak we do pay is one `DecodedWire` per worker during the
+    /// processing loop, not the full concatenated batch.
     async fn ensure_unique_filters_warm_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::reactor::Reactor,
         table_id: i64,
     ) -> Result<(), String> {
-        let (missing, _schema): (Vec<UniqueIndexDesc>, SchemaDescriptor) = unsafe {
+        let missing: Vec<UniqueIndexDesc> = unsafe {
             let disp = &mut *disp_ptr;
-            let (schema, descs) = match disp.unique_index_descriptors(table_id) {
+            let (_schema, descs) = match disp.unique_index_descriptors(table_id) {
                 Some(x) => x,
                 None => return Ok(()),
             };
@@ -1341,17 +1353,33 @@ impl MasterDispatcher {
             for d in &missing {
                 disp.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
             }
-            (missing, schema)
+            missing
         };
 
-        let scan_result = Self::fan_out_scan_async(disp_ptr, reactor, table_id).await?;
-        if let Some(batch) = scan_result {
-            unsafe {
-                let disp = &mut *disp_ptr;
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+            let (schema, col_names) = disp.get_schema_and_names(table_id);
+            disp.write_group_with_req_ids(
+                table_id, 0, &[], &schema, &col_names,
+                0, 0, 0, req_ids, -1,
+            )
+        }).await?;
+
+        if let Some(e) = first_worker_error("scan", &decoded_vec) {
+            return Err(e);
+        }
+
+        unsafe {
+            let disp = &mut *disp_ptr;
+            for decoded in decoded_vec {
+                let batch = match decoded.data_batch {
+                    Some(b) if b.count > 0 => b,
+                    _ => continue,
+                };
                 for d in &missing {
                     if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                        extract_into_filter(filter, &batch, d);
-                        if filter.capped { continue; }
+                        if !filter.capped {
+                            extract_into_filter(filter, &batch, d);
+                        }
                     }
                 }
             }

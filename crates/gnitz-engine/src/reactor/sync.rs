@@ -5,6 +5,18 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+/// Push `waker` into `q` unless a waker already in the queue would wake
+/// the same task. A `LockFuture` / `ReadFuture` / `WriteFuture` that is
+/// polled N times before the lock is released would otherwise enqueue N
+/// wakers for the same task; release cycles then wake that task N times
+/// (wasted polls) and the reactor's run queue gets N duplicate entries.
+/// `will_wake` is a cheap pointer comparison on the waker vtable + data.
+fn push_unique_waker(q: &mut VecDeque<Waker>, waker: &Waker) {
+    if !q.iter().any(|existing| existing.will_wake(waker)) {
+        q.push_back(waker.clone());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // oneshot
 // ---------------------------------------------------------------------------
@@ -205,7 +217,7 @@ impl<'a, T: 'a> Future for LockFuture<'a, T> {
             self.mutex.locked.set(true);
             return Poll::Ready(LockGuard { mutex: Rc::clone(&self.mutex) });
         }
-        self.mutex.waiters.borrow_mut().push_back(cx.waker().clone());
+        push_unique_waker(&mut self.mutex.waiters.borrow_mut(), cx.waker());
         Poll::Pending
     }
 }
@@ -305,7 +317,7 @@ impl<'a> Future for ReadFuture<'a> {
             s.readers += 1;
             return Poll::Ready(ReadGuard { lock: Rc::clone(&self.lock) });
         }
-        s.read_waiters.push_back(cx.waker().clone());
+        push_unique_waker(&mut s.read_waiters, cx.waker());
         Poll::Pending
     }
 }
@@ -343,9 +355,10 @@ impl<'a> Future for WriteFuture<'a> {
             s.writers_waiting += 1;
             drop(s);
             self.parked = true;
-            lock.inner.borrow_mut().write_waiters.push_back(cx.waker().clone());
+            push_unique_waker(
+                &mut lock.inner.borrow_mut().write_waiters, cx.waker());
         } else {
-            s.write_waiters.push_back(cx.waker().clone());
+            push_unique_waker(&mut s.write_waiters, cx.waker());
         }
         Poll::Pending
     }

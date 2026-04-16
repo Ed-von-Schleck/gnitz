@@ -10,9 +10,11 @@
 //!   lives on the reactor. Borrows `*mut MasterDispatcher` to call into
 //!   the dispatcher's SAL writer without an exclusive `&mut Self` borrow
 //!   across `.await`.
-//! - **Debounce.**  The first request starts a `FLUSH_DEADLINE` timer;
-//!   subsequent requests join the batch. The loop flushes when the
-//!   batch crosses `MAX_PENDING_ROWS` rows or the timer fires.
+//! - **Batching.**  Pipelined clients batch naturally: after `rx.recv()`
+//!   returns the first request, `try_recv` drains anything already
+//!   queued (capped at `MAX_PENDING_ROWS`). There is no debounce timer —
+//!   a timer would add tail latency to every commit to help only serial
+//!   single-request workloads. See `debounce_drain`.
 //! - **Checkpoint.**  If `sal.needs_checkpoint()` the committer emits a
 //!   FLAG_FLUSH group with per-worker req_ids, awaits ACKs, runs the
 //!   post-ACK bookkeeping (flush system tables + reset epoch), then

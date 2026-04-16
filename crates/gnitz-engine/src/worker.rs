@@ -631,7 +631,6 @@ impl WorkerProcess {
         });
 
         let master_pid = self.master_pid;
-        let expected_epoch = self.expected_epoch;
         let want_key = (view_id, source_id);
 
         loop {
@@ -652,12 +651,16 @@ impl WorkerProcess {
                     return b;
                 }
 
+                // Re-read `self.expected_epoch` on every iteration: a
+                // FLAG_FLUSH dispatched inline below bumps it, and a stale
+                // snapshot would cause every post-checkpoint message to
+                // fail the epoch check forever (spin at unchanged cursor).
                 let (msg_flags, msg_target, msg_wire) = {
                     let (msg, new_cursor) = match self.sal_reader.try_read(self.read_cursor) {
                         Some(v) => v,
                         None => break, // no more entries — back to outer wait
                     };
-                    if msg.epoch != expected_epoch {
+                    if msg.epoch != self.expected_epoch {
                         break;
                     }
                     self.read_cursor = new_cursor;

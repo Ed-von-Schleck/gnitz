@@ -1477,7 +1477,14 @@ impl SalReader {
     }
 }
 
-/// Worker's write side of W2M.
+/// Worker's write side of a single W2M ring. Each worker owns exactly
+/// one `W2mWriter`; the atomic-release publish protocol (write size
+/// prefix → copy payload → release-store the cursor) is correct only
+/// with a single producer. Multiple concurrent writers would interleave
+/// their payload copies and corrupt the ring. The type is `!Sync` (via
+/// `*mut u8`), so the type system already prevents `&W2mWriter` from
+/// crossing threads; if a future change ever requires multi-writer
+/// semantics, the publish must add a CAS-based reservation step.
 pub struct W2mWriter {
     region_ptr: *mut u8,
     region_size: u64,
