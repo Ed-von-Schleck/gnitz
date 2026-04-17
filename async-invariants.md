@@ -45,11 +45,12 @@ Publish: stamp size prefix → `write_cursor.store(Release)` →
 marker by advancing `vrc` by `pad = cap - phys(vrc)`, decode,
 advance `read_cursor`, bump `writer_seq`, wake if `WRITER_PARKED`.
 
-**W2M slot lifetime** — `try_read` must copy the slot bytes to a heap
-buffer **before** Release-storing the new `read_cursor`; the slot is
-the producer's the moment the cursor advances. The heap copy stays
-attached to `DecodedWire._backing` so the `Batch`'s interior pointers
-remain valid for the consumer's lifetime.
+**W2M slot lifetime** — the slot is the producer's the moment
+`read_cursor` advances. Any decoded view that holds interior pointers
+into the slot (today: `DecodedWire.data_batch`) must own a heap copy
+of the slot bytes pinned to `DecodedWire.batch_backing` before the
+cursor advances. Control-only replies hold no slot-interior pointers
+and decode in place without copying.
 
 **W2M master wait** — one `IORING_OP_FUTEX_WAITV` SQE spans all 64
 `reader_seq` words with `FUTEX2_SIZE_U32`, **shared** (no
@@ -68,9 +69,12 @@ on wake; master never CAS-clears. Master on all-rings-idle:
 `MASTER_PARKED` set → `FUTEX_WAITV` → cleared on wake.
 
 **Worker death** — a dead worker parked on `writer_seq` is not a
-liveness hazard: `executor::worker_watcher` polls `getppid` + `waitpid`
-and triggers `shutdown_workers` + `request_shutdown`. FUTEX contracts
-inherit this abort semantic — no per-contract liveness claim.
+liveness hazard: `executor::worker_watcher` polls
+`MasterDispatcher::check_workers` (a `waitpid`-based crash probe) and
+triggers `shutdown_workers` + `request_shutdown`. Symmetric master
+death: the worker side polls `getppid` in `worker_main` and exits if
+the master's PID changes. FUTEX contracts inherit this abort semantic
+— no per-contract liveness claim.
 
 **Checkpoint exclusivity** — committer is the sole checkpoint driver:
 `FLAG_FLUSH` → ACKs → `flush_all_system_tables` → `checkpoint_reset`. No

@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::executor::ServerExecutor;
 use crate::ipc::{
-    self, FLAG_PUSH, FLAG_DDL_SYNC, SAL_MMAP_SIZE, W2M_REGION_SIZE,
+    self, FLAG_PUSH, FLAG_DDL_SYNC, SAL_MMAP_SIZE,
     SalWriter, SalReader, W2mWriter, W2mReceiver,
 };
 use crate::ipc_sys;
 use crate::sys;
 use crate::master::MasterDispatcher;
-use crate::w2m_ring;
+use crate::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::worker::WorkerProcess;
 
 // ---------------------------------------------------------------------------

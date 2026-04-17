@@ -192,7 +192,18 @@ pub struct Reactor {
 /// Aborts if the kernel returns -EINVAL or -ENOSYS — those signal
 /// that the opcode isn't available, and the W2M master-wait path
 /// would silently fail to deliver CQEs. Linux 6.7+ required.
+///
+/// Memoised: the probe result is process-lifetime invariant (the
+/// kernel does not grow or lose io_uring opcodes mid-run), so the
+/// full probe io_uring cycle only runs on the first `Reactor::new`.
+/// This matters for the test suite, which creates many reactors.
 fn probe_futex_waitv_support() {
+    use std::sync::Once;
+    static PROBED: Once = Once::new();
+    PROBED.call_once(probe_futex_waitv_support_inner);
+}
+
+fn probe_futex_waitv_support_inner() {
     use std::sync::atomic::AtomicU32;
     use io_uring::{opcode, types, IoUring};
 
@@ -302,6 +313,13 @@ impl Reactor {
     /// flips. Without this, dropping the reactor's `FutexWaitV` array
     /// while the SQE still holds a pointer into it is a UAF in the
     /// kernel.
+    ///
+    /// If the cancel CQE does not arrive within 2 s we abort instead of
+    /// freeing the storage: the kernel still holds a pointer into it
+    /// and freeing now would be a use-after-free. A 2 s wait for an
+    /// `AsyncCancel` + `FutexWaitV` pair is already pathological, so
+    /// aborting is strictly safer than the previous behavior of
+    /// silently dropping armed storage.
     fn cancel_futex_waitv_and_wait(&self) {
         if !self.inner.futex_waitv_armed.get() {
             return;
@@ -324,7 +342,15 @@ impl Reactor {
             let _ = self.inner.ring.borrow_mut()
                 .submit_and_wait_timeout(1, 100);
         }
-        // Drop the storage now that no in-flight SQE references it.
+        if self.inner.futex_waitv_armed.get() || !self.inner.futex_waitv_cancelled.get() {
+            crate::gnitz_fatal_abort!(
+                "reactor: FUTEX_WAITV cancel did not complete within 2s \
+                 (armed={}, cancelled={}) — freeing storage now would be a UAF",
+                self.inner.futex_waitv_armed.get(),
+                self.inner.futex_waitv_cancelled.get(),
+            );
+        }
+        // Safe to drop now: no in-flight SQE references the storage.
         *self.inner.futex_waitv_storage.borrow_mut() = None;
     }
 
@@ -474,11 +500,20 @@ impl Reactor {
         for (w, entry) in boxed.iter_mut().enumerate() {
             let hdr = unsafe { w2m.header(w) };
             // Publish park intent FIRST (AcqRel — the flag must be
-            // globally visible before we read reader_seq).
-            hdr.waiter_flags().fetch_or(
-                FLAG_MASTER_PARKED,
-                std::sync::atomic::Ordering::AcqRel,
-            );
+            // globally visible before we read reader_seq). Once the
+            // reactor has attached, no path clears `FLAG_MASTER_PARKED`
+            // (`W2mReceiver::wait_for` does, but it is bootstrap-only
+            // and runs before `attach_w2m`), so after the first
+            // iteration the bit is already set: load first and skip the
+            // RMW when it's a no-op.
+            let flags_now = hdr.waiter_flags()
+                .load(std::sync::atomic::Ordering::Acquire);
+            if flags_now & FLAG_MASTER_PARKED == 0 {
+                hdr.waiter_flags().fetch_or(
+                    FLAG_MASTER_PARKED,
+                    std::sync::atomic::Ordering::AcqRel,
+                );
+            }
             // Now snapshot expected reader_seq. Any worker store that
             // happens-before this load MUST have been preceded by a
             // write_cursor Release store, so the post-loop
@@ -964,16 +999,7 @@ impl Reactor {
             self.inner.w2m.borrow().as_ref()
                 .expect("drain_w2m_for_worker called before attach_w2m"),
         );
-        loop {
-            let cursor = {
-                let hdr = unsafe { w2m.header(w) };
-                hdr.read_cursor()
-                    .load(std::sync::atomic::Ordering::Acquire)
-            };
-            let (decoded, _new_rc) = match w2m.try_read(w, cursor) {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(decoded) = w2m.try_read(w) {
             self.route_reply(w, decoded);
         }
     }
@@ -1841,7 +1867,7 @@ mod tests {
             },
             schema: None,
             data_batch: None,
-            _backing: None,
+            batch_backing: None,
         }
     }
 
@@ -2234,7 +2260,7 @@ mod tests {
             },
             schema: Some(SchemaDescriptor::minimal_u64()),
             data_batch: None,
-            _backing: None,
+            batch_backing: None,
         }
     }
 

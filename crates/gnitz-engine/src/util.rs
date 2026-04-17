@@ -92,6 +92,48 @@ pub fn cstr_from_buf(buf: &[u8]) -> &str {
 
 pub use gnitz_wire::align8;
 
+/// Unaligned write of a `u64` at `base + offset` bytes. Used by the
+/// SAL and W2M mmap paths where offsets are computed from a `*mut u8`
+/// base pointer and don't satisfy the alignment requirement of a
+/// `*mut u64` dereference.
+///
+/// # Safety
+/// `base + offset + 8` must lie inside a live, writable allocation.
+#[inline]
+pub(crate) unsafe fn write_u64_raw(base: *mut u8, offset: usize, val: u64) {
+    (base.add(offset) as *mut u64).write_unaligned(val);
+}
+
+/// Unaligned read of a `u64` at `base + offset`. Companion to
+/// `write_u64_raw`.
+///
+/// # Safety
+/// `base + offset + 8` must lie inside a live, readable allocation.
+#[inline]
+pub(crate) unsafe fn read_u64_raw(base: *const u8, offset: usize) -> u64 {
+    (base.add(offset) as *const u64).read_unaligned()
+}
+
+/// Unaligned write of a `u32` at `base + offset`. Companion to
+/// `write_u64_raw`.
+///
+/// # Safety
+/// `base + offset + 4` must lie inside a live, writable allocation.
+#[inline]
+pub(crate) unsafe fn write_u32_raw(base: *mut u8, offset: usize, val: u32) {
+    (base.add(offset) as *mut u32).write_unaligned(val);
+}
+
+/// Unaligned read of a `u32` at `base + offset`. Companion to
+/// `write_u64_raw`.
+///
+/// # Safety
+/// `base + offset + 4` must lie inside a live, readable allocation.
+#[inline]
+pub(crate) unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
+    (base.add(offset) as *const u32).read_unaligned()
+}
+
 /// Run `f` under `catch_unwind`. On panic, returns
 /// `Err("internal server error (panic in <op>)")`. Otherwise the closure's
 /// `Result` is returned unchanged. Used in async handlers and the committer

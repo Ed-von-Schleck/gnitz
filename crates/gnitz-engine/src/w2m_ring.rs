@@ -16,21 +16,13 @@
 //!     phys(virt) = W2M_HEADER_SIZE + (virt - W2M_HEADER_SIZE) % DCAP
 //! ```
 //!
-//! Core invariants become unambiguous:
+//! Core invariants:
 //!
 //! - **Empty:** `virt_wc == virt_rc`.
 //! - **Unread bytes:** `virt_wc - virt_rc` (always `<= DCAP`).
 //! - **Has room:** `virt_wc - virt_rc + total <= DCAP` (contiguous), or
 //!   `virt_wc - virt_rc + pad + total <= DCAP` (SKIP-wrap, with
 //!   `pad = cap - phys(virt_wc)`).
-//!
-//! The previous physical-cursor predicate (`wc >= rc || wc + total <=
-//! rc`) was unable to distinguish "writer pre-wrap, ahead of reader"
-//! from "writer post-wrap, has caught up to and crossed reader" — both
-//! showed `wc >= rc`. The post-wrap-crossed case silently overwrote
-//! unread data. Virtual cursors collapse the ambiguity into a single
-//! subtraction: the unread count is exactly `virt_wc - virt_rc`,
-//! regardless of wrap history.
 //!
 //! `u64` overflow is a non-issue: even at 1 M msg/s × 280 B/msg
 //! sustained, a `u64` virtual cursor takes ~65 years to wrap.
@@ -72,6 +64,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gnitz_wire::align8;
+
+use crate::util::{read_u64_raw, write_u64_raw};
 
 /// Fixed header size at the start of every W2M mmap region.
 pub const W2M_HEADER_SIZE: usize = 128;
@@ -212,8 +206,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     // raw pointer to avoid forming a &mut reference to the shared
     // struct (which would violate the `&'static Self` aliasing model
     // used elsewhere).
-    let cap_ptr = ptr.add(80) as *mut u64;
-    cap_ptr.write_unaligned(capacity);
+    write_u64_raw(ptr, 80, capacity);
 }
 
 /// Map a virtual cursor to its physical byte offset inside the mmap
@@ -400,8 +393,7 @@ pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     hdr.read_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
-    let cap_ptr = ptr.add(80) as *mut u64;
-    cap_ptr.write_unaligned(capacity);
+    write_u64_raw(ptr, 80, capacity);
 }
 
 /// Read-only predicate: would a `try_reserve` for `sz` bytes succeed
@@ -507,20 +499,6 @@ pub unsafe fn try_consume(
     let new_vrc = vrc + total as u64;
     let ptr = data_base.add(phys_rc as usize + 8);
     Some((ptr, size as u32, new_vrc))
-}
-
-// ---------------------------------------------------------------------------
-// Raw read/write helpers (unaligned within the mmap region)
-// ---------------------------------------------------------------------------
-
-#[inline]
-unsafe fn write_u64_raw(base: *mut u8, offset: usize, val: u64) {
-    (base.add(offset) as *mut u64).write_unaligned(val);
-}
-
-#[inline]
-unsafe fn read_u64_raw(base: *const u8, offset: usize) -> u64 {
-    (base.add(offset) as *const u64).read_unaligned()
 }
 
 // ---------------------------------------------------------------------------

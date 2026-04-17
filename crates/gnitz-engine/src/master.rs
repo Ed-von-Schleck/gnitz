@@ -395,9 +395,8 @@ impl MasterDispatcher {
         let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
         for w in 0..nw {
             loop {
-                let rc = self.w2m.read_cursor(w);
-                match self.w2m.try_read(w, rc) {
-                    Some((decoded, _new_rc)) => {
+                match self.w2m.try_read(w) {
+                    Some(decoded) => {
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
                             return Err(format!("worker {}: {}", w, msg));
@@ -440,8 +439,7 @@ impl MasterDispatcher {
             let mut progressed = false;
             for w in 0..nw {
                 if collected[w] { continue; }
-                let rc = self.w2m.read_cursor(w);
-                let Some((decoded, _new_rc)) = self.w2m.try_read(w, rc) else {
+                let Some(decoded) = self.w2m.try_read(w) else {
                     continue;
                 };
                 progressed = true;

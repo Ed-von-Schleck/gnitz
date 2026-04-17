@@ -7,7 +7,7 @@ use crate::ipc_sys;
 use crate::sys;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
 use crate::storage::{Batch, wal};
-use crate::util::align8;
+use crate::util::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::w2m_ring::{
     self, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED, TryReserve,
 };
@@ -20,7 +20,6 @@ pub const MAX_WORKERS: usize = 64;
 /// Group header: 32 fixed + MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes + 32 pad
 pub(crate) const GROUP_HEADER_SIZE: usize = 576;
 pub const SAL_MMAP_SIZE: usize = 1 << 30;
-pub use crate::w2m_ring::{W2M_HEADER_SIZE, W2M_REGION_SIZE};
 
 /// Base page size on Linux x86_64. The SAL is mmap'd from a regular
 /// filesystem, so hugepage backing is not in play here. Hardcoding
@@ -434,7 +433,7 @@ pub struct DecodedWire {
     /// lifetime of `DecodedWire`. `None` when `data_batch` is `None`
     /// (no allocation needed) or when the source bytes are already
     /// owned by a longer-lived allocation (e.g. the SAL mmap region).
-    pub _backing: Option<Vec<u8>>,
+    pub batch_backing: Option<Vec<u8>>,
 }
 
 /// Decode a WAL block from raw bytes into an Batch.
@@ -767,7 +766,7 @@ fn decode_wire_impl(
         None
     };
 
-    Ok(DecodedWire { control, schema: wire_schema, data_batch, _backing: None })
+    Ok(DecodedWire { control, schema: wire_schema, data_batch, batch_backing: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -799,34 +798,6 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
     if offset + 8 <= mmap_size {
         atomic_store_u64(sal_ptr.add(offset), 0);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Raw read/write helpers for mmap regions
-// ---------------------------------------------------------------------------
-
-#[inline]
-unsafe fn write_u64_raw(base: *mut u8, offset: usize, val: u64) {
-    let p = base.add(offset) as *mut u64;
-    p.write_unaligned(val);
-}
-
-#[inline]
-unsafe fn read_u64_raw(base: *const u8, offset: usize) -> u64 {
-    let p = base.add(offset) as *const u64;
-    p.read_unaligned()
-}
-
-#[inline]
-unsafe fn write_u32_raw(base: *mut u8, offset: usize, val: u32) {
-    let p = base.add(offset) as *mut u32;
-    p.write_unaligned(val);
-}
-
-#[inline]
-unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
-    let p = base.add(offset) as *const u32;
-    p.read_unaligned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,14 +1370,21 @@ impl SalReader {
 /// `read_cursor` when it observes `FLAG_WRITER_PARKED`.
 pub struct W2mWriter {
     region_ptr: *mut u8,
-    region_size: u64,
 }
 
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
     pub fn new(region_ptr: *mut u8, region_size: u64) -> Self {
-        W2mWriter { region_ptr, region_size }
+        // One-shot sanity check: the caller's `region_size` must match
+        // the ring header's own `capacity`. Runs once at construction
+        // instead of per-send.
+        let hdr = unsafe { W2mRingHeader::from_raw(region_ptr as *const u8) };
+        assert_eq!(
+            hdr.capacity(), region_size,
+            "W2mWriter region_size must match ring header capacity",
+        );
+        W2mWriter { region_ptr }
     }
 
     /// Encode wire data into the W2M ring. Blocks on `writer_seq` if
@@ -1418,12 +1396,21 @@ impl W2mWriter {
     /// park the writer forever, but the `worker_watcher` task in the
     /// executor traps master death and tears the worker down first
     /// (see `executor::worker_watcher`).
+    ///
+    /// # Panics
+    /// Panics if `sz > MAX_W2M_MSG`. Without this guard the ring would
+    /// return `TryReserve::Full` for every attempt and `send_encoded`
+    /// would park indefinitely on `writer_seq` — a silent deadlock for
+    /// a caller bug. An oversized message is always a programming error
+    /// (the wire protocol caps payloads well below 256 MiB), so failing
+    /// loudly at the source is the right behavior.
     pub fn send_encoded(&self, sz: usize, encode_fn: impl FnOnce(&mut [u8])) {
-        let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
-        debug_assert_eq!(
-            hdr.capacity(), self.region_size,
-            "W2mWriter region_size must match ring header capacity",
+        assert!(
+            (sz as u64) <= w2m_ring::MAX_W2M_MSG,
+            "W2mWriter::send_encoded: sz={} exceeds MAX_W2M_MSG={}",
+            sz, w2m_ring::MAX_W2M_MSG,
         );
+        let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
 
         // Loop until a reservation is granted, then encode + commit.
         // Encoding happens exactly once, after the slot is secured.
@@ -1482,18 +1469,13 @@ impl W2mWriter {
 /// Master's read side of W2M. Thin adapter over `w2m_ring::try_consume`.
 pub struct W2mReceiver {
     region_ptrs: Vec<*mut u8>,
-    num_workers: usize,
 }
 
 unsafe impl Send for W2mReceiver {}
 
 impl W2mReceiver {
     pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
-        let num_workers = region_ptrs.len();
-        W2mReceiver {
-            region_ptrs,
-            num_workers,
-        }
+        W2mReceiver { region_ptrs }
     }
 
     /// Pointer to worker `w`'s ring region.
@@ -1511,23 +1493,6 @@ impl W2mReceiver {
         W2mRingHeader::from_raw(self.region_ptrs[worker] as *const u8)
     }
 
-    /// Read write-cursor of worker (atomic load).
-    pub fn write_cursor(&self, worker: usize) -> u64 {
-        let hdr = unsafe { self.header(worker) };
-        hdr.write_cursor().load(Ordering::Acquire)
-    }
-
-    /// Read read-cursor of worker (atomic load).
-    pub fn read_cursor(&self, worker: usize) -> u64 {
-        let hdr = unsafe { self.header(worker) };
-        hdr.read_cursor().load(Ordering::Acquire)
-    }
-
-    /// Try to read the next decoded message from worker `w` at
-    /// `read_cursor`. Returns `None` if no new data. On success
-    /// returns `(DecodedWire, new_cursor)` and advances
-    /// `hdr.read_cursor` to `new_cursor`, bumps `writer_seq`, and
-    /// wakes a parked writer if any.
     /// Closure-based consume. The slot bytes are exposed to `f` while
     /// the read cursor still names them; the cursor only advances after
     /// `f` returns. This is the structural form of the SPSC consume
@@ -1566,35 +1531,57 @@ impl W2mReceiver {
         Some(result)
     }
 
-    /// Backwards-compatible wrapper around `try_read_with`. Copies the
-    /// slot to a heap buffer, decodes it, and pins the buffer to
-    /// `DecodedWire._backing` so the batch's interior pointers stay
-    /// valid for the caller's lifetime.
+    /// Decode one reply from worker `w`.
     ///
-    /// `read_cursor` is accepted for source compatibility but ignored;
-    /// the canonical cursor lives in the ring header.
-    pub fn try_read(&self, worker: usize, _read_cursor: u64) -> Option<(DecodedWire, u64)> {
-        let owned: Vec<u8> = self.try_read_with(worker, |slot| slot.to_vec())?;
-        let new_rc = unsafe { self.header(worker) }
-            .read_cursor().load(Ordering::Acquire);
-        let mut decoded = decode_wire(&owned).ok()?;
-        if decoded.data_batch.is_some() {
-            decoded._backing = Some(owned);
+    /// Control-only replies (the common case: tick ACKs, push ACKs,
+    /// checkpoint ACKs, exchange view signals) decode in place against
+    /// the ring slot — no heap copy. Replies that carry a `data_batch`
+    /// fall back to a heap copy because `Batch` holds raw pointers into
+    /// the source bytes and the slot is released to the producer as
+    /// soon as this function returns.
+    pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
+        enum Outcome {
+            NoData(DecodedWire),
+            HasData(Vec<u8>),
+            BadWire,
         }
-        Some((decoded, new_rc))
+        let outcome = self.try_read_with(worker, |slot| match decode_wire(slot) {
+            Err(_) => Outcome::BadWire,
+            Ok(d) if d.data_batch.is_none() => Outcome::NoData(d),
+            Ok(_) => Outcome::HasData(slot.to_vec()),
+        })?;
+        match outcome {
+            Outcome::NoData(d) => Some(d),
+            Outcome::HasData(owned) => {
+                let mut d = decode_wire(&owned).ok()?;
+                d.batch_backing = Some(owned);
+                Some(d)
+            }
+            Outcome::BadWire => None,
+        }
     }
 
-    /// Block until worker `w`'s `reader_seq` counter advances past
-    /// `expected`, or `timeout_ms` elapses. Used by bootstrap paths
-    /// that cannot go through the reactor's FUTEX_WAITV multiplex.
+    /// Block until worker `w` publishes, or `timeout_ms` elapses. Used
+    /// by bootstrap paths that cannot go through the reactor's
+    /// FUTEX_WAITV multiplex.
+    ///
+    /// Parking ordering (matches `Reactor::refresh_futex_waitv_vals` so
+    /// the two W2M wait paths are shape-equivalent):
+    ///
+    /// 1. `fetch_or(FLAG_MASTER_PARKED)` — publish park intent FIRST so
+    ///    any writer that observes the flag will wake us.
+    /// 2. Snapshot `expected = reader_seq`.
+    /// 3. Unread-data short-circuit: if `write_cursor != read_cursor`
+    ///    there's already a pending publish — skip the futex wait.
+    /// 4. Otherwise `FUTEX_WAIT(reader_seq, expected, timeout_ms)`.
     pub fn wait_for(&self, worker: usize, timeout_ms: i32) -> i32 {
         let hdr = unsafe { self.header(worker) };
-        let expected = hdr.reader_seq().load(Ordering::Acquire);
         hdr.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
-        // Recheck: writer may have published between sample and park.
-        let actual = hdr.reader_seq().load(Ordering::Acquire);
-        let rc = if actual != expected {
-            0 // already advanced; no wait needed
+        let expected = hdr.reader_seq().load(Ordering::Acquire);
+        let wc = hdr.write_cursor().load(Ordering::Acquire);
+        let rc_cur = hdr.read_cursor().load(Ordering::Acquire);
+        let rc = if wc != rc_cur {
+            0 // data already pending; no wait needed
         } else {
             ipc_sys::futex_wait_u32(
                 hdr.reader_seq() as *const AtomicU32,
@@ -1606,7 +1593,7 @@ impl W2mReceiver {
         rc
     }
 
-    pub fn num_workers(&self) -> usize { self.num_workers }
+    pub fn num_workers(&self) -> usize { self.region_ptrs.len() }
 }
 
 // ---------------------------------------------------------------------------
@@ -2427,8 +2414,7 @@ mod tests {
         let mut next_expected: u64 = 1;
         let started = std::time::Instant::now();
         while next_expected <= N {
-            let rc = receiver.read_cursor(0);
-            if let Some((decoded, _new_rc)) = receiver.try_read(0, rc) {
+            if let Some(decoded) = receiver.try_read(0) {
                 assert_eq!(
                     decoded.control.request_id, next_expected,
                     "msg ordering broke at req_id={}: writer-cross-reader \
@@ -2438,8 +2424,7 @@ mod tests {
                 next_expected += 1;
             } else {
                 if done.load(Ordering::Acquire) && next_expected <= N {
-                    let rc2 = receiver.read_cursor(0);
-                    if receiver.try_read(0, rc2).is_none() {
+                    if receiver.try_read(0).is_none() {
                         panic!(
                             "writer done but only {}/{} msgs received",
                             next_expected - 1, N,
@@ -2506,8 +2491,7 @@ mod tests {
         let mut next_expected: u64 = 1;
         let started = std::time::Instant::now();
         while next_expected <= N {
-            let rc = receiver.read_cursor(0);
-            if let Some((decoded, _new_rc)) = receiver.try_read(0, rc) {
+            if let Some(decoded) = receiver.try_read(0) {
                 assert_eq!(
                     decoded.control.request_id, next_expected,
                     "large-msg ordering broke at req_id={}", next_expected,
@@ -2528,6 +2512,94 @@ mod tests {
         }
 
         writer_thread.join().expect("writer thread");
+        unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
+    }
+
+    /// Regression: `send_encoded` must panic on `sz > MAX_W2M_MSG`
+    /// rather than silently park forever on a ring that can never
+    /// fit the message. The panic is a *programmer-bug* guard;
+    /// `w2m_ring::try_reserve` returns `Full` for oversized reservations
+    /// and the writer's park-and-retry loop would otherwise spin
+    /// indefinitely.
+    #[test]
+    fn test_w2m_writer_rejects_oversized() {
+        const CAP: usize = 64 * 1024;
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CAP,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            ) as *mut u8
+        };
+        assert!(!region.is_null());
+        unsafe { w2m_ring::init_region_for_tests(region, CAP as u64); }
+
+        let region_addr = region as usize;
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.send_encoded(
+                    (w2m_ring::MAX_W2M_MSG + 1) as usize,
+                    |_| {},
+                );
+            }));
+            let _ = tx.send(result.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(true) => { /* panicked as expected */ }
+            Ok(false) => panic!(
+                "send_encoded returned normally on oversized sz — expected panic"
+            ),
+            Err(_) => panic!(
+                "send_encoded deadlocked on oversized sz — regression: \
+                 must panic instead of spinning on Full forever"
+            ),
+        }
+
+        unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
+    }
+
+    /// Control-only W2M replies (the hot path: tick/push/checkpoint
+    /// ACKs) must decode zero-copy against the ring slot —
+    /// `batch_backing` must be `None` because no interior pointers
+    /// reference the slot, and allocating a backing buffer per ACK
+    /// would burn one alloc + one memcpy on every steady-state reply.
+    #[test]
+    fn test_w2m_control_only_reply_has_no_backing() {
+        const CAP: usize = 64 * 1024;
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CAP,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            ) as *mut u8
+        };
+        assert!(!region.is_null());
+        unsafe { w2m_ring::init_region_for_tests(region, CAP as u64); }
+
+        let writer = W2mWriter::new(region, CAP as u64);
+        let sz = wire_size(STATUS_OK, b"", None, None, None);
+        writer.send_encoded(sz, |buf| {
+            encode_wire_into(
+                buf, 0, 0, 0, 0,
+                0, 0, 0, 42, STATUS_OK, b"", None, None, None,
+            );
+        });
+
+        let receiver = W2mReceiver::new(vec![region]);
+        let decoded = receiver.try_read(0).expect("ACK must decode");
+        assert_eq!(decoded.control.request_id, 42);
+        assert!(decoded.data_batch.is_none(),
+            "control-only ACK must have no data_batch");
+        assert!(decoded.batch_backing.is_none(),
+            "control-only ACK must skip the heap-copy path");
+
         unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
     }
 
