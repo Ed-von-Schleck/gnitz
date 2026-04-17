@@ -14,6 +14,7 @@ use crate::ipc::{
 use crate::ipc_sys;
 use crate::sys;
 use crate::master::MasterDispatcher;
+use crate::w2m_ring;
 use crate::worker::WorkerProcess;
 
 // ---------------------------------------------------------------------------
@@ -307,30 +308,26 @@ pub fn server_main(
         // Requires: echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
         // If shmem_enabled remains "never", this call is silently inert — no harm.
         sys::madvise_hugepage(wptr, W2M_REGION_SIZE);
-        // Initialize write cursor to W2M_HEADER_SIZE (skips the header)
-        use std::sync::atomic::{AtomicU64, Ordering};
+        // Initialize the SPSC ring header (cursors at HEADER_SIZE,
+        // capacity = full region).
         unsafe {
-            let atomic = &*(wptr as *const AtomicU64);
-            atomic.store(ipc::W2M_HEADER_SIZE as u64, Ordering::Release);
+            w2m_ring::init_region(wptr, W2M_REGION_SIZE as u64);
         }
         w2m_ptrs.push(wptr);
         w2m_fds.push(wfd);
         w2m_sizes.push(W2M_REGION_SIZE as u64);
     }
 
-    // --- Eventfds (cross-process signaling) ---
+    // --- M2W eventfds (master→worker signaling; W2M uses futex now) ---
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
-    let mut w2m_efds: Vec<i32> = Vec::with_capacity(nw);
     for _ in 0..nw {
         let m2w = ipc_sys::eventfd_create();
-        let w2m = ipc_sys::eventfd_create();
-        if m2w < 0 || w2m < 0 {
+        if m2w < 0 {
             let msg = b"Error: eventfd_create failed\n";
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
         m2w_efds.push(m2w);
-        w2m_efds.push(w2m);
     }
 
     // Log fd assignments
@@ -339,8 +336,8 @@ pub fn server_main(
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
         for w in 0..nw {
             let msg = format!(
-                "W{} m2w_efd={} w2m_efd={} w2m_fd={}\n",
-                w, m2w_efds[w], w2m_efds[w], w2m_fds[w]
+                "W{} m2w_efd={} w2m_fd={}\n",
+                w, m2w_efds[w], w2m_fds[w]
             );
             unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
         }
@@ -374,12 +371,11 @@ pub fn server_main(
                 }
             }
 
-            // Close eventfds of OTHER workers
+            // Close M2W eventfds of OTHER workers (W2M uses futex, no fd).
             for j in 0..nw {
                 if j != w {
                     unsafe {
                         libc::close(m2w_efds[j]);
-                        libc::close(w2m_efds[j]);
                     }
                 }
             }
@@ -396,7 +392,7 @@ pub fn server_main(
                 sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w],
             );
             let w2m_writer = W2mWriter::new(
-                w2m_ptrs[w], W2M_REGION_SIZE as u64, w2m_efds[w],
+                w2m_ptrs[w], W2M_REGION_SIZE as u64,
             );
 
             // SAL recovery — replay unflushed push data
@@ -440,7 +436,7 @@ pub fn server_main(
     catalog.set_active_partitions(0, 0);
 
     let sal_writer = SalWriter::new(sal_ptr, sal_fd, SAL_MMAP_SIZE as u64, m2w_efds.clone());
-    let w2m_receiver = W2mReceiver::new(w2m_ptrs.clone(), w2m_efds.clone());
+    let w2m_receiver = W2mReceiver::new(w2m_ptrs.clone());
 
     let dispatcher = MasterDispatcher::new(
         nw,

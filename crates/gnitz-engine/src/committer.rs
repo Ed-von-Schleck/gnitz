@@ -172,7 +172,6 @@ async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
         unsafe {
             let disp = &mut *disp_ptr;
             disp.write_checkpoint_group(&req_ids)?;
-            for w in 0..nw { shared.reactor.increment_in_flight(w); }
             disp.signal_all();
         }
         req_ids.iter().map(|&id| shared.reactor.await_reply(id)).collect::<Vec<_>>()
@@ -281,9 +280,6 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
                 (*disp_ptr).write_commit_group(g.tid, &g.merged, mode, &g.req_ids).err()
             })).unwrap_or_else(|panic_msg| Some(panic_msg));
             g.write_err = err;
-            if g.write_err.is_none() {
-                for w in 0..nw { shared.reactor.increment_in_flight(w); }
-            }
         }
 
         let any_written = groups.iter().any(|g| g.write_err.is_none());

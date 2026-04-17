@@ -397,13 +397,6 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
         for (i, &tid) in tids.iter().enumerate() {
             disp.write_tick_group(tid, &req_ids[i])?;
         }
-        // Increment in_flight for every (tid, worker) BEFORE signal_all,
-        // matching dispatch_fanout / committer ordering.
-        for group in &req_ids {
-            for (w, _) in group.iter().enumerate() {
-                shared.reactor.increment_in_flight(w);
-            }
-        }
         disp.signal_all();
         Ok(())
     });

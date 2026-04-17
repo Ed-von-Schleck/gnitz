@@ -1,13 +1,16 @@
 //! IPC transport layer: atomics, SAL (shared append-only log), W2M (worker→master),
 //! and wire protocol encode/decode.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::ipc_sys;
 use crate::sys;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
 use crate::storage::{Batch, wal};
 use crate::util::align8;
+use crate::w2m_ring::{
+    self, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED, TryReserve,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -17,18 +20,12 @@ pub const MAX_WORKERS: usize = 64;
 /// Group header: 32 fixed + MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes + 32 pad
 pub(crate) const GROUP_HEADER_SIZE: usize = 576;
 pub const SAL_MMAP_SIZE: usize = 1 << 30;
-pub const W2M_REGION_SIZE: usize = 1 << 30;
-pub const W2M_HEADER_SIZE: usize = 128;
+pub use crate::w2m_ring::{W2M_HEADER_SIZE, W2M_REGION_SIZE};
 
 /// Base page size on Linux x86_64. The SAL is mmap'd from a regular
 /// filesystem, so hugepage backing is not in play here. Hardcoding
 /// avoids a sysconf(_SC_PAGESIZE) call on every prefault.
 const PAGE_SIZE: u64 = 4096;
-
-/// Upper bound on a single W2M wire message (256 MiB). Large enough for
-/// any real query response, small enough to keep within u32 and to cap
-/// corrupt/buggy worker writes before they cause UB in the master.
-const MAX_W2M_MSG: u64 = 1 << 28;
 
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
@@ -429,6 +426,15 @@ pub struct DecodedWire {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<Batch>,
+    /// Backing buffer for `data_batch`. `Batch::from_regions` builds the
+    /// batch out of pointers into the source bytes; in W2M this source
+    /// is a heap copy of the ring slot (the slot itself can be reused
+    /// by the producer the moment the read cursor advances). Keeping
+    /// the buffer here ensures the pointers remain valid for the
+    /// lifetime of `DecodedWire`. `None` when `data_batch` is `None`
+    /// (no allocation needed) or when the source bytes are already
+    /// owned by a longer-lived allocation (e.g. the SAL mmap region).
+    pub _backing: Option<Vec<u8>>,
 }
 
 /// Decode a WAL block from raw bytes into an Batch.
@@ -761,7 +767,7 @@ fn decode_wire_impl(
         None
     };
 
-    Ok(DecodedWire { control, schema: wire_schema, data_batch })
+    Ok(DecodedWire { control, schema: wire_schema, data_batch, _backing: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,104 +1068,6 @@ pub(crate) unsafe fn sal_read_group_header(
             _pad2: 0,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// W2M write (worker→master)
-// ---------------------------------------------------------------------------
-
-/// Write a pre-encoded wire buffer into a W2M region (test helper).
-///
-/// Returns the new write cursor, or -1 if the region is full.
-///
-/// # Safety
-/// `region_ptr` must be a valid mmap pointer of at least `region_size` bytes.
-#[cfg(test)]
-pub(crate) unsafe fn w2m_write(
-    region_ptr: *mut u8,
-    data_ptr: *const u8,
-    data_size: u32,
-    region_size: u64,
-) -> i64 {
-    let wc = atomic_load_u64(region_ptr) as usize;
-    let sz = data_size as usize;
-    let total = 8 + align8(sz);
-
-    if wc + total > region_size as usize {
-        return -1;
-    }
-
-    // 8-byte size prefix
-    write_u64_raw(region_ptr, wc, sz as u64);
-
-    if sz > 0 && !data_ptr.is_null() {
-        std::ptr::copy_nonoverlapping(
-            data_ptr,
-            region_ptr.add(wc + 8),
-            sz,
-        );
-    }
-
-    let new_wc = wc + total;
-    atomic_store_u64(region_ptr, new_wc as u64);
-    new_wc as i64
-}
-
-/// Read the next message from a W2M region.
-///
-/// Returns (new_read_cursor, data_size, data_ptr). data_ptr is non-owning.
-/// Returns data_size=0 for "no message", either because the region is
-/// empty at read_cursor or because the size prefix was rejected as
-/// corrupt (out-of-bounds, oversized, or payload+alignment would overrun
-/// the region). Corrupt cases are logged so operators can investigate.
-///
-/// # Safety
-/// `region_ptr` must be a valid mmap pointer. `region_size` must match
-/// the actual mmap length. `read_cursor` must be <= region_size.
-pub(crate) unsafe fn w2m_read(
-    region_ptr: *const u8,
-    read_cursor: u64,
-    region_size: u64,
-) -> (u64, u32, *const u8) {
-    let rc = read_cursor as usize;
-    let rsz = region_size as usize;
-
-    // Size prefix must fit in the region.
-    if rc + 8 > rsz {
-        gnitz_error!(
-            "w2m_read: size prefix out of bounds rc={} region_size={}",
-            rc, rsz,
-        );
-        return (read_cursor, 0, std::ptr::null());
-    }
-
-    let size = read_u64_raw(region_ptr, rc);
-    if size == 0 {
-        return (read_cursor, 0, std::ptr::null());
-    }
-
-    // Reject oversized messages before any cast to usize/u32.
-    if size > MAX_W2M_MSG {
-        gnitz_error!(
-            "w2m_read: size exceeds MAX_W2M_MSG rc={} size={} max={}",
-            rc, size, MAX_W2M_MSG,
-        );
-        return (read_cursor, 0, std::ptr::null());
-    }
-
-    let size = size as usize;
-    let total = 8usize.saturating_add(align8(size));
-    if rc.saturating_add(total) > rsz {
-        gnitz_error!(
-            "w2m_read: payload out of bounds rc={} size={} region_size={}",
-            rc, size, rsz,
-        );
-        return (read_cursor, 0, std::ptr::null());
-    }
-
-    let data_ptr = region_ptr.add(rc + 8);
-    let new_rc = rc + total;
-    (new_rc as u64, size as u32, data_ptr)
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,117 +1386,227 @@ impl SalReader {
 }
 
 /// Worker's write side of a single W2M ring. Each worker owns exactly
-/// one `W2mWriter`; the atomic-release publish protocol (write size
-/// prefix → copy payload → release-store the cursor) is correct only
-/// with a single producer. Multiple concurrent writers would interleave
-/// their payload copies and corrupt the ring. The type is `!Sync` (via
-/// `*mut u8`), so the type system already prevents `&W2mWriter` from
-/// crossing threads; if a future change ever requires multi-writer
-/// semantics, the publish must add a CAS-based reservation step.
+/// one `W2mWriter`; the SPSC tail-chasing publish protocol (stamp size
+/// prefix → copy payload → Release-store the write cursor) is correct
+/// only with a single producer. Multiple concurrent writers would
+/// interleave payload copies and corrupt the ring. The type is `!Sync`
+/// (via `*mut u8`), so the type system already prevents `&W2mWriter`
+/// from crossing threads.
+///
+/// On a full ring, `send_encoded` parks on `writer_seq` via a raw v1
+/// `FUTEX_WAIT` (shared, no `FUTEX_PRIVATE_FLAG` — W2M is MAP_SHARED
+/// across fork). The master's consume path wakes us after advancing
+/// `read_cursor` when it observes `FLAG_WRITER_PARKED`.
 pub struct W2mWriter {
     region_ptr: *mut u8,
     region_size: u64,
-    efd: i32,
 }
 
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
-    pub fn new(region_ptr: *mut u8, region_size: u64, efd: i32) -> Self {
-        W2mWriter { region_ptr, region_size, efd }
+    pub fn new(region_ptr: *mut u8, region_size: u64) -> Self {
+        W2mWriter { region_ptr, region_size }
     }
 
-    /// Encode wire data directly into W2M mmap region + signal master.
+    /// Encode wire data into the W2M ring. Blocks on `writer_seq` if
+    /// the ring is full until the master advances `read_cursor`, then
+    /// retries. On successful publish, bumps `reader_seq` and issues a
+    /// `FUTEX_WAKE` if `FLAG_MASTER_PARKED` is set.
+    ///
+    /// The loop is bounded only by backpressure — a dead master would
+    /// park the writer forever, but the `worker_watcher` task in the
+    /// executor traps master death and tears the worker down first
+    /// (see `executor::worker_watcher`).
     pub fn send_encoded(&self, sz: usize, encode_fn: impl FnOnce(&mut [u8])) {
-        unsafe {
-            let wc = atomic_load_u64(self.region_ptr) as usize;
-            let total = 8 + align8(sz);
-            if wc + total > self.region_size as usize { return; }
-            write_u64_raw(self.region_ptr, wc, sz as u64);
-            if sz > 0 {
-                let slot = std::slice::from_raw_parts_mut(
-                    self.region_ptr.add(wc + 8), sz,
-                );
-                encode_fn(slot);
+        let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
+        debug_assert_eq!(
+            hdr.capacity(), self.region_size,
+            "W2mWriter region_size must match ring header capacity",
+        );
+
+        // Loop until a reservation is granted, then encode + commit.
+        // Encoding happens exactly once, after the slot is secured.
+        let reservation = loop {
+            let r = unsafe { w2m_ring::try_reserve(hdr, self.region_ptr, sz) };
+            match r {
+                TryReserve::Ok(r) => break r,
+                TryReserve::Full => {
+                    // Park. Protocol: sample writer_seq, publish
+                    // WRITER_PARKED (AcqRel — ensures the flag is
+                    // visible before we look at the cursor again),
+                    // re-check whether the ring now has room (covers
+                    // the race where the consumer drained between
+                    // our try_reserve and fetch_or), and only then
+                    // block in FUTEX_WAIT. The wake path (reader's
+                    // writer_seq bump) synchronizes with the
+                    // Acquire-loaded expected value.
+                    let expected = hdr.writer_seq().load(Ordering::Acquire);
+                    hdr.waiter_flags()
+                        .fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
+                    let room_now = unsafe { w2m_ring::has_room(hdr, sz) };
+                    if !room_now {
+                        let _ = ipc_sys::futex_wait_u32(
+                            hdr.writer_seq() as *const AtomicU32,
+                            expected,
+                            -1,
+                        );
+                    }
+                    hdr.waiter_flags()
+                        .fetch_and(!FLAG_WRITER_PARKED, Ordering::AcqRel);
+                }
             }
-            atomic_store_u64(self.region_ptr, (wc + total) as u64);
+        };
+
+        // Encode into the reserved slot (at most once) and commit.
+        unsafe {
+            if reservation.slot_len > 0 {
+                let slice = std::slice::from_raw_parts_mut(
+                    reservation.slot_ptr, reservation.slot_len,
+                );
+                encode_fn(slice);
+            }
+            w2m_ring::commit(hdr, &reservation);
         }
-        ipc_sys::eventfd_signal(self.efd);
+
+        // Bump reader_seq + wake master if parked.
+        hdr.reader_seq().fetch_add(1, Ordering::Release);
+        if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED != 0 {
+            let _ = ipc_sys::futex_wake_u32(
+                hdr.reader_seq() as *const AtomicU32, 1,
+            );
+        }
     }
 }
 
-/// Master's read side of W2M.
+/// Master's read side of W2M. Thin adapter over `w2m_ring::try_consume`.
 pub struct W2mReceiver {
     region_ptrs: Vec<*mut u8>,
-    region_size: u64,
-    efds: Vec<i32>,
     num_workers: usize,
 }
 
 unsafe impl Send for W2mReceiver {}
 
 impl W2mReceiver {
-    pub fn new(region_ptrs: Vec<*mut u8>, efds: Vec<i32>) -> Self {
+    pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
         let num_workers = region_ptrs.len();
         W2mReceiver {
             region_ptrs,
-            region_size: W2M_REGION_SIZE as u64,
-            efds,
             num_workers,
         }
     }
 
-    /// Poll for any worker signal (wraps eventfd_wait_any).
-    pub fn poll(&self, timeout_ms: i32) -> i32 {
-        ipc_sys::eventfd_wait_any(&self.efds, timeout_ms)
+    /// Pointer to worker `w`'s ring region.
+    #[inline]
+    pub fn region_ptr(&self, worker: usize) -> *mut u8 {
+        self.region_ptrs[worker]
     }
 
-    /// Wait for a specific worker signal (wraps eventfd_wait).
-    pub fn wait_one(&self, worker: usize, timeout_ms: i32) -> i32 {
-        ipc_sys::eventfd_wait(self.efds[worker], timeout_ms)
+    /// Access worker `w`'s ring header.
+    ///
+    /// # Safety
+    /// `worker` must be < `num_workers`.
+    #[inline]
+    pub unsafe fn header(&self, worker: usize) -> &'static W2mRingHeader {
+        W2mRingHeader::from_raw(self.region_ptrs[worker] as *const u8)
     }
 
     /// Read write-cursor of worker (atomic load).
     pub fn write_cursor(&self, worker: usize) -> u64 {
-        unsafe { atomic_load_u64(self.region_ptrs[worker]) }
+        let hdr = unsafe { self.header(worker) };
+        hdr.write_cursor().load(Ordering::Acquire)
     }
 
-    /// Try to read next decoded message from worker at read_cursor.
-    /// Returns None if no new data. Returns (DecodedWire, new_cursor).
-    pub fn try_read(&self, worker: usize, read_cursor: u64) -> Option<(DecodedWire, u64)> {
-        let wc = self.write_cursor(worker);
-        if read_cursor >= wc {
-            return None;
-        }
-        let (new_rc, data_size, data_ptr) = unsafe {
-            w2m_read(self.region_ptrs[worker], read_cursor, self.region_size)
-        };
-        if data_size == 0 {
-            return None;
-        }
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_size as usize) };
-        match decode_wire(data) {
-            Ok(decoded) => Some((decoded, new_rc)),
-            Err(_) => None,
-        }
+    /// Read read-cursor of worker (atomic load).
+    pub fn read_cursor(&self, worker: usize) -> u64 {
+        let hdr = unsafe { self.header(worker) };
+        hdr.read_cursor().load(Ordering::Acquire)
     }
 
-    /// Reset one worker's W2M write cursor to `W2M_HEADER_SIZE`.
+    /// Try to read the next decoded message from worker `w` at
+    /// `read_cursor`. Returns `None` if no new data. On success
+    /// returns `(DecodedWire, new_cursor)` and advances
+    /// `hdr.read_cursor` to `new_cursor`, bumps `writer_seq`, and
+    /// wakes a parked writer if any.
+    /// Closure-based consume. The slot bytes are exposed to `f` while
+    /// the read cursor still names them; the cursor only advances after
+    /// `f` returns. This is the structural form of the SPSC consume
+    /// protocol — there is no way for a caller to advance the cursor
+    /// before they are done with the slot.
     ///
-    /// SAFETY: Only safe when no worker reply for `worker` is in flight
-    /// — i.e. `reactor.in_flight[worker] == 0` and the master is not
-    /// currently routing replies for it. The reactor is the sole
-    /// W2M reader; resetting under the wrong conditions strands data
-    /// past the new write_cursor. Called only by
-    /// `Reactor::drain_w2m_for_worker` once both gates are confirmed.
-    pub(crate) fn reset_one_unsafe(&self, worker: usize) {
-        unsafe {
-            atomic_store_u64(self.region_ptrs[worker], W2M_HEADER_SIZE as u64);
+    /// `T` cannot borrow from the slot (the slot's lifetime is local to
+    /// this function and `T` must outlive it), so callers that need
+    /// data after the cursor advances must copy bytes out inside `f`.
+    pub fn try_read_with<F, T>(&self, worker: usize, f: F) -> Option<T>
+    where
+        F: FnOnce(&[u8]) -> T,
+    {
+        let hdr = unsafe { self.header(worker) };
+        let cursor = hdr.read_cursor().load(Ordering::Acquire);
+        let (ptr, sz, new_rc) = unsafe {
+            w2m_ring::try_consume(hdr, self.region_ptrs[worker] as *const u8, cursor)?
+        };
+
+        let result = {
+            let slot = unsafe { std::slice::from_raw_parts(ptr, sz as usize) };
+            f(slot)
+            // `slot` is dropped here, before the cursor advances. The
+            // borrow checker prevents `T` from carrying any reference
+            // into `slot`.
+        };
+
+        hdr.read_cursor().store(new_rc, Ordering::Release);
+        hdr.writer_seq().fetch_add(1, Ordering::Release);
+        if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
+            let _ = ipc_sys::futex_wake_u32(
+                hdr.writer_seq() as *const AtomicU32, 1,
+            );
         }
+
+        Some(result)
+    }
+
+    /// Backwards-compatible wrapper around `try_read_with`. Copies the
+    /// slot to a heap buffer, decodes it, and pins the buffer to
+    /// `DecodedWire._backing` so the batch's interior pointers stay
+    /// valid for the caller's lifetime.
+    ///
+    /// `read_cursor` is accepted for source compatibility but ignored;
+    /// the canonical cursor lives in the ring header.
+    pub fn try_read(&self, worker: usize, _read_cursor: u64) -> Option<(DecodedWire, u64)> {
+        let owned: Vec<u8> = self.try_read_with(worker, |slot| slot.to_vec())?;
+        let new_rc = unsafe { self.header(worker) }
+            .read_cursor().load(Ordering::Acquire);
+        let mut decoded = decode_wire(&owned).ok()?;
+        if decoded.data_batch.is_some() {
+            decoded._backing = Some(owned);
+        }
+        Some((decoded, new_rc))
+    }
+
+    /// Block until worker `w`'s `reader_seq` counter advances past
+    /// `expected`, or `timeout_ms` elapses. Used by bootstrap paths
+    /// that cannot go through the reactor's FUTEX_WAITV multiplex.
+    pub fn wait_for(&self, worker: usize, timeout_ms: i32) -> i32 {
+        let hdr = unsafe { self.header(worker) };
+        let expected = hdr.reader_seq().load(Ordering::Acquire);
+        hdr.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
+        // Recheck: writer may have published between sample and park.
+        let actual = hdr.reader_seq().load(Ordering::Acquire);
+        let rc = if actual != expected {
+            0 // already advanced; no wait needed
+        } else {
+            ipc_sys::futex_wait_u32(
+                hdr.reader_seq() as *const AtomicU32,
+                expected,
+                timeout_ms,
+            )
+        };
+        hdr.waiter_flags().fetch_and(!FLAG_MASTER_PARKED, Ordering::AcqRel);
+        rc
     }
 
     pub fn num_workers(&self) -> usize { self.num_workers }
-    pub fn efds(&self) -> &[i32] { &self.efds }
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,179 +1817,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_w2m_round_trip() {
-        unsafe {
-            let size = 1 << 20;
-            let ptr = alloc_mmap(size);
-
-            // Init write cursor to W2M_HEADER_SIZE
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-
-            let buf = make_test_data(0xEE, 256);
-            let new_wc = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
-            assert!(new_wc > 0);
-
-            // Read back
-            let (new_rc, data_size, data_ptr) = w2m_read(ptr, W2M_HEADER_SIZE as u64, size as u64);
-            assert_eq!(data_size as usize, 256);
-            let data = std::slice::from_raw_parts(data_ptr, data_size as usize);
-            assert_eq!(data, buf.as_slice());
-            assert_eq!(new_rc, new_wc as u64);
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    #[test]
-    fn test_w2m_multiple_messages() {
-        unsafe {
-            let size = 1 << 20;
-            let ptr = alloc_mmap(size);
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-
-            for i in 0..3u8 {
-                let buf = make_test_data(i + 1, 100);
-                let r = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
-                assert!(r > 0);
-            }
-
-            let mut rc = W2M_HEADER_SIZE as u64;
-            for i in 0..3u8 {
-                let (new_rc, sz, data_ptr) = w2m_read(ptr, rc, size as u64);
-                assert_eq!(sz, 100);
-                let data = std::slice::from_raw_parts(data_ptr, sz as usize);
-                assert_eq!(data[0], i + 1);
-                rc = new_rc;
-            }
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    #[test]
-    fn test_w2m_cursor_reset() {
-        unsafe {
-            let size = 1 << 20;
-            let ptr = alloc_mmap(size);
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-
-            // Write something
-            let buf = make_test_data(0x42, 64);
-            w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
-
-            // Reset cursor
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-            let wc = atomic_load_u64(ptr);
-            assert_eq!(wc, W2M_HEADER_SIZE as u64);
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    #[test]
-    fn test_w2m_full_error() {
-        unsafe {
-            // Tiny region
-            let size = W2M_HEADER_SIZE + 16; // barely any space
-            let ptr = alloc_mmap(size);
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-
-            let buf = make_test_data(0xFF, 100);
-            let r = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
-            assert_eq!(r, -1);
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    /// A buggy/malicious worker writing a `u64::MAX` size prefix must not
-    /// cause UB in `w2m_read`. It must return (cursor, 0, null) and log,
-    /// and the master's `try_read` must treat that as "no message".
-    #[test]
-    fn test_w2m_read_rejects_oversized_size_prefix() {
-        unsafe {
-            let size = 1 << 16; // 64 KiB
-            let ptr = alloc_mmap(size);
-            let cursor: u64 = 128;
-
-            // Corrupt: write u64::MAX at `cursor`.
-            write_u64_raw(ptr, cursor as usize, u64::MAX);
-
-            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
-            assert_eq!(new_rc, cursor, "cursor must not advance on corrupt size");
-            assert_eq!(data_size, 0);
-            assert!(data_ptr.is_null());
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    /// A size prefix just above `MAX_W2M_MSG` must be rejected too — this
-    /// guards the `size > MAX_W2M_MSG` branch separately from `u64::MAX`,
-    /// which would also fail the overflow/bounds check.
-    #[test]
-    fn test_w2m_read_rejects_above_max_message_cap() {
-        unsafe {
-            let size = 1 << 16;
-            let ptr = alloc_mmap(size);
-            let cursor: u64 = 0;
-
-            write_u64_raw(ptr, cursor as usize, MAX_W2M_MSG + 1);
-
-            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
-            assert_eq!(new_rc, cursor);
-            assert_eq!(data_size, 0);
-            assert!(data_ptr.is_null());
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    /// A plausible size that would still overrun the region (payload past
-    /// region_size) must be rejected by the payload-bounds check.
-    #[test]
-    fn test_w2m_read_rejects_payload_overrun() {
-        unsafe {
-            let size = 1 << 12; // 4 KiB
-            let ptr = alloc_mmap(size);
-            // Put the size prefix near the end so size=1024 would overrun.
-            let cursor: u64 = (size - 64) as u64;
-            write_u64_raw(ptr, cursor as usize, 1024);
-
-            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
-            assert_eq!(new_rc, cursor);
-            assert_eq!(data_size, 0);
-            assert!(data_ptr.is_null());
-
-            free_mmap(ptr, size);
-        }
-    }
-
-    /// Happy path: a small valid write round-trips through `w2m_read`
-    /// with the new `region_size` parameter, confirming the bounds checks
-    /// don't reject legitimate traffic.
-    #[test]
-    fn test_w2m_read_accepts_valid_small_message() {
-        unsafe {
-            let size = 1 << 16;
-            let ptr = alloc_mmap(size);
-            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
-
-            let buf = make_test_data(0xAB, 64);
-            let new_wc = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
-            assert!(new_wc > 0);
-
-            let (new_rc, data_size, data_ptr) =
-                w2m_read(ptr, W2M_HEADER_SIZE as u64, size as u64);
-            assert_eq!(data_size, 64);
-            assert_eq!(new_rc, new_wc as u64);
-            let data = std::slice::from_raw_parts(data_ptr, data_size as usize);
-            assert_eq!(data, buf.as_slice());
-
-            free_mmap(ptr, size);
-        }
-    }
+    // (W2M-specific tests — round-trip, wrap, corrupt-prefix rejection,
+    // zero-copy — now live in `crate::w2m_ring::tests`.)
 
     #[test]
     fn test_sal_cross_process() {
@@ -2520,6 +2367,168 @@ mod tests {
         let result = decode_wire(truncated);
         assert!(result.is_err(),
             "decode should reject truncated control block, got Ok");
+    }
+
+    /// Concurrent W2M writer + reader on a small ring with high publish
+    /// pressure. Catches two failure modes at once:
+    ///
+    /// 1. Wrap-overwrite: virtual cursors must prevent the writer from
+    ///    lapping unread data. A regression here surfaces as out-of-order
+    ///    or missing `req_id`s.
+    /// 2. Decode-after-release: `try_read` must copy the slot bytes
+    ///    before advancing `read_cursor`. A regression here surfaces as
+    ///    wrong `req_id`s (a later message's bytes overwriting the slot
+    ///    we just claimed but haven't decoded yet).
+    ///
+    /// 8 KiB cap forces the writer to wrap many times for 2000 msgs of
+    /// ~280 B each. Worker thread is the producer, main thread spins on
+    /// `try_read` after each publish, asserting strict ordering.
+    #[test]
+    fn test_w2m_concurrent_publish_consume_ordered() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const CAP: usize = 8 * 1024; // 8 KiB → many wraps
+        const N: u64 = 2_000;
+
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CAP,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            ) as *mut u8
+        };
+        assert!(!region.is_null());
+        unsafe { w2m_ring::init_region_for_tests(region, CAP as u64); }
+
+        // SAFETY: the writer thread takes exclusive ownership of `region`
+        // for publishes; the reader (this thread) only reads via
+        // W2mReceiver. The mmap is process-lifetime.
+        let region_addr = region as usize;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_w = Arc::clone(&done);
+        let writer_thread = std::thread::spawn(move || {
+            let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+            let sz = wire_size(STATUS_OK, b"", None, None, None);
+            for req_id in 1..=N {
+                writer.send_encoded(sz, |buf| {
+                    encode_wire_into(
+                        buf, 0, 0, 0, 0,
+                        0, 0, 0, req_id, STATUS_OK, b"", None, None, None,
+                    );
+                });
+            }
+            done_w.store(true, Ordering::Release);
+        });
+
+        let receiver = W2mReceiver::new(vec![region]);
+        let mut next_expected: u64 = 1;
+        let started = std::time::Instant::now();
+        while next_expected <= N {
+            let rc = receiver.read_cursor(0);
+            if let Some((decoded, _new_rc)) = receiver.try_read(0, rc) {
+                assert_eq!(
+                    decoded.control.request_id, next_expected,
+                    "msg ordering broke at req_id={}: writer-cross-reader \
+                     or decode-after-release race",
+                    next_expected,
+                );
+                next_expected += 1;
+            } else {
+                if done.load(Ordering::Acquire) && next_expected <= N {
+                    let rc2 = receiver.read_cursor(0);
+                    if receiver.try_read(0, rc2).is_none() {
+                        panic!(
+                            "writer done but only {}/{} msgs received",
+                            next_expected - 1, N,
+                        );
+                    }
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "test timed out at req_id={}", next_expected,
+            );
+        }
+
+        writer_thread.join().expect("writer thread");
+        unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
+    }
+
+    /// Larger-message variant of the concurrent stress: ~4 KiB messages
+    /// in a 64 KiB cap (only ~15 fit at a time → constant
+    /// backpressure + frequent SKIP wraps with realistic-size payloads).
+    #[test]
+    fn test_w2m_concurrent_large_messages_ordered() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const CAP: usize = 64 * 1024;
+        const N: u64 = 500;
+        // Fabricate a payload that pushes the wire size near 4 KiB by
+        // attaching a long error_msg.
+        let pad: Vec<u8> = vec![b'x'; 4000];
+
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CAP,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            ) as *mut u8
+        };
+        assert!(!region.is_null());
+        unsafe { w2m_ring::init_region_for_tests(region, CAP as u64); }
+
+        let region_addr = region as usize;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_w = Arc::clone(&done);
+        let pad_w = pad.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+            let sz = wire_size(STATUS_OK, &pad_w, None, None, None);
+            for req_id in 1..=N {
+                writer.send_encoded(sz, |buf| {
+                    encode_wire_into(
+                        buf, 0, 0, 0, 0,
+                        0, 0, 0, req_id, STATUS_OK, &pad_w, None, None, None,
+                    );
+                });
+            }
+            done_w.store(true, Ordering::Release);
+        });
+
+        let receiver = W2mReceiver::new(vec![region]);
+        let mut next_expected: u64 = 1;
+        let started = std::time::Instant::now();
+        while next_expected <= N {
+            let rc = receiver.read_cursor(0);
+            if let Some((decoded, _new_rc)) = receiver.try_read(0, rc) {
+                assert_eq!(
+                    decoded.control.request_id, next_expected,
+                    "large-msg ordering broke at req_id={}", next_expected,
+                );
+                assert_eq!(
+                    decoded.control.error_msg, pad,
+                    "payload corrupted at req_id={}", next_expected,
+                );
+                next_expected += 1;
+            } else {
+                std::thread::yield_now();
+            }
+            let _ = done.load(Ordering::Acquire);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "test timed out at req_id={}", next_expected,
+            );
+        }
+
+        writer_thread.join().expect("writer thread");
+        unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
     }
 
 }

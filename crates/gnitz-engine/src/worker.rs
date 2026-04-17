@@ -1131,13 +1131,14 @@ mod tests {
     #[test]
     fn test_send_helpers_echo_request_id() {
         use crate::ipc;
-        const REGION_SIZE: usize = 1 << 20;
-        // mmap an anonymous region; eventfd_create gives a real fd that
-        // accepts eventfd_signal calls without disturbing anything.
+        use crate::w2m_ring;
+        // Use the production-sized region — the mmap reservation is
+        // lazy-populated, so the 1 GiB backing is cheap.
+        let region_size = w2m_ring::W2M_REGION_SIZE;
         let region_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                REGION_SIZE,
+                region_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANONYMOUS | libc::MAP_SHARED,
                 -1, 0,
@@ -1145,12 +1146,9 @@ mod tests {
         };
         assert_ne!(region_ptr, libc::MAP_FAILED);
         let region_ptr = region_ptr as *mut u8;
-        // Init read cursor at W2M_HEADER_SIZE.
-        unsafe { *(region_ptr as *mut u64) = ipc::W2M_HEADER_SIZE as u64; }
+        unsafe { w2m_ring::init_region(region_ptr, region_size as u64); }
 
-        let efd = crate::ipc_sys::eventfd_create();
-        assert!(efd >= 0);
-        let w2m_writer = ipc::W2mWriter::new(region_ptr, REGION_SIZE as u64, efd);
+        let w2m_writer = ipc::W2mWriter::new(region_ptr, region_size as u64);
 
         let wp = WorkerProcess {
             worker_id: 0,
@@ -1174,14 +1172,15 @@ mod tests {
         wp.send_response(8, None, Some(&schema), req_resp);
         wp.send_error("boom", req_err);
 
-        // Decode the three messages back from the region and check ids.
-        let mut rc = ipc::W2M_HEADER_SIZE as u64;
+        // Decode the three messages back from the ring via try_consume.
+        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(region_ptr as *const u8) };
+        let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
         let mut decoded_ids = Vec::new();
         for _ in 0..3 {
-            let (new_rc, sz, data_ptr) = unsafe {
-                ipc::w2m_read(region_ptr as *const u8, rc, REGION_SIZE as u64)
+            let (data_ptr, sz, new_rc) = unsafe {
+                w2m_ring::try_consume(hdr, region_ptr as *const u8, rc)
+                    .expect("expected a message")
             };
-            assert!(sz > 0, "expected a message at cursor {}", rc);
             let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
             let decoded = ipc::decode_wire(data).expect("decode_wire");
             decoded_ids.push(decoded.control.request_id);
@@ -1190,8 +1189,7 @@ mod tests {
         assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
 
         unsafe {
-            libc::munmap(region_ptr as *mut libc::c_void, REGION_SIZE);
-            libc::close(efd);
+            libc::munmap(region_ptr as *mut libc::c_void, region_size);
         }
     }
 

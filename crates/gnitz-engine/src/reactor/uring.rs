@@ -68,16 +68,6 @@ impl Ring for IoUringRing {
         }
     }
 
-    fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64) {
-        self.ensure_sq_room();
-        let entry = opcode::PollAdd::new(types::Fd(fd), mask)
-            .build()
-            .user_data(user_data);
-        unsafe {
-            self.ring.submission().push(&entry).unwrap();
-        }
-    }
-
     fn prep_fsync(&mut self, fd: i32, user_data: u64) {
         self.ensure_sq_room();
         let entry = opcode::Fsync::new(types::Fd(fd))
@@ -99,6 +89,29 @@ impl Ring for IoUringRing {
         let ts_ptr: *const types::Timespec = &*ts;
         self.timer_specs.insert(user_data, ts);
         let entry = opcode::Timeout::new(ts_ptr)
+            .build()
+            .user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
+    unsafe fn prep_futex_waitv(
+        &mut self,
+        futexv: *const types::FutexWaitV,
+        nr: u32,
+        user_data: u64,
+    ) {
+        self.ensure_sq_room();
+        let entry = opcode::FutexWaitV::new(futexv, nr)
+            .build()
+            .user_data(user_data);
+        self.ring.submission().push(&entry).unwrap();
+    }
+
+    fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64) {
+        self.ensure_sq_room();
+        let entry = opcode::AsyncCancel::new(target_user_data)
             .build()
             .user_data(user_data);
         unsafe {

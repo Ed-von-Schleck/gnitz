@@ -13,7 +13,7 @@ use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
-    SalWriter, W2mReceiver, W2M_HEADER_SIZE,
+    SalWriter, W2mReceiver,
 };
 use crate::reactor::PendingRelay;
 use crate::storage::{Batch, partition_for_key};
@@ -386,41 +386,31 @@ impl MasterDispatcher {
         Rc::clone(&self.w2m)
     }
 
-    /// Wait for one response from each worker. Used only by bootstrap
-    /// `fan_out_backfill`; no other sync W2M callers exist. Bootstrap
-    /// runs before the reactor, so the per-worker W2M reset implemented
-    /// in `Reactor::drain_w2m_for_worker` does not yet apply — we still
-    /// need a local reset here.
+    /// Wait for one response from each worker. Bootstrap-only: runs
+    /// before the reactor is up, so we drive each worker's ring via
+    /// `W2mReceiver::wait_for` (sync FUTEX_WAIT on `reader_seq`). The
+    /// tail-chasing ring self-maintains — no reset needed.
     fn wait_all_workers(&mut self) -> Result<Vec<Option<DecodedWire>>, String> {
         let nw = self.num_workers;
         let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
-        let mut remaining = nw;
-        let mut collected = vec![false; nw];
-        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
-
-        let err = (|| -> Result<(), String> {
-            while remaining > 0 {
-                self.w2m.poll(1000);
-                for w in 0..nw {
-                    if collected[w] { continue; }
-                    if let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
-                        w2m_rcs[w] = new_rc;
+        for w in 0..nw {
+            loop {
+                let rc = self.w2m.read_cursor(w);
+                match self.w2m.try_read(w, rc) {
+                    Some((decoded, _new_rc)) => {
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
                             return Err(format!("worker {}: {}", w, msg));
                         }
                         results[w] = Some(decoded);
-                        collected[w] = true;
-                        remaining -= 1;
+                        break;
+                    }
+                    None => {
+                        let _ = self.w2m.wait_for(w, 1000);
                     }
                 }
             }
-            Ok(())
-        })();
-        for w in 0..nw {
-            self.w2m.reset_one_unsafe(w);
         }
-        err?;
         Ok(results)
     }
 
@@ -431,49 +421,52 @@ impl MasterDispatcher {
 
     pub(crate) fn num_workers(&self) -> usize { self.num_workers }
 
-    /// Collect ACKs from all workers, relaying exchange messages inline.
-    /// Bootstrap-only: called by `fan_out_backfill` before the reactor
-    /// is up. Maintains its own ExchangeAccumulator since the reactor's
-    /// is not yet wired.
+    /// Collect ACKs from all workers, relaying exchange messages
+    /// inline. Bootstrap-only: called by `fan_out_backfill` before the
+    /// reactor is up, so we walk each ring serially with
+    /// `W2mReceiver::wait_for`. Maintains its own ExchangeAccumulator
+    /// since the reactor's is not yet wired.
     fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
-        let mut remaining = nw;
         let mut collected = vec![false; nw];
-        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+        let mut remaining = nw;
         let mut acc = crate::reactor::ExchangeAccumulator::new(nw);
 
-        let err = (|| -> Result<(), String> {
-            while remaining > 0 {
-                self.w2m.poll(1000);
-                for w in 0..nw {
-                    if collected[w] { continue; }
-                    while let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
-                        w2m_rcs[w] = new_rc;
-
-                        if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
-                            if let Some(relay) = acc.process(w, decoded) {
-                                let prep = self.prepare_relay(relay)?;
-                                self.emit_relay(prep)?;
-                            }
-                            break; // re-check write_cursor after relay
-                        } else {
-                            if decoded.control.status != 0 {
-                                let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                                return Err(format!("worker {}: {}", w, msg));
-                            }
-                            collected[w] = true;
-                            remaining -= 1;
-                            break;
-                        }
+        while remaining > 0 {
+            // One full pass over all workers per iteration. If a pass
+            // makes no progress, we wait_for on the first still-active
+            // worker. Exchange replies from any worker may trigger
+            // further SAL writes + replies, so we loop broadly.
+            let mut progressed = false;
+            for w in 0..nw {
+                if collected[w] { continue; }
+                let rc = self.w2m.read_cursor(w);
+                let Some((decoded, _new_rc)) = self.w2m.try_read(w, rc) else {
+                    continue;
+                };
+                progressed = true;
+                if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
+                    if let Some(relay) = acc.process(w, decoded) {
+                        let prep = self.prepare_relay(relay)?;
+                        self.emit_relay(prep)?;
                     }
+                } else {
+                    if decoded.control.status != 0 {
+                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                        return Err(format!("worker {}: {}", w, msg));
+                    }
+                    collected[w] = true;
+                    remaining -= 1;
                 }
             }
-            Ok(())
-        })();
-        for w in 0..nw {
-            self.w2m.reset_one_unsafe(w);
+            if !progressed {
+                // Wait for the first still-active worker to publish.
+                if let Some(next) = (0..nw).find(|&w| !collected[w]) {
+                    let _ = self.w2m.wait_for(next, 1000);
+                }
+            }
         }
-        err
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -708,9 +701,6 @@ impl MasterDispatcher {
                     &check.schema, &[], 0, 0, check.col_hint,
                     &rids[idx], -1,
                 )?;
-            }
-            for _ in 0..num_checks {
-                for w in 0..nw { reactor.increment_in_flight(w); }
             }
             disp.signal_all();
             (nw, rids)
@@ -1499,7 +1489,6 @@ where
     unsafe {
         let disp = &mut *disp_ptr;
         submit(disp, &req_ids)?;
-        for w in 0..nw { reactor.increment_in_flight(w); }
         disp.signal_all();
     }
     let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
@@ -1526,7 +1515,6 @@ async fn single_worker_async(
         let req_id = reactor.alloc_request_id();
         disp.write_group(target_id, flags, &[], &schema, &col_names,
                          seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)?;
-        reactor.increment_in_flight(worker);
         disp.signal_one(worker);
         (schema, req_id)
     };

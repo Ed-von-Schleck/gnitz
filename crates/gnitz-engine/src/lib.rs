@@ -14,6 +14,7 @@ pub mod dag;
 pub mod sys;
 pub mod ipc_sys;
 pub mod ipc;
+pub mod w2m_ring;
 pub mod catalog;
 pub mod worker;
 pub mod master;

@@ -19,11 +19,6 @@ pub trait Ring {
     fn prep_send(&mut self, fd: i32, buf: *const u8, len: u32, user_data: u64);
     fn prep_accept(&mut self, fd: i32, user_data: u64);
 
-    /// Submit a `PollAdd` op for `fd` with `mask` (POLLIN/POLLOUT bits).
-    /// One-shot: a single CQE is delivered when the fd becomes ready,
-    /// then the op is consumed. Re-arm by submitting another `prep_poll_add`.
-    fn prep_poll_add(&mut self, fd: i32, mask: u32, user_data: u64);
-
     /// Submit an `Fsync` op with the `DATASYNC` flag on `fd`.
     /// One-shot: a single CQE is delivered when the kernel's fdatasync
     /// completes; the CQE's `res` is the fdatasync return code.
@@ -33,6 +28,30 @@ pub trait Ring {
     /// One-shot: a single CQE is delivered (with `res = -ETIME` on natural
     /// expiry) when the timer expires.
     fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64);
+
+    /// Submit a `FUTEX_WAITV` op over `nr` pointer-stable `FutexWaitV`
+    /// entries. The implementation must own the storage for the array
+    /// so that the kernel's asynchronous dereference stays valid until
+    /// the matching CQE is drained.
+    ///
+    /// One-shot: a single CQE is delivered on wake / cancellation.
+    /// Requires Linux 6.7+; probed at `Reactor::new`.
+    ///
+    /// # Safety
+    /// The caller promises each `FutexWaitV` entry's `uaddr` points to
+    /// a live atomic u32 shared with the producer.
+    unsafe fn prep_futex_waitv(
+        &mut self,
+        futexv: *const io_uring::types::FutexWaitV,
+        nr: u32,
+        user_data: u64,
+    );
+
+    /// Submit an `AsyncCancel` op targeting an in-flight SQE identified
+    /// by its `target_user_data`. The CQE for the cancelled SQE
+    /// arrives first (with `res = -ECANCELED`) and the AsyncCancel's
+    /// own CQE follows.
+    fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64);
 
     /// Submit pending SQEs and optionally wait for completions.
     ///

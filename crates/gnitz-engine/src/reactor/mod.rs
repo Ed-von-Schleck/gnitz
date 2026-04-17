@@ -31,7 +31,11 @@ use std::time::Instant;
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::ipc::{DecodedWire, FLAG_EXCHANGE, W2mReceiver, W2M_HEADER_SIZE, W2M_REGION_SIZE};
+use crate::ipc::{DecodedWire, FLAG_EXCHANGE, W2mReceiver};
+use crate::ipc_sys::FUTEX2_SIZE_U32;
+use crate::w2m_ring::FLAG_MASTER_PARKED;
+
+use io_uring::types::FutexWaitV;
 
 
 pub mod io;
@@ -50,10 +54,11 @@ pub use sync::{AsyncMutex, AsyncRwLock, Either, join2, join_all, oneshot, mpsc, 
 pub const KIND_REPLY:        u64 = 1;
 pub const KIND_TIMEOUT:      u64 = 2;
 pub const KIND_FSYNC:        u64 = 3;
-pub const KIND_POLL_EVENTFD: u64 = 4;
+pub const KIND_FUTEX_WAITV:  u64 = 4;
 pub const KIND_ACCEPT:       u64 = 5;
 pub const KIND_RECV:         u64 = 6;
 pub const KIND_SEND:         u64 = 7;
+pub const KIND_FUTEX_CANCEL: u64 = 8;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK:    u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -103,10 +108,21 @@ struct ReactorShared {
     fsync_wakers: RefCell<HashMap<u64, Waker>>,
     parked_fsync_results: RefCell<HashMap<u64, i32>>,
     w2m: RefCell<Option<Rc<W2mReceiver>>>,
-    in_flight: RefCell<Vec<usize>>,
-    /// Per-worker W2M read cursor. The reactor is the sole W2M reader,
-    /// so this is the only cursor for each ring.
-    w2m_cursors: RefCell<Vec<u64>>,
+    /// Pointer-stable storage for the reactor's persistent
+    /// `FUTEX_WAITV` SQE. The kernel dereferences this array
+    /// asynchronously, so it must outlive the SQE. A single SQE covers
+    /// every worker's `reader_seq` word; we own it on the heap, and
+    /// tear it down only after cancelling the SQE in
+    /// `request_shutdown` and awaiting the `-ECANCELED` CQE.
+    futex_waitv_storage: RefCell<Option<Box<[FutexWaitV]>>>,
+    /// True while an outstanding `FUTEX_WAITV` SQE exists whose
+    /// `FutexWaitV` array lives in `futex_waitv_storage`. Dropping the
+    /// storage without clearing this flag is a use-after-free hazard.
+    futex_waitv_armed: Cell<bool>,
+    /// Signal from `request_shutdown` → `dispatch_cqe` that the
+    /// cancellation CQE for the FUTEX_WAITV SQE has arrived and the
+    /// storage can be dropped.
+    futex_waitv_cancelled: Cell<bool>,
     /// Per-timer wakers keyed by timer_id. Each entry holds the waker to
     /// fire when the io_uring Timeout CQE arrives and a cancellation flag
     /// shared with the owning TimerFuture. If the future is dropped before
@@ -171,8 +187,57 @@ pub struct Reactor {
     inner: Rc<ReactorShared>,
 }
 
+/// Submit a `FUTEX_WAITV` SQE with a deliberately mismatched expected
+/// value (returns -EAGAIN immediately when the opcode is supported).
+/// Aborts if the kernel returns -EINVAL or -ENOSYS — those signal
+/// that the opcode isn't available, and the W2M master-wait path
+/// would silently fail to deliver CQEs. Linux 6.7+ required.
+fn probe_futex_waitv_support() {
+    use std::sync::atomic::AtomicU32;
+    use io_uring::{opcode, types, IoUring};
+
+    let atomic = Box::new(AtomicU32::new(42));
+    let futexv: Box<[FutexWaitV; 1]> = Box::new([
+        FutexWaitV::new()
+            .val(0)
+            .uaddr(&*atomic as *const AtomicU32 as u64)
+            .flags(FUTEX2_SIZE_U32),
+    ]);
+
+    let mut ring = match IoUring::new(8) {
+        Ok(r) => r,
+        Err(e) => crate::gnitz_fatal_abort!(
+            "reactor: probe io_uring init failed: {}", e,
+        ),
+    };
+    let entry = opcode::FutexWaitV::new(futexv.as_ptr() as *const types::FutexWaitV, 1)
+        .build()
+        .user_data(0xFEEDu64);
+    if unsafe { ring.submission().push(&entry) }.is_err() {
+        crate::gnitz_fatal_abort!("reactor: probe SQE push failed");
+    }
+    if let Err(e) = ring.submitter().submit_and_wait(1) {
+        crate::gnitz_fatal_abort!("reactor: probe submit_and_wait failed: {}", e);
+    }
+    let cqe = match ring.completion().next() {
+        Some(c) => c,
+        None => crate::gnitz_fatal_abort!("reactor: probe produced no CQE"),
+    };
+    let res = cqe.result();
+    if res == -libc::ENOSYS || res == -libc::EINVAL {
+        crate::gnitz_fatal_abort!(
+            "reactor: io_uring IORING_OP_FUTEX_WAITV not supported (res={}); \
+             Linux 6.7+ required for the W2M tail-chasing-ring transport.",
+            res,
+        );
+    }
+    drop(futexv);
+    drop(atomic);
+}
+
 impl Reactor {
     pub fn new(ring_capacity: u32) -> std::io::Result<Self> {
+        probe_futex_waitv_support();
         let ring = IoUringRing::new(ring_capacity)?;
         let inner = Rc::new(ReactorShared {
             ring: RefCell::new(ring),
@@ -185,8 +250,9 @@ impl Reactor {
             fsync_wakers: RefCell::new(HashMap::new()),
             parked_fsync_results: RefCell::new(HashMap::new()),
             w2m: RefCell::new(None),
-            in_flight: RefCell::new(Vec::new()),
-            w2m_cursors: RefCell::new(Vec::new()),
+            futex_waitv_storage: RefCell::new(None),
+            futex_waitv_armed: Cell::new(false),
+            futex_waitv_cancelled: Cell::new(false),
             timer_wakers: RefCell::new(HashMap::new()),
             next_timer_id: Cell::new(0),
             #[cfg(test)]
@@ -220,13 +286,46 @@ impl Reactor {
     }
 
     /// Request reactor shutdown — the next `block_until_shutdown` tick
-    /// exits cleanly.
+    /// exits cleanly. Also cancels the outstanding `FUTEX_WAITV` SQE
+    /// (if any) so its `FutexWaitV` array storage can be dropped
+    /// safely; waits for the `-ECANCELED` CQE before returning.
     pub fn request_shutdown(&self) {
         self.inner.shutdown.set(true);
-        // Wake an idle tick so the check fires on the next loop iteration.
+        self.cancel_futex_waitv_and_wait();
         if let Some(w) = self.inner.task_wakers.borrow().values().next().cloned() {
             w.wake();
         }
+    }
+
+    /// If a `FUTEX_WAITV` SQE is armed, submit an `AsyncCancel` against
+    /// it and drive the ring until the `futex_waitv_cancelled` flag
+    /// flips. Without this, dropping the reactor's `FutexWaitV` array
+    /// while the SQE still holds a pointer into it is a UAF in the
+    /// kernel.
+    fn cancel_futex_waitv_and_wait(&self) {
+        if !self.inner.futex_waitv_armed.get() {
+            return;
+        }
+        let target = udata(KIND_FUTEX_WAITV, 0);
+        let cancel_udata = udata(KIND_FUTEX_CANCEL, 0);
+        {
+            let mut ring = self.inner.ring.borrow_mut();
+            ring.prep_async_cancel(target, cancel_udata);
+            let _ = ring.submit_and_wait_timeout(0, 0);
+        }
+        // Pump the ring until both the cancelled FUTEX_WAITV CQE (which
+        // clears `futex_waitv_armed`) and the cancel-CQE (which sets
+        // `futex_waitv_cancelled`) have been drained.
+        let deadline = Instant::now() + std::time::Duration::from_millis(2000);
+        while (self.inner.futex_waitv_armed.get() || !self.inner.futex_waitv_cancelled.get())
+            && Instant::now() < deadline
+        {
+            self.drain_cqes_into_wakers();
+            let _ = self.inner.ring.borrow_mut()
+                .submit_and_wait_timeout(1, 100);
+        }
+        // Drop the storage now that no in-flight SQE references it.
+        *self.inner.futex_waitv_storage.borrow_mut() = None;
     }
 
     /// Allocate a new master-side request_id. Strictly monotonic; values
@@ -300,32 +399,109 @@ impl Reactor {
         }
     }
 
-    /// Arm POLL_ADD on every worker eventfd and stash the W2M handle.
-    /// Re-arms on each one-shot firing, so the wiring lasts the
-    /// lifetime of the executor.
+    /// Attach the `W2mReceiver` and arm a persistent `FUTEX_WAITV` SQE
+    /// that watches every worker's `reader_seq` word. On each CQE, the
+    /// reactor drains all rings (the wake index is not authoritative
+    /// for FutexWaitV), rebuilds the expected-values array, and
+    /// re-arms.
     pub fn attach_w2m(&self, w2m: Rc<W2mReceiver>) {
         let nw = w2m.num_workers();
-        *self.inner.in_flight.borrow_mut() = vec![0; nw];
-        *self.inner.w2m_cursors.borrow_mut() = vec![W2M_HEADER_SIZE as u64; nw];
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(nw);
-        let efds: Vec<i32> = w2m.efds().to_vec();
+        // Allocate a zeroed boxed slice — `refresh_futex_waitv_vals`
+        // fills the entries after MASTER_PARKED is published.
+        let futexv: Vec<FutexWaitV> = (0..nw).map(|_| FutexWaitV::new()).collect();
+        let boxed: Box<[FutexWaitV]> = futexv.into_boxed_slice();
         *self.inner.w2m.borrow_mut() = Some(w2m);
-        for (w, &efd) in efds.iter().enumerate() {
-            self.arm_poll_eventfd(efd, w as u64);
+        *self.inner.futex_waitv_storage.borrow_mut() = Some(boxed);
+        // Drain-then-refresh loop: the same protocol used by the
+        // CQE dispatch path. Drain catches any messages published
+        // between init and attach; refresh snapshots expected values
+        // with MASTER_PARKED already set.
+        let w2m_handle = self.inner.w2m.borrow().as_ref().cloned();
+        if let Some(_w2m) = w2m_handle {
+            loop {
+                for w in 0..nw {
+                    self.drain_w2m_for_worker(w);
+                }
+                if !self.refresh_futex_waitv_vals() {
+                    break;
+                }
+            }
         }
+        self.arm_futex_waitv();
     }
 
-    fn arm_poll_eventfd(&self, fd: i32, worker_id: u64) {
-        self.inner.ring.borrow_mut().prep_poll_add(
-            fd, libc::POLLIN as u32, udata(KIND_POLL_EVENTFD, worker_id),
-        );
+    /// (Re-)submit a `FUTEX_WAITV` SQE referencing the heap-owned
+    /// `FutexWaitV` array in `futex_waitv_storage`. Called by
+    /// `attach_w2m` on startup and by the `KIND_FUTEX_WAITV` dispatch
+    /// handler on every CQE.
+    fn arm_futex_waitv(&self) {
+        let storage = self.inner.futex_waitv_storage.borrow();
+        let Some(boxed) = storage.as_ref() else {
+            return;
+        };
+        let nr = boxed.len() as u32;
+        let ptr = boxed.as_ptr();
+        let udata_val = udata(KIND_FUTEX_WAITV, 0);
+        {
+            let mut ring = self.inner.ring.borrow_mut();
+            unsafe { ring.prep_futex_waitv(ptr, nr, udata_val); }
+            let _ = ring.submit_and_wait_timeout(0, 0);
+        }
+        self.inner.futex_waitv_armed.set(true);
     }
 
-    /// Must be called immediately after submitting a SAL message that
-    /// will produce a reply on worker `w`; `drain_w2m_for_worker` uses
-    /// this to decide when the W2M ring for that worker is drained.
-    pub fn increment_in_flight(&self, w: usize) {
-        self.inner.in_flight.borrow_mut()[w] += 1;
+    /// Publish `MASTER_PARKED` on every ring, then snapshot each
+    /// `reader_seq` for the `FutexWaitV` entry. Returns `true` if any
+    /// ring has unread data (`read_cursor != write_cursor`), meaning
+    /// the caller must drain before arming — otherwise the expected
+    /// values would already match current reader_seq and the SQE
+    /// would block waiting for a wake that already happened (classic
+    /// lost-wake race).
+    ///
+    /// Store order is load-bearing: setting `FLAG_MASTER_PARKED`
+    /// BEFORE loading `reader_seq` ensures that any worker that
+    /// advances `reader_seq` AFTER our fetch_or is guaranteed to
+    /// observe the flag and issue `FUTEX_WAKE`. Workers that advanced
+    /// BEFORE our fetch_or are caught by the post-snapshot
+    /// `write_cursor != read_cursor` check.
+    fn refresh_futex_waitv_vals(&self) -> bool {
+        let mut storage = self.inner.futex_waitv_storage.borrow_mut();
+        let Some(boxed) = storage.as_mut() else { return false; };
+        let w2m_opt = self.inner.w2m.borrow();
+        let Some(w2m) = w2m_opt.as_ref() else { return false; };
+        let mut pending = false;
+        for (w, entry) in boxed.iter_mut().enumerate() {
+            let hdr = unsafe { w2m.header(w) };
+            // Publish park intent FIRST (AcqRel — the flag must be
+            // globally visible before we read reader_seq).
+            hdr.waiter_flags().fetch_or(
+                FLAG_MASTER_PARKED,
+                std::sync::atomic::Ordering::AcqRel,
+            );
+            // Now snapshot expected reader_seq. Any worker store that
+            // happens-before this load MUST have been preceded by a
+            // write_cursor Release store, so the post-loop
+            // `write_cursor != read_cursor` check below catches it.
+            let expected = hdr.reader_seq()
+                .load(std::sync::atomic::Ordering::Acquire);
+            let uaddr = hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64;
+            *entry = FutexWaitV::new()
+                .val(expected as u64)
+                .uaddr(uaddr)
+                .flags(FUTEX2_SIZE_U32);
+            // Unread-data check: if write_cursor has advanced past
+            // read_cursor, a publish is pending that we haven't
+            // drained. Signal the caller to drain before arming.
+            let wc = hdr.write_cursor()
+                .load(std::sync::atomic::Ordering::Acquire);
+            let rc = hdr.read_cursor()
+                .load(std::sync::atomic::Ordering::Acquire);
+            if wc != rc {
+                pending = true;
+            }
+        }
+        pending
     }
 
     /// Submit an fdatasync on `fd`. The SQE is immediately flushed to the
@@ -599,14 +775,39 @@ impl Reactor {
                     if !cancelled.get() { w.wake(); }
                 }
             }
-            KIND_POLL_EVENTFD => {
-                self.drain_w2m_for_worker(id as usize);
-                // POLL_ADD is one-shot — re-arm.
-                let efd = self.inner.w2m.borrow().as_ref()
-                    .map(|w2m| w2m.efds()[id as usize]);
-                if let Some(efd) = efd {
-                    self.arm_poll_eventfd(efd, id);
+            KIND_FUTEX_WAITV => {
+                // Wake index is not authoritative for FUTEX_WAITV:
+                // the kernel may wake us for any of the watched
+                // words. Drain every worker's ring, refresh expected
+                // values (with MASTER_PARKED published first so the
+                // wake window stays closed), and re-arm. The
+                // `refresh → drain` loop runs until no ring has
+                // unread data, guaranteeing we never arm with an
+                // already-stale expected value.
+                self.inner.futex_waitv_armed.set(false);
+                if !self.inner.shutdown.get() {
+                    let nw = self.inner.w2m.borrow().as_ref()
+                        .map(|w2m| w2m.num_workers())
+                        .unwrap_or(0);
+                    loop {
+                        for w in 0..nw {
+                            self.drain_w2m_for_worker(w);
+                        }
+                        if !self.refresh_futex_waitv_vals() {
+                            break;
+                        }
+                    }
+                    self.arm_futex_waitv();
                 }
+            }
+            KIND_FUTEX_CANCEL => {
+                // The AsyncCancel CQE itself arrives here. The
+                // cancellation of the FUTEX_WAITV SQE delivers a
+                // separate CQE under KIND_FUTEX_WAITV with
+                // `res = -ECANCELED`, which we detect via the
+                // `futex_waitv_armed` flag flipping false above.
+                // Record completion so shutdown can drop storage.
+                self.inner.futex_waitv_cancelled.set(true);
             }
             KIND_FSYNC => {
                 self.inner.parked_fsync_results.borrow_mut().insert(id, cqe.res);
@@ -754,92 +955,37 @@ impl Reactor {
     }
 
     /// Decode every unread W2M message for worker `w` and route each
-    /// through `route_reply`. After draining, if the worker has no
-    /// outstanding routed requests AND its cursor has crossed the
-    /// reset threshold, atomically reset the worker's write_cursor
-    /// (mmap header) and the reactor's read cursor. Safe because the
-    /// reactor is the sole W2M reader: there are no other readers
-    /// whose unread data could be stranded.
+    /// through `route_reply`. The tail-chasing ring self-maintains —
+    /// no reset gate, no `in_flight` accounting. Each successful
+    /// `try_read` advances the ring's shared `read_cursor` and may
+    /// wake a parked producer.
     fn drain_w2m_for_worker(&self, w: usize) {
         let w2m = Rc::clone(
             self.inner.w2m.borrow().as_ref()
                 .expect("drain_w2m_for_worker called before attach_w2m"),
         );
-        // Consume the eventfd signal: the one-shot PollAdd re-arms on
-        // the next tick, and without draining the counter Linux would
-        // deliver a CQE immediately (tight loop).
-        {
-            let efd = w2m.efds()[w];
-            let mut v: u64 = 0;
-            unsafe {
-                libc::read(efd, &mut v as *mut u64 as *mut libc::c_void, 8);
-            }
-        }
         loop {
-            let cursor = self.inner.w2m_cursors.borrow()[w];
-            let (decoded, new_rc) = match w2m.try_read(w, cursor) {
+            let cursor = {
+                let hdr = unsafe { w2m.header(w) };
+                hdr.read_cursor()
+                    .load(std::sync::atomic::Ordering::Acquire)
+            };
+            let (decoded, _new_rc) = match w2m.try_read(w, cursor) {
                 Some(v) => v,
                 None => break,
             };
-            self.inner.w2m_cursors.borrow_mut()[w] = new_rc;
             self.route_reply(w, decoded);
         }
-        self.maybe_reset_w2m_for_worker(w, &w2m);
     }
 
-    /// W2M ring reset for `w`. Gated on:
-    /// 1. `in_flight[w] == 0` — no routed requests outstanding for `w`,
-    ///    so worker `w` has no reply to write.  Combined with the
-    ///    single-threaded master + reactor-as-sole-reader, this closes
-    ///    the race where a worker's reply could land at a cursor that
-    ///    we are about to zero.
-    /// 2. cursor crossed `RESET_THRESHOLD` (~half the region) — avoids
-    ///    chatty reset traffic for low-volume workloads.
+    /// Park `decoded` for its awaiter. FLAG_EXCHANGE replies are
+    /// demuxed into `exchange_acc` so the tick req_id's waker stays
+    /// parked until the final (non-FLAG_EXCHANGE) ACK lands. When an
+    /// exchange round completes, the resulting `PendingRelay` is
+    /// dispatched on `relay_tx`. See async-invariants.md §III.3b.
     ///
-    /// Hard safety: warn at 3/4 region, fatal abort at 7/8. The abort
-    /// is a backstop for sustained mixed load where in_flight rarely
-    /// hits 0 and the cursor climbs.
-    fn maybe_reset_w2m_for_worker(&self, w: usize, w2m: &Rc<W2mReceiver>) {
-        const RESET_THRESHOLD: u64 = (W2M_REGION_SIZE as u64) / 2;
-        const WARN_THRESHOLD:  u64 = (W2M_REGION_SIZE as u64) * 3 / 4;
-        const FATAL_THRESHOLD: u64 = (W2M_REGION_SIZE as u64) * 7 / 8;
-
-        let cursor = self.inner.w2m_cursors.borrow()[w];
-        let empty = self.inner.in_flight.borrow()[w] == 0;
-
-        if empty && cursor > RESET_THRESHOLD {
-            // No outstanding requests for w; worker w has no pending
-            // replies to write. Atomically reset worker's write_cursor
-            // (mmap header) and reactor's read cursor.
-            w2m.reset_one_unsafe(w);
-            self.inner.w2m_cursors.borrow_mut()[w] = W2M_HEADER_SIZE as u64;
-            return;
-        }
-
-        if cursor > FATAL_THRESHOLD {
-            crate::gnitz_fatal_abort!(
-                "W2M region near exhaustion for worker={} cursor={} (in_flight={}; reset gate could not fire under sustained traffic)",
-                w, cursor, self.inner.in_flight.borrow()[w]);
-        } else if cursor > WARN_THRESHOLD {
-            crate::gnitz_warn!(
-                "W2M region 3/4 full for worker={} cursor={} in_flight={}",
-                w, cursor, self.inner.in_flight.borrow()[w]);
-        }
-    }
-
-    /// Park `decoded` for its awaiter and update bookkeeping. Returns
-    /// `true` iff this reply drained the last outstanding request for
-    /// `w` (caller resets the ring). Unrouted replies are logged and
-    /// dropped — they do not decrement `in_flight`, since we did not
-    /// track them in the first place.
-    ///
-    /// FLAG_EXCHANGE replies are demuxed into `exchange_acc` instead of
-    /// being routed via the waker map: the worker is still mid-tick
-    /// (waiting for FLAG_EXCHANGE_RELAY), so its tick req_id's waker
-    /// must remain parked. When the accumulator completes a view, the
-    /// resulting PendingRelay is enqueued on `relay_tx` for the relay
-    /// task. See async-invariants III.3b.
-    fn route_reply(&self, w: usize, decoded: DecodedWire) -> bool {
+    /// Unrouted replies are logged and dropped.
+    fn route_reply(&self, w: usize, decoded: DecodedWire) {
         let flags = decoded.control.flags as u32;
         if flags & FLAG_EXCHANGE != 0 {
             let pending = self.inner.exchange_acc.borrow_mut().process(w, decoded);
@@ -847,11 +993,13 @@ impl Reactor {
                 if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
                     tx.send(relay);
                 } else {
-                    crate::gnitz_warn!("reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
-                        relay.view_id);
+                    crate::gnitz_warn!(
+                        "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
+                        relay.view_id,
+                    );
                 }
             }
-            return false;
+            return;
         }
 
         let req_id = decoded.control.request_id;
@@ -860,13 +1008,12 @@ impl Reactor {
             Some(waker) => {
                 self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
                 waker.wake();
-                let mut inflight = self.inner.in_flight.borrow_mut();
-                inflight[w] = inflight[w].saturating_sub(1);
-                inflight[w] == 0
             }
             None => {
-                crate::gnitz_warn!("reactor: unrouted W2M reply req_id={}", req_id);
-                false
+                crate::gnitz_warn!(
+                    "reactor: unrouted W2M reply worker={} req_id={}",
+                    w, req_id,
+                );
             }
         }
     }
@@ -904,23 +1051,17 @@ impl Reactor {
         }
     }
 
-    /// Test-only: size `in_flight` / `w2m_cursors` without a real W2M
-    /// ring so `route_reply` can be driven directly.
+    /// Test-only: size the exchange accumulator so `route_reply` can
+    /// be driven directly.
     #[cfg(test)]
     pub fn test_init_state(&self, num_workers: usize) {
-        *self.inner.in_flight.borrow_mut() = vec![0; num_workers];
-        *self.inner.w2m_cursors.borrow_mut() = vec![W2M_HEADER_SIZE as u64; num_workers];
+        *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(num_workers);
     }
 
     /// Test-only: drive `route_reply` with a synthetic decoded wire.
     #[cfg(test)]
-    pub fn test_route_reply(&self, w: usize, decoded: DecodedWire) -> bool {
+    pub fn test_route_reply(&self, w: usize, decoded: DecodedWire) {
         self.route_reply(w, decoded)
-    }
-
-    #[cfg(test)]
-    pub fn in_flight_len(&self, w: usize) -> usize {
-        self.inner.in_flight.borrow()[w]
     }
 
     #[cfg(test)]
@@ -1700,6 +1841,7 @@ mod tests {
             },
             schema: None,
             data_batch: None,
+            _backing: None,
         }
     }
 
@@ -1720,59 +1862,33 @@ mod tests {
         assert_eq!(r.task_count(), 0);
     }
 
-    /// Routed reply: pops the waker, parks the wire, decrements
-    /// `in_flight`, and reports `should_reset` when the counter hits 0.
+    /// Routed reply: pops the waker, parks the wire for the awaiter.
+    /// No `in_flight` accounting — the tail-chasing ring self-maintains.
     #[test]
-    fn route_reply_routed_path_decrements_and_signals_reset() {
+    fn route_reply_routes_to_registered_waker() {
         let r = make_reactor();
         r.test_init_state(2);
-        r.increment_in_flight(1);
 
-        // Register a waker for req_id=42.
         let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
         r.register_reply_waker(42, waker);
 
-        let should_reset = r.test_route_reply(1, synthetic_decoded_wire(42));
+        r.test_route_reply(1, synthetic_decoded_wire(42));
 
-        assert!(should_reset, "in_flight back to 0 must signal reset");
-        assert_eq!(r.in_flight_len(1), 0);
         assert!(r.inner.parked_replies.borrow().contains_key(&42));
         assert!(!r.inner.reply_wakers.borrow().contains_key(&42));
     }
 
-    /// Routed reply with outstanding siblings must NOT signal reset.
-    /// Guards against premature ring resets when multiple async ops
-    /// target the same worker.
+    /// Unrouted reply (no waker): logged and dropped. Must not
+    /// contaminate `parked_replies` — stale entries would keep
+    /// non-dead memory alive indefinitely.
     #[test]
-    fn route_reply_leaves_reset_deferred_while_in_flight() {
+    fn route_reply_unrouted_is_logged_and_dropped() {
         let r = make_reactor();
         r.test_init_state(1);
-        r.increment_in_flight(0);
-        r.increment_in_flight(0);
-        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
-        r.register_reply_waker(5, waker);
-
-        let should_reset = r.test_route_reply(0, synthetic_decoded_wire(5));
-
-        assert!(!should_reset);
-        assert_eq!(r.in_flight_len(0), 1);
-    }
-
-    /// Unrouted reply (no waker): must NOT decrement `in_flight` —
-    /// decrementing untracked requests would corrupt the ring-reset
-    /// signal for legitimate outstanding ones.
-    #[test]
-    fn route_reply_unrouted_does_not_touch_in_flight() {
-        let r = make_reactor();
-        r.test_init_state(1);
-        r.increment_in_flight(0);
         // No waker registered for req_id=7.
 
-        let should_reset = r.test_route_reply(0, synthetic_decoded_wire(7));
+        r.test_route_reply(0, synthetic_decoded_wire(7));
 
-        assert!(!should_reset);
-        assert_eq!(r.in_flight_len(0), 1,
-            "unrouted reply must leave tracked in_flight untouched");
         assert!(r.inner.parked_replies.borrow().is_empty(),
             "unrouted replies must not leak into parked_replies");
     }
@@ -2118,32 +2234,25 @@ mod tests {
             },
             schema: Some(SchemaDescriptor::minimal_u64()),
             data_batch: None,
+            _backing: None,
         }
     }
 
-    /// FLAG_EXCHANGE replies must NOT consume the registered tick waker
-    /// or decrement in_flight. The tick worker is still mid-DAG and the
-    /// final ACK will arrive separately.
+    /// FLAG_EXCHANGE replies must NOT consume the registered tick
+    /// waker. The tick worker is still mid-DAG and the final ACK will
+    /// arrive separately.
     #[test]
     fn route_reply_flag_exchange_does_not_wake() {
         let r = make_reactor();
         r.test_init_state(2);
-        *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(2);
-        // Simulate a parked tick waker for req_id=42 + an outstanding
-        // request on worker 0.
         let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
         r.register_reply_waker(42, waker);
-        r.increment_in_flight(0);
 
-        // FLAG_EXCHANGE wire with the same req_id MUST be demuxed via the
-        // accumulator instead of consuming the tick waker.
         let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
-        let _ = r.test_route_reply(0, exch);
+        r.test_route_reply(0, exch);
 
         assert!(r.inner.reply_wakers.borrow().contains_key(&42),
             "FLAG_EXCHANGE must NOT consume the tick waker");
-        assert_eq!(r.in_flight_len(0), 1,
-            "FLAG_EXCHANGE must NOT decrement in_flight");
         assert!(r.inner.parked_replies.borrow().is_empty(),
             "FLAG_EXCHANGE must NOT park the wire for await_reply");
     }
@@ -2156,33 +2265,26 @@ mod tests {
         let r = make_reactor();
         let (tx, mut rx) = mpsc::unbounded::<PendingRelay>();
         r.attach_relay_tx(tx);
-        // Manually size accumulator + in_flight for nw=2.
         r.test_init_state(2);
-        *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(2);
 
-        // Two parked tick wakers; in_flight is 1 per worker.
         let w0 = make_waker(0, Arc::clone(&r.inner.run_queue));
         let w1 = make_waker(1, Arc::clone(&r.inner.run_queue));
         r.register_reply_waker(10, w0);
         r.register_reply_waker(11, w1);
-        r.increment_in_flight(0);
-        r.increment_in_flight(1);
 
-        // Worker 0's FLAG_EXCHANGE: accumulator partial (no relay yet).
-        let _ = r.test_route_reply(0, synthetic_exchange_wire(99, 10));
+        r.test_route_reply(0, synthetic_exchange_wire(99, 10));
         assert!(rx.try_recv().is_none(),
             "single-worker FLAG_EXCHANGE must not produce a relay");
-        // Worker 1's FLAG_EXCHANGE: accumulator complete → relay enqueued.
-        let _ = r.test_route_reply(1, synthetic_exchange_wire(99, 11));
+        r.test_route_reply(1, synthetic_exchange_wire(99, 11));
         let relay = rx.try_recv().expect("complete view must produce a relay");
         assert_eq!(relay.view_id, 99);
         assert_eq!(relay.payloads.len(), 2);
-        // Final ACKs (no FLAG_EXCHANGE) for the same req_ids should now
-        // wake their tick wakers and decrement in_flight.
-        let _ = r.test_route_reply(0, synthetic_decoded_wire(10));
-        let _ = r.test_route_reply(1, synthetic_decoded_wire(11));
-        assert_eq!(r.in_flight_len(0), 0);
-        assert_eq!(r.in_flight_len(1), 0);
+        // Final ACKs (no FLAG_EXCHANGE) for the same req_ids wake
+        // their tick wakers and park the wires.
+        r.test_route_reply(0, synthetic_decoded_wire(10));
+        r.test_route_reply(1, synthetic_decoded_wire(11));
+        assert!(r.inner.parked_replies.borrow().contains_key(&10));
+        assert!(r.inner.parked_replies.borrow().contains_key(&11));
     }
 
     /// A view with multiple input sources (e.g. join of two tables)
@@ -2206,7 +2308,6 @@ mod tests {
         for w in 0..4 {
             let waker = make_waker(w, Arc::clone(&r.inner.run_queue));
             r.register_reply_waker(100 + w as u64, waker);
-            r.increment_in_flight(w);
         }
 
         // Interleave two rounds for the same view_id=100:
@@ -2312,5 +2413,227 @@ mod tests {
         }
         r.block_until_idle();
         assert_eq!(order.borrow().len(), 3);
+    }
+
+    /// Cross-process stress: a forked child publishes thousands of
+    /// messages into a shared W2M ring while the parent drains them
+    /// through the reactor's `FUTEX_WAITV` + `W2mReceiver` pipeline.
+    ///
+    /// Regression guard for two distinct hazards:
+    /// 1. The lost-wake race in `refresh_futex_waitv_vals`: at this
+    ///    scale the master takes many `refresh → arm` cycles, each a
+    ///    potential lost-wake window. A missed wake hangs the test
+    ///    (caught by the reactor-timer guard).
+    /// 2. The writer-crosses-reader data-loss bug in the SKIP-wrap
+    ///    path: capacity is small enough (64 KiB) and message count
+    ///    high enough (500 × ~280 B ≈ 140 KiB) to force multiple
+    ///    SKIP-wraps. Truncated or out-of-order delivery fails the
+    ///    `ids` assertion.
+    ///
+    /// Waker-install ordering is load-bearing: the reply futures
+    /// must register their wakers BEFORE `attach_w2m` runs its
+    /// initial drain, otherwise replies drained during attach are
+    /// logged as "unrouted" and dropped. The `poll_nonblocking`
+    /// between `spawn` and `attach_w2m` exists for this reason.
+    #[test]
+    fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
+        use std::time::Duration;
+        use crate::ipc::{self, STATUS_OK, W2mReceiver, W2mWriter};
+        use crate::w2m_ring;
+        use crate::reactor::{join_all, select2, Either};
+
+        // 64 KiB cap forces multiple SKIP-wraps over 500 publishes
+        // of ~280 B each (~140 KiB total). Both the wake-race and
+        // the wrap-overwrite hazards are exercised.
+        const CAPACITY: usize = 64 * 1024; // 64 KiB
+        const N_MESSAGES: u64 = 500;
+        const TIMEOUT_SECS: u64 = 30;
+
+        let fd = crate::ipc_sys::memfd_create(b"w2m_stress");
+        assert!(fd >= 0, "memfd_create failed");
+        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::ipc_sys::mmap_shared(fd, CAPACITY);
+        assert!(!ptr.is_null(), "mmap_shared failed");
+        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: publish a monotonic req_id stream as fast as
+            // possible. The parent's wake protocol must not drop
+            // any of them under the resulting drain-refresh-arm
+            // race pressure.
+            let writer = W2mWriter::new(ptr, CAPACITY as u64);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
+            for req_id in 1..=N_MESSAGES {
+                writer.send_encoded(sz, |buf| {
+                    ipc::encode_wire_into(
+                        buf, 0, 0, 0, 0,
+                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None,
+                    );
+                });
+            }
+            unsafe { libc::_exit(0); }
+        }
+
+        // Parent: drain via the reactor's FUTEX_WAITV + W2mReceiver path.
+        let reactor = Reactor::new(16).expect("reactor");
+
+        let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let reply_futs: Vec<_> = (1..=N_MESSAGES)
+            .map(|i| reactor.await_reply(i))
+            .collect();
+        {
+            let received = Rc::clone(&received);
+            reactor.spawn(async move {
+                let replies = join_all(reply_futs).await;
+                *received.borrow_mut() = replies.into_iter()
+                    .map(|r| r.control.request_id)
+                    .collect();
+            });
+        }
+        // One tick polls the spawned task, which walks join_all and
+        // registers every ReplyFuture's waker before attach drains.
+        reactor.poll_nonblocking();
+
+        let w2m = Rc::new(W2mReceiver::new(vec![ptr]));
+        reactor.attach_w2m(Rc::clone(&w2m));
+
+        let inner = Rc::clone(&reactor.inner);
+        let received_check = Rc::clone(&received);
+        let outcome = reactor.block_on(async move {
+            let timeout = TimerFuture::new(
+                Instant::now() + Duration::from_secs(TIMEOUT_SECS),
+                inner,
+            );
+            let watch = async move {
+                while received_check.borrow().is_empty() {
+                    YieldOnce::new().await;
+                }
+            };
+            select2(watch, timeout).await
+        });
+        if let Either::B(()) = outcome {
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+            panic!(
+                "reactor stalled with {} replies received after {}s — \
+                 lost-wake symptom",
+                received.borrow().len(),
+                TIMEOUT_SECS,
+            );
+        }
+
+        let mut ids = received.borrow().clone();
+        assert_eq!(ids.len(), N_MESSAGES as usize);
+        ids.sort();
+        let expected: Vec<u64> = (1..=N_MESSAGES).collect();
+        assert_eq!(ids, expected, "every published req_id must round-trip");
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0); }
+
+        // AsyncCancel the in-flight FUTEX_WAITV before the storage drops.
+        reactor.request_shutdown();
+
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
+            libc::close(fd);
+        }
+    }
+
+    /// High-volume variant of the W2M cross-process stress: 5 000
+    /// messages through a 64 KiB ring forces dozens of SKIP-wraps and
+    /// many writer-park/wake cycles. Catches any flake in the wake
+    /// protocol or virtual-cursor accounting that only manifests at
+    /// scale.
+    #[test]
+    fn w2m_cross_process_stress_high_volume() {
+        use std::time::Duration;
+        use crate::ipc::{self, STATUS_OK, W2mReceiver, W2mWriter};
+        use crate::w2m_ring;
+        use crate::reactor::{join_all, select2, Either};
+
+        const CAPACITY: usize = 64 * 1024;
+        const N_MESSAGES: u64 = 5_000;
+        const TIMEOUT_SECS: u64 = 60;
+
+        let fd = crate::ipc_sys::memfd_create(b"w2m_stress_hv");
+        assert!(fd >= 0);
+        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::ipc_sys::mmap_shared(fd, CAPACITY);
+        assert!(!ptr.is_null());
+        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let writer = W2mWriter::new(ptr, CAPACITY as u64);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
+            for req_id in 1..=N_MESSAGES {
+                writer.send_encoded(sz, |buf| {
+                    ipc::encode_wire_into(
+                        buf, 0, 0, 0, 0,
+                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None,
+                    );
+                });
+            }
+            unsafe { libc::_exit(0); }
+        }
+
+        let reactor = Reactor::new(16).expect("reactor");
+        let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let reply_futs: Vec<_> = (1..=N_MESSAGES)
+            .map(|i| reactor.await_reply(i))
+            .collect();
+        {
+            let received = Rc::clone(&received);
+            reactor.spawn(async move {
+                let replies = join_all(reply_futs).await;
+                *received.borrow_mut() = replies.into_iter()
+                    .map(|r| r.control.request_id)
+                    .collect();
+            });
+        }
+        reactor.poll_nonblocking();
+
+        let w2m = Rc::new(W2mReceiver::new(vec![ptr]));
+        reactor.attach_w2m(Rc::clone(&w2m));
+
+        let inner = Rc::clone(&reactor.inner);
+        let received_check = Rc::clone(&received);
+        let outcome = reactor.block_on(async move {
+            let timeout = TimerFuture::new(
+                Instant::now() + Duration::from_secs(TIMEOUT_SECS),
+                inner,
+            );
+            let watch = async move {
+                while received_check.borrow().is_empty() {
+                    YieldOnce::new().await;
+                }
+            };
+            select2(watch, timeout).await
+        });
+        if let Either::B(()) = outcome {
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+            panic!(
+                "reactor stalled with {} replies after {}s",
+                received.borrow().len(), TIMEOUT_SECS,
+            );
+        }
+
+        let mut ids = received.borrow().clone();
+        assert_eq!(ids.len(), N_MESSAGES as usize);
+        ids.sort();
+        let expected: Vec<u64> = (1..=N_MESSAGES).collect();
+        assert_eq!(ids, expected);
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0); }
+
+        reactor.request_shutdown();
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
+            libc::close(fd);
+        }
     }
 }

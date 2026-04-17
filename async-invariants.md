@@ -7,12 +7,16 @@ coordination. Update before changing any invariant described here.
 
 ## Kernel coordination
 
-**Eventfd re-arm** — `read()` the eventfd before re-arming `POLL_ADD`;
+**M2W eventfd re-arm** — only the master→worker eventfds remain after
+the W2M migration. `read()` the eventfd before re-arming `POLL_ADD`;
 a counter > 0 fires the next arm immediately.
 
 **SQE buffer lifetime** — memory referenced by an in-flight SQE must
 outlive the CQE. Cancelled futures must transfer ownership to the reactor
-(`SendFuture::Drop` → `send_buffers_in_flight`).
+(`SendFuture::Drop` → `send_buffers_in_flight`). The reactor's
+`FUTEX_WAITV` SQE holds a pointer into the boxed `[FutexWaitV]` array
+owned by `futex_waitv_storage`; `request_shutdown` must `AsyncCancel`
+the SQE and await the cancellation CQE before dropping the storage.
 
 **CQE ordering** — none guaranteed between independent SQEs. Routing uses
 wire request IDs, not CQE order.
@@ -25,13 +29,48 @@ be buffered in user space; next RECV armed eagerly on `MessageDone`.
 
 ## Shared state
 
-**in_flight[w]** — incremented before `signal_all` (worker cannot reply
-until counter is live); decremented by `route_reply` on a matched waker.
-Unrouted replies (req_id == 0, FLAG_EXCHANGE) do not decrement.
-
 **SAL write cursor** — group writes are atomic: reserve → fill →
 release-store header. Workers observe a group only after the release
 (Acquire load).
+
+**W2M ring protocol** — each W2M is a 1 GiB MAP_SHARED memfd mapping
+with a 128-byte header (cursors + u32 seq counters + waiter_flags)
+followed by an SPSC data region. `write_cursor` and `read_cursor` are
+**virtual monotonic offsets** — they only ever increase; physical
+position is `phys(virt) = HEADER + (virt - HEADER) % (cap - HEADER)`.
+Unread bytes is `vwc - vrc` (always `<= DCAP`); empty is `vwc == vrc`.
+Publish: stamp size prefix → `write_cursor.store(Release)` →
+`reader_seq.fetch_add(Release)` → if `MASTER_PARKED` set,
+`FUTEX_WAKE`. Consume: Acquire `write_cursor`, handle `u64::MAX` SKIP
+marker by advancing `vrc` by `pad = cap - phys(vrc)`, decode,
+advance `read_cursor`, bump `writer_seq`, wake if `WRITER_PARKED`.
+
+**W2M slot lifetime** — `try_read` must copy the slot bytes to a heap
+buffer **before** Release-storing the new `read_cursor`; the slot is
+the producer's the moment the cursor advances. The heap copy stays
+attached to `DecodedWire._backing` so the `Batch`'s interior pointers
+remain valid for the consumer's lifetime.
+
+**W2M master wait** — one `IORING_OP_FUTEX_WAITV` SQE spans all 64
+`reader_seq` words with `FUTEX2_SIZE_U32`, **shared** (no
+`FUTEX2_PRIVATE`; W2M is MAP_SHARED). On CQE, drain every ring,
+rebuild expected-values array, re-arm. Wake index is not
+authoritative.
+
+**W2M capacity invariant** — `capacity >= 2 * MAX_W2M_MSG +
+W2M_HEADER_SIZE + 16`. Workers are strictly sequential (one publish
+in flight per ring), so this bound is sufficient for SKIP-wrap tail
+waste plus 8-byte alignment slack.
+
+**W2M backpressure** — writer on full: `WRITER_PARKED` set → recheck
+ring room → `FUTEX_WAIT` on `writer_seq`. Writer clears its own flag
+on wake; master never CAS-clears. Master on all-rings-idle:
+`MASTER_PARKED` set → `FUTEX_WAITV` → cleared on wake.
+
+**Worker death** — a dead worker parked on `writer_seq` is not a
+liveness hazard: `executor::worker_watcher` polls `getppid` + `waitpid`
+and triggers `shutdown_workers` + `request_shutdown`. FUTEX contracts
+inherit this abort semantic — no per-contract liveness claim.
 
 **Checkpoint exclusivity** — committer is the sole checkpoint driver:
 `FLAG_FLUSH` → ACKs → `flush_all_system_tables` → `checkpoint_reset`. No
@@ -48,9 +87,6 @@ silently drops the relay.
 **Per-fd lifecycle** — `register_conn` must clear all sentinels from the
 previous incarnation (fd numbers reuse). `recv_closed[fd]` persists until
 after `reap_closing_conns` so in-flight `recv().await` still sees EOF.
-
-**W2M ring reset** — reset only when `in_flight[w] == 0` AND cursor >
-`RESET_THRESHOLD`. Warn at ¾, fatal abort at ⅞.
 
 ---
 
