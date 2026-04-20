@@ -5,6 +5,8 @@
 mod error;
 mod types;
 pub mod migration;
+pub mod classify;
 
 pub use error::{GnitzSqlParseError, extract_name, extract_table_factor_name};
 pub use types::sql_type_to_typecode;
+pub use classify::{classify_sql, Classification};

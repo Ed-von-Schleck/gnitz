@@ -3432,7 +3432,10 @@ pub(crate) struct ColumnDef {
     pub(crate) fk_col_idx: u32,
 }
 
-/// Circuit graph for create_view.
+/// Circuit graph for create_view. Serializable so it can be embedded
+/// into the migration row (`compiled_circuits`) for worker-side
+/// deserialization during DAG rehydration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CircuitGraph {
     pub(crate) nodes: Vec<(i32, i32)>,           // (node_id, opcode)
     pub(crate) edges: Vec<(i32, i32, i32, i32)>, // (edge_id, src, dst, port)

@@ -12,6 +12,9 @@ gnitz-wire      = { path = "../gnitz-wire" }
 # Pure SQL→DesiredState parser. Server-side DDL compile lives in
 # sqlc.rs and uses this to parse submitted migration SQL.
 gnitz-sql-parse = { path = "../gnitz-sql-parse" }
+# Serde is used for bincoding compiled circuits into migration rows.
+serde       = { version = "1", features = ["derive"] }
+bincode     = { version = "2.0", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 xorf = { version = "0.12", default-features = false }
 libc = "0.2"
