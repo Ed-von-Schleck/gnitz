@@ -1,0 +1,19 @@
+[package]
+name    = "gnitz-sql-parse"
+version = "0.1.0"
+edition = "2021"
+
+# Pure SQL → DesiredState parser and SQL-type mapping.
+#
+# This crate carries NO client dependency (no gnitz-core). It is
+# linkable from gnitz-engine so the server can parse submitted DDL
+# without reaching for the IPC client.
+#
+# The canonical migration AST, serialisation, diff, and hash live in
+# gnitz-wire (shared by client and server). This crate only owns the
+# sqlparser-based parser that turns SQL text into those types.
+
+[dependencies]
+sqlparser      = "0.56"
+gnitz-protocol = { path = "../gnitz-protocol" }
+gnitz-wire     = { path = "../gnitz-wire" }

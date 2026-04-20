@@ -5,6 +5,7 @@ members = [
     "gnitz-protocol",
     "gnitz-core",
     "gnitz-sql",
+    "gnitz-sql-parse",
     "gnitz-capi",
     "gnitz-py",
     "gnitz-engine",
