@@ -2,16 +2,18 @@
 
 ## Status
 
-| Version | Status   | Scope                                                               |
-|---------|----------|---------------------------------------------------------------------|
-| V1      | **done** | `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, direct-apply (no staging) |
-| V1.5    | pending  | `CREATE/DROP VIEW` + full `__mig_<hash>_` staging                    |
-| V2      | pending  | Modifies via backfill + FK rewire + size guardrails                  |
+| Version | Status       | Scope                                                                            |
+|---------|--------------|----------------------------------------------------------------------------------|
+| V1      | **done**     | `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, direct-apply (no staging)              |
+| V1.5    | **partial**  | `CREATE/DROP VIEW` (plain SELECT) done; `__mig_` staging + `mig_gc_task` pending |
+| V2      | pending      | Modifies via backfill + FK rewire + size guardrails                              |
 
-V1 landed as an MVP that punts the staging-and-swap pattern. V1.5 closes
-that gap (add views, re-introduce staging) so V2 can layer backfill on
-top of a full staging pipeline. See **Deviations** below for the
-concrete differences between the code and the original design.
+V1 shipped as an MVP. V1.5 so far: views land in migrations via a
+pre-compiled `CircuitGraph` embedded in the AST; Phase 3 applies the
+8 sys-table deltas atomically using the same direct-apply block as
+V1. Staging, GC, and complex view shapes remain. See **Deviations**
+below for concrete differences between the code and the original
+design.
 
 
 ## Context
@@ -34,25 +36,30 @@ hash = xxh3_128(parent_hash || bincode(desired_state_ast) || author || message)
 ```
 
 The **canonical form** is the shared AST (`TableDef`, `ColumnDef`,
-`ViewDef`, `IndexDef`, `ViewDep`) in `gnitz_wire::migration`,
-serialised with `bincode::config::legacy()` after sorting top-level
-Vecs by fully-qualified name. Whitespace-equivalent *SQL* does not
-guarantee byte-equivalent canonical form today because
-`ViewDef.sql` stores raw text — V1.5 should normalise that at parse
-time (strip comments, canonicalise whitespace) or switch to a parsed
-`SelectStatement` AST.
+`ViewDef` including `circuit: CircuitGraph`, `IndexDef`, `ViewDep`)
+in `gnitz_wire::migration` + `gnitz_wire::circuit`, serialised with
+`bincode::config::legacy()` after sorting top-level Vecs by
+fully-qualified name. Whitespace-equivalent *SQL* does not guarantee
+byte-equivalent canonical form today because `ViewDef.sql` stores
+raw text — V1.5 follow-up should normalise at parse time or persist
+a parsed AST.
 
 Object references inside the canonical form are by **name**, not
 `table_id` — ids are allocation artefacts that change across
-migrations.
+migrations. The `CircuitGraph` inside `ViewDef` is the sole exception:
+its `sources`/`dependencies` fields carry `table_id`s, resolved at
+compile time against the live catalog or (future) the same-migration
+pre-allocation map.
 
 **Stability contract.** Every migration row carries a
-`format_version: U64` column (current value: 1). Changes to struct
-layout, field order, or the hash framing require bumping
-`format_version` and teaching the decoder to dispatch. The pinned
-`canonical_golden_bytes_fixed_ast` test in `gnitz-wire` is the
-drift detector — it fails deterministically on any AST or bincode
-drift and prints the new hash to pin.
+`format_version: U64` column (current value: **2** — V1.5 bumped
+from 1 to accommodate the new `ViewDef.circuit` field). Changes to
+struct layout, field order, or the hash framing require bumping
+`format_version` and teaching the decoder to dispatch. V2's
+transform/rename annotations will require the next bump. Pre-v2 DBs
+surface a clear "wipe the data dir" error at
+`apply_migration_row` — acceptable because migrations were only
+days old at bump time.
 
 **Physical-immutability invariant** (narrower than "nothing about a
 `table_id` ever changes"): a live `table_id`'s *physical layout* —
@@ -84,7 +91,7 @@ One system table: **`sys_migrations`** (done, `MIGRATIONS_TAB = 8`).
 | `created_lsn`             | I64       | SAL LSN at commit (placeholder in V1)      |
 | `desired_state_sql`       | STRING    | Raw input, audit/display only              |
 | `desired_state_canonical` | STRING    | **Hex-encoded** bincode AST blob           |
-| `format_version`          | U64       | Current: 1                                 |
+| `format_version`          | U64       | Current: 2 (V1.5 added `ViewDef.circuit`)  |
 
 No per-object snapshot rows. Historical queries hex-decode then
 `bincode::serde::decode_from_slice` the canonical bytes on demand
@@ -183,12 +190,14 @@ Defence-in-depth: `handle_system_dml` rejects non-empty batches for
 through `apply_migration`, never a raw catalog insert.
 
 
-## Apply algorithm: Stage-and-Swap (V1.5 / V2 shape)
+## Apply algorithm: Stage-and-Swap (V2 shape)
 
-Below is the target shape for V1.5 and V2. **V1 MVP collapses this
-into a single write-lock block with no `__mig_` staging** — see the
-"V1 MVP direct-apply path" subsection. V1.5 resumes the full shape
-to add view support and prepare for V2's backfill.
+Below is the target shape for V2 (backfill) and V1.5-remaining
+(`__mig_` staging for views + prep for V2). **V1 + V1.5-as-shipped
+collapse this into a single write-lock block with no staging** — see
+"V1 MVP direct-apply path". Staging resumes when V2 backfill lands
+or a compelling V1.5 use case forces it (e.g. enabling complex view
+shapes that read from both live and same-migration sources).
 
 Orchestration lives in the **async executor**. Concurrent migrations
 serialise on `shared.migration_in_flight: AtomicBool`. While set,
@@ -428,37 +437,63 @@ async fn apply_migration(shared, decoded) {
 }
 ```
 
-### V1 MVP direct-apply path
+### V1 MVP direct-apply path (done; V1.5 views extend it)
 
-V1 MVP collapses Phases 2 and 3 into a single block under
-`catalog_rwlock.write()` + `sal_writer_excl`, with no `__mig_`
-staging. The full sequence:
+Phase 2 is a no-op; Phase 3 builds `build_{create,drop}_{table,view,index}_batches`
+with FINAL names, ingests + broadcasts each under one
+`sal_writer_excl` + single fsync, then appends the sys_migrations
+row. V1.5 plugged view creates/drops into the existing loop; the
+block structure is unchanged.
 
-1. Phase 1 (drain + validate + diff) as above. Rejects `modified` or
-   any view (created/dropped).
-2. Phase 2→3 relay fence (no-op in V1 MVP — no Phase 2 activity).
-3. Phase 3:
-   - Build drop batches for each dropped table/index (via
-     `catalog::migration::build_drop_*_batches`).
-   - Build create batches for each created table/index (via
-     `catalog::migration::build_create_*_batches`). These allocate
-     `tid` / `idx_id` from master's sequences and emit sys_columns +
-     sys_tables / sys_indices rows with the FINAL names directly.
-   - Build a sys_sequences HWM batch covering
-     `SEQ_ID_TABLES` + `SEQ_ID_INDICES`.
-   - Under one `sal_writer_excl` hold: for each batch,
-     `ingest_to_family` (master WAL) + `broadcast_ddl` (SAL), then
-     ingest + broadcast the sys_migrations row, then submit fsync
-     SQE.
-4. Await fsync outside the lock; `rmtree` dropped directories.
+Safe for pure-create/drop because the commit is a single SAL
+transaction — pre-fsync crash rolls everything back. V2's backfill
+forces the Phase-2 / Phase-3 split: its Phase-2 work is
+non-idempotent and can fail, and you want the failure to leave
+orphans, not a half-applied catalog.
 
-**Why this is safe for V1 pure-create/drop:** no staged objects
-exist, so no atomicity gap between Phase 2 and Phase 3. The entire
-commit is a single SAL transaction; pre-fsync crash rolls everything
-back (see Recovery). V2's backfill and V1.5's view compilation both
-require the staging split because their Phase 2 work is
-non-idempotent and can fail — you want the failure to leave orphans,
-not a half-applied catalog.
+### V1.5 view create/drop (done)
+
+Client path: PyO3 `push_migration` → `has_create_view(sql)` scan →
+`parse_desired_state_with_circuits(sql, client, default_schema)` in
+`gnitz-sql/src/migration.rs`, which:
+1. Calls `parse_desired_state` (empty circuits).
+2. For each `CREATE VIEW`, calls
+   `gnitz_sql::planner::compile_view_for_migration(client,
+   view_schema, stmt)` — uses the view's own schema as binder
+   default so qualified FROMs resolve.
+3. Converts `gnitz_core::CircuitGraph` → `gnitz_wire::CircuitGraph`
+   via `core_to_wire_circuit`.
+4. Populates `state.views[i].circuit`.
+5. Client hashes the full AST (circuits included).
+
+Server path: Phase 1 validates every created view's circuit via
+`CatalogEngine::validate_view_circuit` BEFORE any SAL touch.
+Phase 3 emits view creates + drops via new helpers:
+
+**`build_create_view_batches(v)` emission order (8 batches):**
+1. `sys_columns` (+1 per output col; `OWNER_KIND_VIEW`).
+2. `sys_view_deps` (+1 per dep_tid).
+3. `sys_circuit_nodes` (+1 per node).
+4. `sys_circuit_edges` (+1 per edge).
+5. `sys_circuit_sources` (+1 per source binding).
+6. `sys_circuit_params` (+1 per param; `str_value=NULL`; see
+   deviation 14 re: `const_strings`).
+7. `sys_circuit_group_cols` (+1 per group col).
+8. **`sys_views` (last)** — triggers `on_view_delta` →
+   `dag.register_table` + `ensure_compiled`. Ordering is
+   load-bearing: the hook calls `read_column_defs(vid)` and
+   `dag.get_source_ids(vid)`, both of which read state from batches
+   1-5.
+
+**`build_drop_view_batches(schema, name)` retracts in reverse:**
+circuit (5 tables via `retract_rows_by_pk_hi`) → view_deps →
+columns (via `build_retract_column_records` with `OWNER_KIND_VIEW`)
+→ sys_views (via `retract_single_row`). Returns `(vid, batches,
+Option<PathBuf>)` so `apply_phase3` can rmtree the directory after
+fsync.
+
+Both helpers slot into `apply_phase3`'s existing
+`ingest_to_family + broadcast_ddl` loop — no new wire path.
 
 ### Building swap batches (`build_swap_batches`)
 
@@ -567,39 +602,29 @@ Each step is a single `Batch` whose `-1`/`+1` rows land together
 
 ## Required catalog changes
 
-### Rename fast-path (done)
+### Rename fast-path (done; unexercised until staging lands)
 
-`on_table_delta`, `on_view_delta`, `on_index_delta` detect same-PK
+`on_table_delta` / `on_view_delta` / `on_index_delta` detect same-PK
 `-1`/`+1` pairs via `detect_rename_pks` and apply only the +1's name
-remap — no dag teardown/rebuild. Registry mappings (`name_to_id`,
-`id_to_qualified`, `index_by_name`/`id`) updated in memory;
-`PartitionedTable`, memtable, compiled plan, directory preserved.
-
-For tables this is an optimisation. **For views and indices it is
-strict correctness**: views are ephemeral (teardown loses in-memory
-data); indices need `backfill_index` which under `sal_writer_excl`
-stalls the cluster for one full source scan.
-
-Idempotent on replay: if `name_to_id[new_qualified] == id` already,
-no-op. V1 MVP does not exercise the fast-path (no `__mig_` staging);
-V1.5 activates it when staging resumes.
+remap. Registry mappings updated in memory; `PartitionedTable`,
+memtable, compiled plan, directory preserved. Idempotent on replay.
+Load-bearing for views/indices (teardown loses view in-memory data;
+index rebuild stalls the cluster). V1.5 direct-apply doesn't
+exercise it because views get final names directly.
 
 ### Ownership-guarded `name_to_id.remove` (done)
 
-All three drop hooks only erase a `name_to_id` / `index_by_name`
-entry if it still points to the id being dropped. Prevents a
-same-batch `-1 id=42 name=users` from erasing a fresh
-`name_to_id["public.users"]=100` inserted moments earlier by the
-rename pair's `+1`.
+Drop hooks only erase a `name_to_id` / `index_by_name` entry if it
+still points to the id being dropped. Prevents a same-batch
+`-1 id=42` from clobbering a fresh entry inserted moments earlier
+by the rename pair's `+1`.
 
 ### Directory-column reads (done)
 
-`on_table_delta` reads `TABLETAB_COL_DIRECTORY` from the batch;
-`on_view_delta` reads `VIEWTAB_COL_CACHE_DIRECTORY`. Falls back to
-the synthesized `<base>/<schema>/<name>_<tid>` path only if the
-column is empty (hasn't happened in practice since both paths set
-it). `on_index_delta` needs no change: `idx_dir` derives from
-`owner_dir`.
+`on_table_delta` reads `TABLETAB_COL_DIRECTORY`; `on_view_delta`
+reads `VIEWTAB_COL_CACHE_DIRECTORY`. Load-bearing for staged
+`__mig_<hash>_` paths; synthesised fallback preserved for legacy
+empty-column rows.
 
 ### `on_column_delta` hook (V2)
 
@@ -670,82 +695,40 @@ Exactly one head — no branches. Fresh DB stays zero; first
 migration's `parent_hash=0` passes TOCTOU.
 
 
-## Recovery
+## Recovery (done)
 
-The N swap batches are made durable atomically by the single fsync
-in Phase 3. Pre-fsync crashes lose all of them; post-fsync crashes
-preserve all of them.
+N swap batches are made durable atomically by Phase 3's single fsync.
+Pre-fsync crashes lose all; post-fsync crashes preserve all.
 
-### Master replay
-
-1. **`replay_catalog`** — `Table::new` loads each sys-table WAL's
-   flushed (post-swap) state into the memtable. `replay_catalog`
-   rebuilds in-memory registries by scanning each memtable and
-   firing `on_schema_delta` / `on_table_delta` / `on_view_delta` /
-   `on_index_delta`. `replay_migrations_head` scans
-   `sys_migrations` and sets `current_migration_hash` to the
-   max-LSN row's hash (scan-only; no hook firing — the standard
-   replay above already has post-swap state).
-
-2. **`recover_system_tables_from_sal`**. Replays unflushed
-   `FLAG_DDL_SYNC` entries via `catalog.ingest_to_family`.
-   Pre-checkpoint crashes leave sys-table WALs at pre-swap state
-   while the SAL still holds the migration's N entries; replaying
-   them re-applies the swap deterministically via the standard hook
-   arms. The sys_migrations entry comes last (the order in which
-   they were broadcast); its replay updates `current_migration_hash`.
-
-**Workers skip system-table recovery entirely.** Bootstrap runs step
-2 on master BEFORE `fork()` and flushes. Workers inherit recovered
-state via COW; their `recover_from_sal` handles only user-table PUSH
-entries.
-
-### Idempotence under post-flush / pre-SAL-reset window
-
-`checkpoint_post_ack` flushes system tables before resetting the
-SAL. A crash in that window lets `recover_system_tables_from_sal`
-re-apply every `FLAG_DDL_SYNC` — including the migration's N
-entries — against already-flushed post-swap state. Today's hooks
-tolerate this via check-and-skip (`on_table_delta`). The rename
-fast-path follows suit (done): "if `name_to_id[qualified] == id`
-already, no-op." Memtable weight accumulates ghosts but registry
-state stays correct; not specific to migrations.
+- **`replay_catalog`** loads flushed sys-table state and fires the
+  standard delta hooks. `replay_migrations_head` sets
+  `current_migration_hash` from `max(created_lsn)` in sys_migrations.
+- **`recover_system_tables_from_sal`** replays unflushed
+  `FLAG_DDL_SYNC` entries pre-`fork()` on master only; workers
+  inherit recovered state via COW. sys_migrations entry comes last;
+  its replay updates `current_migration_hash`.
+- **Post-flush / pre-SAL-reset window**: replay may re-apply
+  post-swap state. Hooks tolerate via check-and-skip; memtable
+  weights accumulate ghosts but registry stays correct.
 
 
 ## Crash recovery & GC
 
-- **Pre-SAL crash (Phase 1 or 2)**: pre-migration state intact.
-  Staged `__mig_<hash>_*` objects are orphans → GC task (V1.5+).
-- **Crash between fsync and rmtree**: committed state correct;
-  old-version dir is the orphan → startup sweep removes it (done).
-- **Worker mid-replay crash**: SAL replay resumes at `read_cursor`
-  and re-dispatches; `ddl_sync` is idempotent.
+- **Pre-SAL crash**: pre-migration state intact. Any staged objects
+  (V1.6+) are orphans → `mig_gc_task`.
+- **Crash between fsync and rmtree**: committed state correct; old
+  dir is the orphan → startup sweep (done) removes it.
+- **Worker mid-replay crash**: SAL replay resumes at `read_cursor`;
+  `ddl_sync` is idempotent.
 
 ### Startup sweep (done)
 
-`CatalogEngine::startup_directory_sweep` runs after `replay_catalog`
-and before reactor wire-up. Matches on **full directory paths**
-derived from catalog state — no filename parsing (user table names
-may contain underscores or unicode).
-
-```
-1. replay_catalog() completes, rebuilding registries.
-2. live = HashSet built from:
-     - dag.tables[*].directory  (covers tables AND views;
-       both register via register_table)
-     - for each positive-weight row in sys_indices:
-         format!("{owner_dir}/idx_{idx_id}")
-3. Whitelist <base>/_system_catalog.
-4. For each subdir under data root:
-     if path ∈ live or whitelisted or a known schema dir: recurse,
-     else: rmtree.
-```
-
-**Scope note:** V1 sweep reaps orphan dirs under schema
-directories. When V1.5 resumes `__mig_` staging with possible
-mid-phase aborts, the sweep will also catch those (the directory
-isn't in `live` because the aborted Phase 2 never completed
-registration).
+`startup_directory_sweep` runs after `replay_catalog` and before
+reactor wire-up. Builds a live set from `dag.tables[*].directory` +
+`sys_indices` owner_dir/idx_<id>; whitelists `<base>/_system_catalog`;
+`rmtree`s everything else. Full-path matching — no filename parsing.
+Also catches `__mig_<hash>_` orphans once staging lands (aborted
+Phase 2 never registered the directory).
 
 ### `mig_gc_task` (V1.5+)
 
@@ -832,10 +815,16 @@ and the V1 code that shipped. Read before starting V1.5 / V2.
    must also be durable. V2 adds SEQ_ID_SCHEMAS when migration SQL
    can include `CREATE SCHEMA`.
 
-7. **`CREATE VIEW` in migrations is rejected at Phase 1.** V1 does
-   not have a server-side SQL planner. The migration canonical form
-   carries a view's raw SQL text, which the server cannot compile
-   into a circuit graph. V1.5 resolves this — see below.
+7. **`CREATE VIEW` in migrations (V1.5, partial).** Shipped via
+   route (b) from the V1.5 goals — the AST carries a client-compiled
+   `CircuitGraph` inside `ViewDef.circuit`. Plan originally preferred
+   route (a) (server-side planner) but the "Z-sets over the wire /
+   server doesn't do SQL" tenets ruled it out. The hash covers the
+   CircuitGraph (contradicting the plan's original "hash covers AST,
+   not compiled bundle" note) — acceptable because client compile is
+   deterministic and the simpler canonical form is worth it. Only
+   plain SELECT views are supported today; JOIN / GROUP BY / UNION /
+   DISTINCT and same-migration view-on-table are follow-ups.
 
 8. **FK column index not resolved.** `ColumnDef.fk_table_id` was the
    old design's resolution handle. The canonical AST uses
@@ -855,6 +844,43 @@ and the V1 code that shipped. Read before starting V1.5 / V2.
     by hex encoding; see item 3). The `migrations_tab_schema()`
     builder and `MIGRATIONS_TAB_ID` constant live alongside existing
     sys-table schemas.
+
+11. **Two `CircuitGraph` types (V1.5).** `gnitz-wire::CircuitGraph`
+    (serde, Hash, with `output_col_defs`) is the migration type
+    embedded in `ViewDef.circuit`. `gnitz-core::CircuitGraph` is the
+    imperative type used by `create_view_with_circuit`. Client-side
+    `core_to_wire_circuit` is a field-by-field copy at the migration
+    boundary. Unification is a future refactor; keeping them separate
+    avoids pulling serde into `gnitz-core`'s hot path.
+
+12. **`validate_view_circuit` Phase-1 gate (V1.5).** For every
+    created view, Phase 1 calls
+    `CatalogEngine::validate_view_circuit(&v.circuit)` which wraps
+    `DagEngine::validate_graph_structure`. Rejects empty graphs,
+    dangling edges, missing primary-input source, missing INTEGRATE
+    sink. Runs BEFORE any SAL touch so bad circuits never reach Phase
+    3 where `on_view_delta → ensure_compiled` would panic.
+
+13. **`build_create_view_batches` emission order (V1.5).** sys_columns
+    → sys_view_deps → sys_circuit_nodes → sys_circuit_edges →
+    sys_circuit_sources → sys_circuit_params →
+    sys_circuit_group_cols → **sys_views (last)**. sys_views last is
+    load-bearing: `on_view_delta`'s register path calls
+    `read_column_defs(vid)` and `dag.get_source_ids(vid)` — both read
+    from catalog state the prior batches populated. Reversing the
+    order produces "columns not found" warnings and silent
+    registration skips. Batches go through the same
+    `ingest_to_family + broadcast_ddl` loop in `apply_phase3` that
+    tables use, so no new wire path.
+
+14. **`const_strings` gap (pre-V1.5, still present).** Both the
+    imperative `write_circuit_graph` and the new
+    `build_create_view_batches` iterate `graph.params` and emit
+    `(value, NULL str_value)` to sys_circuit_params. Neither writes
+    `graph.const_strings` rows. Views whose compile produces string
+    literals (e.g. filter-by-const-string) would lose them across
+    restart. Not exercised by current client compile paths; fix
+    before enabling string-predicate views via migration.
 
 ### Relevant file paths (post-V1)
 
@@ -877,22 +903,36 @@ and the V1 code that shipped. Read before starting V1.5 / V2.
 - `gnitz-core/src/client.rs` — `GnitzClient::push_migration`.
 - `gnitz-py/src/lib.rs` — `PyGnitzClient::push_migration` pyo3 binding.
 - `gnitz-py/python/gnitz/_client.py` — `Connection.push_migration`.
-- `gnitz-py/tests/test_migrations.py` — 10 E2E tests.
+- `gnitz-py/tests/test_migrations.py` — migration E2E tests.
+- `gnitz-wire/src/circuit.rs` (V1.5) — `CircuitGraph` canonical type.
+- `gnitz-sql/src/planner.rs` (V1.5) — `compile_view_for_migration`.
 
 
 ## V1 scope (done)
 
 - `CREATE TABLE` / `DROP TABLE` (whole-object).
 - `CREATE INDEX` / `DROP INDEX`.
-- Declarative desired-state via `push_migration`.
-- Content-addressed commits; linear chain; no branches, no rollback.
-- Single-SAL-transaction atomic cutover (no `__mig_` staging).
-- All the V1 prerequisites (rename fast-path, directory columns,
-  ownership guards, `PendingRelay::Fence`, `migration_in_flight`,
-  startup sweep).
+- Declarative desired-state via `push_migration`; content-addressed
+  linear chain; single-SAL-transaction atomic cutover (no staging).
+- Prerequisites: rename fast-path, directory-column reads, ownership
+  guards, `PendingRelay::Fence`, `migration_in_flight`, startup
+  sweep.
 
-Explicit rejections in V1: `CREATE/DROP VIEW`, any `modified` diff
-entry, empty diffs (no-op migrations).
+Rejections: `modified` diff entries, empty diffs.
+
+## V1.5-so-far (done)
+
+- `CREATE/DROP VIEW` in `push_migration` for plain SELECT (WHERE +
+  projection + computed columns). See "V1.5 view create/drop" above
+  for the flow.
+- `format_version` bumped 1 → 2; `ViewDef.circuit` is part of the
+  AST + hash.
+- Phase-1 structural validation of every created view's circuit.
+- Preserves: imperative `create_view_with_circuit` path is unchanged.
+
+Rejections (still present): `modified`, empty diffs, complex view
+shapes via migrations (JOIN/GROUP/UNION/DISTINCT — surface a
+"use imperative" error), same-migration view-on-table.
 
 
 ## V1.5 scope
@@ -902,61 +942,62 @@ the staging pattern. V2 layers backfill on top of V1.5.
 
 ### V1.5 goals
 
-1. **`CREATE/DROP VIEW` in migrations.** Two routes, pick one:
+1. **`CREATE/DROP VIEW` in migrations — done (plain SELECT).**
+   Route (b) shipped: `gnitz-wire::CircuitGraph` embedded in
+   `ViewDef.circuit`; client compiles client-side via
+   `gnitz_sql::migration::parse_desired_state_with_circuits` which
+   delegates to `gnitz_sql::planner::compile_view_for_migration`;
+   server calls `build_create_view_batches` /
+   `build_drop_view_batches` in `apply_phase3`.
 
-   a. **Server-side planning.** Link `gnitz-sql` into `gnitz-engine`
-      (transitively pulls `gnitz-core`, which is weird — `gnitz-core`
-      has client socket code that the server doesn't need). Factor
-      the planner out of `gnitz-core` first, or extract just the
-      SQL→CircuitGraph layer into a new `gnitz-planner` crate that
-      both client and server can depend on. This is the preferred
-      approach because the server can then validate view SQL at
-      Phase 1 time.
+   Remaining follow-ups (track as V1.5 goal 1b):
+   - **Complex view shapes via migrations.** Only plain SELECT is
+     supported; JOIN / GROUP BY / UNION / DISTINCT surface a
+     "use imperative `create_view_with_circuit`" error from the
+     migration compile path. Port the plain-view compile refactor
+     pattern (`compile_plain_view_circuit` in
+     `gnitz-sql/src/planner.rs`) to each `execute_create_*_view`
+     sibling.
+   - **Same-migration view-on-table.** `CREATE TABLE t; CREATE VIEW
+     v AS SELECT * FROM t` in one migration fails at compile time
+     because `t` doesn't yet exist in the live catalog. Fix: client
+     pre-allocates tids for same-migration tables via
+     `FLAG_ALLOCATE_TABLE_ID` before compile, and compile consults
+     a local `(schema, name) → pre_alloc_tid` map before querying
+     the server. Burned tids on migration abort are acceptable
+     (sequences never reuse; migrations are rare).
+   - **`const_strings` persistence.** See deviation 14.
 
-   b. **Client-sent compiled bundles.** Extend the migration wire
-      format: alongside `desired_state_sql` and
-      `desired_state_canonical`, carry a compile bundle mapping view
-      names to `CircuitGraph`. The hash covers the AST, not the
-      compiled bundle (different compile outputs for the same SQL
-      must hash the same). Requires bumping `format_version` to 2.
-
-   (a) is cleaner and matches the plan's spirit; (b) preserves the
-   current server/client separation but adds wire complexity. Note
-   that view compilation depends on the full set of live + staged
-   objects (for `SELECT ... FROM __mig_T`), so (a) must run at
-   Phase 2 staging time, not at migration parse time.
-
-2. **Resume `__mig_<hash>_` staging.** Follow the "Apply algorithm"
-   pseudocode above verbatim. Phase 2 creates staged objects under
-   `__mig_<hash>_<name>` names via the standard DDL path (each gets
-   its own `sal_writer_excl` + fsync — cost accepted, migrations
-   are rare). Phase 3 then becomes the pure rename-and-drop engine
-   described in "Emission order".
+2. **Resume `__mig_<hash>_` staging — pending.** Follow the "Apply
+   algorithm" pseudocode above verbatim. V1.5 as shipped still uses
+   V1's direct-apply block — views get their final names in Phase 3,
+   not staged names. Safe today because views are created empty (no
+   backfill path) and the whole migration is one SAL transaction.
+   Staging becomes mandatory when V2 backfill lands: non-idempotent
+   Phase 2 work needs isolation so a failure leaves orphans instead
+   of a half-applied catalog.
 
    V1's `build_create_table_batches` / `build_create_index_batches`
-   helpers still have value: V1.5's Phase 2 can call them to
-   synthesise the CREATE broadcast, but with staged names instead
-   of final names. Phase 3 uses the existing
-   `build_swap_batches(cascade, row)` + the `Cascade.renames`
-   population from V1's `catalog::migration::Rename` struct.
+   / `build_create_view_batches` helpers still have value: V1.5's
+   Phase 2 can call them to synthesise CREATE broadcasts with staged
+   names. Phase 3 then uses the existing `build_swap_batches` +
+   `Cascade.renames` population with `RenameKind::View` (already
+   drafted in `catalog/migration.rs` but never exercised).
 
-3. **`mig_gc_task`.** Phase 2 aborts can now leave `__mig_` orphans
-   that survive reboot (they made it into master's sys_tables WAL
-   before the abort). Add the one-shot GC task as specified above.
+3. **`mig_gc_task` — pending.** Only relevant once goal 2 lands;
+   today's single-fsync direct-apply cannot leave orphans.
 
-4. **Relay fence now exercised.** `PendingRelay::Fence` already
-   ships and is a no-op in V1. V1.5's Phase 2 emits exchange relays
-   (for join-view backfill) that must drain before Phase 3's write
-   lock. No code change needed beyond making Phase 2 do the work.
+4. **Relay fence — inactive, shipped.** `PendingRelay::Fence`
+   already ships and is a no-op because V1.5 has no Phase 2 activity
+   that emits exchange relays. Becomes load-bearing with goal 2.
 
-5. **ViewDef SQL normalisation.** Decide between raw-text and
-   parsed-AST storage in `ViewDef.sql`. Current V1 stores the
-   `sqlparser::Statement::CreateView.query.to_string()` which
-   round-trips through sqlparser's `Display` impl — close to
-   canonical but not formally guaranteed. If route (1a) lands,
-   consider parsing to `sqlparser::ast::Query` and storing that
-   serde-serialised (`Query` would need `#[derive(Serialize, Deserialize)]`
-   or an equivalent shim).
+5. **ViewDef SQL normalisation — pending.** `ViewDef.sql` stores
+   `sqlparser::Statement::CreateView.query.to_string()`, which
+   round-trips through sqlparser's `Display` impl but whitespace
+   differences in input can still produce different hashes. Consider
+   normalising or storing a parsed AST. Low priority — the
+   `CircuitGraph` inside `ViewDef` is deterministic from SQL so
+   duplicate submissions still match.
 
 ### V1.5 non-goals
 
@@ -971,7 +1012,20 @@ the staging pattern. V2 layers backfill on top of V1.5.
 
 ### V1.5 acceptance criteria
 
-From the original list below, V1.5 should add:
+Rename-fast-path criteria (9-14) and the `mig_gc_task` criterion
+(36) are gated on goal 2 (staging) shipping. What's covered today:
+
+- **16a** ✓ drop-cascade retracts view columns (now exercised via
+  `build_drop_view_batches`).
+- **17** ✓ drop with live view dependency — unchanged; views in
+  migrations go through the same `validate_drop_closure`.
+- **18** ◐ transitive drop-validation: validator unchanged, V1.5 E2E
+  adds a triangle test as a follow-up.
+- **19** ◐ view-on-view create ordering: `topo_sort_diff` already
+  orders `created_views` after `created_tables` and view-on-view by
+  deps; needs E2E once same-migration view-on-table lands.
+
+Remaining for V1.5 (when goal 2 lands):
 - **9**: final directory retains `__mig_` prefix + survives reboot.
 - **10**: unified-batch rename assertion (exercised).
 - **11**: view-rename preserves ephemeral data (V1.5 views do not
@@ -981,10 +1035,7 @@ From the original list below, V1.5 should add:
 - **12**: index rename preserves data + no cluster stall.
 - **13**: table-rename preserves storage.
 - **14**: universal-stage pure-create round-trip.
-- **18**: transitive drop-validation (triangle).
-- **19**: view-on-view create ordering.
-- **36**: pre-SAL crash recovery via `mig_gc_task` (Phase 2 crash,
-  `__mig_` orphans reaped).
+- **36**: pre-SAL crash recovery via `mig_gc_task`.
 
 ### Sketch of the V1.5 apply flow
 
@@ -1109,18 +1160,20 @@ exercised); `V1.5` / `V2` = pending.
     `collect_cascade`.
 16. ✓ **Drop-cascade retracts circuit graph**: V1 `build_swap_batches`
     emits retractions for all 5 circuit tables.
-16a. ✓ **Drop-cascade retracts view columns**: covered once V1.5
-    exercises view drops; V1 code path (`build_retract_column_records`
-    with `OWNER_KIND_VIEW`) is in place.
+16a. ✓ **Drop-cascade retracts view columns**: V1.5
+    `build_drop_view_batches` exercises `build_retract_column_records`
+    with `OWNER_KIND_VIEW`.
 17. ✓ **Drop with live view dependency**: rejected with specific
     error via `validate_drop_closure`.
-18. V1.5 **Transitive drop-validation**: triangle `X→W→V` with all
-    three dropped. *V1 validator exists; V1.5 test needs views.*
+18. ◐ **Transitive drop-validation**: triangle `X→W→V` with all
+    three dropped. Validator exists; V1.5 needs a dedicated E2E now
+    that views work in migrations.
 
 ### Robustness
 
-19. V1.5 **View-on-view create ordering**: topo emits `V_A` before
-    `V_B`. *Validator exists; V1.5 test needs views.*
+19. ◐ **View-on-view create ordering**: `topo_sort_diff` emits
+    `V_A` before `V_B`. E2E needs same-migration view-on-table
+    (V1.5 follow-up) to exercise end-to-end.
 19a. V2 **Multi-hop cascade AST rewrite**.
 20. ✓ **Allocator-race stress**: HWM broadcast covers
     SEQ_ID_TABLES + SEQ_ID_INDICES.
@@ -1190,15 +1243,33 @@ exercised); `V1.5` / `V2` = pending.
 | `gnitz-py/python/gnitz/_client.py`                | Python wrapper.                                                                           |
 | `gnitz-py/tests/test_migrations.py`               | 10 E2E tests.                                                                             |
 
-### V1.5 (expected)
+### V1.5 (shipped — views in direct-apply)
 
-| File                                              | Change                                                                                   |
-|---------------------------------------------------|------------------------------------------------------------------------------------------|
-| `gnitz-engine/Cargo.toml` (or new crate)          | Server-side access to the SQL→CircuitGraph planner.                                       |
-| `gnitz-engine/src/executor.rs`                    | Phase 2 staging loop; `mig_gc_task` spawn; re-enable view support.                        |
-| `gnitz-engine/src/catalog/migration.rs`           | `Cascade.renames` populated from Phase 2 ids; extend `build_swap_batches` for view renames. |
-| `gnitz-sql/src/migration.rs` (possibly)           | AST normalisation of `ViewDef.sql` if chosen.                                             |
-| `gnitz-py/tests/test_migrations.py`               | Add view tests, `__mig_` prefix test, GC-on-boot test.                                    |
+| File                                              | Change                                                                                             |
+|---------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| `gnitz-wire/src/circuit.rs`                       | New. `CircuitGraph` (serde + Hash) canonical type for migrations.                                  |
+| `gnitz-wire/src/lib.rs`                           | `pub mod circuit; pub use circuit::CircuitGraph;`                                                  |
+| `gnitz-wire/src/migration.rs`                     | `ViewDef.circuit: CircuitGraph`.                                                                   |
+| `gnitz-engine/src/executor.rs`                    | Reject `format_version != 2`; drop view-reject; Phase-1 `validate_view_circuit` loop; Phase-3 view create/drop loops. |
+| `gnitz-engine/src/catalog/migration.rs`           | `build_create_view_batches`, `build_drop_view_batches` (8-batch emission order).                   |
+| `gnitz-engine/src/catalog/mod.rs`                 | `CatalogEngine::validate_view_circuit` (Phase-1 gate).                                             |
+| `gnitz-sql/src/planner.rs`                        | `compile_plain_view_circuit` extracted from `execute_create_view`; `compile_view_for_migration` dispatches. |
+| `gnitz-sql/src/migration.rs`                      | `parse_desired_state_with_circuits(sql, client, default_schema)`.                                  |
+| `gnitz-core/src/connection.rs`                    | `push_migration` emits `format_version=2`.                                                         |
+| `gnitz-py/src/lib.rs`                             | `has_create_view` scan; PyO3 `push_migration` routes via `parse_desired_state_with_circuits`.      |
+| `gnitz-py/tests/test_migrations.py`               | View-create + view-drop-by-omission E2E; old view-rejected test removed.                           |
+| `gnitz-engine/src/catalog/tests.rs`               | 5 unit tests: build_create/drop batch shapes, hash stability, circuit-validation rejects.          |
+
+### V1.5 (remaining — staging, GC, complex views)
+
+| File                                              | Change                                                                                              |
+|---------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `gnitz-engine/src/executor.rs`                    | Phase-2 staging loop (CREATE under `__mig_<hash>_` names); `mig_gc_task` spawn.                     |
+| `gnitz-engine/src/catalog/migration.rs`           | `Cascade.renames` population from Phase-2 ids; `build_swap_batches` exercises `RenameKind::View`.   |
+| `gnitz-sql/src/planner.rs`                        | Extract compile-only helpers from the remaining `execute_create_*_view` siblings (join / group / set-op / distinct). |
+| `gnitz-sql/src/migration.rs`                      | Client-side tid pre-allocation for same-migration tables; resolver consults pre-alloc map.          |
+| `gnitz-engine/src/catalog/mod.rs`                 | Persist `circuit.const_strings` to sys_circuit_params (deviation 14) — applies to both imperative and migration paths. |
+| `gnitz-py/tests/test_migrations.py`               | Add `__mig_` prefix test, GC-on-boot test, complex-view tests, same-migration view-on-table test.   |
 
 ### V2 (expected)
 
