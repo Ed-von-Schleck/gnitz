@@ -155,6 +155,16 @@ impl GnitzClient {
         self.conn.push_migration(parent_hash, desired_state_sql, author, message, canonical)
     }
 
+    /// Submit raw SQL for server-side execution. See
+    /// `Connection::execute_sql`.
+    pub fn execute_sql(
+        &self,
+        default_schema: &str,
+        sql:            &str,
+    ) -> Result<(), ClientError> {
+        self.conn.execute_sql(default_schema, sql)
+    }
+
     pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
         self.conn.push(table_id, schema, batch)
     }

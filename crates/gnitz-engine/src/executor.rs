@@ -48,6 +48,7 @@ const FLAG_ALLOCATE_SCHEMA_ID: u64 = 2;
 const FLAG_SEEK: u64               = 128;
 const FLAG_SEEK_BY_INDEX: u64      = 256;
 const FLAG_ALLOCATE_INDEX_ID: u64  = 512;
+const FLAG_EXECUTE_SQL: u64        = gnitz_wire::FLAG_EXECUTE_SQL;
 
 /// Send+Sync wrapper so raw pointers can cross the `Waker` boundary.
 /// The master process is single-threaded; this is a compile-time
@@ -655,7 +656,7 @@ async fn apply_migration(
     shared: Rc<Shared>, fd: i32, client_id: u64, decoded: ipc::DecodedWire,
 ) {
     // ---- CAS + scope guard ---------------------------------------------
-    let _guard = match MigrationInFlightGuard::acquire(&shared) {
+    let guard = match MigrationInFlightGuard::acquire(&shared) {
         Some(g) => g,
         None => {
             let msg = b"another migration is in flight; retry shortly";
@@ -672,6 +673,19 @@ async fn apply_migration(
             return;
         }
     };
+    apply_migration_row(shared, fd, client_id, row, guard).await;
+}
+
+/// Core of `apply_migration`: phase-1 validation + phase-3 commit, given
+/// a pre-built `MigrationRow`. Entered by the existing client-side
+/// `push_migration` path (via `apply_migration`) and by server-side
+/// `handle_execute_sql` once it has parsed + compiled the submitted SQL.
+/// The in-flight guard is taken by the caller and dropped when this
+/// future resolves.
+async fn apply_migration_row(
+    shared: Rc<Shared>, fd: i32, client_id: u64, row: MigrationRow,
+    _guard: MigrationInFlightGuard,
+) {
     if row.format_version != 1 {
         let msg = format!("unsupported format_version {}", row.format_version);
         send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, msg.as_bytes()).await;
@@ -919,6 +933,133 @@ async fn apply_phase3(
 }
 
 // ---------------------------------------------------------------------------
+// FLAG_EXECUTE_SQL handler
+// ---------------------------------------------------------------------------
+
+/// Server-side entry for `FLAG_EXECUTE_SQL`. Takes a two-string batch
+/// `[schema_name, sql]`, classifies the SQL, and routes:
+///
+/// - DDL (CREATE/DROP TABLE, CREATE/DROP INDEX) → build a v1
+///   `MigrationRow` from the parsed desired state and feed it through
+///   `apply_migration_row`.
+/// - DML (INSERT/UPDATE/DELETE/SELECT) → rejected with a clear message
+///   (Phase 2 only supports DDL via execute_sql; DML still goes through
+///   the imperative push path).
+/// - Mixed DDL+DML in one submission → rejected.
+///
+/// View creation goes through the same rejection as today's migration
+/// path (`CREATE/DROP VIEW in migrations is not yet supported`) —
+/// Phase 2 of the unification plan does not enable views via migrations
+/// yet; that comes with the format-v2 row in Phase 5.
+async fn handle_execute_sql(
+    shared: Rc<Shared>, fd: i32, client_id: u64, decoded: ipc::DecodedWire,
+) {
+    // Serialize against concurrent migrations up front — compile
+    // failures shouldn't even contend for the lock, but the plan's
+    // "compile before lock" optimisation is deferred: holding the
+    // guard across parse is simpler and still correct.
+    let guard = match MigrationInFlightGuard::acquire(&shared) {
+        Some(g) => g,
+        None => {
+            let msg = b"another migration is in flight; retry shortly";
+            send_error(&shared, fd, 0, client_id, msg).await;
+            return;
+        }
+    };
+
+    // ---- Payload extraction -------------------------------------------
+    let batch = match decoded.data_batch.as_ref() {
+        Some(b) if b.count == 1 => b,
+        Some(b) => {
+            let msg = format!("execute_sql: batch must carry exactly one row, got {}", b.count);
+            send_error(&shared, fd, 0, client_id, msg.as_bytes()).await;
+            return;
+        }
+        None => {
+            let msg = b"execute_sql: payload batch missing";
+            send_error(&shared, fd, 0, client_id, msg).await;
+            return;
+        }
+    };
+    let schema_name = match read_str(batch, 0, 0) {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(&shared, fd, 0, client_id, e.as_bytes()).await;
+            return;
+        }
+    };
+    let sql_text = match read_str(batch, 0, 1) {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(&shared, fd, 0, client_id, e.as_bytes()).await;
+            return;
+        }
+    };
+
+    // ---- Classify -----------------------------------------------------
+    let cls = match gnitz_sql_parse::classify_sql(&sql_text) {
+        Ok(c) => c,
+        Err(e) => {
+            send_error(&shared, fd, 0, client_id, e.to_string().as_bytes()).await;
+            return;
+        }
+    };
+    if cls.has_ddl && cls.has_dml {
+        let msg = b"execute_sql: DDL and DML cannot be mixed in a single submission";
+        send_error(&shared, fd, 0, client_id, msg).await;
+        return;
+    }
+    if !cls.has_ddl {
+        // Pure DML — Phase 2 keeps the imperative push path
+        // authoritative. A server-side DML planner is a later phase.
+        let msg =
+            b"execute_sql: pure-DML submissions are not yet supported server-side; \
+              use client.push / delete directly for now";
+        send_error(&shared, fd, 0, client_id, msg).await;
+        return;
+    }
+
+    // ---- Parse declared desired state --------------------------------
+    let new_state = match gnitz_sql_parse::migration::parse_desired_state(
+        &sql_text, &schema_name,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(&shared, fd, 0, client_id, e.to_string().as_bytes()).await;
+            return;
+        }
+    };
+
+    // ---- Build a v1 migration row --------------------------------------
+    // Snapshot the current head under the read lock so the hash is
+    // stable against the moment the user submitted. The Phase-3
+    // TOCTOU re-check in apply_migration_row catches any interleaved
+    // migration that committed between here and lock promotion.
+    let parent_hash = {
+        let _g = shared.catalog_rwlock.read().await;
+        shared.cat().current_migration_hash
+    };
+    let canonical = mig::canonicalize(&new_state);
+    let author = "execute_sql".to_string();
+    // Keep the message short — sys_migrations stores it as a STRING
+    // column and it's surfaced to operators via SHOW MIGRATIONS.
+    let message: String = sql_text.chars().take(200).collect();
+    let hash = mig::compute_migration_hash(parent_hash, &canonical, &author, &message);
+
+    let row = MigrationRow {
+        hash,
+        parent_hash,
+        author,
+        message,
+        created_lsn: 0,
+        desired_state_sql: sql_text,
+        desired_state_canonical: canonical,
+        format_version: 1,
+    };
+    apply_migration_row(shared, fd, client_id, row, guard).await;
+}
+
+// ---------------------------------------------------------------------------
 // Message dispatch
 // ---------------------------------------------------------------------------
 
@@ -963,6 +1104,10 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
             let new_id = shared.cat().allocate_index_id();
             shared.cat().advance_sequence(SEQ_ID_INDICES, new_id - 1, new_id);
             send_alloc(shared, fd, new_id, client_id).await;
+            return;
+        }
+        if flags & FLAG_EXECUTE_SQL != 0 {
+            handle_execute_sql(Rc::clone(shared), fd, client_id, decoded).await;
             return;
         }
     }

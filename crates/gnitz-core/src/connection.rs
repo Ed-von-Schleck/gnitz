@@ -1,12 +1,30 @@
 use std::os::unix::io::RawFd;
+use std::sync::OnceLock;
 use gnitz_protocol::{
-    Message, Schema, ZSetBatch,
+    Message, Schema, ZSetBatch, ColumnDef, TypeCode,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
-    FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
+    FLAG_CONFLICT_MODE_PRESENT, FLAG_EXECUTE_SQL, WireConflictMode,
     send_message, recv_message,
     connect as proto_connect, close_fd,
 };
+
+/// Schema used by the `FLAG_EXECUTE_SQL` payload batch. A dummy U64 PK
+/// column sits at index 0 (value 0, ignored by the server); the two
+/// payload STRING columns carry `default_schema` and the submitted
+/// SQL. `BatchAppender` skips the PK column automatically, so a caller
+/// does `add_row(0, 0, 1).str_val(default_schema).str_val(sql)`.
+fn execute_sql_payload_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
+        columns: vec![
+            ColumnDef { name: "_pk".into(),        type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "schema_name".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "sql".into(),         type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ],
+        pk_index: 0,
+    })
+}
 use crate::error::ClientError;
 
 pub use gnitz_wire::{
@@ -101,6 +119,36 @@ impl Connection {
         }
         self.push(MIGRATIONS_TAB, schema, &batch)?;
         Ok(hash)
+    }
+
+    /// Submit a SQL string for server-side execution. The server
+    /// classifies the SQL: DDL becomes a migration via `apply_migration`,
+    /// DML is rejected (Phase 2 keeps the imperative push path for DML),
+    /// and mixed DDL+DML is rejected. `default_schema` fills in for
+    /// unqualified object references.
+    ///
+    /// Returns Ok(()) on successful DDL application, or a server error
+    /// describing the failure (parse error, rejection, hash mismatch).
+    pub fn execute_sql(
+        &self,
+        default_schema: &str,
+        sql:            &str,
+    ) -> Result<(), ClientError> {
+        let schema = execute_sql_payload_schema();
+        let mut batch = ZSetBatch::new(schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            a.add_row(0, 0, 1).str_val(default_schema).str_val(sql);
+        }
+        // target_id=0 (execute_sql is not a table-scoped operation);
+        // the server dispatches on the FLAG_EXECUTE_SQL bit.
+        send_message(
+            self.sock_fd, 0, self.client_id, FLAG_EXECUTE_SQL,
+            0, 0, 0, Some(schema), Some(&batch),
+        )?;
+        let msg = recv_message(self.sock_fd, None)?;
+        check_response(msg)?;
+        Ok(())
     }
 
     /// Default push: silent-upsert (`WireConflictMode::Update`).

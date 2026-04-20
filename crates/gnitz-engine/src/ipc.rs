@@ -55,7 +55,7 @@ pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 // SAL group header flags (u32 — engine-only flags after FLAG_SEEK_BY_INDEX)
 gnitz_wire::cast_consts! { pub u32;
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
-    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_EXECUTE_SQL,
 }
 pub const FLAG_EXCHANGE_RELAY: u32      = 512;
 pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
