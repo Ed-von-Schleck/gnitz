@@ -4,6 +4,9 @@
 //! (gnitz-protocol, gnitz-core) and server (gnitz-engine) must agree on.
 
 pub mod migration;
+pub mod circuit;
+
+pub use circuit::CircuitGraph;
 
 /// Re-declare gnitz-wire constants as a different integer type.
 ///
