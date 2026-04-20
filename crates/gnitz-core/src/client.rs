@@ -143,6 +143,18 @@ impl GnitzClient {
         self.conn.alloc_index_id()
     }
 
+    /// Submit a schema migration. See `Connection::push_migration`.
+    pub fn push_migration(
+        &self,
+        parent_hash: u128,
+        desired_state_sql: &str,
+        author: &str,
+        message: &str,
+        canonical: &[u8],
+    ) -> Result<u128, ClientError> {
+        self.conn.push_migration(parent_hash, desired_state_sql, author, message, canonical)
+    }
+
     pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
         self.conn.push(table_id, schema, batch)
     }

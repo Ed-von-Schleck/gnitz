@@ -32,7 +32,8 @@ pub(super) const VIEW_TAB_ID: i64               = gnitz_wire::VIEW_TAB as i64;
 pub(super) const COL_TAB_ID: i64                = gnitz_wire::COL_TAB as i64;
 pub(super) const IDX_TAB_ID: i64                = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64                = gnitz_wire::DEP_TAB as i64;
-pub(super) const SEQ_TAB_ID: i64                = gnitz_wire::SEQ_TAB as i64;
+pub(crate) const SEQ_TAB_ID: i64                = gnitz_wire::SEQ_TAB as i64;
+pub(crate) const MIGRATIONS_TAB_ID: i64         = gnitz_wire::MIGRATIONS_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64      = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64      = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_SOURCES_TAB_ID: i64    = gnitz_wire::CIRCUIT_SOURCES_TAB as i64;
@@ -77,6 +78,15 @@ pub(super) const DEPTAB_COL_DEP_VIEW_ID: usize = 2;
 pub(super) const DEPTAB_COL_DEP_TABLE_ID: usize = 3;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
+
+pub(crate) const MIGRATIONS_COL_HASH: usize = 0;
+pub(crate) const MIGRATIONS_COL_PARENT_HASH: usize = 1;
+pub(crate) const MIGRATIONS_COL_AUTHOR: usize = 2;
+pub(crate) const MIGRATIONS_COL_MESSAGE: usize = 3;
+pub(crate) const MIGRATIONS_COL_CREATED_LSN: usize = 4;
+pub(crate) const MIGRATIONS_COL_DESIRED_STATE_SQL: usize = 5;
+pub(crate) const MIGRATIONS_COL_DESIRED_STATE_CANONICAL: usize = 6;
+pub(crate) const MIGRATIONS_COL_FORMAT_VERSION: usize = 7;
 
 // Default arena sizes for system tables and user tables
 pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024;          // 256 KB
@@ -155,6 +165,18 @@ pub(super) const fn circuit_params_schema() -> SchemaDescriptor {
 pub(super) const fn circuit_group_cols_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col()], 0)
 }
+pub(super) const fn migrations_tab_schema() -> SchemaDescriptor {
+    make_schema(&[
+        u128_col(),   // hash (PK)
+        u128_col(),   // parent_hash
+        str_col(),    // author
+        str_col(),    // message
+        u64_col(),    // created_lsn
+        str_col(),    // desired_state_sql
+        str_col(),    // desired_state_canonical (raw bincode; not UTF-8 at this layer)
+        u64_col(),    // format_version
+    ], 0)
+}
 
 // Pre-computed statics — initialised once at program start, never reconstructed.
 static S_SCHEMA_TAB:        SchemaDescriptor = schema_tab_schema();
@@ -169,6 +191,7 @@ static S_CIRCUIT_EDGES:     SchemaDescriptor = circuit_edges_schema();
 static S_CIRCUIT_SOURCES:   SchemaDescriptor = circuit_sources_schema();
 static S_CIRCUIT_PARAMS:    SchemaDescriptor = circuit_params_schema();
 static S_CIRCUIT_GROUP_COLS: SchemaDescriptor = circuit_group_cols_schema();
+static S_MIGRATIONS_TAB:     SchemaDescriptor = migrations_tab_schema();
 
 // ---------------------------------------------------------------------------
 // PK packing helpers
@@ -223,6 +246,7 @@ pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
     SysTabInfo { id: CIRCUIT_SOURCES_TAB_ID, subdir: "_circuit_sources", name: "_circuit_sources" },
     SysTabInfo { id: CIRCUIT_PARAMS_TAB_ID, subdir: "_circuit_params", name: "_circuit_params" },
     SysTabInfo { id: CIRCUIT_GROUP_COLS_TAB_ID, subdir: "_circuit_group_cols", name: "_circuit_group_cols" },
+    SysTabInfo { id: MIGRATIONS_TAB_ID, subdir: "_migrations", name: "_migrations" },
 ];
 
 pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
@@ -239,6 +263,7 @@ pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
         CIRCUIT_SOURCES_TAB_ID    => S_CIRCUIT_SOURCES,
         CIRCUIT_PARAMS_TAB_ID     => S_CIRCUIT_PARAMS,
         CIRCUIT_GROUP_COLS_TAB_ID => S_CIRCUIT_GROUP_COLS,
+        MIGRATIONS_TAB_ID         => S_MIGRATIONS_TAB,
         _ => unreachable!("Unknown system table ID: {}", id),
     }
 }

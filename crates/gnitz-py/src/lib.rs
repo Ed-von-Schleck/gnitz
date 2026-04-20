@@ -1064,6 +1064,34 @@ impl PyGnitzClient {
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
+    /// push_migration(parent_hash, desired_state_sql, author, message) -> hash: int
+    ///
+    /// Parses `desired_state_sql` client-side via gnitz-sql to build
+    /// the canonical AST, computes the migration hash, and sends the
+    /// full migration row to the server. Returns the committed hash
+    /// (matches `compute_migration_hash(parent_hash, canonical, author, message)`).
+    ///
+    /// `parent_hash=0` is the genesis commit. Subsequent migrations
+    /// must pass the hash returned by the previous successful call.
+    /// Stale `parent_hash` surfaces as a `GnitzError` naming the
+    /// current head.
+    ///
+    /// Hashes are returned as Python integers (u128). Python's
+    /// arbitrary-precision int handles the range natively.
+    pub fn push_migration(
+        &self, _py: Python<'_>,
+        parent_hash: u128,
+        desired_state_sql: &str,
+        author: &str,
+        message: &str,
+    ) -> PyResult<u128> {
+        let state = gnitz_sql::migration::parse_desired_state(desired_state_sql, "public")
+            .map_err(|e| GnitzError::new_err(format!("parse error: {}", e)))?;
+        let canonical = gnitz_sql::migration::canonicalize(&state);
+        client!(self).push_migration(parent_hash, desired_state_sql, author, message, &canonical)
+            .map_err(|e| GnitzError::new_err(e.to_string()))
+    }
+
     // ----- DML -----
 
     /// push(target_id, batch, conflict_mode="update") -> ingest_lsn: int

@@ -93,10 +93,10 @@ fn test_bootstrap() {
     assert!(engine.has_schema("_system"));
     assert!(engine.has_schema("public"));
 
-    // System tables (12 expected)
-    assert_eq!(count_records(&mut engine.sys_tables), 12);
-    // System columns (46 expected for all 12 system tables)
-    assert_eq!(count_records(&mut engine.sys_columns), 46);
+    // System tables (13 expected: 12 original + sys_migrations)
+    assert_eq!(count_records(&mut engine.sys_tables), 13);
+    // System columns (54 expected: 46 original + 8 in sys_migrations)
+    assert_eq!(count_records(&mut engine.sys_columns), 54);
     // Sequences (4 expected)
     assert_eq!(count_records(&mut engine.sys_sequences), 4);
     // Schemas (2 expected: _system, public)
@@ -112,7 +112,7 @@ fn test_bootstrap() {
     // Idempotent re-open: should not duplicate records
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
     assert_eq!(count_records(&mut engine2.sys_schemas), 2);
-    assert_eq!(count_records(&mut engine2.sys_tables), 12);
+    assert_eq!(count_records(&mut engine2.sys_tables), 13);
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);
@@ -2216,3 +2216,110 @@ fn test_intra_batch_same_pk_propagates_to_view() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── migration helpers ─────────────────────────────────────────────────
+
+#[test]
+fn test_build_create_table_batches_shape() {
+    use gnitz_wire::migration as mig;
+    use crate::schema::decode_german_string;
+    let dir = temp_dir("mig_create_table_shape");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let t = mig::TableDef {
+        schema: "public".into(),
+        name: "users".into(),
+        columns: vec![
+            mig::ColumnDef {
+                name: "id".into(), type_code: crate::schema::type_code::U64,
+                is_nullable: false,
+                fk_schema: String::new(), fk_table: String::new(), fk_col_idx: 0,
+            },
+            mig::ColumnDef {
+                name: "email".into(), type_code: crate::schema::type_code::STRING,
+                is_nullable: false,
+                fk_schema: String::new(), fk_table: String::new(), fk_col_idx: 0,
+            },
+        ],
+        pk_col_idx: 0,
+        unique_pk: true,
+    };
+    let (tid, batches) = engine.build_create_table_batches(&t).unwrap();
+    assert!(tid >= FIRST_USER_TABLE_ID);
+    assert_eq!(batches.len(), 2);
+
+    // sys_columns batch: one row per column, with correct name/type_code.
+    let cols_batch = &batches[0];
+    assert_eq!(cols_batch.0, COL_TAB_ID);
+    assert_eq!(cols_batch.1.count, 2);
+    let col_idx_data = cols_batch.1.col_data(COLTAB_COL_COL_IDX - 1);
+    let name_data = cols_batch.1.col_data(COLTAB_COL_NAME - 1);
+    let tc_data = cols_batch.1.col_data(COLTAB_COL_TYPE_CODE - 1);
+    let blob = &cols_batch.1.blob;
+    let mut seen_names: Vec<(u64, String, u64)> = Vec::with_capacity(2);
+    for i in 0..cols_batch.1.count {
+        let idx = u64::from_le_bytes(col_idx_data[i*8..i*8+8].try_into().unwrap());
+        let tc = u64::from_le_bytes(tc_data[i*8..i*8+8].try_into().unwrap());
+        let st: [u8; 16] = name_data[i*16..i*16+16].try_into().unwrap();
+        let name = String::from_utf8(decode_german_string(&st, blob)).unwrap();
+        seen_names.push((idx, name, tc));
+    }
+    seen_names.sort_by_key(|&(idx, _, _)| idx);
+    assert_eq!(seen_names[0], (0, "id".into(), crate::schema::type_code::U64 as u64));
+    assert_eq!(seen_names[1], (1, "email".into(), crate::schema::type_code::STRING as u64));
+
+    // sys_tables batch: name, pk_col_idx, unique_pk flag all carried through.
+    let tab_batch = &batches[1];
+    assert_eq!(tab_batch.0, TABLE_TAB_ID);
+    assert_eq!(tab_batch.1.count, 1);
+    assert_eq!(tab_batch.1.get_pk(0), tid as u128);
+    let pk_idx_data = tab_batch.1.col_data(TABLETAB_COL_PK_COL_IDX - 1);
+    let flags_data = tab_batch.1.col_data(TABLETAB_COL_FLAGS - 1);
+    let tab_name_data = tab_batch.1.col_data(TABLETAB_COL_NAME - 1);
+    let pk_idx = u64::from_le_bytes(pk_idx_data[0..8].try_into().unwrap());
+    let flags = u64::from_le_bytes(flags_data[0..8].try_into().unwrap());
+    let st: [u8; 16] = tab_name_data[0..16].try_into().unwrap();
+    let tab_name = String::from_utf8(decode_german_string(&st, &tab_batch.1.blob)).unwrap();
+    assert_eq!(pk_idx, 0);
+    assert_eq!(flags & TABLETAB_FLAG_UNIQUE_PK, TABLETAB_FLAG_UNIQUE_PK);
+    assert_eq!(tab_name, "users");
+
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_current_migration_hash_replay() {
+    use gnitz_wire::migration as mig;
+    use super::migration::MigrationRow;
+    let dir = temp_dir("mig_head_replay");
+
+    // Initial open: head is 0 (fresh DB).
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    assert_eq!(engine.current_migration_hash, 0);
+
+    // Ingest a migration row with non-zero hash.
+    let canonical = b"canonical1".to_vec();
+    let hash1 = mig::compute_migration_hash(0, &canonical, "alice", "init");
+    let row = MigrationRow {
+        hash: hash1, parent_hash: 0,
+        author: "alice".into(), message: "init".into(),
+        created_lsn: 1,
+        desired_state_sql: String::new(),
+        desired_state_canonical: canonical,
+        format_version: 1,
+    };
+    let batch = engine.build_migration_row_batch(&row);
+    engine.ingest_to_family(MIGRATIONS_TAB_ID, &batch).unwrap();
+    assert_eq!(engine.current_migration_hash, hash1, "hook should update head");
+
+    // Close + reopen: replay arm should repopulate the head.
+    engine.close();
+    drop(engine);
+    let engine2 = CatalogEngine::open(&dir).unwrap();
+    assert_eq!(engine2.current_migration_hash, hash1, "replay should restore head");
+    drop(engine2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

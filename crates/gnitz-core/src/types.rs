@@ -76,6 +76,23 @@ pub fn col_tab_schema() -> &'static Schema {
     })
 }
 
+pub fn migrations_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
+        columns: vec![
+            ColumnDef { name: "hash".into(),                    type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "parent_hash".into(),             type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "author".into(),                  type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "message".into(),                 type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "created_lsn".into(),             type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "desired_state_sql".into(),       type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "desired_state_canonical".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "format_version".into(),          type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ],
+        pk_index: 0,
+    })
+}
+
 pub fn view_tab_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {

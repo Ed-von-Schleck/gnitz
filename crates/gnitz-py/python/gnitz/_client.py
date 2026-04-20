@@ -38,6 +38,21 @@ class Connection:
     def drop_table(self, schema_name, table_name):
         self._client.drop_table(schema_name, table_name)
 
+    # Migrations
+
+    def push_migration(self, parent_hash, desired_state_sql, author, message):
+        """Submit a schema migration and return the committed hash.
+
+        parent_hash=0 is the genesis commit; otherwise pass the hash
+        returned by the previous successful push_migration. Supports
+        CREATE/DROP TABLE and CREATE/DROP INDEX; CREATE/DROP VIEW in
+        migration SQL is rejected (use the non-migration create_view
+        path for views).
+        """
+        return self._client.push_migration(
+            parent_hash, desired_state_sql, author, message,
+        )
+
     # DML
 
     def push(self, target_id, batch):

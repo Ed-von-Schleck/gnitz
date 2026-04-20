@@ -10,9 +10,12 @@ use gnitz_protocol::{
 use crate::error::ClientError;
 
 pub use gnitz_wire::{
-    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB, MIGRATIONS_TAB,
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
+use gnitz_protocol::{BatchAppender};
+use gnitz_wire::migration as mig;
+use crate::types::migrations_tab_schema;
 
 fn check_response(msg: Message) -> Result<Message, ClientError> {
     if msg.status == STATUS_ERROR {
@@ -51,6 +54,53 @@ impl Connection {
     pub fn alloc_index_id(&self) -> Result<u64, ClientError> {
         let msg = self.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, None, None)?;
         Ok(msg.target_id)
+    }
+
+    /// Submit a schema migration.
+    ///
+    /// - `parent_hash`: 0 for the genesis commit, otherwise the hash
+    ///   of the current head on the server.
+    /// - `desired_state_sql`: the full target catalog as a SQL script
+    ///   (one-or-more CREATE TABLE / VIEW / INDEX statements).
+    ///   Whitespace-equivalent SQL does not necessarily hash the same
+    ///   under V1 — the canonical form is sorted bincode of the
+    ///   parsed AST, so the *AST* is what's content-addressed.
+    /// - `author`, `message`: audit metadata.
+    /// - `canonical`: the byte-exact output of
+    ///   `gnitz_wire::migration::canonicalize()` over the parsed AST.
+    ///   Clients typically call [`gnitz_sql::migration::parse_desired_state`]
+    ///   then [`gnitz_sql::migration::canonicalize`] to produce it.
+    ///
+    /// Returns the commit hash on success. On failure, the server's
+    /// error message is propagated unchanged.
+    pub fn push_migration(
+        &self,
+        parent_hash: u128,
+        desired_state_sql: &str,
+        author: &str,
+        message: &str,
+        canonical: &[u8],
+    ) -> Result<u128, ClientError> {
+        let hash = mig::compute_migration_hash(parent_hash, canonical, author, message);
+        let canonical_hex = mig::to_hex(canonical);
+
+        let schema = migrations_tab_schema();
+        let mut batch = gnitz_protocol::ZSetBatch::new(schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            let pk_lo = hash as u64;
+            let pk_hi = (hash >> 64) as u64;
+            a.add_row(pk_lo, pk_hi, 1)
+                .u128_val(parent_hash as u64, (parent_hash >> 64) as u64)
+                .str_val(author)
+                .str_val(message)
+                .u64_val(0)                      // created_lsn placeholder — server overrides
+                .str_val(desired_state_sql)
+                .str_val(&canonical_hex)
+                .u64_val(1);                     // format_version = 1
+        }
+        self.push(MIGRATIONS_TAB, schema, &batch)?;
+        Ok(hash)
     }
 
     /// Default push: silent-upsert (`WireConflictMode::Update`).

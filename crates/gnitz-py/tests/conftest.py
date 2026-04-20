@@ -1,6 +1,51 @@
-import os, subprocess, tempfile, time, shutil
+import os, subprocess, tempfile, time, shutil, signal
 import pytest
 import gnitz
+
+
+def _resolve_server_binary():
+    binary = os.environ.get(
+        "GNITZ_SERVER_BIN",
+        os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     "../../../gnitz-server")),
+    )
+    if not os.path.isfile(binary):
+        pytest.skip(f"Server binary not found: {binary}")
+    return binary
+
+
+def start_server_proc(data_dir, sock_path, workers=None, extra_env=None):
+    """Launch a fresh server in its own process group; wait for socket."""
+    binary = _resolve_server_binary()
+    cmd = [binary, data_dir, sock_path]
+    if workers:
+        cmd += [f"--workers={workers}"]
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True, env=env,
+    )
+    for _ in range(100):
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError("Server did not start")
+    return proc
+
+
+def stop_server_proc(proc):
+    """SIGKILL the entire process group, then reap."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
 
 
 @pytest.fixture(scope="session")

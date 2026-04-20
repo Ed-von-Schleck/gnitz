@@ -1019,9 +1019,16 @@ impl Reactor {
                 if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
                     tx.send(relay);
                 } else {
+                    // Only the Relay variant reaches here (produced by
+                    // ExchangeAccumulator::process); log the view_id out
+                    // of the ref without consuming the message.
+                    let vid = match &relay {
+                        crate::reactor::PendingRelay::Relay { view_id, .. } => *view_id,
+                        crate::reactor::PendingRelay::Fence { .. } => -1,
+                    };
                     crate::gnitz_warn!(
                         "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
-                        relay.view_id,
+                        vid,
                     );
                 }
             }
@@ -2303,8 +2310,13 @@ mod tests {
             "single-worker FLAG_EXCHANGE must not produce a relay");
         r.test_route_reply(1, synthetic_exchange_wire(99, 11));
         let relay = rx.try_recv().expect("complete view must produce a relay");
-        assert_eq!(relay.view_id, 99);
-        assert_eq!(relay.payloads.len(), 2);
+        match relay {
+            PendingRelay::Relay { view_id, payloads, .. } => {
+                assert_eq!(view_id, 99);
+                assert_eq!(payloads.len(), 2);
+            }
+            PendingRelay::Fence { .. } => panic!("unexpected Fence"),
+        }
         // Final ACKs (no FLAG_EXCHANGE) for the same req_ids wake
         // their tick wakers and park the wires.
         r.test_route_reply(0, synthetic_decoded_wire(10));
@@ -2349,18 +2361,28 @@ mod tests {
         let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 10, 103));
         // Round A must now be complete (4 workers reported).
         let ra = rx.try_recv().expect("round A should produce a relay");
-        assert_eq!(ra.view_id, 100);
-        assert_eq!(ra.source_id, 10);
-        assert_eq!(ra.payloads.len(), 4);
+        match ra {
+            PendingRelay::Relay { view_id, source_id, payloads, .. } => {
+                assert_eq!(view_id, 100);
+                assert_eq!(source_id, 10);
+                assert_eq!(payloads.len(), 4);
+            }
+            PendingRelay::Fence { .. } => panic!("unexpected Fence"),
+        }
         // Round B still incomplete — worker 2+3 haven't reported for src=20.
         assert!(rx.try_recv().is_none(), "round B must not be ready yet");
 
         let _ = r.test_route_reply(2, synthetic_exchange_wire_src(100, 20, 102));
         let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 20, 103));
         let rb = rx.try_recv().expect("round B should now produce a relay");
-        assert_eq!(rb.view_id, 100);
-        assert_eq!(rb.source_id, 20);
-        assert_eq!(rb.payloads.len(), 4);
+        match rb {
+            PendingRelay::Relay { view_id, source_id, payloads, .. } => {
+                assert_eq!(view_id, 100);
+                assert_eq!(source_id, 20);
+                assert_eq!(payloads.len(), 4);
+            }
+            PendingRelay::Fence { .. } => panic!("unexpected Fence"),
+        }
     }
 
     /// `select2` returns whichever future completes first; the loser is

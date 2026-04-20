@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ipc::DecodedWire;
+use crate::reactor::oneshot;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 
@@ -26,14 +27,26 @@ pub struct ExchangeAccumulator {
     nw: usize,
 }
 
-/// One completed exchange ready for relay.  The relay task owns this:
-/// it acquires the catalog read lock + SAL-writer mutex, calls
-/// `MasterDispatcher::relay_exchange`, then releases both.
-pub struct PendingRelay {
-    pub view_id:   i64,
-    pub payloads:  Vec<Option<Batch>>,
-    pub schema:    SchemaDescriptor,
-    pub source_id: i64,
+/// Message carried on the relay channel.
+///
+/// - `Relay`: one completed exchange ready for relay.  The relay task
+///   owns this: it acquires the catalog read lock + SAL-writer mutex,
+///   calls `MasterDispatcher::relay_exchange`, then releases both.
+/// - `Fence`: a synchronization barrier sent by `apply_migration`
+///   between Phase 2 (universal stage) and Phase 3 (swap).  When the
+///   loop pops a `Fence`, it has already drained all earlier `Relay`s
+///   and the read lock has been released; signalling `done` proves no
+///   stale relay message can fire against the post-swap catalog.
+pub enum PendingRelay {
+    Relay {
+        view_id:   i64,
+        payloads:  Vec<Option<Batch>>,
+        schema:    SchemaDescriptor,
+        source_id: i64,
+    },
+    Fence {
+        done: oneshot::Sender<()>,
+    },
 }
 
 impl ExchangeAccumulator {
@@ -81,7 +94,9 @@ impl ExchangeAccumulator {
             };
             let payloads_vec = self.payloads.remove(&key).unwrap();
             self.counts.remove(&key);
-            Some(PendingRelay { view_id: vid, payloads: payloads_vec, schema, source_id })
+            Some(PendingRelay::Relay {
+                view_id: vid, payloads: payloads_vec, schema, source_id,
+            })
         } else {
             None
         }

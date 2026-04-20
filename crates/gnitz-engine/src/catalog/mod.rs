@@ -10,6 +10,7 @@
 //! - Catalog persistence and recovery
 
 mod sys_tables;
+pub(crate) mod migration;
 
 #[cfg(test)]
 mod tests;
@@ -24,7 +25,21 @@ use crate::storage::{Batch, PartitionedTable, partition_arena_size, CursorHandle
 
 // Re-export items used by other crate modules.
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
-pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
+pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID, MIGRATIONS_TAB_ID};
+pub(crate) use sys_tables::{
+    MIGRATIONS_COL_PARENT_HASH, MIGRATIONS_COL_AUTHOR, MIGRATIONS_COL_MESSAGE,
+    MIGRATIONS_COL_CREATED_LSN, MIGRATIONS_COL_DESIRED_STATE_SQL,
+    MIGRATIONS_COL_DESIRED_STATE_CANONICAL, MIGRATIONS_COL_FORMAT_VERSION,
+};
+
+/// Public wrapper for `sys_tab_schema(id)` — some extra-module
+/// callers (executor migration logic) need to know the schema of a
+/// sys table without importing private helpers.
+pub(crate) fn sys_tab_schema_pub(id: i64) -> SchemaDescriptor {
+    sys_tables::sys_tab_schema(id)
+}
+
+pub(crate) use sys_tables::SEQ_TAB_ID;
 
 // Import everything from sys_tables for internal use.
 use sys_tables::*;
@@ -73,6 +88,18 @@ impl BatchBuilder {
     /// Put a string value for the current payload column.
     pub(crate) fn put_string(&mut self, s: &str) {
         let st = crate::schema::encode_german_string(s.as_bytes(), &mut self.batch.blob);
+        self.batch.extend_col(self.curr_col, &st);
+        self.curr_col += 1;
+    }
+
+    /// Put raw bytes for a STRING column, skipping UTF-8 validation.
+    /// The German-string codec accepts arbitrary bytes; this is safe
+    /// at the ingest path (the WAL-block wire-decode path is the
+    /// only layer that enforces UTF-8, and it is not in play for
+    /// `ingest_to_family`). Used by migration row construction to
+    /// store bincode blobs in `desired_state_canonical`.
+    pub(crate) fn put_string_bytes(&mut self, bytes: &[u8]) {
+        let st = crate::schema::encode_german_string(bytes, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;
     }
@@ -296,6 +323,12 @@ pub struct CatalogEngine {
     sys_circuit_sources: Box<Table>,
     sys_circuit_params: Box<Table>,
     sys_circuit_group_cols: Box<Table>,
+    sys_migrations: Box<Table>,
+
+    // --- Current migration head (zero for fresh DB). Updated by
+    //     apply_migration in Phase 3 after the swap applies, and on
+    //     workers by the fire_hooks arm for MIGRATIONS_TAB_ID.
+    pub(crate) current_migration_hash: u128,
 
     // --- Hook state ---
     cascade_enabled: bool,
@@ -418,6 +451,7 @@ impl CatalogEngine {
         let sys_circuit_sources = create_sys_table(&SYS_TAB_INFOS[9])?;
         let sys_circuit_params = create_sys_table(&SYS_TAB_INFOS[10])?;
         let sys_circuit_group_cols = create_sys_table(&SYS_TAB_INFOS[11])?;
+        let sys_migrations = create_sys_table(&SYS_TAB_INFOS[12])?;
 
         // Check if this is a fresh database (no table records yet)
         let is_new = {
@@ -460,6 +494,8 @@ impl CatalogEngine {
             sys_circuit_sources,
             sys_circuit_params,
             sys_circuit_group_cols,
+            sys_migrations,
+            current_migration_hash: 0,
             cascade_enabled: false,
         };
 
@@ -479,10 +515,129 @@ impl CatalogEngine {
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
 
+        // Startup directory sweep: any subdirectory under base_dir
+        // that isn't whitelisted or claimed by the live catalog is
+        // an orphan — Phase-2-aborted __mig_ staging or left-over
+        // directory from a crash between fsync and rmtree. Runs
+        // AFTER replay_catalog so registries are populated.
+        engine.startup_directory_sweep();
+
         // Enable cascading effects (e.g. auto-create FK indices)
         engine.cascade_enabled = true;
 
         Ok(engine)
+    }
+
+    /// Reap directories under `base_dir` that no longer match any
+    /// live catalog object. Invariant: live = union of
+    ///   - `dag.tables[*].directory` (covers both tables and views),
+    ///   - every `<owner_dir>/idx_<idx_id>` for rows in sys_indices,
+    ///   - `<base_dir>/<SYS_CATALOG_DIRNAME>` (whitelisted),
+    ///   - every `<base_dir>/<schema_name>` (schemas are containers).
+    ///
+    /// Schemas are preserved as containers — they're empty of data
+    /// when all their members have been reaped. The sweep is
+    /// idempotent: running it twice reaps nothing extra.
+    fn startup_directory_sweep(&mut self) {
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(&self.base_dir);
+
+        // Build the live directory set.
+        let mut live: HashSet<PathBuf> = HashSet::new();
+        for entry in self.dag.tables.values() {
+            live.insert(PathBuf::from(&entry.directory));
+        }
+        // Index directories — derived from sys_indices rows.
+        let index_dirs = self.collect_live_index_directories();
+        for d in index_dirs {
+            live.insert(d);
+        }
+
+        // Schema directories (kept as containers).
+        let schema_dirs: HashSet<PathBuf> = self.schema_name_to_id.keys()
+            .map(|n| base.join(n))
+            .collect();
+
+        // Whitelist.
+        let sys_catalog_dir = base.join(SYS_CATALOG_DIRNAME);
+
+        let Ok(entries) = std::fs::read_dir(&base) else { return; };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path == sys_catalog_dir { continue; }
+            if schema_dirs.contains(&path) {
+                // Descend into the schema dir and reap orphans.
+                self.sweep_schema_dir(&path, &live);
+                continue;
+            }
+            // Not a known schema, not system catalog — top-level
+            // orphan (e.g. a directory left from a removed schema).
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    fn sweep_schema_dir(&self, schema_dir: &std::path::Path, live: &std::collections::HashSet<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(schema_dir) else { return; };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if !path.is_dir() { continue; }
+            if live.contains(&path) {
+                // Keep the table/view dir; optionally sweep its
+                // idx_* children.
+                self.sweep_table_dir(&path, live);
+                continue;
+            }
+            // Orphan — not registered in any live entry.
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    fn sweep_table_dir(&self, table_dir: &std::path::Path, live: &std::collections::HashSet<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(table_dir) else { return; };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if !path.is_dir() { continue; }
+            // Within a table directory we only expect `idx_<id>`
+            // subdirectories or the table's partition/shard files
+            // (which are files, not directories). Keep live idx
+            // paths; reap unrecognised dirs.
+            if live.contains(&path) { continue; }
+            // Could be a partition directory — keep anything that
+            // doesn't look like an idx_ entry. Partitioned tables
+            // use numeric directory names (p_N); indices use
+            // `idx_<id>`. Only reap idx_* orphans at this level to
+            // avoid accidentally nuking partition trees.
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("idx_") {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+            }
+        }
+    }
+
+    fn collect_live_index_directories(&mut self) -> Vec<std::path::PathBuf> {
+        use std::path::PathBuf;
+        // For each positive-weight row in sys_indices, derive
+        // `<owner_dir>/idx_<idx_id>`. owner_dir comes from the
+        // owner table's TableEntry in dag.tables.
+        let mut out: Vec<PathBuf> = Vec::new();
+        let Ok(mut cursor) = self.sys_indices.create_cursor() else { return out; };
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                let idx_id = cursor.cursor.current_key_lo as i64;
+                let owner_id = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
+                if let Some(entry) = self.dag.tables.get(&owner_id) {
+                    let d = format!("{}/idx_{}", entry.directory, idx_id);
+                    out.push(PathBuf::from(d));
+                }
+            }
+            cursor.cursor.advance();
+        }
+        out
     }
 
     // -- Bootstrap (fresh database) ----------------------------------------
@@ -568,6 +723,14 @@ impl CatalogEngine {
                     ("str_value", type_code::STRING),
                 ]),
                 (CIRCUIT_GROUP_COLS_TAB_ID, &[("gcol_pk", type_code::U128), ("col_idx", type_code::U64)]),
+                (MIGRATIONS_TAB_ID, &[
+                    ("hash", type_code::U128), ("parent_hash", type_code::U128),
+                    ("author", type_code::STRING), ("message", type_code::STRING),
+                    ("created_lsn", type_code::U64),
+                    ("desired_state_sql", type_code::STRING),
+                    ("desired_state_canonical", type_code::STRING),
+                    ("format_version", type_code::U64),
+                ]),
             ];
 
             for &(tid, cols) in system_cols {
@@ -658,8 +821,8 @@ impl CatalogEngine {
     fn register_system_table_families(&mut self) {
         let sys_dir = format!("{}/{}", self.base_dir, SYS_CATALOG_DIRNAME);
 
-        // Collect all 12 system table pointers
-        let table_ptrs: [*mut Table; 12] = [
+        // Collect all 13 system table pointers
+        let table_ptrs: [*mut Table; 13] = [
             &mut *self.sys_schemas,
             &mut *self.sys_tables,
             &mut *self.sys_views,
@@ -672,6 +835,7 @@ impl CatalogEngine {
             &mut *self.sys_circuit_sources,
             &mut *self.sys_circuit_params,
             &mut *self.sys_circuit_group_cols,
+            &mut *self.sys_migrations,
         ];
 
         for (i, info) in SYS_TAB_INFOS.iter().enumerate() {
@@ -729,7 +893,37 @@ impl CatalogEngine {
         self.replay_system_table(TABLE_TAB_ID)?;
         self.replay_system_table(VIEW_TAB_ID)?;
         self.replay_system_table(IDX_TAB_ID)?;
+        // Migration head — scan-only, no hook firing; sys_tables /
+        // sys_views already carry post-swap state from the standard
+        // replay above.
+        self.replay_migrations_head();
         Ok(())
+    }
+
+    /// Scan `sys_migrations` and set `current_migration_hash` to the
+    /// hash of the row with the highest `created_lsn`. Zero if the
+    /// table is empty (fresh DB, no migrations applied).
+    fn replay_migrations_head(&mut self) {
+        let mut cursor = match self.sys_migrations.create_cursor() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut best_lsn: u64 = 0;
+        let mut best_hash: u128 = 0;
+        let mut seen_any = false;
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                let lsn = cursor_read_u64(&cursor, MIGRATIONS_COL_CREATED_LSN);
+                if !seen_any || lsn >= best_lsn {
+                    best_lsn = lsn;
+                    best_hash = ((cursor.cursor.current_key_hi as u128) << 64)
+                        | (cursor.cursor.current_key_lo as u128);
+                    seen_any = true;
+                }
+            }
+            cursor.cursor.advance();
+        }
+        self.current_migration_hash = best_hash;
     }
 
     fn replay_system_table(&mut self, sys_table_id: i64) -> Result<(), String> {
@@ -835,7 +1029,7 @@ fn copy_cursor_row_with_weight(
 
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
-fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> Batch {
+pub(super) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
@@ -868,7 +1062,7 @@ fn schema_has_string_columns(schema: &SchemaDescriptor) -> bool {
 /// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
 /// emitting each as a retraction (weight=-1). Exploits U128 sort order
 /// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
-fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> Batch {
+pub(super) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
@@ -913,6 +1107,30 @@ fn retract_and_ingest(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) 
     }
 }
 
+/// Detect rename pairs within a Batch: PKs that appear with BOTH a
+/// positive-weight and a negative-weight row. Returns the set of such
+/// PKs.  A rename preserves the ID and (for tables) the physical
+/// directory across the change; the hook applies only the +1 side's
+/// name update and skips teardown/rebuild.
+///
+/// Invariant: mismatched `-1`/`+1` pairs that cross batches would be a
+/// caller bug — the swap-batch builder always pairs them in one Batch.
+/// If only one half is seen, the row is classified as a normal
+/// create-or-drop and handled by the standard path.
+fn detect_rename_pks(batch: &Batch) -> HashSet<u64> {
+    let mut seen: HashMap<u64, u8> = HashMap::with_capacity(batch.count);
+    for i in 0..batch.count {
+        let pk = batch.get_pk(i) as u64;
+        let w = batch.get_weight(i);
+        let entry = seen.entry(pk).or_insert(0);
+        if w > 0 { *entry |= 1; }
+        if w < 0 { *entry |= 2; }
+    }
+    seen.into_iter()
+        .filter_map(|(pk, bits)| if bits == 3 { Some(pk) } else { None })
+        .collect()
+}
+
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
@@ -924,6 +1142,21 @@ impl CatalogEngine {
             IDX_TAB_ID => self.on_index_delta(batch),
             DEP_TAB_ID => {
                 self.dag.invalidate_dep_map();
+                Ok(())
+            }
+            MIGRATIONS_TAB_ID => {
+                // sys_migrations is append-only (no drops); rows arrive
+                // in commit order, so the last positive-weight row in a
+                // batch wins. PK (col 0) carries the hash — lo in
+                // pk_lo, hi in pk_hi. No other catalog state is touched
+                // by this hook; workers learn the new head here, master
+                // updates the field directly from apply_migration's
+                // Phase 3 block.
+                for i in 0..batch.count {
+                    if batch.get_weight(i) <= 0 { continue; }
+                    let pk = batch.get_pk(i);
+                    self.current_migration_hash = pk;
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -962,11 +1195,46 @@ impl CatalogEngine {
     }
 
     fn on_table_delta(&mut self, batch: &Batch) -> Result<(), String> {
+        // Rename fast-path: tid appearing with both -1 and +1 in the
+        // same Batch. Apply only the +1's name remap in memory — skip
+        // dag teardown/rebuild, preserving the PartitionedTable, memtable,
+        // compiled artefacts, and on-disk directory (which keeps its
+        // pre-migration __mig_<hash>_<name>_<tid> path across the swap).
+        let renames = detect_rename_pks(batch);
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64; // TABLETAB_COL_SCHEMA_ID
             let name = self.read_batch_string(batch, i, 1);    // TABLETAB_COL_NAME
+
+            if renames.contains(&(tid as u64)) {
+                if weight <= 0 { continue; } // drop half: skip, kept by fast-path
+                let schema_name = self.schema_id_to_name.get(&sid)
+                    .cloned().unwrap_or_default();
+                let new_qualified = format!("{}.{}", schema_name, name);
+                // Idempotent on replay: if already pointing to us, no-op.
+                if self.name_to_id.get(&new_qualified) == Some(&tid) {
+                    continue;
+                }
+                // Remove the old qualified name (only if it still points to us).
+                if let Some((old_sn, old_tn)) = self.id_to_qualified.get(&tid).cloned() {
+                    let old_qualified = format!("{}.{}", old_sn, old_tn);
+                    if old_qualified != new_qualified
+                        && self.name_to_id.get(&old_qualified) == Some(&tid)
+                    {
+                        self.name_to_id.remove(&old_qualified);
+                    }
+                }
+                self.name_to_id.insert(new_qualified, tid);
+                self.id_to_qualified.insert(tid, (schema_name, name));
+                continue;
+            }
+            // payload col 2 = TABLETAB_COL_DIRECTORY — authoritative physical path.
+            // Load-bearing for migration rename: __mig_<hash>_<name>_<tid>
+            // staged directories keep their on-disk name across the swap, so
+            // we must never synthesize the path from (schema, name, tid) on
+            // reboot — it would open a non-existent directory.
+            let directory_batch = self.read_batch_string(batch, i, 2);
             let pk_col_idx = self.read_batch_u64(batch, i, 3) as u32; // TABLETAB_COL_PK_COL_IDX
             let flags = self.read_batch_u64(batch, i, 5);      // TABLETAB_COL_FLAGS
             let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
@@ -993,7 +1261,11 @@ impl CatalogEngine {
 
                 let schema_name = self.schema_id_to_name.get(&sid)
                     .cloned().unwrap_or_default();
-                let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid);
+                let directory = if !directory_batch.is_empty() {
+                    directory_batch
+                } else {
+                    format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid)
+                };
 
                 // Build schema descriptor from column defs
                 let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk_col_idx);
@@ -1053,10 +1325,15 @@ impl CatalogEngine {
 
                     self.dag.unregister_table(tid);
                     self.col_names_cache.remove(&tid);
-                    // Clean up registry
+                    // Clean up registry — only remove name_to_id if it still
+                    // points to us. A same-batch rename may have inserted a
+                    // new id under the same qualified name; we must not wipe
+                    // that mapping.
                     if let Some((sn, tn)) = self.id_to_qualified.remove(&tid) {
                         let qualified = format!("{}.{}", sn, tn);
-                        self.name_to_id.remove(&qualified);
+                        if self.name_to_id.get(&qualified) == Some(&tid) {
+                            self.name_to_id.remove(&qualified);
+                        }
                     }
                     self.schema_ids.remove(&tid);
 
@@ -1079,11 +1356,43 @@ impl CatalogEngine {
     }
 
     fn on_view_delta(&mut self, batch: &Batch) -> Result<(), String> {
+        // Rename fast-path. For views this is CORRECTNESS, not optimisation:
+        // views are ephemeral (`durable=false`), so teardown permanently
+        // drops in-memory rows. The fast-path keeps the PartitionedTable,
+        // trace, and compiled plan intact while remapping the name.
+        let renames = detect_rename_pks(batch);
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64;
             let name = self.read_batch_string(batch, i, 1);
+
+            if renames.contains(&(vid as u64)) {
+                if weight <= 0 { continue; }
+                let schema_name = self.schema_id_to_name.get(&sid)
+                    .cloned().unwrap_or_default();
+                let new_qualified = format!("{}.{}", schema_name, name);
+                if self.name_to_id.get(&new_qualified) == Some(&vid) {
+                    continue; // idempotent on replay
+                }
+                if let Some((old_sn, old_tn)) = self.id_to_qualified.get(&vid).cloned() {
+                    let old_qualified = format!("{}.{}", old_sn, old_tn);
+                    if old_qualified != new_qualified
+                        && self.name_to_id.get(&old_qualified) == Some(&vid)
+                    {
+                        self.name_to_id.remove(&old_qualified);
+                    }
+                }
+                self.name_to_id.insert(new_qualified, vid);
+                self.id_to_qualified.insert(vid, (schema_name, name));
+                continue;
+            }
+            // payload col 3 = VIEWTAB_COL_CACHE_DIRECTORY. Views are
+            // ephemeral so this is hygiene (the directory is recreated on
+            // register), but reading from the batch keeps staged
+            // __mig_<hash>_<view>_<vid> paths consistent instead of
+            // synthesizing a parallel name.
+            let cache_dir_batch = self.read_batch_string(batch, i, 3);
 
             if weight > 0 {
                 if self.dag.tables.contains_key(&vid) {
@@ -1098,7 +1407,11 @@ impl CatalogEngine {
 
                 let schema_name = self.schema_id_to_name.get(&sid)
                     .cloned().unwrap_or_default();
-                let directory = format!("{}/{}/view_{}_{}", self.base_dir, schema_name, name, vid);
+                let directory = if !cache_dir_batch.is_empty() {
+                    cache_dir_batch
+                } else {
+                    format!("{}/{}/view_{}_{}", self.base_dir, schema_name, name, vid)
+                };
                 let view_schema = self.build_schema_from_col_defs(&col_defs, 0);
 
                 // Create partitioned ephemeral table
@@ -1153,9 +1466,14 @@ impl CatalogEngine {
                 if self.dag.tables.contains_key(&vid) {
                     self.dag.unregister_table(vid);
                     self.col_names_cache.remove(&vid);
+                    // Only remove name_to_id if it still points to this vid
+                    // (a same-batch rename may have re-inserted the name
+                    // under a fresh id already).
                     if let Some((sn, tn)) = self.id_to_qualified.remove(&vid) {
                         let qualified = format!("{}.{}", sn, tn);
-                        self.name_to_id.remove(&qualified);
+                        if self.name_to_id.get(&qualified) == Some(&vid) {
+                            self.name_to_id.remove(&qualified);
+                        }
                     }
                     self.schema_ids.remove(&vid);
 
@@ -1168,6 +1486,13 @@ impl CatalogEngine {
     }
 
     fn on_index_delta(&mut self, batch: &Batch) -> Result<(), String> {
+        // Rename fast-path — CORRECTNESS for indices: the normal create
+        // branch runs `backfill_index` which scans the source table;
+        // under `sal_writer_excl` that would stall the cluster for the
+        // length of one full scan per renamed index. Also preserves the
+        // backing `Table` (ephemeral — rebuilds would lose all entries
+        // until backfill finishes).
+        let renames = detect_rename_pks(batch);
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
@@ -1176,6 +1501,23 @@ impl CatalogEngine {
             let name = self.read_batch_string(batch, i, 3);
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
             let cache_dir = self.read_batch_string(batch, i, 5);
+
+            if renames.contains(&(idx_id as u64)) {
+                if weight <= 0 { continue; }
+                if self.index_by_name.get(&name) == Some(&idx_id) {
+                    continue; // idempotent on replay
+                }
+                if let Some(old_name) = self.index_by_id.get(&idx_id).cloned() {
+                    if old_name != name
+                        && self.index_by_name.get(&old_name) == Some(&idx_id)
+                    {
+                        self.index_by_name.remove(&old_name);
+                    }
+                }
+                self.index_by_name.insert(name.clone(), idx_id);
+                self.index_by_id.insert(idx_id, name);
+                continue;
+            }
 
             if weight > 0 {
                 if self.index_by_name.contains_key(&name) {
@@ -1223,7 +1565,11 @@ impl CatalogEngine {
                     // entry point `drop_index`; this hook executes for both
                     // explicit drops and cascade drops from `drop_table`.
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
-                    self.index_by_name.remove(&name);
+                    // Only remove index_by_name if it still points to us.
+                    // Same-batch rename guard (mirrors table/view drops).
+                    if self.index_by_name.get(&name) == Some(&idx_id) {
+                        self.index_by_name.remove(&name);
+                    }
                     self.index_by_id.remove(&idx_id);
                 }
             }
@@ -2116,6 +2462,33 @@ impl CatalogEngine {
         self.emit_column_records(owner_id, kind, col_defs, 1);
     }
 
+    /// Build a retraction batch (-1 rows) for every sys_columns row
+    /// belonging to `owner_id`. Reads column defs from the store; does
+    /// NOT ingest. Used by the migration swap-batch builder which must
+    /// assemble many retractions across multiple sys tables before any
+    /// ingest/broadcast happens.
+    pub(super) fn build_retract_column_records(
+        &mut self, owner_id: i64, kind: i64,
+    ) -> Result<Batch, String> {
+        let col_defs = self.read_column_defs(owner_id)?;
+        let schema = col_tab_schema();
+        let mut bb = BatchBuilder::new(schema);
+        for (i, cd) in col_defs.iter().enumerate() {
+            let pk = pack_column_id(owner_id, i as i64);
+            bb.begin_row(pk, 0, -1);
+            bb.put_u64(owner_id as u64);
+            bb.put_u64(kind as u64);
+            bb.put_u64(i as u64);
+            bb.put_string(&cd.name);
+            bb.put_u64(cd.type_code as u64);
+            bb.put_u64(if cd.is_nullable { 1 } else { 0 });
+            bb.put_u64(cd.fk_table_id as u64);
+            bb.put_u64(cd.fk_col_idx as u64);
+            bb.end_row();
+        }
+        Ok(bb.finish())
+    }
+
     fn retract_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) {
         self.emit_column_records(owner_id, kind, col_defs, -1);
     }
@@ -2268,6 +2641,7 @@ impl CatalogEngine {
             CIRCUIT_SOURCES_TAB_ID => Some(&mut self.sys_circuit_sources),
             CIRCUIT_PARAMS_TAB_ID => Some(&mut self.sys_circuit_params),
             CIRCUIT_GROUP_COLS_TAB_ID => Some(&mut self.sys_circuit_group_cols),
+            MIGRATIONS_TAB_ID => Some(&mut self.sys_migrations),
             _ => None,
         }
     }
@@ -2294,6 +2668,7 @@ impl CatalogEngine {
                 CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
                 CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
                 CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
+                MIGRATIONS_TAB_ID => &mut self.sys_migrations,
                 _ => return Err(format!("Unknown system table_id {}", table_id)),
             };
             // Clone batch for hooks (hooks need to read it after table borrows it)
@@ -2507,6 +2882,7 @@ impl CatalogEngine {
             CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
             CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
             CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
+            MIGRATIONS_TAB_ID => &mut self.sys_migrations,
             _ => return Err(format!("Unknown system table_id {}", table_id)),
         };
         // Memonly ingest (no WAL)
@@ -2756,6 +3132,12 @@ impl CatalogEngine {
     }
 
     // -- Close engine ------------------------------------------------------
+
+    /// Create a cursor over sys_migrations (used by apply_migration
+    /// to look up a parent commit's canonical bytes).
+    pub(crate) fn sys_migrations_cursor(&mut self) -> Result<CursorHandle<'_>, i32> {
+        self.sys_migrations.create_cursor()
+    }
 
     /// Flush all system tables (memtable → shard). Called at checkpoint and close.
     pub fn flush_all_system_tables(&mut self) {

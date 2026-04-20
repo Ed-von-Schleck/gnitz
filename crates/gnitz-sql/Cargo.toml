@@ -7,3 +7,7 @@ edition = "2021"
 sqlparser   = "0.56"
 gnitz-core     = { path = "../gnitz-core" }
 gnitz-protocol = { path = "../gnitz-protocol" }
+# Migration AST + canonical form + diff / hash live in gnitz-wire so
+# the server-side apply (gnitz-engine) can share them. This crate
+# only owns the SQL→DesiredState parser.
+gnitz-wire     = { path = "../gnitz-wire" }

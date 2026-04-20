@@ -508,7 +508,15 @@ impl MasterDispatcher {
                 "SAL space exhausted during exchange relay ({} bytes left)", remaining));
         }
 
-        let PendingRelay { view_id, payloads, schema, source_id } = relay;
+        // Only `Relay` ever reaches here — `Fence` is handled in the
+        // relay loop and never forwarded to prepare_relay.
+        let (view_id, payloads, schema, source_id) = match relay {
+            PendingRelay::Relay { view_id, payloads, schema, source_id } =>
+                (view_id, payloads, schema, source_id),
+            PendingRelay::Fence { .. } => {
+                return Err("prepare_relay called with Fence variant".into());
+            }
+        };
 
         let cat = unsafe { &mut *self.catalog };
         let shard_cols = if source_id > 0 {

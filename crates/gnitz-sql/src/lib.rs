@@ -4,6 +4,7 @@ mod logical_plan;
 mod binder;
 mod expr;
 pub mod dml;
+pub mod migration;
 pub mod planner;
 
 pub use error::GnitzSqlError;

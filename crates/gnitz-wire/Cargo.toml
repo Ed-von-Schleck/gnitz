@@ -2,3 +2,12 @@
 name    = "gnitz-wire"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+# Migration AST lives here (shared by client-side parser in gnitz-sql
+# and server-side apply in gnitz-engine). bincode + serde give a
+# stable canonical encoding; xxhash-rust is already a dep of every
+# crate that touches row data, so reuse it for the content hash.
+serde       = { version = "1", features = ["derive"] }
+bincode     = { version = "2.0", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
