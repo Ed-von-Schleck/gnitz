@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::ptr;
 use std::sync::Arc;
 
+use super::batch::Batch;
 use super::columnar::{self, ColumnarSource};
 use crate::schema::SchemaDescriptor;
 use super::heap::MergeHeap;
@@ -14,18 +15,23 @@ use super::merge::MemBatch;
 use super::shard_reader::MappedShard;
 
 // ---------------------------------------------------------------------------
-// CursorSource — unified access to batch buffers or shard mmap
+// CursorSource — unified access to in-memory batches or shard mmaps
 // ---------------------------------------------------------------------------
+//
+// Both variants own their backing data via `Arc`, so a `CursorSource` (and
+// therefore the enclosing `ReadCursor`) is a self-contained owning value with
+// no borrow lifetime.  This is what lets us hand `CursorHandle` (and pointers
+// to it) across DAG/VM boundaries without needing a `'static` transmute.
 
-enum CursorSource<'a> {
-    Batch(MemBatch<'a>),
-    /// Arc-owned reference to a MappedShard.
-    /// The Arc keeps the MappedShard (and its mmap) alive for the cursor's lifetime,
-    /// eliminating the UAF risk from raw `*const MappedShard` pointers.
+enum CursorSource {
+    /// Arc-owned in-memory batch.  The Arc keeps the data alive for the
+    /// cursor's lifetime; multiple cursors can share a snapshot.
+    Batch(Arc<Batch>),
+    /// Arc-owned reference to a MappedShard.  The Arc keeps the mmap alive.
     Shard(Arc<MappedShard>),
 }
 
-impl<'a> CursorSource<'a> {
+impl CursorSource {
     #[allow(dead_code)]
     fn count(&self) -> usize {
         match self {
@@ -83,7 +89,7 @@ impl<'a> CursorSource<'a> {
 
     fn blob_slice(&self) -> &[u8] {
         match self {
-            CursorSource::Batch(b) => b.blob,
+            CursorSource::Batch(b) => &b.blob,
             CursorSource::Shard(s) => s.blob_slice(),
         }
     }
@@ -96,7 +102,7 @@ impl<'a> CursorSource<'a> {
     }
 }
 
-impl<'a> ColumnarSource for CursorSource<'a> {
+impl ColumnarSource for CursorSource {
     #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         CursorSource::get_null_word(self, row)
@@ -136,15 +142,15 @@ fn entry_cmp(
 // ReadCursorEntry — per-source position tracker
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ReadCursorEntry<'a> {
-    source: CursorSource<'a>,
+pub(crate) struct ReadCursorEntry {
+    source: CursorSource,
     position: usize,
     count: usize,
     is_shard: bool,
 }
 
-impl<'a> ReadCursorEntry<'a> {
-    fn new_batch(batch: MemBatch<'a>) -> Self {
+impl ReadCursorEntry {
+    fn new_batch(batch: Arc<Batch>) -> Self {
         let count = batch.count;
         ReadCursorEntry {
             source: CursorSource::Batch(batch),
@@ -224,8 +230,8 @@ impl<'a> ReadCursorEntry<'a> {
 // ReadCursor
 // ---------------------------------------------------------------------------
 
-pub struct ReadCursor<'a> {
-    entries: Vec<ReadCursorEntry<'a>>,
+pub struct ReadCursor {
+    entries: Vec<ReadCursorEntry>,
     tree: Option<MergeHeap>,
     schema: SchemaDescriptor,
     // Current row state
@@ -240,8 +246,8 @@ pub struct ReadCursor<'a> {
     advance_buf: Vec<usize>,
 }
 
-impl<'a> ReadCursor<'a> {
-    fn build_tree(entries: &[ReadCursorEntry<'a>], schema: &SchemaDescriptor) -> MergeHeap {
+impl ReadCursor {
+    fn build_tree(entries: &[ReadCursorEntry], schema: &SchemaDescriptor) -> MergeHeap {
         let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
             entry_cmp(entries, schema, a, b).is_lt()
         };
@@ -258,7 +264,7 @@ impl<'a> ReadCursor<'a> {
         )
     }
 
-    pub(crate) fn new(entries: Vec<ReadCursorEntry<'a>>, schema: SchemaDescriptor) -> Self {
+    pub(crate) fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
         let tree = if n > 1 {
             Some(Self::build_tree(&entries, &schema))
@@ -423,18 +429,17 @@ impl<'a> ReadCursor<'a> {
                     // truncate the high half; return null so callers see no data
                     // rather than corrupt data.
                     return ptr::null();
+                }
+                // Map logical → payload index
+                let payload_idx = if col_idx < pk_index {
+                    col_idx
                 } else {
-                    // Map logical → payload index
-                    let payload_idx = if col_idx < pk_index {
-                        col_idx
-                    } else {
-                        col_idx - 1
-                    };
-                    if payload_idx < b.col_data.len() {
-                        unsafe { b.col_data[payload_idx].as_ptr().add(row * col_size) }
-                    } else {
-                        ptr::null()
-                    }
+                    col_idx - 1
+                };
+                if payload_idx < b.num_payload_cols() {
+                    b.get_col_ptr(row, payload_idx, col_size).as_ptr()
+                } else {
+                    ptr::null()
                 }
             }
         }
@@ -478,29 +483,10 @@ impl<'a> ReadCursor<'a> {
             CursorSource::Batch(b) => {
                 // Batch sources are always consolidated (no ghosts).
                 let end = start + row_count;
-                let npc = b.col_data.len();
-                let num_regions = 4 + npc + 1;
-                let mut region_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_regions);
-                region_bufs.push(b.pk_lo[start * 8..end * 8].to_vec());
-                region_bufs.push(b.pk_hi[start * 8..end * 8].to_vec());
-                region_bufs.push(b.weight[start * 8..end * 8].to_vec());
-                region_bufs.push(b.null_bmp[start * 8..end * 8].to_vec());
-                let pk_index = schema.pk_index as usize;
-                let mut pi = 0;
-                for ci in 0..schema.num_columns as usize {
-                    if ci == pk_index { continue; }
-                    let cs = schema.columns[ci].size as usize;
-                    region_bufs.push(b.col_data[pi][start * cs..end * cs].to_vec());
-                    pi += 1;
-                }
-                region_bufs.push(b.blob.to_vec());
-
-                let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
-                let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
-                let mut out = unsafe { super::batch::Batch::from_regions(&ptrs, &sizes, row_count, npc) };
+                let mut out = Batch::with_schema(*schema, row_count.max(1));
+                out.append_batch(b, start, end);
                 out.sorted = true;
                 out.consolidated = true;
-                out.set_schema(*schema);
                 out
             }
             CursorSource::Shard(s) => {
@@ -517,44 +503,40 @@ impl<'a> ReadCursor<'a> {
         Some(batch)
     }
 
-    /// If this cursor is backed by exactly one `MemBatch` source, returns a
-    /// reference to that batch and the current row position (`entry.position`).
-    /// Returns `None` for multi-source or shard-backed cursors.
+    /// If this cursor is backed by exactly one in-memory `Batch` source,
+    /// returns a `MemBatch` view over it and the current row position
+    /// (`entry.position`).  Returns `None` for multi-source or shard-backed
+    /// cursors.
     ///
-    /// Used by the bulk retraction path in the catalog to avoid per-row overhead
-    /// when copying a contiguous range of rows from a single in-memory source.
-    pub(crate) fn single_mem_batch(&self) -> Option<(&MemBatch<'_>, usize)> {
+    /// Used by the bulk retraction path in the catalog to avoid per-row
+    /// overhead when copying a contiguous range of rows from a single
+    /// in-memory source.
+    pub(crate) fn single_mem_batch(&self) -> Option<(MemBatch<'_>, usize)> {
         if !self.valid || self.entries.len() != 1 {
             return None;
         }
         let entry = &self.entries[0];
         match &entry.source {
-            CursorSource::Batch(b) => Some((b, entry.position)),
+            CursorSource::Batch(b) => Some((b.as_mem_batch(), entry.position)),
             CursorSource::Shard(_) => None,
         }
     }
 }
 
-/// Build a ReadCursor from batch regions + shard Arcs.
-pub fn create_read_cursor<'a>(
-    batch_regions: &[MemBatch<'a>],
+/// Build a ReadCursor from in-memory batches + shard Arcs.
+///
+/// Both inputs are passed by `Arc`, so the cursor owns its data and has no
+/// borrow lifetime — see the `CursorSource` doc comment.
+pub fn create_read_cursor(
+    batches: &[Arc<Batch>],
     shard_arcs: &[Arc<MappedShard>],
     schema: SchemaDescriptor,
-) -> ReadCursor<'a> {
-    let mut entries = Vec::with_capacity(batch_regions.len() + shard_arcs.len());
+) -> ReadCursor {
+    let mut entries = Vec::with_capacity(batches.len() + shard_arcs.len());
 
-    for batch in batch_regions {
+    for batch in batches {
         if batch.count > 0 {
-            // Clone the MemBatch (it's just slice references, cheap)
-            entries.push(ReadCursorEntry::new_batch(MemBatch {
-                pk_lo: batch.pk_lo,
-                pk_hi: batch.pk_hi,
-                weight: batch.weight,
-                null_bmp: batch.null_bmp,
-                col_data: batch.col_data.clone(),
-                blob: batch.blob,
-                count: batch.count,
-            }));
+            entries.push(ReadCursorEntry::new_batch(Arc::clone(batch)));
         }
     }
 
@@ -568,72 +550,49 @@ pub fn create_read_cursor<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// CursorHandle — wraps ReadCursor + optional owned snapshot data
+// CursorHandle — owning wrapper around ReadCursor
 // ---------------------------------------------------------------------------
 
-use super::batch::Batch;
-
-/// Owns the ReadCursor and, when created from snapshots, keeps the `Arc<Batch>`
-/// references alive so the cursor's borrowed `MemBatch` slices remain valid.
-///
-/// Field order matters: `cursor` is dropped before `_owned_snapshots`,
-/// ensuring the cursor's borrowed slices are invalidated before the backing
-/// data is freed.
-pub struct CursorHandle<'a> {
-    pub(crate) cursor: ReadCursor<'a>,
-    _owned_snapshots: Vec<Arc<Batch>>,
+/// Owns a `ReadCursor`.  Since the cursor now owns its data via `Arc`s in
+/// each `CursorSource`, this is a thin newtype — the separate "owned
+/// snapshots" vector that previously kept `Arc<Batch>` alive alongside
+/// transmuted-to-`'static` `MemBatch` views is gone.
+pub struct CursorHandle {
+    pub(crate) cursor: ReadCursor,
 }
 
-impl<'a> CursorHandle<'a> {
-    /// Wrap a cursor with no owned snapshot data.
-    pub fn from_cursor(cursor: ReadCursor<'a>) -> Self {
-        CursorHandle {
-            cursor,
-            _owned_snapshots: Vec::new(),
-        }
+impl CursorHandle {
+    /// Wrap a cursor.
+    pub fn from_cursor(cursor: ReadCursor) -> Self {
+        CursorHandle { cursor }
     }
 
     /// Build a CursorHandle from Rust-owned in-memory snapshots (no shards).
     pub fn from_owned(
         snapshots: &[Arc<Batch>],
         schema: crate::schema::SchemaDescriptor,
-    ) -> CursorHandle<'static> {
+    ) -> CursorHandle {
         create_cursor_from_snapshots(snapshots, &[], schema)
     }
 
     /// Mutable access to the inner ReadCursor.
-    pub(crate) fn cursor_mut(&mut self) -> &mut ReadCursor<'a> {
+    pub(crate) fn cursor_mut(&mut self) -> &mut ReadCursor {
         &mut self.cursor
     }
 }
 
 /// Build a CursorHandle from Rust-owned snapshots + shard Arcs.
 ///
-/// Each snapshot's `Arc<Batch>` is cloned into the handle to keep the
-/// data alive.  `MemBatch` views are created with transmuted `'static`
-/// lifetime — sound because the `Arc` clones in `_owned_snapshots` guarantee
-/// the data outlives the cursor (dropped after it).
-/// Each `Arc<MappedShard>` is cloned into `CursorSource::Shard`, keeping the
-/// mmap alive for the cursor's lifetime without raw pointer aliasing.
+/// Each snapshot's `Arc<Batch>` and shard's `Arc<MappedShard>` is cloned into
+/// the corresponding `CursorSource` entry, keeping the data alive for the
+/// cursor's entire lifetime without any unsafe lifetime extension.
 pub fn create_cursor_from_snapshots(
     snapshots: &[Arc<Batch>],
     shard_arcs: &[Arc<MappedShard>],
     schema: SchemaDescriptor,
-) -> CursorHandle<'static> {
-    // Build MemBatch views with 'static lifetime.
-    // Safety: we store Arc clones in the CursorHandle, keeping data alive.
-    let batches: Vec<MemBatch<'static>> = snapshots
-        .iter()
-        .filter(|s| s.count > 0)
-        .map(|s| unsafe { std::mem::transmute::<MemBatch<'_>, MemBatch<'static>>(s.as_mem_batch()) })
-        .collect();
-
-    let cursor = create_read_cursor(&batches, shard_arcs, schema);
-
-    CursorHandle {
-        cursor,
-        _owned_snapshots: snapshots.to_vec(),
-    }
+) -> CursorHandle {
+    let cursor = create_read_cursor(snapshots, shard_arcs, schema);
+    CursorHandle { cursor }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +603,6 @@ pub fn create_cursor_from_snapshots(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use super::super::merge::MemBatch;
 
     fn make_schema_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -672,35 +630,23 @@ mod tests {
         }
     }
 
-    fn make_batch<'a>(
-        rows: &[(u64, u64, i64, i64)],
-        pk_lo: &'a mut Vec<u8>,
-        pk_hi: &'a mut Vec<u8>,
-        weight: &'a mut Vec<u8>,
-        null_bmp: &'a mut Vec<u8>,
-        col0: &'a mut Vec<u8>,
-    ) -> MemBatch<'a> {
-        pk_lo.clear();
-        pk_hi.clear();
-        weight.clear();
-        null_bmp.clear();
-        col0.clear();
+    /// Build an `Arc<Batch>` with i64-payload rows.  Tests pre-sort their
+    /// inputs and have at most one row per (PK, payload), so we mark the
+    /// batch as sorted+consolidated.
+    fn make_batch(rows: &[(u64, u64, i64, i64)]) -> Arc<Batch> {
+        let schema = make_schema_i64();
+        let mut b = Batch::with_schema(schema, rows.len().max(1));
         for &(lo, hi, w, val) in rows {
-            pk_lo.extend_from_slice(&lo.to_le_bytes());
-            pk_hi.extend_from_slice(&hi.to_le_bytes());
-            weight.extend_from_slice(&w.to_le_bytes());
-            null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            col0.extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&lo.to_le_bytes());
+            b.extend_pk_hi(&hi.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
         }
-        MemBatch {
-            pk_lo: pk_lo.as_slice(),
-            pk_hi: pk_hi.as_slice(),
-            weight: weight.as_slice(),
-            null_bmp: null_bmp.as_slice(),
-            col_data: vec![col0.as_slice()],
-            blob: &[],
-            count: rows.len(),
-        }
+        b.sorted = true;
+        b.consolidated = true;
+        Arc::new(b)
     }
 
     fn scan_all(cursor: &mut ReadCursor) -> Vec<(u64, u64, i64)> {
@@ -727,19 +673,7 @@ mod tests {
     #[test]
     fn test_single_batch_scan() {
         let schema = make_schema_i64();
-        let mut pk_lo = Vec::new();
-        let mut pk_hi = Vec::new();
-        let mut w = Vec::new();
-        let mut n = Vec::new();
-        let mut c = Vec::new();
-        let batch = make_batch(
-            &[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)],
-            &mut pk_lo,
-            &mut pk_hi,
-            &mut w,
-            &mut n,
-            &mut c,
-        );
+        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
         let rows = scan_all(&mut cursor);
@@ -752,34 +686,8 @@ mod tests {
     #[test]
     fn test_two_batch_merge() {
         let schema = make_schema_i64();
-        let mut pk1 = Vec::new();
-        let mut hi1 = Vec::new();
-        let mut w1 = Vec::new();
-        let mut n1 = Vec::new();
-        let mut c1 = Vec::new();
-        let b1 = make_batch(
-            &[(1, 0, 1, 10), (3, 0, 1, 30)],
-            &mut pk1,
-            &mut hi1,
-            &mut w1,
-            &mut n1,
-            &mut c1,
-        );
-
-        let mut pk2 = Vec::new();
-        let mut hi2 = Vec::new();
-        let mut w2 = Vec::new();
-        let mut n2 = Vec::new();
-        let mut c2 = Vec::new();
-        let b2 = make_batch(
-            &[(2, 0, 1, 20), (4, 0, 1, 40)],
-            &mut pk2,
-            &mut hi2,
-            &mut w2,
-            &mut n2,
-            &mut c2,
-        );
-
+        let b1 = make_batch(&[(1, 0, 1, 10), (3, 0, 1, 30)]);
+        let b2 = make_batch(&[(2, 0, 1, 20), (4, 0, 1, 40)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -796,36 +704,10 @@ mod tests {
     #[test]
     fn test_ghost_elimination_across_sources() {
         let schema = make_schema_i64();
-        // Batch 1: pk=5 val=50 w=+1
-        let mut pk1 = Vec::new();
-        let mut hi1 = Vec::new();
-        let mut w1 = Vec::new();
-        let mut n1 = Vec::new();
-        let mut c1 = Vec::new();
-        let b1 = make_batch(
-            &[(5, 0, 1, 50), (10, 0, 1, 100)],
-            &mut pk1,
-            &mut hi1,
-            &mut w1,
-            &mut n1,
-            &mut c1,
-        );
-
+        // Batch 1: pk=5 val=50 w=+1, pk=10 val=100 w=+1
+        let b1 = make_batch(&[(5, 0, 1, 50), (10, 0, 1, 100)]);
         // Batch 2: pk=5 val=50 w=-1 (retraction)
-        let mut pk2 = Vec::new();
-        let mut hi2 = Vec::new();
-        let mut w2 = Vec::new();
-        let mut n2 = Vec::new();
-        let mut c2 = Vec::new();
-        let b2 = make_batch(
-            &[(5, 0, -1, 50)],
-            &mut pk2,
-            &mut hi2,
-            &mut w2,
-            &mut n2,
-            &mut c2,
-        );
-
+        let b2 = make_batch(&[(5, 0, -1, 50)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -840,19 +722,7 @@ mod tests {
     #[test]
     fn test_seek() {
         let schema = make_schema_i64();
-        let mut pk_lo = Vec::new();
-        let mut pk_hi = Vec::new();
-        let mut w = Vec::new();
-        let mut n = Vec::new();
-        let mut c = Vec::new();
-        let batch = make_batch(
-            &[(1, 0, 1, 10), (5, 0, 1, 50), (10, 0, 1, 100)],
-            &mut pk_lo,
-            &mut pk_hi,
-            &mut w,
-            &mut n,
-            &mut c,
-        );
+        let batch = make_batch(&[(1, 0, 1, 10), (5, 0, 1, 50), (10, 0, 1, 100)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -875,34 +745,8 @@ mod tests {
     fn test_same_pk_different_payload_ordering() {
         let schema = make_schema_i64();
         // Two entries with same PK but different payloads
-        let mut pk1 = Vec::new();
-        let mut hi1 = Vec::new();
-        let mut w1 = Vec::new();
-        let mut n1 = Vec::new();
-        let mut c1 = Vec::new();
-        let b1 = make_batch(
-            &[(5, 0, 1, 200)],
-            &mut pk1,
-            &mut hi1,
-            &mut w1,
-            &mut n1,
-            &mut c1,
-        );
-
-        let mut pk2 = Vec::new();
-        let mut hi2 = Vec::new();
-        let mut w2 = Vec::new();
-        let mut n2 = Vec::new();
-        let mut c2 = Vec::new();
-        let b2 = make_batch(
-            &[(5, 0, 1, 100)],
-            &mut pk2,
-            &mut hi2,
-            &mut w2,
-            &mut n2,
-            &mut c2,
-        );
-
+        let b1 = make_batch(&[(5, 0, 1, 200)]);
+        let b2 = make_batch(&[(5, 0, 1, 100)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -919,34 +763,8 @@ mod tests {
     fn test_weight_accumulation_across_sources() {
         let schema = make_schema_i64();
         // Same (PK, payload) in two batches: weights should sum
-        let mut pk1 = Vec::new();
-        let mut hi1 = Vec::new();
-        let mut w1 = Vec::new();
-        let mut n1 = Vec::new();
-        let mut c1 = Vec::new();
-        let b1 = make_batch(
-            &[(5, 0, 3, 50)],
-            &mut pk1,
-            &mut hi1,
-            &mut w1,
-            &mut n1,
-            &mut c1,
-        );
-
-        let mut pk2 = Vec::new();
-        let mut hi2 = Vec::new();
-        let mut w2 = Vec::new();
-        let mut n2 = Vec::new();
-        let mut c2 = Vec::new();
-        let b2 = make_batch(
-            &[(5, 0, 7, 50)],
-            &mut pk2,
-            &mut hi2,
-            &mut w2,
-            &mut n2,
-            &mut c2,
-        );
-
+        let b1 = make_batch(&[(5, 0, 3, 50)]);
+        let b2 = make_batch(&[(5, 0, 7, 50)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -960,15 +778,7 @@ mod tests {
     #[test]
     fn test_drain_single_source_full() {
         let schema = make_schema_i64();
-        let mut pk_lo = Vec::new();
-        let mut pk_hi = Vec::new();
-        let mut w = Vec::new();
-        let mut n = Vec::new();
-        let mut c = Vec::new();
-        let batch = make_batch(
-            &[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)],
-            &mut pk_lo, &mut pk_hi, &mut w, &mut n, &mut c,
-        );
+        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -984,15 +794,7 @@ mod tests {
     #[test]
     fn test_drain_single_source_with_limit() {
         let schema = make_schema_i64();
-        let mut pk_lo = Vec::new();
-        let mut pk_hi = Vec::new();
-        let mut w = Vec::new();
-        let mut n = Vec::new();
-        let mut c = Vec::new();
-        let batch = make_batch(
-            &[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30), (4, 0, 1, 40)],
-            &mut pk_lo, &mut pk_hi, &mut w, &mut n, &mut c,
-        );
+        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30), (4, 0, 1, 40)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -1014,24 +816,8 @@ mod tests {
     #[test]
     fn test_drain_multi_source_returns_none() {
         let schema = make_schema_i64();
-        let mut pk1 = Vec::new();
-        let mut hi1 = Vec::new();
-        let mut w1 = Vec::new();
-        let mut n1 = Vec::new();
-        let mut c1 = Vec::new();
-        let b1 = make_batch(
-            &[(1, 0, 1, 10)],
-            &mut pk1, &mut hi1, &mut w1, &mut n1, &mut c1,
-        );
-        let mut pk2 = Vec::new();
-        let mut hi2 = Vec::new();
-        let mut w2 = Vec::new();
-        let mut n2 = Vec::new();
-        let mut c2 = Vec::new();
-        let b2 = make_batch(
-            &[(2, 0, 1, 20)],
-            &mut pk2, &mut hi2, &mut w2, &mut n2, &mut c2,
-        );
+        let b1 = make_batch(&[(1, 0, 1, 10)]);
+        let b2 = make_batch(&[(2, 0, 1, 20)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),

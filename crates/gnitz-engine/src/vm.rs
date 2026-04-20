@@ -531,7 +531,7 @@ pub struct VmHandle {
     pub owned_trace_regs: Vec<(u16, usize)>,
     /// Cursor handles for owned trace registers, kept alive across the epoch.
     /// Indexed in parallel with `owned_trace_regs`.
-    owned_cursor_handles: Vec<Option<Box<CursorHandle<'static>>>>,
+    owned_cursor_handles: Vec<Option<Box<CursorHandle>>>,
 }
 
 impl VmHandle {
@@ -558,7 +558,7 @@ impl VmHandle {
             match table.create_cursor() {
                 Ok(ch) => {
                     let mut boxed = Box::new(ch);
-                    let ptr = &mut *boxed as *mut CursorHandle<'static>;
+                    let ptr = &mut *boxed as *mut CursorHandle;
                     self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
                     self.owned_cursor_handles[slot] = Some(boxed);
                 }
@@ -619,7 +619,7 @@ pub struct Register {
     /// Delta: current batch.  Trace: unused (empty).
     pub batch: Batch,
     /// Trace: current cursor.  Borrowed each epoch.  Delta: None.
-    pub cursor_ptr: *mut CursorHandle<'static>,
+    pub cursor_ptr: *mut CursorHandle,
 }
 
 /// Collection of registers for a single plan execution.
@@ -670,7 +670,7 @@ impl RegisterFile {
                 if is_owned {
                     // Cursor was set by refresh_owned_cursors; leave it alone.
                 } else if i < handles.len() && !handles[i].is_null() {
-                    reg.cursor_ptr = handles[i] as *mut CursorHandle<'static>;
+                    reg.cursor_ptr = handles[i] as *mut CursorHandle;
                 } else {
                     reg.cursor_ptr = std::ptr::null_mut();
                 }
@@ -944,7 +944,7 @@ pub fn execute_epoch(
 
                 gnitz_debug!("vm: INTEGRATE in_count={} target={} gi={} avi={}",
                     reg!(*in_reg).batch.count, target.is_some(), gi_desc.is_some(), avi_desc.is_some());
-                ops::op_integrate_with_indexes(
+                let _ = ops::op_integrate_with_indexes(
                     &reg!(*in_reg).batch, target, &schema,
                     gi_desc.as_ref(), avi_desc.as_ref(),
                 );
@@ -985,7 +985,7 @@ pub fn execute_epoch(
 
                 // AVI cursor — created fresh from the AVI table (not a register).
                 // Must be created AFTER INTEGRATE populates the AVI table.
-                let mut avi_cursor_handle: Option<Box<CursorHandle<'static>>> = if *avi_table_idx >= 0 {
+                let mut avi_cursor_handle: Option<Box<CursorHandle>> = if *avi_table_idx >= 0 {
                     let avi_ptr = program.tables[*avi_table_idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
                     avi_table.create_cursor().ok().map(|ch| Box::new(ch))
@@ -994,7 +994,7 @@ pub fn execute_epoch(
                 };
 
                 // GI cursor — created fresh from the GI table (not a register)
-                let mut gi_cursor_handle: Option<Box<CursorHandle<'static>>> = if *gi_table_idx >= 0 {
+                let mut gi_cursor_handle: Option<Box<CursorHandle>> = if *gi_table_idx >= 0 {
                     let gi_ptr = program.tables[*gi_table_idx as usize];
                     let gi_table = unsafe { &mut *gi_ptr };
                     gi_table.create_cursor().ok().map(|ch| Box::new(ch))

@@ -1043,7 +1043,6 @@ fn append_membatch_row_to_batch(
     row: usize,
     schema: &SchemaDescriptor,
 ) {
-    let pki = schema.pk_index as usize;
     let pk = mb.get_pk(row);
     output.extend_pk_lo(&(pk as u64).to_le_bytes());
     output.extend_pk_hi(&((pk >> 64) as u64).to_le_bytes());
@@ -1051,12 +1050,7 @@ fn append_membatch_row_to_batch(
     let null_word = mb.get_null_word(row);
     output.extend_null_bmp(&null_word.to_le_bytes());
 
-    let mut pi = 0;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pki {
-            continue;
-        }
-        let col = &schema.columns[ci];
+    for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
         let is_null = (null_word >> pi) & 1 != 0;
         if is_null {
@@ -1070,7 +1064,6 @@ fn append_membatch_row_to_batch(
             let src = mb.get_col_ptr(row, pi, cs);
             output.extend_col(pi, src);
         }
-        pi += 1;
     }
     output.count += 1;
 }
@@ -1241,8 +1234,8 @@ fn emit_gather_row(
     schema: &SchemaDescriptor,
     num_aggs: usize,
 ) {
-    let pki = schema.pk_index as usize;
     let num_cols = schema.num_columns as usize;
+    let agg_base = num_cols - num_aggs;
 
     output.extend_pk_lo(&group_key_lo.to_le_bytes());
     output.extend_pk_hi(&group_key_hi.to_le_bytes());
@@ -1250,16 +1243,10 @@ fn emit_gather_row(
 
     let mut null_word: u64 = 0;
     let in_null = input_mb.get_null_word(exemplar_row);
-    let mut out_pi = 0usize;
 
-    for ci in 0..num_cols {
-        if ci == pki {
-            continue;
-        }
-        let col = &schema.columns[ci];
+    for (out_pi, ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
 
-        let agg_base = num_cols - num_aggs;
         if ci >= agg_base {
             let agg_idx = ci - agg_base;
             let bits = if use_old_val {
@@ -1289,7 +1276,6 @@ fn emit_gather_row(
                 output.extend_col(out_pi, src);
             }
         }
-        out_pi += 1;
     }
 
     output.extend_null_bmp(&null_word.to_le_bytes());

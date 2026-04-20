@@ -991,17 +991,14 @@ fn copy_cursor_row_with_weight(
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
 
-        let pk_index = schema.pk_index as usize;
         let src_blob_ptr = cursor.cursor.blob_ptr();
-        let mut payload_idx = 0;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col_size = schema.columns[ci].size as usize;
+        for (payload_idx, ci, col) in schema.payload_columns() {
+            let col_size = col.size as usize;
             let ptr = cursor.cursor.col_ptr(ci, col_size);
             if !ptr.is_null() {
                 let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
                 // For out-of-line strings, rewrite blob offset to target batch.blob
-                if schema.columns[ci].type_code == type_code::STRING && col_size == 16 {
+                if col.type_code == type_code::STRING && col_size == 16 {
                     let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                     if len > crate::schema::SHORT_STRING_THRESHOLD && !src_blob_ptr.is_null() {
                         let src_offset = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
@@ -1021,7 +1018,6 @@ fn copy_cursor_row_with_weight(
             } else {
                 batch.fill_col_zero(payload_idx, col_size);
             }
-            payload_idx += 1;
         }
 
         batch.count += 1;
@@ -1049,14 +1045,7 @@ pub(super) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
 /// Returns true if any non-PK payload column has STRING type, meaning bulk
 /// copy would require out-of-line blob relocation and must fall back.
 fn schema_has_string_columns(schema: &SchemaDescriptor) -> bool {
-    let pk_index = schema.pk_index as usize;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index { continue; }
-        if schema.columns[ci].type_code == type_code::STRING {
-            return true;
-        }
-    }
-    false
+    schema.payload_columns().any(|(_pi, _ci, col)| col.type_code == type_code::STRING)
 }
 
 /// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
@@ -1084,7 +1073,7 @@ pub(super) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
             {
                 end += 1;
             }
-            batch.append_mem_batch_range(src, start, end, -1);
+            batch.append_mem_batch_range(&src, start, end, -1);
             return batch;
         }
     }
@@ -3135,7 +3124,7 @@ impl CatalogEngine {
 
     /// Create a cursor over sys_migrations (used by apply_migration
     /// to look up a parent commit's canonical bytes).
-    pub(crate) fn sys_migrations_cursor(&mut self) -> Result<CursorHandle<'_>, i32> {
+    pub(crate) fn sys_migrations_cursor(&mut self) -> Result<CursorHandle, crate::storage::StorageError> {
         self.sys_migrations.create_cursor()
     }
 

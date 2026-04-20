@@ -5,6 +5,7 @@ use std::fs;
 use std::sync::Arc;
 
 use super::compact;
+use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::manifest::{self, ManifestEntryRaw};
 use super::shard_reader::MappedShard;
@@ -16,10 +17,10 @@ const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
 
-fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, i32> {
+fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
     strings
         .iter()
-        .map(|f| CString::new(f.as_str()).map_err(|_| -1))
+        .map(|f| CString::new(f.as_str()).map_err(|_| StorageError::InvalidPath))
         .collect()
 }
 
@@ -38,8 +39,8 @@ impl ShardEntry {
         schema: &SchemaDescriptor,
         min_lsn: u64,
         max_lsn: u64,
-    ) -> Result<Self, i32> {
-        let cpath = CString::new(path).map_err(|_| -1)?;
+    ) -> Result<Self, StorageError> {
+        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
         let shard = Arc::new(MappedShard::open(&cpath, schema, false)?);
         // Empty shard: pk_min > pk_max so range checks always fail
         let (pk_min, pk_max) = if shard.count > 0 {
@@ -62,9 +63,8 @@ impl ShardEntry {
             if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
-            let row = self.shard.find_row_index(key);
-            if row >= 0 {
-                return Some((Arc::clone(&self.shard), row as usize));
+            if let Some(row) = self.shard.find_row_index(key) {
+                return Some((Arc::clone(&self.shard), row));
             }
         }
         None
@@ -192,7 +192,7 @@ impl ShardIndex {
         level_idx + 1
     }
 
-    pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), i32> {
+    pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, min_lsn, max_lsn)?;
         self.l0.push(entry);
         self.sort_l0();
@@ -281,27 +281,23 @@ impl ShardIndex {
         raw
     }
 
-    pub fn load_manifest(&mut self, path: &str) -> Result<(), i32> {
-        let cpath = CString::new(path).map_err(|_| -1)?;
-        let cap = manifest::entry_count(&cpath);
-        if cap < 0 {
-            if cap == manifest::MANIFEST_ERR_IO {
-                return Ok(());
-            }
-            return Err(cap);
-        }
-        let cap = (cap as usize).max(1);
+    pub fn load_manifest(&mut self, path: &str) -> Result<(), StorageError> {
+        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
+        // Missing manifest file ⇒ first-time table boot, treat as empty.
+        // Other read errors propagate.
+        let cap = match manifest::entry_count(&cpath)? {
+            Some(n) => n.max(1),
+            None => return Ok(()),
+        };
         let mut entries = vec![ManifestEntryRaw::zeroed(); cap];
         let mut global_lsn = 0u64;
-        let count = manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn);
-        if count < 0 {
-            if count == manifest::MANIFEST_ERR_IO {
-                return Ok(());
-            }
-            return Err(count);
-        }
+        let count = match manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn) {
+            Ok(n) => n,
+            Err(StorageError::Io) => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
-        for i in 0..count as usize {
+        for i in 0..count {
             let raw = &entries[i];
             if raw.table_id != self.table_id as u64 {
                 continue;
@@ -325,15 +321,11 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub fn publish_manifest(&self, path: &str) -> Result<(), i32> {
+    pub fn publish_manifest(&self, path: &str) -> Result<(), StorageError> {
         let entries = self.build_manifest_entries();
         let global_lsn = self.max_lsn();
-        let cpath = CString::new(path).map_err(|_| -1)?;
-        let rc = manifest::write_file(&cpath, &entries, global_lsn);
-        if rc != 0 {
-            return Err(rc);
-        }
-        Ok(())
+        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
+        manifest::write_file(&cpath, &entries, global_lsn)
     }
 
     fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {
@@ -355,7 +347,7 @@ impl ShardIndex {
     /// immediately without draining anything. This invariant is
     /// load-bearing for the schema-migration swap path, which rmtrees
     /// dropped-table directories right after the Phase-4 ACKs.
-    pub fn run_compact(&mut self) -> Result<(), i32> {
+    pub fn run_compact(&mut self) -> Result<(), StorageError> {
         if !self.needs_compaction {
             return Ok(());
         }
@@ -375,7 +367,7 @@ impl ShardIndex {
         let l0_cstrings = to_cstrings(&l0_filenames)?;
         let l0_cstrs: Vec<&CStr> = l0_cstrings.iter().map(|c| c.as_c_str()).collect();
 
-        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| -1)?;
+        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let result_cap = guard_keys.len().max(l0_filenames.len());
         let mut results: Vec<compact::GuardResult> =
             (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
@@ -389,13 +381,9 @@ impl ShardIndex {
             1,
             lsn_tag,
             &mut results,
-        );
+        )?;
 
-        if num_results < 0 {
-            return Err(num_results);
-        }
-
-        let guard_outputs: Vec<(u128, String)> = results[..num_results as usize]
+        let guard_outputs: Vec<(u128, String)> = results[..num_results]
             .iter()
             .map(|r| (r.guard_key, r.filename_str().to_string()))
             .collect();
@@ -441,7 +429,7 @@ impl ShardIndex {
         &mut self,
         guard_outputs: &[(u128, String)],
         max_lsn: u64,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         self.ensure_level(1);
         let schema_copy = self.schema;
 
@@ -466,7 +454,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    fn compact_guards_if_needed(&mut self) -> Result<(), i32> {
+    fn compact_guards_if_needed(&mut self) -> Result<(), StorageError> {
         for li in 0..self.levels.len() {
             let threshold = if Self::level_num(li) == MAX_LEVELS - 1 {
                 LMAX_FILE_THRESHOLD
@@ -484,7 +472,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    fn compact_one_guard(&mut self, level_idx: usize, guard_idx: usize) -> Result<(), i32> {
+    fn compact_one_guard(&mut self, level_idx: usize, guard_idx: usize) -> Result<(), StorageError> {
         self.compact_seq += 1;
         let guard = &self.levels[level_idx].guards[guard_idx];
 
@@ -502,12 +490,11 @@ impl ShardIndex {
             guard.entries.iter().map(|e| e.filename.clone()).collect();
         let input_cstrings = to_cstrings(&input_filenames)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_cstr = CString::new(out_path.as_str()).map_err(|_| -1)?;
+        let out_cstr = CString::new(out_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
 
-        let rc = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id);
-        if rc != 0 {
+        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id) {
             let _ = fs::remove_file(&out_path);
-            return Err(rc);
+            return Err(e);
         }
 
         let new_entry = ShardEntry::open(&out_path, &self.schema, 0, guard_max_lsn)?;
@@ -519,7 +506,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    fn compact_guard_vertical(&mut self, src_level_num: usize) -> Result<(), i32> {
+    fn compact_guard_vertical(&mut self, src_level_num: usize) -> Result<(), StorageError> {
         if src_level_num < 1 || src_level_num >= MAX_LEVELS {
             return Ok(());
         }
@@ -604,7 +591,7 @@ impl ShardIndex {
 
         let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| -1)?;
+        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let result_cap = guard_keys.len().max(1);
         let mut results: Vec<compact::GuardResult> =
             (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
@@ -618,13 +605,9 @@ impl ShardIndex {
             src_level_num as u32 + 1,
             lsn_tag,
             &mut results,
-        );
+        )?;
 
-        if num_results < 0 {
-            return Err(num_results);
-        }
-
-        let guard_outputs: Vec<(u128, String)> = results[..num_results as usize]
+        let guard_outputs: Vec<(u128, String)> = results[..num_results]
             .iter()
             .map(|r| (r.guard_key, r.filename_str().to_string()))
             .collect();
@@ -733,8 +716,7 @@ mod tests {
         let image = shard_file::build_shard_image(42, n as u32, &regions);
         let path = dir.join(name);
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let rc = shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false);
-        assert_eq!(rc, 0);
+        shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
         path.to_str().unwrap().to_string()
     }
 

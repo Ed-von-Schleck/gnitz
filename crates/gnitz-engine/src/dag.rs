@@ -981,16 +981,22 @@ impl DagEngine {
         (0, Some(effective_batch))
     }
 
-    /// Flush a table's WAL.
+    /// Flush a table's WAL.  Returns 0 on success, -1 on missing table or
+    /// any underlying storage error (the i32 is what the caller — vm/worker —
+    /// already pattern-matches against, so we keep the legacy signature here).
     pub fn flush(&mut self, table_id: i64) -> i32 {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return -1,
         };
-        match &mut entry.handle {
-            StoreHandle::Single(t) => match t.flush() { Ok(_) => 0, Err(e) => e },
-            StoreHandle::Borrowed(ptr) => match unsafe { &mut **ptr }.flush() { Ok(_) => 0, Err(e) => e },
-            StoreHandle::Partitioned(pt) => match pt.flush() { Ok(_) => 0, Err(e) => e },
+        let result = match &mut entry.handle {
+            StoreHandle::Single(t) => t.flush().map(|_| ()),
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush().map(|_| ()),
+            StoreHandle::Partitioned(pt) => pt.flush().map(|_| ()),
+        };
+        match result {
+            Ok(()) => 0,
+            Err(_) => -1,
         }
     }
 
@@ -1323,9 +1329,9 @@ impl DagEngine {
         &self,
         ext_trace_regs: &[(u16, i64)],
         num_regs: usize,
-    ) -> (Vec<*mut libc::c_void>, Vec<Box<CursorHandle<'static>>>) {
+    ) -> (Vec<*mut libc::c_void>, Vec<Box<CursorHandle>>) {
         let mut ptrs: Vec<*mut libc::c_void> = vec![std::ptr::null_mut(); num_regs];
-        let mut storage: Vec<Box<CursorHandle<'static>>> = Vec::new();
+        let mut storage: Vec<Box<CursorHandle>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
             if let Some(entry) = self.tables.get(&table_id) {
                 let tbl_ptr = entry.handle.table_ptr();

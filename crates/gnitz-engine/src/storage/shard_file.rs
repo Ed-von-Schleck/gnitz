@@ -10,6 +10,7 @@ use libc::c_int;
 
 use crate::layout::*;
 use crate::util::write_u64_le;
+use super::error::StorageError;
 use super::xor8;
 use crate::xxh;
 
@@ -253,7 +254,7 @@ pub fn build_shard_image(
 }
 
 /// pwrite loop that handles short writes and EINTR.
-unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> i32 {
+unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(), StorageError> {
     let mut remaining = buf.len();
     let mut p = buf.as_ptr();
     while remaining > 0 {
@@ -263,16 +264,16 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> i32 {
             if e == libc::EINTR {
                 continue;
             }
-            return -3;
+            return Err(StorageError::Io);
         }
         if written == 0 {
-            return -3;
+            return Err(StorageError::Io);
         }
         remaining -= written as usize;
         p = p.add(written as usize);
         offset += written as libc::off_t;
     }
-    0
+    Ok(())
 }
 
 /// Write a shard directly to disk without building an intermediate Vec<u8>.
@@ -286,7 +287,7 @@ pub fn write_shard_streaming(
     row_count: u32,
     regions: &[(*const u8, usize)],
     durable: bool,
-) -> i32 {
+) -> Result<(), StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
@@ -429,21 +430,22 @@ pub fn write_shard_streaming(
             0o644,
         );
         if fd < 0 {
-            return -3;
+            return Err(StorageError::Io);
         }
 
-        if libc::ftruncate(fd, total_size as libc::off_t) < 0 {
+        // Helper: on any post-open failure, unlink the .tmp file and bubble Io.
+        let abort = |fd: c_int| -> StorageError {
             libc::close(fd);
             libc::unlinkat(dirfd, tmp_name, 0);
-            return -3;
+            StorageError::Io
+        };
+
+        if libc::ftruncate(fd, total_size as libc::off_t) < 0 {
+            return Err(abort(fd));
         }
 
         // Phase 6: write header + directory
-        if pwrite_all(fd, &hdr_buf, 0) < 0 {
-            libc::close(fd);
-            libc::unlinkat(dirfd, tmp_name, 0);
-            return -3;
-        }
+        pwrite_all(fd, &hdr_buf, 0).map_err(|_| abort(fd))?;
 
         // Phase 7: write each region
         for i in 0..num_regions {
@@ -454,51 +456,33 @@ pub fn write_shard_streaming(
                 RegionEncoding::Raw => {
                     if actual_sizes[i] > 0 && !src_ptr.is_null() {
                         let src = std::slice::from_raw_parts(src_ptr, orig_sz);
-                        if pwrite_all(fd, src, r_off) < 0 {
-                            libc::close(fd);
-                            libc::unlinkat(dirfd, tmp_name, 0);
-                            return -3;
-                        }
+                        pwrite_all(fd, src, r_off).map_err(|_| abort(fd))?;
                     }
                 }
                 RegionEncoding::Constant { .. } => {
                     let elem_width = actual_sizes[i];
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
-                    if pwrite_all(fd, src, r_off) < 0 {
-                        libc::close(fd);
-                        libc::unlinkat(dirfd, tmp_name, 0);
-                        return -3;
-                    }
+                    pwrite_all(fd, src, r_off).map_err(|_| abort(fd))?;
                 }
                 RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
                     let mut tmp = Vec::with_capacity(16 + bitvec.len());
                     tmp.extend_from_slice(&value_a.to_le_bytes());
                     tmp.extend_from_slice(&value_b.to_le_bytes());
                     tmp.extend_from_slice(bitvec);
-                    if pwrite_all(fd, &tmp, r_off) < 0 {
-                        libc::close(fd);
-                        libc::unlinkat(dirfd, tmp_name, 0);
-                        return -3;
-                    }
+                    pwrite_all(fd, &tmp, r_off).map_err(|_| abort(fd))?;
                 }
             }
         }
 
         // Phase 8: write XOR8 filter
         if let Some(ref data) = xor8_data {
-            if pwrite_all(fd, data, xor8_offset as libc::off_t) < 0 {
-                libc::close(fd);
-                libc::unlinkat(dirfd, tmp_name, 0);
-                return -3;
-            }
+            pwrite_all(fd, data, xor8_offset as libc::off_t).map_err(|_| abort(fd))?;
         }
 
         // Phase 9: sync and rename
         if durable {
             if libc::fdatasync(fd) < 0 {
-                libc::close(fd);
-                libc::unlinkat(dirfd, tmp_name, 0);
-                return -3;
+                return Err(abort(fd));
             }
         }
 
@@ -506,20 +490,18 @@ pub fn write_shard_streaming(
 
         if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
             libc::unlinkat(dirfd, tmp_name, 0);
-            return -3;
+            return Err(StorageError::Io);
         }
     }
 
-    0
+    Ok(())
 }
 
 /// Write `image` atomically using openat/fdatasync/renameat.
 ///
 /// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
 /// for absolute paths.
-///
-/// Returns 0 on success, -3 on I/O error.
-pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> i32 {
+pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> Result<(), StorageError> {
     let base_bytes = basename.to_bytes();
     let mut tmp_buf = Vec::with_capacity(base_bytes.len() + 5);
     tmp_buf.extend_from_slice(base_bytes);
@@ -534,33 +516,32 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             0o644,
         );
         if fd < 0 {
-            return -3;
+            return Err(StorageError::Io);
         }
 
-        let rc = crate::util::write_all_fd(fd, image);
-        if rc < 0 {
+        let abort = |fd: c_int| -> StorageError {
             libc::close(fd);
             libc::unlinkat(dirfd, tmp_name, 0);
-            return -3;
+            StorageError::Io
+        };
+
+        if crate::util::write_all_fd(fd, image) < 0 {
+            return Err(abort(fd));
         }
 
-        if durable {
-            if libc::fdatasync(fd) < 0 {
-                libc::close(fd);
-                libc::unlinkat(dirfd, tmp_name, 0);
-                return -3;
-            }
+        if durable && libc::fdatasync(fd) < 0 {
+            return Err(abort(fd));
         }
 
         libc::close(fd);
 
         if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
             libc::unlinkat(dirfd, tmp_name, 0);
-            return -3;
+            return Err(StorageError::Io);
         }
     }
 
-    0
+    Ok(())
 }
 
 #[cfg(test)]
@@ -673,8 +654,7 @@ mod tests {
         ];
 
         let image = build_shard_image(7, row_count, &regions);
-        let rc = write_shard_at(libc::AT_FDCWD, &path_cstr, &image, true);
-        assert_eq!(rc, 0);
+        write_shard_at(libc::AT_FDCWD, &path_cstr, &image, true).unwrap();
         assert!(shard_path.exists());
 
         let schema = make_schema_desc(2, 0);
@@ -704,8 +684,7 @@ mod tests {
         ];
 
         let image = build_shard_image(1, 0, &regions);
-        let rc = write_shard_at(libc::AT_FDCWD, &cpath, &image, false);
-        assert_eq!(rc, 0);
+        write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
 
         let schema = make_schema_desc(1, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -737,10 +716,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let rc = write_shard_streaming(
+        write_shard_streaming(
             libc::AT_FDCWD, &cpath, 42, row_count, &regions, true,
-        );
-        assert_eq!(rc, 0);
+        ).unwrap();
 
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -781,10 +759,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let rc = write_shard_streaming(
+        write_shard_streaming(
             libc::AT_FDCWD, &cpath, 7, row_count, &regions, true,
-        );
-        assert_eq!(rc, 0);
+        ).unwrap();
 
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();

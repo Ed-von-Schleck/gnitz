@@ -43,6 +43,25 @@ impl SchemaDescriptor {
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
     }
+
+    /// Iterate over the non-PK ("payload") columns.
+    ///
+    /// Yields `(payload_idx, col_idx, &SchemaColumn)` where:
+    /// - `payload_idx` is the dense 0-based index used for batch payload
+    ///   regions and null-bitmap bits;
+    /// - `col_idx` is the original logical column index in `self.columns`.
+    ///
+    /// Replaces the manual `for ci in 0..n { if ci == pk { continue; } ... pi += 1 }`
+    /// pattern; keeps `pi` and `ci` in lockstep so they cannot desync.
+    #[inline]
+    pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
+        let pk = self.pk_index as usize;
+        let n = self.num_columns as usize;
+        (0..n)
+            .filter(move |ci| *ci != pk)
+            .enumerate()
+            .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
+    }
 }
 
 pub(crate) const fn type_size(tc: u8) -> u8 {

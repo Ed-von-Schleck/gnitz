@@ -1,6 +1,7 @@
 use std::mem;
 
 use crate::util::{read_u64_le, write_u64_le};
+use super::error::StorageError;
 
 // ---------------------------------------------------------------------------
 // Manifest file format
@@ -77,20 +78,17 @@ impl ManifestEntryRaw {
     }
 }
 
-pub const MANIFEST_ERR_MAGIC: i32 = -1;
-pub const MANIFEST_ERR_TRUNCATED: i32 = -2;
-
 /// Serialize manifest entries into `out_buf`.
-/// Returns bytes written, or -1 if buffer too small.
+/// Returns bytes written, or `BufferTooSmall` if `out_buf` cannot fit.
 pub fn serialize(
     out_buf: &mut [u8],
     entries: &[ManifestEntryRaw],
     global_max_lsn: u64,
-) -> i64 {
+) -> Result<usize, StorageError> {
     let count = entries.len();
     let total = HEADER_SIZE + count * ENTRY_SIZE_V3;
     if out_buf.len() < total {
-        return -1;
+        return Err(StorageError::BufferTooSmall);
     }
 
     // Zero header
@@ -119,24 +117,24 @@ pub fn serialize(
         write_u64_le(out_buf, off + 200, e.guard_key_hi);
     }
 
-    total as i64
+    Ok(total)
 }
 
-/// Parse a manifest buffer. Returns entry count on success, negative on error.
+/// Parse a manifest buffer. Returns entry count on success.
 /// Supports V2 (184-byte entries, level/guard default to 0) and V3 (208 bytes).
 pub fn parse(
     buf: &[u8],
     out_entries: &mut [ManifestEntryRaw],
     max_entries: u32,
     out_global_max_lsn: &mut u64,
-) -> i32 {
+) -> Result<usize, StorageError> {
     if buf.len() < HEADER_SIZE {
-        return MANIFEST_ERR_TRUNCATED;
+        return Err(StorageError::Truncated);
     }
 
     let magic = read_u64_le(buf, 0);
     if magic != MAGIC {
-        return MANIFEST_ERR_MAGIC;
+        return Err(StorageError::InvalidMagic);
     }
 
     let version = read_u64_le(buf, 8);
@@ -148,12 +146,12 @@ pub fn parse(
     } else if version >= VERSION_V2 {
         ENTRY_SIZE_V2
     } else {
-        return MANIFEST_ERR_MAGIC; // unsupported version
+        return Err(StorageError::InvalidVersion);
     };
 
     let expected_data = HEADER_SIZE + count * entry_size;
     if buf.len() < expected_data {
-        return MANIFEST_ERR_TRUNCATED;
+        return Err(StorageError::Truncated);
     }
 
     let n = count.min(max_entries as usize);
@@ -186,7 +184,7 @@ pub fn parse(
         out_entries[i] = entry;
     }
 
-    n as i32
+    Ok(n)
 }
 
 /// Returns the buffer size needed to serialize `count` entries.
@@ -200,32 +198,29 @@ pub const fn serialized_size(count: usize) -> usize {
 
 /// Read a manifest file from disk, parse it, write entries into `out_entries`.
 ///
-/// Returns entry count on success (>= 0), negative on error:
-///   -1 = bad magic (corrupt)
-///   -2 = truncated (corrupt)
-///   -3 = I/O error
+/// Returns entry count on success.
 pub fn read_file(
     path: &std::ffi::CStr,
     out_entries: &mut [ManifestEntryRaw],
     max_entries: u32,
     out_global_max_lsn: &mut u64,
-) -> i32 {
+) -> Result<usize, StorageError> {
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
         if fd < 0 {
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
 
         let mut st: libc::stat = std::mem::zeroed();
         if libc::fstat(fd, &mut st) < 0 {
             libc::close(fd);
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
         let file_size = st.st_size as usize;
 
         if file_size < HEADER_SIZE {
             libc::close(fd);
-            return MANIFEST_ERR_TRUNCATED;
+            return Err(StorageError::Truncated);
         }
 
         let mut buf = vec![0u8; file_size];
@@ -233,7 +228,7 @@ pub fn read_file(
         libc::close(fd);
 
         if bytes_read < 0 || (bytes_read as usize) < file_size {
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
 
         parse(&buf, out_entries, max_entries, out_global_max_lsn)
@@ -241,23 +236,16 @@ pub fn read_file(
 }
 
 /// Serialize entries and write atomically (write .tmp, fdatasync, rename).
-///
-/// Returns 0 on success, negative on error:
-///   -1 = serialize error
-///   -3 = I/O error
 pub fn write_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
     global_max_lsn: u64,
-) -> i32 {
+) -> Result<(), StorageError> {
     let count = entries.len();
     let total = serialized_size(count);
 
     let mut buf = vec![0u8; total];
-    let written = serialize(&mut buf, entries, global_max_lsn);
-    if written < 0 {
-        return -1;
-    }
+    let written = serialize(&mut buf, entries, global_max_lsn)?;
 
     let path_bytes = path.to_bytes();
     let mut tmp_path = Vec::with_capacity(path_bytes.len() + 5);
@@ -272,55 +260,55 @@ pub fn write_file(
             0o644 as libc::mode_t,
         );
         if fd < 0 {
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
 
-        let rc = crate::util::write_all_fd(fd, &buf[..written as usize]);
+        let rc = crate::util::write_all_fd(fd, &buf[..written]);
         if rc < 0 {
             libc::close(fd);
             libc::unlink(tmp_cstr);
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
 
         if libc::fdatasync(fd) < 0 {
             libc::close(fd);
             libc::unlink(tmp_cstr);
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
 
         libc::close(fd);
 
         if libc::rename(tmp_cstr, path.as_ptr()) < 0 {
             libc::unlink(tmp_cstr);
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Io);
         }
     }
 
-    0
+    Ok(())
 }
 
-pub const MANIFEST_ERR_IO: i32 = -3;
-
 /// Read just the entry count from a manifest file header.
-/// Returns the count (>= 0) on success, or MANIFEST_ERR_IO if the file
-/// cannot be opened (e.g. does not exist).
-pub fn entry_count(path: &std::ffi::CStr) -> i32 {
+///
+/// Returns `Ok(None)` when the file cannot be opened (does not exist yet —
+/// load_manifest treats this as the empty manifest), `Ok(Some(n))` when the
+/// header parses, or `Err(_)` on any other failure.
+pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError> {
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
         if fd < 0 {
-            return MANIFEST_ERR_IO;
+            return Ok(None);
         }
         let mut hdr = [0u8; HEADER_SIZE];
         let n = crate::util::read_all_fd(fd, &mut hdr);
         libc::close(fd);
         if n < HEADER_SIZE as i64 {
-            return MANIFEST_ERR_IO;
+            return Err(StorageError::Truncated);
         }
         let magic = read_u64_le(&hdr, 0);
         if magic != MAGIC {
-            return MANIFEST_ERR_MAGIC;
+            return Err(StorageError::InvalidMagic);
         }
-        read_u64_le(&hdr, 16) as i32
+        Ok(Some(read_u64_le(&hdr, 16) as usize))
     }
 }
 
@@ -358,12 +346,12 @@ mod tests {
         ];
         let mut buf = vec![0u8; serialized_size(3)];
 
-        let written = serialize(&mut buf, &entries, 999);
-        assert_eq!(written as usize, buf.len());
+        let written = serialize(&mut buf, &entries, 999).unwrap();
+        assert_eq!(written, buf.len());
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 3];
         let mut lsn = 0u64;
-        let count = parse(&buf, &mut out, 3, &mut lsn);
+        let count = parse(&buf, &mut out, 3, &mut lsn).unwrap();
         assert_eq!(count, 3);
         assert_eq!(lsn, 999);
 
@@ -404,7 +392,7 @@ mod tests {
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        let count = parse(&buf, &mut out, 1, &mut lsn);
+        let count = parse(&buf, &mut out, 1, &mut lsn).unwrap();
         assert_eq!(count, 1);
         assert_eq!(lsn, 50);
         assert_eq!(out[0].table_id, 7);
@@ -419,14 +407,14 @@ mod tests {
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), MANIFEST_ERR_MAGIC);
+        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::InvalidMagic));
     }
 
     #[test]
     fn truncated() {
         assert_eq!(
             parse(&[0u8; 10], &mut [], 0, &mut 0u64),
-            MANIFEST_ERR_TRUNCATED
+            Err(StorageError::Truncated),
         );
     }
 
@@ -434,17 +422,17 @@ mod tests {
     fn buffer_too_small() {
         let entries = vec![make_entry(1, "test.db")];
         let mut buf = vec![0u8; 64]; // too small for header + entry
-        assert_eq!(serialize(&mut buf, &entries, 0), -1);
+        assert_eq!(serialize(&mut buf, &entries, 0), Err(StorageError::BufferTooSmall));
     }
 
     #[test]
     fn empty_manifest() {
         let mut buf = vec![0u8; HEADER_SIZE];
-        let written = serialize(&mut buf, &[], 42);
-        assert_eq!(written, HEADER_SIZE as i64);
+        let written = serialize(&mut buf, &[], 42).unwrap();
+        assert_eq!(written, HEADER_SIZE);
 
         let mut lsn = 0u64;
-        let count = parse(&buf, &mut [], 0, &mut lsn);
+        let count = parse(&buf, &mut [], 0, &mut lsn).unwrap();
         assert_eq!(count, 0);
         assert_eq!(lsn, 42);
     }
@@ -453,11 +441,11 @@ mod tests {
     fn filename_null_terminated() {
         let e = make_entry(1, "hello.db");
         let mut buf = vec![0u8; serialized_size(1)];
-        serialize(&mut buf, &[e], 0);
+        serialize(&mut buf, &[e], 0).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        parse(&buf, &mut out, 1, &mut lsn);
+        parse(&buf, &mut out, 1, &mut lsn).unwrap();
 
         // Extract filename
         let end = out[0].filename.iter().position(|&b| b == 0).unwrap_or(128);
@@ -479,13 +467,12 @@ mod tests {
             make_entry(3, "shard_3.db"),
         ];
 
-        let rc = write_file(&cpath, &entries, 99);
-        assert_eq!(rc, 0);
+        write_file(&cpath, &entries, 99).unwrap();
         assert!(path.exists());
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 8];
         let mut lsn = 0u64;
-        let count = read_file(&cpath, &mut out, 8, &mut lsn);
+        let count = read_file(&cpath, &mut out, 8, &mut lsn).unwrap();
         assert_eq!(count, 3);
         assert_eq!(lsn, 99);
         assert_eq!(out[0].table_id, 1);
@@ -504,7 +491,7 @@ mod tests {
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
         let rc = read_file(&cpath, &mut out, 1, &mut lsn);
-        assert_eq!(rc, MANIFEST_ERR_IO);
+        assert_eq!(rc, Err(StorageError::Io));
     }
 
     #[test]
@@ -513,12 +500,11 @@ mod tests {
         let path = dir.path().join("MANIFEST_EMPTY");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let rc = write_file(&cpath, &[], 42);
-        assert_eq!(rc, 0);
+        write_file(&cpath, &[], 42).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        let count = read_file(&cpath, &mut out, 1, &mut lsn);
+        let count = read_file(&cpath, &mut out, 1, &mut lsn).unwrap();
         assert_eq!(count, 0);
         assert_eq!(lsn, 42);
     }

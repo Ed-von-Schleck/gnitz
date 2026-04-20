@@ -13,28 +13,68 @@ use crate::sys;
 use crate::layout::*;
 use crate::util::{read_u64_le, read_i64_le};
 use crate::xxh;
+use super::error::StorageError;
 use super::xor8;
 
-/// RAII guard for mmap'd memory.  Calls `munmap` on drop unless disarmed.
-struct MmapGuard {
+/// RAII handle for an mmap'd file region.
+///
+/// Owning the mapping in a single `Drop`-bearing struct means the unmap path
+/// lives in exactly one place — neither `MappedShard::open`'s error returns
+/// nor `MappedShard::Drop` need to repeat the `munmap` call.
+struct Mmap {
     ptr: *mut u8,
     len: usize,
 }
 
-impl MmapGuard {
-    fn disarm(mut self) -> *mut u8 {
-        let p = self.ptr;
-        self.ptr = ptr::null_mut();
-        p
+impl Mmap {
+    /// Open `path` read-only, mmap the whole file, and apply huge-page +
+    /// sequential madvise hints.  Returns `Truncated` for a file shorter than
+    /// `HEADER_SIZE` (the minimum a shard header occupies).
+    fn open(path: &CStr) -> Result<Self, StorageError> {
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            return Err(StorageError::Io);
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            unsafe { libc::close(fd); }
+            return Err(StorageError::Io);
+        }
+        let len = st.st_size as usize;
+        if len < HEADER_SIZE {
+            unsafe { libc::close(fd); }
+            return Err(StorageError::Truncated);
+        }
+        let raw = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        unsafe { libc::close(fd); }
+        if raw == libc::MAP_FAILED {
+            return Err(StorageError::Io);
+        }
+        let ptr = raw as *mut u8;
+        sys::madvise_hugepage(ptr, len);
+        sys::madvise_sequential(ptr, len);
+        Ok(Mmap { ptr, len })
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-impl Drop for MmapGuard {
+impl Drop for Mmap {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.len);
-            }
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
     }
 }
@@ -54,8 +94,10 @@ pub(crate) enum RegionView {
 }
 
 pub struct MappedShard {
-    pub(crate) mmap_ptr: *mut u8,
-    pub(crate) mmap_len: usize,
+    /// Owning RAII handle for the mmap.  Dropped last, so `as_slice()` /
+    /// raw pointers derived from it remain valid for the entire lifetime
+    /// of the `MappedShard`.
+    mmap: Mmap,
     pub(crate) count: usize,
     pub(crate) pk_lo: RegionView,
     pub(crate) pk_hi: RegionView,
@@ -80,51 +122,19 @@ impl MappedShard {
         path: &CStr,
         schema: &crate::schema::SchemaDescriptor,
         validate_checksums: bool,
-    ) -> Result<Self, i32> {
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
-        if fd < 0 {
-            return Err(-1);
-        }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } < 0 {
-            unsafe { libc::close(fd); }
-            return Err(-1);
-        }
-        let file_size = st.st_size as usize;
-        if file_size < HEADER_SIZE {
-            unsafe { libc::close(fd); }
-            return Err(-2);
-        }
-
-        let mmap_ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                file_size,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        unsafe { libc::close(fd); }
-        if mmap_ptr == libc::MAP_FAILED {
-            return Err(-1);
-        }
-        sys::madvise_hugepage(mmap_ptr as *mut u8, file_size);
-        sys::madvise_sequential(mmap_ptr as *mut u8, file_size);
-
-        let guard = MmapGuard {
-            ptr: mmap_ptr as *mut u8,
-            len: file_size,
-        };
-        let data = unsafe { std::slice::from_raw_parts(guard.ptr, file_size) };
+    ) -> Result<Self, StorageError> {
+        // `Mmap`'s Drop unmaps the file on any early `?` return below — no
+        // manual cleanup needed in the validation path.
+        let mmap = Mmap::open(path)?;
+        let file_size = mmap.len;
+        let data = mmap.as_slice();
 
         if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
-            return Err(-2);
+            return Err(StorageError::InvalidMagic);
         }
         let version = read_u64_le(data, OFF_VERSION);
         if version != SHARD_VERSION && version != SHARD_VERSION_V3 {
-            return Err(-2);
+            return Err(StorageError::InvalidVersion);
         }
         let dir_entry_size = if version >= 4 { DIR_ENTRY_SIZE } else { DIR_ENTRY_SIZE_V3 };
 
@@ -148,7 +158,7 @@ impl MappedShard {
         for i in 0..num_regions {
             let entry_off = dir_off + i * dir_entry_size;
             if entry_off + dir_entry_size > file_size {
-                return Err(-2);
+                return Err(StorageError::InvalidShard);
             }
             let r_off = read_u64_le(data, entry_off) as usize;
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
@@ -159,12 +169,12 @@ impl MappedShard {
                 // Validate reserved bytes [25..32] are all zero
                 for b in &data[entry_off + 25..entry_off + 32] {
                     if *b != 0 {
-                        return Err(-2);
+                        return Err(StorageError::InvalidShard);
                     }
                 }
                 // Validate known encoding
                 if enc != ENCODING_RAW && enc != ENCODING_CONSTANT && enc != ENCODING_TWO_VALUE {
-                    return Err(-2);
+                    return Err(StorageError::InvalidShard);
                 }
                 enc
             } else {
@@ -172,7 +182,7 @@ impl MappedShard {
             };
 
             if r_off.saturating_add(r_sz) > file_size {
-                return Err(-2);
+                return Err(StorageError::InvalidShard);
             }
             entries.push(DirEntry { offset: r_off, size: r_sz, checksum: r_cs, encoding });
         }
@@ -181,7 +191,7 @@ impl MappedShard {
         if validate_checksums {
             for e in &entries {
                 if e.size > 0 && xxh::checksum(&data[e.offset..e.offset + e.size]) != e.checksum {
-                    return Err(-3);
+                    return Err(StorageError::ChecksumMismatch);
                 }
             }
         }
@@ -248,10 +258,8 @@ impl MappedShard {
             None
         };
 
-        let mmap_ptr = guard.disarm();
         Ok(MappedShard {
-            mmap_ptr,
-            mmap_len: file_size,
+            mmap,
             count,
             pk_lo,
             pk_hi,
@@ -268,7 +276,7 @@ impl MappedShard {
 
     #[inline]
     pub(crate) fn data(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len) }
+        self.mmap.as_slice()
     }
 
     #[inline]
@@ -342,18 +350,19 @@ impl MappedShard {
             return ptr::null();
         }
         let payload_idx = self.col_to_payload[col_idx];
+        let base = self.mmap.ptr;
         if payload_idx == usize::MAX {
             // PK column
             match &self.pk_lo {
                 RegionView::Raw { offset, .. } => {
                     let off = offset + row * 8;
-                    if off + 8 > self.mmap_len {
+                    if off + 8 > self.mmap.len {
                         return ptr::null();
                     }
-                    return unsafe { self.mmap_ptr.add(off) };
+                    return unsafe { base.add(off) };
                 }
                 RegionView::Constant { offset, .. } => {
-                    return unsafe { self.mmap_ptr.add(*offset) };
+                    return unsafe { base.add(*offset) };
                 }
                 RegionView::TwoValue { .. } => unreachable!(),
             }
@@ -367,10 +376,10 @@ impl MappedShard {
                 if off + col_size > offset + size {
                     return ptr::null();
                 }
-                unsafe { self.mmap_ptr.add(off) }
+                unsafe { base.add(off) }
             }
             RegionView::Constant { offset, .. } => {
-                unsafe { self.mmap_ptr.add(*offset) }
+                unsafe { base.add(*offset) }
             }
             RegionView::TwoValue { .. } => unreachable!(),
         }
@@ -383,7 +392,7 @@ impl MappedShard {
 
     #[inline]
     pub fn blob_ptr(&self) -> *const u8 {
-        unsafe { self.mmap_ptr.add(self.blob_off) }
+        unsafe { self.mmap.ptr.add(self.blob_off) }
     }
 
     #[inline]
@@ -418,13 +427,15 @@ impl MappedShard {
         lo
     }
 
-    /// Binary search for an exact PK match. Returns row index or -1.
-    pub fn find_row_index(&self, key: u128) -> i32 {
+    /// Binary search for an exact PK match. Returns the row index, or `None`
+    /// if `key` is not present.
+    pub fn find_row_index(&self, key: u128) -> Option<usize> {
         let idx = self.find_lower_bound(key);
         if idx < self.count && self.get_pk(idx) == key {
-            return idx as i32;
+            Some(idx)
+        } else {
+            None
         }
-        -1
     }
 
     /// Bulk-copy a contiguous slice of rows into an Batch.
@@ -479,13 +490,9 @@ impl MappedShard {
         region_bufs.push(expand_region(&self.weight, 8));
         region_bufs.push(expand_region(&self.null_bmp, 8));
 
-        let pk_index = schema.pk_index as usize;
-        let mut reg_idx = 0;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col_size = schema.columns[ci].size as usize;
+        for (reg_idx, _ci, col) in schema.payload_columns() {
+            let col_size = col.size as usize;
             region_bufs.push(expand_region(&self.col_regions[reg_idx], col_size));
-            reg_idx += 1;
         }
 
         // Blob region
@@ -530,16 +537,8 @@ impl super::columnar::ColumnarSource for MappedShard {
     }
 }
 
-impl Drop for MappedShard {
-    fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() {
-            unsafe {
-                libc::munmap(self.mmap_ptr as *mut libc::c_void, self.mmap_len);
-            }
-            self.mmap_ptr = ptr::null_mut();
-        }
-    }
-}
+// MappedShard does not implement Drop — the owned `mmap: Mmap` field handles
+// `munmap` automatically when the shard is dropped.
 
 #[cfg(test)]
 mod tests {
@@ -703,12 +702,12 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
 
-        assert_eq!(shard.find_row_index(10), 4);
-        assert_eq!(shard.find_row_index(200), 99);
+        assert_eq!(shard.find_row_index(10), Some(4));
+        assert_eq!(shard.find_row_index(200), Some(99));
 
-        assert_eq!(shard.find_row_index(3), -1);
-        assert_eq!(shard.find_row_index(0), -1);
-        assert_eq!(shard.find_row_index(201), -1);
+        assert_eq!(shard.find_row_index(3), None);
+        assert_eq!(shard.find_row_index(0), None);
+        assert_eq!(shard.find_row_index(201), None);
 
         assert_eq!(shard.find_lower_bound(3), 1);
         assert_eq!(shard.find_lower_bound(1), 0);
@@ -757,7 +756,7 @@ mod tests {
         std::fs::write(path_str, &data).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true);
-        assert_eq!(shard.err(), Some(-3));
+        assert_eq!(shard.err(), Some(StorageError::ChecksumMismatch));
     }
 
     #[test]
@@ -771,7 +770,7 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.count, 0);
-        assert_eq!(shard.find_row_index(1), -1);
+        assert_eq!(shard.find_row_index(1), None);
         assert_eq!(shard.find_lower_bound(1), 0);
     }
 
@@ -858,9 +857,9 @@ mod tests {
             assert_eq!(shard.get_pk(i), (i + 1) as u128);
         }
         // Binary search still works
-        assert_eq!(shard.find_row_index(64), 63);
-        assert_eq!(shard.find_row_index(1), 0);
-        assert_eq!(shard.find_row_index(128), 127);
+        assert_eq!(shard.find_row_index(64), Some(63));
+        assert_eq!(shard.find_row_index(1), Some(0));
+        assert_eq!(shard.find_row_index(128), Some(127));
         assert_eq!(shard.find_lower_bound(65), 64);
     }
 
@@ -921,7 +920,7 @@ mod tests {
             assert_eq!(shard.get_weight(i), 1);
             assert_eq!(shard.get_null_word(i), 0);
         }
-        assert_eq!(shard.find_row_index(3), 2);
+        assert_eq!(shard.find_row_index(3), Some(2));
     }
 
     #[test]
@@ -939,7 +938,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(-2));
+        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(StorageError::InvalidShard));
     }
 
     #[test]
@@ -957,7 +956,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(-2));
+        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(StorageError::InvalidShard));
     }
 
     #[test]
@@ -975,8 +974,8 @@ mod tests {
         assert_eq!(shard.get_pk(0), 42);
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_null_word(0), 0);
-        assert_eq!(shard.find_row_index(42), 0);
-        assert_eq!(shard.find_row_index(1), -1);
+        assert_eq!(shard.find_row_index(42), Some(0));
+        assert_eq!(shard.find_row_index(1), None);
     }
 
     #[test]

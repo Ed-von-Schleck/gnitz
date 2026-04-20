@@ -833,11 +833,7 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema.unwrap_or_else(|| src.schema.unwrap());
-        let pk_index = schema.pk_index as usize;
-        let mut pi = 0usize;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col_desc = &schema.columns[ci];
+        for (pi, _ci, col_desc) in schema.payload_columns() {
             let cs = col_desc.size as usize;
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
@@ -861,7 +857,6 @@ impl Batch {
                 let off = row * cs;
                 self.extend_col(pi, &src.col_data(pi)[off..off + cs]);
             }
-            pi += 1;
         }
         self.count += 1;
         self.sorted = false;

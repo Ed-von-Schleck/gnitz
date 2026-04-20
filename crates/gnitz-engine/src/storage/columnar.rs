@@ -36,20 +36,13 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     src_b: &B,
     row_b: usize,
 ) -> Ordering {
-    let pk_index = schema.pk_index as usize;
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
-    let mut payload_col: usize = 0;
 
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-
+    for (payload_col, _ci, col) in schema.payload_columns() {
         let null_a = (null_word_a >> payload_col) & 1 != 0;
         let null_b = (null_word_b >> payload_col) & 1 != 0;
         if null_a && null_b {
-            payload_col += 1;
             continue;
         }
         if null_a {
@@ -59,7 +52,6 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
             return Ordering::Greater;
         }
 
-        let col = &schema.columns[ci];
         let col_size = col.size as usize;
 
         let ord = match col.type_code {
@@ -97,8 +89,6 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
                 va.cmp(&vb)
             }
         };
-
-        payload_col += 1;
 
         if ord != Ordering::Equal {
             return ord;

@@ -196,14 +196,8 @@ impl<'a> DirectWriter<'a> {
         self.weight[out_row * 8..out_row * 8 + 8].copy_from_slice(&weight.to_le_bytes());
         self.null_bmp[out_row * 8..out_row * 8 + 8].copy_from_slice(&null_word.to_le_bytes());
 
-        let pk_index = self.schema.pk_index as usize;
-        let mut payload_idx: usize = 0;
-
-        for ci in 0..self.schema.num_columns as usize {
-            if ci == pk_index {
-                continue;
-            }
-            let col = &self.schema.columns[ci];
+        let schema = self.schema;
+        for (payload_idx, _ci, col) in schema.payload_columns() {
             let col_size = col.size as usize;
             let is_null = (null_word >> payload_idx) & 1 != 0;
 
@@ -217,7 +211,6 @@ impl<'a> DirectWriter<'a> {
                 let off = out_row * col_size;
                 self.col_bufs[payload_idx][off..off + col_size].copy_from_slice(src);
             }
-            payload_idx += 1;
         }
     }
 

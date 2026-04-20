@@ -213,7 +213,7 @@ fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor
 fn open_system_cursor(
     table: *mut Table,
     view_id: u64,
-) -> Option<CursorHandle<'static>> {
+) -> Option<CursorHandle> {
     if table.is_null() {
         return None;
     }
@@ -955,7 +955,7 @@ fn create_child_table(
     child_name: &str,
     schema: SchemaDescriptor,
     table_id: u32,
-) -> Result<Table, i32> {
+) -> Result<Table, crate::storage::StorageError> {
     let child_dir = format!("{}/scratch_{}", view_dir, child_name);
     Table::new(&child_dir, child_name, schema, table_id, 256 * 1024, false)
 }

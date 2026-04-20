@@ -7,8 +7,9 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use super::columnar;
+use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::memtable::{self, MemTable};
+use super::memtable::MemTable;
 use super::batch::{self, Batch};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
@@ -55,7 +56,7 @@ impl Table {
         table_id: u32,
         arena_size: u64,
         durable: bool,
-    ) -> Result<Self, i32> {
+    ) -> Result<Self, StorageError> {
         let dir_c = ensure_dir(dir)?;
 
         // Try to set NOCOW (btrfs; silently ignored on other fs)
@@ -66,7 +67,7 @@ impl Table {
             libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
         };
         if dirfd < 0 {
-            return Err(-3);
+            return Err(StorageError::Io);
         }
 
         // Erase stale ephemeral shards (prefix-matched)
@@ -134,7 +135,7 @@ impl Table {
 
     /// Ingest an already-constructed Batch into the memtable.
     /// Used by PartitionedTable after hash-routing.
-    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), i32> {
+    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
@@ -165,7 +166,7 @@ impl Table {
         sizes: &[u32],
         count: u32,
         num_payload_cols: usize,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         if count == 0 {
             return Ok(());
         }
@@ -185,7 +186,7 @@ impl Table {
         sizes: &[u32],
         count: u32,
         num_payload_cols: usize,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         if count == 0 {
             return Ok(());
         }
@@ -200,7 +201,7 @@ impl Table {
         count: u32,
         num_payload_cols: usize,
         force_ephemeral: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         let batch = unsafe {
             Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
@@ -213,7 +214,7 @@ impl Table {
                 }
                 Ok(())
             }
-            Err(code) if code == memtable::ERR_CAPACITY => {
+            Err(StorageError::Capacity) => {
                 self.flush_inner(durable)?;
                 let batch2 = unsafe {
                     Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
@@ -231,7 +232,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Flush memtable to shard.  Persistent tables also update manifest.
-    pub fn flush(&mut self) -> Result<bool, i32> {
+    pub fn flush(&mut self) -> Result<bool, StorageError> {
         self.flush_inner(self.durable)
     }
 
@@ -239,11 +240,11 @@ impl Table {
     /// WAL state.  Used by checkpoint: system tables disable WAL (SAL
     /// provides durability) but still need manifest-tracked shards so
     /// the data survives restart.
-    pub fn flush_durable(&mut self) -> Result<bool, i32> {
+    pub fn flush_durable(&mut self) -> Result<bool, StorageError> {
         self.flush_inner(true)
     }
 
-    fn flush_inner(&mut self, durable: bool) -> Result<bool, i32> {
+    fn flush_inner(&mut self, durable: bool) -> Result<bool, StorageError> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
             return Ok(false);
@@ -266,14 +267,9 @@ impl Table {
         };
 
         let shard_path = format!("{}/{}", self.directory, shard_name);
-        let name_c = CString::new(shard_name.as_str()).map_err(|_| -1)?;
+        let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
 
-        let rc = self.memtable.flush(self.dirfd, &name_c, self.table_id, durable);
-        if rc < 0 && rc != -1 {
-            return Err(rc);
-        }
-
-        let wrote = rc >= 0;
+        let wrote = self.memtable.flush(self.dirfd, &name_c, self.table_id, durable)?;
         if wrote {
             self.shard_index.add_shard(&shard_path, 0, lsn_max)?;
         } else {
@@ -285,7 +281,7 @@ impl Table {
                 self.shard_index.publish_manifest(path)?;
             }
             if unsafe { libc::fsync(self.dirfd) } < 0 {
-                return Err(-3);
+                return Err(StorageError::Io);
             }
         }
 
@@ -299,7 +295,7 @@ impl Table {
 
     /// Create a cursor over all data (memtable snapshot + shards).
     /// Runs compaction if needed.  Returns an opaque CursorHandle.
-    pub fn create_cursor(&mut self) -> Result<CursorHandle<'static>, i32> {
+    pub fn create_cursor(&mut self) -> Result<CursorHandle, StorageError> {
         self.compact_if_needed()?;
         let snapshot = self.memtable.get_snapshot();
         let shard_arcs = self.shard_index.all_shard_arcs();
@@ -441,7 +437,7 @@ impl Table {
     // Compaction
     // ------------------------------------------------------------------
 
-    pub fn compact_if_needed(&mut self) -> Result<(), i32> {
+    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.needs_compaction {
             return Ok(());
         }
@@ -450,7 +446,7 @@ impl Table {
         if let Some(ref path) = self.manifest_path {
             self.shard_index.publish_manifest(path)?;
             if unsafe { libc::fsync(self.dirfd) } < 0 {
-                return Err(-3);
+                return Err(StorageError::Io);
             }
         }
         self.shard_index.try_cleanup();
@@ -475,7 +471,7 @@ impl Table {
 
     /// Upsert a pre-sorted batch directly into the memtable (no WAL).
     /// Used by the accumulator flush path.
-    pub fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), i32> {
+    pub fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.memtable.upsert_sorted_batch(batch)
     }
 
@@ -487,7 +483,7 @@ impl Table {
         &self,
         child_name: &str,
         child_schema: SchemaDescriptor,
-    ) -> Result<Table, i32> {
+    ) -> Result<Table, StorageError> {
         let child_dir = format!("{}/scratch_{}", self.directory, child_name);
         Table::new(
             &child_dir,
@@ -554,12 +550,12 @@ impl Drop for Table {
 // OS helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn ensure_dir(dir: &str) -> Result<CString, i32> {
-    let dir_c = CString::new(dir).map_err(|_| -1)?;
+pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
+    let dir_c = CString::new(dir).map_err(|_| StorageError::InvalidPath)?;
     match std::fs::create_dir(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err(-3),
+        Err(_) => return Err(StorageError::Io),
     }
     Ok(dir_c)
 }

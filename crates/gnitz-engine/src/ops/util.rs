@@ -74,19 +74,13 @@ pub(super) fn append_cursor_row_to_batch(
     cursor: &ReadCursor,
     schema: &SchemaDescriptor,
 ) {
-    let pki = schema.pk_index as usize;
     output.extend_pk_lo(&cursor.current_key_lo.to_le_bytes());
     output.extend_pk_hi(&cursor.current_key_hi.to_le_bytes());
     output.extend_weight(&cursor.current_weight.to_le_bytes());
     output.extend_null_bmp(&cursor.current_null_word.to_le_bytes());
 
     let blob_base = cursor.blob_ptr();
-    let mut pi = 0;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pki {
-            continue;
-        }
-        let col = &schema.columns[ci];
+    for (pi, ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
         let is_null = (cursor.current_null_word >> pi) & 1 != 0;
         if is_null {
@@ -118,7 +112,6 @@ pub(super) fn append_cursor_row_to_batch(
                 output.extend_col(pi, src);
             }
         }
-        pi += 1;
     }
     output.count += 1;
 }
@@ -135,7 +128,6 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    let pki = schema.pk_index as usize;
     let cursor_blob = cursor.blob_ptr();
     let cursor_blob_slice: &[u8] = if cursor_blob.is_null() {
         &[]
@@ -143,12 +135,7 @@ pub(super) fn compare_cursor_payload_to_batch_row(
         unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) }
     };
 
-    let mut pi = 0usize;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pki {
-            continue;
-        }
-        let col = &schema.columns[ci];
+    for (pi, ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
 
         let cursor_null = (cursor.current_null_word >> pi) & 1 != 0;
@@ -203,7 +190,6 @@ pub(super) fn compare_cursor_payload_to_batch_row(
         if ord != Ordering::Equal {
             return ord;
         }
-        pi += 1;
     }
     Ordering::Equal
 }

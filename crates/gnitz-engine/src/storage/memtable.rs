@@ -8,6 +8,7 @@ use std::sync::Arc;
 use super::batch::{Batch, write_to_batch};
 use super::bloom::BloomFilter;
 use super::columnar;
+use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::merge::{self, MemBatch};
 use super::shard_file;
@@ -15,9 +16,6 @@ use super::shard_file;
 // Accessible to the tests submodule (private items are visible to descendants).
 #[cfg(test)]
 use super::batch::relocate_string_cell;
-
-/// Error code returned when the MemTable exceeds its capacity.
-pub const ERR_CAPACITY: i32 = -2;
 
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
@@ -81,7 +79,7 @@ impl MemTable {
     }
 
     /// Append a pre-sorted batch as a new run.
-    pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), i32> {
+    pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
@@ -258,18 +256,18 @@ impl MemTable {
 
     /// Consolidate all runs and write to a shard file.
     ///
-    /// Returns 0 on success, -1 if empty (no file written), or a negative
-    /// error code from `write_shard_at`.
+    /// Returns `Ok(true)` on success, `Ok(false)` when there is nothing to
+    /// flush (no file written), or `Err(_)` on shard-write failure.
     pub fn flush(
         &mut self,
         dirfd: libc::c_int,
         basename: &CStr,
         table_id: u32,
         durable: bool,
-    ) -> i32 {
+    ) -> Result<bool, StorageError> {
         let snapshot = self.get_snapshot();
         if snapshot.count == 0 {
-            return -1; // nothing to write
+            return Ok(false);
         }
 
         let regions = snapshot.regions();
@@ -278,7 +276,8 @@ impl MemTable {
             snapshot.count as u32,
             &regions,
         );
-        shard_file::write_shard_at(dirfd, basename, &image, durable)
+        shard_file::write_shard_at(dirfd, basename, &image, durable)?;
+        Ok(true)
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -320,9 +319,9 @@ impl MemTable {
         self.invalidate_cache();
     }
 
-    fn check_capacity(&self) -> Result<(), i32> {
+    fn check_capacity(&self) -> Result<(), StorageError> {
         if self.runs_bytes > self.max_bytes {
-            return Err(ERR_CAPACITY);
+            return Err(StorageError::Capacity);
         }
         Ok(())
     }
@@ -499,7 +498,7 @@ mod tests {
         // Second upsert fails: runs_bytes (160) > max_bytes (64)
         let b2 = make_batch(&schema, &[(50, 1, 500)]);
         let rc = mt.upsert_sorted_batch(b2);
-        assert_eq!(rc, Err(ERR_CAPACITY));
+        assert_eq!(rc, Err(StorageError::Capacity));
     }
 
     #[test]
@@ -550,8 +549,8 @@ mod tests {
         assert!(dirfd >= 0);
 
         let name = std::ffi::CString::new("test_shard.db").unwrap();
-        let rc = mt.flush(dirfd, &name, 42, false);
-        assert_eq!(rc, 0);
+        let wrote = mt.flush(dirfd, &name, 42, false).unwrap();
+        assert!(wrote);
 
         // Verify shard file exists
         let shard_path = dir.path().join("test_shard.db");
@@ -562,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn memtable_flush_empty_returns_neg1() {
+    fn memtable_flush_empty_returns_false() {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
         let dir = tempfile::tempdir().unwrap();
@@ -575,8 +574,8 @@ mod tests {
         assert!(dirfd >= 0);
 
         let name = std::ffi::CString::new("empty.db").unwrap();
-        let rc = mt.flush(dirfd, &name, 42, false);
-        assert_eq!(rc, -1);
+        let wrote = mt.flush(dirfd, &name, 42, false).unwrap();
+        assert!(!wrote);
         unsafe { libc::close(dirfd); }
     }
 

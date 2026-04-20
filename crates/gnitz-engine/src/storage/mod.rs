@@ -21,6 +21,7 @@ mod read_cursor;
 mod table;
 mod partitioned_table;
 pub(crate) mod batch_pool;
+mod error;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 pub use table::Table;
@@ -28,6 +29,7 @@ pub use partitioned_table::{PartitionedTable, partition_for_key, partition_arena
 pub use read_cursor::CursorHandle;
 pub use batch::{Batch, write_to_batch};
 pub use merge::{MemBatch, scatter_copy, sort_and_consolidate};
+pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use read_cursor::{ReadCursor, create_cursor_from_snapshots};

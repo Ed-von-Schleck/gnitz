@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::schema::SchemaDescriptor;
 use super::batch::Batch;
+use super::error::StorageError;
 use super::merge;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
@@ -36,7 +37,7 @@ impl PartitionedTable {
         part_start: u32,
         part_end: u32,
         arena_size: u64,
-    ) -> Result<Self, i32> {
+    ) -> Result<Self, StorageError> {
         table::ensure_dir(dir)?;
 
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
@@ -81,7 +82,7 @@ impl PartitionedTable {
         sizes: &[u32],
         count: u32,
         num_payload_cols: usize,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         if count == 0 || self.tables.is_empty() {
             return Ok(());
         }
@@ -131,7 +132,7 @@ impl PartitionedTable {
         sizes: &[u32],
         count: u32,
         num_payload_cols: usize,
-    ) -> Result<(), i32> {
+    ) -> Result<(), StorageError> {
         debug_assert_eq!(
             self.num_partitions, 1,
             "ingest_batch_memonly_from_regions bypasses hash routing; \
@@ -147,7 +148,7 @@ impl PartitionedTable {
     // Cursor
     // ------------------------------------------------------------------
 
-    pub fn create_cursor(&mut self) -> Result<CursorHandle<'static>, i32> {
+    pub fn create_cursor(&mut self) -> Result<CursorHandle, StorageError> {
         if self.tables.is_empty() {
             return Ok(read_cursor::create_cursor_from_snapshots(&[], &[], self.schema));
         }
@@ -255,7 +256,7 @@ impl PartitionedTable {
     // Broadcast operations
     // ------------------------------------------------------------------
 
-    pub fn flush(&mut self) -> Result<bool, i32> {
+    pub fn flush(&mut self) -> Result<bool, StorageError> {
         let mut any_wrote = false;
         for table in &mut self.tables {
             if table.flush()? {
@@ -265,7 +266,7 @@ impl PartitionedTable {
         Ok(any_wrote)
     }
 
-    pub fn compact_if_needed(&mut self) -> Result<(), i32> {
+    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         for table in &mut self.tables {
             table.compact_if_needed()?;
         }
@@ -328,9 +329,9 @@ impl PartitionedTable {
         &self,
         child_name: &str,
         child_schema: SchemaDescriptor,
-    ) -> Result<Table, i32> {
+    ) -> Result<Table, StorageError> {
         if self.tables.is_empty() {
-            return Err(-1);
+            return Err(StorageError::InvalidPath);
         }
         self.tables[0].create_child(child_name, child_schema)
     }

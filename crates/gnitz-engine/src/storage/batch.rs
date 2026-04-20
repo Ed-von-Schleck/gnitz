@@ -20,6 +20,21 @@ const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 /// payload columns.  Use 68 for alignment.
 pub(super) const MAX_BATCH_REGIONS: usize = 68;
 
+// ── Region indices into `offsets` / `strides` ───────────────────────────────
+//
+// The first four regions are fixed (one 8-byte word per row each); payload
+// columns start at index 4 and continue for `num_payload_cols()` slots.  Use
+// these constants instead of bare numeric literals — naming the slots makes
+// the layout self-documenting and turns an off-by-one in this file into a
+// compile-time grep target.
+const REG_PK_LO: usize = 0;
+const REG_PK_HI: usize = 1;
+const REG_WEIGHT: usize = 2;
+const REG_NULL_BMP: usize = 3;
+const REG_PAYLOAD_START: usize = 4;
+/// Stride (in bytes) of each of the four fixed regions.
+const FIXED_REGION_STRIDE: u8 = 8;
+
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
 /// For sizes >= HUGEPAGE_THRESHOLD, calls `calloc` (via `vec!`) which for large
@@ -80,8 +95,11 @@ fn fill_payload_strides(
 /// Build a strides array from a SchemaDescriptor.
 pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
-    strides[0] = 8; strides[1] = 8; strides[2] = 8; strides[3] = 8;
-    let nr = fill_payload_strides(schema, &mut strides, 4);
+    strides[REG_PK_LO] = FIXED_REGION_STRIDE;
+    strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+    strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
+    strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
+    let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
     (strides, nr as u8)
 }
 
@@ -116,9 +134,12 @@ impl Batch {
     ///
     /// Intended for zero-row return values and swap-placeholder slots.
     pub fn empty(num_payload_cols: usize) -> Self {
-        let nr = 4 + num_payload_cols;
+        let nr = REG_PAYLOAD_START + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[0] = 8; strides[1] = 8; strides[2] = 8; strides[3] = 8;
+        strides[REG_PK_LO] = FIXED_REGION_STRIDE;
+        strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
+        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
@@ -164,8 +185,11 @@ impl Batch {
         right_schema: &SchemaDescriptor,
     ) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[0] = 8; strides[1] = 8; strides[2] = 8; strides[3] = 8;
-        let mid = fill_payload_strides(left_schema, &mut strides, 4);
+        strides[REG_PK_LO] = FIXED_REGION_STRIDE;
+        strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
+        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
+        let mid = fill_payload_strides(left_schema, &mut strides, REG_PAYLOAD_START);
         let out_idx = fill_payload_strides(right_schema, &mut strides, mid);
         Batch {
             data: Vec::new(),
@@ -241,7 +265,7 @@ impl Batch {
             return Self::empty(num_payload_cols);
         }
 
-        let nr = 4 + num_payload_cols;
+        let nr = REG_PAYLOAD_START + num_payload_cols;
         // Derive strides from sizes / count.
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         for i in 0..nr {
@@ -274,7 +298,7 @@ impl Batch {
         }
 
         // Blob is separate — try pool first.
-        let blob_idx = 4 + num_payload_cols;
+        let blob_idx = REG_PAYLOAD_START + num_payload_cols;
         let blob_sz = sizes[blob_idx] as usize;
         let blob = if blob_sz > 0 && !ptrs[blob_idx].is_null() {
             // SAFETY: copy_nonoverlapping below writes all blob_sz bytes.
@@ -331,27 +355,27 @@ impl Batch {
 
     #[inline]
     pub fn pk_lo_data(&self) -> &[u8] {
-        let off = self.offsets[0] as usize;
+        let off = self.offsets[REG_PK_LO] as usize;
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn pk_hi_data(&self) -> &[u8] {
-        let off = self.offsets[1] as usize;
+        let off = self.offsets[REG_PK_HI] as usize;
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn weight_data(&self) -> &[u8] {
-        let off = self.offsets[2] as usize;
+        let off = self.offsets[REG_WEIGHT] as usize;
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn null_bmp_data(&self) -> &[u8] {
-        let off = self.offsets[3] as usize;
+        let off = self.offsets[REG_NULL_BMP] as usize;
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn col_data(&self, pi: usize) -> &[u8] {
-        let r = 4 + pi;
+        let r = REG_PAYLOAD_START + pi;
         let off = self.offsets[r] as usize;
         &self.data[off..off + self.count * self.strides[r] as usize]
     }
@@ -359,38 +383,38 @@ impl Batch {
     pub fn blob_data(&self) -> &[u8] { &self.blob }
     #[inline]
     pub fn num_payload_cols(&self) -> usize {
-        self.num_regions as usize - 4
+        self.num_regions as usize - REG_PAYLOAD_START
     }
 
     // ── Mutable slice accessors ─────────────────────────────────────────
 
     #[inline]
     pub fn pk_lo_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[0] as usize;
+        let off = self.offsets[REG_PK_LO] as usize;
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn pk_hi_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[1] as usize;
+        let off = self.offsets[REG_PK_HI] as usize;
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn weight_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[2] as usize;
+        let off = self.offsets[REG_WEIGHT] as usize;
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn null_bmp_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[3] as usize;
+        let off = self.offsets[REG_NULL_BMP] as usize;
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn col_data_mut(&mut self, pi: usize) -> &mut [u8] {
-        let r = 4 + pi;
+        let r = REG_PAYLOAD_START + pi;
         let off = self.offsets[r] as usize;
         let end = off + self.count * self.strides[r] as usize;
         &mut self.data[off..end]
@@ -400,11 +424,11 @@ impl Batch {
 
     #[inline]
     fn get_pk_lo(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[0] as usize..], row * 8)
+        read_u64_le(&self.data[self.offsets[REG_PK_LO] as usize..], row * 8)
     }
     #[inline]
     fn get_pk_hi(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[1] as usize..], row * 8)
+        read_u64_le(&self.data[self.offsets[REG_PK_HI] as usize..], row * 8)
     }
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
@@ -412,15 +436,15 @@ impl Batch {
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
-        read_i64_le(&self.data[self.offsets[2] as usize..], row * 8)
+        read_i64_le(&self.data[self.offsets[REG_WEIGHT] as usize..], row * 8)
     }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[3] as usize..], row * 8)
+        read_u64_le(&self.data[self.offsets[REG_NULL_BMP] as usize..], row * 8)
     }
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        let off = self.offsets[4 + payload_col] as usize + row * col_size;
+        let off = self.offsets[REG_PAYLOAD_START + payload_col] as usize + row * col_size;
         &self.data[off..off + col_size]
     }
 
@@ -573,20 +597,20 @@ impl Batch {
         let n = end - start;
         if n == 0 { return; }
         self.reserve_rows(n);
-        self.bulk_copy_region(0, src.pk_lo, start, end);
-        self.bulk_copy_region(1, src.pk_hi, start, end);
+        self.bulk_copy_region(REG_PK_LO, src.pk_lo, start, end);
+        self.bulk_copy_region(REG_PK_HI, src.pk_hi, start, end);
         // Fill weight region with the constant override value.
         {
-            let dst_off = self.offsets[2] as usize + self.count * 8;
+            let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
             let w_bytes = weight_override.to_le_bytes();
             let dest = &mut self.data[dst_off..dst_off + n * 8];
             for chunk in dest.chunks_exact_mut(8) {
                 chunk.copy_from_slice(&w_bytes);
             }
         }
-        self.bulk_copy_region(3, src.null_bmp, start, end);
+        self.bulk_copy_region(REG_NULL_BMP, src.null_bmp, start, end);
         for pi in 0..src.col_data.len() {
-            self.bulk_copy_region(4 + pi, src.col_data[pi], start, end);
+            self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data[pi], start, end);
         }
         self.count += n;
     }
@@ -639,10 +663,11 @@ impl Batch {
     /// Produce region pointer/size arrays for `Table::ingest_batch_from_regions`.
     pub fn to_region_ptrs(&self) -> (Vec<*const u8>, Vec<u32>) {
         let npc = self.num_payload_cols();
-        let cap = 4 + npc + 1;
+        // 4 fixed regions + npc payload regions + 1 blob region.
+        let cap = REG_PAYLOAD_START + npc + 1;
         let mut ptrs = Vec::with_capacity(cap);
         let mut sizes = Vec::with_capacity(cap);
-        for i in 0..4 + npc {
+        for i in 0..REG_PAYLOAD_START + npc {
             let off = self.offsets[i] as usize;
             let len = self.count * self.strides[i] as usize;
             ptrs.push(self.data[off..].as_ptr());
@@ -793,12 +818,8 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema.expect("append_row_simple requires schema");
-        let pk_index = schema.pk_index as usize;
 
-        let mut pi = 0usize;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col = &schema.columns[ci];
+        for (pi, _ci, col) in schema.payload_columns() {
             let col_size = col.size as usize;
             let is_null = (null_word >> pi) & 1 != 0;
 
@@ -838,7 +859,6 @@ impl Batch {
                     }
                 }
             }
-            pi += 1;
         }
 
         self.count += 1;
@@ -888,15 +908,15 @@ impl Batch {
         let n = end - start;
         self.reserve_rows(n);
         // All four system regions
-        self.bulk_copy_region(0, &src.data[src.offsets[0] as usize..], start, end);
-        self.bulk_copy_region(1, &src.data[src.offsets[1] as usize..], start, end);
-        self.bulk_copy_region(2, &src.data[src.offsets[2] as usize..], start, end);
-        self.bulk_copy_region(3, &src.data[src.offsets[3] as usize..], start, end);
+        self.bulk_copy_region(REG_PK_LO, &src.data[src.offsets[REG_PK_LO] as usize..], start, end);
+        self.bulk_copy_region(REG_PK_HI, &src.data[src.offsets[REG_PK_HI] as usize..], start, end);
+        self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT] as usize..], start, end);
+        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP] as usize..], start, end);
         // Payload columns — string structs copied verbatim (blob already shared)
         let npc = self.num_payload_cols();
         for pi in 0..npc {
-            if self.strides[4 + pi] > 0 {
-                self.bulk_copy_region(4 + pi, &src.data[src.offsets[4 + pi] as usize..], start, end);
+            if self.strides[REG_PAYLOAD_START + pi] > 0 {
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi] as usize..], start, end);
             }
         }
         self.count += n;
@@ -909,45 +929,46 @@ impl Batch {
         self.reserve_rows(n);
 
         // Fixed columns: bulk copy from src's data buffer.
-        self.bulk_copy_region(0, &src.data[src.offsets[0] as usize..], start, end);
-        self.bulk_copy_region(1, &src.data[src.offsets[1] as usize..], start, end);
+        self.bulk_copy_region(REG_PK_LO, &src.data[src.offsets[REG_PK_LO] as usize..], start, end);
+        self.bulk_copy_region(REG_PK_HI, &src.data[src.offsets[REG_PK_HI] as usize..], start, end);
         if negate {
-            let w_off = self.offsets[2] as usize;
+            let w_off = self.offsets[REG_WEIGHT] as usize;
             for i in start..end {
                 let dst = w_off + (self.count + i - start) * 8;
                 self.data[dst..dst + 8].copy_from_slice(&(-src.get_weight(i)).to_le_bytes());
             }
         } else {
-            self.bulk_copy_region(2, &src.data[src.offsets[2] as usize..], start, end);
+            self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT] as usize..], start, end);
         }
-        self.bulk_copy_region(3, &src.data[src.offsets[3] as usize..], start, end);
+        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP] as usize..], start, end);
 
-        // Payload columns
-        let has_schema = self.schema.is_some();
-        let schema_copy = self.schema;
-        let pk_index = schema_copy.map_or(usize::MAX, |s| s.pk_index as usize);
+        // Payload columns.  When the schema is installed, we need to know
+        // which payload positions hold STRING values so the blob can be
+        // relocated; without a schema, treat all payload columns as opaque
+        // bytes (no blob relocation is possible without type info anyway).
+        //
+        // `is_string_at[pi]` is true iff payload column `pi` is a STRING.
         let npc = self.num_payload_cols();
+        let mut is_string_at = [false; MAX_BATCH_REGIONS];
+        if let Some(s) = self.schema {
+            for (pi, _ci, col) in s.payload_columns() {
+                if pi >= npc { break; }
+                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING;
+            }
+        }
 
-        let mut pi = 0;
-        let num_cols = schema_copy.map_or(npc, |s| s.num_columns as usize);
-        for ci in 0..num_cols {
-            if ci == pk_index { continue; }
-            if pi >= npc { break; }
-            let is_string = has_schema
-                && schema_copy.unwrap().columns[ci].type_code == crate::schema::type_code::STRING;
-            let cs = self.strides[4 + pi] as usize;
-
-            if is_string && cs == 16 {
+        for pi in 0..npc {
+            let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
+            if is_string_at[pi] && cs == 16 {
                 for row in start..end {
-                    let src_off = src.offsets[4 + pi] as usize + row * 16;
+                    let src_off = src.offsets[REG_PAYLOAD_START + pi] as usize + row * 16;
                     let src_struct = &src.data[src_off..src_off + 16];
-                    let dst_off = self.offsets[4 + pi] as usize + (self.count + row - start) * 16;
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize + (self.count + row - start) * 16;
                     relocate_string_cell(src_struct, &src.blob, &mut self.data[dst_off..dst_off + 16], &mut self.blob);
                 }
             } else if cs > 0 {
-                self.bulk_copy_region(4 + pi, &src.data[src.offsets[4 + pi] as usize..], start, end);
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi] as usize..], start, end);
             }
-            pi += 1;
         }
 
         self.count += n;
@@ -964,7 +985,6 @@ impl Batch {
     ) {
         self.ensure_row_capacity();
         let schema = self.schema.expect("append_row_from_ptable_found requires schema");
-        let pk_index = schema.pk_index as usize;
         let null_word = ptable.found_null_word();
 
         let (pk_lo, pk_hi) = crate::util::split_pk(pk);
@@ -973,10 +993,7 @@ impl Batch {
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
-        let mut pi = 0usize;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col_desc = &schema.columns[ci];
+        for (pi, _ci, col_desc) in schema.payload_columns() {
             let cs = col_desc.size as usize;
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
@@ -1004,7 +1021,6 @@ impl Batch {
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
                 self.extend_col(pi, src_slice);
             }
-            pi += 1;
         }
 
         self.count += 1;
@@ -1020,14 +1036,13 @@ impl Batch {
         schema: &crate::schema::SchemaDescriptor,
     ) {
         if indices.is_empty() { return; }
-        let pki = schema.pk_index as usize;
-        let mut col_meta: Vec<(usize, bool)> = Vec::with_capacity(schema.num_columns as usize - 1);
-        for ci in 0..schema.num_columns as usize {
-            if ci == pki { continue; }
-            let col = &schema.columns[ci];
-            let is_string = col.type_code == crate::schema::type_code::STRING && col.size == 16;
-            col_meta.push((col.size as usize, is_string));
-        }
+        let col_meta: Vec<(usize, bool)> = schema
+            .payload_columns()
+            .map(|(_pi, _ci, col)| {
+                let is_string = col.type_code == crate::schema::type_code::STRING && col.size == 16;
+                (col.size as usize, is_string)
+            })
+            .collect();
 
         self.reserve_rows(indices.len());
         for &idx in indices {
@@ -1046,7 +1061,7 @@ impl Batch {
                     self.fill_col_zero(pi, cs);
                 } else if is_string {
                     let src_struct = src.get_col_ptr(row, pi, 16);
-                    let dst_off = self.offsets[4 + pi] as usize + self.count * 16;
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize + self.count * 16;
                     relocate_string_cell(src_struct, src.blob, &mut self.data[dst_off..dst_off + 16], &mut self.blob);
                 } else if cs > 0 {
                     self.extend_col(pi, src.get_col_ptr(row, pi, cs));
@@ -1074,20 +1089,20 @@ impl Batch {
 
     /// Get region pointer by index.
     pub fn region_ptr(&self, idx: usize) -> *const u8 {
-        let npc = self.num_payload_cols();
-        if idx < 4 + npc {
+        let blob_idx = REG_PAYLOAD_START + self.num_payload_cols();
+        if idx < blob_idx {
             self.data[self.offsets[idx] as usize..].as_ptr()
-        } else if idx == 4 + npc {
+        } else if idx == blob_idx {
             self.blob.as_ptr()
         } else {
-            panic!("region_ptr: index {idx} out of range (num_regions_total = {})", 4 + npc + 1);
+            panic!("region_ptr: index {idx} out of range (num_regions_total = {})", blob_idx + 1);
         }
     }
 
     /// Get region size by index.
     pub fn region_size(&self, idx: usize) -> usize {
-        let npc = self.num_payload_cols();
-        if idx < 4 + npc {
+        let blob_idx = REG_PAYLOAD_START + self.num_payload_cols();
+        if idx < blob_idx {
             self.count * self.strides[idx] as usize
         } else {
             self.blob.len()
@@ -1096,8 +1111,8 @@ impl Batch {
 
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
         let npc = self.num_payload_cols();
-        let mut r = Vec::with_capacity(4 + npc + 1);
-        for i in 0..4 + npc {
+        let mut r = Vec::with_capacity(REG_PAYLOAD_START + npc + 1);
+        for i in 0..REG_PAYLOAD_START + npc {
             let off = self.offsets[i] as usize;
             let len = self.count * self.strides[i] as usize;
             r.push((self.data[off..].as_ptr(), len));
@@ -1118,7 +1133,6 @@ impl Batch {
         if weight == 0 { return; }
         self.ensure_row_capacity();
         let schema = self.schema.expect("append_row_from_source requires schema");
-        let pk_index = schema.pk_index as usize;
 
         self.extend_pk_lo(&(key as u64).to_le_bytes());
         self.extend_pk_hi(&((key >> 64) as u64).to_le_bytes());
@@ -1127,10 +1141,7 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let src_blob = source.blob_slice();
-        let mut pi: usize = 0;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let col = &schema.columns[ci];
+        for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size as usize;
             let is_null = (null_word >> pi) & 1 != 0;
 
@@ -1145,7 +1156,6 @@ impl Batch {
             } else {
                 self.extend_col(pi, source.get_col_ptr(row, pi, cs));
             }
-            pi += 1;
         }
 
         self.count += 1;
@@ -1157,7 +1167,7 @@ impl Batch {
     pub(crate) fn data_capacity(&self) -> usize { self.data.capacity() }
 
     /// Write this batch as a shard file directly to disk.
-    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> i32 {
+    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> Result<(), super::error::StorageError> {
         let regions = self.regions();
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true)
     }

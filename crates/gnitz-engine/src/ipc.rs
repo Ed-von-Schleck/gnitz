@@ -314,12 +314,10 @@ fn encode_batch_to_wal_into(
         sizes[i] = batch.region_size(i) as u32;
     }
     let blob_size = batch.blob.len() as u64;
-    let result = wal::encode(
+    wal::encode(
         out, offset, 0, table_id, batch.count as u32,
         &ptrs[..nr], &sizes[..nr], blob_size,
-    );
-    assert!(result >= 0, "WAL encode_into failed");
-    result as usize
+    ).expect("WAL encode_into failed: buffer too small")
 }
 
 /// Encode a full IPC wire message into a caller-provided buffer.
@@ -449,11 +447,10 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'s
     let mut offsets = [0u64; 128];
     let mut sizes = [0u32; 128];
 
-    let rc = wal::validate_and_parse(
+    if wal::validate_and_parse(
         data, &mut lsn, &mut tid, &mut count, &mut num_regions,
         &mut blob_size, &mut offsets, &mut sizes, 128,
-    );
-    if rc != wal::WAL_OK {
+    ).is_err() {
         return Err("WAL block validation failed");
     }
     if (num_regions as usize) != expected_regions {
@@ -503,11 +500,10 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     let mut offsets = [0u64; EXPECTED_REGIONS];
     let mut sizes   = [0u32; EXPECTED_REGIONS];
 
-    let rc = wal::validate_and_parse(
+    if wal::validate_and_parse(
         data, &mut lsn, &mut tid, &mut count, &mut num_regions,
         &mut blob_size, &mut offsets, &mut sizes, EXPECTED_REGIONS as u32,
-    );
-    if rc != wal::WAL_OK {
+    ).is_err() {
         return Err("control block invalid");
     }
     if count != 1 {
@@ -586,11 +582,10 @@ fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
     let mut offsets = [0u64; EXPECTED_REGIONS];
     let mut sizes   = [0u32; EXPECTED_REGIONS];
 
-    let rc = wal::validate_and_parse(
+    if wal::validate_and_parse(
         data, &mut lsn, &mut tid, &mut count, &mut num_regions,
         &mut blob_size, &mut offsets, &mut sizes, EXPECTED_REGIONS as u32,
-    );
-    if rc != wal::WAL_OK {
+    ).is_err() {
         return Err("schema block invalid");
     }
     if count == 0 {

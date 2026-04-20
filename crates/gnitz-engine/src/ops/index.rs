@@ -211,9 +211,9 @@ pub fn op_integrate_with_indexes(
     input_schema: &SchemaDescriptor,
     gi: Option<&GiDesc>,
     avi: Option<&AviDesc>,
-) -> i32 {
+) -> Result<(), crate::storage::StorageError> {
     if batch.count == 0 {
-        return 0;
+        return Ok(());
     }
 
     // Phase 1: ingest into target table
@@ -222,9 +222,7 @@ pub fn op_integrate_with_indexes(
         let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
         let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
         let npc = input_schema.num_columns as usize - 1;
-        if let Err(rc) = table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc) {
-            return rc;
-        }
+        table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc)?;
     }
 
     let mb = batch.as_mem_batch();
@@ -330,5 +328,5 @@ pub fn op_integrate_with_indexes(
         }
     }
 
-    0
+    Ok(())
 }
