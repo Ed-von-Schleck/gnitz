@@ -17,6 +17,3 @@ edition = "2021"
 sqlparser      = "0.56"
 gnitz-protocol = { path = "../gnitz-protocol" }
 gnitz-wire     = { path = "../gnitz-wire" }
-# Serde is used to derive Serialize/Deserialize on CircuitGraph so
-# compiled view circuits can be bincoded into a migration row.
-serde          = { version = "1", features = ["derive"] }

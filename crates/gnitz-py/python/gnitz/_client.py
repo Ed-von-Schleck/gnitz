@@ -107,16 +107,6 @@ class Connection:
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
         return self._client.execute_sql(schema_name, sql)
 
-    def submit_sql(self, sql: str, schema_name: str = "public") -> None:
-        """Submit raw SQL to the server for atomic DDL application.
-
-        Routes through FLAG_EXECUTE_SQL → server-side parse + migration
-        apply. Phase 2 supports DDL (CREATE/DROP TABLE / INDEX) only;
-        DML and mixed DDL+DML are rejected. Phase 4 will collapse the
-        client-side `execute_sql` into this path and rename.
-        """
-        return self._client.submit_sql(schema_name, sql)
-
     # Low-level
 
     def allocate_table_id(self):

@@ -214,12 +214,6 @@ pub const FLAG_PUSH:           u64 = 32;
 pub const FLAG_HAS_PK:         u64 = 64;
 pub const FLAG_SEEK:           u64 = 128;
 pub const FLAG_SEEK_BY_INDEX:  u64 = 256;
-/// Server-side SQL execution. Payload is a single-row batch carrying
-/// [schema_name: String, sql: String]. Control `target_id` is 0 (no
-/// user-table target); the server parses the SQL, classifies it, and
-/// routes DDL through the migration path or DML through the existing
-/// push path. Mixed DDL+DML in one submission is rejected.
-pub const FLAG_EXECUTE_SQL:    u64 = 32768;
 /// Marker bit set on FLAG_PUSH messages that carry an explicit
 /// `WireConflictMode` in the low byte of `seek_col_idx`. When the bit
 /// is absent, decoders default to `WireConflictMode::Update`, so SAL

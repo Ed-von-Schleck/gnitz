@@ -9,18 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 gnitz-wire      = { path = "../gnitz-wire" }
-# Pure SQL→DesiredState parser. Server-side DDL compile lives in
-# sqlc.rs and uses this to parse submitted migration SQL.
-gnitz-sql-parse = { path = "../gnitz-sql-parse" }
-# gnitz-sql-parse's CatalogResolver surface is expressed in terms of
-# gnitz_protocol::Schema; sqlc's resolver synthesises those Schemas
-# from DesiredState. Type-name overlap with `crate::schema` is
-# deliberate — sqlc lives on the migration-row boundary, not inside
-# the hot DAG path.
-gnitz-protocol  = { path = "../gnitz-protocol" }
-# Serde is used for bincoding compiled circuits into migration rows.
-serde       = { version = "1", features = ["derive"] }
-bincode     = { version = "2.0", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 xorf = { version = "0.12", default-features = false }
 libc = "0.2"

@@ -1120,107 +1120,6 @@ fn detect_rename_pks(batch: &Batch) -> HashSet<u64> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// DagSnapshot — Phase 3 boot-time equivalence assertion
-// ---------------------------------------------------------------------------
-
-/// Stable, name-keyed fingerprint of the catalog's user-visible object
-/// topology. Used by the Phase-3 boot assertion to verify that the
-/// head migration's declarative state is a subset of the live catalog
-/// — i.e. every object declared by a migration has been re-materialised
-/// by `replay_catalog`. The assertion becomes strict equality in Phase
-/// 5 when the imperative DDL path is removed.
-///
-/// Name-keyed (not id-keyed) so it survives ID allocation drift and
-/// the fold can reason from the canonical `DesiredState` alone.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DagSnapshot {
-    /// (schema, name) per user table.
-    pub(crate) tables:  std::collections::BTreeSet<(String, String)>,
-    /// (schema, name) per user view.
-    pub(crate) views:   std::collections::BTreeSet<(String, String)>,
-    /// (index_schema, index_name, owner_schema, owner_name) per user index.
-    /// Internal FK indices (`__fk_*`) are excluded since they are never
-    /// declared in migrations.
-    pub(crate) indices: std::collections::BTreeSet<(String, String, String, String)>,
-}
-
-use gnitz_wire::migration as mig;
-
-/// Read the canonical payload (bincoded `DesiredState`) of a
-/// sys_migrations row by content hash. Returns `None` if the hash
-/// isn't present (or was retracted). Used only by
-/// `CatalogEngine::fold_migration_snapshot` — executor.rs has an
-/// independent copy because it reads under a different code path.
-pub(crate) fn read_migration_canonical_by_hash(
-    cat: &mut CatalogEngine, hash: u128,
-) -> Option<Vec<u8>> {
-    let mut cursor = cat.sys_migrations.create_cursor().ok()?;
-    let (pk_lo, pk_hi) = (hash as u64, (hash >> 64) as u64);
-    cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
-    if !cursor.cursor.valid
-        || cursor.cursor.current_key_lo != pk_lo
-        || cursor.cursor.current_key_hi != pk_hi
-        || cursor.cursor.current_weight <= 0
-    {
-        return None;
-    }
-    let hex_str = cursor_read_string(&cursor, MIGRATIONS_COL_DESIRED_STATE_CANONICAL);
-    mig::from_hex(&hex_str).ok()
-}
-
-impl DagSnapshot {
-    /// Build a snapshot from a canonical `DesiredState` (the migration-
-    /// fold path).
-    pub(crate) fn from_desired_state(state: &mig::DesiredState) -> Self {
-        DagSnapshot {
-            tables: state.tables.iter()
-                .map(|t| (t.schema.clone(), t.name.clone())).collect(),
-            views: state.views.iter()
-                .map(|v| (v.schema.clone(), v.name.clone())).collect(),
-            indices: state.indices.iter()
-                .map(|i| (
-                    i.schema.clone(), i.name.clone(),
-                    i.owner_schema.clone(), i.owner_name.clone(),
-                ))
-                .collect(),
-        }
-    }
-
-    /// Returns the first object that is in `self` but not in `other`,
-    /// formatted for operator error messages. `None` means
-    /// `self ⊆ other`. Phase 3 uses this one-sided check (migration
-    /// fold ⊆ live) since imperative DDL can still add objects outside
-    /// the migration chain.
-    pub(crate) fn missing_from(&self, other: &DagSnapshot) -> Option<String> {
-        for t in &self.tables {
-            if !other.tables.contains(t) {
-                return Some(format!(
-                    "table {}.{} declared by migration but missing from live catalog",
-                    t.0, t.1,
-                ));
-            }
-        }
-        for v in &self.views {
-            if !other.views.contains(v) {
-                return Some(format!(
-                    "view {}.{} declared by migration but missing from live catalog",
-                    v.0, v.1,
-                ));
-            }
-        }
-        for i in &self.indices {
-            if !other.indices.contains(i) {
-                return Some(format!(
-                    "index {}.{} (owner {}.{}) declared by migration but missing from live catalog",
-                    i.0, i.1, i.2, i.3,
-                ));
-            }
-        }
-        None
-    }
-}
-
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
@@ -3198,89 +3097,6 @@ impl CatalogEngine {
         &mut self.dag as *mut DagEngine
     }
 
-    // -- Phase-3 boot assertion -----------------------------------------------
-
-    /// Snapshot the live registry by walking `sys_tables`, `sys_views`,
-    /// and `sys_indices` cursors. Each sys-table is authoritative for
-    /// its object kind and has been fully populated by the caller's
-    /// `replay_catalog`. The snapshot excludes system-owned objects
-    /// (ids below `FIRST_USER_TABLE_ID`) and internal FK indices.
-    pub(crate) fn live_dag_snapshot(&mut self) -> DagSnapshot {
-        let mut snap = DagSnapshot::default();
-
-        // Tables.
-        if let Ok(mut c) = self.sys_tables.create_cursor() {
-            while c.cursor.valid {
-                if c.cursor.current_weight > 0 {
-                    let tid = c.cursor.current_key_lo as i64;
-                    if tid >= FIRST_USER_TABLE_ID {
-                        let sid = cursor_read_u64(&c, TABLETAB_COL_SCHEMA_ID) as i64;
-                        let name = cursor_read_string(&c, TABLETAB_COL_NAME);
-                        if let Some(schema_name) = self.schema_id_to_name.get(&sid) {
-                            snap.tables.insert((schema_name.clone(), name));
-                        }
-                    }
-                }
-                c.cursor.advance();
-            }
-        }
-        // Views.
-        if let Ok(mut c) = self.sys_views.create_cursor() {
-            while c.cursor.valid {
-                if c.cursor.current_weight > 0 {
-                    let vid = c.cursor.current_key_lo as i64;
-                    if vid >= FIRST_USER_TABLE_ID {
-                        let sid = cursor_read_u64(&c, VIEWTAB_COL_SCHEMA_ID) as i64;
-                        let name = cursor_read_string(&c, VIEWTAB_COL_NAME);
-                        if let Some(schema_name) = self.schema_id_to_name.get(&sid) {
-                            snap.views.insert((schema_name.clone(), name));
-                        }
-                    }
-                }
-                c.cursor.advance();
-            }
-        }
-        // Indices. sys_indices has no direct schema column — the index
-        // lives in its owner table's schema. Internal FK indices
-        // (`__fk_*`) are generated by the cascade layer, never declared
-        // in migrations, and are excluded.
-        if let Ok(mut c) = self.sys_indices.create_cursor() {
-            while c.cursor.valid {
-                if c.cursor.current_weight > 0 {
-                    let owner_id = cursor_read_u64(&c, IDXTAB_COL_OWNER_ID) as i64;
-                    let name     = cursor_read_string(&c, IDXTAB_COL_NAME);
-                    if !name.contains("__fk_") {
-                        if let Some((owner_schema, owner_name))
-                            = self.id_to_qualified.get(&owner_id).cloned()
-                        {
-                            snap.indices.insert((
-                                owner_schema.clone(), name,
-                                owner_schema, owner_name,
-                            ));
-                        }
-                    }
-                }
-                c.cursor.advance();
-            }
-        }
-        snap
-    }
-
-    /// Build a snapshot purely from the head migration's canonical
-    /// desired state. Empty if no migrations have been committed yet.
-    pub(crate) fn fold_migration_snapshot(&mut self) -> Result<DagSnapshot, String> {
-        if self.current_migration_hash == 0 {
-            return Ok(DagSnapshot::default());
-        }
-        let bytes = read_migration_canonical_by_hash(self, self.current_migration_hash)
-            .ok_or_else(|| format!(
-                "head migration 0x{:032x} not found in sys_migrations",
-                self.current_migration_hash,
-            ))?;
-        let state = mig::decanonicalize(&bytes)?;
-        Ok(DagSnapshot::from_desired_state(&state))
-    }
-
     // -- Iteration helpers ----------------------------------------------------
 
     /// Collect all user table IDs.
@@ -3616,10 +3432,7 @@ pub(crate) struct ColumnDef {
     pub(crate) fk_col_idx: u32,
 }
 
-/// Circuit graph for create_view. Serializable so it can be embedded
-/// into the migration row (`compiled_circuits`) for worker-side
-/// deserialization during DAG rehydration.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Circuit graph for create_view.
 pub(crate) struct CircuitGraph {
     pub(crate) nodes: Vec<(i32, i32)>,           // (node_id, opcode)
     pub(crate) edges: Vec<(i32, i32, i32, i32)>, // (edge_id, src, dst, port)

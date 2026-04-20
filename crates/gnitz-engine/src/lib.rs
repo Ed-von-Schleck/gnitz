@@ -20,6 +20,5 @@ pub mod worker;
 pub mod master;
 pub mod executor;
 pub mod bootstrap;
-pub mod sqlc;
 pub mod reactor;
 pub mod committer;

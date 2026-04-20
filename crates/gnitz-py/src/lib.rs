@@ -1092,26 +1092,6 @@ impl PyGnitzClient {
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    /// submit_sql(default_schema, sql) -> None
-    ///
-    /// Submits raw SQL to the server via `FLAG_EXECUTE_SQL`. The server
-    /// parses and classifies the SQL: DDL is applied atomically as a
-    /// migration; DML is rejected (Phase 2 only supports DDL via this
-    /// path). Mixed DDL+DML is rejected.
-    ///
-    /// Named `submit_sql` (not `execute_sql`) to avoid collision with
-    /// the client-side planner's `execute_sql` below, which will be
-    /// removed in Phase 4 when client DDL is deleted. At that point
-    /// this method is renamed to `execute_sql`.
-    pub fn submit_sql(
-        &self, _py: Python<'_>,
-        default_schema: &str,
-        sql:            &str,
-    ) -> PyResult<()> {
-        client!(self).execute_sql(default_schema, sql)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
-    }
-
     // ----- DML -----
 
     /// push(target_id, batch, conflict_mode="update") -> ingest_lsn: int
