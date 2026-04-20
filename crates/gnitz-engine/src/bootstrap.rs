@@ -285,6 +285,38 @@ pub fn server_main(
         catalog.flush_all_system_tables();
     }
 
+    // --- Phase-3 boot-time equivalence assertion (debug-only) ---
+    //
+    // Verify that every object declared by the head migration (folded
+    // from its canonical DesiredState) appears in the live registry.
+    // This is the one-sided check appropriate for Phases 3-4, during
+    // which imperative DDL can still add objects outside the migration
+    // chain. Phase 5 will tighten the check to strict equality once
+    // imperative DDL is deleted.
+    //
+    // On mismatch we panic with a specific object name. Release builds
+    // skip the check entirely — the assertion is a development safety
+    // net, not a production recovery mechanism.
+    #[cfg(debug_assertions)]
+    {
+        let catalog = unsafe { &mut *catalog_ptr };
+        let live   = catalog.live_dag_snapshot();
+        let folded = match catalog.fold_migration_snapshot() {
+            Ok(s) => s,
+            Err(e) => panic!(
+                "Phase-3 boot fold failed: {} (head=0x{:032x})",
+                e, catalog.current_migration_hash,
+            ),
+        };
+        if let Some(diff) = folded.missing_from(&live) {
+            panic!(
+                "Phase-3 boot-fold assertion failed: {}\n\
+                 head=0x{:032x}\nfolded={:#?}\nlive={:#?}",
+                diff, catalog.current_migration_hash, folded, live,
+            );
+        }
+    }
+
     // --- W2M regions (memfd-backed, one per worker→master) ---
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut w2m_fds: Vec<i32> = Vec::with_capacity(nw);
