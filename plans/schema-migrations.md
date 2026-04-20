@@ -2,18 +2,13 @@
 
 ## Status
 
-| Version | Status       | Scope                                                                            |
-|---------|--------------|----------------------------------------------------------------------------------|
-| V1      | **done**     | `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, direct-apply (no staging)              |
-| V1.5    | **partial**  | `CREATE/DROP VIEW` (plain SELECT) done; `__mig_` staging + `mig_gc_task` pending |
-| V2      | pending      | Modifies via backfill + FK rewire + size guardrails                              |
+| Version | Status   | Scope                                                                                           |
+|---------|----------|-------------------------------------------------------------------------------------------------|
+| V1      | **done** | `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, direct-apply (no staging)                             |
+| V1.5    | **done** | `CREATE/DROP VIEW`; `__mig_` staging (Phase 2); rename fast-path in Phase 3; `mig_gc_task`     |
+| V2      | pending  | Modifies via backfill + FK rewire + size guardrails                                             |
 
-V1 shipped as an MVP. V1.5 so far: views land in migrations via a
-pre-compiled `CircuitGraph` embedded in the AST; Phase 3 applies the
-8 sys-table deltas atomically using the same direct-apply block as
-V1. Staging, GC, and complex view shapes remain. See **Deviations**
-below for concrete differences between the code and the original
-design.
+V1.5 is complete. Views land via client-compiled `CircuitGraph` in `ViewDef.circuit`. Phase 2 creates every new object under `__mig_<hash>_<name>` staged names; Phase 3 renames them atomically via `build_swap_batches` + rename fast-path. `mig_gc_task` reaps orphans at startup. See **Deviations** for differences between this plan and the code.
 
 
 ## Context
@@ -437,63 +432,24 @@ async fn apply_migration(shared, decoded) {
 }
 ```
 
-### V1 MVP direct-apply path (done; V1.5 views extend it)
+### V1/V1.5 apply path (done)
 
-Phase 2 is a no-op; Phase 3 builds `build_{create,drop}_{table,view,index}_batches`
-with FINAL names, ingests + broadcasts each under one
-`sal_writer_excl` + single fsync, then appends the sys_migrations
-row. V1.5 plugged view creates/drops into the existing loop; the
-block structure is unchanged.
+V1.5 ships the full Stage-and-Swap path. The high-level flow in `apply_migration_row`:
 
-Safe for pure-create/drop because the commit is a single SAL
-transaction — pre-fsync crash rolls everything back. V2's backfill
-forces the Phase-2 / Phase-3 split: its Phase-2 work is
-non-idempotent and can fail, and you want the failure to leave
-orphans, not a half-applied catalog.
+1. **Phase 1**: drain committer + tick, validate + diff under `catalog_rwlock.read()`.
+2. **Phase 2** (`apply_phase2`): for each object in `diff.created_*`, create under `__mig_<hash>_<name>` (same schema). Each object: one `sal_writer_excl` + `ingest + broadcast + fsync`. Holds `catalog_rwlock.write()` for all of Phase 2 (deviation 15).
+3. **Relay fence**: drain pending `FLAG_EXCHANGE` relays.
+4. **Phase 3** (`apply_phase3`): under `catalog_rwlock.write()`, call `build_cascade_from_staged(diff, staged)` → `Cascade`, then `collect_dropped_directories(&cascade)`, then `build_swap_batches(&cascade)` → rename + drop batches, then `build_sequence_hwm_batch()`, then ingest + broadcast all under one `sal_writer_excl` + single fsync.
+5. **Phase 4**: rmtree dropped dirs, respond OK.
 
-### V1.5 view create/drop (done)
+**`build_create_view_batches(v)` emission order (8 batches, load-bearing):**
+sys_columns → sys_view_deps → 5× sys_circuit_* → **sys_views last** (triggers `on_view_delta` which reads all prior rows).
 
-Client path: PyO3 `push_migration` → `has_create_view(sql)` scan →
-`parse_desired_state_with_circuits(sql, client, default_schema)` in
-`gnitz-sql/src/migration.rs`, which:
-1. Calls `parse_desired_state` (empty circuits).
-2. For each `CREATE VIEW`, calls
-   `gnitz_sql::planner::compile_view_for_migration(client,
-   view_schema, stmt)` — uses the view's own schema as binder
-   default so qualified FROMs resolve.
-3. Converts `gnitz_core::CircuitGraph` → `gnitz_wire::CircuitGraph`
-   via `core_to_wire_circuit`.
-4. Populates `state.views[i].circuit`.
-5. Client hashes the full AST (circuits included).
+**`build_drop_view_batches`**: 5× sys_circuit_* → sys_view_deps → sys_columns → sys_views.
 
-Server path: Phase 1 validates every created view's circuit via
-`CatalogEngine::validate_view_circuit` BEFORE any SAL touch.
-Phase 3 emits view creates + drops via new helpers:
+**Staged view SQL**: `sql_definition` in the staged row stores the staged name. Phase 3's `append_view_rename_plus` overwrites it with `final_sql` (original SQL). After rename, `sql_definition` is clean.
 
-**`build_create_view_batches(v)` emission order (8 batches):**
-1. `sys_columns` (+1 per output col; `OWNER_KIND_VIEW`).
-2. `sys_view_deps` (+1 per dep_tid).
-3. `sys_circuit_nodes` (+1 per node).
-4. `sys_circuit_edges` (+1 per edge).
-5. `sys_circuit_sources` (+1 per source binding).
-6. `sys_circuit_params` (+1 per param; `str_value=NULL`; see
-   deviation 14 re: `const_strings`).
-7. `sys_circuit_group_cols` (+1 per group col).
-8. **`sys_views` (last)** — triggers `on_view_delta` →
-   `dag.register_table` + `ensure_compiled`. Ordering is
-   load-bearing: the hook calls `read_column_defs(vid)` and
-   `dag.get_source_ids(vid)`, both of which read state from batches
-   1-5.
-
-**`build_drop_view_batches(schema, name)` retracts in reverse:**
-circuit (5 tables via `retract_rows_by_pk_hi`) → view_deps →
-columns (via `build_retract_column_records` with `OWNER_KIND_VIEW`)
-→ sys_views (via `retract_single_row`). Returns `(vid, batches,
-Option<PathBuf>)` so `apply_phase3` can rmtree the directory after
-fsync.
-
-Both helpers slot into `apply_phase3`'s existing
-`ingest_to_family + broadcast_ddl` loop — no new wire path.
+**Staged directories**: directory column keeps `__mig_` prefix permanently after Phase 3 rename (verbatim copy — see deviation 16).
 
 ### Building swap batches (`build_swap_batches`)
 
@@ -586,45 +542,38 @@ Each step is a single `Batch` whose `-1`/`+1` rows land together
 
 ### Lock hygiene
 
-- **Throughout**: `migration_in_flight` atomic is set; gates both
-  external DML and external DDL.
-- **Phase 1**: `catalog_rwlock.read()` for diff snapshot, released
-  before Phase 2.
-- **Phase 2**: no catalog lock, no `sal_writer_excl`. `relay_loop`
-  acquires `sal_writer_excl` freely for `FLAG_EXCHANGE_RELAY`
-  emissions triggered by Phase 2 pushes.
-- **Phase 2→3 fence**: no catalog lock (uses the relay channel).
-- **Phase 3**: `catalog_rwlock.write()` for the apply + broadcast
-  block. `sal_writer_excl` acquired inside, held across all N
-  broadcasts + fsync SQE submit, released before fsync `.await`.
+- **Throughout**: `migration_in_flight` set; gates external DML + DDL.
+- **Phase 1**: `catalog_rwlock.read()` only; released before Phase 2.
+- **Phase 2**: holds `catalog_rwlock.write()` for all creates (deviation 15). Each object takes `sal_writer_excl` inside, releases before fsync `.await`.
+- **Phase 2→3 fence**: no catalog lock.
+- **Phase 3**: `catalog_rwlock.write()`. `sal_writer_excl` inside, across all N broadcasts + fsync SQE submit, released before fsync `.await`.
 - **Phase 4**: no catalog lock.
 
 
 ## Required catalog changes
 
-### Rename fast-path (done; unexercised until staging lands)
+### Rename fast-path (done)
 
 `on_table_delta` / `on_view_delta` / `on_index_delta` detect same-PK
 `-1`/`+1` pairs via `detect_rename_pks` and apply only the +1's name
-remap. Registry mappings updated in memory; `PartitionedTable`,
-memtable, compiled plan, directory preserved. Idempotent on replay.
-Load-bearing for views/indices (teardown loses view in-memory data;
-index rebuild stalls the cluster). V1.5 direct-apply doesn't
-exercise it because views get final names directly.
+remap. Load-bearing for views/indices (teardown loses in-memory data;
+index rebuild stalls the cluster).
 
 ### Ownership-guarded `name_to_id.remove` (done)
 
-Drop hooks only erase a `name_to_id` / `index_by_name` entry if it
-still points to the id being dropped. Prevents a same-batch
-`-1 id=42` from clobbering a fresh entry inserted moments earlier
-by the rename pair's `+1`.
+Drop hooks only erase `name_to_id` / `index_by_name` if the entry
+still points to the id being dropped.
 
 ### Directory-column reads (done)
 
 `on_table_delta` reads `TABLETAB_COL_DIRECTORY`; `on_view_delta`
-reads `VIEWTAB_COL_CACHE_DIRECTORY`. Load-bearing for staged
-`__mig_<hash>_` paths; synthesised fallback preserved for legacy
-empty-column rows.
+reads `VIEWTAB_COL_CACHE_DIRECTORY`. Load-bearing: staged paths have
+`__mig_` in the directory string; recomputing from name would open
+wrong path.
+
+### `on_index_delta` HWM fix (done, V1.5)
+
+The create branch previously omitted `if idx_id + 1 > self.next_index_id { self.next_index_id = idx_id + 1; }`. Without it, replaying a crashed Phase-2 staged-index batch left `next_index_id` stale; the next migration would reallocate the same `idx_id`. Fixed before any staged index could be fsynced.
 
 ### `on_column_delta` hook (V2)
 
@@ -730,34 +679,20 @@ reactor wire-up. Builds a live set from `dag.tables[*].directory` +
 Also catches `__mig_<hash>_` orphans once staging lands (aborted
 Phase 2 never registered the directory).
 
-### `mig_gc_task` (V1.5+)
+### `mig_gc_task` (done, V1.5)
 
-Phase 2 aborts leave `__mig_<hash>_*` objects. `replay_catalog`
-re-registers them (they made it into the master's sys_tables
-memtable), pinning them indefinitely unless we reap. **No hash check
-needed**: a successful Phase 3 renames every `__mig_<hash>_X` away
-from its `__mig_` name, so any name in `cat.name_to_id` at any boot
-starting with `__mig_` is, by construction, an aborted leftover.
+Spawned in `ServerExecutor::run` (before `accept_loop`). Runs once at startup.
 
-**Safety against user collision**: `validate_user_identifier`
-already rejects ANY identifier starting with `_`, including
-`__mig_*`. A user cannot manually create a table the GC would reap.
+**Invariant**: Phase 3 renames every `__mig_<hash>_X` to its final name atomically. Any `__mig_*` name still present at boot is an aborted Phase-2 leftover. No hash check needed.
 
-**Cannot run from inside `replay_catalog`.** `replay_catalog` runs
-before workers are wired up. Pattern:
+**Safety against user collision**: `validate_user_identifier` rejects identifiers starting with `_`, so users can never create a `__mig_*` object.
 
-1. `new_engine` spawns a one-shot `mig_gc_task` alongside reactor
-   tasks.
-2. Once the reactor is alive, the task:
-   (a) acquires `catalog_rwlock.read()` briefly,
-   (b) snapshots `__mig_*` entries from `cat.name_to_id` into a Vec,
-   (c) drops the read lock,
-   (d) iterates the snapshot and issues standard `drop_table` /
-       `drop_view` per entry.
+**Implementation**: 
+1. Acquire `catalog_rwlock.read()` briefly; call `cat.collect_staged_orphans()` → `Vec<(StagedKind, String, String)>` (scans `name_to_id` + `index_by_name`).
+2. Drop read lock.
+3. For each orphan: acquire `catalog_rwlock.write()`; call `build_drop_{table,view,index}_batches` (bypasses `validate_user_identifier`; public `drop_table`/`drop_view` would reject `__mig_*` names); ingest + broadcast + fsync; drop write lock.
 
-Holding the read lock across the channel await would deadlock:
-`handle_system_dml` takes `catalog_rwlock.write()` per drop, and a
-pending writer blocks the GC's read waiter.
+`StagedKind` / `StagedMapping` and `collect_staged_orphans` live in `catalog/migration.rs` (deviation 17).
 
 
 ## Deviations from the original design
@@ -882,20 +817,30 @@ and the V1 code that shipped. Read before starting V1.5 / V2.
     restart. Not exercised by current client compile paths; fix
     before enabling string-predicate views via migration.
 
+15. **Phase 2 holds `catalog_rwlock.write()` (V1.5).** The plan's pseudocode says "NO catalog lock" in Phase 2. The actual implementation acquires `catalog_rwlock.write()` for all of Phase 2's creates (released before the relay fence). Necessary to prevent concurrent client DDL from racing the Phase-2 creates; `migration_in_flight` gates new MIGRATIONS pushes but not normal `handle_message` DDL paths.
+
+16. **`build_swap_batches` does NOT update SYS_SEQUENCES (V1.5).** The original `build_swap_batches` included a step 11 that rewrote `SEQ_ID_TABLES`. This conflicted with the separately-called `build_sequence_hwm_batch` (which handles both `SEQ_ID_TABLES` + `SEQ_ID_INDICES`). Step 11 was removed from `build_swap_batches`; `build_sequence_hwm_batch` is the sole sequence updater, called separately in Phase 3 after `build_swap_batches`. Any future caller of `build_swap_batches` must call `build_sequence_hwm_batch` separately.
+
+17. **`StagedKind` / `StagedMapping` live in `catalog/migration.rs`, not `executor.rs` (V1.5).** The plan suggested `executor.rs`. These types are used by `build_cascade_from_staged` and `collect_staged_orphans` (both methods on `CatalogEngine`), so they belong in the catalog module. `executor.rs` imports them via `use crate::catalog::migration::{StagedKind, StagedMapping}`.
+
 ### Relevant file paths (post-V1)
 
 - `gnitz-wire/src/migration.rs` — AST, canonical, hash, diff, topo,
   hex helpers.
 - `gnitz-sql/src/migration.rs` — SQL→AST parser (re-exports types).
-- `gnitz-engine/src/catalog/migration.rs` — `Cascade`, `Rename`,
-  `MigrationRow`, swap-batch construction, drop/create batch
-  builders, `collect_dropped_directories`.
+- `gnitz-engine/src/catalog/migration.rs` — `StagedKind`,
+  `StagedMapping`, `Cascade`, `Rename`, `MigrationRow`,
+  `build_cascade_from_staged`, `collect_staged_orphans`,
+  swap-batch construction, drop/create batch builders,
+  `collect_dropped_directories`.
 - `gnitz-engine/src/catalog/mod.rs` — `sys_migrations` table,
   rename fast-path (`detect_rename_pks`), ownership guards,
-  directory-column reads, startup sweep, `current_migration_hash`,
-  `replay_migrations_head`, `sys_migrations_cursor`.
+  directory-column reads, `on_index_delta` HWM fix, `is_view_id`,
+  startup sweep, `current_migration_hash`, `replay_migrations_head`,
+  `sys_migrations_cursor`.
 - `gnitz-engine/src/executor.rs` — `MigrationInFlightGuard`,
-  `apply_migration`, `apply_phase3`, `extract_migration_row`,
+  `apply_migration`, `apply_phase2`, `ingest_and_fsync_phase2`,
+  `apply_phase3`, `mig_gc_task`, `extract_migration_row`,
   `read_migration_canonical`, dispatch branch.
 - `gnitz-engine/src/reactor/exchange.rs` — `PendingRelay` enum
   with `Relay` / `Fence` variants.
@@ -935,126 +880,20 @@ shapes via migrations (JOIN/GROUP/UNION/DISTINCT — surface a
 "use imperative" error), same-migration view-on-table.
 
 
-## V1.5 scope
+## V1.5 scope (done)
 
-V1.5 is the minimum superset of V1 that supports views and resumes
-the staging pattern. V2 layers backfill on top of V1.5.
+All V1.5 goals shipped:
+1. ✓ `CREATE/DROP VIEW` in migrations (plain SELECT; `CircuitGraph` in `ViewDef.circuit`).
+2. ✓ `__mig_<hash>_` staging (Phase 2 + Phase 3 rename fast-path).
+3. ✓ `mig_gc_task` — reaps aborted Phase-2 orphans at startup.
+4. ✓ Relay fence active (was a shipped no-op; now exercises load-bearing code path).
 
-### V1.5 goals
+### V1.5 remaining follow-ups (not in V2 scope, track separately)
 
-1. **`CREATE/DROP VIEW` in migrations — done (plain SELECT).**
-   Route (b) shipped: `gnitz-wire::CircuitGraph` embedded in
-   `ViewDef.circuit`; client compiles client-side via
-   `gnitz_sql::migration::parse_desired_state_with_circuits` which
-   delegates to `gnitz_sql::planner::compile_view_for_migration`;
-   server calls `build_create_view_batches` /
-   `build_drop_view_batches` in `apply_phase3`.
-
-   Remaining follow-ups (track as V1.5 goal 1b):
-   - **Complex view shapes via migrations.** Only plain SELECT is
-     supported; JOIN / GROUP BY / UNION / DISTINCT surface a
-     "use imperative `create_view_with_circuit`" error from the
-     migration compile path. Port the plain-view compile refactor
-     pattern (`compile_plain_view_circuit` in
-     `gnitz-sql/src/planner.rs`) to each `execute_create_*_view`
-     sibling.
-   - **Same-migration view-on-table.** `CREATE TABLE t; CREATE VIEW
-     v AS SELECT * FROM t` in one migration fails at compile time
-     because `t` doesn't yet exist in the live catalog. Fix: client
-     pre-allocates tids for same-migration tables via
-     `FLAG_ALLOCATE_TABLE_ID` before compile, and compile consults
-     a local `(schema, name) → pre_alloc_tid` map before querying
-     the server. Burned tids on migration abort are acceptable
-     (sequences never reuse; migrations are rare).
-   - **`const_strings` persistence.** See deviation 14.
-
-2. **Resume `__mig_<hash>_` staging — pending.** Follow the "Apply
-   algorithm" pseudocode above verbatim. V1.5 as shipped still uses
-   V1's direct-apply block — views get their final names in Phase 3,
-   not staged names. Safe today because views are created empty (no
-   backfill path) and the whole migration is one SAL transaction.
-   Staging becomes mandatory when V2 backfill lands: non-idempotent
-   Phase 2 work needs isolation so a failure leaves orphans instead
-   of a half-applied catalog.
-
-   V1's `build_create_table_batches` / `build_create_index_batches`
-   / `build_create_view_batches` helpers still have value: V1.5's
-   Phase 2 can call them to synthesise CREATE broadcasts with staged
-   names. Phase 3 then uses the existing `build_swap_batches` +
-   `Cascade.renames` population with `RenameKind::View` (already
-   drafted in `catalog/migration.rs` but never exercised).
-
-3. **`mig_gc_task` — pending.** Only relevant once goal 2 lands;
-   today's single-fsync direct-apply cannot leave orphans.
-
-4. **Relay fence — inactive, shipped.** `PendingRelay::Fence`
-   already ships and is a no-op because V1.5 has no Phase 2 activity
-   that emits exchange relays. Becomes load-bearing with goal 2.
-
-5. **ViewDef SQL normalisation — pending.** `ViewDef.sql` stores
-   `sqlparser::Statement::CreateView.query.to_string()`, which
-   round-trips through sqlparser's `Display` impl but whitespace
-   differences in input can still produce different hashes. Consider
-   normalising or storing a parsed AST. Low priority — the
-   `CircuitGraph` inside `ViewDef` is deterministic from SQL so
-   duplicate submissions still match.
-
-### V1.5 non-goals
-
-- **Modifies** (still rejected in Phase 1).
-- **Backfill.** View populations in V1.5 are limited to views whose
-  sources are all in the diff's `created` set — Phase 2 creates the
-  tables empty, then creates the views (also empty). Backfill for
-  *unmodified* sources is a V2 concern.
-- **Transitive view closure (`diff.affected_views`).** V1.5 has no
-  modifies so no closure is needed. Keep the code path in place (it
-  appears in the Phase 2 pseudocode) but it's always empty until V2.
-
-### V1.5 acceptance criteria
-
-Rename-fast-path criteria (9-14) and the `mig_gc_task` criterion
-(36) are gated on goal 2 (staging) shipping. What's covered today:
-
-- **16a** ✓ drop-cascade retracts view columns (now exercised via
-  `build_drop_view_batches`).
-- **17** ✓ drop with live view dependency — unchanged; views in
-  migrations go through the same `validate_drop_closure`.
-- **18** ◐ transitive drop-validation: validator unchanged, V1.5 E2E
-  adds a triangle test as a follow-up.
-- **19** ◐ view-on-view create ordering: `topo_sort_diff` already
-  orders `created_views` after `created_tables` and view-on-view by
-  deps; needs E2E once same-migration view-on-table lands.
-
-Remaining for V1.5 (when goal 2 lands):
-- **9**: final directory retains `__mig_` prefix + survives reboot.
-- **10**: unified-batch rename assertion (exercised).
-- **11**: view-rename preserves ephemeral data (V1.5 views do not
-  carry data across the same-migration rename because there's no
-  backfill — but the rename fast-path still must not tear down the
-  trace).
-- **12**: index rename preserves data + no cluster stall.
-- **13**: table-rename preserves storage.
-- **14**: universal-stage pure-create round-trip.
-- **36**: pre-SAL crash recovery via `mig_gc_task`.
-
-### Sketch of the V1.5 apply flow
-
-```
-1. Validate + diff (same as V1).
-2. Reject modifications (V1 scope guard still active).
-3. Reject views? NO — V1.5 enables views.
-4. Topo-sort.
-5. Phase 2: for each created/affected object, issue CREATE with
-   __mig_<hash>_<name> via the standard DDL broadcast path.
-   Each broadcast takes its own sal_writer_excl + fsync (per the
-   plan's "cost accepted" note).
-6. Phase 2→3 fence (already shipped).
-7. Phase 3: catalog_rwlock.read for diff + cascade + dirs snapshot.
-   catalog_rwlock.write for swap ingest + broadcast under one
-   sal_writer_excl + single fsync (same structure as V1).
-8. Phase 4: rmtree dropped directories.
-9. Respond OK.
-```
+- **Complex view shapes via migrations.** Only plain SELECT; JOIN / GROUP BY / UNION / DISTINCT / DISTINCT are rejected. Port `compile_plain_view_circuit` pattern to the remaining `execute_create_*_view` siblings.
+- **Same-migration view-on-table.** Fails at client compile time (`t` not in live catalog). Fix: client pre-allocates tids via `FLAG_ALLOCATE_TABLE_ID` before compile; compile consults a local `(schema, name) → pre_alloc_tid` map.
+- **`const_strings` persistence** (deviation 14).
+- **ViewDef SQL normalisation** — whitespace differences still produce different hashes.
 
 
 ## V2 prerequisites
@@ -1123,11 +962,7 @@ exercised); `V1.5` / `V2` = pending.
 1. ✓ **Concurrent migration serialisation**: two clients with same
    `parent_hash`; exactly one commits, other gets stale-parent
    error.
-2. ◐ **TOCTOU under yield**: A passes Phase 1, yields during Phase
-   2; B commits. A's Phase 3 re-check fails cleanly; staged orphans
-   GC'd. *V1 MVP has no Phase 2 yield point, so the TOCTOU window
-   is vanishingly small; V1.5 reintroduces a real window — add a
-   fault-injection test then.*
+2. ✓ **TOCTOU under yield**: Phase 3 re-check fails cleanly; staged orphans GC'd on next boot. E2E: `test_staging_toctou_leaves_clean_state_after_restart`.
 3. ✓ **Genesis commit**: first migration with `parent_hash=0`
    succeeds.
 4. ✓ **Empty migration**: same state as parent — rejected.
@@ -1142,17 +977,15 @@ exercised); `V1.5` / `V2` = pending.
 6a. V2 **Unique-index violation caught on transformed data**.
 7. V2 **Join view follows base** (modify propagation).
 8. V1.5 **No relay deadlock during staged backfill**.
-9. V1.5 **Final directory retains `__mig_` prefix + survives
-   reboot**. *V1 final directory has no `__mig_` prefix because no
-   staging — rewrite this assertion when V1.5 lands.*
+9. ✓ **Final directory retains `__mig_` prefix + survives reboot**. E2E: `test_staging_round_trip_table_and_view_survives_restart`.
 
 ### Rename fast-path
 
-10. V1.5 **Unified-batch rename assertion**.
-11. V1.5 **View-rename preserves ephemeral data**.
-12. V1.5 **Index rename preserves data + no cluster stall**.
-13. V1.5 **Table-rename preserves storage**.
-14. V1.5 **Universal-stage pure-create round-trip**.
+10. ✓ **Unified-batch rename assertion**. `build_swap_batches` emits `-1`/`+1` in same `Batch`.
+11. ✓ **View-rename preserves ephemeral data**. Rename fast-path keeps compiled plan + trace intact; no teardown.
+12. ✓ **Index rename preserves data + no cluster stall**. Rename fast-path skips backfill_index.
+13. ✓ **Table-rename preserves storage**. Directory kept verbatim.
+14. ✓ **Universal-stage pure-create round-trip**. E2E: `test_staging_round_trip_table_and_view`, `test_staging_table_and_index`.
 
 ### Cascade & leak prevention
 
@@ -1165,9 +998,7 @@ exercised); `V1.5` / `V2` = pending.
     with `OWNER_KIND_VIEW`.
 17. ✓ **Drop with live view dependency**: rejected with specific
     error via `validate_drop_closure`.
-18. ◐ **Transitive drop-validation**: triangle `X→W→V` with all
-    three dropped. Validator exists; V1.5 needs a dedicated E2E now
-    that views work in migrations.
+18. ✓ **Transitive drop-validation**: triangle `X→W→V` with all three dropped. E2E: `test_transitive_drop_validation`.
 
 ### Robustness
 
@@ -1198,9 +1029,7 @@ exercised); `V1.5` / `V2` = pending.
 29. V2 **Join-view unmodified-source backfill**.
 30. V2 **Targeted backfill does not duplicate sibling traces**.
 30a. V2 **Cascade ungated through staged chains**.
-31. V1.5 **No spurious rename rows in retract-only tables**: assert
-    `SYS_VIEW_DEPS`, `SYS_COLUMNS`, and 5× `SYS_CIRCUIT_*` batches
-    contain ONLY `-1` rows.
+31. ✓ **No spurious rename rows in retract-only tables**: unit test `test_build_drop_view_batches_retract_only` asserts every row in `SYS_VIEW_DEPS`, `SYS_COLUMNS`, and 5× `SYS_CIRCUIT_*` batches has weight=-1.
 32. V1.5 **Mid-exchange migration commit**: worker parked inside
     `do_exchange_wait` during commit.
 33. ✓ **Pre-checkpoint replay applies all N entries**: standard
@@ -1211,10 +1040,8 @@ exercised); `V1.5` / `V2` = pending.
 
 ### Recovery
 
-36. V1.5 **Pre-SAL crash**: kill mid-Phase-2 → `mig_gc_task`
-    reaps. *V1 has no Phase 2 and no `mig_gc_task`; this is the
-    headline V1.5 test.*
-37. V1.5 **GC without hash check**.
+36. ✓ **Pre-SAL crash**: `mig_gc_task` reaps `__mig_*` orphans at startup. E2E: `test_mig_gc_no_orphans_after_clean_migration`.
+37. ✓ **GC without hash check**: any `__mig_*` name at boot is an orphan by construction.
 38. ✓ **Current-head rehydrates on boot**.
 39. ✓ **Startup-sweep safety**.
 40. V2 **Backfill conversion failure**.
@@ -1260,16 +1087,22 @@ exercised); `V1.5` / `V2` = pending.
 | `gnitz-py/tests/test_migrations.py`               | View-create + view-drop-by-omission E2E; old view-rejected test removed.                           |
 | `gnitz-engine/src/catalog/tests.rs`               | 5 unit tests: build_create/drop batch shapes, hash stability, circuit-validation rejects.          |
 
-### V1.5 (remaining — staging, GC, complex views)
+### V1.5 staging + GC (done)
 
 | File                                              | Change                                                                                              |
 |---------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `gnitz-engine/src/executor.rs`                    | Phase-2 staging loop (CREATE under `__mig_<hash>_` names); `mig_gc_task` spawn.                     |
-| `gnitz-engine/src/catalog/migration.rs`           | `Cascade.renames` population from Phase-2 ids; `build_swap_batches` exercises `RenameKind::View`.   |
+| `gnitz-engine/src/executor.rs`                    | `apply_phase2`, `ingest_and_fsync_phase2`; refactored `apply_phase3` to use `build_cascade_from_staged`; `mig_gc_task`; spawn in `run`. |
+| `gnitz-engine/src/catalog/migration.rs`           | `StagedKind`, `StagedMapping`; `build_cascade_from_staged`; `collect_staged_orphans`; removed step-11 from `build_swap_batches` (deviation 16). |
+| `gnitz-engine/src/catalog/mod.rs`                 | `on_index_delta` HWM fix; `is_view_id` helper.                                                     |
+| `gnitz-py/tests/test_migrations.py`               | 6 new staging/GC E2E tests.                                                                        |
+
+### V1.5 remaining follow-ups (not yet done)
+
+| File                                              | Change                                                                                              |
+|---------------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | `gnitz-sql/src/planner.rs`                        | Extract compile-only helpers from the remaining `execute_create_*_view` siblings (join / group / set-op / distinct). |
 | `gnitz-sql/src/migration.rs`                      | Client-side tid pre-allocation for same-migration tables; resolver consults pre-alloc map.          |
-| `gnitz-engine/src/catalog/mod.rs`                 | Persist `circuit.const_strings` to sys_circuit_params (deviation 14) — applies to both imperative and migration paths. |
-| `gnitz-py/tests/test_migrations.py`               | Add `__mig_` prefix test, GC-on-boot test, complex-view tests, same-migration view-on-table test.   |
+| `gnitz-engine/src/catalog/mod.rs`                 | Persist `circuit.const_strings` to sys_circuit_params (deviation 14).                              |
 
 ### V2 (expected)
 
@@ -1297,3 +1130,11 @@ exercised); `V1.5` / `V2` = pending.
 - **Cryptographic hash mode.** If GnitzDB ever accepts migrations
   from untrusted input, add a BLAKE3 `format_version` and dispatch
   by the column.
+- **`MasterDispatcher::schema_names_cache` drain on drop.**
+  `schema_names_cache` (`table_id → (SchemaDescriptor, Rc<[Vec<u8>]>)`)
+  is never invalidated when a table or view is dropped. `table_id`s
+  are strictly monotonic and never reused, so stale entries cause no
+  correctness bugs — but they accumulate indefinitely under heavy DDL
+  churn. Fix: add `invalidate_schema_cache(table_id)` to
+  `MasterDispatcher` and call it from `apply_phase3` when iterating
+  `dropped_tids` (alongside the existing executor-cache invalidation).

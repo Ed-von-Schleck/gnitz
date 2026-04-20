@@ -19,6 +19,39 @@ use super::{
 };
 use super::sys_tables::*;
 
+/// Phase-2 record of a single staged object.  Created by `apply_phase2`
+/// and consumed by `apply_phase3` via `build_cascade_from_staged`.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedMapping {
+    pub kind: StagedKind,
+    /// The tid / vid / idx_id allocated in Phase 2.
+    pub staged_id: i64,
+    pub final_schema: String,
+    pub final_name: String,
+    /// For views only: the original SQL text (with the final view name)
+    /// so Phase 3's rename overwrites `sql_definition` correctly.
+    pub final_sql: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StagedKind { Table, View, Index }
+
+pub(crate) const STAGED_PREFIX: &str = "__mig_";
+
+pub(crate) fn staged_name(hash_hex: &str, name: &str) -> String {
+    format!("__mig_{}_{}", hash_hex, name)
+}
+
+impl From<StagedKind> for RenameKind {
+    fn from(k: StagedKind) -> Self {
+        match k {
+            StagedKind::Table => RenameKind::Table,
+            StagedKind::View  => RenameKind::View,
+            StagedKind::Index => RenameKind::Index,
+        }
+    }
+}
+
 /// One entry in the Phase-3 swap that takes a staged object named
 /// `__mig_<hash>_<final_name>` and renames it to `<final_name>`.
 /// The object's tid/vid/idx_id is preserved across the swap; only
@@ -129,6 +162,68 @@ impl CatalogEngine {
         }
 
         cascade
+    }
+
+    /// Build the Phase-3 Cascade from the list of staged objects produced
+    /// by Phase 2 plus the drop lists in `diff`.  Must be called under
+    /// `catalog_rwlock.write()`.
+    pub(crate) fn build_cascade_from_staged(
+        &mut self,
+        diff: &gnitz_wire::migration::Diff,
+        staged: &[StagedMapping],
+    ) -> Cascade {
+        let renames: Vec<Rename> = staged.iter().map(|m| Rename {
+            kind: m.kind.into(),
+            id: m.staged_id,
+            final_schema: m.final_schema.clone(),
+            final_name:   m.final_name.clone(),
+            final_sql:    m.final_sql.clone(),
+        }).collect();
+
+        let dropped_tables: Vec<(String, String)> = diff.dropped_tables.iter()
+            .map(|t| (t.schema.clone(), t.name.clone())).collect();
+        let dropped_views: Vec<(String, String)> = diff.dropped_views.iter()
+            .map(|v| (v.schema.clone(), v.name.clone())).collect();
+        let dropped_indices: Vec<(String, String)> = diff.dropped_indices.iter()
+            .map(|i| (i.schema.clone(), i.name.clone())).collect();
+
+        self.collect_cascade(&dropped_tables, &dropped_views, &dropped_indices, renames)
+    }
+
+    /// Collect all `__mig_*` objects currently live in the catalog.  Called by
+    /// `mig_gc_task` under a brief read lock to snapshot the orphan list.
+    pub(crate) fn collect_staged_orphans(&mut self) -> Vec<(StagedKind, String, String)> {
+        let mut out: Vec<(StagedKind, String, String)> = Vec::new();
+
+        // Collect __mig_* table / view names (they share the name_to_id map).
+        let mig_entries: Vec<(String, String, i64)> = self.name_to_id.iter()
+            .filter_map(|(qualified, &id)| {
+                let mut it = qualified.splitn(2, '.');
+                let schema = it.next()?;
+                let name   = it.next()?;
+                if name.starts_with(STAGED_PREFIX) {
+                    Some((schema.to_string(), name.to_string(), id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (schema, name, id) in mig_entries {
+            let kind = if self.is_view_id(id) { StagedKind::View } else { StagedKind::Table };
+            out.push((kind, schema, name));
+        }
+
+        // Collect __mig_* index names.
+        let mig_idx: Vec<String> = self.index_by_name.keys()
+            .filter(|n| n.starts_with(STAGED_PREFIX))
+            .cloned()
+            .collect();
+        for name in mig_idx {
+            out.push((StagedKind::Index, String::new(), name));
+        }
+
+        out
     }
 
     // -- Directory snapshot ---------------------------------------------
@@ -306,25 +401,6 @@ impl CatalogEngine {
                 batch.append_batch(&r, 0, r.count);
             }
             if batch.count > 0 { out.push((tab_id, batch)); }
-        }
-
-        // 11. SYS_SEQUENCES: -1/+1 rewriting SEQ_ID_TABLES next_val to
-        //     master's authoritative HWM (next_table_id - 1).
-        {
-            let schema = seq_tab_schema();
-            let mut batch = Batch::with_schema(schema, 2);
-            // -1: cursor-seek current stored value
-            let r = retract_single_row(&mut self.sys_sequences, &schema, SEQ_ID_TABLES as u64, 0);
-            batch.append_batch(&r, 0, r.count);
-            // +1: authoritative HWM from master state
-            let new_val = self.next_table_id - 1;
-            let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(SEQ_ID_TABLES as u64, 0, 1);
-            bb.put_u64(new_val as u64);
-            bb.end_row();
-            let plus = bb.finish();
-            batch.append_batch(&plus, 0, plus.count);
-            if batch.count > 0 { out.push((SEQ_TAB_ID, batch)); }
         }
 
         Ok(out)
@@ -884,6 +960,70 @@ impl CatalogEngine {
             batch.append_batch(&plus, 0, plus.count);
         }
         Ok(batch)
+    }
+
+    /// Phase-1 transitive drop-closure check.  For every live record in
+    /// sys_view_deps, if the depended-upon object (table or view) is in
+    /// `diff.dropped_*`, the dependent view must also be in `diff.dropped_views`.
+    ///
+    /// Transitivity is handled naturally: each intermediate dep record
+    /// (V→W) is checked individually — if W is also being dropped then
+    /// that record is OK, and the record (W→T) is checked separately.
+    pub(crate) fn validate_drop_closure_diff(
+        &mut self,
+        diff: &gnitz_wire::migration::Diff,
+    ) -> Result<(), String> {
+        use std::collections::HashSet;
+
+        if diff.dropped_tables.is_empty() && diff.dropped_views.is_empty() {
+            return Ok(());
+        }
+
+        let mut dropped_ids: HashSet<i64> = HashSet::new();
+        let mut dropped_view_ids: HashSet<i64> = HashSet::new();
+        for t in &diff.dropped_tables {
+            let q = format!("{}.{}", t.schema, t.name);
+            if let Some(&id) = self.name_to_id.get(&q) {
+                dropped_ids.insert(id);
+            }
+        }
+        for v in &diff.dropped_views {
+            let q = format!("{}.{}", v.schema, v.name);
+            if let Some(&id) = self.name_to_id.get(&q) {
+                dropped_ids.insert(id);
+                dropped_view_ids.insert(id);
+            }
+        }
+
+        if dropped_ids.is_empty() {
+            return Ok(());
+        }
+
+        let Ok(mut cursor) = self.sys_view_deps.create_cursor() else {
+            return Ok(());
+        };
+
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                let view_id = cursor_read_u64(&cursor, DEPTAB_COL_VIEW_ID) as i64;
+                let dep_id  = cursor_read_u64(&cursor, DEPTAB_COL_DEP_TABLE_ID) as i64;
+                if dropped_ids.contains(&dep_id) && !dropped_view_ids.contains(&view_id) {
+                    let dep_name = self.id_to_qualified.get(&dep_id)
+                        .map(|(s, n)| format!("{}.{}", s, n))
+                        .unwrap_or_else(|| format!("id={}", dep_id));
+                    let view_name = self.id_to_qualified.get(&view_id)
+                        .map(|(s, n)| format!("{}.{}", s, n))
+                        .unwrap_or_else(|| format!("id={}", view_id));
+                    return Err(format!(
+                        "cannot drop {}: still referenced by view {}",
+                        dep_name, view_name,
+                    ));
+                }
+            }
+            cursor.cursor.advance();
+        }
+
+        Ok(())
     }
 
     /// Convenience used by apply_migration to surface the engine's

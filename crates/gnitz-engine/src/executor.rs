@@ -27,7 +27,7 @@ use crate::catalog::{
     MIGRATIONS_COL_CREATED_LSN, MIGRATIONS_COL_DESIRED_STATE_SQL,
     MIGRATIONS_COL_DESIRED_STATE_CANONICAL, MIGRATIONS_COL_FORMAT_VERSION,
 };
-use crate::catalog::migration::MigrationRow;
+use crate::catalog::migration::{MigrationRow, StagedKind, StagedMapping, staged_name};
 use gnitz_wire::migration as mig;
 use crate::committer::{self, CommitRequest};
 use crate::ipc::{self, STATUS_OK, STATUS_ERROR, WireConflictMode};
@@ -292,6 +292,7 @@ impl ServerExecutor {
         });
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
+        reactor.spawn(mig_gc_task(Rc::clone(&shared)));
         reactor.spawn(accept_loop(Rc::clone(&shared)));
         reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
         reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
@@ -761,6 +762,9 @@ async fn apply_migration_row(
             return Err("migration is a no-op (empty diff)".into());
         }
 
+        // Transitive drop-validation: closure(diff.dropped, sys_view_deps) ⊆ diff.dropped.
+        shared.cat().validate_drop_closure_diff(&diff)?;
+
         // Topo sort creates (parent-before-child) and drops (child-before-parent).
         mig::topo_sort_diff(&mut diff)?;
 
@@ -775,16 +779,24 @@ async fn apply_migration_row(
         }
     };
 
+    // ---- Phase 2: create staged objects under __mig_<hash>_ names -----
+    let staged = match apply_phase2(&shared, &row, &diff).await {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
+            return;
+        }
+    };
+
     // ---- Phase 2 → 3 relay fence --------------------------------------
-    // No Phase-2 work emits relays today, but the fence is retained
-    // for symmetry: once backfill lands, any FLAG_EXCHANGE relays it
-    // emits must drain before Phase 3's write lock.
+    // Drains any FLAG_EXCHANGE relays emitted during Phase 2 before the
+    // Phase-3 write lock is acquired.
     let (r_tx, r_rx) = oneshot::channel::<()>();
     shared.relay_tx.send(PendingRelay::Fence { done: r_tx });
     let _ = r_rx.await;
 
-    // ---- Phase 3: master-local apply + broadcast under write lock -----
-    let dropped_dirs = match apply_phase3(&shared, &row, diff).await {
+    // ---- Phase 3: atomic rename + drops under write lock --------------
+    let dropped_dirs = match apply_phase3(&shared, &row, diff, staged).await {
         Ok(d) => d,
         Err(e) => {
             send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
@@ -807,8 +819,139 @@ async fn apply_migration_row(
     ).await;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: create staged objects under __mig_<hash>_ names
+// ---------------------------------------------------------------------------
+
+/// Ingest + broadcast a set of batches under `sal_writer_excl` and fsync.
+/// Used by `apply_phase2` for each staged object.  Aborts on partial
+/// broadcast (unrecoverable) via `gnitz_fatal_abort!`.
+async fn ingest_and_fsync_phase2(shared: &Rc<Shared>, batches: &[(i64, Batch)]) {
+    let fsync_fut = {
+        let _sal_excl = shared.sal_writer_excl.lock().await;
+        let cat_ptr   = shared.catalog.0;
+        let disp_ptr  = shared.dispatcher.0;
+        for (tid, batch) in batches {
+            let r = guard_panic("phase2 ingest", || {
+                unsafe { &mut *cat_ptr }.ingest_to_family(*tid, batch)
+            });
+            if let Err(e) = r {
+                gnitz_fatal_abort!("phase2 ingest failed: {}", e);
+            }
+            let r = guard_panic("phase2 broadcast", || unsafe {
+                (*disp_ptr).broadcast_ddl(*tid, batch)
+            });
+            if let Err(e) = r {
+                gnitz_fatal_abort!("phase2 broadcast failed: {}", e);
+            }
+        }
+        shared.reactor.fsync(shared.sal_fd)
+    };
+    let lsn = shared.ingest_lsn.get() + 1;
+    shared.ingest_lsn.set(lsn);
+    let rc = fsync_fut.await;
+    if rc < 0 {
+        gnitz_fatal_abort!("SAL fdatasync (phase2) failed rc={}", rc);
+    }
+}
+
+/// Phase 2: create every object in `diff.created_*` under a
+/// `__mig_<hash>_<final_name>` staged name so Phase 3 can atomically
+/// rename them.  Holds the catalog write lock for all creates.
+///
+/// On any pre-ingest error, returns `Err`; the RAII guard clears
+/// `migration_in_flight` and any already-fsynced `__mig_*` objects are
+/// reaped by `mig_gc_task` on next boot.
+async fn apply_phase2(
+    shared: &Rc<Shared>,
+    row: &MigrationRow,
+    diff: &mig::Diff,
+) -> Result<Vec<StagedMapping>, String> {
+    if diff.created_tables.is_empty()
+        && diff.created_views.is_empty()
+        && diff.created_indices.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+
+    let hash_hex = format!("{:032x}", row.hash);
+    let mut staged: Vec<StagedMapping> = Vec::new();
+
+    let _write = shared.catalog_rwlock.write().await;
+
+    // Staged tables.
+    for t in &diff.created_tables {
+        let mut staged_def = t.clone();
+        staged_def.name = staged_name(&hash_hex, &t.name);
+
+        let (tid, batches) = shared.cat().build_create_table_batches(&staged_def)?;
+        ingest_and_fsync_phase2(shared, &batches).await;
+
+        staged.push(StagedMapping {
+            kind: StagedKind::Table,
+            staged_id: tid,
+            final_schema: t.schema.clone(),
+            final_name:   t.name.clone(),
+            final_sql:    None,
+        });
+    }
+
+    // Staged views (keep sql as-is — references only live tables).
+    for v in &diff.created_views {
+        let mut staged_def = v.clone();
+        staged_def.name = staged_name(&hash_hex, &v.name);
+
+        let (vid, batches) = shared.cat().build_create_view_batches(&staged_def)?;
+        ingest_and_fsync_phase2(shared, &batches).await;
+
+        staged.push(StagedMapping {
+            kind: StagedKind::View,
+            staged_id: vid,
+            final_schema: v.schema.clone(),
+            final_name:   v.name.clone(),
+            final_sql:    Some(v.sql.clone()),
+        });
+    }
+
+    // Staged indices.  If the owner table was staged in this migration,
+    // reference it by its staged name so `build_create_index_batches`
+    // can look it up in name_to_id.
+    for idx in &diff.created_indices {
+        let staged_owner_name = staged.iter()
+            .find(|m| matches!(m.kind, StagedKind::Table)
+                && m.final_schema == idx.owner_schema
+                && m.final_name   == idx.owner_name)
+            .map(|m| staged_name(&hash_hex, &m.final_name))
+            .unwrap_or_else(|| idx.owner_name.clone());
+
+        let mut staged_idx_def = idx.clone();
+        staged_idx_def.name       = staged_name(&hash_hex, &idx.name);
+        staged_idx_def.owner_name = staged_owner_name;
+
+        let (idx_id, batches) = shared.cat().build_create_index_batches(&staged_idx_def)?;
+        ingest_and_fsync_phase2(shared, &batches).await;
+
+        staged.push(StagedMapping {
+            kind: StagedKind::Index,
+            staged_id: idx_id,
+            final_schema: idx.schema.clone(),
+            final_name:   idx.name.clone(),
+            final_sql:    None,
+        });
+    }
+
+    Ok(staged)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: atomic rename of staged objects + drops
+// ---------------------------------------------------------------------------
+
 async fn apply_phase3(
-    shared: &Rc<Shared>, row: &MigrationRow, diff: mig::Diff,
+    shared: &Rc<Shared>,
+    row: &MigrationRow,
+    diff: mig::Diff,
+    staged: Vec<StagedMapping>,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let _write = shared.catalog_rwlock.write().await;
 
@@ -823,51 +966,33 @@ async fn apply_phase3(
         }
     }
 
-    // Build drop batches first (collect directories to rmtree later).
     let mut to_broadcast: Vec<(i64, Batch)> = Vec::new();
-    let mut dropped_dirs: Vec<std::path::PathBuf> = Vec::new();
-    let mut dropped_tids: Vec<i64> = Vec::new();
 
-    // Drops are already topo-sorted (child-before-parent).
-    for idx in &diff.dropped_indices {
+    // Resolve drops + staged renames into a single Cascade.
+    let cascade = {
         let cat = shared.cat();
-        let batches = cat.build_drop_index_batches(&idx.name)?;
-        to_broadcast.extend(batches);
-    }
-    for v in &diff.dropped_views {
-        let cat = shared.cat();
-        let (vid, batches, dir) = cat.build_drop_view_batches(&v.schema, &v.name)?;
-        to_broadcast.extend(batches);
-        if let Some(d) = dir { dropped_dirs.push(d); }
-        dropped_tids.push(vid);
-    }
-    for t in &diff.dropped_tables {
-        let cat = shared.cat();
-        let (tid, batches, dir) = cat.build_drop_table_batches(&t.schema, &t.name)?;
-        to_broadcast.extend(batches);
-        if let Some(d) = dir { dropped_dirs.push(d); }
-        dropped_tids.push(tid);
-    }
+        cat.build_cascade_from_staged(&diff, &staged)
+    };
 
-    // Creates are already topo-sorted (parent-before-child).
-    for t in &diff.created_tables {
+    // Collect directories to rmtree BEFORE swap fires hooks that unregister tables.
+    let dropped_dirs = {
         let cat = shared.cat();
-        let (_tid, batches) = cat.build_create_table_batches(t)?;
-        to_broadcast.extend(batches);
-    }
-    for v in &diff.created_views {
+        cat.collect_dropped_directories(&cascade)
+    };
+    let dropped_tids: Vec<i64> = cascade.dropped_table_ids.iter()
+        .chain(cascade.dropped_view_ids.iter())
+        .copied()
+        .collect();
+
+    // Build Phase-3 swap batches (drops + renames from staged).
+    {
         let cat = shared.cat();
-        let (_vid, batches) = cat.build_create_view_batches(v)?;
-        to_broadcast.extend(batches);
-    }
-    for idx in &diff.created_indices {
-        let cat = shared.cat();
-        let (_idx_id, batches) = cat.build_create_index_batches(idx)?;
-        to_broadcast.extend(batches);
+        let swap_batches = cat.build_swap_batches(&cascade)?;
+        to_broadcast.extend(swap_batches);
     }
 
-    // Update the durable sys_sequences HWM (covers both
-    // allocate_table_id and allocate_index_id bumps above).
+    // Update the durable sys_sequences HWM (covers table and index allocations
+    // made in Phase 2).
     {
         let cat = shared.cat();
         let seq_batch = cat.build_sequence_hwm_batch()?;
@@ -947,6 +1072,76 @@ async fn apply_phase3(
     }
 
     Ok(dropped_dirs)
+}
+
+// ---------------------------------------------------------------------------
+// GC task: reap __mig_* orphans from a crashed Phase 2
+// ---------------------------------------------------------------------------
+
+/// Runs once at startup.  Scans the catalog for any `__mig_*` objects left
+/// by a Phase-2 crash and drops them, each with its own write-lock + fsync.
+/// The startup sweep on worker processes handles their stale on-disk dirs.
+async fn mig_gc_task(shared: Rc<Shared>) {
+    // Snapshot orphan list under a brief read lock.
+    let orphans: Vec<(StagedKind, String, String)> = {
+        let _r = shared.catalog_rwlock.read().await;
+        shared.cat().collect_staged_orphans()
+    };
+
+    for (kind, schema, name) in orphans {
+        // Acquire write lock for the full drop + ingest + fsync sequence.
+        let _w = shared.catalog_rwlock.write().await;
+        let cat = shared.cat();
+
+        let batches: Vec<(i64, Batch)> = match kind {
+            StagedKind::Table => {
+                match cat.build_drop_table_batches(&schema, &name) {
+                    Ok((_tid, b, _dir)) => b,
+                    Err(_) => continue,
+                }
+            }
+            StagedKind::View => {
+                match cat.build_drop_view_batches(&schema, &name) {
+                    Ok((_vid, b, _dir)) => b,
+                    Err(_) => continue,
+                }
+            }
+            StagedKind::Index => {
+                match cat.build_drop_index_batches(&name) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        let fsync_fut = {
+            let _sal_excl = shared.sal_writer_excl.lock().await;
+            let cat_ptr  = shared.catalog.0;
+            let disp_ptr = shared.dispatcher.0;
+            for (tid, batch) in &batches {
+                let r = guard_panic("gc_task ingest", || {
+                    unsafe { &mut *cat_ptr }.ingest_to_family(*tid, batch)
+                });
+                if let Err(e) = r {
+                    gnitz_fatal_abort!("mig_gc_task ingest failed: {}", e);
+                }
+                let r = guard_panic("gc_task broadcast", || unsafe {
+                    (*disp_ptr).broadcast_ddl(*tid, batch)
+                });
+                if let Err(e) = r {
+                    gnitz_fatal_abort!("mig_gc_task broadcast failed: {}", e);
+                }
+            }
+            shared.reactor.fsync(shared.sal_fd)
+        };
+        let lsn = shared.ingest_lsn.get() + 1;
+        shared.ingest_lsn.set(lsn);
+        let rc = fsync_fut.await;
+        if rc < 0 {
+            gnitz_fatal_abort!("SAL fdatasync (mig_gc_task) failed rc={}", rc);
+        }
+        // _w released here — next iteration acquires a fresh write lock.
+    }
 }
 
 // ---------------------------------------------------------------------------

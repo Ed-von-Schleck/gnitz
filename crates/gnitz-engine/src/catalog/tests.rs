@@ -2506,3 +2506,73 @@ fn test_view_circuit_validation_rejects_empty() {
     engine.close();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Criterion 31: every batch targeting SYS_VIEW_DEPS, SYS_COLUMNS, and
+/// all five SYS_CIRCUIT_* tables produced by build_drop_view_batches
+/// must contain ONLY rows with weight == -1.  A spurious +1 would leave
+/// a ghost row after consolidation and corrupt view restart.
+#[test]
+fn test_build_drop_view_batches_retract_only() {
+    let dir = temp_dir("view_drop_retract_only");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Three-column table so SYS_COLUMNS gets multiple rows to retract.
+    let tid = engine.create_table(
+        "public.t",
+        &[u64_col_def("id"), str_col_def("label"), i64_col_def("score")],
+        0,
+        true,
+    ).unwrap();
+
+    let out_cols = vec![
+        ("id".to_string(),    type_code::U64),
+        ("label".to_string(), type_code::STRING),
+        ("score".to_string(), type_code::I64),
+    ];
+    let graph = make_passthrough_graph(tid, &out_cols);
+    let vid = engine.create_view("public.v", &graph, "SELECT * FROM t").unwrap();
+    assert!(vid >= FIRST_USER_TABLE_ID);
+
+    let (_dropped_vid, batches, _dir_opt) =
+        engine.build_drop_view_batches("public", "v").unwrap();
+
+    // These tables are retract-only: no +1 rename rows may appear.
+    const RETRACT_ONLY: &[i64] = &[
+        DEP_TAB_ID,
+        COL_TAB_ID,
+        CIRCUIT_NODES_TAB_ID,
+        CIRCUIT_EDGES_TAB_ID,
+        CIRCUIT_SOURCES_TAB_ID,
+        CIRCUIT_PARAMS_TAB_ID,
+        CIRCUIT_GROUP_COLS_TAB_ID,
+    ];
+
+    for (tab_id, batch) in &batches {
+        if RETRACT_ONLY.contains(tab_id) {
+            for row in 0..batch.count {
+                let w = batch.get_weight(row);
+                assert_eq!(w, -1,
+                    "tab_id={tab_id} row={row}: expected weight=-1, got {w}");
+            }
+        }
+    }
+
+    // SYS_COLUMNS retracts exactly one row per column.
+    let col_batch = batches.iter().find(|(t, _)| *t == COL_TAB_ID).unwrap();
+    assert_eq!(col_batch.1.count, out_cols.len(),
+        "SYS_COLUMNS must retract one row per column");
+
+    // SYS_VIEW_DEPS retracts exactly the one T→V dependency row.
+    let dep_batch = batches.iter().find(|(t, _)| *t == DEP_TAB_ID).unwrap();
+    assert_eq!(dep_batch.1.count, 1,
+        "SYS_VIEW_DEPS must retract exactly one dep row");
+
+    // SYS_VIEWS gets exactly one -1 (the view record itself).
+    let view_batch = batches.iter().find(|(t, _)| *t == VIEW_TAB_ID).unwrap();
+    assert_eq!(view_batch.1.count, 1);
+    assert_eq!(view_batch.1.get_weight(0), -1,
+        "SYS_VIEWS retraction must carry weight=-1");
+
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}

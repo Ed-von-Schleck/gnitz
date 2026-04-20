@@ -1548,6 +1548,11 @@ impl CatalogEngine {
                 // Register in index maps
                 self.index_by_name.insert(name.clone(), idx_id);
                 self.index_by_id.insert(idx_id, name.clone());
+
+                // Phase-2 crash replay may load an idx_id > next_index_id; advance to prevent reallocation.
+                if idx_id + 1 > self.next_index_id {
+                    self.next_index_id = idx_id + 1;
+                }
             } else {
                 if self.index_by_name.contains_key(&name) {
                     // Policy check ("__fk_" guard) lives at the user-facing
@@ -3401,6 +3406,18 @@ impl CatalogEngine {
             }
         }
         Ok(())
+    }
+
+    /// Returns true if `id` refers to a live view (positive-weight row in sys_views).
+    pub(crate) fn is_view_id(&mut self, id: i64) -> bool {
+        let mut cursor = match self.sys_views.create_cursor() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        cursor.cursor.seek(crate::util::make_pk(id as u64, 0));
+        cursor.cursor.valid
+            && cursor.cursor.current_key_lo == id as u64
+            && cursor.cursor.current_weight > 0
     }
 
     fn promote_to_pk_key(&self, batch: &Batch, row: usize, payload_col: usize, col_type: u8) -> (u64, u64) {
