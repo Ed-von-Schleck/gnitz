@@ -503,7 +503,9 @@ fn sys_circuit_group_cols_ptr(c: &mut CatalogEngine) -> *mut crate::storage::Tab
 
 use gnitz_wire::migration::{
     ColumnDef as AstColumnDef, IndexDef as AstIndexDef, TableDef as AstTableDef,
+    ViewDef as AstViewDef,
 };
+use super::{pack_column_id, pack_dep_pk, pack_node_pk, pack_edge_pk, pack_param_pk, pack_gcol_pk};
 
 impl CatalogEngine {
     /// Allocate tid and build the sys_columns +1 batch (one row per
@@ -652,6 +654,205 @@ impl CatalogEngine {
         out.push((TABLE_TAB_ID, tab_batch));
 
         Ok((tid, out, dir))
+    }
+
+    /// Allocate vid and build the full set of +1 batches for a
+    /// CREATE VIEW: columns → view_deps → circuit (5 tables) → view
+    /// row. sys_views is emitted LAST so `on_view_delta` fires only
+    /// after all dependency rows are in place.
+    pub(crate) fn build_create_view_batches(
+        &mut self, v: &AstViewDef,
+    ) -> Result<(i64, Vec<(i64, Batch)>), String> {
+        let sid = self.get_schema_id(&v.schema);
+        if sid < 0 {
+            return Err(format!("schema does not exist: {}", v.schema));
+        }
+
+        self.dag.validate_graph_structure(
+            &v.circuit.nodes.iter().map(|&(a, b)| (a as i32, b as i32)).collect::<Vec<_>>(),
+            &v.circuit.edges.iter().map(|&(a, b, c, d)| (a as i32, b as i32, c as i32, d as i32)).collect::<Vec<_>>(),
+            &v.circuit.sources.iter().map(|&(a, b)| (a as i32, b as i64)).collect::<Vec<_>>(),
+        ).map_err(|e| format!("invalid view circuit: {}", e))?;
+
+        let vid = self.allocate_table_id();
+        let directory = format!("{}/{}/view_{}_{}", self.base_dir, v.schema, v.name, vid);
+
+        let mut out: Vec<(i64, Batch)> = Vec::new();
+
+        // 1. sys_columns +1 (one row per output column)
+        {
+            let schema = col_tab_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for (i, (name, tc)) in v.circuit.output_col_defs.iter().enumerate() {
+                let pk = pack_column_id(vid, i as i64);
+                bb.begin_row(pk, 0, 1);
+                bb.put_u64(vid as u64);
+                bb.put_u64(OWNER_KIND_VIEW as u64);
+                bb.put_u64(i as u64);
+                bb.put_string(name);
+                bb.put_u64(*tc as u64);
+                bb.put_u64(0); // is_nullable
+                bb.put_u64(0); // fk_table_id
+                bb.put_u64(0); // fk_col_idx
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((COL_TAB_ID, batch)); }
+        }
+
+        // 2. sys_view_deps +1
+        {
+            let schema = dep_tab_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &dep_tid in &v.circuit.dependencies {
+                let (pk_lo, pk_hi) = pack_dep_pk(vid, dep_tid as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(vid as u64);
+                bb.put_u64(0); // dep_view_id
+                bb.put_u64(dep_tid);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((DEP_TAB_ID, batch)); }
+        }
+
+        // 3. sys_circuit_nodes +1
+        {
+            let schema = circuit_nodes_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &(node_id, opcode) in &v.circuit.nodes {
+                let (pk_lo, pk_hi) = pack_node_pk(vid, node_id as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(opcode);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((CIRCUIT_NODES_TAB_ID, batch)); }
+        }
+
+        // 4. sys_circuit_edges +1
+        {
+            let schema = circuit_edges_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &(edge_id, src, dst, port) in &v.circuit.edges {
+                let (pk_lo, pk_hi) = pack_edge_pk(vid, edge_id as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(src);
+                bb.put_u64(dst);
+                bb.put_u64(port);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((CIRCUIT_EDGES_TAB_ID, batch)); }
+        }
+
+        // 5. sys_circuit_sources +1
+        {
+            let schema = circuit_sources_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &(node_id, table_id) in &v.circuit.sources {
+                let (pk_lo, pk_hi) = pack_node_pk(vid, node_id as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(table_id);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((CIRCUIT_SOURCES_TAB_ID, batch)); }
+        }
+
+        // 6. sys_circuit_params +1
+        {
+            let schema = circuit_params_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &(node_id, slot, value) in &v.circuit.params {
+                let (pk_lo, pk_hi) = pack_param_pk(vid, node_id as i64, slot as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(value);
+                bb.put_null(); // str_value
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((CIRCUIT_PARAMS_TAB_ID, batch)); }
+        }
+
+        // 7. sys_circuit_group_cols +1
+        {
+            let schema = circuit_group_cols_schema();
+            let mut bb = BatchBuilder::new(schema);
+            for &(node_id, col_idx) in &v.circuit.group_cols {
+                let (pk_lo, pk_hi) = pack_gcol_pk(vid, node_id as i64, col_idx as i64);
+                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.put_u64(col_idx);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            if batch.count > 0 { out.push((CIRCUIT_GROUP_COLS_TAB_ID, batch)); }
+        }
+
+        // 8. sys_views +1 (LAST — triggers on_view_delta → register + ensure_compiled)
+        {
+            let schema = view_tab_schema();
+            let mut bb = BatchBuilder::new(schema);
+            bb.begin_row(vid as u64, 0, 1);
+            bb.put_u64(sid as u64);
+            bb.put_string(&v.name);
+            bb.put_string(&v.sql);
+            bb.put_string(&directory);
+            bb.put_u64(0); // created_lsn placeholder
+            bb.end_row();
+            let batch = bb.finish();
+            out.push((VIEW_TAB_ID, batch));
+        }
+
+        Ok((vid, out))
+    }
+
+    /// Retract every sys_* row that `build_create_view_batches`
+    /// emitted: circuit (5 tables) → view_deps → columns → view row.
+    /// Cursor-seek payloads for byte-exact consolidation.
+    pub(crate) fn build_drop_view_batches(
+        &mut self, schema_name: &str, view_name: &str,
+    ) -> Result<(i64, Vec<(i64, Batch)>, Option<PathBuf>), String> {
+        let q = format!("{}.{}", schema_name, view_name);
+        let vid = *self.name_to_id.get(&q)
+            .ok_or_else(|| format!("drop: view not found: {}", q))?;
+
+        let mut out: Vec<(i64, Batch)> = Vec::new();
+
+        // 1. sys_circuit_* -1 per dropped view.
+        for &(tab_id, ptr_fn) in &[
+            (CIRCUIT_NODES_TAB_ID,      sys_circuit_nodes_ptr as fn(&mut CatalogEngine) -> *mut crate::storage::Table),
+            (CIRCUIT_EDGES_TAB_ID,      sys_circuit_edges_ptr as fn(&mut CatalogEngine) -> *mut crate::storage::Table),
+            (CIRCUIT_SOURCES_TAB_ID,    sys_circuit_sources_ptr as fn(&mut CatalogEngine) -> *mut crate::storage::Table),
+            (CIRCUIT_PARAMS_TAB_ID,     sys_circuit_params_ptr as fn(&mut CatalogEngine) -> *mut crate::storage::Table),
+            (CIRCUIT_GROUP_COLS_TAB_ID, sys_circuit_group_cols_ptr as fn(&mut CatalogEngine) -> *mut crate::storage::Table),
+        ] {
+            let schema = sys_tab_schema(tab_id);
+            let tab_ptr = ptr_fn(self);
+            let batch = retract_rows_by_pk_hi(unsafe { &mut *tab_ptr }, &schema, vid as u64);
+            if batch.count > 0 { out.push((tab_id, batch)); }
+        }
+
+        // 2. sys_view_deps -1
+        {
+            let schema = dep_tab_schema();
+            let batch = retract_rows_by_pk_hi(&mut self.sys_view_deps, &schema, vid as u64);
+            if batch.count > 0 { out.push((DEP_TAB_ID, batch)); }
+        }
+
+        // 3. sys_columns -1
+        let cols_retract = self.build_retract_column_records(vid, OWNER_KIND_VIEW)?;
+        if cols_retract.count > 0 { out.push((COL_TAB_ID, cols_retract)); }
+
+        // 4. sys_views -1 (last)
+        let tab_batch = retract_single_row(&mut self.sys_views, &view_tab_schema(), vid as u64, 0);
+        if tab_batch.count == 0 {
+            return Err(format!("drop: sys_views has no row for vid={}", vid));
+        }
+        let dir = self.dag.tables.get(&vid).map(|e| PathBuf::from(&e.directory));
+        out.push((VIEW_TAB_ID, tab_batch));
+
+        Ok((vid, out, dir))
     }
 
     /// For a DROP INDEX: retract its sys_indices row.

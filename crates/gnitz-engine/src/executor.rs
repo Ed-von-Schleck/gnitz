@@ -683,8 +683,12 @@ async fn apply_migration_row(
     shared: Rc<Shared>, fd: i32, client_id: u64, row: MigrationRow,
     _guard: MigrationInFlightGuard,
 ) {
-    if row.format_version != 1 {
-        let msg = format!("unsupported format_version {}", row.format_version);
+    if row.format_version != 2 {
+        let msg = format!(
+            "unsupported format_version {} (expected 2); \
+             pre-V2 migration rows are not readable — wipe the data dir",
+            row.format_version,
+        );
         send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, msg.as_bytes()).await;
         return;
     }
@@ -737,17 +741,21 @@ async fn apply_migration_row(
             ));
         }
 
-        if !diff.created_views.is_empty() || !diff.dropped_views.is_empty() {
-            return Err(
-                "CREATE/DROP VIEW in migrations is not yet supported; \
-                 use the non-migration DDL path for views".into(),
-            );
+        // Structurally validate every view's circuit before we
+        // commit to ingest. Catches dangling edges / bad node refs
+        // early so the Phase-3 `on_view_delta` hook can't fail mid-
+        // ingest.
+        for v in &diff.created_views {
+            let cat_mut = shared.cat();
+            cat_mut.validate_view_circuit(&v.circuit)?;
         }
 
         // Empty diff — nothing to do, reject as the plan mandates.
         if diff.created_tables.is_empty()
+            && diff.created_views.is_empty()
             && diff.created_indices.is_empty()
             && diff.dropped_tables.is_empty()
+            && diff.dropped_views.is_empty()
             && diff.dropped_indices.is_empty()
         {
             return Err("migration is a no-op (empty diff)".into());
@@ -826,6 +834,13 @@ async fn apply_phase3(
         let batches = cat.build_drop_index_batches(&idx.name)?;
         to_broadcast.extend(batches);
     }
+    for v in &diff.dropped_views {
+        let cat = shared.cat();
+        let (vid, batches, dir) = cat.build_drop_view_batches(&v.schema, &v.name)?;
+        to_broadcast.extend(batches);
+        if let Some(d) = dir { dropped_dirs.push(d); }
+        dropped_tids.push(vid);
+    }
     for t in &diff.dropped_tables {
         let cat = shared.cat();
         let (tid, batches, dir) = cat.build_drop_table_batches(&t.schema, &t.name)?;
@@ -838,6 +853,11 @@ async fn apply_phase3(
     for t in &diff.created_tables {
         let cat = shared.cat();
         let (_tid, batches) = cat.build_create_table_batches(t)?;
+        to_broadcast.extend(batches);
+    }
+    for v in &diff.created_views {
+        let cat = shared.cat();
+        let (_vid, batches) = cat.build_create_view_batches(v)?;
         to_broadcast.extend(batches);
     }
     for idx in &diff.created_indices {

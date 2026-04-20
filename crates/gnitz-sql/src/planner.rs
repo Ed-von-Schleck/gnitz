@@ -198,12 +198,11 @@ fn execute_create_view(
     binder:      &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
+    let sql_text = format!("{}", stmt);
 
     if query.order_by.is_some() {
         return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
     }
-
-    let sql_text = format!("{}", stmt);
 
     // Process CTEs (WITH clause) — inline them into the binder cache
     if let Some(with) = &query.with {
@@ -214,7 +213,6 @@ fn execute_create_view(
         }
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.clone();
-            // Resolve the CTE's SELECT to find its source table and schema
             let cte_select = match cte.query.body.as_ref() {
                 SetExpr::Select(s) => s,
                 _ => return Err(GnitzSqlError::Unsupported(
@@ -230,7 +228,6 @@ fn execute_create_view(
                 &cte_select.from[0].relation,
                 &format!("CTE '{}'", cte_name),
             )?;
-            // Resolve the CTE's source table and cache the CTE name as an alias
             let resolved = binder.resolve(&cte_table_name)?;
             binder.cache_alias(cte_name, resolved);
         }
@@ -253,24 +250,19 @@ fn execute_create_view(
         _ => unreachable!(),
     };
 
-    // Handle SELECT DISTINCT
     if select.distinct.is_some() {
         return execute_create_distinct_view(
             client, schema_name, &view_name, &sql_text, select, binder,
         );
     }
-
     if select.from.len() != 1 {
         return Err(GnitzSqlError::Unsupported("CREATE VIEW: only single FROM item supported".to_string()));
     }
-    // Delegate to join handler if JOINs present
     if !select.from[0].joins.is_empty() {
         return execute_create_join_view(
             client, schema_name, &view_name, &sql_text, select, binder, query,
         );
     }
-
-    // Check for GROUP BY and delegate
     let has_group_by = match &select.group_by {
         GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
         _ => false,
@@ -281,11 +273,28 @@ fn execute_create_view(
         );
     }
 
-    let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
+    let (circuit, out_cols, view_id) =
+        compile_plain_view_circuit(client, select, binder)?;
 
+    client.create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols)
+        .map_err(GnitzSqlError::Exec)?;
+
+    Ok(SqlResult::ViewCreated { view_id })
+}
+
+/// Compile the circuit + output columns for a plain SELECT view.
+/// Allocates a `view_id` server-side. Shared between the imperative
+/// path (execute_create_view, pushes via create_view_with_circuit)
+/// and the migration path (`compile_view_for_migration`, embeds the
+/// circuit in the AST).
+fn compile_plain_view_circuit(
+    client: &GnitzClient,
+    select: &sqlparser::ast::Select,
+    binder: &mut Binder<'_>,
+) -> Result<(gnitz_core::CircuitGraph, Vec<ColumnDef>, u64), GnitzSqlError> {
+    let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
     let (source_tid, source_schema) = binder.resolve(&table_name)?;
 
-    // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
         let bound = binder.bind_expr(where_expr, &source_schema)?;
         let mut eb = ExprBuilder::new();
@@ -295,15 +304,11 @@ fn execute_create_view(
         None
     };
 
-    // Build projection column list
     let (items, out_cols) = build_projection(&select.projection, &source_schema, binder)?;
-
     let has_computed = items.iter().any(|i| matches!(i, ProjectionItem::Computed { .. }));
 
-    // Allocate view_id
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
 
-    // Build circuit
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta();
     let filtered = match expr_prog {
@@ -312,51 +317,131 @@ fn execute_create_view(
     };
 
     let out_node = if has_computed {
-        // Expr-map: compile all payload items into one ExprProgram
         let mut eb = ExprBuilder::new();
         let mut payload_idx = 0u32;
         for item in &items {
-            if is_pk_item(item, &source_schema) { continue; }  // PK handled by commit_row
+            if is_pk_item(item, &source_schema) { continue; }
             match item {
                 ProjectionItem::PassThrough { src_col } => {
                     let tc = source_schema.columns[*src_col].type_code as u32;
                     eb.copy_col(tc, *src_col as u32, payload_idx);
                 }
                 ProjectionItem::Computed { bound_expr, .. } => {
-                    let (reg, is_float) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
-                    if is_float {
-                        // EMIT writes via append_int which stores raw bits — correct for float
-                    }
+                    let (reg, _is_float) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
                     eb.emit_col(reg, payload_idx);
                 }
             }
             payload_idx += 1;
         }
-        let program = eb.build(0);  // result_reg unused — EMIT/COPY_COL write directly
+        let program = eb.build(0);
         cb.map_expr(filtered, program)
     } else if items.len() < source_schema.columns.len()
            || items.iter().enumerate().any(|(i, item)| match item {
                ProjectionItem::PassThrough { src_col } => *src_col != i,
                _ => false,
            }) {
-        // Pure column reorder/subset — use existing projection map
         let cols: Vec<usize> = items.iter().filter_map(|i| match i {
             ProjectionItem::PassThrough { src_col } => Some(*src_col),
             _ => None,
         }).collect();
         cb.map(filtered, &cols)
     } else {
-        // Identity — no map needed
         filtered
     };
 
     cb.sink(out_node);
-    let circuit = cb.build();
+    Ok((cb.build(), out_cols, view_id))
+}
 
-    client.create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols)
-        .map_err(GnitzSqlError::Exec)?;
+/// Compile a single `CREATE VIEW` statement into a wire-form circuit
+/// graph suitable for embedding in a migration's `ViewDef.circuit`.
+/// Returns `(gnitz-wire::CircuitGraph, output_cols)`.
+///
+/// Source tables must already exist in the live catalog (same-migration
+/// table references are a follow-up). JOIN/GROUP BY/UNION/DISTINCT are
+/// not yet supported via this path — use the imperative
+/// `create_view_with_circuit` for those shapes.
+pub fn compile_view_for_migration(
+    client:      &GnitzClient,
+    schema_name: &str,
+    stmt:        &Statement,
+) -> Result<(gnitz_wire::CircuitGraph, Vec<ColumnDef>), GnitzSqlError> {
+    let (name_obj, query) = match stmt {
+        Statement::CreateView { name, query, .. } => (name, query),
+        _ => return Err(GnitzSqlError::Unsupported(
+            "compile_view_for_migration called on non-CREATE VIEW statement".into()
+        )),
+    };
+    let _view_name = extract_name(name_obj, "CREATE VIEW")?;
+    if query.order_by.is_some() {
+        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".into()));
+    }
+    let mut binder = Binder::new(client, schema_name);
+    if let Some(with) = &query.with {
+        if with.recursive {
+            return Err(GnitzSqlError::Unsupported("recursive CTEs not supported".into()));
+        }
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.clone();
+            let cte_select = match cte.query.body.as_ref() {
+                SetExpr::Select(s) => s,
+                _ => return Err(GnitzSqlError::Unsupported(
+                    format!("CTE '{}': only SELECT supported", cte_name)
+                )),
+            };
+            if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
+                return Err(GnitzSqlError::Unsupported(
+                    format!("CTE '{}': only single table without JOINs", cte_name)
+                ));
+            }
+            let cte_table_name = extract_table_factor_name(
+                &cte_select.from[0].relation,
+                &format!("CTE '{}'", cte_name),
+            )?;
+            let resolved = binder.resolve(&cte_table_name)?;
+            binder.cache_alias(cte_name, resolved);
+        }
+    }
 
-    Ok(SqlResult::ViewCreated { view_id })
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Err(GnitzSqlError::Unsupported(
+            "migration compile: CREATE VIEW shapes other than plain SELECT are a follow-up; \
+             use create_view_with_circuit imperatively for now".into()
+        )),
+    };
+    if select.distinct.is_some()
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || matches!(&select.group_by, GroupByExpr::Expressions(exprs, _) if !exprs.is_empty())
+    {
+        return Err(GnitzSqlError::Unsupported(
+            "migration compile: CREATE VIEW with JOIN / GROUP BY / UNION / DISTINCT is a \
+             follow-up; use create_view_with_circuit imperatively for now".into()
+        ));
+    }
+
+    let (core_circuit, out_cols, _vid) = compile_plain_view_circuit(client, select, &mut binder)?;
+    Ok((core_to_wire_circuit(core_circuit, &out_cols), out_cols))
+}
+
+fn core_to_wire_circuit(
+    c: gnitz_core::CircuitGraph, out_cols: &[ColumnDef],
+) -> gnitz_wire::CircuitGraph {
+    gnitz_wire::CircuitGraph {
+        view_id:         c.view_id,
+        primary_source_id: c.primary_source_id,
+        nodes:           c.nodes,
+        edges:           c.edges,
+        sources:         c.sources,
+        params:          c.params,
+        group_cols:      c.group_cols,
+        const_strings:   c.const_strings,
+        output_col_defs: out_cols.iter()
+            .map(|c| (c.name.clone(), c.type_code as u8))
+            .collect(),
+        dependencies:    c.dependencies,
+    }
 }
 
 fn execute_create_index(

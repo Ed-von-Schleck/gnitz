@@ -97,7 +97,7 @@ impl Connection {
                 .u64_val(0)                      // created_lsn placeholder — server overrides
                 .str_val(desired_state_sql)
                 .str_val(&canonical_hex)
-                .u64_val(1);                     // format_version = 1
+                .u64_val(2);                     // format_version = 2 (ViewDef.circuit)
         }
         self.push(MIGRATIONS_TAB, schema, &batch)?;
         Ok(hash)

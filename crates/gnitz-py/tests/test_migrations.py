@@ -161,18 +161,55 @@ def test_push_migration_modify_rejected(mig_client):
     assert "modification" in err or "v1" in err
 
 
-def test_push_migration_view_rejected(mig_client):
-    """CREATE VIEW in migrations is rejected — view planning is client-side."""
+def test_push_migration_creates_view(mig_client):
+    """V1.5: CREATE VIEW in a follow-up migration compiles the view's
+    circuit client-side, embeds it in the canonical AST, and the
+    server applies the 8-batch swap atomically."""
     sn = "mig" + _uid()
     mig_client.create_schema(sn)
-    sql1 = f"CREATE TABLE {sn}.t (id BIGINT UNSIGNED PRIMARY KEY)"
+    sql1 = f"CREATE TABLE {sn}.t (id BIGINT UNSIGNED PRIMARY KEY, x BIGINT NOT NULL)"
     h1 = mig_client.push_migration(0, sql1, "alice", "tbl")
 
     sql2 = (sql1 + "; "
-            f"CREATE VIEW {sn}.v AS SELECT * FROM {sn}.t")
-    with pytest.raises(gnitz.GnitzError) as e:
-        mig_client.push_migration(h1, sql2, "alice", "view")
-    assert "view" in str(e.value).lower()
+            f"CREATE VIEW {sn}.v AS SELECT * FROM {sn}.t WHERE x > 5")
+    h2 = mig_client.push_migration(h1, sql2, "alice", "view")
+    assert h2 != 0
+
+    # Push rows and verify the view yields only the rows where x > 5.
+    tid, _ = mig_client.resolve_table(sn, "t")
+    cols = [gnitz.ColumnDef("id", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("x", gnitz.TypeCode.I64)]
+    schema = gnitz.Schema(cols)
+    batch = gnitz.ZSetBatch(schema)
+    batch.append(id=1, x=3)
+    batch.append(id=2, x=10)
+    mig_client.push(tid, batch)
+
+    vid, _ = mig_client.resolve_table(sn, "v")
+    rows = [r for r in mig_client.scan(vid) if r.weight > 0]
+    assert len(rows) == 1
+    assert rows[0].id == 2
+
+
+def test_push_migration_drops_view_via_omission(mig_client):
+    """Dropping a view by omitting it from the next desired-state
+    triggers build_drop_view_batches → circuit + deps + cols + view
+    retractions emitted atomically."""
+    sn = "mig" + _uid()
+    mig_client.create_schema(sn)
+    # Same-migration view-on-table requires tid pre-allocation (a
+    # V1.5 follow-up), so split this into two migrations.
+    sql1 = f"CREATE TABLE {sn}.t (id BIGINT UNSIGNED PRIMARY KEY)"
+    h1 = mig_client.push_migration(0, sql1, "alice", "tbl")
+    sql2 = sql1 + f"; CREATE VIEW {sn}.v AS SELECT * FROM {sn}.t"
+    h2 = mig_client.push_migration(h1, sql2, "alice", "init")
+
+    # Omit the view — must drop it.
+    sql3 = f"CREATE TABLE {sn}.t (id BIGINT UNSIGNED PRIMARY KEY)"
+    h3 = mig_client.push_migration(h2, sql3, "alice", "drop v")
+    assert h3 != 0
+    with pytest.raises(gnitz.GnitzError):
+        mig_client.resolve_table(sn, "v")
 
 
 def test_push_migration_invalid_sql(mig_client):

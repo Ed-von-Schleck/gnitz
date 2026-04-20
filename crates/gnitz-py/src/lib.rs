@@ -1085,8 +1085,17 @@ impl PyGnitzClient {
         author: &str,
         message: &str,
     ) -> PyResult<u128> {
-        let state = gnitz_sql::migration::parse_desired_state(desired_state_sql, "public")
-            .map_err(|e| GnitzError::new_err(format!("parse error: {}", e)))?;
+        // If the SQL declares any views, compile each view's circuit
+        // client-side and embed it in the canonical AST. Otherwise
+        // the plain parser-only path is slightly cheaper.
+        let state = if has_create_view(desired_state_sql) {
+            gnitz_sql::migration::parse_desired_state_with_circuits(
+                desired_state_sql, client!(self), "public",
+            ).map_err(|e| GnitzError::new_err(format!("parse error: {}", e)))?
+        } else {
+            gnitz_sql::migration::parse_desired_state(desired_state_sql, "public")
+                .map_err(|e| GnitzError::new_err(format!("parse error: {}", e)))?
+        };
         let canonical = gnitz_sql::migration::canonicalize(&state);
         client!(self).push_migration(parent_hash, desired_state_sql, author, message, &canonical)
             .map_err(|e| GnitzError::new_err(e.to_string()))
@@ -1454,6 +1463,26 @@ fn encode_push_payload(
     client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
 ) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
     gnitz_protocol::encode_message(target_id, client_id, 0, 0, 0, 0, Some(schema), Some(batch))
+}
+
+/// Cheap case-insensitive scan for a `CREATE VIEW` statement in the
+/// migration SQL. We just want to decide which parse path to take;
+/// false positives are harmless (the circuit-compile path is a
+/// superset of the plain parse path).
+fn has_create_view(sql: &str) -> bool {
+    let mut matched_create = false;
+    for token in sql.split_whitespace() {
+        if !matched_create {
+            if token.eq_ignore_ascii_case("create") { matched_create = true; }
+        } else if token.eq_ignore_ascii_case("view") {
+            return true;
+        } else if !token.eq_ignore_ascii_case("or") && !token.eq_ignore_ascii_case("replace") {
+            // `CREATE OR REPLACE VIEW` keeps the match alive; anything
+            // else means the CREATE wasn't for a VIEW.
+            matched_create = false;
+        }
+    }
+    false
 }
 
 fn encode_scan_payload(

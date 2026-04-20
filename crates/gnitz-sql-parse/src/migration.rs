@@ -43,7 +43,12 @@ pub fn parse_desired_state(
             Statement::CreateTable(ct) => tables.push(table_from_create(ct, default_schema)?),
             Statement::CreateView { name, query, .. } => {
                 let (schema, vname) = split_qualified(&name, default_schema);
-                views.push(ViewDef { schema, name: vname, sql: query.to_string() });
+                views.push(ViewDef {
+                    schema,
+                    name:    vname,
+                    sql:     query.to_string(),
+                    circuit: Default::default(),
+                });
             }
             Statement::CreateIndex(ci) => indices.push(index_from_create(ci, default_schema)?),
             _ => return Err(GnitzSqlParseError::Unsupported(

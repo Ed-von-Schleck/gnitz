@@ -61,6 +61,26 @@ fn make_passthrough_graph(source_table_id: i64, output_cols: &[(String, u8)]) ->
     }
 }
 
+/// Wire-form passthrough graph — the shape `build_create_view_batches`
+/// consumes (via `ViewDef.circuit`). Same topology as
+/// `make_passthrough_graph` above but typed as `gnitz_wire::CircuitGraph`.
+fn make_wire_passthrough_graph(
+    source_table_id: u64, output_cols: &[(String, u8)],
+) -> gnitz_wire::CircuitGraph {
+    gnitz_wire::CircuitGraph {
+        view_id:           0,
+        primary_source_id: source_table_id,
+        nodes:           vec![(1, 11), (2, 7)],
+        edges:           vec![(1, 1, 2, 0)],
+        sources:         vec![(1, 0)],
+        params:          vec![],
+        group_cols:      vec![],
+        const_strings:   vec![],
+        output_col_defs: output_cols.to_vec(),
+        dependencies:    vec![source_table_id],
+    }
+}
+
 // ── test_identifiers ─────────────────────────────────────────────────
 
 #[test]
@@ -2307,7 +2327,7 @@ fn test_current_migration_hash_replay() {
         created_lsn: 1,
         desired_state_sql: String::new(),
         desired_state_canonical: canonical,
-        format_version: 1,
+        format_version: 2,
     };
     let batch = engine.build_migration_row_batch(&row);
     engine.ingest_to_family(MIGRATIONS_TAB_ID, &batch).unwrap();
@@ -2320,5 +2340,169 @@ fn test_current_migration_hash_replay() {
     assert_eq!(engine2.current_migration_hash, hash1, "replay should restore head");
     drop(engine2);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── V1.5 view-migration builder tests ───────────────────────────────
+
+use gnitz_wire::migration as wire_mig;
+
+fn make_ast_view(
+    schema: &str, name: &str, source_table_id: u64, output_cols: &[(String, u8)],
+) -> wire_mig::ViewDef {
+    wire_mig::ViewDef {
+        schema:  schema.into(),
+        name:    name.into(),
+        sql:     format!("SELECT * FROM t_{}", source_table_id),
+        circuit: make_wire_passthrough_graph(source_table_id, output_cols),
+    }
+}
+
+/// build_create_view_batches emits sys_columns → sys_view_deps →
+/// sys_circuit_* → sys_views in that order, and the final sys_views
+/// batch is always present (triggers on_view_delta → register).
+#[test]
+fn test_build_create_view_batches_shape() {
+    let dir = temp_dir("view_migr_create_shape");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Source table must exist for dependency resolution later, but
+    // build_create_view_batches only emits +1 rows — no dependency
+    // lookup. Still, get_schema_id needs "public" to exist.
+    let out_cols = vec![("id".to_string(), type_code::U64)];
+    let v = make_ast_view("public", "myview", 100, &out_cols);
+
+    let (vid, batches) = engine.build_create_view_batches(&v).unwrap();
+    assert!(vid >= FIRST_USER_TABLE_ID);
+
+    let tab_ids: Vec<i64> = batches.iter().map(|(t, _)| *t).collect();
+    // Must include columns, circuit nodes + edges + sources, and views;
+    // view row must be LAST (triggers on_view_delta after deps exist).
+    assert_eq!(tab_ids.last(), Some(&VIEW_TAB_ID), "sys_views must be emitted last");
+    assert!(tab_ids.contains(&COL_TAB_ID), "sys_columns present");
+    assert!(tab_ids.contains(&DEP_TAB_ID), "sys_view_deps present");
+    assert!(tab_ids.contains(&CIRCUIT_NODES_TAB_ID), "sys_circuit_nodes present");
+    assert!(tab_ids.contains(&CIRCUIT_EDGES_TAB_ID), "sys_circuit_edges present");
+    assert!(tab_ids.contains(&CIRCUIT_SOURCES_TAB_ID), "sys_circuit_sources present");
+
+    // Ordering: columns + deps + all circuit tables come BEFORE sys_views.
+    let view_idx = tab_ids.iter().position(|&t| t == VIEW_TAB_ID).unwrap();
+    for &prereq in &[COL_TAB_ID, DEP_TAB_ID, CIRCUIT_NODES_TAB_ID,
+                      CIRCUIT_EDGES_TAB_ID, CIRCUIT_SOURCES_TAB_ID] {
+        let pos = tab_ids.iter().position(|&t| t == prereq).unwrap();
+        assert!(pos < view_idx, "{} must precede VIEW_TAB_ID", prereq);
+    }
+
+    // Column count matches output_col_defs.
+    let cols_batch = batches.iter().find(|(t, _)| *t == COL_TAB_ID).unwrap();
+    assert_eq!(cols_batch.1.count, out_cols.len());
+
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// build_drop_view_batches retracts circuit tables BEFORE the view
+/// row, and all retractions carry the exact stored payload.
+#[test]
+fn test_build_drop_view_batches_shape() {
+    let dir = temp_dir("view_migr_drop_shape");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Create an underlying table first so the imperative create_view
+    // has something to depend on.
+    let tid = engine.create_table("public.t", &[u64_col_def("id")], 0, true).unwrap();
+
+    // Imperative create_view via the existing code path — that registers
+    // the view in the catalog and writes sys_circuit_* rows we can then
+    // retract via the new drop builder.
+    let graph = make_passthrough_graph(tid, &[("id".to_string(), type_code::U64)]);
+    let vid = engine.create_view("public.v", &graph, "SELECT * FROM t").unwrap();
+    assert!(vid >= FIRST_USER_TABLE_ID);
+
+    let (dropped_vid, batches, dir_opt) =
+        engine.build_drop_view_batches("public", "v").unwrap();
+    assert_eq!(dropped_vid, vid);
+    assert!(dir_opt.is_some(), "drop must surface a cache dir for rmtree");
+
+    let tab_ids: Vec<i64> = batches.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tab_ids.last(), Some(&VIEW_TAB_ID), "sys_views retraction is last");
+
+    // Every circuit table that had rows must appear before VIEW_TAB_ID.
+    let view_idx = tab_ids.iter().position(|&t| t == VIEW_TAB_ID).unwrap();
+    for prereq in [CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
+                    CIRCUIT_SOURCES_TAB_ID, DEP_TAB_ID, COL_TAB_ID] {
+        if let Some(pos) = tab_ids.iter().position(|&t| t == prereq) {
+            assert!(pos < view_idx, "{} must precede VIEW_TAB_ID", prereq);
+        }
+    }
+
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Canonical-form round-trip with a view that carries a non-empty
+/// CircuitGraph. Proves format-v2 DesiredState hashes consistently.
+#[test]
+fn test_view_migration_hash_stable_across_rebuild() {
+    let circuit = make_wire_passthrough_graph(100, &[
+        ("id".to_string(), type_code::U64),
+    ]);
+    let state = wire_mig::DesiredState {
+        tables: vec![],
+        views: vec![wire_mig::ViewDef {
+            schema:  "public".into(),
+            name:    "v".into(),
+            sql:     "SELECT * FROM t".into(),
+            circuit: circuit.clone(),
+        }],
+        indices: vec![],
+    };
+    let c1 = wire_mig::canonicalize(&state);
+    let c2 = wire_mig::canonicalize(&state);
+    assert_eq!(c1, c2, "canonicalize must be deterministic");
+
+    let decoded = wire_mig::decanonicalize(&c1).unwrap();
+    assert_eq!(decoded, state, "roundtrip preserves circuit field");
+
+    let h1 = wire_mig::compute_migration_hash(0, &c1, "alice", "v1");
+    let h2 = wire_mig::compute_migration_hash(0, &c2, "alice", "v1");
+    assert_eq!(h1, h2, "migration hash stable across rebuild");
+}
+
+/// A malformed circuit (dangling edge reference) fails structural
+/// validation — the Phase-1 gate that prevents bad circuits from
+/// reaching Phase 3.
+#[test]
+fn test_view_circuit_validation_rejects_dangling_edge() {
+    let dir = temp_dir("view_migr_dangling_edge");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Missing node id 99 referenced by the edge — must fail.
+    let bad = gnitz_wire::CircuitGraph {
+        view_id: 0, primary_source_id: 100,
+        nodes:   vec![(1, 11), (2, 7)],
+        edges:   vec![(1, 1, 99, 0)],    // dst=99 doesn't exist
+        sources: vec![(1, 0)],
+        params: vec![], group_cols: vec![], const_strings: vec![],
+        output_col_defs: vec![("id".into(), type_code::U64)],
+        dependencies: vec![100],
+    };
+    assert!(engine.validate_view_circuit(&bad).is_err());
+
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty circuit (no nodes) also fails validation — vacuous passing
+/// would later produce an uncompileable view.
+#[test]
+fn test_view_circuit_validation_rejects_empty() {
+    let dir = temp_dir("view_migr_empty_circuit");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let empty = gnitz_wire::CircuitGraph::default();
+    assert!(engine.validate_view_circuit(&empty).is_err());
+
+    engine.close();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -22,6 +22,8 @@
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::circuit::CircuitGraph;
+
 // ---------------------------------------------------------------------------
 // AST types (canonical form)
 // ---------------------------------------------------------------------------
@@ -47,9 +49,10 @@ pub struct TableDef {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ViewDef {
-    pub schema: String,
-    pub name:   String,
-    pub sql:    String,
+    pub schema:  String,
+    pub name:    String,
+    pub sql:     String,
+    pub circuit: CircuitGraph,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]

@@ -3097,6 +3097,23 @@ impl CatalogEngine {
         &mut self.dag as *mut DagEngine
     }
 
+    /// Structural validation of a wire-form view circuit: dangling
+    /// edge references, unknown source ids, etc. Wraps
+    /// `dag.validate_graph_structure` with the i32 conversion the
+    /// legacy imperative API expects.
+    pub(crate) fn validate_view_circuit(
+        &mut self, circuit: &gnitz_wire::CircuitGraph,
+    ) -> Result<(), String> {
+        let nodes: Vec<(i32, i32)> = circuit.nodes.iter()
+            .map(|&(a, b)| (a as i32, b as i32)).collect();
+        let edges: Vec<(i32, i32, i32, i32)> = circuit.edges.iter()
+            .map(|&(a, b, c, d)| (a as i32, b as i32, c as i32, d as i32)).collect();
+        let sources: Vec<(i32, i64)> = circuit.sources.iter()
+            .map(|&(a, b)| (a as i32, b as i64)).collect();
+        self.dag.validate_graph_structure(&nodes, &edges, &sources)
+            .map_err(|e| format!("invalid view circuit: {}", e))
+    }
+
     // -- Iteration helpers ----------------------------------------------------
 
     /// Collect all user table IDs.
