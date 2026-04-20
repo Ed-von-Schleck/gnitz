@@ -668,12 +668,6 @@ impl CatalogEngine {
             return Err(format!("schema does not exist: {}", v.schema));
         }
 
-        self.dag.validate_graph_structure(
-            &v.circuit.nodes.iter().map(|&(a, b)| (a as i32, b as i32)).collect::<Vec<_>>(),
-            &v.circuit.edges.iter().map(|&(a, b, c, d)| (a as i32, b as i32, c as i32, d as i32)).collect::<Vec<_>>(),
-            &v.circuit.sources.iter().map(|&(a, b)| (a as i32, b as i64)).collect::<Vec<_>>(),
-        ).map_err(|e| format!("invalid view circuit: {}", e))?;
-
         let vid = self.allocate_table_id();
         let directory = format!("{}/{}/view_{}_{}", self.base_dir, v.schema, v.name, vid);
 

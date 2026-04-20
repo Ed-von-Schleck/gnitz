@@ -3,7 +3,7 @@ use sqlparser::ast::{
     Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Expr,
     SelectItem, TableFactor, JoinOperator, JoinConstraint, GroupByExpr,
     SetOperator, SetQuantifier,
-    FunctionArguments, FunctionArg, FunctionArgExpr,
+    FunctionArguments, FunctionArg, FunctionArgExpr, With,
 };
 use gnitz_protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
@@ -189,6 +189,33 @@ fn execute_drop(
     Ok(SqlResult::Dropped)
 }
 
+fn bind_with_clause(with: &With, binder: &mut Binder<'_>) -> Result<(), GnitzSqlError> {
+    if with.recursive {
+        return Err(GnitzSqlError::Unsupported("recursive CTEs not supported".into()));
+    }
+    for cte in &with.cte_tables {
+        let cte_name = cte.alias.name.value.clone();
+        let cte_select = match cte.query.body.as_ref() {
+            SetExpr::Select(s) => s,
+            _ => return Err(GnitzSqlError::Unsupported(
+                format!("CTE '{}': only SELECT supported", cte_name)
+            )),
+        };
+        if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
+            return Err(GnitzSqlError::Unsupported(
+                format!("CTE '{}': only single table without JOINs", cte_name)
+            ));
+        }
+        let cte_table_name = extract_table_factor_name(
+            &cte_select.from[0].relation,
+            &format!("CTE '{}'", cte_name),
+        )?;
+        let resolved = binder.resolve(&cte_table_name)?;
+        binder.cache_alias(cte_name, resolved);
+    }
+    Ok(())
+}
+
 fn execute_create_view(
     client:      &GnitzClient,
     schema_name: &str,
@@ -204,33 +231,8 @@ fn execute_create_view(
         return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
     }
 
-    // Process CTEs (WITH clause) — inline them into the binder cache
     if let Some(with) = &query.with {
-        if with.recursive {
-            return Err(GnitzSqlError::Unsupported(
-                "recursive CTEs not supported".to_string()
-            ));
-        }
-        for cte in &with.cte_tables {
-            let cte_name = cte.alias.name.value.clone();
-            let cte_select = match cte.query.body.as_ref() {
-                SetExpr::Select(s) => s,
-                _ => return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only SELECT supported", cte_name)
-                )),
-            };
-            if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only single table without JOINs", cte_name)
-                ));
-            }
-            let cte_table_name = extract_table_factor_name(
-                &cte_select.from[0].relation,
-                &format!("CTE '{}'", cte_name),
-            )?;
-            let resolved = binder.resolve(&cte_table_name)?;
-            binder.cache_alias(cte_name, resolved);
-        }
+        bind_with_clause(with, binder)?;
     }
 
     // Handle set operations (UNION, INTERSECT, EXCEPT)
@@ -378,29 +380,7 @@ pub fn compile_view_for_migration(
     }
     let mut binder = Binder::new(client, schema_name);
     if let Some(with) = &query.with {
-        if with.recursive {
-            return Err(GnitzSqlError::Unsupported("recursive CTEs not supported".into()));
-        }
-        for cte in &with.cte_tables {
-            let cte_name = cte.alias.name.value.clone();
-            let cte_select = match cte.query.body.as_ref() {
-                SetExpr::Select(s) => s,
-                _ => return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only SELECT supported", cte_name)
-                )),
-            };
-            if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only single table without JOINs", cte_name)
-                ));
-            }
-            let cte_table_name = extract_table_factor_name(
-                &cte_select.from[0].relation,
-                &format!("CTE '{}'", cte_name),
-            )?;
-            let resolved = binder.resolve(&cte_table_name)?;
-            binder.cache_alias(cte_name, resolved);
-        }
+        bind_with_clause(with, &mut binder)?;
     }
 
     let select = match query.body.as_ref() {

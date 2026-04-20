@@ -21,34 +21,27 @@ use sqlparser::parser::Parser;
 use crate::error::GnitzSqlParseError;
 use crate::types::sql_type_to_typecode;
 
-/// Parse a migration's declarative SQL into a complete desired state.
+/// Parse migration SQL into a `DesiredState` and the raw
+/// `Vec<Statement>`. Use this when the caller needs to walk the AST
+/// after parsing (e.g. to compile view circuits) so the SQL is only
+/// parsed once.
 ///
-/// Input is one-or-more top-level `CREATE TABLE / VIEW / INDEX`
-/// statements separated by semicolons. Any other statement kind
-/// (INSERT, UPDATE, DROP, ALTER, ...) is rejected — migrations carry
-/// the full target catalog, not a diff script.
-pub fn parse_desired_state(
+/// Input must be one-or-more `CREATE TABLE / VIEW / INDEX` statements
+/// separated by semicolons. Any other statement kind is rejected.
+pub fn parse_desired_state_with_stmts(
     sql: &str, default_schema: &str,
-) -> Result<DesiredState, GnitzSqlParseError> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
+) -> Result<(DesiredState, Vec<Statement>), GnitzSqlParseError> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
         .map_err(GnitzSqlParseError::Parse)?;
-
     let mut tables: Vec<TableDef> = Vec::new();
     let mut views: Vec<ViewDef> = Vec::new();
     let mut indices: Vec<IndexDef> = Vec::new();
-
-    for stmt in statements {
+    for stmt in &statements {
         match stmt {
             Statement::CreateTable(ct) => tables.push(table_from_create(ct, default_schema)?),
             Statement::CreateView { name, query, .. } => {
-                let (schema, vname) = split_qualified(&name, default_schema);
-                views.push(ViewDef {
-                    schema,
-                    name:    vname,
-                    sql:     query.to_string(),
-                    circuit: Default::default(),
-                });
+                let (schema, vname) = split_qualified(name, default_schema);
+                views.push(ViewDef { schema, name: vname, sql: query.to_string(), circuit: Default::default() });
             }
             Statement::CreateIndex(ci) => indices.push(index_from_create(ci, default_schema)?),
             _ => return Err(GnitzSqlParseError::Unsupported(
@@ -56,7 +49,16 @@ pub fn parse_desired_state(
             )),
         }
     }
-    Ok(DesiredState { tables, views, indices })
+    Ok((DesiredState { tables, views, indices }, statements))
+}
+
+/// Parse migration SQL into a `DesiredState`. Prefer
+/// [`parse_desired_state_with_stmts`] when the parsed AST is also
+/// needed.
+pub fn parse_desired_state(
+    sql: &str, default_schema: &str,
+) -> Result<DesiredState, GnitzSqlParseError> {
+    parse_desired_state_with_stmts(sql, default_schema).map(|(s, _)| s)
 }
 
 fn split_qualified(name: &ObjectName, default_schema: &str) -> (String, String) {
@@ -83,7 +85,7 @@ fn obj_part_to_string(part: &sqlparser::ast::ObjectNamePart) -> String {
 fn ident_to_string(id: &Ident) -> String { id.value.clone() }
 
 fn table_from_create(
-    ct: CreateTable, default_schema: &str,
+    ct: &CreateTable, default_schema: &str,
 ) -> Result<TableDef, GnitzSqlParseError> {
     let (schema, name) = split_qualified(&ct.name, default_schema);
 
@@ -156,7 +158,7 @@ fn table_from_create(
 }
 
 fn index_from_create(
-    ci: CreateIndex, default_schema: &str,
+    ci: &CreateIndex, default_schema: &str,
 ) -> Result<IndexDef, GnitzSqlParseError> {
     let idx_qualified = ci.name.clone().ok_or_else(|| GnitzSqlParseError::Unsupported(
         "CREATE INDEX without explicit name".into(),
