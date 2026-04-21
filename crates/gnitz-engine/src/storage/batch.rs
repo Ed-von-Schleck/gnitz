@@ -119,8 +119,8 @@ pub struct Batch {
     num_regions: u8,
     capacity: u32,
     pub count: usize,
-    pub sorted: bool,
-    pub consolidated: bool,
+    pub(crate) sorted: bool,
+    pub(crate) consolidated: bool,
     pub schema: Option<SchemaDescriptor>,
 }
 
@@ -632,6 +632,15 @@ impl Batch {
             col_data: col_slices,
             blob: &self.blob,
             count: self.count,
+        }
+    }
+
+    /// Returns `None` for unsorted batches; `count <= 1` is always sorted.
+    pub(super) fn as_sorted_mem_batch(&self) -> Option<merge::SortedMemBatch<'_>> {
+        if self.sorted || self.count <= 1 {
+            Some(merge::SortedMemBatch::new_unchecked(self.as_mem_batch()))
+        } else {
+            None
         }
     }
 

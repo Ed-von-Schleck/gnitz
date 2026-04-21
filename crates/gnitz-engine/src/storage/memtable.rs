@@ -10,7 +10,7 @@ use super::bloom::BloomFilter;
 use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::merge::{self, MemBatch};
+use super::merge::{self, SortedMemBatch};
 use super::shard_file;
 
 // Accessible to the tests submodule (private items are visible to descendants).
@@ -22,7 +22,7 @@ const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
 fn consolidate_batches(
-    batches: &[MemBatch],
+    batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
 ) -> Batch {
     let num_payload_cols = schema.num_columns as usize - 1;
@@ -36,13 +36,11 @@ fn consolidate_batches(
         return Batch::empty(num_payload_cols);
     }
 
-    let result = write_to_batch(schema, total_rows, total_blob, |writer| {
-        if batches.len() == 1 {
-            merge::sort_and_consolidate(&batches[0], schema, writer);
-        } else {
-            merge::merge_batches(batches, schema, writer);
-        }
+    let mut result = write_to_batch(schema, total_rows, total_blob, |writer| {
+        merge::merge_batches(batches, schema, writer);
     });
+    result.sorted = true;
+    result.consolidated = true;
     result
 }
 
@@ -80,6 +78,7 @@ impl MemTable {
 
     /// Append a pre-sorted batch as a new run.
     pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+        debug_assert!(batch.sorted || batch.count <= 1, "upsert_sorted_batch called with unsorted batch");
         if batch.count == 0 {
             return Ok(());
         }
@@ -120,14 +119,19 @@ impl MemTable {
         self.total_row_count
     }
 
+    fn runs_as_sorted(&self) -> Vec<SortedMemBatch<'_>> {
+        self.runs.iter()
+            .map(|r| r.as_sorted_mem_batch().expect("MemTable runs are always sorted"))
+            .collect()
+    }
+
     /// Get a consolidated snapshot.  Caches the merged result of all runs.
     /// Returns an `Arc<Batch>` — cheap to clone for multiple consumers.
     pub fn get_snapshot(&mut self) -> Arc<Batch> {
         let num_payload_cols = self.schema.num_columns as usize - 1;
 
         if self.cached_consolidated.is_none() && !self.runs.is_empty() {
-            let batches: Vec<MemBatch> =
-                self.runs.iter().map(|r| r.as_mem_batch()).collect();
+            let batches = self.runs_as_sorted();
             let consolidated = consolidate_batches(&batches, &self.schema);
             self.cached_consolidated = Some(Arc::new(consolidated));
         }
@@ -306,8 +310,7 @@ impl MemTable {
         if self.runs.len() < INLINE_CONSOLIDATE_THRESHOLD {
             return;
         }
-        let batches: Vec<MemBatch> =
-            self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let batches = self.runs_as_sorted();
         let merged = consolidate_batches(&batches, &self.schema);
         self.runs.clear();
         self.runs_bytes = merged.total_bytes();
@@ -708,10 +711,10 @@ mod tests {
             (0, 0,  1, 0, 15000),  // insert sum=15000
         ]);
 
-        let batches: Vec<super::merge::MemBatch> = vec![
-            run1.as_mem_batch(),
-            run2.as_mem_batch(),
-            run3.as_mem_batch(),
+        let batches: Vec<SortedMemBatch> = vec![
+            run1.as_sorted_mem_batch().expect("test batch is sorted"),
+            run2.as_sorted_mem_batch().expect("test batch is sorted"),
+            run3.as_sorted_mem_batch().expect("test batch is sorted"),
         ];
 
         let consolidated = consolidate_batches(&batches, &schema);

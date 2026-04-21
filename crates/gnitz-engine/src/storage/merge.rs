@@ -20,6 +20,31 @@ use type_code::STRING as TYPE_STRING;
 // MemBatch: a view over flat columnar buffers (one batch / sorted run)
 // ---------------------------------------------------------------------------
 
+/// A `MemBatch` that has been certified sorted by (PK, payload).
+///
+/// The only ways to obtain one are:
+/// - `Batch::as_sorted_mem_batch()` — runtime check on the `sorted` flag
+/// - `SortedMemBatch::new_unchecked()` — caller asserts the invariant
+///
+/// `merge_batches` requires `&[SortedMemBatch]` so the compiler enforces that
+/// only certified-sorted inputs reach the N-way merge.
+#[repr(transparent)]
+pub struct SortedMemBatch<'a>(MemBatch<'a>);
+
+impl<'a> SortedMemBatch<'a> {
+    /// Wrap `mb` asserting it is already sorted by (PK, payload).
+    /// Use `Batch::as_sorted_mem_batch()` for the checked variant.
+    pub(crate) fn new_unchecked(mb: MemBatch<'a>) -> Self {
+        SortedMemBatch(mb)
+    }
+}
+
+impl<'a> std::ops::Deref for SortedMemBatch<'a> {
+    type Target = MemBatch<'a>;
+    fn deref(&self) -> &MemBatch<'a> { &self.0 }
+}
+
+#[derive(Clone)]
 pub struct MemBatch<'a> {
     pub pk_lo: &'a [u8],     // count * 8
     pub pk_hi: &'a [u8],     // count * 8
@@ -125,7 +150,7 @@ impl MemBatchCursor {
     }
 
     #[inline]
-    pub fn peek_key(&self, batches: &[MemBatch]) -> u128 {
+    pub fn peek_key(&self, batches: &[SortedMemBatch]) -> u128 {
         if self.is_valid() {
             batches[self.batch_idx].get_pk(self.position)
         } else {
@@ -269,7 +294,7 @@ impl<'a> DirectWriter<'a> {
 /// between operations.
 fn merge_entry_less<'c>(
     cursors: &'c [MemBatchCursor],
-    batches: &'c [MemBatch],
+    batches: &'c [SortedMemBatch],
     schema: &'c SchemaDescriptor,
 ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
     move |a, b| {
@@ -280,11 +305,11 @@ fn merge_entry_less<'c>(
         let bj = cursors[b.idx].batch_idx;
         let ri = cursors[a.idx].position;
         let rj = cursors[b.idx].position;
-        columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj) == Ordering::Less
+        columnar::compare_rows(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
     }
 }
 
-/// Perform N-way merge + consolidation of MemBatch slices into a DirectWriter.
+/// Perform N-way merge + consolidation of **sorted** `MemBatch` slices.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
 /// (PK, payload) groups are dropped.  The payload-aware heap ordering ensures
@@ -292,8 +317,11 @@ fn merge_entry_less<'c>(
 /// single-level pending-group drain below handles both intra-cursor
 /// duplicates (consecutive matching rows inside one sorted batch) and
 /// cross-cursor duplicates (matching rows in different batches) in one pass.
+///
+/// The `SortedMemBatch` parameter enforces at the call site that every input
+/// is certified sorted by (PK, payload).
 pub fn merge_batches(
-    batches: &[MemBatch],
+    batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
@@ -335,8 +363,8 @@ pub fn merge_batches(
             && cur_pk == pending_pk
             && columnar::compare_rows(
                 schema,
-                &batches[pending_batch], pending_row,
-                &batches[bi], ri,
+                &batches[pending_batch].0, pending_row,
+                &batches[bi].0, ri,
             ) == Ordering::Equal;
 
         if same_group {
@@ -580,8 +608,12 @@ mod tests {
         }
     }
 
-    // Helper to run merge and collect output rows
+    // Takes &[MemBatch] so test call sites don't need to construct SortedMemBatch.
     fn run_merge(batches: &[MemBatch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
+        let sorted: Vec<SortedMemBatch> = batches.iter()
+            .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
+            .collect();
+        let batches = &sorted[..];
         let total_rows: usize = batches.iter().map(|b| b.count).sum();
         let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
 
