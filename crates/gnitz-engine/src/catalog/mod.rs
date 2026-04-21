@@ -16,6 +16,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
@@ -211,6 +212,55 @@ fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str
 }
 
 // ---------------------------------------------------------------------------
+// CatalogCacheSet — all typed caches for one CatalogEngine
+// ---------------------------------------------------------------------------
+
+struct CatalogCacheSet {
+    schema_by_name:  HashMap<String, i64>,
+    schema_by_id:    HashMap<i64, String>,
+    entity_by_qname: HashMap<String, i64>,
+    entity_by_id:    HashMap<i64, (String, String)>,
+    schema_of:       HashMap<i64, i64>,
+    pk_col_of:       HashMap<i64, u32>,
+    col_names:       HashMap<i64, Vec<String>>,
+    col_names_bytes: HashMap<i64, Rc<Vec<Vec<u8>>>>,
+    index_by_name:   HashMap<String, i64>,
+    index_by_id:     HashMap<i64, String>,
+    fk_by_child:     HashMap<i64, Vec<FkConstraint>>,
+    fk_by_parent:    HashMap<i64, Vec<(i64, usize)>>,
+    needs_lock:      HashSet<i64>,
+    cascade_enabled: bool,
+    source_index:    HashMap<i64, Vec<(u64, u64)>>,
+}
+
+impl CatalogCacheSet {
+    fn new() -> Self {
+        CatalogCacheSet {
+            schema_by_name:  HashMap::new(),
+            schema_by_id:    HashMap::new(),
+            entity_by_qname: HashMap::new(),
+            entity_by_id:    HashMap::new(),
+            schema_of:       HashMap::new(),
+            pk_col_of:       HashMap::new(),
+            col_names:       HashMap::new(),
+            col_names_bytes: HashMap::new(),
+            index_by_name:   HashMap::new(),
+            index_by_id:     HashMap::new(),
+            fk_by_child:     HashMap::new(),
+            fk_by_parent:    HashMap::new(),
+            needs_lock:      HashSet::new(),
+            cascade_enabled: false,
+            source_index:    HashMap::new(),
+        }
+    }
+
+    fn invalidate_col_names(&mut self, id: i64) {
+        self.col_names.remove(&id);
+        self.col_names_bytes.remove(&id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FK constraint
 // ---------------------------------------------------------------------------
 
@@ -258,30 +308,15 @@ pub struct CatalogEngine {
     pub(crate) dag: DagEngine,
     pub(crate) base_dir: String,
 
-    // --- Entity registry ---
-    schema_name_to_id: HashMap<String, i64>,
-    schema_id_to_name: HashMap<i64, String>,
-    name_to_id: HashMap<String, i64>,          // "schema.table" -> table_id
-    id_to_qualified: HashMap<i64, (String, String)>, // table_id -> (schema, table)
+    // --- Unified cache set (replaces 11 ad-hoc HashMaps) ---
+    caches: CatalogCacheSet,
+
+    // --- Sequence counters ---
     next_schema_id: i64,
     next_table_id: i64,
     next_index_id: i64,
     active_part_start: u32,
     active_part_end: u32,
-
-    // --- FK constraints per table ---
-    fk_constraints: HashMap<i64, Vec<FkConstraint>>,
-    // Reverse index: parent_table_id → Vec<(child_table_id, fk_col_idx)>
-    fk_parent_map: HashMap<i64, Vec<(i64, usize)>>,
-
-    // --- Index registry ---
-    index_by_name: HashMap<String, i64>,   // name -> index_id
-    index_by_id: HashMap<i64, String>,     // index_id -> name
-
-    // --- Per-table metadata (not tracked by DagEngine) ---
-    schema_ids: HashMap<i64, i64>,        // table_id -> schema_id
-    pk_col_indices: HashMap<i64, u32>,    // table_id -> pk_col_idx
-    col_names_cache: HashMap<i64, Vec<String>>,  // table_id -> column names
 
     // --- System tables (owned, single-partition, durable) ---
     sys_schemas: Box<Table>,
@@ -291,14 +326,12 @@ pub struct CatalogEngine {
     sys_indices: Box<Table>,
     sys_view_deps: Box<Table>,
     sys_sequences: Box<Table>,
+    sys_catalog_caches: Box<Table>,
     sys_circuit_nodes: Box<Table>,
     sys_circuit_edges: Box<Table>,
     sys_circuit_sources: Box<Table>,
     sys_circuit_params: Box<Table>,
     sys_circuit_group_cols: Box<Table>,
-
-    // --- Hook state ---
-    cascade_enabled: bool,
 }
 
 // SAFETY: CatalogEngine is only accessed from a single thread.
@@ -413,11 +446,12 @@ impl CatalogEngine {
         let sys_indices = create_sys_table(&SYS_TAB_INFOS[4])?;
         let sys_view_deps = create_sys_table(&SYS_TAB_INFOS[5])?;
         let sys_sequences = create_sys_table(&SYS_TAB_INFOS[6])?;
-        let sys_circuit_nodes = create_sys_table(&SYS_TAB_INFOS[7])?;
-        let sys_circuit_edges = create_sys_table(&SYS_TAB_INFOS[8])?;
-        let sys_circuit_sources = create_sys_table(&SYS_TAB_INFOS[9])?;
-        let sys_circuit_params = create_sys_table(&SYS_TAB_INFOS[10])?;
-        let sys_circuit_group_cols = create_sys_table(&SYS_TAB_INFOS[11])?;
+        let sys_catalog_caches = create_sys_table(&SYS_TAB_INFOS[7])?;
+        let sys_circuit_nodes = create_sys_table(&SYS_TAB_INFOS[8])?;
+        let sys_circuit_edges = create_sys_table(&SYS_TAB_INFOS[9])?;
+        let sys_circuit_sources = create_sys_table(&SYS_TAB_INFOS[10])?;
+        let sys_circuit_params = create_sys_table(&SYS_TAB_INFOS[11])?;
+        let sys_circuit_group_cols = create_sys_table(&SYS_TAB_INFOS[12])?;
 
         // Check if this is a fresh database (no table records yet)
         let is_new = {
@@ -432,22 +466,12 @@ impl CatalogEngine {
         let mut engine = CatalogEngine {
             dag,
             base_dir: base_dir.to_string(),
-            schema_name_to_id: HashMap::new(),
-            schema_id_to_name: HashMap::new(),
-            name_to_id: HashMap::new(),
-            id_to_qualified: HashMap::new(),
+            caches: CatalogCacheSet::new(),
             next_schema_id: FIRST_USER_SCHEMA_ID,
             next_table_id: FIRST_USER_TABLE_ID,
             next_index_id: FIRST_USER_INDEX_ID,
             active_part_start: 0,
             active_part_end: NUM_PARTITIONS,
-            fk_constraints: HashMap::new(),
-            fk_parent_map: HashMap::new(),
-            index_by_name: HashMap::new(),
-            index_by_id: HashMap::new(),
-            schema_ids: HashMap::new(),
-            pk_col_indices: HashMap::new(),
-            col_names_cache: HashMap::new(),
             sys_schemas,
             sys_tables,
             sys_views,
@@ -455,12 +479,12 @@ impl CatalogEngine {
             sys_indices,
             sys_view_deps,
             sys_sequences,
+            sys_catalog_caches,
             sys_circuit_nodes,
             sys_circuit_edges,
             sys_circuit_sources,
             sys_circuit_params,
             sys_circuit_group_cols,
-            cascade_enabled: false,
         };
 
         if is_new {
@@ -480,7 +504,7 @@ impl CatalogEngine {
         engine.replay_catalog()?;
 
         // Enable cascading effects (e.g. auto-create FK indices)
-        engine.cascade_enabled = true;
+        engine.caches.cascade_enabled = true;
 
         Ok(engine)
     }
@@ -557,6 +581,11 @@ impl CatalogEngine {
                     ("cache_directory", type_code::STRING),
                 ]),
                 (SEQ_TAB_ID, &[("seq_id", type_code::U64), ("next_val", type_code::U64)]),
+                (CATALOG_CACHES_TAB_ID, &[
+                    ("cache_entry_pk", type_code::U128),
+                    ("name", type_code::STRING),
+                    ("kind", type_code::U64),
+                ]),
                 (CIRCUIT_NODES_TAB_ID, &[("node_pk", type_code::U128), ("opcode", type_code::U64)]),
                 (CIRCUIT_EDGES_TAB_ID, &[
                     ("edge_pk", type_code::U128), ("src_node", type_code::U64),
@@ -609,13 +638,68 @@ impl CatalogEngine {
             ingest_batch_into(&mut self.sys_sequences, &batch);
         }
 
+        // 5. Catalog cache registration rows
+        self.bootstrap_catalog_caches();
+
         // Flush all foundational metadata to disk
         let _ = self.sys_schemas.flush();
         let _ = self.sys_tables.flush();
         let _ = self.sys_columns.flush();
         let _ = self.sys_sequences.flush();
+        let _ = self.sys_catalog_caches.flush();
 
         Ok(())
+    }
+
+    fn bootstrap_catalog_caches(&mut self) {
+        let schema = catalog_caches_schema();
+        // Rows ordered by desired dispatch order within each source_table_id.
+        // PK = (lo=effect_id, hi=source_table_id).
+        let rows: &[(u64, u64, &str, u64)] = &[
+            // SCHEMA_TAB_ID effects
+            (CACHE_ID_SCHEMA_BY_NAME,  SCHEMA_TAB_ID as u64, "schema_by_name",  CCTAB_KIND_DATA),
+            (CACHE_ID_SCHEMA_BY_ID,    SCHEMA_TAB_ID as u64, "schema_by_id",    CCTAB_KIND_DATA),
+            (HOOK_ID_SCHEMA_DIR,       SCHEMA_TAB_ID as u64, "schema_dir",      CCTAB_KIND_HOOK),
+            // TABLE_TAB_ID effects (TABLE_REGISTER before NEEDS_LOCK intentional here)
+            (CACHE_ID_ENTITY_BY_QNAME, TABLE_TAB_ID as u64,  "entity_by_qname", CCTAB_KIND_DATA),
+            (CACHE_ID_ENTITY_BY_ID,    TABLE_TAB_ID as u64,  "entity_by_id",    CCTAB_KIND_DATA),
+            (CACHE_ID_SCHEMA_OF,       TABLE_TAB_ID as u64,  "schema_of",       CCTAB_KIND_DATA),
+            (CACHE_ID_PK_COL_OF,       TABLE_TAB_ID as u64,  "pk_col_of",       CCTAB_KIND_DATA),
+            (HOOK_ID_TABLE_REGISTER,   TABLE_TAB_ID as u64,  "table_register",  CCTAB_KIND_HOOK),
+            (CACHE_ID_NEEDS_LOCK,      TABLE_TAB_ID as u64,  "needs_lock",      CCTAB_KIND_DATA),
+            (HOOK_ID_CASCADE_FK,       TABLE_TAB_ID as u64,  "cascade_fk",      CCTAB_KIND_HOOK),
+            // VIEW_TAB_ID effects
+            (CACHE_ID_ENTITY_BY_QNAME, VIEW_TAB_ID as u64,   "entity_by_qname", CCTAB_KIND_DATA),
+            (CACHE_ID_ENTITY_BY_ID,    VIEW_TAB_ID as u64,   "entity_by_id",    CCTAB_KIND_DATA),
+            (CACHE_ID_SCHEMA_OF,       VIEW_TAB_ID as u64,   "schema_of",       CCTAB_KIND_DATA),
+            (CACHE_ID_PK_COL_OF,       VIEW_TAB_ID as u64,   "pk_col_of",       CCTAB_KIND_DATA),
+            (HOOK_ID_VIEW_REGISTER,    VIEW_TAB_ID as u64,   "view_register",   CCTAB_KIND_HOOK),
+            // COL_TAB_ID effects
+            (CACHE_ID_COL_NAMES,       COL_TAB_ID as u64,    "col_names",       CCTAB_KIND_DATA),
+            (CACHE_ID_COL_NAMES_BYTES, COL_TAB_ID as u64,    "col_names_bytes", CCTAB_KIND_DATA),
+            (CACHE_ID_FK_BY_CHILD,     COL_TAB_ID as u64,    "fk_by_child",     CCTAB_KIND_DATA),
+            (CACHE_ID_FK_BY_PARENT,    COL_TAB_ID as u64,    "fk_by_parent",    CCTAB_KIND_DATA),
+            (CACHE_ID_NEEDS_LOCK,      COL_TAB_ID as u64,    "needs_lock",      CCTAB_KIND_DATA),
+            // IDX_TAB_ID effects (INDEX_REGISTER before NEEDS_LOCK intentional here)
+            (CACHE_ID_INDEX_BY_NAME,   IDX_TAB_ID as u64,    "index_by_name",   CCTAB_KIND_DATA),
+            (CACHE_ID_INDEX_BY_ID,     IDX_TAB_ID as u64,    "index_by_id",     CCTAB_KIND_DATA),
+            (HOOK_ID_INDEX_REGISTER,   IDX_TAB_ID as u64,    "index_register",  CCTAB_KIND_HOOK),
+            (CACHE_ID_NEEDS_LOCK,      IDX_TAB_ID as u64,    "needs_lock",      CCTAB_KIND_DATA),
+            // DEP_TAB_ID effects
+            (HOOK_ID_DEP_INVALIDATE,   DEP_TAB_ID as u64,    "dep_invalidate",  CCTAB_KIND_HOOK),
+        ];
+        let mut bb = BatchBuilder::new(schema);
+        for &(effect_id, source_tid, name, kind) in rows {
+            let (pk_lo, pk_hi) = pack_cache_entry_pk(effect_id, source_tid);
+            bb.begin_row(pk_lo, pk_hi, 1);
+            bb.put_string(name);
+            bb.put_u64(kind);
+            bb.end_row();
+        }
+        let batch = bb.finish();
+        ingest_batch_into(&mut self.sys_catalog_caches, &batch);
+        // Populate source_index immediately for the fresh-start code path
+        let _ = self.on_catalog_caches_delta(&batch);
     }
 
     // -- Recover sequence counters from sys_sequences ----------------------
@@ -658,8 +742,8 @@ impl CatalogEngine {
     fn register_system_table_families(&mut self) {
         let sys_dir = format!("{}/{}", self.base_dir, SYS_CATALOG_DIRNAME);
 
-        // Collect all 12 system table pointers
-        let table_ptrs: [*mut Table; 12] = [
+        // Collect all 13 system table pointers (order matches SYS_TAB_INFOS)
+        let table_ptrs: [*mut Table; 13] = [
             &mut *self.sys_schemas,
             &mut *self.sys_tables,
             &mut *self.sys_views,
@@ -667,6 +751,7 @@ impl CatalogEngine {
             &mut *self.sys_indices,
             &mut *self.sys_view_deps,
             &mut *self.sys_sequences,
+            &mut *self.sys_catalog_caches,
             &mut *self.sys_circuit_nodes,
             &mut *self.sys_circuit_edges,
             &mut *self.sys_circuit_sources,
@@ -674,31 +759,26 @@ impl CatalogEngine {
             &mut *self.sys_circuit_group_cols,
         ];
 
+        self.caches.schema_by_name.insert("_system".into(), SYSTEM_SCHEMA_ID);
+        self.caches.schema_by_id.insert(SYSTEM_SCHEMA_ID, "_system".into());
+
         for (i, info) in SYS_TAB_INFOS.iter().enumerate() {
-            let qualified = format!("_system.{}", info.name);
             let dir = format!("{}/{}", sys_dir, info.subdir);
-
-            self.name_to_id.insert(qualified, info.id);
-            self.id_to_qualified.insert(info.id, ("_system".into(), info.name.into()));
-            self.schema_ids.insert(info.id, SYSTEM_SCHEMA_ID);
-            // directory tracked by DagEngine TableEntry
-            self.pk_col_indices.insert(info.id, 0);
-            // unique_pk and directory tracked by DagEngine TableEntry
-
+            let qualified = format!("_system.{}", info.name);
+            self.caches.entity_by_qname.insert(qualified, info.id);
+            self.caches.entity_by_id.insert(info.id, ("_system".into(), info.name.into()));
+            self.caches.schema_of.insert(info.id, SYSTEM_SCHEMA_ID);
+            self.caches.pk_col_of.insert(info.id, 0);
             let schema = sys_tab_schema(info.id);
             self.dag.register_table(
                 info.id,
                 StoreHandle::Borrowed(table_ptrs[i]),
                 schema,
-                0, // depth
-                false, // unique_pk
+                0,
+                false,
                 dir,
             );
         }
-
-        // Register system schema names
-        self.schema_name_to_id.insert("_system".into(), SYSTEM_SCHEMA_ID);
-        self.schema_id_to_name.insert(SYSTEM_SCHEMA_ID, "_system".into());
     }
 
     // -- Setup DagEngine system table references ---------------------------
@@ -724,10 +804,11 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        // Replay in dependency order: schemas, then tables, then views, then indices
+        self.replay_system_table(CATALOG_CACHES_TAB_ID)?; // must be first: populates source_index
         self.replay_system_table(SCHEMA_TAB_ID)?;
         self.replay_system_table(TABLE_TAB_ID)?;
         self.replay_system_table(VIEW_TAB_ID)?;
+        self.replay_system_table(COL_TAB_ID)?;   // FK wiring + col_names invalidation
         self.replay_system_table(IDX_TAB_ID)?;
         Ok(())
     }
@@ -735,9 +816,11 @@ impl CatalogEngine {
     fn replay_system_table(&mut self, sys_table_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(sys_table_id);
         let table_ptr: *mut Table = match sys_table_id {
+            CATALOG_CACHES_TAB_ID => &mut *self.sys_catalog_caches,
             SCHEMA_TAB_ID => &mut *self.sys_schemas,
             TABLE_TAB_ID => &mut *self.sys_tables,
             VIEW_TAB_ID => &mut *self.sys_views,
+            COL_TAB_ID => &mut *self.sys_columns,
             IDX_TAB_ID => &mut *self.sys_indices,
             _ => return Ok(()),
         };
@@ -906,73 +989,310 @@ impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
     fn fire_hooks(&mut self, sys_table_id: i64, batch: &Batch) -> Result<(), String> {
-        match sys_table_id {
-            SCHEMA_TAB_ID => self.on_schema_delta(batch),
-            TABLE_TAB_ID => self.on_table_delta(batch),
-            VIEW_TAB_ID => self.on_view_delta(batch),
-            IDX_TAB_ID => self.on_index_delta(batch),
-            DEP_TAB_ID => {
-                self.dag.invalidate_dep_map();
-                Ok(())
+        if sys_table_id == CATALOG_CACHES_TAB_ID {
+            return self.on_catalog_caches_delta(batch);
+        }
+        let effects = self.caches.source_index.get(&sys_table_id).cloned().unwrap_or_default();
+        for (effect_id, kind) in effects {
+            match kind {
+                CCTAB_KIND_DATA => self.apply_cache_delta(effect_id, sys_table_id, batch)?,
+                CCTAB_KIND_HOOK => self.apply_hook(effect_id, batch)?,
+                _ => {}
             }
-            _ => Ok(()),
+        }
+        Ok(())
+    }
+
+    fn on_catalog_caches_delta(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let pk = batch.get_pk(i);
+            let effect_id = pk as u64;
+            let source_tid = (pk >> 64) as i64;
+            let kind = self.read_batch_u64(batch, i, 1); // payload[1] = kind
+            let effects = self.caches.source_index.entry(source_tid).or_default();
+            if weight > 0 {
+                if !effects.iter().any(|&(id, _)| id == effect_id) {
+                    effects.push((effect_id, kind));
+                }
+            } else {
+                effects.retain(|&(id, _)| id != effect_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_cache_delta(&mut self, effect_id: u64, source_tid: i64, batch: &Batch) -> Result<(), String> {
+        match effect_id {
+            CACHE_ID_SCHEMA_BY_NAME          => self.apply_schema_by_name(batch),
+            CACHE_ID_SCHEMA_BY_ID            => self.apply_schema_by_id(batch),
+            CACHE_ID_ENTITY_BY_QNAME         => self.apply_entity_by_qname(batch),
+            CACHE_ID_ENTITY_BY_ID            => self.apply_entity_by_id(batch),
+            CACHE_ID_SCHEMA_OF               => self.apply_schema_of(batch),
+            CACHE_ID_PK_COL_OF               => self.apply_pk_col_of(source_tid, batch),
+            CACHE_ID_COL_NAMES | CACHE_ID_COL_NAMES_BYTES => self.apply_col_names_invalidate(batch),
+            CACHE_ID_INDEX_BY_NAME           => self.apply_index_by_name(batch),
+            CACHE_ID_INDEX_BY_ID             => self.apply_index_by_id(batch),
+            CACHE_ID_FK_BY_CHILD             => self.apply_fk_by_child(batch),
+            CACHE_ID_FK_BY_PARENT            => self.apply_fk_by_parent(batch),
+            CACHE_ID_NEEDS_LOCK              => self.apply_needs_lock(source_tid, batch),
+            _                                => Ok(()),
         }
     }
 
-    fn on_schema_delta(&mut self, batch: &Batch) -> Result<(), String> {
+    fn apply_hook(&mut self, effect_id: u64, batch: &Batch) -> Result<(), String> {
+        match effect_id {
+            HOOK_ID_SCHEMA_DIR     => self.hook_schema_dir(batch),
+            HOOK_ID_TABLE_REGISTER => self.hook_table_register(batch),
+            HOOK_ID_VIEW_REGISTER  => self.hook_view_register(batch),
+            HOOK_ID_INDEX_REGISTER => self.hook_index_register(batch),
+            HOOK_ID_CASCADE_FK     => self.hook_cascade_fk(batch),
+            HOOK_ID_DEP_INVALIDATE => { self.dag.invalidate_dep_map(); Ok(()) },
+            _                      => Ok(()),
+        }
+    }
+
+    // -- Cache delta appliers -----------------------------------------------
+
+    fn apply_schema_by_name(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
-            let name = self.read_batch_string(batch, i, 0); // COL_NAME at payload col 0
-            gnitz_debug!("catalog: on_schema_delta sid={} weight={} name={:?}", sid, weight, name);
-
+            let name = self.read_batch_string(batch, i, 0);
             if weight > 0 {
-                if self.schema_name_to_id.contains_key(&name) {
-                    continue;
-                }
-                let path = format!("{}/{}", self.base_dir, name);
-                ensure_dir(&path)?;
-                fsync_dir(&self.base_dir);
-                self.schema_name_to_id.insert(name.clone(), sid);
-                self.schema_id_to_name.insert(sid, name);
+                self.caches.schema_by_name.insert(name, sid);
             } else {
-                if self.schema_name_to_id.contains_key(&name) {
-                    if name == "_system" {
-                        return Err("Forbidden: cannot drop system schema".into());
-                    }
-                    // Caller (drop_schema) cascades dependents first, so
-                    // the schema is empty by the time this delta applies.
-                    self.schema_name_to_id.remove(&name);
-                    self.schema_id_to_name.remove(&sid);
+                self.caches.schema_by_name.remove(&name);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_schema_by_id(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let sid = batch.get_pk(i) as i64;
+            let name = self.read_batch_string(batch, i, 0);
+            if weight > 0 {
+                self.caches.schema_by_id.insert(sid, name);
+            } else {
+                self.caches.schema_by_id.remove(&sid);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_entity_by_qname(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let tid = batch.get_pk(i) as i64;
+            let sid = self.read_batch_u64(batch, i, 0) as i64;
+            let name = self.read_batch_string(batch, i, 1);
+            if weight > 0 {
+                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
+                let qualified = format!("{}.{}", schema_name, name);
+                self.caches.entity_by_qname.insert(qualified, tid);
+            } else {
+                // entity_by_id still present at this point (ENTITY_BY_QNAME fires before ENTITY_BY_ID)
+                if let Some((sn, en)) = self.caches.entity_by_id.get(&tid).cloned() {
+                    let qualified = format!("{}.{}", sn, en);
+                    self.caches.entity_by_qname.remove(&qualified);
                 }
             }
         }
         Ok(())
     }
 
-    fn on_table_delta(&mut self, batch: &Batch) -> Result<(), String> {
+    fn apply_entity_by_id(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            let sid = self.read_batch_u64(batch, i, 0) as i64; // TABLETAB_COL_SCHEMA_ID
-            let name = self.read_batch_string(batch, i, 1);    // TABLETAB_COL_NAME
-            let pk_col_idx = self.read_batch_u64(batch, i, 3) as u32; // TABLETAB_COL_PK_COL_IDX
-            let flags = self.read_batch_u64(batch, i, 5);      // TABLETAB_COL_FLAGS
+            let sid = self.read_batch_u64(batch, i, 0) as i64;
+            let name = self.read_batch_string(batch, i, 1);
+            if weight > 0 {
+                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
+                self.caches.entity_by_id.insert(tid, (schema_name, name));
+            } else {
+                self.caches.col_names.remove(&tid);
+                self.caches.col_names_bytes.remove(&tid);
+                self.caches.entity_by_id.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_schema_of(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let tid = batch.get_pk(i) as i64;
+            let sid = self.read_batch_u64(batch, i, 0) as i64;
+            if weight > 0 {
+                self.caches.schema_of.insert(tid, sid);
+            } else {
+                self.caches.schema_of.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_pk_col_of(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let tid = batch.get_pk(i) as i64;
+            if weight > 0 {
+                let pk_col = if source_tid == TABLE_TAB_ID {
+                    self.read_batch_u64(batch, i, 3) as u32 // TABLETAB_COL_PK_COL_IDX payload index
+                } else {
+                    0u32 // views always pk_col=0
+                };
+                self.caches.pk_col_of.insert(tid, pk_col);
+            } else {
+                self.caches.pk_col_of.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_col_names_invalidate(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+            self.caches.col_names.remove(&owner_id);
+            self.caches.col_names_bytes.remove(&owner_id);
+        }
+        Ok(())
+    }
+
+    fn apply_index_by_name(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let idx_id = batch.get_pk(i) as i64;
+            let name = self.read_batch_string(batch, i, 3); // IDXTAB_COL_NAME payload index
+            if weight > 0 {
+                self.caches.index_by_name.insert(name, idx_id);
+            } else {
+                self.caches.index_by_name.remove(&name);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_index_by_id(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let idx_id = batch.get_pk(i) as i64;
+            let name = self.read_batch_string(batch, i, 3);
+            if weight > 0 {
+                self.caches.index_by_id.insert(idx_id, name);
+            } else {
+                self.caches.index_by_id.remove(&idx_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_fk_by_child(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+            let col_idx = self.read_batch_u64(batch, i, 2) as usize;
+            let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
+            if fk_table_id == 0 { continue; }
+            if weight > 0 {
+                let constraints = self.caches.fk_by_child.entry(owner_id).or_default();
+                if !constraints.iter().any(|c| c.fk_col_idx == col_idx) {
+                    constraints.push(FkConstraint { fk_col_idx: col_idx, target_table_id: fk_table_id });
+                }
+            } else if let Some(constraints) = self.caches.fk_by_child.get_mut(&owner_id) {
+                constraints.retain(|c| c.fk_col_idx != col_idx);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_fk_by_parent(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+            let col_idx = self.read_batch_u64(batch, i, 2) as usize;
+            let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
+            if fk_table_id == 0 { continue; }
+            if weight > 0 {
+                let parents = self.caches.fk_by_parent.entry(fk_table_id).or_default();
+                if !parents.iter().any(|&(t, c)| t == owner_id && c == col_idx) {
+                    parents.push((owner_id, col_idx));
+                }
+            } else if let Some(parents) = self.caches.fk_by_parent.get_mut(&fk_table_id) {
+                parents.retain(|&(t, c)| !(t == owner_id && c == col_idx));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_needs_lock(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
+        match source_tid {
+            TABLE_TAB_ID => {
+                for i in 0..batch.count {
+                    let tid = batch.get_pk(i) as i64;
+                    self.recompute_needs_lock(tid);
+                }
+            }
+            IDX_TAB_ID => {
+                for i in 0..batch.count {
+                    let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+                    self.recompute_needs_lock(owner_id);
+                }
+            }
+            COL_TAB_ID => {
+                for i in 0..batch.count {
+                    let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+                    let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
+                    if fk_table_id != 0 {
+                        self.recompute_needs_lock(owner_id);
+                        if self.dag.tables.contains_key(&fk_table_id) {
+                            self.recompute_needs_lock(fk_table_id);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // -- Hook handlers ---------------------------------------------------------
+
+    fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            if weight > 0 {
+                let name = self.read_batch_string(batch, i, 0);
+                let path = format!("{}/{}", self.base_dir, name);
+                ensure_dir(&path)?;
+                fsync_dir(&self.base_dir);
+            }
+        }
+        Ok(())
+    }
+
+    fn hook_table_register(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            let tid = batch.get_pk(i) as i64;
+            let sid = self.read_batch_u64(batch, i, 0) as i64;
+            let name = self.read_batch_string(batch, i, 1);
+            let pk_col_idx = self.read_batch_u64(batch, i, 3) as u32;
+            let flags = self.read_batch_u64(batch, i, 5);
             let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
 
             if weight > 0 {
-                if self.dag.tables.contains_key(&tid) {
-                    continue;
-                }
+                if self.dag.tables.contains_key(&tid) { continue; }
 
-                // Read column definitions
                 let col_defs = self.read_column_defs(tid)?;
                 if col_defs.is_empty() {
                     gnitz_warn!("catalog: cannot register table '{}': columns not found", name);
                     continue;
                 }
 
-                // Validate PK type (must be U64 or U128)
                 if (pk_col_idx as usize) < col_defs.len() {
                     let pk_type = col_defs[pk_col_idx as usize].type_code;
                     if pk_type != type_code::U64 && pk_type != type_code::U128 {
@@ -980,94 +1300,36 @@ impl CatalogEngine {
                     }
                 }
 
-                let schema_name = self.schema_id_to_name.get(&sid)
-                    .cloned().unwrap_or_default();
+                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid);
-
-                // Build schema descriptor from column defs
                 let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk_col_idx);
 
-                // Create partitioned table
                 let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);
                 gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, num_parts);
                 let pt = PartitionedTable::new(
                     &directory, &name, tbl_schema, tid as u32, num_parts,
-                    true, // durable
-                    self.active_part_start, self.active_part_end,
-                    arena,
+                    true, self.active_part_start, self.active_part_end, arena,
                 ).map_err(|e| format!("Failed to create table '{}': error {} (dir={})", name, e, directory))?;
 
                 fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
-
-                // Register with entity registry
-                let qualified = format!("{}.{}", schema_name, name);
-                self.name_to_id.insert(qualified, tid);
-                self.id_to_qualified.insert(tid, (schema_name.clone(), name.clone()));
-                self.schema_ids.insert(tid, sid);
-                self.pk_col_indices.insert(tid, pk_col_idx);
-
-                // Register with DagEngine — Box ownership transfers here
-                self.dag.register_table(
-                    tid,
-                    StoreHandle::Partitioned(Box::new(pt)),
-                    tbl_schema,
-                    0, // depth
-                    is_unique,
-                    directory.clone(),
-                );
-
-                // Advance next_table_id if this is a gap recovery
-                if tid + 1 > self.next_table_id {
-                    self.next_table_id = tid + 1;
+                self.dag.register_table(tid, StoreHandle::Partitioned(Box::new(pt)), tbl_schema, 0, is_unique, directory);
+                if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
+                // Ensure needs_lock is set for unique_pk tables regardless of effect dispatch order
+                if is_unique { self.recompute_needs_lock(tid); }
+            } else if self.dag.tables.contains_key(&tid) {
+                let children = self.caches.fk_by_parent.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]);
+                if let Some(&(child_tid, _)) = children.first() {
+                    let (sn, tn) = self.caches.entity_by_id.get(&child_tid).cloned().unwrap_or_default();
+                    return Err(format!("Integrity violation: table referenced by '{}.{}'", sn, tn));
                 }
-
-                // Wire FK constraints
-                self.wire_fk_constraints(tid, &col_defs);
-
-                if self.cascade_enabled {
-                    self.create_fk_indices(tid)?;
-                }
-            } else {
-                if self.dag.tables.contains_key(&tid) {
-                    // Check for FK references before dropping
-                    let children = self.fk_children_of(tid);
-                    if let Some(&(child_tid, _)) = children.first() {
-                        let (sn, tn) = self.id_to_qualified.get(&child_tid)
-                            .cloned().unwrap_or_default();
-                        return Err(format!(
-                            "Integrity violation: table referenced by '{}.{}'", sn, tn
-                        ));
-                    }
-
-                    self.dag.unregister_table(tid);
-                    self.col_names_cache.remove(&tid);
-                    // Clean up registry
-                    if let Some((sn, tn)) = self.id_to_qualified.remove(&tid) {
-                        let qualified = format!("{}.{}", sn, tn);
-                        self.name_to_id.remove(&qualified);
-                    }
-                    self.schema_ids.remove(&tid);
-
-                    self.pk_col_indices.remove(&tid);
-
-                    // Remove this table's FK constraints and clean up parent map
-                    if let Some(constraints) = self.fk_constraints.remove(&tid) {
-                        for c in &constraints {
-                            if let Some(children) = self.fk_parent_map.get_mut(&c.target_table_id) {
-                                children.retain(|&(child_tid, _)| child_tid != tid);
-                            }
-                        }
-                    }
-                    // Also remove this table from being a parent
-                    self.fk_parent_map.remove(&tid);
-                }
+                self.dag.unregister_table(tid);
             }
         }
         Ok(())
     }
 
-    fn on_view_delta(&mut self, batch: &Batch) -> Result<(), String> {
+    fn hook_view_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
@@ -1075,9 +1337,7 @@ impl CatalogEngine {
             let name = self.read_batch_string(batch, i, 1);
 
             if weight > 0 {
-                if self.dag.tables.contains_key(&vid) {
-                    continue;
-                }
+                if self.dag.tables.contains_key(&vid) { continue; }
 
                 let col_defs = self.read_column_defs(vid)?;
                 if col_defs.is_empty() {
@@ -1085,78 +1345,41 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let schema_name = self.schema_id_to_name.get(&sid)
-                    .cloned().unwrap_or_default();
+                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = format!("{}/{}/view_{}_{}", self.base_dir, schema_name, name, vid);
                 let view_schema = self.build_schema_from_col_defs(&col_defs, 0);
 
-                // Create partitioned ephemeral table
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);
                 let et = PartitionedTable::new(
                     &directory, &name, view_schema, vid as u32, num_parts,
-                    false, // not durable (ephemeral)
-                    self.active_part_start, self.active_part_end,
-                    arena,
+                    false, self.active_part_start, self.active_part_end, arena,
                 ).map_err(|e| format!("Failed to create view '{}': error {}", name, e))?;
 
-                // Compute depth from source tables
                 let source_ids = self.dag.get_source_ids(vid);
-                let mut max_depth = 0i32;
-                for src_id in &source_ids {
-                    if let Some(entry) = self.dag.tables.get(src_id) {
-                        let d = entry.depth + 1;
-                        if d > max_depth { max_depth = d; }
-                    }
+                let max_depth = source_ids.iter()
+                    .filter_map(|id| self.dag.tables.get(id))
+                    .map(|e| e.depth + 1)
+                    .max()
+                    .unwrap_or(0);
+
+                self.dag.register_table(vid, StoreHandle::Partitioned(Box::new(et)), view_schema, max_depth, false, directory);
+                if vid + 1 > self.next_table_id { self.next_table_id = vid + 1; }
+
+                if self.active_part_start != self.active_part_end
+                    && self.dag.ensure_compiled(vid)
+                    && !self.dag.view_needs_exchange(vid)
+                {
+                    self.backfill_view(vid);
                 }
-
-                let qualified = format!("{}.{}", schema_name, name);
-                self.name_to_id.insert(qualified, vid);
-                self.id_to_qualified.insert(vid, (schema_name.clone(), name.clone()));
-                self.schema_ids.insert(vid, sid);
-                self.pk_col_indices.insert(vid, 0);
-
-                self.dag.register_table(
-                    vid,
-                    StoreHandle::Partitioned(Box::new(et)),
-                    view_schema,
-                    max_depth,
-                    false,
-                    directory.clone(),
-                );
-
-                // Advance next_table_id if this is a gap recovery
-                if vid + 1 > self.next_table_id {
-                    self.next_table_id = vid + 1;
-                }
-
-                // Compile and backfill (only on processes that own data)
-                if self.active_part_start != self.active_part_end {
-                    if self.dag.ensure_compiled(vid) {
-                        if !self.dag.view_needs_exchange(vid) {
-                            self.backfill_view(vid);
-                        }
-                    }
-                }
-            } else {
-                if self.dag.tables.contains_key(&vid) {
-                    self.dag.unregister_table(vid);
-                    self.col_names_cache.remove(&vid);
-                    if let Some((sn, tn)) = self.id_to_qualified.remove(&vid) {
-                        let qualified = format!("{}.{}", sn, tn);
-                        self.name_to_id.remove(&qualified);
-                    }
-                    self.schema_ids.remove(&vid);
-
-                    self.pk_col_indices.remove(&vid);
-
-                }
+            } else if self.dag.tables.contains_key(&vid) {
+                self.dag.unregister_table(vid);
             }
         }
         Ok(())
     }
 
-    fn on_index_delta(&mut self, batch: &Batch) -> Result<(), String> {
+    fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
@@ -1164,12 +1387,13 @@ impl CatalogEngine {
             let source_col_idx = self.read_batch_u64(batch, i, 2) as u32;
             let name = self.read_batch_string(batch, i, 3);
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
-            let cache_dir = self.read_batch_string(batch, i, 5);
 
             if weight > 0 {
-                if self.index_by_name.contains_key(&name) {
-                    continue;
-                }
+                // Use dag presence check since apply_index_by_name may have already fired
+                let already_registered = self.dag.tables.get(&owner_id)
+                    .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
+                    .unwrap_or(false);
+                if already_registered { continue; }
 
                 let entry = self.dag.tables.get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
@@ -1185,36 +1409,41 @@ impl CatalogEngine {
                 let idx_dir = format!("{}/idx_{}", owner_dir, idx_id);
 
                 let idx_table = Table::new(
-                    &idx_dir,
-                    &format!("_idx_{}", idx_id),
-                    idx_schema,
-                    idx_id as u32,
-                    SYS_TABLE_ARENA,
-                    false, // not durable (rebuilt from source)
+                    &idx_dir, &format!("_idx_{}", idx_id), idx_schema, idx_id as u32,
+                    SYS_TABLE_ARENA, false,
                 ).map_err(|e| format!("Failed to create index table: error {}", e))?;
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
-
-                // Backfill index from source table.  For is_unique, this
-                // also validates that no two rows share the same key.
                 self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
-
-                // Register with DagEngine — Box ownership transfers here
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
-
-                // Register in index maps
-                self.index_by_name.insert(name.clone(), idx_id);
-                self.index_by_id.insert(idx_id, name.clone());
+                // Ensure needs_lock is correct after index registration
+                if is_unique { self.recompute_needs_lock(owner_id); }
+                let _ = name; // name captured via apply_index_by_name
             } else {
-                if self.index_by_name.contains_key(&name) {
-                    // Policy check ("__fk_" guard) lives at the user-facing
-                    // entry point `drop_index`; this hook executes for both
-                    // explicit drops and cascade drops from `drop_table`.
+                let is_registered = self.dag.tables.get(&owner_id)
+                    .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
+                    .unwrap_or(false);
+                if is_registered {
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
-                    self.index_by_name.remove(&name);
-                    self.index_by_id.remove(&idx_id);
+                    // Recompute after removal so needs_lock reflects the updated state
+                    if self.dag.tables.contains_key(&owner_id) {
+                        self.recompute_needs_lock(owner_id);
+                    }
                 }
+                let _ = name;
+            }
+        }
+        Ok(())
+    }
+
+    fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            let weight = batch.get_weight(i);
+            if weight <= 0 { continue; }
+            let tid = batch.get_pk(i) as i64;
+            if self.caches.cascade_enabled && self.dag.tables.contains_key(&tid) {
+                self.create_fk_indices(tid)?;
             }
         }
         Ok(())
@@ -1414,42 +1643,39 @@ impl CatalogEngine {
         sd
     }
 
-    // -- FK constraint wiring ----------------------------------------------
-
-    fn wire_fk_constraints(&mut self, table_id: i64, col_defs: &[ColumnDef]) {
-        let mut constraints = Vec::new();
-        for (col_idx, cd) in col_defs.iter().enumerate() {
-            if cd.fk_table_id != 0 {
-                constraints.push(FkConstraint {
-                    fk_col_idx: col_idx,
-                    target_table_id: cd.fk_table_id,
-                });
-                self.fk_parent_map.entry(cd.fk_table_id)
-                    .or_default()
-                    .push((table_id, col_idx));
-            }
-        }
-        if !constraints.is_empty() {
-            self.fk_constraints.insert(table_id, constraints);
-        }
-    }
+    // -- FK constraint queries ---------------------------------------------
 
     /// Returns all child tables that have FK constraints targeting `parent_id`.
     fn fk_children_of(&self, parent_id: i64) -> &[(i64, usize)] {
-        self.fk_parent_map.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.caches.fk_by_parent.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Recompute and store needs_lock for `tid` from current cache + dag state.
+    fn recompute_needs_lock(&mut self, tid: i64) {
+        let fk_child_count = self.caches.fk_by_child.get(&tid).map(|v| v.len()).unwrap_or(0);
+        let fk_parent_count = self.caches.fk_by_parent.get(&tid).map(|v| v.len()).unwrap_or(0);
+        let (has_unique_index, unique_pk) = self.dag.tables.get(&tid)
+            .map(|e| (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk))
+            .unwrap_or((false, false));
+        let needs = fk_child_count > 0 || fk_parent_count > 0 || has_unique_index || unique_pk;
+        if needs {
+            self.caches.needs_lock.insert(tid);
+        } else {
+            self.caches.needs_lock.remove(&tid);
+        }
     }
 
     fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
         let col_defs = self.read_column_defs(table_id)?;
-        let pk_idx = self.pk_col_indices.get(&table_id).copied().unwrap_or(0) as usize;
+        let pk_idx = self.caches.pk_col_of.get(&table_id).copied().unwrap_or(0) as usize;
 
-        let (schema_name, table_name) = self.id_to_qualified.get(&table_id)
+        let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id)
             .cloned().unwrap_or_default();
 
         for (col_idx, cd) in col_defs.iter().enumerate() {
             if cd.fk_table_id == 0 || col_idx == pk_idx { continue; }
             let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);
-            if self.index_by_name.contains_key(&index_name) { continue; }
+            if self.caches.index_by_name.contains_key(&index_name) { continue; }
 
             let index_id = self.next_index_id;
             self.next_index_id += 1;
@@ -1469,7 +1695,7 @@ impl CatalogEngine {
             ingest_batch_into(&mut self.sys_indices, &batch);
 
             // Process through hook
-            self.on_index_delta(&batch)?;
+            self.fire_hooks(IDX_TAB_ID, &batch)?;
 
             // Update sequence
             self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
@@ -1506,22 +1732,19 @@ impl CatalogEngine {
     }
 
     pub fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
-        self.schema_id_to_name.get(&schema_id).map(|s| s.as_str()).unwrap_or("")
+        self.caches.schema_by_id.get(&schema_id).map(|s| s.as_str()).unwrap_or("")
     }
 
     pub fn has_schema(&self, name: &str) -> bool {
-        self.schema_name_to_id.contains_key(name)
+        self.caches.schema_by_name.contains_key(name)
     }
 
     pub fn get_schema_id(&self, name: &str) -> i64 {
-        self.schema_name_to_id.get(name).copied().unwrap_or(-1)
+        self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
     }
 
     pub fn schema_is_empty(&self, schema_name: &str) -> bool {
-        for (_, (sn, _)) in &self.id_to_qualified {
-            if sn == schema_name { return false; }
-        }
-        true
+        self.caches.entity_by_id.values().all(|(sn, _)| sn != schema_name)
     }
 
     pub fn allocate_schema_id(&mut self) -> i64 {
@@ -1547,16 +1770,16 @@ impl CatalogEngine {
     }
 
     pub fn get_qualified_name(&self, table_id: i64) -> Option<(&str, &str)> {
-        self.id_to_qualified.get(&table_id).map(|(s, t)| (s.as_str(), t.as_str()))
+        self.caches.entity_by_id.get(&table_id).map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
     pub fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
         let qualified = format!("{}.{}", schema_name, table_name);
-        self.name_to_id.get(&qualified).copied()
+        self.caches.entity_by_qname.get(&qualified).copied()
     }
 
     pub fn has_index_by_name(&self, name: &str) -> bool {
-        self.index_by_name.contains_key(name)
+        self.caches.index_by_name.contains_key(name)
     }
 
     pub fn is_unique_pk(&self, table_id: i64) -> bool {
@@ -1584,7 +1807,7 @@ impl CatalogEngine {
 
     pub fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if self.schema_name_to_id.contains_key(name) {
+        if self.caches.schema_by_name.contains_key(name) {
             return Err(format!("Schema already exists: {}", name));
         }
         let sid = self.allocate_schema_id();
@@ -1599,7 +1822,7 @@ impl CatalogEngine {
 
         // Ingest into schemas family (triggers hook)
         ingest_batch_into(&mut self.sys_schemas, &batch);
-        self.on_schema_delta(&batch)?;
+        self.fire_hooks(SCHEMA_TAB_ID, &batch)?;
 
         self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
         Ok(())
@@ -1609,7 +1832,7 @@ impl CatalogEngine {
     /// (PostgreSQL's `DROP SCHEMA ... CASCADE` semantics).
     pub fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if !self.schema_name_to_id.contains_key(name) {
+        if !self.caches.schema_by_name.contains_key(name) {
             return Err("Schema does not exist".into());
         }
         if name == "_system" {
@@ -1636,7 +1859,7 @@ impl CatalogEngine {
         let batch = bb.finish();
 
         ingest_batch_into(&mut self.sys_schemas, &batch);
-        self.on_schema_delta(&batch)?;
+        self.fire_hooks(SCHEMA_TAB_ID, &batch)?;
         Ok(())
     }
 
@@ -1646,9 +1869,9 @@ impl CatalogEngine {
     /// (views first).
     fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
         let views = collect_for_schema(
-            &mut *self.sys_views, VIEWTAB_COL_SCHEMA_ID, sid, &self.id_to_qualified);
+            &mut *self.sys_views, VIEWTAB_COL_SCHEMA_ID, sid, &self.caches.entity_by_id);
         let tables = collect_for_schema(
-            &mut *self.sys_tables, TABLETAB_COL_SCHEMA_ID, sid, &self.id_to_qualified);
+            &mut *self.sys_tables, TABLETAB_COL_SCHEMA_ID, sid, &self.caches.entity_by_id);
         (views, tables)
     }
 
@@ -1698,11 +1921,11 @@ impl CatalogEngine {
         validate_user_identifier(schema_name)?;
         validate_user_identifier(table_name)?;
 
-        if !self.schema_name_to_id.contains_key(schema_name) {
+        if !self.caches.schema_by_name.contains_key(schema_name) {
             return Err("Schema does not exist".into());
         }
         let qualified = format!("{}.{}", schema_name, table_name);
-        if self.name_to_id.contains_key(&qualified) {
+        if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("Table already exists".into());
         }
         if col_defs.len() > 64 {
@@ -1732,8 +1955,8 @@ impl CatalogEngine {
         let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, table_name, tid);
         let flags = if unique_pk { TABLETAB_FLAG_UNIQUE_PK } else { 0 };
 
-        // Write columns first (table hook reads them)
-        self.write_column_records(tid, OWNER_KIND_TABLE, col_defs);
+        // Write columns first (table hook reads them via sys_columns)
+        self.write_column_records(tid, OWNER_KIND_TABLE, col_defs)?;
 
         // Write table record (triggers hook)
         {
@@ -1749,7 +1972,7 @@ impl CatalogEngine {
             bb.end_row();
             let batch = bb.finish();
             ingest_batch_into(&mut self.sys_tables, &batch);
-            self.on_table_delta(&batch)?;
+            self.fire_hooks(TABLE_TAB_ID, &batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
@@ -1762,14 +1985,12 @@ impl CatalogEngine {
         validate_user_identifier(table_name)?;
 
         let qualified = format!("{}.{}", schema_name, table_name);
-        let tid = *self.name_to_id.get(&qualified)
+        let tid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {}.{}", schema_name, table_name))?;
 
         self.check_for_dependencies(tid, table_name)?;
 
         // Cascade: retract every index owned by this table (secondary + FK).
-        // Must run before the table record is retracted so the
-        // `on_index_delta` hook can still resolve the owner if needed.
         self.retract_indices_for_owner(tid)?;
 
         // Retract table record — cursor-based to match exact stored payload
@@ -1778,13 +1999,13 @@ impl CatalogEngine {
             let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u64, 0);
             if batch.count > 0 {
                 ingest_batch_into(&mut self.sys_tables, &batch);
-                self.on_table_delta(&batch)?;
+                self.fire_hooks(TABLE_TAB_ID, &batch)?;
             }
         }
 
         // Retract column records
         let col_defs = self.read_column_defs(tid)?;
-        self.retract_column_records(tid, OWNER_KIND_TABLE, &col_defs);
+        self.retract_column_records(tid, OWNER_KIND_TABLE, &col_defs)?;
 
         Ok(())
     }
@@ -1810,7 +2031,7 @@ impl CatalogEngine {
         }
         if batch.count > 0 {
             ingest_batch_into(&mut self.sys_indices, &batch);
-            self.on_index_delta(&batch)?;
+            self.fire_hooks(IDX_TAB_ID, &batch)?;
         }
         Ok(())
     }
@@ -1824,11 +2045,11 @@ impl CatalogEngine {
         sql_definition: &str,
     ) -> Result<i64, String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
-        if !self.schema_name_to_id.contains_key(schema_name) {
+        if !self.caches.schema_by_name.contains_key(schema_name) {
             return Err("Schema does not exist".into());
         }
         let qualified = format!("{}.{}", schema_name, view_name);
-        if self.name_to_id.contains_key(&qualified) {
+        if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("View/Table already exists".into());
         }
 
@@ -1849,7 +2070,7 @@ impl CatalogEngine {
             fk_table_id: 0,
             fk_col_idx: 0,
         }).collect();
-        self.write_column_records(vid, OWNER_KIND_VIEW, &col_defs);
+        self.write_column_records(vid, OWNER_KIND_VIEW, &col_defs)?;
         let _ = self.sys_columns.flush();
 
         // 2. View dependencies
@@ -1879,7 +2100,7 @@ impl CatalogEngine {
             let batch = bb.finish();
             ingest_batch_into(&mut self.sys_views, &batch);
             let _ = self.sys_views.flush();
-            self.on_view_delta(&batch)?;
+            self.fire_hooks(VIEW_TAB_ID, &batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, vid - 1, vid);
@@ -1895,7 +2116,7 @@ impl CatalogEngine {
     pub fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
         let qualified = format!("{}.{}", schema_name, view_name);
-        let vid = *self.name_to_id.get(&qualified)
+        let vid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("View does not exist: {}", qualified))?;
 
         self.check_for_dependencies(vid, view_name)?;
@@ -1908,7 +2129,7 @@ impl CatalogEngine {
             let batch = retract_single_row(&mut self.sys_views, &schema, vid as u64, 0);
             if batch.count > 0 {
                 ingest_batch_into(&mut self.sys_views, &batch);
-                self.on_view_delta(&batch)?;
+                self.fire_hooks(VIEW_TAB_ID, &batch)?;
             }
         }
 
@@ -1916,7 +2137,7 @@ impl CatalogEngine {
         self.retract_circuit_graph(vid);
         self.retract_view_deps(vid);
         let col_defs = self.read_column_defs(vid)?;
-        self.retract_column_records(vid, OWNER_KIND_VIEW, &col_defs);
+        self.retract_column_records(vid, OWNER_KIND_VIEW, &col_defs)?;
 
         Ok(())
     }
@@ -1931,7 +2152,7 @@ impl CatalogEngine {
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
         let qualified = format!("{}.{}", schema_name, table_name);
-        let owner_id = *self.name_to_id.get(&qualified)
+        let owner_id = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
         // Find column
@@ -1959,7 +2180,7 @@ impl CatalogEngine {
             bb.end_row();
             let batch = bb.finish();
             ingest_batch_into(&mut self.sys_indices, &batch);
-            if let Err(e) = self.on_index_delta(&batch) {
+            if let Err(e) = self.fire_hooks(IDX_TAB_ID, &batch) {
                 let mut undo = BatchBuilder::new(schema);
                 undo.begin_row(index_id as u64, 0, -1);
                 undo.put_u64(owner_id as u64);
@@ -1982,7 +2203,7 @@ impl CatalogEngine {
         if index_name.contains("__fk_") {
             return Err("Forbidden: cannot drop internal FK index".into());
         }
-        let idx_id = *self.index_by_name.get(index_name)
+        let idx_id = *self.caches.index_by_name.get(index_name)
             .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
 
         // Read the full index record from sys_indices to retract it
@@ -2013,7 +2234,7 @@ impl CatalogEngine {
         bb.end_row();
         let batch = bb.finish();
         ingest_batch_into(&mut self.sys_indices, &batch);
-        self.on_index_delta(&batch)?;
+        self.fire_hooks(IDX_TAB_ID, &batch)?;
         Ok(())
     }
 
@@ -2023,7 +2244,7 @@ impl CatalogEngine {
         // Check FK references
         let children = self.fk_children_of(tid);
         if let Some(&(child_tid, _)) = children.first() {
-            let (sn, tn) = self.id_to_qualified.get(&child_tid)
+            let (sn, tn) = self.caches.entity_by_id.get(&child_tid)
                 .cloned().unwrap_or_default();
             return Err(format!("FK dependency: table '{}.{}'", sn, tn));
         }
@@ -2081,7 +2302,7 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
-    fn emit_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) {
+    fn build_col_batch(&self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
         let schema = col_tab_schema();
         let mut bb = BatchBuilder::new(schema);
         for (i, cd) in col_defs.iter().enumerate() {
@@ -2097,16 +2318,19 @@ impl CatalogEngine {
             bb.put_u64(cd.fk_col_idx as u64);
             bb.end_row();
         }
-        let batch = bb.finish();
+        bb.finish()
+    }
+
+    fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
+        let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
         ingest_batch_into(&mut self.sys_columns, &batch);
+        self.fire_hooks(COL_TAB_ID, &batch)
     }
 
-    fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) {
-        self.emit_column_records(owner_id, kind, col_defs, 1);
-    }
-
-    fn retract_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) {
-        self.emit_column_records(owner_id, kind, col_defs, -1);
+    fn retract_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
+        let batch = self.build_col_batch(owner_id, kind, col_defs, -1);
+        ingest_batch_into(&mut self.sys_columns, &batch);
+        self.fire_hooks(COL_TAB_ID, &batch)
     }
 
     fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) {
@@ -2252,6 +2476,7 @@ impl CatalogEngine {
             IDX_TAB_ID => Some(&mut self.sys_indices),
             DEP_TAB_ID => Some(&mut self.sys_view_deps),
             SEQ_TAB_ID => Some(&mut self.sys_sequences),
+            CATALOG_CACHES_TAB_ID => Some(&mut self.sys_catalog_caches),
             CIRCUIT_NODES_TAB_ID => Some(&mut self.sys_circuit_nodes),
             CIRCUIT_EDGES_TAB_ID => Some(&mut self.sys_circuit_edges),
             CIRCUIT_SOURCES_TAB_ID => Some(&mut self.sys_circuit_sources),
@@ -2278,6 +2503,7 @@ impl CatalogEngine {
                 IDX_TAB_ID => &mut self.sys_indices,
                 DEP_TAB_ID => &mut self.sys_view_deps,
                 SEQ_TAB_ID => &mut self.sys_sequences,
+                CATALOG_CACHES_TAB_ID => &mut self.sys_catalog_caches,
                 CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
                 CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
                 CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
@@ -2491,6 +2717,7 @@ impl CatalogEngine {
             IDX_TAB_ID => &mut self.sys_indices,
             DEP_TAB_ID => &mut self.sys_view_deps,
             SEQ_TAB_ID => &mut self.sys_sequences,
+            CATALOG_CACHES_TAB_ID => &mut self.sys_catalog_caches,
             CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
             CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
             CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
@@ -2592,12 +2819,12 @@ impl CatalogEngine {
 
     /// Number of FK constraints on a table.
     pub fn get_fk_count(&self, table_id: i64) -> usize {
-        self.fk_constraints.get(&table_id).map(|v| v.len()).unwrap_or(0)
+        self.caches.fk_by_child.get(&table_id).map(|v| v.len()).unwrap_or(0)
     }
 
     /// Get FK constraint at index: (fk_col_idx, target_table_id).
     pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64)> {
-        self.fk_constraints.get(&table_id)
+        self.caches.fk_by_child.get(&table_id)
             .and_then(|v| v.get(idx))
             .map(|c| (c.fk_col_idx, c.target_table_id))
     }
@@ -2647,7 +2874,7 @@ impl CatalogEngine {
 
     /// Number of child tables that reference `parent_id` via FK.
     pub fn get_fk_children_count(&self, parent_id: i64) -> usize {
-        self.fk_parent_map.get(&parent_id).map(|v| v.len()).unwrap_or(0)
+        self.caches.fk_by_parent.get(&parent_id).map(|v| v.len()).unwrap_or(0)
     }
 
     /// True if the table has at least one unique secondary index circuit.
@@ -2670,7 +2897,7 @@ impl CatalogEngine {
 
     /// Get child info at index: (child_table_id, fk_col_idx).
     pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize)> {
-        self.fk_parent_map.get(&parent_id)
+        self.caches.fk_by_parent.get(&parent_id)
             .and_then(|v| v.get(idx))
             .copied()
     }
@@ -2684,15 +2911,32 @@ impl CatalogEngine {
 
     /// Get column names for a table/view. Cached after first lookup.
     pub fn get_column_names(&mut self, table_id: i64) -> Vec<String> {
-        if let Some(names) = self.col_names_cache.get(&table_id) {
+        if let Some(names) = self.caches.col_names.get(&table_id) {
             return names.clone();
         }
         let names = match self.read_column_defs(table_id) {
             Ok(defs) => defs.into_iter().map(|cd| cd.name).collect(),
             Err(_) => Vec::new(),
         };
-        self.col_names_cache.insert(table_id, names.clone());
+        self.caches.col_names.insert(table_id, names.clone());
         names
+    }
+
+    /// Get column names as byte vectors. Backed by col_names cache; lazy-populated.
+    pub fn get_col_names_bytes(&mut self, table_id: i64) -> Rc<Vec<Vec<u8>>> {
+        if let Some(bytes) = self.caches.col_names_bytes.get(&table_id) {
+            return bytes.clone();
+        }
+        let names = self.get_column_names(table_id);
+        let bytes = Rc::new(names.iter().map(|n| n.as_bytes().to_vec()).collect::<Vec<_>>());
+        self.caches.col_names_bytes.insert(table_id, bytes.clone());
+        bytes
+    }
+
+    /// True if any lock is needed for inserts into this table.
+    /// Cached: set on table/index create/drop, no per-call overhead.
+    pub fn needs_table_lock(&self, table_id: i64) -> bool {
+        self.caches.needs_lock.contains(&table_id)
     }
 
     // -- Store handle accessors -----------------------------------------------
@@ -2709,7 +2953,7 @@ impl CatalogEngine {
 
     /// Get schema descriptor for a table.
     pub fn get_schema_desc(&self, table_id: i64) -> Option<SchemaDescriptor> {
-        if table_id < FIRST_USER_TABLE_ID {
+        if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
             Some(sys_tab_schema(table_id))
         } else {
             self.dag.tables.get(&table_id).map(|e| e.schema)
@@ -2778,7 +3022,7 @@ impl CatalogEngine {
     // -- FK inline validation (single-worker) ------------------------------
 
     pub fn validate_fk_inline(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        let constraints = match self.fk_constraints.get(&table_id) {
+        let constraints = match self.caches.fk_by_child.get(&table_id) {
             Some(c) if !c.is_empty() => c,
             _ => return Ok(()),
         };
@@ -2825,10 +3069,10 @@ impl CatalogEngine {
                 };
 
                 if !has {
-                    let (sn, tn) = self.id_to_qualified.get(&table_id)
+                    let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
                     let col_name = &schema.columns[col_idx].type_code.to_string();
-                    let (tsn, ttn) = self.id_to_qualified.get(&target_id)
+                    let (tsn, ttn) = self.caches.entity_by_id.get(&target_id)
                         .cloned().unwrap_or_default();
                     return Err(format!(
                         "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
@@ -2869,9 +3113,9 @@ impl CatalogEngine {
                 if batch.get_weight(row) >= 0 { continue; }
                 let pk = batch.get_pk(row);
                 if idx_table.has_pk(pk) {
-                    let (sn, tn) = self.id_to_qualified.get(&table_id)
+                    let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
-                    let (csn, ctn) = self.id_to_qualified.get(&child_tid)
+                    let (csn, ctn) = self.caches.entity_by_id.get(&child_tid)
                         .cloned().unwrap_or_default();
                     return Err(format!(
                         "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",

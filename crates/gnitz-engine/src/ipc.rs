@@ -563,6 +563,14 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 /// META_SCHEMA_DESC layout (4 columns, pk_index=0, N rows = N table columns):
 ///   [0]=pk_lo  [1]=pk_hi  [2]=weight  [3]=null_bmp
 ///   [4]=type_code (u64)  [5]=flags (u64)  [6]=name (STRING, skipped)  [7]=blob (skipped)
+fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
+    if a.num_columns != b.num_columns || a.pk_index != b.pk_index { return false; }
+    for i in 0..a.num_columns as usize {
+        if a.columns[i].type_code != b.columns[i].type_code { return false; }
+    }
+    true
+}
+
 fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
     // 4 fixed + 3 payload + 1 blob = 8. Keep in sync with META_SCHEMA_DESC.
     const EXPECTED_REGIONS: usize = 8;
@@ -668,12 +676,11 @@ pub fn peek_target_id(data: &[u8]) -> Result<i64, &'static str> {
     Ok(ctrl.target_id as i64)
 }
 
-/// Decode a wire message using a caller-provided schema, skipping schema
-/// block decode entirely.
+/// Decode a wire message using a caller-provided schema.
 ///
-/// The schema block bytes are still present on the wire (protocol requires
-/// FLAG_HAS_SCHEMA when FLAG_HAS_DATA is set), but this function only reads
-/// the block SIZE to advance the offset — it does not parse the contents.
+/// Parses the wire schema block and validates it matches `schema` (num_columns,
+/// pk_index, and per-column type_codes must all agree). Returns Err on mismatch
+/// so callers never silently ingest data encoded with a different layout.
 pub fn decode_wire_with_schema(data: &[u8], schema: &SchemaDescriptor) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, Some(schema))
 }
@@ -729,10 +736,14 @@ fn decode_wire_impl(
             return Err("schema block truncated");
         }
 
+        let parsed = decode_schema_block(&data[off..off + schema_size])?;
         if let Some(hint) = schema_hint {
+            if !schemas_layout_equal(&parsed, hint) {
+                return Err("schema mismatch: client schema differs from server schema");
+            }
             wire_schema = Some(*hint);
         } else {
-            wire_schema = Some(decode_schema_block(&data[off..off + schema_size])?);
+            wire_schema = Some(parsed);
         }
         off += schema_size;
     }

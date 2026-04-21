@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::committer::{self, CommitRequest};
-use crate::ipc::{self, STATUS_OK, STATUS_ERROR, WireConflictMode};
+use crate::ipc::{self, STATUS_OK, STATUS_ERROR};
 use crate::master::{MasterDispatcher, first_worker_error};
 use crate::reactor::{
     AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, mpsc, oneshot, select2,
@@ -90,8 +90,6 @@ pub struct Shared {
     tick_tids: Rc<RefCell<Vec<i64>>>,
     t_last_push: Rc<Cell<Option<Instant>>>,
     table_locks: RefCell<HashMap<i64, Rc<AsyncMutex<()>>>>,
-    schema_cache: RefCell<HashMap<i64, SchemaDescriptor>>,
-    col_names_cache: RefCell<HashMap<i64, Vec<Vec<u8>>>>,
 }
 
 impl Shared {
@@ -99,23 +97,12 @@ impl Shared {
     fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.dispatcher.0 } }
 
     fn get_schema_desc(&self, target_id: i64) -> SchemaDescriptor {
-        if let Some(&s) = self.schema_cache.borrow().get(&target_id) { return s; }
-        let desc = self.cat().get_schema_desc(target_id)
-            .unwrap_or_else(SchemaDescriptor::minimal_u64);
-        self.schema_cache.borrow_mut().insert(target_id, desc);
-        desc
+        self.cat().get_schema_desc(target_id)
+            .unwrap_or_else(SchemaDescriptor::minimal_u64)
     }
 
-    fn get_col_names_bytes(&self, target_id: i64) -> std::cell::Ref<'_, Vec<Vec<u8>>> {
-        {
-            let mut cache = self.col_names_cache.borrow_mut();
-            if !cache.contains_key(&target_id) {
-                let names = self.cat().get_column_names(target_id);
-                let bytes: Vec<Vec<u8>> = names.into_iter().map(String::into_bytes).collect();
-                cache.insert(target_id, bytes);
-            }
-        }
-        std::cell::Ref::map(self.col_names_cache.borrow(), |m| m.get(&target_id).unwrap())
+    fn get_col_names_bytes(&self, target_id: i64) -> Rc<Vec<Vec<u8>>> {
+        self.cat().get_col_names_bytes(target_id)
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
@@ -126,12 +113,8 @@ impl Shared {
         l
     }
 
-    fn needs_table_lock(&self, tid: i64, mode: WireConflictMode) -> bool {
-        let cat = self.cat();
-        cat.get_fk_count(tid) > 0
-            || cat.get_fk_children_count(tid) > 0
-            || cat.has_any_unique_index(tid)
-            || (matches!(mode, WireConflictMode::Error) && cat.table_has_unique_pk(tid))
+    fn needs_table_lock(&self, tid: i64) -> bool {
+        self.cat().needs_table_lock(tid)
     }
 
     fn bump_tick_rows(&self, tid: i64, rows: usize) {
@@ -224,8 +207,6 @@ impl ServerExecutor {
             tick_tids: Rc::clone(&tick_tids),
             t_last_push: Rc::clone(&t_last_push),
             table_locks: RefCell::new(HashMap::new()),
-            schema_cache: RefCell::new(HashMap::new()),
-            col_names_cache: RefCell::new(HashMap::new()),
         });
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
@@ -463,12 +444,11 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
 
 async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
     let decoded = {
-        let target_id = ipc::peek_target_id(data).unwrap_or(-1);
-        let cached = shared.schema_cache.borrow().get(&target_id).copied();
-        let result = if let Some(s) = cached {
-            ipc::decode_wire_with_schema(data, &s)
-        } else {
-            ipc::decode_wire(data)
+        let schema_hint = ipc::peek_target_id(data).ok()
+            .and_then(|tid| shared.cat().get_schema_desc(tid));
+        let result = match schema_hint.as_ref() {
+            Some(s) => ipc::decode_wire_with_schema(data, s),
+            None    => ipc::decode_wire(data),
         };
         match result {
             Ok(d) => d,
@@ -553,7 +533,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
             send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
             return;
         }
-        let needs_lock = shared.needs_table_lock(target_id, mode);
+        let needs_lock = shared.needs_table_lock(target_id);
         let _tlock = if needs_lock {
             Some(shared.table_lock(target_id).lock().await)
         } else {
@@ -823,17 +803,16 @@ async fn send_ok_response(
     result: Option<&Batch>, client_id: u64,
     schema: &SchemaDescriptor, seek_pk_lo: u64,
 ) {
-    let col_names_ref = shared.get_col_names_bytes(target_id);
+    let col_names = shared.get_col_names_bytes(target_id);
     let mut name_refs_arr = [&[] as &[u8]; 64];
-    for (i, n) in col_names_ref.iter().enumerate().take(64) {
+    for (i, n) in col_names.iter().enumerate().take(64) {
         name_refs_arr[i] = n.as_slice();
     }
-    let col_names_opt = Some(&name_refs_arr[..col_names_ref.len()]);
+    let col_names_opt = Some(&name_refs_arr[..col_names.len()]);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
         schema, col_names_opt, seek_pk_lo,
     );
-    drop(col_names_ref);
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
 }

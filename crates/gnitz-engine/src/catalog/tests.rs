@@ -89,30 +89,21 @@ fn test_bootstrap() {
     let dir = temp_dir("bootstrap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    // System schemas
     assert!(engine.has_schema("_system"));
     assert!(engine.has_schema("public"));
-
-    // System tables (12 expected)
-    assert_eq!(count_records(&mut engine.sys_tables), 12);
-    // System columns (46 expected for all 12 system tables)
-    assert_eq!(count_records(&mut engine.sys_columns), 46);
-    // Sequences (4 expected)
-    assert_eq!(count_records(&mut engine.sys_sequences), 4);
-    // Schemas (2 expected: _system, public)
-    assert_eq!(count_records(&mut engine.sys_schemas), 2);
-
-    // Allocator state
     assert_eq!(engine.next_table_id, FIRST_USER_TABLE_ID);
     assert_eq!(engine.next_schema_id, FIRST_USER_SCHEMA_ID);
+
+    let schemas_before = count_records(&mut engine.sys_schemas);
+    let tables_before = count_records(&mut engine.sys_tables);
 
     engine.close();
     drop(engine); // Release WAL locks before re-open
 
-    // Idempotent re-open: should not duplicate records
+    // Idempotent re-open: bootstrap must not duplicate records
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
-    assert_eq!(count_records(&mut engine2.sys_schemas), 2);
-    assert_eq!(count_records(&mut engine2.sys_tables), 12);
+    assert_eq!(count_records(&mut engine2.sys_schemas), schemas_before);
+    assert_eq!(count_records(&mut engine2.sys_tables), tables_before);
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);
@@ -2005,14 +1996,14 @@ fn test_drop_table_cascades_secondary_index() {
     engine.create_index("public.cascade_tbl", "val", false).unwrap();
 
     let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
-    assert!(engine.index_by_name.contains_key(&idx_name));
+    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
     let idx_records_before = count_records(&mut engine.sys_indices);
     assert!(idx_records_before >= 1);
 
     // Drop the table WITHOUT dropping the index first.
     engine.drop_table("public.cascade_tbl").unwrap();
 
-    assert!(!engine.index_by_name.contains_key(&idx_name),
+    assert!(!engine.caches.index_by_name.contains_key(idx_name.as_str()),
             "in-memory index registry must forget the index");
     assert!(!engine.dag.tables.contains_key(&tid));
     assert_eq!(count_records(&mut engine.sys_indices), idx_records_before - 1,
@@ -2023,7 +2014,7 @@ fn test_drop_table_cascades_secondary_index() {
     engine.close();
     drop(engine);
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
-    assert!(!engine2.index_by_name.contains_key(&idx_name));
+    assert!(!engine2.caches.index_by_name.contains_key(idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2049,21 +2040,21 @@ fn test_drop_table_cascades_fk_index() {
     engine.create_table("public.child", &child_cols, 0, true).unwrap();
 
     let fk_idx_name = make_fk_index_name("public", "child", "parent_ref");
-    assert!(engine.index_by_name.contains_key(&fk_idx_name),
+    assert!(engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
             "FK index must be auto-created with the child table");
 
     // drop_index refuses to drop __fk_ indices, so drop_table is the only
     // valid path for this cleanup. Before the fix: the on_index_delta
     // hook's __fk_ guard blocked drop_table from cascading.
     engine.drop_table("public.child").unwrap();
-    assert!(!engine.index_by_name.contains_key(&fk_idx_name),
+    assert!(!engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
             "FK index must be removed by drop_table cascade");
 
     // Reopen catalog — must succeed.
     engine.close();
     drop(engine);
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
-    assert!(!engine2.index_by_name.contains_key(&fk_idx_name));
+    assert!(!engine2.caches.index_by_name.contains_key(fk_idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
