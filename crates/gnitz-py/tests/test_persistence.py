@@ -1,24 +1,72 @@
-"""Persistence and recovery: verify that tables, views, and data
-survive a full server restart (crash-only shutdown via SIGKILL)."""
+"""
+Persistence and recovery: verify that tables, views, and data survive
+a full server restart (crash-only shutdown via SIGKILL).
+
+Ports compile_graph_test.py::test_persistence_and_recovery.
+"""
 
 import os
+import subprocess
 import tempfile
+import time
 import shutil
+import signal
 
 import pytest
 import gnitz
 
-from conftest import start_server_proc, stop_server_proc
-
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
+
+
+def _start_server(data_dir, sock_path, workers=None, extra_env=None):
+    binary = os.environ.get(
+        "GNITZ_SERVER_BIN",
+        os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     "../../../gnitz-server")),
+    )
+    if not os.path.isfile(binary):
+        pytest.skip(f"Server binary not found: {binary}")
+    cmd = [binary, data_dir, sock_path]
+    if workers:
+        cmd += [f"--workers={workers}"]
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True, env=env,
+    )
+    for _ in range(100):
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError("Server did not start")
+    return proc
+
+
+def _stop_server(proc):
+    """Kill server and all child workers (entire process group)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
 
 
 def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
     """SIGKILL the entire process group, clean up socket, restart."""
-    stop_server_proc(proc)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
     if os.path.exists(sock_path):
         os.unlink(sock_path)
-    return start_server_proc(data_dir, sock_path, workers=workers, extra_env=extra_env)
+    return _start_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
 
 
 def test_table_data_survives_restart():
@@ -32,7 +80,7 @@ def test_table_data_survives_restart():
 
     try:
         # --- Phase 1: create table and insert data ---
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("test_persist")
@@ -51,14 +99,14 @@ def test_table_data_survives_restart():
         assert len(rows) == 3, f"pre-restart: expected 3 rows, got {len(rows)}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
 
         # Remove socket so new server can bind
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
         # --- Phase 2: restart and verify ---
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         tid2, _ = conn.resolve_table("test_persist", "t")
@@ -70,7 +118,7 @@ def test_table_data_survives_restart():
         assert vals == [100, 200, 300], f"post-restart: unexpected vals {vals}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -88,7 +136,7 @@ def test_table_data_survives_restart_multiworker():
     sock_path = os.path.join(tmpdir, "gnitz.sock")
 
     try:
-        proc = start_server_proc(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("test_persist")
@@ -116,7 +164,7 @@ def test_table_data_survives_restart_multiworker():
         assert vals == [100, 200, 300]
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -133,7 +181,7 @@ def test_view_survives_restart():
 
     try:
         # --- Phase 1: create table + view, insert data ---
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("test_persist")
@@ -156,13 +204,13 @@ def test_view_survives_restart():
         assert len(rows) >= 1, "pre-restart: view should have rows"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
 
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
         # --- Phase 2: restart, push new data, verify view processes it ---
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         tid2, _ = conn.resolve_table("test_persist", "t")
@@ -182,7 +230,7 @@ def test_view_survives_restart():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -204,7 +252,7 @@ def test_dml_insert_survives_crash():
     """ACKed INSERTs survive SIGKILL (WAL + SAL replay)."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -239,7 +287,7 @@ def test_dml_insert_survives_crash():
         assert vals_before == vals_after, "row data changed after crash recovery"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -248,7 +296,7 @@ def test_dml_update_survives_crash():
     """ACKed UPDATEs (upsert = retract + insert) survive SIGKILL."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -279,7 +327,7 @@ def test_dml_update_survives_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -288,7 +336,7 @@ def test_dml_delete_survives_crash():
     """ACKed DELETEs survive SIGKILL."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -318,7 +366,7 @@ def test_dml_delete_survives_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -327,7 +375,7 @@ def test_ddl_create_table_survives_crash():
     """ACKed CREATE TABLE survives SIGKILL (SAL DDL_SYNC replay)."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -358,7 +406,7 @@ def test_ddl_create_table_survives_crash():
         assert len(conn.scan(tid2_r)) == 1
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -367,7 +415,7 @@ def test_ddl_create_view_survives_crash():
     """ACKed CREATE VIEW survives SIGKILL. View processes new data after restart."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -400,7 +448,7 @@ def test_ddl_create_view_survives_crash():
         assert rows[2] == 21, f"view not processing after crash: {rows}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -409,7 +457,7 @@ def test_ddl_drop_table_survives_crash():
     """ACKed DROP TABLE stays dropped after SIGKILL (no phantom tables)."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -431,7 +479,7 @@ def test_ddl_drop_table_survives_crash():
             conn.resolve_table("dur", "t")
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -444,7 +492,7 @@ def test_multiple_ddl_batch_survives_crash():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -473,7 +521,7 @@ def test_multiple_ddl_batch_survives_crash():
             assert len(rows) == 1
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -486,7 +534,7 @@ def test_interleaved_ddl_dml_survives_crash():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -537,7 +585,7 @@ def test_interleaved_ddl_dml_survives_crash():
         assert v_rows[3] == 100, f"view broken after crash: {v_rows}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -551,7 +599,7 @@ def test_no_phantom_data_after_crash():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -582,7 +630,7 @@ def test_no_phantom_data_after_crash():
         assert rows == {1: 111, 2: 222}, f"phantom or stale data: {rows}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -591,7 +639,7 @@ def test_sequence_monotonicity_after_crash():
     """Table ID allocator does not reuse IDs after crash recovery."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -622,7 +670,7 @@ def test_sequence_monotonicity_after_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -631,7 +679,7 @@ def test_double_crash_recovery():
     """Data survives two consecutive crashes without any clean shutdown."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -660,7 +708,7 @@ def test_double_crash_recovery():
         assert rows == {1: 100, 2: 200}, f"data lost after double crash: {rows}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -676,7 +724,7 @@ def test_multiworker_dml_survives_crash():
     """Multi-worker: ACKed INSERTs across partitions survive SIGKILL."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -703,7 +751,7 @@ def test_multiworker_dml_survives_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -720,7 +768,7 @@ def test_multiworker_ddl_batch_survives_crash():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -749,7 +797,7 @@ def test_multiworker_ddl_batch_survives_crash():
             assert len(rows) == 10, f"{name}: expected 10 rows, got {len(rows)}"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -761,7 +809,7 @@ def test_multiworker_view_survives_crash():
     """Multi-worker: view + data survive SIGKILL, view processes new data."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -796,7 +844,7 @@ def test_multiworker_view_survives_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -809,7 +857,7 @@ def test_string_column_survives_crash():
     """VARCHAR columns (inline + out-of-line blob encoding) survive SIGKILL."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -851,7 +899,7 @@ def test_string_column_survives_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -860,7 +908,7 @@ def test_drop_view_survives_crash():
     """ACKed DROP VIEW stays dropped after SIGKILL (retraction durability)."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -895,7 +943,7 @@ def test_drop_view_survives_crash():
         assert rows == {1: 10}
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -904,7 +952,7 @@ def test_fk_constraint_survives_crash():
     """FK constraints are enforced after crash recovery."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -942,7 +990,7 @@ def test_fk_constraint_survives_crash():
         assert rows == {1: 10, 3: 10}
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -951,7 +999,7 @@ def test_multiple_upserts_same_pk_crash():
     """Multiple updates to the same PK before crash: final value survives."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -985,7 +1033,7 @@ def test_multiple_upserts_same_pk_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -994,7 +1042,7 @@ def test_nullable_columns_survive_crash():
     """Nullable columns with NULL values survive SIGKILL."""
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("dur")
@@ -1041,7 +1089,7 @@ def test_nullable_columns_survive_crash():
         )
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1066,7 +1114,7 @@ def test_multiworker_crash_across_checkpoint():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(
+        proc = _start_server(
             data_dir, sock_path, workers=_NUM_WORKERS, extra_env=_CHECKPOINT_ENV,
         )
         conn = gnitz.connect(sock_path)
@@ -1108,7 +1156,7 @@ def test_multiworker_crash_across_checkpoint():
         assert vals_before == vals_after, "data mismatch after checkpoint crash"
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1124,7 +1172,7 @@ def test_multiworker_crash_after_checkpoint():
     """
     tmpdir, data_dir, sock_path = _make_env()
     try:
-        proc = start_server_proc(
+        proc = _start_server(
             data_dir, sock_path, workers=_NUM_WORKERS, extra_env=_CHECKPOINT_ENV,
         )
         conn = gnitz.connect(sock_path)
@@ -1167,6 +1215,6 @@ def test_multiworker_crash_after_checkpoint():
         assert len(rows_final) == n + 1
 
         conn.close()
-        stop_server_proc(proc)
+        _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

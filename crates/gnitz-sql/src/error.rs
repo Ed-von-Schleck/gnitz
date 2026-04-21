@@ -1,7 +1,5 @@
 use std::fmt;
 
-use gnitz_sql_parse::GnitzSqlParseError;
-
 #[derive(Debug)]
 pub enum GnitzSqlError {
     Parse(sqlparser::parser::ParserError),
@@ -34,17 +32,6 @@ impl From<gnitz_core::ClientError> for GnitzSqlError {
 impl From<sqlparser::parser::ParserError> for GnitzSqlError {
     fn from(e: sqlparser::parser::ParserError) -> Self {
         GnitzSqlError::Parse(e)
-    }
-}
-
-impl From<GnitzSqlParseError> for GnitzSqlError {
-    fn from(e: GnitzSqlParseError) -> Self {
-        match e {
-            GnitzSqlParseError::Parse(p)       => GnitzSqlError::Parse(p),
-            GnitzSqlParseError::Bind(s)        => GnitzSqlError::Bind(s),
-            GnitzSqlParseError::Plan(s)        => GnitzSqlError::Plan(s),
-            GnitzSqlParseError::Unsupported(s) => GnitzSqlError::Unsupported(s),
-        }
     }
 }
 

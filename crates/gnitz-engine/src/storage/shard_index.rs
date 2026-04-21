@@ -340,13 +340,6 @@ impl ShardIndex {
         }
     }
 
-    /// Synchronous compaction: all file writes use pwrite+fdatasync
-    /// inside `shard_file::write_shard_streaming`, not io_uring. When
-    /// this function returns, no I/O activity related to this run
-    /// remains in flight — callers may rmtree the owning directory
-    /// immediately without draining anything. This invariant is
-    /// load-bearing for the schema-migration swap path, which rmtrees
-    /// dropped-table directories right after the Phase-4 ACKs.
     pub fn run_compact(&mut self) -> Result<(), StorageError> {
         if !self.needs_compaction {
             return Ok(());

@@ -3,11 +3,6 @@
 //! Single source of truth for constants and codecs that both the client
 //! (gnitz-protocol, gnitz-core) and server (gnitz-engine) must agree on.
 
-pub mod migration;
-pub mod circuit;
-
-pub use circuit::CircuitGraph;
-
 /// Re-declare gnitz-wire constants as a different integer type.
 ///
 /// ```ignore
@@ -193,7 +188,6 @@ pub const COL_TAB:              u64 = 4;
 pub const IDX_TAB:              u64 = 5;
 pub const DEP_TAB:              u64 = 6;
 pub const SEQ_TAB:              u64 = 7;
-pub const MIGRATIONS_TAB:       u64 = 8;
 pub const CIRCUIT_NODES_TAB:    u64 = 11;
 pub const CIRCUIT_EDGES_TAB:    u64 = 12;
 pub const CIRCUIT_SOURCES_TAB:  u64 = 13;

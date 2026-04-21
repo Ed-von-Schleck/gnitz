@@ -4,13 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sqlparser        = "0.56"
-gnitz-core       = { path = "../gnitz-core" }
-gnitz-protocol   = { path = "../gnitz-protocol" }
-# Migration AST + canonical form + diff / hash live in gnitz-wire so
-# the server-side apply (gnitz-engine) can share them.
-gnitz-wire       = { path = "../gnitz-wire" }
-# Pure SQL parser (no client dep); gnitz-sql re-exports its DDL
-# parsing so existing consumers keep compiling, and gnitz-engine
-# links the parse crate directly.
-gnitz-sql-parse  = { path = "../gnitz-sql-parse" }
+sqlparser   = "0.56"
+gnitz-core     = { path = "../gnitz-core" }
+gnitz-protocol = { path = "../gnitz-protocol" }

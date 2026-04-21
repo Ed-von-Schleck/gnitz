@@ -17,18 +17,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::catalog::{
-    CatalogEngine, FIRST_USER_TABLE_ID, MIGRATIONS_TAB_ID,
-    SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
-    MIGRATIONS_COL_PARENT_HASH, MIGRATIONS_COL_AUTHOR, MIGRATIONS_COL_MESSAGE,
-    MIGRATIONS_COL_CREATED_LSN, MIGRATIONS_COL_DESIRED_STATE_SQL,
-    MIGRATIONS_COL_DESIRED_STATE_CANONICAL, MIGRATIONS_COL_FORMAT_VERSION,
-};
-use crate::catalog::migration::{MigrationRow, StagedKind, StagedMapping, staged_name};
-use gnitz_wire::migration as mig;
+use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::committer::{self, CommitRequest};
 use crate::ipc::{self, STATUS_OK, STATUS_ERROR, WireConflictMode};
 use crate::master::{MasterDispatcher, first_worker_error};
@@ -90,19 +81,6 @@ pub struct Shared {
     /// Tick trigger sender; senders include INSERT (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
     tick_tx: mpsc::Sender<TickTrigger>,
-    /// Clone of the relay channel sender. The reactor's exchange
-    /// accumulator also holds a sender (installed via
-    /// `attach_relay_tx`); this copy is reserved for `apply_migration`
-    /// to enqueue a `PendingRelay::Fence` between Phase 2 and Phase 3.
-    pub(crate) relay_tx: mpsc::Sender<PendingRelay>,
-    /// Set by `apply_migration` from `false` to `true` via CAS on
-    /// entry; cleared on exit (including panic) via a scope guard.
-    /// While set, `handle_message` rejects external DML and external
-    /// DDL pushes with a transient "another migration in flight"
-    /// error. Migration pushes (target_id == MIGRATIONS_TAB_ID) are
-    /// NOT gated here — their own CAS handles the "already running"
-    /// case.
-    pub(crate) migration_in_flight: AtomicBool,
     /// Committer-owned counter; shared here so SCAN/SEEK handlers can
     /// report the same LSN the committer assigns.
     ingest_lsn: Rc<Cell<u64>>,
@@ -138,15 +116,6 @@ impl Shared {
             }
         }
         std::cell::Ref::map(self.col_names_cache.borrow(), |m| m.get(&target_id).unwrap())
-    }
-
-    /// Drop all per-tid caches for `target_id`. Must be called after a
-    /// DROP TABLE so a subsequent operation on a fresh table (even one
-    /// that reuses the tid) doesn't see a stale schema/column list.
-    fn invalidate_tid_caches(&self, target_id: i64) {
-        self.schema_cache.borrow_mut().remove(&target_id);
-        self.col_names_cache.borrow_mut().remove(&target_id);
-        self.table_locks.borrow_mut().remove(&target_id);
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
@@ -193,33 +162,6 @@ impl Shared {
     }
 }
 
-/// RAII clear-on-drop guard for `Shared::migration_in_flight`. Takes
-/// ownership on successful CAS; clears the flag when dropped — normal
-/// return, early error, or panic unwind. Use
-/// `MigrationInFlightGuard::acquire(&shared)` to CAS and install.
-pub(crate) struct MigrationInFlightGuard {
-    shared: Rc<Shared>,
-}
-
-impl MigrationInFlightGuard {
-    /// Try to acquire the flag. Returns `Some(guard)` iff this caller
-    /// won the CAS. Returns `None` if a migration is already in flight.
-    pub(crate) fn acquire(shared: &Rc<Shared>) -> Option<Self> {
-        match shared.migration_in_flight.compare_exchange(
-            false, true, Ordering::AcqRel, Ordering::Acquire,
-        ) {
-            Ok(_) => Some(MigrationInFlightGuard { shared: Rc::clone(shared) }),
-            Err(_) => None,
-        }
-    }
-}
-
-impl Drop for MigrationInFlightGuard {
-    fn drop(&mut self) {
-        self.shared.migration_in_flight.store(false, Ordering::Release);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ServerExecutor entry point
 // ---------------------------------------------------------------------------
@@ -255,9 +197,6 @@ impl ServerExecutor {
         let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
         let (relay_tx, relay_rx) = mpsc::unbounded::<PendingRelay>();
-        // Clone the sender so `apply_migration` can enqueue a Fence on
-        // the same channel between Phase 2 and Phase 3.
-        let relay_tx_for_shared = relay_tx.clone();
         // Wire the relay channel into the reactor so route_reply's
         // FLAG_EXCHANGE accumulator can hand off completed views.
         reactor.attach_relay_tx(relay_tx);
@@ -279,8 +218,6 @@ impl ServerExecutor {
             catalog_rwlock: Rc::new(AsyncRwLock::new()),
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             tick_tx,
-            relay_tx: relay_tx_for_shared,
-            migration_in_flight: AtomicBool::new(false),
             ingest_lsn: Rc::clone(&ingest_lsn),
             last_tick_lsn: Rc::clone(&last_tick_lsn),
             tick_rows: Rc::clone(&tick_rows),
@@ -292,7 +229,6 @@ impl ServerExecutor {
         });
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
-        reactor.spawn(mig_gc_task(Rc::clone(&shared)));
         reactor.spawn(accept_loop(Rc::clone(&shared)));
         reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
         reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
@@ -495,652 +431,29 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
 /// unrecoverable channel close (all senders dropped) terminates it.
 async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
     loop {
-        let msg = match rx.recv().await {
+        let relay = match rx.recv().await {
             Some(r) => r,
             None => return,
         };
-        match msg {
-            PendingRelay::Fence { done } => {
-                // The fence is processed strictly after every earlier
-                // Relay on the channel. Signal back to apply_migration
-                // that the relay pipeline is drained so Phase 3's
-                // write-lock acquisition cannot park a stale relay.
-                let _ = done.send(());
+        // Phase 1: CPU work + catalog read only — no SAL mutex.
+        let prep = {
+            let _cat = shared.catalog_rwlock.read().await;
+            match guard_panic("prepare_relay", || unsafe {
+                (*shared.dispatcher.0).prepare_relay(relay)
+            }) {
+                Ok(p) => p,
+                Err(e) => { gnitz_warn!("prepare_relay: {}", e); continue; }
             }
-            relay @ PendingRelay::Relay { .. } => {
-                // Phase 1: CPU work + catalog read only — no SAL mutex.
-                let prep = {
-                    let _cat = shared.catalog_rwlock.read().await;
-                    match guard_panic("prepare_relay", || unsafe {
-                        (*shared.dispatcher.0).prepare_relay(relay)
-                    }) {
-                        Ok(p) => p,
-                        Err(e) => { gnitz_warn!("prepare_relay: {}", e); continue; }
-                    }
-                };
-                // Phase 2: SAL write only — grab the mutex, no awaits inside.
-                {
-                    let _sal = shared.sal_writer_excl.lock().await;
-                    if let Err(e) = guard_panic("emit_relay", || unsafe {
-                        (*shared.dispatcher.0).emit_relay(prep)
-                    }) {
-                        gnitz_warn!("emit_relay failed: {}", e);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Migration apply
-// ---------------------------------------------------------------------------
-
-/// Decode the migration row out of an inbound `decoded` wire.
-/// Returns the populated `MigrationRow` or an error describing why
-/// the batch is malformed.
-fn extract_migration_row(decoded: &ipc::DecodedWire) -> Result<MigrationRow, String> {
-    let batch = decoded.data_batch.as_ref()
-        .ok_or("migration push carries no batch")?;
-    if batch.count != 1 {
-        return Err(format!(
-            "migration push must carry exactly one row, got {}", batch.count,
-        ));
-    }
-    let pk = batch.get_pk(0);
-
-    // PK is schema col 0 and lives in pk_lo/hi, so payload_col = schema_col - 1.
-    let parent_hash = read_u128(batch, 0, MIGRATIONS_COL_PARENT_HASH - 1)?;
-    let author = read_str(batch, 0, MIGRATIONS_COL_AUTHOR - 1)?;
-    let message = read_str(batch, 0, MIGRATIONS_COL_MESSAGE - 1)?;
-    let created_lsn = read_u64(batch, 0, MIGRATIONS_COL_CREATED_LSN - 1)? as i64;
-    let desired_state_sql = read_str(batch, 0, MIGRATIONS_COL_DESIRED_STATE_SQL - 1)?;
-    let canonical_hex_bytes = read_bytes(batch, 0, MIGRATIONS_COL_DESIRED_STATE_CANONICAL - 1)?;
-    let format_version = read_u64(batch, 0, MIGRATIONS_COL_FORMAT_VERSION - 1)?;
-
-    let canonical_hex = String::from_utf8(canonical_hex_bytes)
-        .map_err(|e| format!("desired_state_canonical is not valid UTF-8: {}", e))?;
-    let canonical_bytes = mig::from_hex(&canonical_hex)
-        .map_err(|e| format!("desired_state_canonical hex decode: {}", e))?;
-
-    Ok(MigrationRow {
-        hash: pk,
-        parent_hash,
-        author,
-        message,
-        created_lsn,
-        desired_state_sql,
-        desired_state_canonical: canonical_bytes,
-        format_version,
-    })
-}
-
-fn read_u64(batch: &Batch, row: usize, payload_col: usize) -> Result<u64, String> {
-    let data = batch.col_data(payload_col);
-    let off = row * 8;
-    if off + 8 > data.len() {
-        return Err(format!("migration row: u64 col {} truncated", payload_col));
-    }
-    Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
-}
-
-fn read_u128(batch: &Batch, row: usize, payload_col: usize) -> Result<u128, String> {
-    let data = batch.col_data(payload_col);
-    let off = row * 16;
-    if off + 16 > data.len() {
-        return Err(format!("migration row: u128 col {} truncated", payload_col));
-    }
-    let lo = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-    let hi = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
-    Ok(((hi as u128) << 64) | (lo as u128))
-}
-
-fn read_str(batch: &Batch, row: usize, payload_col: usize) -> Result<String, String> {
-    let bytes = read_bytes(batch, row, payload_col)?;
-    String::from_utf8(bytes)
-        .map_err(|e| format!("migration row: string col {} invalid UTF-8: {}", payload_col, e))
-}
-
-fn read_bytes(batch: &Batch, row: usize, payload_col: usize) -> Result<Vec<u8>, String> {
-    let data = batch.col_data(payload_col);
-    let off = row * 16;
-    if off + 16 > data.len() {
-        return Err(format!("migration row: string col {} truncated", payload_col));
-    }
-    let st: [u8; 16] = data[off..off + 16].try_into().unwrap();
-    Ok(crate::schema::decode_german_string(&st, &batch.blob))
-}
-
-/// Read the canonical bytes of a historical migration from
-/// `sys_migrations`. Returns `None` if the hash is not present.
-fn read_migration_canonical(cat: &mut CatalogEngine, hash: u128) -> Option<Vec<u8>> {
-    let mut cursor = cat.sys_migrations_cursor().ok()?;
-    let (pk_lo, pk_hi) = (hash as u64, (hash >> 64) as u64);
-    cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
-    if !cursor.cursor.valid
-        || cursor.cursor.current_key_lo != pk_lo
-        || cursor.cursor.current_key_hi != pk_hi
-        || cursor.cursor.current_weight <= 0
-    {
-        return None;
-    }
-    let ptr = cursor.cursor.col_ptr(MIGRATIONS_COL_DESIRED_STATE_CANONICAL, 16);
-    if ptr.is_null() { return None; }
-    let st: [u8; 16] = unsafe { std::slice::from_raw_parts(ptr, 16) }
-        .try_into().unwrap();
-    let blob_ptr = cursor.cursor.blob_ptr();
-    let blob_slice = if !blob_ptr.is_null() {
-        unsafe { std::slice::from_raw_parts(blob_ptr, cursor.cursor.blob_len()) }
-    } else { &[] };
-    let hex_bytes = crate::schema::decode_german_string(&st, blob_slice);
-    let hex_str = String::from_utf8(hex_bytes).ok()?;
-    mig::from_hex(&hex_str).ok()
-}
-
-/// apply_migration: serialised atomic schema-migration commit.
-///
-/// Supports CREATE/DROP TABLE and CREATE/DROP INDEX; views in
-/// migration SQL return an explicit "not yet implemented" error
-/// because the SQL planner runs client-side.
-///
-/// Flow:
-///   1. CAS `migration_in_flight` (scope guard clears on any exit).
-///   2. drain committer + tick; verify hash, parent, decode canonical,
-///      parse new, compute diff.
-///   3. relay fence — defensive no-op today, symmetric with the staging
-///      phase that backfill migrations will add later.
-///   4. under write lock, build drop + create batches, ingest locally
-///      + broadcast, single fsync.
-///   5. rmtree dropped directories, respond OK.
-async fn apply_migration(
-    shared: Rc<Shared>, fd: i32, client_id: u64, decoded: ipc::DecodedWire,
-) {
-    // ---- CAS + scope guard ---------------------------------------------
-    let guard = match MigrationInFlightGuard::acquire(&shared) {
-        Some(g) => g,
-        None => {
-            let msg = b"another migration is in flight; retry shortly";
-            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, msg).await;
-            return;
-        }
-    };
-
-    // ---- Extract migration row -----------------------------------------
-    let row = match extract_migration_row(&decoded) {
-        Ok(r) => r,
-        Err(e) => {
-            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
-            return;
-        }
-    };
-    apply_migration_row(shared, fd, client_id, row, guard).await;
-}
-
-/// Core of `apply_migration`: phase-1 validation + phase-3 commit, given
-/// a pre-built `MigrationRow`. Entered by the client-side
-/// `push_migration` path (via `apply_migration`). The in-flight guard
-/// is taken by the caller and dropped when this future resolves.
-async fn apply_migration_row(
-    shared: Rc<Shared>, fd: i32, client_id: u64, row: MigrationRow,
-    _guard: MigrationInFlightGuard,
-) {
-    if row.format_version != 2 {
-        let msg = format!(
-            "unsupported format_version {} (expected 2); \
-             pre-V2 migration rows are not readable — wipe the data dir",
-            row.format_version,
-        );
-        send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, msg.as_bytes()).await;
-        return;
-    }
-
-    // ---- Phase 1: drain barriers --------------------------------------
-    let (c_tx, c_rx) = oneshot::channel::<()>();
-    shared.committer_tx.send(CommitRequest::Barrier { done: c_tx });
-    let _ = c_rx.await;
-    let (t_tx, t_rx) = oneshot::channel::<()>();
-    shared.tick_tx.send(TickTrigger::Drain { tids: vec![], done: t_tx });
-    let _ = t_rx.await;
-
-    // ---- Phase 1: validate + diff (under read lock) --------------------
-    let diff_opt: Result<mig::Diff, String> = async {
-        let _cat = shared.catalog_rwlock.read().await;
-        let cat = shared.cat();
-
-        // Hash verification.
-        let expected = mig::compute_migration_hash(
-            row.parent_hash, &row.desired_state_canonical, &row.author, &row.message,
-        );
-        if expected != row.hash {
-            return Err("migration hash does not match its canonical payload".into());
-        }
-
-        // Parent verification (provisional — re-checked under write lock).
-        if row.parent_hash != cat.current_migration_hash {
-            return Err(format!(
-                "stale parent_hash: expected 0x{:032x}, got 0x{:032x}",
-                cat.current_migration_hash, row.parent_hash,
-            ));
-        }
-
-        // Decode parent + new canonical forms.
-        let parent_state = if row.parent_hash == 0 {
-            mig::DesiredState::default()
-        } else {
-            let bytes = read_migration_canonical(cat, row.parent_hash)
-                .ok_or("parent migration row not found in sys_migrations")?;
-            mig::decanonicalize(&bytes)?
         };
-        let new_state = mig::decanonicalize(&row.desired_state_canonical)?;
-
-        // Diff.
-        let mut diff = mig::diff_by_name(&parent_state, &new_state);
-        if diff.has_modifications() {
-            let desc = diff.first_modification_description().unwrap_or_default();
-            return Err(format!(
-                "schema modifications are not yet supported; offending object: {}", desc,
-            ));
-        }
-
-        // Structurally validate every view's circuit before we
-        // commit to ingest. Catches dangling edges / bad node refs
-        // early so the Phase-3 `on_view_delta` hook can't fail mid-
-        // ingest.
-        for v in &diff.created_views {
-            let cat_mut = shared.cat();
-            cat_mut.validate_view_circuit(&v.circuit)?;
-        }
-
-        // Empty diff — nothing to do, reject as the plan mandates.
-        if diff.created_tables.is_empty()
-            && diff.created_views.is_empty()
-            && diff.created_indices.is_empty()
-            && diff.dropped_tables.is_empty()
-            && diff.dropped_views.is_empty()
-            && diff.dropped_indices.is_empty()
+        // Phase 2: SAL write only — grab the mutex, no awaits inside.
         {
-            return Err("migration is a no-op (empty diff)".into());
-        }
-
-        // Transitive drop-validation: closure(diff.dropped, sys_view_deps) ⊆ diff.dropped.
-        shared.cat().validate_drop_closure_diff(&diff)?;
-
-        // Topo sort creates (parent-before-child) and drops (child-before-parent).
-        mig::topo_sort_diff(&mut diff)?;
-
-        Ok(diff)
-    }.await;
-
-    let diff = match diff_opt {
-        Ok(d) => d,
-        Err(e) => {
-            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
-            return;
-        }
-    };
-
-    // ---- Phase 2: create staged objects under __mig_<hash>_ names -----
-    let staged = match apply_phase2(&shared, &row, &diff).await {
-        Ok(s) => s,
-        Err(e) => {
-            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
-            return;
-        }
-    };
-
-    // ---- Phase 2 → 3 relay fence --------------------------------------
-    // Drains any FLAG_EXCHANGE relays emitted during Phase 2 before the
-    // Phase-3 write lock is acquired.
-    let (r_tx, r_rx) = oneshot::channel::<()>();
-    shared.relay_tx.send(PendingRelay::Fence { done: r_tx });
-    let _ = r_rx.await;
-
-    // ---- Phase 3: atomic rename + drops under write lock --------------
-    let dropped_dirs = match apply_phase3(&shared, &row, diff, staged).await {
-        Ok(d) => d,
-        Err(e) => {
-            send_error(&shared, fd, MIGRATIONS_TAB_ID, client_id, e.as_bytes()).await;
-            return;
-        }
-    };
-
-    // ---- Phase 4: rmtree + respond ------------------------------------
-    for dir in dropped_dirs {
-        // rmtree is best-effort; orphans (if any) are reaped by the
-        // startup directory sweep on next boot.
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Success response.
-    let schema = shared.get_schema_desc(MIGRATIONS_TAB_ID);
-    send_ok_response(
-        &shared, fd, MIGRATIONS_TAB_ID, None, client_id, &schema,
-        shared.ingest_lsn.get(),
-    ).await;
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: create staged objects under __mig_<hash>_ names
-// ---------------------------------------------------------------------------
-
-/// Ingest + broadcast a set of batches under `sal_writer_excl` and fsync.
-/// Used by `apply_phase2` for each staged object.  Aborts on partial
-/// broadcast (unrecoverable) via `gnitz_fatal_abort!`.
-async fn ingest_and_fsync_phase2(shared: &Rc<Shared>, batches: &[(i64, Batch)]) {
-    let fsync_fut = {
-        let _sal_excl = shared.sal_writer_excl.lock().await;
-        let cat_ptr   = shared.catalog.0;
-        let disp_ptr  = shared.dispatcher.0;
-        for (tid, batch) in batches {
-            let r = guard_panic("phase2 ingest", || {
-                unsafe { &mut *cat_ptr }.ingest_to_family(*tid, batch)
-            });
-            if let Err(e) = r {
-                gnitz_fatal_abort!("phase2 ingest failed: {}", e);
-            }
-            let r = guard_panic("phase2 broadcast", || unsafe {
-                (*disp_ptr).broadcast_ddl(*tid, batch)
-            });
-            if let Err(e) = r {
-                gnitz_fatal_abort!("phase2 broadcast failed: {}", e);
+            let _sal = shared.sal_writer_excl.lock().await;
+            if let Err(e) = guard_panic("emit_relay", || unsafe {
+                (*shared.dispatcher.0).emit_relay(prep)
+            }) {
+                gnitz_warn!("emit_relay failed: {}", e);
             }
         }
-        shared.reactor.fsync(shared.sal_fd)
-    };
-    let lsn = shared.ingest_lsn.get() + 1;
-    shared.ingest_lsn.set(lsn);
-    let rc = fsync_fut.await;
-    if rc < 0 {
-        gnitz_fatal_abort!("SAL fdatasync (phase2) failed rc={}", rc);
-    }
-}
-
-/// Phase 2: create every object in `diff.created_*` under a
-/// `__mig_<hash>_<final_name>` staged name so Phase 3 can atomically
-/// rename them.  Holds the catalog write lock for all creates.
-///
-/// On any pre-ingest error, returns `Err`; the RAII guard clears
-/// `migration_in_flight` and any already-fsynced `__mig_*` objects are
-/// reaped by `mig_gc_task` on next boot.
-async fn apply_phase2(
-    shared: &Rc<Shared>,
-    row: &MigrationRow,
-    diff: &mig::Diff,
-) -> Result<Vec<StagedMapping>, String> {
-    if diff.created_tables.is_empty()
-        && diff.created_views.is_empty()
-        && diff.created_indices.is_empty()
-    {
-        return Ok(Vec::new());
-    }
-
-    let hash_hex = format!("{:032x}", row.hash);
-    let mut staged: Vec<StagedMapping> = Vec::new();
-
-    let _write = shared.catalog_rwlock.write().await;
-
-    // Staged tables.
-    for t in &diff.created_tables {
-        let mut staged_def = t.clone();
-        staged_def.name = staged_name(&hash_hex, &t.name);
-
-        let (tid, batches) = shared.cat().build_create_table_batches(&staged_def)?;
-        ingest_and_fsync_phase2(shared, &batches).await;
-
-        staged.push(StagedMapping {
-            kind: StagedKind::Table,
-            staged_id: tid,
-            final_schema: t.schema.clone(),
-            final_name:   t.name.clone(),
-            final_sql:    None,
-        });
-    }
-
-    // Staged views (keep sql as-is — references only live tables).
-    for v in &diff.created_views {
-        let mut staged_def = v.clone();
-        staged_def.name = staged_name(&hash_hex, &v.name);
-
-        let (vid, batches) = shared.cat().build_create_view_batches(&staged_def)?;
-        ingest_and_fsync_phase2(shared, &batches).await;
-
-        staged.push(StagedMapping {
-            kind: StagedKind::View,
-            staged_id: vid,
-            final_schema: v.schema.clone(),
-            final_name:   v.name.clone(),
-            final_sql:    Some(v.sql.clone()),
-        });
-    }
-
-    // Staged indices.  If the owner table was staged in this migration,
-    // reference it by its staged name so `build_create_index_batches`
-    // can look it up in name_to_id.
-    for idx in &diff.created_indices {
-        let staged_owner_name = staged.iter()
-            .find(|m| matches!(m.kind, StagedKind::Table)
-                && m.final_schema == idx.owner_schema
-                && m.final_name   == idx.owner_name)
-            .map(|m| staged_name(&hash_hex, &m.final_name))
-            .unwrap_or_else(|| idx.owner_name.clone());
-
-        let mut staged_idx_def = idx.clone();
-        staged_idx_def.name       = staged_name(&hash_hex, &idx.name);
-        staged_idx_def.owner_name = staged_owner_name;
-
-        let (idx_id, batches) = shared.cat().build_create_index_batches(&staged_idx_def)?;
-        ingest_and_fsync_phase2(shared, &batches).await;
-
-        staged.push(StagedMapping {
-            kind: StagedKind::Index,
-            staged_id: idx_id,
-            final_schema: idx.schema.clone(),
-            final_name:   idx.name.clone(),
-            final_sql:    None,
-        });
-    }
-
-    Ok(staged)
-}
-
-// ---------------------------------------------------------------------------
-// Phase 3: atomic rename of staged objects + drops
-// ---------------------------------------------------------------------------
-
-async fn apply_phase3(
-    shared: &Rc<Shared>,
-    row: &MigrationRow,
-    diff: mig::Diff,
-    staged: Vec<StagedMapping>,
-) -> Result<Vec<std::path::PathBuf>, String> {
-    let _write = shared.catalog_rwlock.write().await;
-
-    // TOCTOU re-check.
-    {
-        let cat = shared.cat();
-        if row.parent_hash != cat.current_migration_hash {
-            return Err(format!(
-                "stale parent_hash at apply: another migration committed first (current 0x{:032x})",
-                cat.current_migration_hash,
-            ));
-        }
-    }
-
-    let mut to_broadcast: Vec<(i64, Batch)> = Vec::new();
-
-    // Resolve drops + staged renames into a single Cascade.
-    let cascade = {
-        let cat = shared.cat();
-        cat.build_cascade_from_staged(&diff, &staged)
-    };
-
-    // Collect directories to rmtree BEFORE swap fires hooks that unregister tables.
-    let dropped_dirs = {
-        let cat = shared.cat();
-        cat.collect_dropped_directories(&cascade)
-    };
-    let dropped_tids: Vec<i64> = cascade.dropped_table_ids.iter()
-        .chain(cascade.dropped_view_ids.iter())
-        .copied()
-        .collect();
-
-    // Build Phase-3 swap batches (drops + renames from staged).
-    {
-        let cat = shared.cat();
-        let swap_batches = cat.build_swap_batches(&cascade)?;
-        to_broadcast.extend(swap_batches);
-    }
-
-    // Update the durable sys_sequences HWM (covers table and index allocations
-    // made in Phase 2).
-    {
-        let cat = shared.cat();
-        let seq_batch = cat.build_sequence_hwm_batch()?;
-        if seq_batch.count > 0 {
-            to_broadcast.push((crate::catalog::SEQ_TAB_ID, seq_batch));
-        }
-    }
-
-    // Build the sys_migrations insert row.
-    let migration_batch = {
-        let cat = shared.cat();
-        cat.build_migration_row_batch(row)
-    };
-
-    // Ingest locally + broadcast under one sal_writer_excl + single fsync.
-    let fsync_fut = {
-        let _sal_excl = shared.sal_writer_excl.lock().await;
-        let cat_ptr = shared.catalog.0;
-        let disp_ptr = shared.dispatcher.0;
-
-        // Each batch: ingest to master's catalog (writes master WAL
-        // + fires hooks), then broadcast over the SAL to workers.
-        for (tid, batch) in &to_broadcast {
-            let ingest_res = guard_panic("migration ingest", || {
-                let cat = unsafe { &mut *cat_ptr };
-                cat.ingest_to_family(*tid, batch)
-            });
-            if let Err(e) = ingest_res {
-                gnitz_fatal_abort!("migration ingest failed mid-Phase-3: {}", e);
-            }
-            let bcast_res = guard_panic("migration broadcast_ddl", || unsafe {
-                (*disp_ptr).broadcast_ddl(*tid, batch)
-            });
-            if let Err(e) = bcast_res {
-                // Per plan: a partial broadcast is unrecoverable.
-                gnitz_fatal_abort!("migration broadcast failed mid-Phase-3: {}", e);
-            }
-        }
-
-        // sys_migrations row goes last so workers process it after
-        // the swap is applied.
-        let ingest_res = guard_panic("migration-row ingest", || {
-            let cat = unsafe { &mut *cat_ptr };
-            cat.ingest_to_family(MIGRATIONS_TAB_ID, &migration_batch)
-        });
-        if let Err(e) = ingest_res {
-            gnitz_fatal_abort!("sys_migrations ingest failed: {}", e);
-        }
-        let bcast_res = guard_panic("migration-row broadcast_ddl", || unsafe {
-            (*disp_ptr).broadcast_ddl(MIGRATIONS_TAB_ID, &migration_batch)
-        });
-        if let Err(e) = bcast_res {
-            gnitz_fatal_abort!("sys_migrations broadcast failed: {}", e);
-        }
-
-        // Update head.
-        unsafe { (*cat_ptr).current_migration_hash = row.hash; }
-
-        // SQE submit, no await inside the lock.
-        shared.reactor.fsync(shared.sal_fd)
-    };
-
-    let lsn = shared.ingest_lsn.get() + 1;
-    shared.ingest_lsn.set(lsn);
-
-    let fsync_rc = fsync_fut.await;
-    if fsync_rc < 0 {
-        gnitz_fatal_abort!("SAL fdatasync (migration) failed rc={}", fsync_rc);
-    }
-
-    // Drop per-tid caches for every dropped table — the cached
-    // SchemaDescriptor / column names / table lock now describe an
-    // object that no longer exists, and a subsequent tid reuse would
-    // otherwise see stale values.
-    for tid in dropped_tids {
-        shared.invalidate_tid_caches(tid);
-    }
-
-    Ok(dropped_dirs)
-}
-
-// ---------------------------------------------------------------------------
-// GC task: reap __mig_* orphans from a crashed Phase 2
-// ---------------------------------------------------------------------------
-
-/// Runs once at startup.  Scans the catalog for any `__mig_*` objects left
-/// by a Phase-2 crash and drops them, each with its own write-lock + fsync.
-/// The startup sweep on worker processes handles their stale on-disk dirs.
-async fn mig_gc_task(shared: Rc<Shared>) {
-    // Snapshot orphan list under a brief read lock.
-    let orphans: Vec<(StagedKind, String, String)> = {
-        let _r = shared.catalog_rwlock.read().await;
-        shared.cat().collect_staged_orphans()
-    };
-
-    for (kind, schema, name) in orphans {
-        // Acquire write lock for the full drop + ingest + fsync sequence.
-        let _w = shared.catalog_rwlock.write().await;
-        let cat = shared.cat();
-
-        let batches: Vec<(i64, Batch)> = match kind {
-            StagedKind::Table => {
-                match cat.build_drop_table_batches(&schema, &name) {
-                    Ok((_tid, b, _dir)) => b,
-                    Err(_) => continue,
-                }
-            }
-            StagedKind::View => {
-                match cat.build_drop_view_batches(&schema, &name) {
-                    Ok((_vid, b, _dir)) => b,
-                    Err(_) => continue,
-                }
-            }
-            StagedKind::Index => {
-                match cat.build_drop_index_batches(&name) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                }
-            }
-        };
-
-        let fsync_fut = {
-            let _sal_excl = shared.sal_writer_excl.lock().await;
-            let cat_ptr  = shared.catalog.0;
-            let disp_ptr = shared.dispatcher.0;
-            for (tid, batch) in &batches {
-                let r = guard_panic("gc_task ingest", || {
-                    unsafe { &mut *cat_ptr }.ingest_to_family(*tid, batch)
-                });
-                if let Err(e) = r {
-                    gnitz_fatal_abort!("mig_gc_task ingest failed: {}", e);
-                }
-                let r = guard_panic("gc_task broadcast", || unsafe {
-                    (*disp_ptr).broadcast_ddl(*tid, batch)
-                });
-                if let Err(e) = r {
-                    gnitz_fatal_abort!("mig_gc_task broadcast failed: {}", e);
-                }
-            }
-            shared.reactor.fsync(shared.sal_fd)
-        };
-        let lsn = shared.ingest_lsn.get() + 1;
-        shared.ingest_lsn.set(lsn);
-        let rc = fsync_fut.await;
-        if rc < 0 {
-            gnitz_fatal_abort!("SAL fdatasync (mig_gc_task) failed rc={}", rc);
-        }
-        // _w released here — next iteration acquires a fresh write lock.
     }
 }
 
@@ -1227,27 +540,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
                 return;
             }
         }
-    }
-
-    // ---------- Migration dispatch (goes before the in-flight gate) ----------
-    // Migrations have their own CAS inside apply_migration; we do NOT
-    // want the generic gate to reject a migration push while another
-    // migration is in flight (the CAS gives a proper error).
-    if target_id == MIGRATIONS_TAB_ID && has_batch && batch_count > 0 {
-        apply_migration(Rc::clone(shared), fd, client_id, decoded).await;
-        return;
-    }
-
-    // ---------- Migration-in-flight gate (rejects external DML + DDL) ----------
-    // The migration dispatch branch (target_id == MIGRATIONS_TAB_ID,
-    // added in handle_message before system_dml) runs before this
-    // check; we never gate migration pushes themselves. Read-only
-    // paths (SEEK / SEEK_BY_INDEX / empty-batch SCAN) already
-    // returned above, so only mutating pushes reach here.
-    if shared.migration_in_flight.load(Ordering::Acquire) {
-        let msg = b"another migration is in flight; retry shortly" as &[u8];
-        send_error(shared, fd, target_id, client_id, msg).await;
-        return;
     }
 
     // ---------- User-table INSERT ----------
@@ -1417,18 +709,6 @@ async fn handle_system_dml(
     let batch = decoded.data_batch;
     let non_empty = batch.as_ref().map(|b| b.count > 0).unwrap_or(false);
     let schema = shared.get_schema_desc(target_id);
-
-    // Defence-in-depth: non-empty batches for sys_migrations must
-    // go through apply_migration (which the dispatch branch in
-    // handle_message routes). Reject here so a bug in the routing
-    // can't silently ingest a migration row as a plain catalog
-    // insert.
-    if target_id == MIGRATIONS_TAB_ID && non_empty {
-        let msg = b"sys_migrations inserts must go through push_migration, \
-                    not a raw catalog INSERT";
-        send_error(shared, fd, target_id, client_id, msg).await;
-        return;
-    }
 
     // Empty SCAN for system tables — no DDL, no lock needed.
     if !non_empty {
@@ -1618,46 +898,4 @@ fn validate_schema_match(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::BatchBuilder;
-    use crate::catalog::sys_tab_schema_pub;
-
-    /// Silent-zero regression: before the fix, a read past the column
-    /// data returned a zero-filled value. Now it returns an error so
-    /// malformed migration rows are rejected at the protocol boundary.
-    #[test]
-    fn read_helpers_reject_short_payload() {
-        let schema = sys_tab_schema_pub(MIGRATIONS_TAB_ID);
-        let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(1, 0, 1);
-        bb.put_u128(0, 0);
-        bb.put_string("a");
-        bb.put_string("m");
-        bb.put_u64(0);
-        bb.put_string("sql");
-        bb.put_string("deadbeef");
-        bb.put_u64(1);
-        bb.end_row();
-        let batch = bb.finish();
-
-        assert!(read_u64(&batch, 0, 3).is_ok());
-        assert!(read_u128(&batch, 0, 0).is_ok());
-        assert!(read_str(&batch, 0, 1).is_ok());
-        assert!(read_bytes(&batch, 0, 5).is_ok());
-
-        // Row index past the batch's row count: silent-zero would have
-        // returned 0; the hardened helpers must error.
-        let err = read_u64(&batch, 1, 3).unwrap_err();
-        assert!(err.contains("truncated"), "got: {}", err);
-        let err = read_u128(&batch, 1, 0).unwrap_err();
-        assert!(err.contains("truncated"), "got: {}", err);
-        let err = read_bytes(&batch, 1, 5).unwrap_err();
-        assert!(err.contains("truncated"), "got: {}", err);
-        let err = read_str(&batch, 7, 1).unwrap_err();
-        assert!(err.contains("truncated"), "got: {}", err);
-    }
 }
