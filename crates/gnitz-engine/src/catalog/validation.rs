@@ -1,34 +1,6 @@
 use super::*;
 
 impl CatalogEngine {
-    // -- Dependency check --------------------------------------------------
-
-    pub(crate) fn check_for_dependencies(&mut self, tid: i64, name: &str) -> Result<(), String> {
-        // Check FK references
-        let children = self.fk_children_of(tid);
-        if let Some(&(child_tid, _)) = children.first() {
-            let (sn, tn) = self.caches.entity_by_id.get(&child_tid)
-                .cloned().unwrap_or_default();
-            return Err(format!("FK dependency: table '{}.{}'", sn, tn));
-        }
-
-        // Check view dependencies
-        let mut cursor = match self.sys_view_deps.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
-        };
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
-                let dep_tid = cursor_read_u64(&cursor, DEPTAB_COL_DEP_TABLE_ID) as i64;
-                if dep_tid == tid {
-                    return Err(format!("View dependency: entity '{}'", name));
-                }
-            }
-            cursor.cursor.advance();
-        }
-        Ok(())
-    }
-
     // -- FK column validation (pre-create) ---------------------------------
 
     pub(crate) fn validate_fk_column(
@@ -87,11 +59,7 @@ impl CatalogEngine {
 
                 // Check null
                 let null_word = batch.get_null_word(row);
-                let payload_col = if col_idx < schema.pk_index as usize {
-                    col_idx
-                } else {
-                    col_idx - 1
-                };
+                let payload_col = schema.payload_idx(col_idx);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
                 // Promote column value to PK key
@@ -187,22 +155,17 @@ impl CatalogEngine {
         if !has_unique { return Ok(()); }
 
         let schema = entry.schema;
-        let pk_index = schema.pk_index as usize;
 
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
             let source_col_idx = ic.col_idx as usize;
             let col_type = schema.columns[source_col_idx].type_code;
-            let payload_col = if source_col_idx < pk_index {
-                source_col_idx
-            } else {
-                source_col_idx - 1
-            };
+            let payload_col = schema.payload_idx(source_col_idx);
 
             let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
 
             // Track seen keys for batch-internal duplicate detection
-            let mut seen: HashMap<(u64, u64), bool> = HashMap::new();
+            let mut seen: HashSet<(u64, u64)> = HashSet::new();
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
@@ -234,14 +197,13 @@ impl CatalogEngine {
                 let (key_lo, key_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);
 
                 // Batch-internal duplicate check
-                if seen.contains_key(&(key_lo, key_hi)) {
+                if !seen.insert((key_lo, key_hi)) {
                     let col_names = self.get_column_names(table_id);
                     let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
                     return Err(format!(
                         "Unique index violation on column '{}': duplicate in batch", cname
                     ));
                 }
-                seen.insert((key_lo, key_hi), true);
 
                 // Check index store for existing key
                 let key_u128 = crate::util::make_pk(key_lo, key_hi);

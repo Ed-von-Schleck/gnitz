@@ -25,35 +25,30 @@ impl CatalogEngine {
     // -- Server ingestion / scan / seek / flush -----------------------------
 
     /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
-    /// For system tables: fires hooks after ingestion.
-    /// For user tables: delegates to DagEngine::ingest_to_family.
+    /// System tables go through precheck → ingest → hooks → broadcast-queue.
+    /// User tables delegate to `DagEngine::ingest_to_family`.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
-            // System table: ingest into owned Table, then fire hooks.
+            // Reject BEFORE any WAL write; avoids dangling retractions that
+            // would later trip replay_catalog.
+            self.precheck_sys_ingest(table_id, batch)?;
+
             let schema = sys_tab_schema(table_id);
-            let table: &mut Table = match table_id {
-                SCHEMA_TAB_ID => &mut self.sys_schemas,
-                TABLE_TAB_ID => &mut self.sys_tables,
-                VIEW_TAB_ID => &mut self.sys_views,
-                COL_TAB_ID => &mut self.sys_columns,
-                IDX_TAB_ID => &mut self.sys_indices,
-                DEP_TAB_ID => &mut self.sys_view_deps,
-                SEQ_TAB_ID => &mut self.sys_sequences,
-                CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
-                CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
-                CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
-                CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
-                CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
-                _ => return Err(format!("Unknown system table_id {}", table_id)),
-            };
-            // Clone batch for hooks (hooks need to read it after table borrows it)
+            let table = self.sys_table_mut(table_id)
+                .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
+            ingest_batch_into(table, batch);
             let mut batch_for_hooks = batch.clone();
             batch_for_hooks.set_schema(schema);
-            ingest_batch_into(table, batch);
             self.fire_hooks(table_id, &batch_for_hooks)?;
+
+            // Enqueue after hooks so nested cascade pushes land first and the
+            // executor broadcasts children → parent. Drop empty batches so
+            // worker-side no-op cascades don't accumulate unread entries.
+            if batch_for_hooks.count > 0 {
+                self.pending_broadcasts.push((table_id, batch_for_hooks));
+            }
             Ok(())
         } else {
-            // User table: DagEngine handles unique_pk, store ingest, index projection.
             let rc = self.dag.ingest_by_ref(table_id, batch);
             if rc < 0 {
                 Err(format!("ingest_to_family failed for table_id={} rc={}", table_id, rc))
@@ -61,6 +56,54 @@ impl CatalogEngine {
                 Ok(())
             }
         }
+    }
+
+    /// Reject FK-blocked or view-dep-blocked drops before they hit the WAL.
+    /// Only TABLE_TAB and VIEW_TAB retractions have pre-conditions; other
+    /// system tables (including cascade targets) are no-ops.
+    fn precheck_sys_ingest(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+        if table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID {
+            return Ok(());
+        }
+
+        let mut drop_ids: Vec<i64> = Vec::new();
+        for i in 0..batch.count {
+            if batch.get_weight(i) < 0 {
+                drop_ids.push(batch.get_pk(i) as i64);
+            }
+        }
+        if drop_ids.is_empty() {
+            return Ok(());
+        }
+
+        if table_id == TABLE_TAB_ID {
+            for &tid in &drop_ids {
+                if let Some(&(child_tid, _)) = self.fk_children_of(tid).first() {
+                    let (sn, tn) = self.caches.entity_by_id.get(&child_tid)
+                        .cloned().unwrap_or_default();
+                    return Err(format!(
+                        "Integrity violation: table referenced by '{}.{}'", sn, tn
+                    ));
+                }
+            }
+        }
+
+        let dep_map = self.dag.get_dep_map();
+        for &id in &drop_ids {
+            if dep_map.get(&id).map(|v| !v.is_empty()).unwrap_or(false) {
+                let (sn, tn) = self.caches.entity_by_id.get(&id)
+                    .cloned().unwrap_or_default();
+                return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain the pending-broadcast queue. Master calls this once per
+    /// top-level DDL and forwards each entry to `broadcast_ddl`. Workers
+    /// never call this — the queue simply grows unread on them.
+    pub fn drain_pending_broadcasts(&mut self) -> Vec<(i64, Batch)> {
+        std::mem::take(&mut self.pending_broadcasts)
     }
 
     /// Ingest a user-table batch and return the effective delta (after unique_pk
@@ -132,19 +175,17 @@ impl CatalogEngine {
                 .ok_or_else(|| format!("Unknown table_id {}", table_id))?
         };
 
-        // Create cursor and seek
+        // Create cursor and seek.  Circuit_* system tables are intentionally
+        // excluded from the seek surface (internal DBSP bookkeeping, not
+        // part of the client catalog view).
         let cursor_result = if table_id < FIRST_USER_TABLE_ID {
-            let table: &mut Table = match table_id {
-                SCHEMA_TAB_ID => &mut self.sys_schemas,
-                TABLE_TAB_ID => &mut self.sys_tables,
-                VIEW_TAB_ID => &mut self.sys_views,
-                COL_TAB_ID => &mut self.sys_columns,
-                IDX_TAB_ID => &mut self.sys_indices,
-                DEP_TAB_ID => &mut self.sys_view_deps,
-                SEQ_TAB_ID => &mut self.sys_sequences,
+            match table_id {
+                SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID
+                | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID => {
+                    self.sys_table_mut(table_id).unwrap().create_cursor()
+                }
                 _ => return Ok(None),
-            };
-            table.create_cursor()
+            }
         } else {
             let entry = self.dag.tables.get(&table_id).unwrap();
             match &entry.handle {
@@ -244,21 +285,8 @@ impl CatalogEngine {
         if table_id >= FIRST_USER_TABLE_ID {
             return Err("ddl_sync only for system tables".into());
         }
-        let table: &mut Table = match table_id {
-            SCHEMA_TAB_ID => &mut self.sys_schemas,
-            TABLE_TAB_ID => &mut self.sys_tables,
-            VIEW_TAB_ID => &mut self.sys_views,
-            COL_TAB_ID => &mut self.sys_columns,
-            IDX_TAB_ID => &mut self.sys_indices,
-            DEP_TAB_ID => &mut self.sys_view_deps,
-            SEQ_TAB_ID => &mut self.sys_sequences,
-            CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
-            CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
-            CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
-            CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
-            CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
-            _ => return Err(format!("Unknown system table_id {}", table_id)),
-        };
+        let table = self.sys_table_mut(table_id)
+            .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
         // Memonly ingest (no WAL)
         let npc = batch.num_payload_cols();
         let (ptrs, sizes) = batch.to_region_ptrs();
@@ -659,10 +687,6 @@ impl CatalogEngine {
         self.caches.index_by_name.contains_key(name)
     }
 
-    pub fn is_unique_pk(&self, table_id: i64) -> bool {
-        self.dag.tables.get(&table_id).map(|e| e.unique_pk).unwrap_or(false)
-    }
-
     // -- Sequence management -----------------------------------------------
 
     pub fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
@@ -710,9 +734,14 @@ impl CatalogEngine {
             let snapshot = table.get_snapshot();
             let shards = table.all_shard_arcs();
 
-            // Snapshot is consolidated → all weights > 0 → every row passes filter
-            if shards.is_empty() && snapshot.count > 0 {
-                return snapshot;
+            if shards.is_empty() {
+                // Snapshot is consolidated → all weights > 0 → every row passes filter.
+                // Empty-everywhere case returns an empty batch without building a cursor.
+                return if snapshot.count > 0 {
+                    snapshot
+                } else {
+                    Arc::new(Batch::empty_with_schema(schema))
+                };
             }
 
             // All weights non-zero and shard is sorted+consolidated

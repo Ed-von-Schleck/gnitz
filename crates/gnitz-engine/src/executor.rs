@@ -715,10 +715,13 @@ async fn handle_system_dml(
     let t_after_barrier = Instant::now();
 
     let batch = batch.unwrap();
-    let ddl_clone = batch.clone_batch();
     let t_mut_start = Instant::now();
 
     let cat_ptr_raw = shared.catalog.0;
+    // Discard any stale queue entries from a prior failed DDL so they don't
+    // piggyback on this one.
+    let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
+
     if let Err(e) = guard_panic("DDL", || {
         let cat = unsafe { &mut *cat_ptr_raw };
         cat.ingest_to_family(target_id, &batch)?;
@@ -726,6 +729,9 @@ async fn handle_system_dml(
         unsafe { (*dag).evaluate_dag(target_id, batch); }
         Ok(())
     }) {
+        // A partial cascade may have pushed entries before the failing hook;
+        // clear them so the next DDL doesn't inherit half-applied broadcasts.
+        let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
     }
@@ -737,12 +743,15 @@ async fn handle_system_dml(
     // broadcast write against committer + tick + relay. Lock held ONLY
     // across the synchronous broadcast + fsync SQE submit; the fsync
     // .await happens after release so concurrent writers can proceed.
+    let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
     let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
         let disp_ptr_raw = shared.dispatcher.0;
-        let ddl_for_broadcast = ddl_clone;
-        if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
-            (*disp_ptr_raw).broadcast_ddl(target_id, &ddl_for_broadcast)
+        if let Err(e) = guard_panic("broadcast_ddl", || {
+            for (tid, bat) in &drained {
+                unsafe { (*disp_ptr_raw).broadcast_ddl(*tid, bat)?; }
+            }
+            Ok::<(), String>(())
         }) {
             send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
             return;

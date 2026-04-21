@@ -19,8 +19,7 @@ impl CatalogEngine {
         let batch = bb.finish();
 
         // Ingest into schemas family (triggers hook)
-        ingest_batch_into(&mut self.sys_schemas, &batch);
-        self.fire_hooks(SCHEMA_TAB_ID, &batch)?;
+        self.ingest_to_family(SCHEMA_TAB_ID, &batch)?;
 
         self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
         Ok(())
@@ -56,8 +55,7 @@ impl CatalogEngine {
         bb.end_row();
         let batch = bb.finish();
 
-        ingest_batch_into(&mut self.sys_schemas, &batch);
-        self.fire_hooks(SCHEMA_TAB_ID, &batch)?;
+        self.ingest_to_family(SCHEMA_TAB_ID, &batch)?;
         Ok(())
     }
 
@@ -169,8 +167,7 @@ impl CatalogEngine {
             bb.put_u64(flags);
             bb.end_row();
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_tables, &batch);
-            self.fire_hooks(TABLE_TAB_ID, &batch)?;
+            self.ingest_to_family(TABLE_TAB_ID, &batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
@@ -184,54 +181,14 @@ impl CatalogEngine {
 
         let qualified = format!("{}.{}", schema_name, table_name);
         let tid = *self.caches.entity_by_qname.get(&qualified)
-            .ok_or_else(|| format!("Table does not exist: {}.{}", schema_name, table_name))?;
+            .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
-        self.check_for_dependencies(tid, table_name)?;
-
-        // Cascade: retract every index owned by this table (secondary + FK).
-        self.retract_indices_for_owner(tid)?;
-
-        // Retract table record — cursor-based to match exact stored payload
-        {
-            let schema = table_tab_schema();
-            let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u64, 0);
-            if batch.count > 0 {
-                ingest_batch_into(&mut self.sys_tables, &batch);
-                self.fire_hooks(TABLE_TAB_ID, &batch)?;
-            }
+        let schema = table_tab_schema();
+        let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u64, 0);
+        if batch.count == 0 {
+            return Err(format!("Table does not exist: {}", qualified));
         }
-
-        // Retract column records
-        let col_defs = self.read_column_defs(tid)?;
-        self.retract_column_records(tid, OWNER_KIND_TABLE, &col_defs)?;
-
-        Ok(())
-    }
-
-    /// Retract every live index record whose owner_id matches `owner_id`.
-    /// Used by `drop_table` to prevent orphaned index rows that would
-    /// break `replay_catalog` on restart.
-    fn retract_indices_for_owner(&mut self, owner_id: i64) -> Result<(), String> {
-        let schema = idx_tab_schema();
-        let mut cursor = match self.sys_indices.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
-        };
-        let mut batch = Batch::with_schema(schema, 4);
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
-                let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
-                if row_owner == owner_id {
-                    copy_cursor_row_with_weight(&cursor, &schema, &mut batch, -1);
-                }
-            }
-            cursor.cursor.advance();
-        }
-        if batch.count > 0 {
-            ingest_batch_into(&mut self.sys_indices, &batch);
-            self.fire_hooks(IDX_TAB_ID, &batch)?;
-        }
-        Ok(())
+        self.ingest_to_family(TABLE_TAB_ID, &batch)
     }
 
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
@@ -296,9 +253,8 @@ impl CatalogEngine {
             bb.put_u64(0); // created_lsn
             bb.end_row();
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_views, &batch);
             let _ = self.sys_views.flush();
-            self.fire_hooks(VIEW_TAB_ID, &batch)?;
+            self.ingest_to_family(VIEW_TAB_ID, &batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, vid - 1, vid);
@@ -317,27 +273,14 @@ impl CatalogEngine {
         let vid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("View does not exist: {}", qualified))?;
 
-        self.check_for_dependencies(vid, view_name)?;
-
         self.dag.invalidate(vid);
 
-        // Retract view record — cursor-based to match exact stored payload
-        {
-            let schema = view_tab_schema();
-            let batch = retract_single_row(&mut self.sys_views, &schema, vid as u64, 0);
-            if batch.count > 0 {
-                ingest_batch_into(&mut self.sys_views, &batch);
-                self.fire_hooks(VIEW_TAB_ID, &batch)?;
-            }
+        let schema = view_tab_schema();
+        let batch = retract_single_row(&mut self.sys_views, &schema, vid as u64, 0);
+        if batch.count == 0 {
+            return Err(format!("View does not exist: {}", qualified));
         }
-
-        // Retract circuit graph, deps, columns
-        self.retract_circuit_graph(vid);
-        self.retract_view_deps(vid);
-        let col_defs = self.read_column_defs(vid)?;
-        self.retract_column_records(vid, OWNER_KIND_VIEW, &col_defs)?;
-
-        Ok(())
+        self.ingest_to_family(VIEW_TAB_ID, &batch)
     }
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
@@ -361,7 +304,7 @@ impl CatalogEngine {
         let index_name = make_secondary_index_name(schema_name, table_name, col_name);
         let index_id = self.allocate_index_id();
 
-        // Write index record (triggers hook).  If the hook fails — most
+        // Write index record (triggers hook). If the hook fails — most
         // notably when is_unique and the source column contains duplicates —
         // we retract the +1 so sys_indices stays consistent and the next
         // restart's replay doesn't try to reconstruct a broken index.
@@ -377,8 +320,7 @@ impl CatalogEngine {
             bb.put_string("");
             bb.end_row();
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_indices, &batch);
-            if let Err(e) = self.fire_hooks(IDX_TAB_ID, &batch) {
+            if let Err(e) = self.ingest_to_family(IDX_TAB_ID, &batch) {
                 let mut undo = BatchBuilder::new(schema);
                 undo.begin_row(index_id as u64, 0, -1);
                 undo.put_u64(owner_id as u64);
@@ -388,7 +330,8 @@ impl CatalogEngine {
                 undo.put_u64(if is_unique { 1 } else { 0 });
                 undo.put_string("");
                 undo.end_row();
-                ingest_batch_into(&mut self.sys_indices, &undo.finish());
+                let undo_batch = undo.finish();
+                ingest_batch_into(&mut self.sys_indices, &undo_batch);
                 return Err(e);
             }
         }
@@ -431,8 +374,7 @@ impl CatalogEngine {
         bb.put_string(&cache_dir);
         bb.end_row();
         let batch = bb.finish();
-        ingest_batch_into(&mut self.sys_indices, &batch);
-        self.fire_hooks(IDX_TAB_ID, &batch)?;
+        self.ingest_to_family(IDX_TAB_ID, &batch)?;
         Ok(())
     }
 
@@ -543,12 +485,13 @@ impl CatalogEngine {
             bb.put_string("");                     // cache_directory
             bb.end_row();
             let batch = bb.finish();
+            // hook_cascade_fk fires on both master and workers, so each side
+            // computes its own FK indices locally. Routing this through
+            // `ingest_to_family` would broadcast IDX_TAB before TABLE_TAB and
+            // duplicate the rows the worker already produced.
             ingest_batch_into(&mut self.sys_indices, &batch);
-
-            // Process through hook
             self.fire_hooks(IDX_TAB_ID, &batch)?;
 
-            // Update sequence
             self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
         }
         Ok(())
@@ -577,14 +520,7 @@ impl CatalogEngine {
 
     pub(crate) fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
-        ingest_batch_into(&mut self.sys_columns, &batch);
-        self.fire_hooks(COL_TAB_ID, &batch)
-    }
-
-    pub(crate) fn retract_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
-        let batch = self.build_col_batch(owner_id, kind, col_defs, -1);
-        ingest_batch_into(&mut self.sys_columns, &batch);
-        self.fire_hooks(COL_TAB_ID, &batch)
+        self.ingest_to_family(COL_TAB_ID, &batch)
     }
 
     pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) {
@@ -600,36 +536,6 @@ impl CatalogEngine {
         }
         let batch = bb.finish();
         ingest_batch_into(&mut self.sys_view_deps, &batch);
-    }
-
-    pub(crate) fn retract_view_deps(&mut self, vid: i64) {
-        let schema = dep_tab_schema();
-        let mut cursor = match self.sys_view_deps.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        cursor.cursor.seek(crate::util::make_pk(0, vid as u64));
-
-        let end_hi = (vid + 1) as u64;
-        let mut bb = BatchBuilder::new(schema);
-        while cursor.cursor.valid {
-            if cursor.cursor.current_key_hi >= end_hi { break; }
-            if cursor.cursor.current_key_hi == vid as u64 && cursor.cursor.current_weight > 0 {
-                let dep_vid = cursor_read_u64(&cursor, DEPTAB_COL_DEP_VIEW_ID) as i64;
-                let dep_tid = cursor_read_u64(&cursor, DEPTAB_COL_DEP_TABLE_ID) as i64;
-                let (pk_lo, pk_hi) = pack_dep_pk(vid, dep_tid);
-                bb.begin_row(pk_lo, pk_hi, -1);
-                bb.put_u64(vid as u64);
-                bb.put_u64(dep_vid as u64);
-                bb.put_u64(dep_tid as u64);
-                bb.end_row();
-            }
-            cursor.cursor.advance();
-        }
-        let batch = bb.finish();
-        if batch.count > 0 {
-            ingest_batch_into(&mut self.sys_view_deps, &batch);
-        }
     }
 
     pub(crate) fn write_circuit_graph(&mut self, vid: i64, graph: &CircuitGraph) {
@@ -707,14 +613,4 @@ impl CatalogEngine {
         }
     }
 
-    pub(crate) fn retract_circuit_graph(&mut self, vid: i64) {
-        let pk_hi = vid as u64;
-        for &tab_id in &[CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
-                         CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
-                         CIRCUIT_GROUP_COLS_TAB_ID] {
-            let schema = sys_tab_schema(tab_id);
-            let table = self.sys_table_mut(tab_id).unwrap();
-            retract_and_ingest(table, &schema, pk_hi);
-        }
-    }
 }

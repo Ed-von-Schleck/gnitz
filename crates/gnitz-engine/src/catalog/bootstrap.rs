@@ -64,6 +64,7 @@ impl CatalogEngine {
             sys_circuit_sources,
             sys_circuit_params,
             sys_circuit_group_cols,
+            pending_broadcasts: Vec::new(),
         };
 
         if is_new {
@@ -332,14 +333,15 @@ impl CatalogEngine {
 
     fn replay_system_table(&mut self, sys_table_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(sys_table_id);
-        let table_ptr: *mut Table = match sys_table_id {
-            SCHEMA_TAB_ID => &mut *self.sys_schemas,
-            TABLE_TAB_ID => &mut *self.sys_tables,
-            VIEW_TAB_ID => &mut *self.sys_views,
-            COL_TAB_ID => &mut *self.sys_columns,
-            IDX_TAB_ID => &mut *self.sys_indices,
+        // Only the five catalog tables below need hook-driven replay. Circuit_*
+        // and sys_sequences are loaded directly by other open-time paths.
+        match sys_table_id {
+            SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID | IDX_TAB_ID => {}
             _ => return Ok(()),
-        };
+        }
+        let table_ptr: *mut Table = self.sys_table_mut(sys_table_id)
+            .expect("sys_table_mut covers the match arms above")
+            as *mut Table;
 
         // Scan all live rows and process through hooks
         let mut cursor = unsafe { (*table_ptr).create_cursor().map_err(|e| format!("cursor error: {}", e))? };
@@ -390,17 +392,12 @@ impl CatalogEngine {
 
     pub fn close(&mut self) {
         // Flush and close all user tables before clearing DagEngine
-        let user_tids: Vec<i64> = self.dag.tables.keys()
-            .filter(|&&tid| tid >= FIRST_USER_TABLE_ID)
-            .copied()
-            .collect();
-        for tid in &user_tids {
-            if let Some(entry) = self.dag.tables.get_mut(tid) {
-                match &mut entry.handle {
-                    StoreHandle::Single(t) => { let _ = t.flush(); }
-                    StoreHandle::Partitioned(pt) => { let _ = pt.flush(); pt.close(); }
-                    StoreHandle::Borrowed(_) => {} // system tables flushed below
-                }
+        for (&tid, entry) in self.dag.tables.iter_mut() {
+            if tid < FIRST_USER_TABLE_ID { continue; }
+            match &mut entry.handle {
+                StoreHandle::Single(t) => { let _ = t.flush(); }
+                StoreHandle::Partitioned(pt) => { let _ = pt.flush(); pt.close(); }
+                StoreHandle::Borrowed(_) => {} // system tables flushed below
             }
         }
         // tables.clear() in dag.close() drops Box<Table>/Box<PartitionedTable> automatically.

@@ -349,6 +349,32 @@ pub(crate) fn schema_has_string_columns(schema: &SchemaDescriptor) -> bool {
     schema.payload_columns().any(|(_pi, _ci, col)| col.type_code == type_code::STRING)
 }
 
+/// Scan `[pk_lo_start, pk_lo_end)` on `pk_hi == 0` and emit a weight=-1 batch
+/// of every positive-weight row in the range. Used for U64-PK system tables
+/// where rows belonging to one owner share a packed PK prefix (e.g.
+/// `sys_columns` keyed by `pack_column_id(owner, col)`).
+pub(crate) fn retract_rows_by_pk_lo_range(
+    table: &mut Table,
+    schema: &SchemaDescriptor,
+    pk_lo_start: u64,
+    pk_lo_end: u64,
+) -> Batch {
+    let mut batch = Batch::with_schema(*schema, 8);
+    let mut cursor = match table.create_cursor() {
+        Ok(c) => c,
+        Err(_) => return batch,
+    };
+    cursor.cursor.seek(crate::util::make_pk(pk_lo_start, 0));
+    while cursor.cursor.valid {
+        if cursor.cursor.current_key_lo >= pk_lo_end { break; }
+        if cursor.cursor.current_weight > 0 {
+            copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+        }
+        cursor.cursor.advance();
+    }
+    batch
+}
+
 /// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
 /// emitting each as a retraction (weight=-1). Exploits U128 sort order
 /// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
@@ -389,10 +415,3 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     batch
 }
 
-/// Retract all positive-weight rows with the given pk_hi from a system table.
-pub(crate) fn retract_and_ingest(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) {
-    let batch = retract_rows_by_pk_hi(table, schema, pk_hi);
-    if batch.count > 0 {
-        ingest_batch_into(table, &batch);
-    }
-}

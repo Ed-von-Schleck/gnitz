@@ -62,6 +62,14 @@ impl SchemaDescriptor {
             .enumerate()
             .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
     }
+
+    /// Map a logical column index to its dense payload index (batch payload
+    /// region + null-bitmap bit position). Caller must ensure `col_idx != pk_index`.
+    #[inline]
+    pub fn payload_idx(&self, col_idx: usize) -> usize {
+        let pk = self.pk_index as usize;
+        if col_idx < pk { col_idx } else { col_idx - 1 }
+    }
 }
 
 pub(crate) const fn type_size(tc: u8) -> u8 {

@@ -8,6 +8,24 @@
 //! - DDL intent (CREATE/DROP SCHEMA/TABLE/VIEW/INDEX)
 //! - Hook processing (schema, table, view, index, dep effects)
 //! - Catalog persistence and recovery
+//!
+//! # Hook model
+//!
+//! System-table writes flow through [`fire_hooks`](CatalogEngine::fire_hooks),
+//! which dispatches two categories of handler per sys_table_id:
+//!
+//! * `apply_*` — pure cache-delta appliers. Each row's weight drives a
+//!   HashMap/HashSet insert (weight > 0) or remove (weight < 0). Naturally
+//!   handles retract+insert pairs because HashMap ops commute with the sign
+//!   of the weight.
+//! * `hook_*` — side-effectful, edge-triggered handlers that create
+//!   directories, allocate store partitions, register DAG entries, or
+//!   backfill derived state. These are NOT symmetric under retract+insert
+//!   on the same row; the current DDL surface (CREATE is +1, DROP is -1)
+//!   never produces that pattern, so edge-triggering is safe.
+//!
+//! See `hooks.rs` for the cross-sys-table ordering contract and where it's
+//! enforced.
 
 mod sys_tables;
 mod types;
@@ -48,7 +66,8 @@ pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_n
                        collect_for_schema,
                        copy_cursor_row_with_weight,
                        retract_single_row,
-                       retract_and_ingest};
+                       retract_rows_by_pk_hi,
+                       retract_rows_by_pk_lo_range};
 pub(crate) use cache::CatalogCacheSet;
 
 // ---------------------------------------------------------------------------
@@ -84,6 +103,17 @@ pub struct CatalogEngine {
     pub(crate) sys_circuit_sources: Box<Table>,
     pub(crate) sys_circuit_params: Box<Table>,
     pub(crate) sys_circuit_group_cols: Box<Table>,
+
+    // --- Pending broadcasts (ordered innermost → outermost) ---
+    //
+    // System-table DDL goes through `ingest_to_family` → `fire_hooks`. Hooks
+    // may recursively call `ingest_to_family` to cascade retractions (indices,
+    // columns, circuit graph, view deps). Each nested call appends its
+    // (table_id, batch) AFTER its own hooks fire, so this queue ends up in
+    // dependency-safe order: children before parents. The executor drains it
+    // once per top-level DDL and relays each entry to workers. Workers never
+    // drain this (no broadcast channel), so it stays empty there.
+    pub(crate) pending_broadcasts: Vec<(i64, Batch)>,
 }
 
 // SAFETY: CatalogEngine is only accessed from a single thread.

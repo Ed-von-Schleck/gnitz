@@ -201,10 +201,10 @@ fn test_unique_pk_metadata() {
         engine.create_schema("sales").unwrap();
         // default = unique_pk=true
         let tid1 = engine.create_table("sales.u_default", &cols, 0, true).unwrap();
-        assert!(engine.is_unique_pk(tid1));
+        assert!(engine.table_has_unique_pk(tid1));
         // explicit false
         let tid2 = engine.create_table("sales.u_off", &cols, 0, false).unwrap();
-        assert!(!engine.is_unique_pk(tid2));
+        assert!(!engine.table_has_unique_pk(tid2));
         // For restart test
         engine.create_table("sales.u_restart", &cols, 0, true).unwrap();
         engine.close();
@@ -214,9 +214,9 @@ fn test_unique_pk_metadata() {
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let tid_restart = engine.get_by_name("sales", "u_restart").unwrap();
-        assert!(engine.is_unique_pk(tid_restart));
+        assert!(engine.table_has_unique_pk(tid_restart));
         let tid_off = engine.get_by_name("sales", "u_off").unwrap();
-        assert!(!engine.is_unique_pk(tid_off));
+        assert!(!engine.table_has_unique_pk(tid_off));
         engine.close();
     }
 

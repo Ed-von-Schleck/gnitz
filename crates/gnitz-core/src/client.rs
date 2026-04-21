@@ -69,22 +69,6 @@ fn idx_tab_schema() -> &'static Schema {
     })
 }
 
-fn copy_col_row(src: &ColData, row: usize, dst: &mut ColData, stride: usize) {
-    match (src, dst) {
-        (ColData::Fixed(s), ColData::Fixed(d)) => {
-            let offset = row * stride;
-            d.extend_from_slice(&s[offset..offset + stride]);
-        }
-        (ColData::Strings(s), ColData::Strings(d)) => {
-            d.push(s[row].clone());
-        }
-        (ColData::U128s(s), ColData::U128s(d)) => {
-            d.push(s[row]);
-        }
-        _ => panic!("copy_col_row: mismatched ColData variants"),
-    }
-}
-
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
     if col_idx >= 512 {
         return Err(ClientError::ServerError(
@@ -348,11 +332,6 @@ impl GnitzClient {
         })?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
-        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
-        if let Some(col_batch) = col_batch {
-            self.retract_col_tab_records(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        }
-
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(&tbl_schema);
         BatchAppender::new(&mut tb, &tbl_schema)
@@ -577,27 +556,16 @@ impl GnitzClient {
         })?;
         let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
-        // Retract view record first — triggers teardown
-        {
-            let view_s = view_tab_schema();
-            let mut vb = ZSetBatch::new(&view_s);
-            BatchAppender::new(&mut vb, &view_s)
-                .add_row(vr.vid, 0, -1)
-                .u64_val(vr.schema_id)
-                .str_val(&vr.name)
-                .str_val(&vr.sql_definition)
-                .str_val(&vr.cache_directory)
-                .u64_val(vr.created_lsn);
-            self.conn.push(VIEW_TAB, &view_s, &vb)?;
-        }
-
-        self.retract_circuit_graph(vr.vid)?;
-        self.retract_deps_for_view(vr.vid)?;
-
-        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
-        if let Some(col_batch) = col_batch {
-            self.retract_col_tab_records(&col_batch, vr.vid, OWNER_KIND_VIEW)?;
-        }
+        let view_s = view_tab_schema();
+        let mut vb = ZSetBatch::new(&view_s);
+        BatchAppender::new(&mut vb, &view_s)
+            .add_row(vr.vid, 0, -1)
+            .u64_val(vr.schema_id)
+            .str_val(&vr.name)
+            .str_val(&vr.sql_definition)
+            .str_val(&vr.cache_directory)
+            .u64_val(vr.created_lsn);
+        self.conn.push(VIEW_TAB, &view_s, &vb)?;
 
         Ok(())
     }
@@ -774,82 +742,6 @@ impl GnitzClient {
             }
         }
         self.conn.push(COL_TAB, &schema, &batch)?;
-        Ok(())
-    }
-
-    fn retract_col_tab_records(
-        &self,
-        col_batch: &ZSetBatch,
-        owner_id: u64,
-        owner_kind: u64,
-    ) -> Result<(), ClientError> {
-        let schema = col_tab_schema();
-        self.retract_matching(COL_TAB, &schema, col_batch, |i| {
-            col_u64(&col_batch.columns[1], i).map_or(false, |v| v == owner_id) &&
-            col_u64(&col_batch.columns[2], i).map_or(false, |v| v == owner_kind)
-        })
-    }
-
-    fn retract_circuit_graph(&self, vid: u64) -> Result<(), ClientError> {
-        let circuit_tables: &[(u64, fn() -> &'static Schema)] = &[
-            (CIRCUIT_NODES_TAB,      circuit_nodes_schema      as fn() -> &'static Schema),
-            (CIRCUIT_EDGES_TAB,      circuit_edges_schema      as fn() -> &'static Schema),
-            (CIRCUIT_SOURCES_TAB,    circuit_sources_schema    as fn() -> &'static Schema),
-            (CIRCUIT_PARAMS_TAB,     circuit_params_schema     as fn() -> &'static Schema),
-            (CIRCUIT_GROUP_COLS_TAB, circuit_group_cols_schema as fn() -> &'static Schema),
-        ];
-        for &(tab_id, schema_fn) in circuit_tables {
-            let schema = schema_fn();
-            let (_, batch, _) = self.conn.scan(tab_id)?;
-            if let Some(batch) = batch {
-                self.retract_records_for_view_u128(tab_id, schema, &batch, vid)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn retract_records_for_view_u128(
-        &self,
-        table_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        vid: u64,
-    ) -> Result<(), ClientError> {
-        self.retract_matching(table_id, schema, batch, |i| batch.pk_hi[i] == vid)
-    }
-
-    fn retract_deps_for_view(&self, vid: u64) -> Result<(), ClientError> {
-        let (_, dep_batch, _) = self.conn.scan(DEP_TAB)?;
-        let dep_batch = match dep_batch { Some(b) => b, None => return Ok(()) };
-        let dep_s = dep_tab_schema();
-        self.retract_matching(DEP_TAB, &dep_s, &dep_batch, |i| {
-            col_u64(&dep_batch.columns[1], i).map_or(false, |v| v == vid)
-        })
-    }
-
-    fn retract_matching(
-        &self,
-        table_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        matches: impl Fn(usize) -> bool,
-    ) -> Result<(), ClientError> {
-        let mut retract = ZSetBatch::new(schema);
-        for i in 0..batch.len() {
-            if batch.weights[i] <= 0 { continue; }
-            if !matches(i) { continue; }
-            retract.pk_lo.push(batch.pk_lo[i]);
-            retract.pk_hi.push(batch.pk_hi[i]);
-            retract.weights.push(-1);
-            retract.nulls.push(0);
-            for ci in 0..schema.columns.len() {
-                if ci == schema.pk_index { continue; }
-                let stride = schema.columns[ci].type_code.wire_stride();
-                copy_col_row(&batch.columns[ci], i, &mut retract.columns[ci], stride);
-            }
-        }
-        if retract.is_empty() { return Ok(()); }
-        self.conn.push(table_id, schema, &retract)?;
         Ok(())
     }
 

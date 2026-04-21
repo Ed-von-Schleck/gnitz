@@ -9,6 +9,37 @@ impl CatalogEngine {
     // order at startup, which produced a silent divergence between fresh
     // install and recovery (see git history).
     //
+    // Two categories of handler are dispatched from here:
+    //
+    //   * `apply_*`  — pure cache-delta appliers. Each row's weight drives
+    //     a HashMap/HashSet insert (+1) or remove (-1). Naturally idempotent
+    //     under retract+insert because HashMap ops commute with weight sign.
+    //   * `hook_*`   — side-effectful, edge-triggered handlers that build
+    //     directories, allocate partitions, register DAG entries, or
+    //     backfill derived state. These are NOT idempotent across a
+    //     retract+insert pair on the same row; today's DDL surface never
+    //     produces such a pair for sys_tables / sys_views / sys_indices,
+    //     so edge-triggering is safe. If that ever changes (e.g. an ALTER
+    //     path that rewrites a row via -1,+1), these handlers need to be
+    //     revisited.
+    //
+    // Cross-sys-table ordering contract (required by `hook_table_register`
+    // and `hook_view_register`, which read sys_columns via
+    // `read_column_defs`):
+    //
+    //   COL_TAB writes MUST precede TABLE_TAB / VIEW_TAB writes.
+    //
+    // Where this is enforced:
+    //   * Client DDL (`gnitz-core/src/client.rs::create_table`): sequential
+    //     `conn.push(COL_TAB, ...)` then `conn.push(TABLE_TAB, ...)`. Each
+    //     push is a full RPC (ingest + broadcast + fsync + ACK).
+    //   * Wire: the SAL is a single FIFO; worker `FLAG_DDL_SYNC` dispatch
+    //     preserves master broadcast order.
+    //   * Replay (`bootstrap.rs::replay_catalog`): TABLE_TAB is replayed
+    //     before COL_TAB, but `read_column_defs` reads sys_columns storage
+    //     directly (loaded at open time), not the cache, so the ordering
+    //     holds.
+    //
     // Retraction dependencies to be aware of:
     //   * apply_entity_by_qname reads entity_by_id on retract → must fire before apply_entity_by_id.
 
@@ -81,12 +112,19 @@ impl CatalogEngine {
             let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
 
             if weight > 0 {
+                // System tables are pre-registered by `register_system_table_families`
+                // before `replay_catalog` fires hooks, so their rows show up here
+                // with the DAG already populated. Skip to avoid double-registration.
                 if self.dag.tables.contains_key(&tid) { continue; }
 
                 let col_defs = self.read_column_defs(tid)?;
                 if col_defs.is_empty() {
-                    gnitz_warn!("catalog: cannot register table '{}': columns not found", name);
-                    continue;
+                    return Err(format!(
+                        "catalog invariant violated: table '{}' (tid={}) registered \
+                         before its column records. COL_TAB writes must precede \
+                         TABLE_TAB writes (see hooks.rs dispatch doc).",
+                        name, tid,
+                    ));
                 }
 
                 if (pk_col_idx as usize) < col_defs.len() {
@@ -112,13 +150,48 @@ impl CatalogEngine {
                 self.dag.register_table(tid, StoreHandle::Partitioned(Box::new(pt)), tbl_schema, 0, is_unique, directory);
                 if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
             } else if self.dag.tables.contains_key(&tid) {
-                let children = self.caches.fk_by_parent.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]);
-                if let Some(&(child_tid, _)) = children.first() {
-                    let (sn, tn) = self.caches.entity_by_id.get(&child_tid).cloned().unwrap_or_default();
-                    return Err(format!("Integrity violation: table referenced by '{}.{}'", sn, tn));
-                }
+                // Safe to cascade unconditionally: precheck_sys_ingest rejects
+                // FK/view-dep-blocked drops before the -1 row reaches the WAL.
+                self.cascade_retract_indices(tid)?;
+                self.cascade_retract_columns(tid)?;
                 self.dag.unregister_table(tid);
             }
+        }
+        Ok(())
+    }
+
+    fn cascade_retract_indices(&mut self, owner_id: i64) -> Result<(), String> {
+        let schema = sys_tab_schema(IDX_TAB_ID);
+        let mut batch = Batch::with_schema(schema, 4);
+        {
+            let mut cursor = match self.sys_indices.create_cursor() {
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            while cursor.cursor.valid {
+                if cursor.cursor.current_weight > 0
+                    && cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64 == owner_id
+                {
+                    copy_cursor_row_with_weight(&cursor, &schema, &mut batch, -1);
+                }
+                cursor.cursor.advance();
+            }
+        }
+        if batch.count > 0 {
+            self.ingest_to_family(IDX_TAB_ID, &batch)?;
+        }
+        Ok(())
+    }
+
+    fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
+        let schema = sys_tab_schema(COL_TAB_ID);
+        let batch = retract_rows_by_pk_lo_range(
+            &mut self.sys_columns, &schema,
+            pack_column_id(owner_id, 0),
+            pack_column_id(owner_id + 1, 0),
+        );
+        if batch.count > 0 {
+            self.ingest_to_family(COL_TAB_ID, &batch)?;
         }
         Ok(())
     }
@@ -131,12 +204,18 @@ impl CatalogEngine {
             let name = self.read_batch_string(batch, i, 1);
 
             if weight > 0 {
+                // See hook_table_register: system tables are pre-registered, user
+                // views are not, so this only skips re-registration on replay.
                 if self.dag.tables.contains_key(&vid) { continue; }
 
                 let col_defs = self.read_column_defs(vid)?;
                 if col_defs.is_empty() {
-                    gnitz_warn!("catalog: cannot register view '{}': columns not found", name);
-                    continue;
+                    return Err(format!(
+                        "catalog invariant violated: view '{}' (vid={}) registered \
+                         before its column records. COL_TAB writes must precede \
+                         VIEW_TAB writes (see hooks.rs dispatch doc).",
+                        name, vid,
+                    ));
                 }
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
@@ -167,7 +246,31 @@ impl CatalogEngine {
                     self.backfill_view(vid);
                 }
             } else if self.dag.tables.contains_key(&vid) {
+                self.cascade_retract_circuit_and_deps(vid)?;
+                self.cascade_retract_columns(vid)?;
                 self.dag.unregister_table(vid);
+            }
+        }
+        Ok(())
+    }
+
+    fn cascade_retract_circuit_and_deps(&mut self, vid: i64) -> Result<(), String> {
+        let pk_hi = vid as u64;
+        for tab_id in [
+            CIRCUIT_NODES_TAB_ID,
+            CIRCUIT_EDGES_TAB_ID,
+            CIRCUIT_SOURCES_TAB_ID,
+            CIRCUIT_PARAMS_TAB_ID,
+            CIRCUIT_GROUP_COLS_TAB_ID,
+            DEP_TAB_ID,
+        ] {
+            let schema = sys_tab_schema(tab_id);
+            let batch = {
+                let table = self.sys_table_mut(tab_id).unwrap();
+                retract_rows_by_pk_hi(table, &schema, pk_hi)
+            };
+            if batch.count > 0 {
+                self.ingest_to_family(tab_id, &batch)?;
             }
         }
         Ok(())
