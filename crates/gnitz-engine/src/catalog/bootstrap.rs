@@ -27,12 +27,11 @@ impl CatalogEngine {
         let sys_indices = create_sys_table(&SYS_TAB_INFOS[4])?;
         let sys_view_deps = create_sys_table(&SYS_TAB_INFOS[5])?;
         let sys_sequences = create_sys_table(&SYS_TAB_INFOS[6])?;
-        let sys_catalog_caches = create_sys_table(&SYS_TAB_INFOS[7])?;
-        let sys_circuit_nodes = create_sys_table(&SYS_TAB_INFOS[8])?;
-        let sys_circuit_edges = create_sys_table(&SYS_TAB_INFOS[9])?;
-        let sys_circuit_sources = create_sys_table(&SYS_TAB_INFOS[10])?;
-        let sys_circuit_params = create_sys_table(&SYS_TAB_INFOS[11])?;
-        let sys_circuit_group_cols = create_sys_table(&SYS_TAB_INFOS[12])?;
+        let sys_circuit_nodes = create_sys_table(&SYS_TAB_INFOS[7])?;
+        let sys_circuit_edges = create_sys_table(&SYS_TAB_INFOS[8])?;
+        let sys_circuit_sources = create_sys_table(&SYS_TAB_INFOS[9])?;
+        let sys_circuit_params = create_sys_table(&SYS_TAB_INFOS[10])?;
+        let sys_circuit_group_cols = create_sys_table(&SYS_TAB_INFOS[11])?;
 
         // Check if this is a fresh database (no table records yet)
         let is_new = {
@@ -60,7 +59,6 @@ impl CatalogEngine {
             sys_indices,
             sys_view_deps,
             sys_sequences,
-            sys_catalog_caches,
             sys_circuit_nodes,
             sys_circuit_edges,
             sys_circuit_sources,
@@ -162,11 +160,6 @@ impl CatalogEngine {
                     ("cache_directory", type_code::STRING),
                 ]),
                 (SEQ_TAB_ID, &[("seq_id", type_code::U64), ("next_val", type_code::U64)]),
-                (CATALOG_CACHES_TAB_ID, &[
-                    ("cache_entry_pk", type_code::U128),
-                    ("name", type_code::STRING),
-                    ("kind", type_code::U64),
-                ]),
                 (CIRCUIT_NODES_TAB_ID, &[("node_pk", type_code::U128), ("opcode", type_code::U64)]),
                 (CIRCUIT_EDGES_TAB_ID, &[
                     ("edge_pk", type_code::U128), ("src_node", type_code::U64),
@@ -219,68 +212,13 @@ impl CatalogEngine {
             ingest_batch_into(&mut self.sys_sequences, &batch);
         }
 
-        // 5. Catalog cache registration rows
-        self.bootstrap_catalog_caches();
-
         // Flush all foundational metadata to disk
         let _ = self.sys_schemas.flush();
         let _ = self.sys_tables.flush();
         let _ = self.sys_columns.flush();
         let _ = self.sys_sequences.flush();
-        let _ = self.sys_catalog_caches.flush();
 
         Ok(())
-    }
-
-    fn bootstrap_catalog_caches(&mut self) {
-        let schema = catalog_caches_schema();
-        // Rows ordered by desired dispatch order within each source_table_id.
-        // PK = (lo=effect_id, hi=source_table_id).
-        let rows: &[(u64, u64, &str, u64)] = &[
-            // SCHEMA_TAB_ID effects
-            (CACHE_ID_SCHEMA_BY_NAME,  SCHEMA_TAB_ID as u64, "schema_by_name",  CCTAB_KIND_DATA),
-            (CACHE_ID_SCHEMA_BY_ID,    SCHEMA_TAB_ID as u64, "schema_by_id",    CCTAB_KIND_DATA),
-            (HOOK_ID_SCHEMA_DIR,       SCHEMA_TAB_ID as u64, "schema_dir",      CCTAB_KIND_HOOK),
-            // TABLE_TAB_ID effects (TABLE_REGISTER before NEEDS_LOCK intentional here)
-            (CACHE_ID_ENTITY_BY_QNAME, TABLE_TAB_ID as u64,  "entity_by_qname", CCTAB_KIND_DATA),
-            (CACHE_ID_ENTITY_BY_ID,    TABLE_TAB_ID as u64,  "entity_by_id",    CCTAB_KIND_DATA),
-            (CACHE_ID_SCHEMA_OF,       TABLE_TAB_ID as u64,  "schema_of",       CCTAB_KIND_DATA),
-            (CACHE_ID_PK_COL_OF,       TABLE_TAB_ID as u64,  "pk_col_of",       CCTAB_KIND_DATA),
-            (HOOK_ID_TABLE_REGISTER,   TABLE_TAB_ID as u64,  "table_register",  CCTAB_KIND_HOOK),
-            (CACHE_ID_NEEDS_LOCK,      TABLE_TAB_ID as u64,  "needs_lock",      CCTAB_KIND_DATA),
-            (HOOK_ID_CASCADE_FK,       TABLE_TAB_ID as u64,  "cascade_fk",      CCTAB_KIND_HOOK),
-            // VIEW_TAB_ID effects
-            (CACHE_ID_ENTITY_BY_QNAME, VIEW_TAB_ID as u64,   "entity_by_qname", CCTAB_KIND_DATA),
-            (CACHE_ID_ENTITY_BY_ID,    VIEW_TAB_ID as u64,   "entity_by_id",    CCTAB_KIND_DATA),
-            (CACHE_ID_SCHEMA_OF,       VIEW_TAB_ID as u64,   "schema_of",       CCTAB_KIND_DATA),
-            (CACHE_ID_PK_COL_OF,       VIEW_TAB_ID as u64,   "pk_col_of",       CCTAB_KIND_DATA),
-            (HOOK_ID_VIEW_REGISTER,    VIEW_TAB_ID as u64,   "view_register",   CCTAB_KIND_HOOK),
-            // COL_TAB_ID effects
-            (CACHE_ID_COL_NAMES,       COL_TAB_ID as u64,    "col_names",       CCTAB_KIND_DATA),
-            (CACHE_ID_COL_NAMES_BYTES, COL_TAB_ID as u64,    "col_names_bytes", CCTAB_KIND_DATA),
-            (CACHE_ID_FK_BY_CHILD,     COL_TAB_ID as u64,    "fk_by_child",     CCTAB_KIND_DATA),
-            (CACHE_ID_FK_BY_PARENT,    COL_TAB_ID as u64,    "fk_by_parent",    CCTAB_KIND_DATA),
-            (CACHE_ID_NEEDS_LOCK,      COL_TAB_ID as u64,    "needs_lock",      CCTAB_KIND_DATA),
-            // IDX_TAB_ID effects (INDEX_REGISTER before NEEDS_LOCK intentional here)
-            (CACHE_ID_INDEX_BY_NAME,   IDX_TAB_ID as u64,    "index_by_name",   CCTAB_KIND_DATA),
-            (CACHE_ID_INDEX_BY_ID,     IDX_TAB_ID as u64,    "index_by_id",     CCTAB_KIND_DATA),
-            (HOOK_ID_INDEX_REGISTER,   IDX_TAB_ID as u64,    "index_register",  CCTAB_KIND_HOOK),
-            (CACHE_ID_NEEDS_LOCK,      IDX_TAB_ID as u64,    "needs_lock",      CCTAB_KIND_DATA),
-            // DEP_TAB_ID effects
-            (HOOK_ID_DEP_INVALIDATE,   DEP_TAB_ID as u64,    "dep_invalidate",  CCTAB_KIND_HOOK),
-        ];
-        let mut bb = BatchBuilder::new(schema);
-        for &(effect_id, source_tid, name, kind) in rows {
-            let (pk_lo, pk_hi) = pack_cache_entry_pk(effect_id, source_tid);
-            bb.begin_row(pk_lo, pk_hi, 1);
-            bb.put_string(name);
-            bb.put_u64(kind);
-            bb.end_row();
-        }
-        let batch = bb.finish();
-        ingest_batch_into(&mut self.sys_catalog_caches, &batch);
-        // Populate source_index immediately for the fresh-start code path
-        let _ = self.on_catalog_caches_delta(&batch);
     }
 
     // -- Recover sequence counters from sys_sequences ----------------------
@@ -323,8 +261,8 @@ impl CatalogEngine {
     fn register_system_table_families(&mut self) {
         let sys_dir = format!("{}/{}", self.base_dir, SYS_CATALOG_DIRNAME);
 
-        // Collect all 13 system table pointers (order matches SYS_TAB_INFOS)
-        let table_ptrs: [*mut Table; 13] = [
+        // Collect system table pointers (order matches SYS_TAB_INFOS)
+        let table_ptrs: [*mut Table; 12] = [
             &mut *self.sys_schemas,
             &mut *self.sys_tables,
             &mut *self.sys_views,
@@ -332,7 +270,6 @@ impl CatalogEngine {
             &mut *self.sys_indices,
             &mut *self.sys_view_deps,
             &mut *self.sys_sequences,
-            &mut *self.sys_catalog_caches,
             &mut *self.sys_circuit_nodes,
             &mut *self.sys_circuit_edges,
             &mut *self.sys_circuit_sources,
@@ -385,7 +322,6 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        self.replay_system_table(CATALOG_CACHES_TAB_ID)?; // must be first: populates source_index
         self.replay_system_table(SCHEMA_TAB_ID)?;
         self.replay_system_table(TABLE_TAB_ID)?;
         self.replay_system_table(VIEW_TAB_ID)?;
@@ -397,7 +333,6 @@ impl CatalogEngine {
     fn replay_system_table(&mut self, sys_table_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(sys_table_id);
         let table_ptr: *mut Table = match sys_table_id {
-            CATALOG_CACHES_TAB_ID => &mut *self.sys_catalog_caches,
             SCHEMA_TAB_ID => &mut *self.sys_schemas,
             TABLE_TAB_ID => &mut *self.sys_tables,
             VIEW_TAB_ID => &mut *self.sys_views,

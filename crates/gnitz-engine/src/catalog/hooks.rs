@@ -2,69 +2,57 @@ use super::*;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
+    //
+    // Dispatch is a static per-system-table sequence. The order of calls is
+    // the dependency order; previous revisions stored this order in a system
+    // table (`sys_catalog_caches`) and rebuilt the schedule from PK sort
+    // order at startup, which produced a silent divergence between fresh
+    // install and recovery (see git history).
+    //
+    // Retraction dependencies to be aware of:
+    //   * apply_entity_by_qname reads entity_by_id on retract → must fire before apply_entity_by_id.
 
     pub(crate) fn fire_hooks(&mut self, sys_table_id: i64, batch: &Batch) -> Result<(), String> {
-        if sys_table_id == CATALOG_CACHES_TAB_ID {
-            return self.on_catalog_caches_delta(batch);
-        }
-        let effects = self.caches.source_index.get(&sys_table_id).cloned().unwrap_or_default();
-        for (effect_id, kind) in effects {
-            match kind {
-                CCTAB_KIND_DATA => self.apply_cache_delta(effect_id, sys_table_id, batch)?,
-                CCTAB_KIND_HOOK => self.apply_hook(effect_id, batch)?,
-                _ => {}
+        match sys_table_id {
+            SCHEMA_TAB_ID => {
+                self.apply_schema_by_name(batch)?;
+                self.apply_schema_by_id(batch)?;
+                self.hook_schema_dir(batch)?;
             }
+            TABLE_TAB_ID => {
+                self.apply_entity_by_qname(batch)?;
+                self.apply_entity_by_id(batch)?;
+                self.apply_schema_of(batch)?;
+                self.apply_pk_col_of(TABLE_TAB_ID, batch)?;
+                self.hook_table_register(batch)?;
+                self.apply_needs_lock(TABLE_TAB_ID, batch)?;
+                self.hook_cascade_fk(batch)?;
+            }
+            VIEW_TAB_ID => {
+                self.apply_entity_by_qname(batch)?;
+                self.apply_entity_by_id(batch)?;
+                self.apply_schema_of(batch)?;
+                self.apply_pk_col_of(VIEW_TAB_ID, batch)?;
+                self.hook_view_register(batch)?;
+            }
+            COL_TAB_ID => {
+                self.apply_col_names_invalidate(batch)?;
+                self.apply_fk_by_child(batch)?;
+                self.apply_fk_by_parent(batch)?;
+                self.apply_needs_lock(COL_TAB_ID, batch)?;
+            }
+            IDX_TAB_ID => {
+                self.apply_index_by_name(batch)?;
+                self.apply_index_by_id(batch)?;
+                self.hook_index_register(batch)?;
+                self.apply_needs_lock(IDX_TAB_ID, batch)?;
+            }
+            DEP_TAB_ID => {
+                self.dag.invalidate_dep_map();
+            }
+            _ => {}
         }
         Ok(())
-    }
-
-    pub(crate) fn on_catalog_caches_delta(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
-            let weight = batch.get_weight(i);
-            let pk = batch.get_pk(i);
-            let effect_id = pk as u64;
-            let source_tid = (pk >> 64) as i64;
-            let kind = self.read_batch_u64(batch, i, 1); // payload[1] = kind
-            let effects = self.caches.source_index.entry(source_tid).or_default();
-            if weight > 0 {
-                if !effects.iter().any(|&(id, _)| id == effect_id) {
-                    effects.push((effect_id, kind));
-                }
-            } else {
-                effects.retain(|&(id, _)| id != effect_id);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_cache_delta(&mut self, effect_id: u64, source_tid: i64, batch: &Batch) -> Result<(), String> {
-        match effect_id {
-            CACHE_ID_SCHEMA_BY_NAME          => self.apply_schema_by_name(batch),
-            CACHE_ID_SCHEMA_BY_ID            => self.apply_schema_by_id(batch),
-            CACHE_ID_ENTITY_BY_QNAME         => self.apply_entity_by_qname(batch),
-            CACHE_ID_ENTITY_BY_ID            => self.apply_entity_by_id(batch),
-            CACHE_ID_SCHEMA_OF               => self.apply_schema_of(batch),
-            CACHE_ID_PK_COL_OF               => self.apply_pk_col_of(source_tid, batch),
-            CACHE_ID_COL_NAMES | CACHE_ID_COL_NAMES_BYTES => self.apply_col_names_invalidate(batch),
-            CACHE_ID_INDEX_BY_NAME           => self.apply_index_by_name(batch),
-            CACHE_ID_INDEX_BY_ID             => self.apply_index_by_id(batch),
-            CACHE_ID_FK_BY_CHILD             => self.apply_fk_by_child(batch),
-            CACHE_ID_FK_BY_PARENT            => self.apply_fk_by_parent(batch),
-            CACHE_ID_NEEDS_LOCK              => self.apply_needs_lock(source_tid, batch),
-            _                                => Ok(()),
-        }
-    }
-
-    pub(crate) fn apply_hook(&mut self, effect_id: u64, batch: &Batch) -> Result<(), String> {
-        match effect_id {
-            HOOK_ID_SCHEMA_DIR     => self.hook_schema_dir(batch),
-            HOOK_ID_TABLE_REGISTER => self.hook_table_register(batch),
-            HOOK_ID_VIEW_REGISTER  => self.hook_view_register(batch),
-            HOOK_ID_INDEX_REGISTER => self.hook_index_register(batch),
-            HOOK_ID_CASCADE_FK     => self.hook_cascade_fk(batch),
-            HOOK_ID_DEP_INVALIDATE => { self.dag.invalidate_dep_map(); Ok(()) },
-            _                      => Ok(()),
-        }
     }
 
     // -- Hook handlers ---------------------------------------------------------
@@ -123,8 +111,6 @@ impl CatalogEngine {
                 fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
                 self.dag.register_table(tid, StoreHandle::Partitioned(Box::new(pt)), tbl_schema, 0, is_unique, directory);
                 if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
-                // Ensure needs_lock is set for unique_pk tables regardless of effect dispatch order
-                if is_unique { self.recompute_needs_lock(tid); }
             } else if self.dag.tables.contains_key(&tid) {
                 let children = self.caches.fk_by_parent.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]);
                 if let Some(&(child_tid, _)) = children.first() {
@@ -225,8 +211,6 @@ impl CatalogEngine {
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
                 self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
-                // Ensure needs_lock is correct after index registration
-                if is_unique { self.recompute_needs_lock(owner_id); }
                 let _ = name; // name captured via apply_index_by_name
             } else {
                 let is_registered = self.dag.tables.get(&owner_id)
@@ -234,10 +218,6 @@ impl CatalogEngine {
                     .unwrap_or(false);
                 if is_registered {
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
-                    // Recompute after removal so needs_lock reflects the updated state
-                    if self.dag.tables.contains_key(&owner_id) {
-                        self.recompute_needs_lock(owner_id);
-                    }
                 }
                 let _ = name;
             }

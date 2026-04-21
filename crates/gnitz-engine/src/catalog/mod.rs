@@ -79,7 +79,6 @@ pub struct CatalogEngine {
     pub(crate) sys_indices: Box<Table>,
     pub(crate) sys_view_deps: Box<Table>,
     pub(crate) sys_sequences: Box<Table>,
-    pub(crate) sys_catalog_caches: Box<Table>,
     pub(crate) sys_circuit_nodes: Box<Table>,
     pub(crate) sys_circuit_edges: Box<Table>,
     pub(crate) sys_circuit_sources: Box<Table>,

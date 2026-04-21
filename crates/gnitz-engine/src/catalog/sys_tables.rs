@@ -33,7 +33,6 @@ pub(super) const COL_TAB_ID: i64                = gnitz_wire::COL_TAB as i64;
 pub(super) const IDX_TAB_ID: i64                = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64                = gnitz_wire::DEP_TAB as i64;
 pub(super) const SEQ_TAB_ID: i64                = gnitz_wire::SEQ_TAB as i64;
-pub(super) const CATALOG_CACHES_TAB_ID: i64      = gnitz_wire::CATALOG_CACHES_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64      = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64      = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_SOURCES_TAB_ID: i64    = gnitz_wire::CIRCUIT_SOURCES_TAB as i64;
@@ -78,31 +77,6 @@ pub(super) const DEPTAB_COL_DEP_VIEW_ID: usize = 2;
 pub(super) const DEPTAB_COL_DEP_TABLE_ID: usize = 3;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
-
-pub(super) const CCTAB_COL_NAME: usize = 1;
-pub(super) const CCTAB_COL_KIND: usize = 2;
-pub(super) const CCTAB_KIND_DATA: u64 = 0;
-pub(super) const CCTAB_KIND_HOOK: u64 = 1;
-
-pub(super) const CACHE_ID_SCHEMA_BY_NAME:  u64 = 1;
-pub(super) const CACHE_ID_SCHEMA_BY_ID:    u64 = 2;
-pub(super) const CACHE_ID_ENTITY_BY_QNAME: u64 = 3;
-pub(super) const CACHE_ID_ENTITY_BY_ID:    u64 = 4;
-pub(super) const CACHE_ID_SCHEMA_OF:       u64 = 5;
-pub(super) const CACHE_ID_PK_COL_OF:       u64 = 6;
-pub(super) const CACHE_ID_COL_NAMES:       u64 = 7;
-pub(super) const CACHE_ID_COL_NAMES_BYTES: u64 = 8;
-pub(super) const CACHE_ID_INDEX_BY_NAME:   u64 = 9;
-pub(super) const CACHE_ID_INDEX_BY_ID:     u64 = 10;
-pub(super) const CACHE_ID_FK_BY_CHILD:     u64 = 11;
-pub(super) const CACHE_ID_FK_BY_PARENT:    u64 = 12;
-pub(super) const CACHE_ID_NEEDS_LOCK:      u64 = 13;
-pub(super) const HOOK_ID_SCHEMA_DIR:       u64 = 20;
-pub(super) const HOOK_ID_TABLE_REGISTER:   u64 = 21;
-pub(super) const HOOK_ID_VIEW_REGISTER:    u64 = 22;
-pub(super) const HOOK_ID_INDEX_REGISTER:   u64 = 23;
-pub(super) const HOOK_ID_CASCADE_FK:       u64 = 24;
-pub(super) const HOOK_ID_DEP_INVALIDATE:   u64 = 25;
 
 // Default arena sizes for system tables and user tables
 pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024;          // 256 KB
@@ -181,11 +155,6 @@ pub(super) const fn circuit_params_schema() -> SchemaDescriptor {
 pub(super) const fn circuit_group_cols_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col()], 0)
 }
-pub(super) const fn catalog_caches_schema() -> SchemaDescriptor {
-    // PK: u128 packed from (cache_id: lo, source_table_id: hi)
-    // Payload: name: str, kind: u64 (0=DATA, 1=HOOK)
-    make_schema(&[u128_col(), str_col(), u64_col()], 0)
-}
 
 // Pre-computed statics — initialised once at program start, never reconstructed.
 static S_SCHEMA_TAB:        SchemaDescriptor = schema_tab_schema();
@@ -200,15 +169,10 @@ static S_CIRCUIT_EDGES:     SchemaDescriptor = circuit_edges_schema();
 static S_CIRCUIT_SOURCES:   SchemaDescriptor = circuit_sources_schema();
 static S_CIRCUIT_PARAMS:    SchemaDescriptor = circuit_params_schema();
 static S_CIRCUIT_GROUP_COLS: SchemaDescriptor = circuit_group_cols_schema();
-static S_CATALOG_CACHES:    SchemaDescriptor = catalog_caches_schema();
 
 // ---------------------------------------------------------------------------
 // PK packing helpers
 // ---------------------------------------------------------------------------
-
-pub(super) fn pack_cache_entry_pk(cache_id: u64, source_table_id: u64) -> (u64, u64) {
-    (cache_id, source_table_id)
-}
 
 pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     ((owner_id as u64) << 9) | (col_idx as u64)
@@ -254,7 +218,6 @@ pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
     SysTabInfo { id: IDX_TAB_ID, subdir: "_indices", name: "_indices" },
     SysTabInfo { id: DEP_TAB_ID, subdir: "_view_deps", name: "_view_deps" },
     SysTabInfo { id: SEQ_TAB_ID, subdir: "_sequences", name: "_sequences" },
-    SysTabInfo { id: CATALOG_CACHES_TAB_ID, subdir: "_catalog_caches", name: "_catalog_caches" },
     SysTabInfo { id: CIRCUIT_NODES_TAB_ID, subdir: "_circuit_nodes", name: "_circuit_nodes" },
     SysTabInfo { id: CIRCUIT_EDGES_TAB_ID, subdir: "_circuit_edges", name: "_circuit_edges" },
     SysTabInfo { id: CIRCUIT_SOURCES_TAB_ID, subdir: "_circuit_sources", name: "_circuit_sources" },
@@ -276,7 +239,6 @@ pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
         CIRCUIT_SOURCES_TAB_ID    => S_CIRCUIT_SOURCES,
         CIRCUIT_PARAMS_TAB_ID     => S_CIRCUIT_PARAMS,
         CIRCUIT_GROUP_COLS_TAB_ID => S_CIRCUIT_GROUP_COLS,
-        CATALOG_CACHES_TAB_ID    => S_CATALOG_CACHES,
         _ => unreachable!("Unknown system table ID: {}", id),
     }
 }

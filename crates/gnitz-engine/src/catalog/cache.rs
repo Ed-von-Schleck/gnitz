@@ -19,7 +19,6 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) fk_by_parent:    HashMap<i64, Vec<(i64, usize)>>,
     pub(crate) needs_lock:      HashSet<i64>,
     pub(crate) cascade_enabled: bool,
-    pub(crate) source_index:    HashMap<i64, Vec<(u64, u64)>>,
 }
 
 impl CatalogCacheSet {
@@ -39,7 +38,6 @@ impl CatalogCacheSet {
             fk_by_parent:    HashMap::new(),
             needs_lock:      HashSet::new(),
             cascade_enabled: false,
-            source_index:    HashMap::new(),
         }
     }
 
