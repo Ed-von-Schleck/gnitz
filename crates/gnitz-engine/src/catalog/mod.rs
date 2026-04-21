@@ -60,6 +60,7 @@ use sys_tables::*;
 pub(crate) use types::{ColumnDef, CircuitGraph, FkConstraint};
 pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_name,
                        make_fk_index_name, make_secondary_index_name, ingest_batch_into,
+                       flush_sys_table,
                        ensure_dir, fsync_dir,
                        get_index_key_type, make_index_schema,
                        cursor_read_u64, cursor_read_string,

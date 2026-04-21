@@ -192,6 +192,15 @@ pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
     let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
 }
 
+/// Flush a system table, surfacing the error with a contextual message.
+/// Used on catalog paths whose only durability mechanism is flush (namely
+/// sys_circuit_* and sys_view_deps, which bypass SAL broadcast).
+pub(crate) fn flush_sys_table(table: &mut Table, name: &str) -> Result<(), String> {
+    table.flush()
+        .map(|_| ())
+        .map_err(|e| format!("flush {} failed: {:?}", name, e))
+}
+
 // ---------------------------------------------------------------------------
 // Helper: read column data from cursor
 // ---------------------------------------------------------------------------

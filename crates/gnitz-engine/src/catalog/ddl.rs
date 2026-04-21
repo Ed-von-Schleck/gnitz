@@ -229,20 +229,26 @@ impl CatalogEngine {
             fk_col_idx: 0,
         }).collect();
         self.write_column_records(vid, OWNER_KIND_VIEW, &col_defs)?;
-        let _ = self.sys_columns.flush();
+        flush_sys_table(&mut self.sys_columns, "sys_columns")?;
 
-        // 2. View dependencies
+        // 2. View dependencies.
+        //
+        // sys_view_deps and sys_circuit_* are the only catalog tables that
+        // bypass ingest_to_family (and therefore the SAL broadcast path), so
+        // flush is their sole durability mechanism — a silent flush failure
+        // here would lose the circuit graph and produce an uncompilable
+        // zombie view on restart.
         self.write_view_deps(vid, &graph.dependencies);
-        let _ = self.sys_view_deps.flush();
+        flush_sys_table(&mut self.sys_view_deps, "sys_view_deps")?;
         self.dag.invalidate_dep_map();
 
         // 3. Circuit graph records
         self.write_circuit_graph(vid, graph);
-        let _ = self.sys_circuit_nodes.flush();
-        let _ = self.sys_circuit_edges.flush();
-        let _ = self.sys_circuit_sources.flush();
-        let _ = self.sys_circuit_params.flush();
-        let _ = self.sys_circuit_group_cols.flush();
+        flush_sys_table(&mut self.sys_circuit_nodes,      "sys_circuit_nodes")?;
+        flush_sys_table(&mut self.sys_circuit_edges,      "sys_circuit_edges")?;
+        flush_sys_table(&mut self.sys_circuit_sources,    "sys_circuit_sources")?;
+        flush_sys_table(&mut self.sys_circuit_params,     "sys_circuit_params")?;
+        flush_sys_table(&mut self.sys_circuit_group_cols, "sys_circuit_group_cols")?;
 
         // 4. View record (triggers hook)
         {
@@ -256,14 +262,19 @@ impl CatalogEngine {
             bb.put_u64(0); // created_lsn
             bb.end_row();
             let batch = bb.finish();
-            let _ = self.sys_views.flush();
+            flush_sys_table(&mut self.sys_views, "sys_views")?;
             self.ingest_to_family(VIEW_TAB_ID, &batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, vid - 1, vid);
 
-        // 5. Eagerly compile to catch schema errors
+        // 5. Eagerly compile to catch schema errors. Earlier steps persisted
+        //    the view's rows across sys_views / sys_columns / sys_view_deps /
+        //    sys_circuit_*, so a compile failure here would leave a zombie
+        //    that re-registers on restart. Cascade-drop the view on failure
+        //    to keep the catalog consistent and the name reusable.
         if !self.dag.ensure_compiled(vid) {
+            let _ = self.drop_view(&qualified);
             return Err("View circuit schema does not match declared output columns".into());
         }
 
@@ -478,8 +489,7 @@ impl CatalogEngine {
             let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);
             if self.caches.index_by_name.contains_key(&index_name) { continue; }
 
-            let index_id = self.next_index_id;
-            self.next_index_id += 1;
+            let index_id = self.allocate_index_id();
 
             // Write index record to sys_indices
             let idx_schema = idx_tab_schema();

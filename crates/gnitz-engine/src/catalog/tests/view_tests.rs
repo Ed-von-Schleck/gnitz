@@ -626,3 +626,114 @@ fn test_intra_batch_same_pk_propagates_to_view() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── Regression: create_view must not leak records on compile failure ─────
+// Source table has 2 columns but the view graph declares 3 output columns.
+// build_plan rejects this mismatch (compiler.rs sink_schema check), so
+// ensure_compiled returns false. Prior to the fix, ingest_to_family had
+// already persisted sys_views + sys_columns + sys_circuit_* + sys_view_deps
+// rows, leaving a zombie that poisoned the name and re-appeared on restart.
+
+#[test]
+fn test_failed_create_view_does_not_leak_records() {
+    let dir = temp_dir("failed_create_view_no_leak");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let tid = engine.create_table("public.src",
+        &[u64_col_def("id"), i64_col_def("val")], 0, true).unwrap();
+
+    // Baseline AFTER the source table exists: we're measuring delta from
+    // the aborted view only, not from the source table's own rows.
+    let base_views   = count_records(&mut engine.sys_views);
+    let base_cols    = count_records(&mut engine.sys_columns);
+    let base_deps    = count_records(&mut engine.sys_view_deps);
+    let base_nodes   = count_records(&mut engine.sys_circuit_nodes);
+    let base_edges   = count_records(&mut engine.sys_circuit_edges);
+    let base_sources = count_records(&mut engine.sys_circuit_sources);
+
+    // Source table has 2 columns; declare 3 output columns to force a
+    // sink-schema mismatch in the compiler.
+    let bad_out_cols = vec![
+        ("id".to_string(),    type_code::U64),
+        ("val".to_string(),   type_code::I64),
+        ("extra".to_string(), type_code::U64),
+    ];
+    let bad_graph = make_passthrough_graph(tid, &bad_out_cols);
+    let result = engine.create_view("public.bad_view", &bad_graph, "");
+    assert!(result.is_err(), "create_view with mismatched output schema must fail");
+
+    // None of the system tables must retain records from the aborted view.
+    let _ = engine.sys_views.flush();
+    let _ = engine.sys_columns.flush();
+    let _ = engine.sys_view_deps.flush();
+    let _ = engine.sys_circuit_nodes.flush();
+    let _ = engine.sys_circuit_edges.flush();
+    let _ = engine.sys_circuit_sources.flush();
+    assert_eq!(count_records(&mut engine.sys_views),           base_views,
+               "sys_views leaked rows from failed create_view");
+    assert_eq!(count_records(&mut engine.sys_columns),         base_cols,
+               "sys_columns leaked rows from failed create_view");
+    assert_eq!(count_records(&mut engine.sys_view_deps),       base_deps,
+               "sys_view_deps leaked rows from failed create_view");
+    assert_eq!(count_records(&mut engine.sys_circuit_nodes),   base_nodes,
+               "sys_circuit_nodes leaked rows from failed create_view");
+    assert_eq!(count_records(&mut engine.sys_circuit_edges),   base_edges,
+               "sys_circuit_edges leaked rows from failed create_view");
+    assert_eq!(count_records(&mut engine.sys_circuit_sources), base_sources,
+               "sys_circuit_sources leaked rows from failed create_view");
+
+    // The name must not be poisoned: recreating with a matching schema succeeds.
+    let good_out_cols = vec![
+        ("id".to_string(),  type_code::U64),
+        ("val".to_string(), type_code::I64),
+    ];
+    let good_graph = make_passthrough_graph(tid, &good_out_cols);
+    let vid = engine.create_view("public.bad_view", &good_graph, "")
+        .expect("re-creating view after failed attempt must succeed");
+    assert!(engine.dag.ensure_compiled(vid),
+            "recreated view must compile cleanly");
+
+    engine.drop_view("public.bad_view").unwrap();
+    engine.drop_table("public.src").unwrap();
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_failed_create_view_survives_restart() {
+    // Stronger guarantee: after a failed create_view + restart, no ghost
+    // records should re-animate as a zombie view.
+    let dir = temp_dir("failed_create_view_restart");
+
+    {
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let tid = engine.create_table("public.src",
+            &[u64_col_def("id"), i64_col_def("val")], 0, true).unwrap();
+
+        let bad_graph = make_passthrough_graph(tid, &[
+            ("id".to_string(),    type_code::U64),
+            ("val".to_string(),   type_code::I64),
+            ("extra".to_string(), type_code::U64),
+        ]);
+        assert!(engine.create_view("public.ghost", &bad_graph, "").is_err());
+        engine.close();
+    }
+
+    {
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        assert!(engine.get_by_name("public", "ghost").is_none(),
+                "zombie view re-registered on restart");
+
+        // Name must be reusable with a valid schema after recovery.
+        let tid = engine.get_by_name("public", "src").unwrap();
+        let good_graph = make_passthrough_graph(tid, &[
+            ("id".to_string(),  type_code::U64),
+            ("val".to_string(), type_code::I64),
+        ]);
+        engine.create_view("public.ghost", &good_graph, "")
+            .expect("name must be reusable after a failed attempt + restart");
+        engine.close();
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
