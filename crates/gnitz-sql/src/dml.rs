@@ -233,12 +233,31 @@ fn bind_do_update_rhs(
             return Ok(BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx)));
         }
     }
-    // Everything else binds against the existing-row scope. Bare
-    // column references, literals, and arithmetic like `val + 1` all
-    // route through the standard binder. `val + EXCLUDED.val` fails
-    // here because the binder has no EXCLUDED column.
+    // Reject expressions that embed EXCLUDED references inside compound
+    // expressions (e.g. `col + EXCLUDED.col`): the standard binder strips
+    // table qualifiers, so it would silently bind EXCLUDED.col to the
+    // existing row's col, producing wrong results.
+    if expr_contains_excluded(expr) {
+        return Err(GnitzSqlError::Unsupported(
+            "EXCLUDED column references inside compound expressions are not \
+             supported; use a simple `col = EXCLUDED.col` assignment".to_string()
+        ));
+    }
     let bound = binder.bind_expr(expr, schema)?;
     Ok(BoundUpdateExpr::Existing(bound))
+}
+
+/// Returns true if `expr` contains any `EXCLUDED.<col>` compound identifier.
+fn expr_contains_excluded(expr: &Expr) -> bool {
+    match expr {
+        Expr::CompoundIdentifier(parts) =>
+            parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED"),
+        Expr::BinaryOp { left, right, .. } =>
+            expr_contains_excluded(left) || expr_contains_excluded(right),
+        Expr::UnaryOp { expr: inner, .. } => expr_contains_excluded(inner),
+        Expr::Nested(inner) => expr_contains_excluded(inner),
+        _ => false,
+    }
 }
 
 /// Drop incoming rows whose PK already exists in the store. Returns
@@ -712,32 +731,49 @@ fn eval_pred_row(
     i:      usize,
     schema: &Schema,
 ) -> Result<bool, GnitzSqlError> {
-    Ok(eval_expr(pred, batch, i, schema)? != 0)
+    // SQL NULL in a predicate position is UNKNOWN → treated as false (row excluded).
+    Ok(eval_expr(pred, batch, i, schema)?.map_or(false, |v| v != 0))
 }
 
+/// Evaluate a bound expression against a single row.
+///
+/// Returns `None` when the result is SQL NULL. A NULL column operand propagates
+/// through all arithmetic and comparison operators. Callers that need a boolean
+/// predicate should treat `None` as `false` (UNKNOWN → row excluded).
 fn eval_expr(
     expr:   &BoundExpr,
     batch:  &ZSetBatch,
     i:      usize,
     schema: &Schema,
-) -> Result<i64, GnitzSqlError> {
+) -> Result<Option<i64>, GnitzSqlError> {
     use crate::logical_plan::BinOp;
     match expr {
         BoundExpr::ColRef(c) => {
+            // PK is never null. Payload columns must be checked via the null bitmap.
+            if *c != schema.pk_index {
+                let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+                if (batch.nulls[i] & (1u64 << payload_idx)) != 0 {
+                    return Ok(None);
+                }
+            }
             let col_def = &schema.columns[*c];
             match &batch.columns[*c] {
                 ColData::Fixed(buf) => {
                     let stride = col_def.type_code.wire_stride();
                     let start  = i * stride;
                     let slice  = &buf[start..start + stride];
-                    let v = match stride {
-                        1 => slice[0] as i8  as i64,
-                        2 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        4 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        8 => i64::from_le_bytes(slice.try_into().unwrap()),
-                        _ => 0,
+                    // Decode using the actual type code so unsigned columns
+                    // are not sign-extended through an intermediate signed cast.
+                    let v: i64 = match col_def.type_code {
+                        TypeCode::U8  => slice[0] as i64,
+                        TypeCode::I8  => slice[0] as i8 as i64,
+                        TypeCode::U16 => u16::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        TypeCode::I16 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        TypeCode::U32 => u32::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        TypeCode::I32 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        _             => i64::from_le_bytes(slice.try_into().unwrap()),
                     };
-                    Ok(v)
+                    Ok(Some(v))
                 }
                 ColData::Strings(_) => Err(GnitzSqlError::Unsupported(
                     "residual filter on string column not supported".to_string()
@@ -748,7 +784,7 @@ fn eval_expr(
                 )),
             }
         }
-        BoundExpr::LitInt(v) => Ok(*v),
+        BoundExpr::LitInt(v) => Ok(Some(*v)),
         BoundExpr::LitFloat(_) => Err(GnitzSqlError::Unsupported(
             "float literals in residual filter not supported".to_string()
         )),
@@ -757,14 +793,21 @@ fn eval_expr(
              use CREATE INDEX or CREATE VIEW".to_string()
         )),
         BoundExpr::BinOp(l, op, r) => {
-            let lv = eval_expr(l, batch, i, schema)?;
-            let rv = eval_expr(r, batch, i, schema)?;
-            Ok(match op {
+            let lv = match eval_expr(l, batch, i, schema)? {
+                None => return Ok(None),
+                Some(v) => v,
+            };
+            let rv = match eval_expr(r, batch, i, schema)? {
+                None => return Ok(None),
+                Some(v) => v,
+            };
+            Ok(Some(match op {
                 BinOp::Add => lv.wrapping_add(rv),
                 BinOp::Sub => lv.wrapping_sub(rv),
                 BinOp::Mul => lv.wrapping_mul(rv),
-                BinOp::Div => if rv == 0 { 0 } else { lv / rv },
-                BinOp::Mod => if rv == 0 { 0 } else { lv % rv },
+                // wrapping_div/rem prevent the i64::MIN / -1 overflow panic.
+                BinOp::Div => if rv == 0 { 0 } else { lv.wrapping_div(rv) },
+                BinOp::Mod => if rv == 0 { 0 } else { lv.wrapping_rem(rv) },
                 BinOp::Eq  => (lv == rv) as i64,
                 BinOp::Ne  => (lv != rv) as i64,
                 BinOp::Gt  => (lv >  rv) as i64,
@@ -773,25 +816,34 @@ fn eval_expr(
                 BinOp::Le  => (lv <= rv) as i64,
                 BinOp::And => ((lv != 0) && (rv != 0)) as i64,
                 BinOp::Or  => ((lv != 0) || (rv != 0)) as i64,
-            })
+            }))
         }
         BoundExpr::UnaryOp(op, e) => {
-            let v = eval_expr(e, batch, i, schema)?;
+            let v = match eval_expr(e, batch, i, schema)? {
+                None => return Ok(None),
+                Some(v) => v,
+            };
             use crate::logical_plan::UnaryOp;
-            Ok(match op {
+            Ok(Some(match op {
                 UnaryOp::Neg => v.wrapping_neg(),
                 UnaryOp::Not => (v == 0) as i64,
-            })
+            }))
         }
         BoundExpr::IsNull(c) => {
+            if *c == schema.pk_index {
+                return Ok(Some(0)); // PK is never null → IS NULL is always false
+            }
             let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
             let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
-            Ok(is_null as i64)
+            Ok(Some(is_null as i64))
         }
         BoundExpr::IsNotNull(c) => {
+            if *c == schema.pk_index {
+                return Ok(Some(1)); // PK is never null → IS NOT NULL is always true
+            }
             let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
             let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
-            Ok(!is_null as i64)
+            Ok(Some(!is_null as i64))
         }
         BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
             "aggregate functions not allowed in this context".to_string()
@@ -939,7 +991,10 @@ fn eval_set_expr(
         }
         _ => {}
     }
-    eval_expr(expr, batch, row_idx, schema).map(ColumnValue::Int)
+    match eval_expr(expr, batch, row_idx, schema)? {
+        None    => Ok(ColumnValue::Null),
+        Some(v) => Ok(ColumnValue::Int(v)),
+    }
 }
 
 fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
@@ -1006,12 +1061,20 @@ fn write_set_columns(
     dst.pk_lo.push(current.pk_lo[row_idx]);
     dst.pk_hi.push(current.pk_hi[row_idx]);
     dst.weights.push(1);
-    dst.nulls.push(current.nulls[row_idx]);
+    // Start with the existing row's null bits; each assignment updates only
+    // its own column's bit (set for a NULL result, clear for non-NULL).
+    let mut null_bits = current.nulls[row_idx];
 
     for (ci, col_def) in schema.columns.iter().enumerate() {
         if ci == schema.pk_index { continue; }
+        let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
         if let Some((_, expr)) = assignments.iter().find(|(idx, _)| *idx == ci) {
             let cv = eval_set_expr(expr, current, row_idx, schema)?;
+            if matches!(cv, ColumnValue::Null) {
+                null_bits |= 1u64 << payload_idx;
+            } else {
+                null_bits &= !(1u64 << payload_idx);
+            }
             append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
         } else {
             let stride = col_def.type_code.wire_stride();
@@ -1025,6 +1088,7 @@ fn write_set_columns(
             }
         }
     }
+    dst.nulls.push(null_bits);
     Ok(())
 }
 
@@ -1265,5 +1329,212 @@ pub fn execute_delete(
             if n > 0 { client.delete(table_id, actual_schema, &pks)?; }
             Ok(SqlResult::RowsAffected { count: n })
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnitz_protocol::{ColumnDef, TypeCode, ZSetBatch, ColData, Schema};
+    use crate::logical_plan::{BoundExpr, BinOp};
+
+    fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
+        ColumnDef { name: name.into(), type_code: tc, is_nullable: nullable,
+                    fk_table_id: 0, fk_col_idx: 0 }
+    }
+
+    /// Two-column schema: pk (U64, pk_index=0) + val (nullable).
+    fn two_col(val_tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![col_def("pk", TypeCode::U64, false), col_def("val", val_tc, true)],
+            pk_index: 0,
+        }
+    }
+
+    /// Single-row batch for a two-column schema (pk + one payload column).
+    fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
+        let schema = two_col(val_tc);
+        let mut b = ZSetBatch::new(&schema);
+        b.pk_lo.push(1); b.pk_hi.push(0); b.weights.push(1); b.nulls.push(null_bits);
+        if let ColData::Fixed(ref mut buf) = b.columns[1] { buf.extend(val_bytes); }
+        b
+    }
+
+    // ------------------------------------------------------------------
+    // Bug #4 — unsigned integers must not be sign-extended
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_u8_200_not_sign_extended() {
+        let schema = two_col(TypeCode::U8);
+        let batch  = batch_2col(vec![200u8], TypeCode::U8, 0);
+        assert_eq!(eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap(), Some(200));
+    }
+
+    #[test]
+    fn test_u16_60000_not_sign_extended() {
+        let schema = two_col(TypeCode::U16);
+        let batch  = batch_2col(60000u16.to_le_bytes().to_vec(), TypeCode::U16, 0);
+        assert_eq!(eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap(), Some(60000));
+    }
+
+    #[test]
+    fn test_u32_3b_not_sign_extended() {
+        let schema = two_col(TypeCode::U32);
+        let batch  = batch_2col(3_000_000_000u32.to_le_bytes().to_vec(), TypeCode::U32, 0);
+        assert_eq!(eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap(), Some(3_000_000_000));
+    }
+
+    // ------------------------------------------------------------------
+    // Bug #5 — NULL must propagate through predicates
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_null_col_returns_none() {
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(vec![0u8; 8], TypeCode::I64, 0b1); // bit 0 set → val is NULL
+        assert_eq!(eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap(), None);
+    }
+
+    #[test]
+    fn test_null_col_eq_zero_predicate_is_false() {
+        // WHERE val = 0 must NOT match a NULL row (SQL: NULL = 0 → UNKNOWN → false)
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(vec![0u8; 8], TypeCode::I64, 0b1);
+        let pred = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(1)),
+            BinOp::Eq,
+            Box::new(BoundExpr::LitInt(0)),
+        );
+        assert!(!eval_pred_row(&pred, &batch, 0, &schema).unwrap());
+    }
+
+    // ------------------------------------------------------------------
+    // Bug #6 — IS NULL / IS NOT NULL on the PK column must not panic
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_isnull_on_pk_is_false_no_panic() {
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(vec![0u8; 8], TypeCode::I64, 0);
+        // pk_index = 0; previously `*c - 1` would underflow when *c == 0
+        assert_eq!(eval_expr(&BoundExpr::IsNull(0), &batch, 0, &schema).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_isnotnull_on_pk_is_true_no_panic() {
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(vec![0u8; 8], TypeCode::I64, 0);
+        assert_eq!(eval_expr(&BoundExpr::IsNotNull(0), &batch, 0, &schema).unwrap(), Some(1));
+    }
+
+    // ------------------------------------------------------------------
+    // Bug #7 — i64::MIN / -1 and i64::MIN % -1 must not panic
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_div_i64_min_by_neg1_no_panic() {
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(i64::MIN.to_le_bytes().to_vec(), TypeCode::I64, 0);
+        let expr = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(1)),
+            BinOp::Div,
+            Box::new(BoundExpr::LitInt(-1)),
+        );
+        assert!(eval_expr(&expr, &batch, 0, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_mod_i64_min_by_neg1_no_panic() {
+        let schema = two_col(TypeCode::I64);
+        let batch  = batch_2col(i64::MIN.to_le_bytes().to_vec(), TypeCode::I64, 0);
+        let expr = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(1)),
+            BinOp::Mod,
+            Box::new(BoundExpr::LitInt(-1)),
+        );
+        assert!(eval_expr(&expr, &batch, 0, &schema).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Bug #1 — write_set_columns must update the null bitmap for assignments
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_write_set_clears_null_bit_on_non_null_assignment() {
+        // Existing row: val = NULL (null bit set). Assignment: SET val = 99.
+        // Expected: val = 99, null bit cleared.
+        let schema = two_col(TypeCode::I64);
+        let current = batch_2col(vec![0u8; 8], TypeCode::I64, 0b1); // val is NULL
+
+        let assignments = vec![(1usize, BoundExpr::LitInt(99))];
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+
+        assert_eq!(dst.nulls[0] & 0b1, 0, "null bit must be cleared after non-null assignment");
+        if let ColData::Fixed(ref buf) = dst.columns[1] {
+            assert_eq!(i64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
+        }
+    }
+
+    #[test]
+    fn test_write_set_sets_null_bit_when_source_col_is_null() {
+        // Three-column schema: pk, a (non-null), b (null).
+        // Assignment: SET a = b (b is NULL → a should become NULL).
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("a",  TypeCode::I64, true),
+                col_def("b",  TypeCode::I64, true),
+            ],
+            pk_index: 0,
+        };
+        let mut current = ZSetBatch::new(&schema);
+        current.pk_lo.push(1); current.pk_hi.push(0);
+        current.weights.push(1);
+        current.nulls.push(0b10); // payload bit 1 (b) is NULL; bit 0 (a) is non-null
+        if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }
+        if let ColData::Fixed(ref mut buf) = current.columns[2] { buf.extend_from_slice(&[0u8; 8]); }
+
+        // SET a = b  (ColRef(2) = b, which is NULL in current)
+        let assignments = vec![(1usize, BoundExpr::ColRef(2))];
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+
+        // a's null bit (payload_idx 0 → bit 0) must now be set
+        assert_ne!(dst.nulls[0] & 0b01, 0, "a must be null after SET a = NULL_col");
+        // b's null bit (payload_idx 1 → bit 1) must remain set (not touched)
+        assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null");
+    }
+
+    #[test]
+    fn test_write_set_preserves_null_bits_for_unassigned_cols() {
+        // Unassigned columns must carry their original null status unchanged.
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("a",  TypeCode::I64, true),
+                col_def("b",  TypeCode::I64, true),
+            ],
+            pk_index: 0,
+        };
+        let mut current = ZSetBatch::new(&schema);
+        current.pk_lo.push(1); current.pk_hi.push(0);
+        current.weights.push(1);
+        current.nulls.push(0b10); // b is NULL, a is not
+        if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }
+        if let ColData::Fixed(ref mut buf) = current.columns[2] { buf.extend_from_slice(&[0u8; 8]); }
+
+        // Only assign to a; b is untouched
+        let assignments = vec![(1usize, BoundExpr::LitInt(10))];
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+
+        assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
+        assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
     }
 }
