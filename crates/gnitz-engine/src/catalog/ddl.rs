@@ -59,15 +59,25 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Walk sys_views and sys_tables and collect qualified names for
-    /// every view/table whose schema_id matches `sid`. Views and tables
-    /// are returned separately because they must be dropped in order
-    /// (views first).
+    /// Collect qualified names of every view and table in schema `sid`
+    /// from in-memory caches. Views and tables are returned separately
+    /// because drop_schema drops views first (to handle view-on-view deps)
+    /// and tables second (to handle FK chains).
     fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
-        let views = collect_for_schema(
-            &mut *self.sys_views, VIEWTAB_COL_SCHEMA_ID, sid, &self.caches.entity_by_id);
-        let tables = collect_for_schema(
-            &mut *self.sys_tables, TABLETAB_COL_SCHEMA_ID, sid, &self.caches.entity_by_id);
+        let view_ids: Vec<i64> = self.caches.views_by_schema.get(&sid)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let table_ids: Vec<i64> = self.caches.tables_by_schema.get(&sid)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let views = view_ids.iter()
+            .filter_map(|&id| self.caches.entity_by_id.get(&id)
+                .map(|(sn, en)| format!("{}.{}", sn, en)))
+            .collect();
+        let tables = table_ids.iter()
+            .filter_map(|&id| self.caches.entity_by_id.get(&id)
+                .map(|(sn, en)| format!("{}.{}", sn, en)))
+            .collect();
         (views, tables)
     }
 

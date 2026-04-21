@@ -619,7 +619,13 @@ impl CatalogEngine {
     }
 
     pub fn schema_is_empty(&self, schema_name: &str) -> bool {
-        self.caches.entity_by_id.values().all(|(sn, _)| sn != schema_name)
+        let sid = match self.caches.schema_by_name.get(schema_name) {
+            Some(&sid) => sid,
+            None => return true,
+        };
+        let t_empty = self.caches.tables_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true);
+        let v_empty = self.caches.views_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true);
+        t_empty && v_empty
     }
 
     pub fn allocate_schema_id(&mut self) -> i64 {

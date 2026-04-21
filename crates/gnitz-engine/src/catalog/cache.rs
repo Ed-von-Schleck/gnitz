@@ -5,39 +5,45 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 pub(crate) struct CatalogCacheSet {
-    pub(crate) schema_by_name:  HashMap<String, i64>,
-    pub(crate) schema_by_id:    HashMap<i64, String>,
-    pub(crate) entity_by_qname: HashMap<String, i64>,
-    pub(crate) entity_by_id:    HashMap<i64, (String, String)>,
-    pub(crate) schema_of:       HashMap<i64, i64>,
-    pub(crate) pk_col_of:       HashMap<i64, u32>,
-    pub(crate) col_names:       HashMap<i64, Vec<String>>,
-    pub(crate) col_names_bytes: HashMap<i64, Rc<Vec<Vec<u8>>>>,
-    pub(crate) index_by_name:   HashMap<String, i64>,
-    pub(crate) index_by_id:     HashMap<i64, String>,
-    pub(crate) fk_by_child:     HashMap<i64, Vec<FkConstraint>>,
-    pub(crate) fk_by_parent:    HashMap<i64, Vec<(i64, usize)>>,
-    pub(crate) needs_lock:      HashSet<i64>,
-    pub(crate) cascade_enabled: bool,
+    pub(crate) schema_by_name:   HashMap<String, i64>,
+    pub(crate) schema_by_id:     HashMap<i64, String>,
+    pub(crate) entity_by_qname:  HashMap<String, i64>,
+    pub(crate) entity_by_id:     HashMap<i64, (String, String)>,
+    pub(crate) schema_of:        HashMap<i64, i64>,
+    pub(crate) tables_by_schema: HashMap<i64, HashSet<i64>>,
+    pub(crate) views_by_schema:  HashMap<i64, HashSet<i64>>,
+    pub(crate) pk_col_of:        HashMap<i64, u32>,
+    pub(crate) col_names:        HashMap<i64, Vec<String>>,
+    pub(crate) col_names_bytes:  HashMap<i64, Rc<Vec<Vec<u8>>>>,
+    pub(crate) index_by_name:    HashMap<String, i64>,
+    pub(crate) index_by_id:      HashMap<i64, String>,
+    pub(crate) indices_by_owner: HashMap<i64, Vec<i64>>,
+    pub(crate) fk_by_child:      HashMap<i64, Vec<FkConstraint>>,
+    pub(crate) fk_by_parent:     HashMap<i64, Vec<(i64, usize)>>,
+    pub(crate) needs_lock:       HashSet<i64>,
+    pub(crate) cascade_enabled:  bool,
 }
 
 impl CatalogCacheSet {
     pub(crate) fn new() -> Self {
         CatalogCacheSet {
-            schema_by_name:  HashMap::new(),
-            schema_by_id:    HashMap::new(),
-            entity_by_qname: HashMap::new(),
-            entity_by_id:    HashMap::new(),
-            schema_of:       HashMap::new(),
-            pk_col_of:       HashMap::new(),
-            col_names:       HashMap::new(),
-            col_names_bytes: HashMap::new(),
-            index_by_name:   HashMap::new(),
-            index_by_id:     HashMap::new(),
-            fk_by_child:     HashMap::new(),
-            fk_by_parent:    HashMap::new(),
-            needs_lock:      HashSet::new(),
-            cascade_enabled: false,
+            schema_by_name:   HashMap::new(),
+            schema_by_id:     HashMap::new(),
+            entity_by_qname:  HashMap::new(),
+            entity_by_id:     HashMap::new(),
+            schema_of:        HashMap::new(),
+            tables_by_schema: HashMap::new(),
+            views_by_schema:  HashMap::new(),
+            pk_col_of:        HashMap::new(),
+            col_names:        HashMap::new(),
+            col_names_bytes:  HashMap::new(),
+            index_by_name:    HashMap::new(),
+            index_by_id:      HashMap::new(),
+            indices_by_owner: HashMap::new(),
+            fk_by_child:      HashMap::new(),
+            fk_by_parent:     HashMap::new(),
+            needs_lock:       HashSet::new(),
+            cascade_enabled:  false,
         }
     }
 
@@ -118,15 +124,27 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn apply_schema_of(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_schema_of(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64;
             if weight > 0 {
                 self.caches.schema_of.insert(tid, sid);
+                if source_tid == TABLE_TAB_ID {
+                    self.caches.tables_by_schema.entry(sid).or_default().insert(tid);
+                } else {
+                    self.caches.views_by_schema.entry(sid).or_default().insert(tid);
+                }
             } else {
                 self.caches.schema_of.remove(&tid);
+                if source_tid == TABLE_TAB_ID {
+                    if let Some(set) = self.caches.tables_by_schema.get_mut(&sid) {
+                        set.remove(&tid);
+                    }
+                } else if let Some(set) = self.caches.views_by_schema.get_mut(&sid) {
+                    set.remove(&tid);
+                }
             }
         }
         Ok(())
@@ -176,11 +194,16 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let name = self.read_batch_string(batch, i, 3);
+            let owner_id = self.read_batch_u64(batch, i, 0) as i64; // IDXTAB_COL_OWNER_ID
+            let name = self.read_batch_string(batch, i, 3);          // IDXTAB_COL_NAME
             if weight > 0 {
                 self.caches.index_by_id.insert(idx_id, name);
+                self.caches.indices_by_owner.entry(owner_id).or_default().push(idx_id);
             } else {
                 self.caches.index_by_id.remove(&idx_id);
+                if let Some(ids) = self.caches.indices_by_owner.get_mut(&owner_id) {
+                    ids.retain(|&id| id != idx_id);
+                }
             }
         }
         Ok(())

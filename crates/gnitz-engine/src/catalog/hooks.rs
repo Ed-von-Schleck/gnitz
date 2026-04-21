@@ -53,7 +53,7 @@ impl CatalogEngine {
             TABLE_TAB_ID => {
                 self.apply_entity_by_qname(batch)?;
                 self.apply_entity_by_id(batch)?;
-                self.apply_schema_of(batch)?;
+                self.apply_schema_of(TABLE_TAB_ID, batch)?;
                 self.apply_pk_col_of(TABLE_TAB_ID, batch)?;
                 self.hook_table_register(batch)?;
                 self.apply_needs_lock(TABLE_TAB_ID, batch)?;
@@ -62,7 +62,7 @@ impl CatalogEngine {
             VIEW_TAB_ID => {
                 self.apply_entity_by_qname(batch)?;
                 self.apply_entity_by_id(batch)?;
-                self.apply_schema_of(batch)?;
+                self.apply_schema_of(VIEW_TAB_ID, batch)?;
                 self.apply_pk_col_of(VIEW_TAB_ID, batch)?;
                 self.hook_view_register(batch)?;
             }
@@ -161,24 +161,18 @@ impl CatalogEngine {
     }
 
     fn cascade_retract_indices(&mut self, owner_id: i64) -> Result<(), String> {
+        // Clone the idx_id list before any mutation so ingest_to_family → apply_index_by_id
+        // can safely remove entries from indices_by_owner as each retraction fires.
+        let idx_ids: Vec<i64> = match self.caches.indices_by_owner.get(&owner_id) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
+            _ => return Ok(()),
+        };
         let schema = sys_tab_schema(IDX_TAB_ID);
-        let mut batch = Batch::with_schema(schema, 4);
-        {
-            let mut cursor = match self.sys_indices.create_cursor() {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
-            };
-            while cursor.cursor.valid {
-                if cursor.cursor.current_weight > 0
-                    && cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64 == owner_id
-                {
-                    copy_cursor_row_with_weight(&cursor, &schema, &mut batch, -1);
-                }
-                cursor.cursor.advance();
+        for idx_id in idx_ids {
+            let batch = retract_single_row(&mut self.sys_indices, &schema, idx_id as u64, 0);
+            if batch.count > 0 {
+                self.ingest_to_family(IDX_TAB_ID, &batch)?;
             }
-        }
-        if batch.count > 0 {
-            self.ingest_to_family(IDX_TAB_ID, &batch)?;
         }
         Ok(())
     }

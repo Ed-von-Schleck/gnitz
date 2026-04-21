@@ -469,6 +469,54 @@ fn test_drop_table_cascades_fk_index() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── Regression: indices_by_owner cache drives cascade_retract_indices ──
+// drop_table must cascade-retract ALL owned indices. With the O(N) full-scan
+// implementation this always worked, but the cache-based implementation must
+// correctly track every idx_id under the same owner and emit one retraction
+// per index via retract_single_row.
+
+#[test]
+fn test_drop_table_cascades_multiple_indices() {
+    let dir = temp_dir("cascade_multi_idx");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), i64_col_def("val1"), i64_col_def("val2")];
+    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+
+    let idx1 = engine.create_index("public.t", "val1", false).unwrap();
+    let idx2 = engine.create_index("public.t", "val2", false).unwrap();
+
+    // Both indices tracked in cache
+    assert_eq!(engine.caches.indices_by_owner.get(&tid).map(|v| v.len()), Some(2),
+        "indices_by_owner must track both indices");
+    assert!(engine.caches.index_by_id.contains_key(&idx1));
+    assert!(engine.caches.index_by_id.contains_key(&idx2));
+
+    let idx_count_before = count_records(&mut engine.sys_indices);
+    assert!(idx_count_before >= 2);
+
+    // Drop the table — cascade must retract both indices
+    engine.drop_table("public.t").unwrap();
+
+    assert!(!engine.dag.tables.contains_key(&tid), "table DAG entry must be gone");
+    assert!(!engine.caches.index_by_id.contains_key(&idx1), "idx1 must be removed from index_by_id");
+    assert!(!engine.caches.index_by_id.contains_key(&idx2), "idx2 must be removed from index_by_id");
+    assert!(engine.caches.indices_by_owner.get(&tid).map(|v| v.is_empty()).unwrap_or(true),
+        "indices_by_owner for dropped table must be empty");
+    assert_eq!(count_records(&mut engine.sys_indices), idx_count_before - 2,
+        "sys_indices must retract exactly two records");
+
+    // Reopen: replay must succeed without orphaned sys_indices rows
+    engine.close();
+    drop(engine);
+    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    assert!(!engine2.caches.index_by_id.contains_key(&idx1));
+    assert!(!engine2.caches.index_by_id.contains_key(&idx2));
+    engine2.close();
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── Regression: create_index rollback must clean up all caches ────────
 // If hook_index_register fails (e.g. unique index on a column with
 // duplicate values), the earlier apply_index_by_{name,id} hooks have
