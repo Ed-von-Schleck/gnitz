@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
-use crate::storage::{Batch, CursorHandle, Table, PartitionedTable};
+use crate::storage::{Batch, CursorHandle, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
 
@@ -61,6 +61,119 @@ impl StoreHandle {
             StoreHandle::Partitioned(pt) => std::ptr::addr_of!(**pt) as *mut PartitionedTable,
             _ => std::ptr::null_mut(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Interior-mutable accessors
+    //
+    // DagEngine/CatalogEngine are single-threaded (!Sync) and the
+    // HashMap<id, TableEntry> stores owning Boxes whose heap allocations
+    // have stable addresses, so the mutation is race-free. But the
+    // registry HashMap is read via immutable get(), which would normally
+    // prevent handing out &mut to the owned Table / PartitionedTable.
+    // These accessors encapsulate the raw-pointer re-borrow that
+    // reconciles the lookup API with the mutation need, so call sites
+    // stop reimplementing it inline.
+    //
+    // SAFETY contract for every method below: no aliasing &mut into the
+    // same storage may be live across the call.
+    // ------------------------------------------------------------------
+
+    /// Get `&mut Table` for Single/Borrowed variants, or the sole
+    /// partition of a 1-partition Partitioned. None for multi-partition.
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_single_mut(&self) -> Option<&mut Table> {
+        unsafe {
+            match self {
+                StoreHandle::Single(t) => {
+                    Some(&mut *(std::ptr::addr_of!(**t) as *mut Table))
+                }
+                StoreHandle::Borrowed(ptr) => Some(&mut **ptr),
+                StoreHandle::Partitioned(pt) => {
+                    let ptbl = &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable);
+                    if ptbl.num_partitions() == 1 {
+                        Some(ptbl.table_mut(0))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get `&mut PartitionedTable` if this handle is Partitioned.
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_partitioned_mut(&self) -> Option<&mut PartitionedTable> {
+        match self {
+            StoreHandle::Partitioned(pt) => {
+                Some(unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) })
+            }
+            _ => None,
+        }
+    }
+
+    /// Dispatched `has_pk` that works for every variant.
+    pub fn has_pk(&self, key: u128) -> bool {
+        unsafe {
+            match self {
+                StoreHandle::Single(t) => {
+                    (*(std::ptr::addr_of!(**t) as *mut Table)).has_pk(key)
+                }
+                StoreHandle::Borrowed(ptr) => (**ptr).has_pk(key),
+                StoreHandle::Partitioned(pt) => {
+                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable)).has_pk(key)
+                }
+            }
+        }
+    }
+
+    /// Dispatched `create_cursor` across all variants.
+    pub fn create_cursor(&self) -> Result<CursorHandle, StorageError> {
+        unsafe {
+            match self {
+                StoreHandle::Single(t) => {
+                    (*(std::ptr::addr_of!(**t) as *mut Table)).create_cursor()
+                }
+                StoreHandle::Borrowed(ptr) => (**ptr).create_cursor(),
+                StoreHandle::Partitioned(pt) => {
+                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable)).create_cursor()
+                }
+            }
+        }
+    }
+
+    /// Dispatched durable ingest.
+    pub fn ingest_batch_from_regions(
+        &self,
+        ptrs: &[*const u8],
+        sizes: &[u32],
+        count: u32,
+        num_payload_cols: usize,
+    ) -> Result<(), StorageError> {
+        unsafe {
+            match self {
+                StoreHandle::Single(t) => (*(std::ptr::addr_of!(**t) as *mut Table))
+                    .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols),
+                StoreHandle::Borrowed(ptr) => (**ptr)
+                    .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols),
+                StoreHandle::Partitioned(pt) => {
+                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable))
+                        .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols)
+                }
+            }
+        }
+    }
+}
+
+impl IndexCircuitEntry {
+    /// Interior-mutable access to the owned index Table.
+    ///
+    /// The boxed Table has stable heap address, so this raw-pointer
+    /// reborrow is race-free on a single thread. Like the StoreHandle
+    /// helpers above, callers must ensure no aliasing &mut is live.
+    #[allow(clippy::mut_from_ref)]
+    pub fn table_mut(&self) -> &mut Table {
+        unsafe { &mut *(std::ptr::addr_of!(*self.index_table) as *mut Table) }
     }
 }
 

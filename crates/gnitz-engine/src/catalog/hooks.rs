@@ -277,12 +277,14 @@ impl CatalogEngine {
     }
 
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
+        // Index name lives in the batch's payload column 3; apply_index_by_name
+        // already populated the name-indexed caches from there, so we don't
+        // read the string here — it would just be a wasted allocation.
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
             let source_col_idx = self.read_batch_u64(batch, i, 2) as u32;
-            let name = self.read_batch_string(batch, i, 3);
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
 
             if weight > 0 {
@@ -314,7 +316,6 @@ impl CatalogEngine {
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
                 self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
-                let _ = name; // name captured via apply_index_by_name
             } else {
                 let is_registered = self.dag.tables.get(&owner_id)
                     .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
@@ -322,7 +323,6 @@ impl CatalogEngine {
                 if is_registered {
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
                 }
-                let _ = name;
             }
         }
         Ok(())

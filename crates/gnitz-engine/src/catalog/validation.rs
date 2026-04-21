@@ -68,22 +68,9 @@ impl CatalogEngine {
 
                 // Check if target has this PK
                 let fk_key = crate::util::make_pk(fk_lo, fk_hi);
-                let has = match &target_entry.handle {
-                    StoreHandle::Single(ref t) => {
-                        let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                        table.has_pk(fk_key)
-                    }
-                    StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(fk_key),
-                    StoreHandle::Partitioned(ref pt) => {
-                        let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                        ptable.has_pk(fk_key)
-                    }
-                };
-
-                if !has {
+                if !target_entry.handle.has_pk(fk_key) {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
-                    let col_name = &schema.columns[col_idx].type_code.to_string();
                     let (tsn, ttn) = self.caches.entity_by_id.get(&target_id)
                         .cloned().unwrap_or_default();
                     return Err(format!(
@@ -119,7 +106,7 @@ impl CatalogEngine {
                     ));
                 }
             };
-            let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
+            let idx_table = ic.table_mut();
 
             for row in 0..batch.count {
                 if batch.get_weight(row) >= 0 { continue; }
@@ -162,7 +149,7 @@ impl CatalogEngine {
             let col_type = schema.columns[source_col_idx].type_code;
             let payload_col = schema.payload_idx(source_col_idx);
 
-            let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
+            let idx_table = ic.table_mut();
 
             // Track seen keys for batch-internal duplicate detection
             let mut seen: HashSet<(u64, u64)> = HashSet::new();
@@ -177,21 +164,7 @@ impl CatalogEngine {
                 let row_pk = batch.get_pk(row);
 
                 // Determine if this is an UPSERT (PK already exists in store)
-                let is_upsert = if entry.unique_pk {
-                    match &entry.handle {
-                        StoreHandle::Partitioned(ref pt) => {
-                            let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                            ptable.has_pk(row_pk)
-                        }
-                        StoreHandle::Single(ref t) => {
-                            let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                            table.has_pk(row_pk)
-                        }
-                        StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(row_pk),
-                    }
-                } else {
-                    false
-                };
+                let is_upsert = entry.unique_pk && entry.handle.has_pk(row_pk);
 
                 // Promote column value to index key
                 let (key_lo, key_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);

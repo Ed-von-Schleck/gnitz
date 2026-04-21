@@ -468,3 +468,52 @@ fn test_drop_table_cascades_fk_index() {
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── Regression: create_index rollback must clean up all caches ────────
+// If hook_index_register fails (e.g. unique index on a column with
+// duplicate values), the earlier apply_index_by_{name,id} hooks have
+// already mutated the caches. The rollback must reverse those writes
+// or the name/id caches end up pointing at a ghost index.
+
+#[test]
+fn test_create_unique_index_duplicate_rolls_back_cleanly() {
+    let dir = temp_dir("unique_idx_rollback");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Seed duplicate values on `val` so a unique index over it cannot be built.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2, 0, 1); bb.put_u64(42); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let idx_name = make_secondary_index_name("public", "t", "val");
+    let idx_records_before = count_records(&mut engine.sys_indices);
+
+    // Attempt should fail because of duplicate values.
+    let result = engine.create_index("public.t", "val", true);
+    assert!(result.is_err(), "unique index over duplicates must fail");
+
+    // All catalog-visible state must have reverted: the ghost name/id
+    // entries created by apply_index_by_{name,id} are the thing the
+    // rollback is responsible for sweeping up.
+    assert!(!engine.caches.index_by_name.contains_key(idx_name.as_str()),
+            "index_by_name must not retain a ghost entry after rollback");
+    assert!(!engine.dag.tables.get(&tid).unwrap()
+                .index_circuits.iter().any(|ic| ic.col_idx == 1),
+            "DAG must not retain a half-built index circuit");
+    assert_eq!(count_records(&mut engine.sys_indices), idx_records_before,
+               "sys_indices must net out to zero after rollback");
+
+    // The failed attempt must not block a later successful, non-unique index
+    // on the same column.
+    engine.create_index("public.t", "val", false).unwrap();
+    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

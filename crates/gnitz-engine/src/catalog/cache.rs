@@ -111,8 +111,7 @@ impl CatalogEngine {
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 self.caches.entity_by_id.insert(tid, (schema_name, name));
             } else {
-                self.caches.col_names.remove(&tid);
-                self.caches.col_names_bytes.remove(&tid);
+                self.caches.invalidate_col_names(tid);
                 self.caches.entity_by_id.remove(&tid);
             }
         }
@@ -154,8 +153,7 @@ impl CatalogEngine {
     pub(crate) fn apply_col_names_invalidate(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            self.caches.col_names.remove(&owner_id);
-            self.caches.col_names_bytes.remove(&owner_id);
+            self.caches.invalidate_col_names(owner_id);
         }
         Ok(())
     }

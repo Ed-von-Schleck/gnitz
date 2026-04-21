@@ -187,18 +187,7 @@ impl CatalogEngine {
                 _ => return Ok(None),
             }
         } else {
-            let entry = self.dag.tables.get(&table_id).unwrap();
-            match &entry.handle {
-                StoreHandle::Single(ref t) => {
-                    let tbl = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                    tbl.create_cursor()
-                }
-                StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.create_cursor(),
-                StoreHandle::Partitioned(ref pt) => {
-                    let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                    ptbl.create_cursor()
-                }
-            }
+            self.dag.tables.get(&table_id).unwrap().handle.create_cursor()
         };
 
         let mut cursor = match cursor_result {
@@ -231,7 +220,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
 
         // Seek in index table
-        let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
+        let idx_table = ic.table_mut();
         let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
         cursor.cursor.seek(crate::util::make_pk(key_lo, key_hi));
         if !cursor.cursor.valid { return Ok(None); }
@@ -302,20 +291,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
         let npc = batch.num_payload_cols();
         let (ptrs, sizes) = batch.to_region_ptrs();
-        match &entry.handle {
-            StoreHandle::Single(ref t) => {
-                let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-            StoreHandle::Borrowed(ptr) => {
-                let table = unsafe { &mut **ptr };
-                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-            StoreHandle::Partitioned(ref pt) => {
-                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-        }
+        let _ = entry.handle.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
         Ok(())
     }
 
@@ -354,8 +330,7 @@ impl CatalogEngine {
     pub fn close_user_table_partitions(&mut self) {
         for (&tid, entry) in &self.dag.tables {
             if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
-                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+            if let Some(ptable) = entry.handle.as_partitioned_mut() {
                 ptable.close_all_partitions();
             }
         }
@@ -365,8 +340,7 @@ impl CatalogEngine {
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for (&tid, entry) in &self.dag.tables {
             if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
-                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+            if let Some(ptable) = entry.handle.as_partitioned_mut() {
                 ptable.close_partitions_outside(start, end);
             }
         }
@@ -409,14 +383,10 @@ impl CatalogEngine {
     pub fn get_index_circuit_info(&self, table_id: i64, idx: usize)
         -> Option<(u32, bool, u8)>
     {
-        self.dag.tables.get(&table_id)
-            .and_then(|e| e.index_circuits.get(idx))
-            .map(|ic| {
-                let type_code = self.dag.tables.get(&table_id)
-                    .map(|e| e.schema.columns[ic.col_idx as usize].type_code)
-                    .unwrap_or(0);
-                (ic.col_idx, ic.is_unique, type_code)
-            })
+        let entry = self.dag.tables.get(&table_id)?;
+        let ic = entry.index_circuits.get(idx)?;
+        let type_code = entry.schema.columns[ic.col_idx as usize].type_code;
+        Some((ic.col_idx, ic.is_unique, type_code))
     }
 
     /// Get index store handle for a specific column index (for worker has_pk via index).
@@ -712,24 +682,8 @@ impl CatalogEngine {
             None => return Arc::new(Batch::empty_with_schema(schema)),
         };
 
-        // Extract single-Table handle (Single, Borrowed, or 1-partition Partitioned)
-        let tbl: Option<&mut Table> = match &entry.handle {
-            StoreHandle::Single(ref t) => {
-                Some(unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) })
-            }
-            StoreHandle::Borrowed(ptr) => Some(unsafe { &mut **ptr }),
-            StoreHandle::Partitioned(ref pt) => {
-                let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                if ptbl.num_partitions() == 1 {
-                    Some(ptbl.table_mut(0))
-                } else {
-                    None
-                }
-            }
-        };
-
         // Single-Table path: try fast paths, then build cursor from already-computed data
-        let mut cursor = if let Some(table) = tbl {
+        let mut cursor = if let Some(table) = entry.handle.as_single_mut() {
             let _ = table.compact_if_needed();
             let snapshot = table.get_snapshot();
             let shards = table.all_shard_arcs();
@@ -752,15 +706,9 @@ impl CatalogEngine {
             crate::storage::create_cursor_from_snapshots(&[snapshot], &shards, *schema)
         } else {
             // Multi-partition: delegate to PartitionedTable
-            match &entry.handle {
-                StoreHandle::Partitioned(ref pt) => {
-                    let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                    match ptbl.create_cursor() {
-                        Ok(c) => c,
-                        Err(_) => return Arc::new(Batch::empty_with_schema(schema)),
-                    }
-                }
-                _ => unreachable!(),
+            match entry.handle.create_cursor() {
+                Ok(c) => c,
+                Err(_) => return Arc::new(Batch::empty_with_schema(schema)),
             }
         };
 

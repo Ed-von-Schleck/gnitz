@@ -207,6 +207,9 @@ impl CatalogEngine {
         if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("View/Table already exists".into());
         }
+        if graph.output_col_defs.len() > 64 {
+            return Err("Maximum 64 columns supported".into());
+        }
 
         // Validate graph structure via DagEngine
         self.dag.validate_graph_structure(
@@ -321,6 +324,11 @@ impl CatalogEngine {
             bb.end_row();
             let batch = bb.finish();
             if let Err(e) = self.ingest_to_family(IDX_TAB_ID, &batch) {
+                // Route the undo through ingest_to_family so the index_by_name
+                // / index_by_id hooks (which already fired on the +1 before
+                // hook_index_register failed) are reversed by the matching -1.
+                // Writing directly to storage would leave those caches poisoned
+                // with a ghost index that doesn't exist on disk.
                 let mut undo = BatchBuilder::new(schema);
                 undo.begin_row(index_id as u64, 0, -1);
                 undo.put_u64(owner_id as u64);
@@ -331,7 +339,7 @@ impl CatalogEngine {
                 undo.put_string("");
                 undo.end_row();
                 let undo_batch = undo.finish();
-                ingest_batch_into(&mut self.sys_indices, &undo_batch);
+                let _ = self.ingest_to_family(IDX_TAB_ID, &undo_batch);
                 return Err(e);
             }
         }
