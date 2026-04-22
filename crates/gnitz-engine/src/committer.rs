@@ -23,7 +23,10 @@
 //!   signals via a oneshot — used by DDL to drain the committer before
 //!   catalog mutation.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 use crate::ipc::WireConflictMode;
 use crate::master::{MasterDispatcher, first_worker_error};
 use crate::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
@@ -31,6 +34,7 @@ use crate::storage::Batch;
 use crate::util::guard_panic;
 
 const MAX_PENDING_ROWS: usize = 100_000;
+const TICK_COALESCE_ROWS: usize = 10_000;
 
 /// One request to the committer.
 pub enum CommitRequest {
@@ -67,8 +71,12 @@ pub struct Shared {
     /// Monotonic LSN incremented on each successful commit; exposed to
     /// handlers via the `done` oneshot and shared with the executor so
     /// SCAN/SEEK responses report the same value.
-    pub ingest_lsn: Rc<std::cell::Cell<u64>>,
+    pub ingest_lsn: Rc<Cell<u64>>,
     pub num_workers: usize,
+    pub tick_rows: Rc<RefCell<HashMap<i64, usize>>>,
+    pub tick_tids: Rc<RefCell<Vec<i64>>>,
+    pub fire_auto_tick: Rc<dyn Fn()>,
+    pub t_last_push: Rc<Cell<Option<Instant>>>,
 }
 
 /// The committer task loop. Returns when all senders drop (shutdown).
@@ -309,17 +317,12 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     };
 
     // ------------------------------------------------------------------
-    // Phase C (no lock): wait for fsync + per-group ACKs; post-process.
+    // Phase C (no lock): await push ACKs, assign LSNs, fire tick.
+    // fsync is awaited separately in Phase D so DAG evaluation overlaps
+    // with fdatasync (~5 ms gap eliminated).
     // ------------------------------------------------------------------
     {
-        let (fsync_rc, decoded_vec) =
-            reactor::join2(fsync_fut, reactor::join_all(reply_futs)).await;
-
-        if fsync_rc < 0 {
-            crate::gnitz_fatal_abort!(
-                "SAL fdatasync (committer) failed rc={}", fsync_rc
-            );
-        }
+        let decoded_vec = reactor::join_all(reply_futs).await;
 
         let mut cursor = 0usize;
         for g in groups.iter_mut() {
@@ -356,6 +359,40 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
                 });
                 crate::gnitz_warn!("{}", e);
             }
+        }
+
+        // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
+        // the fsync CQE so DAG evaluation overlaps with fdatasync.
+        // ingest_lsn is already updated above; run_tick reads the correct
+        // value when it fires (single-threaded: tick only runs after the
+        // fsync yield below).
+        {
+            let mut tr = shared.tick_rows.borrow_mut();
+            let mut tids = shared.tick_tids.borrow_mut();
+            for g in &groups {
+                if g.write_err.is_none() {
+                    let entry = tr.entry(g.tid).or_insert(0);
+                    if *entry == 0 { tids.push(g.tid); }
+                    *entry += g.merged.count;
+                }
+            }
+            shared.t_last_push.set(Some(Instant::now()));
+        }
+        if shared.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS) {
+            (shared.fire_auto_tick)();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase D (no lock): await fsync CQE.  Client response is held until
+    // after fsync so the client sees only durable data.
+    // ------------------------------------------------------------------
+    {
+        let fsync_rc = fsync_fut.await;
+        if fsync_rc < 0 {
+            crate::gnitz_fatal_abort!(
+                "SAL fdatasync (committer) failed rc={}", fsync_rc
+            );
         }
     }
 

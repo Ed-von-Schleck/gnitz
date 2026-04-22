@@ -117,19 +117,8 @@ impl Shared {
         self.cat().needs_table_lock(tid)
     }
 
-    fn bump_tick_rows(&self, tid: i64, rows: usize) {
-        let mut tr = self.tick_rows.borrow_mut();
-        let entry = tr.entry(tid).or_insert(0);
-        if *entry == 0 {
-            self.tick_tids.borrow_mut().push(tid);
-        }
-        *entry += rows;
-        self.t_last_push.set(Some(Instant::now()));
-    }
-
     /// True iff some pending tid has crossed the row coalesce threshold.
-    /// Used by the INSERT handler to decide whether to send an immediate
-    /// tick trigger, and by the tick task to skip the deadline window.
+    /// Used by the tick task to skip the deadline coalesce window.
     fn any_threshold_crossed(&self) -> bool {
         self.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS)
     }
@@ -184,6 +173,7 @@ impl ServerExecutor {
         // FLAG_EXCHANGE accumulator can hand off completed views.
         reactor.attach_relay_tx(relay_tx);
 
+        let auto_tick_tx = tick_tx.clone();
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp_ptr: dispatcher,
@@ -191,6 +181,10 @@ impl ServerExecutor {
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             ingest_lsn: Rc::clone(&ingest_lsn),
             num_workers,
+            tick_rows: Rc::clone(&tick_rows),
+            tick_tids: Rc::clone(&tick_tids),
+            fire_auto_tick: Rc::new(move || { auto_tick_tx.send(TickTrigger::Auto); }),
+            t_last_push: Rc::clone(&t_last_push),
         });
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
@@ -558,7 +552,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         }
 
         // Route through the committer and wait for commit ACK.
-        let batch_count = batch.count;
         let (tx, rx) = oneshot::channel::<Result<u64, String>>();
         shared.committer_tx.send(CommitRequest::Push {
             tid: target_id, batch, mode, done: tx,
@@ -566,11 +559,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
-                // Successful commit: bump tick counter for this table.
-                shared.bump_tick_rows(target_id, batch_count);
-                if shared.any_threshold_crossed() {
-                    shared.tick_tx.send(TickTrigger::Auto);
-                }
                 let schema = shared.get_schema_desc(target_id);
                 send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn).await;
             }
