@@ -1231,15 +1231,15 @@ impl Batch {
     }
 
     /// Consolidate a borrowed batch if needed. Returns `None` when the batch is already
-    /// consolidated or empty (caller borrows the original). Returns `Some(Batch)` when
-    /// a new consolidated batch was allocated (caller borrows that instead).
+    /// consolidated or empty (caller borrows the original). Returns `Some(ConsolidatedBatch)`
+    /// when a new consolidated batch was allocated (caller borrows that instead).
     ///
     /// Idiomatic usage:
     /// ```ignore
     /// let cs = Batch::consolidate_if_needed(delta, schema);
-    /// let c: &Batch = cs.as_ref().unwrap_or(delta);
+    /// let c: &Batch = cs.as_deref().unwrap_or(delta);
     /// ```
-    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
+    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<ConsolidatedBatch> {
         if batch.consolidated || batch.count == 0 {
             return None;
         }
@@ -1251,7 +1251,7 @@ impl Batch {
         result.sorted = true;
         result.consolidated = true;
         result.set_schema(*schema);
-        Some(result)
+        Some(ConsolidatedBatch::new_unchecked(result))
     }
 
     #[cfg(test)]

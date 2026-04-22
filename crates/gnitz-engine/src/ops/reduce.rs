@@ -540,7 +540,7 @@ pub fn op_reduce(
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     // Fast path (linear or already consolidated): borrow delta directly — no allocation.
     let cs = if all_linear { None } else { Batch::consolidate_if_needed(delta, input_schema) };
-    let working: &Batch = cs.as_ref().unwrap_or(delta);
+    let working: &Batch = cs.as_deref().unwrap_or(delta);
 
     let n = working.count;
     if n == 0 {
@@ -803,10 +803,9 @@ pub fn op_reduce(
         // PK-grouped output: one row per unique PK, sorted and weight-folded.
         raw_output.sorted = true;
         raw_output.consolidated = true;
-        (ConsolidatedBatch::new_unchecked(raw_output).into_inner(), fin_output)
-    } else {
-        (raw_output, fin_output)
+        debug_assert!(ConsolidatedBatch::from_batch_ref(&raw_output).is_some());
     }
+    (raw_output, fin_output)
 }
 
 /// Emit one reduce output row.

@@ -18,7 +18,7 @@ pub fn op_anti_join_delta_trace(
 ) -> ConsolidatedBatch {
     let npc = schema.num_columns as usize - 1;
     let cs = Batch::consolidate_if_needed(delta, schema);
-    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
@@ -83,7 +83,7 @@ pub fn op_semi_join_delta_trace(
 ) -> ConsolidatedBatch {
     let npc = schema.num_columns as usize - 1;
     let cs = Batch::consolidate_if_needed(delta, schema);
-    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
@@ -215,7 +215,7 @@ pub fn op_join_delta_trace(
     let out_npc = left_npc + right_npc;
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
-    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc);
@@ -337,7 +337,7 @@ pub fn op_join_delta_trace_outer(
     let out_npc = left_npc + right_npc;
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
-    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc);
@@ -576,8 +576,8 @@ fn filter_join_dd_with_payload(
     let npc = schema.num_columns as usize - 1;
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -647,8 +647,8 @@ fn filter_join_dd(
     let npc = schema.num_columns as usize - 1;
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -717,8 +717,8 @@ pub fn op_join_delta_delta(
 
     let cs_a = Batch::consolidate_if_needed(batch_a, left_schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, right_schema);
-    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
