@@ -47,6 +47,30 @@ fn prop_null2(mask: u64, dst: usize, a1: usize, a2: usize) -> u64 {
     (mask & !(1u64 << dst)) | (n << dst)
 }
 
+/// SQL 3VL AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL.
+#[inline(always)]
+fn eval_bool_and(null_mask: u64, regs: &[i64], dst: usize, a1: usize, a2: usize) -> (u64, i64) {
+    let n1 = (null_mask >> a1) & 1 != 0;
+    let n2 = (null_mask >> a2) & 1 != 0;
+    let v1 = regs[a1] != 0;
+    let v2 = regs[a2] != 0;
+    let definite_false = (!n1 && !v1) || (!n2 && !v2);
+    let is_null = !definite_false && (n1 || n2);
+    (set_null_bit(null_mask, dst, is_null), if !is_null && v1 && v2 { 1 } else { 0 })
+}
+
+/// SQL 3VL OR: TRUE OR anything = TRUE; FALSE OR NULL = NULL.
+#[inline(always)]
+fn eval_bool_or(null_mask: u64, regs: &[i64], dst: usize, a1: usize, a2: usize) -> (u64, i64) {
+    let n1 = (null_mask >> a1) & 1 != 0;
+    let n2 = (null_mask >> a2) & 1 != 0;
+    let v1 = regs[a1] != 0;
+    let v2 = regs[a2] != 0;
+    let definite_true = (!n1 && v1) || (!n2 && v2);
+    let is_null = !definite_true && (n1 || n2);
+    (set_null_bit(null_mask, dst, is_null), if definite_true { 1 } else { 0 })
+}
+
 // ---------------------------------------------------------------------------
 // ExprProgram — immutable bytecode container
 // ---------------------------------------------------------------------------
@@ -552,26 +576,10 @@ pub fn eval_predicate(
                 };
             }
             EXPR_BOOL_AND => {
-                // SQL 3VL: FALSE AND anything = FALSE; TRUE AND NULL = NULL.
-                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
-                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
-                let v1 = regs[a1 as usize] != 0;
-                let v2 = regs[a2 as usize] != 0;
-                let definite_false = (!n1 && !v1) || (!n2 && !v2);
-                let is_null = !definite_false && (n1 || n2);
-                null_mask = set_null_bit(null_mask, dst, is_null);
-                regs[dst] = if !is_null && v1 && v2 { 1 } else { 0 };
+                (null_mask, regs[dst]) = eval_bool_and(null_mask, &regs, dst, a1 as usize, a2 as usize);
             }
             EXPR_BOOL_OR => {
-                // SQL 3VL: TRUE OR anything = TRUE; FALSE OR NULL = NULL.
-                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
-                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
-                let v1 = regs[a1 as usize] != 0;
-                let v2 = regs[a2 as usize] != 0;
-                let definite_true = (!n1 && v1) || (!n2 && v2);
-                let is_null = !definite_true && (n1 || n2);
-                null_mask = set_null_bit(null_mask, dst, is_null);
-                regs[dst] = if definite_true { 1 } else { 0 };
+                (null_mask, regs[dst]) = eval_bool_or(null_mask, &regs, dst, a1 as usize, a2 as usize);
             }
             EXPR_BOOL_NOT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);
@@ -947,26 +955,10 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_BOOL_AND => {
-                // SQL 3VL: FALSE AND anything = FALSE; TRUE AND NULL = NULL.
-                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
-                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
-                let v1 = regs[a1 as usize] != 0;
-                let v2 = regs[a2 as usize] != 0;
-                let definite_false = (!n1 && !v1) || (!n2 && !v2);
-                let is_null = !definite_false && (n1 || n2);
-                null_mask = set_null_bit(null_mask, dst, is_null);
-                regs[dst] = if !is_null && v1 && v2 { 1 } else { 0 };
+                (null_mask, regs[dst]) = eval_bool_and(null_mask, &regs, dst, a1 as usize, a2 as usize);
             }
             EXPR_BOOL_OR => {
-                // SQL 3VL: TRUE OR anything = TRUE; FALSE OR NULL = NULL.
-                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
-                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
-                let v1 = regs[a1 as usize] != 0;
-                let v2 = regs[a2 as usize] != 0;
-                let definite_true = (!n1 && v1) || (!n2 && v2);
-                let is_null = !definite_true && (n1 || n2);
-                null_mask = set_null_bit(null_mask, dst, is_null);
-                regs[dst] = if definite_true { 1 } else { 0 };
+                (null_mask, regs[dst]) = eval_bool_or(null_mask, &regs, dst, a1 as usize, a2 as usize);
             }
             EXPR_BOOL_NOT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);

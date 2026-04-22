@@ -1181,16 +1181,20 @@ impl Batch {
         if self.consolidated || self.count == 0 {
             return ConsolidatedBatch(self);
         }
+        let already_sorted = self.sorted;
         let mb = self.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
         let mut result = write_to_batch(schema, self.count, blob_cap, |writer| {
-            merge::sort_and_consolidate(&mb, schema, writer);
+            if already_sorted {
+                merge::fold_sorted(&mb, schema, writer);
+            } else {
+                merge::sort_and_consolidate(&mb, schema, writer);
+            }
         });
         result.sorted = true;
         result.consolidated = true;
         result.set_schema(*schema);
         ConsolidatedBatch(result)
-        // self dropped here → buffers recycled to pool
     }
 
     /// Consolidate a borrowed batch if needed. Returns `None` when the batch is already

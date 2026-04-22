@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::sync::Arc;
 
-use super::batch::{Batch, write_to_batch};
+use super::batch::{Batch, write_to_batch, ConsolidatedBatch};
 use super::bloom::BloomFilter;
 use super::columnar;
 use super::error::StorageError;
@@ -76,19 +76,16 @@ impl MemTable {
         }
     }
 
-    /// Append a pre-sorted batch as a new run.
-    pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        debug_assert!(batch.sorted || batch.count <= 1, "upsert_sorted_batch called with unsorted batch");
+    /// Append a consolidated batch as a new run.
+    pub fn upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
+        let batch = batch.into_inner();
         if batch.count == 0 {
             return Ok(());
         }
         self.check_capacity()?;
-
-        // Add all PKs to bloom
         for i in 0..batch.count {
             self.bloom.add(batch.get_pk(i));
         }
-
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();
         self.runs.push(batch);
@@ -348,9 +345,9 @@ mod tests {
         }
     }
 
-    /// Build a sorted Batch from (pk, weight, payload) triples.
-    /// Assumes triples are already sorted by pk.
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
+    /// Build a consolidated Batch from (pk, weight, payload) triples.
+    /// Assumes triples are already sorted by pk with no duplicate (pk, payload) pairs.
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -364,8 +361,7 @@ mod tests {
         }
 
         b.sorted = true;
-        b.consolidated = false;
-        b
+        b.into_consolidated(schema)
     }
 
     #[test]
@@ -649,7 +645,7 @@ mod tests {
     #[test]
     fn batch_clear() {
         let schema = make_u64_i64_schema();
-        let mut batch = make_batch(&schema, &[(10, 1, 100)]);
+        let mut batch = make_batch(&schema, &[(10, 1, 100)]).into_inner();
         assert_eq!(batch.count, 1);
 
         batch.clear();

@@ -454,7 +454,42 @@ pub fn sort_and_consolidate(
         }
     }
 
-    // Flush last pending
+    if pending_weight != 0 {
+        writer.write_row(batch, pending_idx, pending_weight);
+    }
+}
+
+/// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
+/// rows and drop ghosts (net weight == 0). Caller must guarantee sorted input.
+pub fn fold_sorted(
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+) {
+    let n = batch.count;
+    if n == 0 {
+        return;
+    }
+    let mut pending_idx = 0usize;
+    let mut pending_pk = batch.get_pk(0);
+    let mut pending_weight = batch.get_weight(0);
+
+    for pos in 1..n {
+        let cur_pk = batch.get_pk(pos);
+        let same_group = cur_pk == pending_pk
+            && columnar::compare_rows(schema, batch, pending_idx, batch, pos) == Ordering::Equal;
+
+        if same_group {
+            pending_weight += batch.get_weight(pos);
+        } else {
+            if pending_weight != 0 {
+                writer.write_row(batch, pending_idx, pending_weight);
+            }
+            pending_idx = pos;
+            pending_pk = cur_pk;
+            pending_weight = batch.get_weight(pos);
+        }
+    }
     if pending_weight != 0 {
         writer.write_row(batch, pending_idx, pending_weight);
     }
@@ -485,6 +520,7 @@ pub fn scatter_copy(
 /// Sort a single batch by (PK, payload) WITHOUT consolidation.
 /// All N input rows produce N output rows — no weight merging, no ghost elimination.
 /// Duplicate (PK, payload) entries are preserved as separate rows.
+#[allow(dead_code)]
 pub fn sort_only(
     batch: &MemBatch,
     schema: &SchemaDescriptor,

@@ -10,7 +10,7 @@ use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::memtable::MemTable;
-use super::batch::{self, Batch};
+use super::batch::{Batch, ConsolidatedBatch};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
@@ -110,25 +110,6 @@ impl Table {
     }
 
     // ------------------------------------------------------------------
-    // Ingest helpers
-    // ------------------------------------------------------------------
-
-    /// Sort `batch` by (PK, payload) if it is not already marked sorted.
-    /// Returns the batch unchanged if `batch.sorted` or `batch.count <= 1`.
-    fn sort_batch_if_needed(&self, batch: Batch) -> Batch {
-        if batch.sorted || batch.count <= 1 {
-            return batch;
-        }
-        let mb = batch.as_mem_batch();
-        let mut sorted = batch::write_to_batch(
-            &self.schema, batch.count, batch.blob.len().max(1),
-            |w| super::merge::sort_only(&mb, &self.schema, w),
-        );
-        sorted.sorted = true;
-        sorted.set_schema(self.schema);
-        sorted
-    }
-
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
@@ -139,7 +120,7 @@ impl Table {
         if batch.count == 0 {
             return Ok(());
         }
-        let batch = self.sort_batch_if_needed(batch);
+        let consolidated = batch.into_consolidated(&self.schema);
         self.found_source = FoundSource::None;
 
         if self.durable {
@@ -152,7 +133,7 @@ impl Table {
         // The should_flush() pre-check above ensures runs_bytes is either 0
         // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
         // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
-        self.memtable.upsert_sorted_batch(batch)?;
+        self.memtable.upsert_sorted_batch(consolidated)?;
         if self.memtable.should_flush() {
             self.flush()?;
         }
@@ -205,9 +186,9 @@ impl Table {
         let batch = unsafe {
             Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
-        let batch = self.sort_batch_if_needed(batch);
+        let consolidated = batch.into_consolidated(&self.schema);
         let durable = !force_ephemeral && self.durable;
-        match self.memtable.upsert_sorted_batch(batch) {
+        match self.memtable.upsert_sorted_batch(consolidated) {
             Ok(()) => {
                 if self.memtable.should_flush() {
                     self.flush_inner(durable)?;
@@ -219,8 +200,8 @@ impl Table {
                 let batch2 = unsafe {
                     Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
                 };
-                let batch2 = self.sort_batch_if_needed(batch2);
-                self.memtable.upsert_sorted_batch(batch2)?;
+                let consolidated2 = batch2.into_consolidated(&self.schema);
+                self.memtable.upsert_sorted_batch(consolidated2)?;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -469,9 +450,9 @@ impl Table {
         self.memtable.is_empty()
     }
 
-    /// Upsert a pre-sorted batch directly into the memtable (no WAL).
+    /// Upsert a consolidated batch directly into the memtable (no WAL).
     /// Used by the accumulator flush path.
-    pub fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+    pub fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
         self.memtable.upsert_sorted_batch(batch)
     }
 
@@ -844,10 +825,10 @@ mod tests {
         // (bypasses auto-flush so runs_bytes exceeds max_bytes).
         let (fill_ptrs, fill_sizes, fill_count) =
             make_regions(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let mut fill_batch = unsafe {
+        let fill_batch = unsafe {
             Batch::from_regions(&fill_ptrs, &fill_sizes, fill_count as usize, 1)
         };
-        fill_batch.sorted = true;
+        let fill_batch = fill_batch.into_consolidated(&schema);
         t.memtable_upsert_sorted_batch(fill_batch).unwrap();
         // runs_bytes (~120) > max_bytes (40) — next upsert will hit ERR_CAPACITY.
 
