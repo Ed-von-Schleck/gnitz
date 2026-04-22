@@ -403,6 +403,84 @@ class TestIndexSql:
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
 
+    def test_select_where_indexed_col_negative_i64(self, client):
+        """WHERE bigint_col = -N must use the index and find the correct row."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, score BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, -5), (2, -1), (3, 0), (4, 10)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE INDEX ON t(score)", schema_name=sn)
+
+            for pk, val in [(1, -5), (2, -1), (3, 0), (4, 10)]:
+                results = client.execute_sql(
+                    f"SELECT * FROM t WHERE score = {val}", schema_name=sn
+                )
+                assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
+                rows = results[0]["rows"]
+                assert len(rows.batch.pk_lo) == 1, f"expected 1 row for score={val}"
+                assert rows.batch.pk_lo[0] == pk, f"wrong pk for score={val}"
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_score"],
+                      tables=["t"])
+
+    def test_select_where_indexed_col_negative_i32(self, client):
+        """WHERE int_col = -N must use the index and find the correct row (I32)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, score INT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, -100), (2, -1), (3, 0), (4, 100)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE INDEX ON t(score)", schema_name=sn)
+
+            for pk, val in [(1, -100), (2, -1), (3, 0), (4, 100)]:
+                results = client.execute_sql(
+                    f"SELECT * FROM t WHERE score = {val}", schema_name=sn
+                )
+                assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
+                rows = results[0]["rows"]
+                assert len(rows.batch.pk_lo) == 1, f"expected 1 row for score={val}"
+                assert rows.batch.pk_lo[0] == pk, f"wrong pk for score={val}"
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_score"],
+                      tables=["t"])
+
+    def test_select_where_indexed_col_negative_miss(self, client):
+        """WHERE bigint_col = -N returns empty when the value is absent."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+
+            results = client.execute_sql(
+                "SELECT * FROM t WHERE val = -99", schema_name=sn
+            )
+            assert results[0]["type"] == "Rows"
+            assert len(results[0]["rows"].batch.pk_lo) == 0
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # TestIndexIntegrity

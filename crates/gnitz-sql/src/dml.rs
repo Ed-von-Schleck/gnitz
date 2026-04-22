@@ -634,23 +634,63 @@ fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<(u64, u64)> {
 fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-            let is_num = |e: &Expr| matches!(e, Expr::Value(vws) if matches!(vws.value, Value::Number(_, _)));
+            // sqlparser represents negative number literals as UnaryOp(Minus, Number("N")).
+            let is_num_or_neg = |e: &Expr| match e {
+                Expr::Value(vws) => matches!(vws.value, Value::Number(_, _)),
+                Expr::UnaryOp { op: UnaryOperator::Minus, expr } =>
+                    matches!(expr.as_ref(), Expr::Value(vws) if matches!(vws.value, Value::Number(_, _))),
+                _ => false,
+            };
             let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(_), r) if is_num(r) => (left.as_ref(), right.as_ref()),
-                (l, Expr::Identifier(_)) if is_num(l) => (right.as_ref(), left.as_ref()),
+                (Expr::Identifier(_), r) if is_num_or_neg(r) => (left.as_ref(), right.as_ref()),
+                (l, Expr::Identifier(_)) if is_num_or_neg(l) => (right.as_ref(), left.as_ref()),
                 _ => return None,
             };
             let col_name = if let Expr::Identifier(id) = col_expr { &id.value } else { return None; };
-            let n_str = if let Expr::Value(vws) = lit_expr {
-                if let Value::Number(n, _) = &vws.value { n } else { return None; }
-            } else { return None; };
+            // Extract (negated, numeric_string) from the literal side.
+            let (negated, n_str): (bool, &str) = match lit_expr {
+                Expr::Value(vws) => {
+                    if let Value::Number(n, _) = &vws.value { (false, n.as_str()) } else { return None; }
+                }
+                Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                    if let Expr::Value(vws) = expr.as_ref() {
+                        if let Value::Number(n, _) = &vws.value { (true, n.as_str()) } else { return None; }
+                    } else { return None; }
+                }
+                _ => return None,
+            };
             let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
             if schema.columns[col_idx].type_code == TypeCode::U128 {
+                if negated { return None; }
                 let val = n_str.parse::<u128>().ok()?;
                 let (lo, hi) = u128_lo_hi(val);
                 Some((col_idx, lo, hi))
             } else {
-                let key_lo = n_str.parse::<u64>().ok()?;
+                // Secondary indexes store column values as zero-extended LE bytes cast to u64.
+                // For signed types, we must produce the same bit pattern by casting through
+                // the type's unsigned equivalent (not sign-extending to 64 bits).
+                let key_lo = match schema.columns[col_idx].type_code {
+                    TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+                        let neg_buf;
+                        let s: &str = if negated {
+                            neg_buf = format!("-{}", n_str);
+                            &neg_buf
+                        } else {
+                            n_str
+                        };
+                        let v = s.parse::<i64>().ok()?;
+                        match schema.columns[col_idx].type_code {
+                            TypeCode::I8  => (v as i8  as u8)  as u64,
+                            TypeCode::I16 => (v as i16 as u16) as u64,
+                            TypeCode::I32 => (v as i32 as u32) as u64,
+                            _             => v as u64,
+                        }
+                    }
+                    _ => {
+                        if negated { return None; }
+                        n_str.parse::<u64>().ok()?
+                    }
+                };
                 Some((col_idx, key_lo, 0u64))
             }
         }
@@ -1536,5 +1576,91 @@ mod tests {
 
         assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
+    }
+
+    // ------------------------------------------------------------------
+    // try_col_eq_literal — negative signed integer index seek keys
+    // ------------------------------------------------------------------
+
+    fn make_schema_col(tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![
+                col_def("pk",  TypeCode::U64, false),
+                col_def("val", tc, true),
+            ],
+            pk_index: 0,
+        }
+    }
+
+    fn neg_num_expr(n: &str) -> Expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: Value::Number(n.into(), false),
+                span:  sqlparser::tokenizer::Span::empty(),
+            })),
+        }
+    }
+
+    fn eq_expr(col: &str, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(col))),
+            op:   BinaryOperator::Eq,
+            right: Box::new(rhs),
+        }
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i64() {
+        let schema = make_schema_col(TypeCode::I64);
+        let expr = eq_expr("val", neg_num_expr("1"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        // -1i64 as u64 = u64::MAX
+        assert_eq!(result, Some((1, (-1i64) as u64, 0)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i32() {
+        let schema = make_schema_col(TypeCode::I32);
+        let expr = eq_expr("val", neg_num_expr("1"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        // I32 -1 stored as 4 bytes zero-padded → (-1i32 as u32) as u64
+        assert_eq!(result, Some((1, (-1i32 as u32) as u64, 0)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i16() {
+        let schema = make_schema_col(TypeCode::I16);
+        let expr = eq_expr("val", neg_num_expr("1"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        assert_eq!(result, Some((1, (-1i16 as u16) as u64, 0)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i8() {
+        let schema = make_schema_col(TypeCode::I8);
+        let expr = eq_expr("val", neg_num_expr("5"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        assert_eq!(result, Some((1, (-5i8 as u8) as u64, 0)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_positive_i64_still_works() {
+        let schema = make_schema_col(TypeCode::I64);
+        let expr = eq_expr("val", Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::Number("42".into(), false),
+            span:  sqlparser::tokenizer::Span::empty(),
+        }));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        assert_eq!(result, Some((1, 42u64, 0)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_u64_returns_none() {
+        // Cannot have a negative value for an unsigned column.
+        let schema = make_schema_col(TypeCode::U64);
+        let expr = eq_expr("val", neg_num_expr("1"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        assert_eq!(result, None);
     }
 }

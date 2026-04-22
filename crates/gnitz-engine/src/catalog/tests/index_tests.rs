@@ -254,6 +254,73 @@ fn test_seek_by_index_not_found() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── Regression: negative I64 index key storage and retrieval ────────
+
+#[test]
+fn test_seek_by_index_negative_i64() {
+    let dir = temp_dir("catalog_seekidx_neg_i64");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i64_col_def("score")];
+    let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    engine.create_index("public.t", "score", false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u64((-5i64) as u64); bb.end_row();
+    bb.begin_row(2, 0, 1); bb.put_u64((-1i64) as u64); bb.end_row();
+    bb.begin_row(3, 0, 1); bb.put_u64(0); bb.end_row();
+    bb.begin_row(4, 0, 1); bb.put_u64(10); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Index stores I64 values as their raw bit pattern (2's complement).
+    let result = engine.seek_by_index(tid, 1, (-1i64) as u64, 0).unwrap();
+    assert!(result.is_some(), "index must find row with score=-1");
+    assert_eq!(result.unwrap().get_pk(0), 2);
+
+    let result2 = engine.seek_by_index(tid, 1, (-5i64) as u64, 0).unwrap();
+    assert!(result2.is_some(), "index must find row with score=-5");
+    assert_eq!(result2.unwrap().get_pk(0), 1);
+
+    let result3 = engine.seek_by_index(tid, 1, 10, 0).unwrap();
+    assert!(result3.is_some(), "index must still find positive values");
+    assert_eq!(result3.unwrap().get_pk(0), 4);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Regression: negative I32 index key storage and retrieval ────────
+
+#[test]
+fn test_seek_by_index_negative_i32() {
+    let dir = temp_dir("catalog_seekidx_neg_i32");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i32_col_def("score")];
+    let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    engine.create_index("public.t", "score", false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1, 0, 1); bb.put_u32((-1i32) as u32); bb.end_row();
+    bb.begin_row(2, 0, 1); bb.put_u32((-100i32) as u32); bb.end_row();
+    bb.begin_row(3, 0, 1); bb.put_u32(42u32); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // I32 values are zero-extended to u64 in the index (NOT sign-extended).
+    let result = engine.seek_by_index(tid, 1, (-1i32) as u32 as u64, 0).unwrap();
+    assert!(result.is_some(), "index must find row with score=-1");
+    assert_eq!(result.unwrap().get_pk(0), 1);
+
+    let result2 = engine.seek_by_index(tid, 1, (-100i32) as u32 as u64, 0).unwrap();
+    assert!(result2.is_some(), "index must find row with score=-100");
+    assert_eq!(result2.unwrap().get_pk(0), 2);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── Regression: small-column index projection (bug #1) ────────────
 
 #[test]
