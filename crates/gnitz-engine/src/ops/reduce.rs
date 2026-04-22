@@ -2,7 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{Batch, MemBatch, ReadCursor};
+use crate::storage::{Batch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
 
 use super::util::{
     consolidate_owned, append_cursor_row_to_batch, write_string_from_batch, payload_idx,
@@ -449,11 +449,10 @@ fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
         }
     });
 
-    // Scatter-copy in sorted order
-    let mut output = Batch::with_schema(*schema, n);
-    for &idx in &indices {
-        output.append_batch(batch, idx as usize, idx as usize + 1);
-    }
+    let blob_cap = mb.blob.len().max(1);
+    let mut output = write_to_batch(schema, n, blob_cap, |writer| {
+        scatter_copy(&mb, &indices, &[], writer);
+    });
     output.sorted = true;
     output
 }

@@ -11,7 +11,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::storage::partition_for_key;
-use crate::ops::worker_for_partition_pub;
+use crate::ops::worker_for_partition;
 use crate::ipc::{
     self, SAL_MMAP_SIZE, STATUS_OK, STATUS_ERROR,
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
@@ -496,7 +496,7 @@ impl WorkerProcess {
         let nw = self.num_workers;
         let mut indices: Vec<u32> = Vec::new();
         for i in 0..n {
-            if worker_for_partition_pub(partition_for_key(batch.get_pk(i)), nw) == wid {
+            if worker_for_partition(partition_for_key(batch.get_pk(i)), nw) == wid {
                 indices.push(i as u32);
             }
         }
@@ -1027,7 +1027,7 @@ mod tests {
             // Every row in the filtered batch must belong to this worker.
             for i in 0..filtered.count {
                 let part = partition_for_key(filtered.get_pk(i));
-                assert_eq!(worker_for_partition_pub(part, nw), wid as usize);
+                assert_eq!(worker_for_partition(part, nw), wid as usize);
             }
             total += filtered.count;
         }

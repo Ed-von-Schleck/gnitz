@@ -19,7 +19,7 @@ use crate::reactor::PendingRelay;
 use crate::storage::{Batch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter,
-    worker_for_partition_pub,
+    worker_for_partition,
 };
 
 // ---------------------------------------------------------------------------
@@ -591,7 +591,7 @@ impl MasterDispatcher {
     ) -> Result<Option<Batch>, String> {
         let worker = unsafe {
             let pk = crate::util::make_pk(pk_lo, pk_hi);
-            worker_for_partition_pub(partition_for_key(pk), (*disp_ptr).num_workers)
+            worker_for_partition(partition_for_key(pk), (*disp_ptr).num_workers)
         };
         single_worker_async(disp_ptr, reactor, target_id, FLAG_SEEK,
                             worker, pk_lo, pk_hi, 0, "seek").await

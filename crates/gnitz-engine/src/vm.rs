@@ -2238,6 +2238,8 @@ mod tests {
             const_strings: vec![],
             const_prefixes: vec![],
             const_lengths: vec![],
+            payload_col_sizes: vec![],
+            payload_col_type_codes: vec![],
         };
 
         let func = Box::new(ScalarFuncKind::Plan(

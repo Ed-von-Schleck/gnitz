@@ -30,13 +30,9 @@ fn build_w_map(num_workers: usize) -> [usize; 256] {
 }
 
 #[inline]
-fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
+pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
     let chunk = 256 / num_workers;
     (partition / chunk).min(num_workers - 1)
-}
-
-pub fn worker_for_partition_pub(partition: usize, num_workers: usize) -> usize {
-    worker_for_partition(partition, num_workers)
 }
 
 // ---------------------------------------------------------------------------

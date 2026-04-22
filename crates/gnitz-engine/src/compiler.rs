@@ -905,10 +905,12 @@ fn create_expr_predicate(
     result_reg: i64,
     const_strings: Vec<Vec<u8>>,
     pk_index: u32,
+    schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let prog = ExprProgram::new(code, num_regs as u32, result_reg as u32, const_strings);
+    let mut prog = ExprProgram::new(code, num_regs as u32, result_reg as u32, const_strings);
+    prog.set_payload_col_info(schema);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
@@ -920,10 +922,12 @@ fn create_expr_map(
     num_regs: i64,
     const_strings: Vec<Vec<u8>>,
     pk_index: u32,
+    schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let prog = ExprProgram::new(code, num_regs as u32, 0, const_strings);
+    let mut prog = ExprProgram::new(code, num_regs as u32, 0, const_strings);
+    prog.set_payload_col_info(schema);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
@@ -1059,7 +1063,7 @@ fn emit_node(
                 let result_reg = node_params.get(&PARAM_EXPR_RESULT_REG).copied().unwrap_or(0);
                 let code = extract_map_code(&node_params);
                 let const_strings = extract_const_strings(&graph.str_params, nid);
-                create_expr_predicate(code, num_regs, result_reg, const_strings, in_schema.pk_index, owned_expr_progs, owned_funcs)
+                create_expr_predicate(code, num_regs, result_reg, const_strings, in_schema.pk_index, &in_schema, owned_expr_progs, owned_funcs)
             } else {
                 null_func_ptr()
             };
@@ -1093,7 +1097,7 @@ fn emit_node(
             let (func_ptr, node_schema) = if has_expr_code {
                 let code = extract_map_code(&node_params);
                 let const_strings = extract_const_strings(&graph.str_params, nid);
-                let fp = create_expr_map(code, num_regs, const_strings, in_reg_schema.pk_index, owned_expr_progs, owned_funcs);
+                let fp = create_expr_map(code, num_regs, const_strings, in_reg_schema.pk_index, &in_reg_schema, owned_expr_progs, owned_funcs);
                 let schema = if reindex_col_check >= 0 {
                     // Reindex MAP: output has synthetic PK + all input cols
                     let mut s = empty_schema();

@@ -88,64 +88,7 @@ fn extract_gc_u64(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u64 {
-    let pki = schema.pk_index as usize;
-    if group_by_cols.len() == 1 {
-        let c_idx = group_by_cols[0] as usize;
-        let tc = schema.columns[c_idx].type_code;
-        if tc != type_code::U128 && tc != type_code::STRING
-            && tc != type_code::F32 && tc != type_code::F64
-        {
-            let pi = payload_idx(c_idx, pki);
-            let cs = crate::schema::type_size(tc) as usize;
-            let ptr = mb.get_col_ptr(row, pi, cs);
-            let mut buf = [0u8; 8];
-            buf[..cs].copy_from_slice(ptr);
-            return u64::from_le_bytes(buf);
-        }
-    }
-    // Fallback: use extract_group_key from reduce (duplicate inline here)
-    // For index.rs we only need the lo part.
-    use crate::schema::type_code::STRING as TYPE_STRING;
-    use crate::schema::SHORT_STRING_THRESHOLD;
-    use crate::xxh;
-
-    #[inline]
-    fn mix64(mut v: u64) -> u64 {
-        v ^= v >> 33;
-        v = v.wrapping_mul(0xFF51AFD7ED558CCD);
-        v ^= v >> 33;
-        v = v.wrapping_mul(0xC4CEB9FE1A85EC53);
-        v ^= v >> 33;
-        v
-    }
-
-    let mut h: u64 = 0x9E3779B97F4A7C15;
-    for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
-        let c_idx = c_idx_u32 as usize;
-        let tc = schema.columns[c_idx].type_code;
-        let col_hash = if tc == TYPE_STRING {
-            let pi = payload_idx(c_idx, pki);
-            let struct_bytes = mb.get_col_ptr(row, pi, 16);
-            let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-            if length == 0 {
-                0u64
-            } else if length <= SHORT_STRING_THRESHOLD {
-                xxh::checksum(&struct_bytes[4..4 + length])
-            } else {
-                let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
-            }
-        } else {
-            let pi = payload_idx(c_idx, pki);
-            let cs = schema.columns[c_idx].size as usize;
-            let ptr = mb.get_col_ptr(row, pi, cs);
-            let mut buf = [0u8; 8];
-            buf[..cs].copy_from_slice(ptr);
-            mix64(u64::from_le_bytes(buf))
-        };
-        h = mix64(h ^ col_hash ^ (i as u64));
-    }
-    h
+    super::util::extract_group_key(mb, row, schema, group_by_cols).0
 }
 
 // ---------------------------------------------------------------------------

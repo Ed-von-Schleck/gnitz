@@ -3,7 +3,7 @@
 //! Evaluates compiled expression programs against columnar batch rows.
 
 use crate::schema::{
-    compare_german_strings, german_string_tail,
+    compare_german_strings, german_string_tail, SchemaDescriptor, type_code as tc,
 };
 use crate::storage::MemBatch;
 use crate::util::read_u32_le;
@@ -59,6 +59,12 @@ pub struct ExprProgram {
     pub const_strings: Vec<Vec<u8>>,
     pub const_prefixes: Vec<u32>,
     pub const_lengths: Vec<u32>,
+    /// Byte size of each physical payload column (indexed by payload_col).
+    /// Empty in legacy mode — callers that set this via set_payload_col_info
+    /// get correct narrow-type (TINYINT/SMALLINT/INT) handling.
+    pub payload_col_sizes: Vec<u8>,
+    /// Type code of each physical payload column (same indexing as payload_col_sizes).
+    pub payload_col_type_codes: Vec<u8>,
 }
 
 impl ExprProgram {
@@ -102,6 +108,8 @@ impl ExprProgram {
             const_strings,
             const_prefixes,
             const_lengths,
+            payload_col_sizes: Vec::new(),
+            payload_col_type_codes: Vec::new(),
         }
     }
 }
@@ -154,6 +162,19 @@ impl ExprProgram {
             }
         }
     }
+
+    /// Populate payload column size and type-code tables from a schema.
+    /// Must be called before `eval_predicate` / `eval_with_emit` when the
+    /// program contains `EXPR_LOAD_PAYLOAD_INT` or `EXPR_LOAD_PAYLOAD_FLOAT`
+    /// instructions referencing narrow-type columns (TINYINT / SMALLINT / INT).
+    pub fn set_payload_col_info(&mut self, schema: &SchemaDescriptor) {
+        self.payload_col_sizes.clear();
+        self.payload_col_type_codes.clear();
+        for (_, _, col) in schema.payload_columns() {
+            self.payload_col_sizes.push(col.size);
+            self.payload_col_type_codes.push(col.type_code);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +219,18 @@ fn read_col_float(batch: &MemBatch, row: usize, col_idx: usize, pk_index: usize)
         let ptr = batch.get_col_ptr(row, pi, 8);
         // Raw bytes — already in float bit representation
         i64::from_le_bytes(ptr.try_into().unwrap())
+    }
+}
+
+/// Read a physical payload column value with correct sign/zero extension for narrow types.
+#[inline]
+fn read_payload_as_i64(bytes: &[u8], size: usize, type_code: u8) -> i64 {
+    if matches!(type_code, tc::I8 | tc::I16 | tc::I32 | tc::I64) {
+        crate::schema::read_signed(bytes, size)
+    } else {
+        let mut buf = [0u8; 8];
+        buf[..size].copy_from_slice(bytes);
+        i64::from_le_bytes(buf)
     }
 }
 
@@ -272,20 +305,8 @@ fn col_string_equals_const(
     const_prefix: u32,
     const_len: u32,
 ) -> bool {
-    let col_len = read_u32_le(struct_bytes, 0) as usize;
-    let c_len = const_len as usize;
-    if col_len != c_len {
-        return false;
-    }
-    // Prefix comparison using the same BE encoding as compute_prefix.
-    let col_prefix = u32::from_be_bytes(struct_bytes[4..8].try_into().unwrap());
-    if col_prefix != const_prefix {
-        return false;
-    }
-    if col_len <= 4 {
-        return true;
-    }
-    german_string_tail(struct_bytes, blob, col_len, col_len) == &const_bytes[4..col_len]
+    compare_col_string_vs_const(struct_bytes, blob, const_bytes, const_prefix, const_len)
+        == std::cmp::Ordering::Equal
 }
 
 // ---------------------------------------------------------------------------
@@ -316,11 +337,35 @@ pub fn eval_predicate(
         match op {
             // Resolved opcodes: emitted by resolve_column_indices.
             // Physical payload index is already in a1 — no pk_index branch.
-            EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
+            EXPR_LOAD_PAYLOAD_INT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                let ptr = batch.get_col_ptr(row, pi, 8);
-                regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                if prog.payload_col_sizes.is_empty() {
+                    let ptr = batch.get_col_ptr(row, pi, 8);
+                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                } else {
+                    let col_size = prog.payload_col_sizes[pi] as usize;
+                    let col_tc = prog.payload_col_type_codes[pi];
+                    let ptr = batch.get_col_ptr(row, pi, col_size);
+                    regs[dst] = read_payload_as_i64(ptr, col_size, col_tc);
+                }
+            }
+            EXPR_LOAD_PAYLOAD_FLOAT => {
+                let pi = a1 as usize;
+                null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
+                if prog.payload_col_sizes.is_empty() {
+                    let ptr = batch.get_col_ptr(row, pi, 8);
+                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                } else {
+                    let col_size = prog.payload_col_sizes[pi] as usize;
+                    let ptr = batch.get_col_ptr(row, pi, col_size);
+                    regs[dst] = if col_size == 4 {
+                        let bits = u32::from_le_bytes(ptr.try_into().unwrap());
+                        float_to_bits(f32::from_bits(bits) as f64)
+                    } else {
+                        i64::from_le_bytes(ptr.try_into().unwrap())
+                    };
+                }
             }
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
@@ -339,6 +384,7 @@ pub fn eval_predicate(
             }
             EXPR_LOAD_CONST => {
                 null_mask &= !(1u64 << dst);
+                // a1 = low 32 bits (sign-extended i64), a2 = high 32 bits.
                 regs[dst] = (a2 << 32) | (a1 & 0xFFFF_FFFF);
             }
             EXPR_INT_ADD => {
@@ -494,20 +540,26 @@ pub fn eval_predicate(
                 };
             }
             EXPR_BOOL_AND => {
-                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
-                regs[dst] = if regs[a1 as usize] != 0 && regs[a2 as usize] != 0 {
-                    1
-                } else {
-                    0
-                };
+                // SQL 3VL: FALSE AND anything = FALSE; TRUE AND NULL = NULL.
+                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
+                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
+                let v1 = regs[a1 as usize] != 0;
+                let v2 = regs[a2 as usize] != 0;
+                let definite_false = (!n1 && !v1) || (!n2 && !v2);
+                let is_null = !definite_false && (n1 || n2);
+                null_mask = set_null_bit(null_mask, dst, is_null);
+                regs[dst] = if !is_null && v1 && v2 { 1 } else { 0 };
             }
             EXPR_BOOL_OR => {
-                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
-                regs[dst] = if regs[a1 as usize] != 0 || regs[a2 as usize] != 0 {
-                    1
-                } else {
-                    0
-                };
+                // SQL 3VL: TRUE OR anything = TRUE; FALSE OR NULL = NULL.
+                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
+                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
+                let v1 = regs[a1 as usize] != 0;
+                let v2 = regs[a2 as usize] != 0;
+                let definite_true = (!n1 && v1) || (!n2 && v2);
+                let is_null = !definite_true && (n1 || n2);
+                null_mask = set_null_bit(null_mask, dst, is_null);
+                regs[dst] = if definite_true { 1 } else { 0 };
             }
             EXPR_BOOL_NOT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);
@@ -515,6 +567,9 @@ pub fn eval_predicate(
             }
             EXPR_IS_NULL => {
                 null_mask &= !(1u64 << dst);
+                // a1 is intentionally a logical column index: is_col_null handles
+                // the logical→physical mapping internally. Unlike LOAD_COL_INT, these
+                // opcodes are NOT remapped by resolve_column_indices.
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     1
                 } else {
@@ -697,11 +752,35 @@ pub fn eval_with_emit(
                 // Handled at batch level
             }
             // Resolved opcodes (set by resolve_column_indices):
-            EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
+            EXPR_LOAD_PAYLOAD_INT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                let ptr = batch.get_col_ptr(row, pi, 8);
-                regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                if prog.payload_col_sizes.is_empty() {
+                    let ptr = batch.get_col_ptr(row, pi, 8);
+                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                } else {
+                    let col_size = prog.payload_col_sizes[pi] as usize;
+                    let col_tc = prog.payload_col_type_codes[pi];
+                    let ptr = batch.get_col_ptr(row, pi, col_size);
+                    regs[dst] = read_payload_as_i64(ptr, col_size, col_tc);
+                }
+            }
+            EXPR_LOAD_PAYLOAD_FLOAT => {
+                let pi = a1 as usize;
+                null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
+                if prog.payload_col_sizes.is_empty() {
+                    let ptr = batch.get_col_ptr(row, pi, 8);
+                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
+                } else {
+                    let col_size = prog.payload_col_sizes[pi] as usize;
+                    let ptr = batch.get_col_ptr(row, pi, col_size);
+                    regs[dst] = if col_size == 4 {
+                        let bits = u32::from_le_bytes(ptr.try_into().unwrap());
+                        float_to_bits(f32::from_bits(bits) as f64)
+                    } else {
+                        i64::from_le_bytes(ptr.try_into().unwrap())
+                    };
+                }
             }
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
@@ -720,6 +799,7 @@ pub fn eval_with_emit(
             }
             EXPR_LOAD_CONST => {
                 null_mask &= !(1u64 << dst);
+                // a1 = low 32 bits (sign-extended i64), a2 = high 32 bits.
                 regs[dst] = (a2 << 32) | (a1 & 0xFFFF_FFFF);
             }
             EXPR_INT_ADD => {
@@ -875,20 +955,26 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_BOOL_AND => {
-                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
-                regs[dst] = if regs[a1 as usize] != 0 && regs[a2 as usize] != 0 {
-                    1
-                } else {
-                    0
-                };
+                // SQL 3VL: FALSE AND anything = FALSE; TRUE AND NULL = NULL.
+                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
+                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
+                let v1 = regs[a1 as usize] != 0;
+                let v2 = regs[a2 as usize] != 0;
+                let definite_false = (!n1 && !v1) || (!n2 && !v2);
+                let is_null = !definite_false && (n1 || n2);
+                null_mask = set_null_bit(null_mask, dst, is_null);
+                regs[dst] = if !is_null && v1 && v2 { 1 } else { 0 };
             }
             EXPR_BOOL_OR => {
-                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
-                regs[dst] = if regs[a1 as usize] != 0 || regs[a2 as usize] != 0 {
-                    1
-                } else {
-                    0
-                };
+                // SQL 3VL: TRUE OR anything = TRUE; FALSE OR NULL = NULL.
+                let n1 = (null_mask >> (a1 as usize)) & 1 != 0;
+                let n2 = (null_mask >> (a2 as usize)) & 1 != 0;
+                let v1 = regs[a1 as usize] != 0;
+                let v2 = regs[a2 as usize] != 0;
+                let definite_true = (!n1 && v1) || (!n2 && v2);
+                let is_null = !definite_true && (n1 || n2);
+                null_mask = set_null_bit(null_mask, dst, is_null);
+                regs[dst] = if definite_true { 1 } else { 0 };
             }
             EXPR_BOOL_NOT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);
@@ -896,6 +982,9 @@ pub fn eval_with_emit(
             }
             EXPR_IS_NULL => {
                 null_mask &= !(1u64 << dst);
+                // a1 is intentionally a logical column index: is_col_null handles
+                // the logical→physical mapping internally. Unlike LOAD_COL_INT, these
+                // opcodes are NOT remapped by resolve_column_indices.
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     1
                 } else {
@@ -1963,6 +2052,72 @@ mod tests {
                 col_s, const_s, expected_lt, val != 0
             );
         }
+    }
+
+    // SQL three-valued logic (3VL) tests for BOOL_AND and BOOL_OR.
+    // SQL requires NULL AND FALSE = FALSE and NULL OR TRUE = TRUE,
+    // which is stricter than pure null propagation.
+    #[test]
+    fn test_bool_and_or_three_valued_logic() {
+        // Schema: pk(U64), col1(I64), col2(I64) — both nullable
+        let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+        // null_word bits: bit 0 = col1 null, bit 1 = col2 null
+        let batch = make_int_batch(&schema, &[
+            (1, 1, 0, &[1, 0]), // row0: T, F
+            (2, 1, 0, &[0, 1]), // row1: F, T
+            (3, 1, 2, &[1, 0]), // row2: T, NULL
+            (4, 1, 2, &[0, 0]), // row3: F, NULL
+            (5, 1, 1, &[0, 1]), // row4: NULL, T
+            (6, 1, 1, &[0, 0]), // row5: NULL, F
+            (7, 1, 3, &[0, 0]), // row6: NULL, NULL
+        ]);
+        let mb = batch.as_mem_batch();
+
+        let and_code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_COL_INT, 1, 2, 0,
+            EXPR_BOOL_AND, 2, 0, 1,
+        ];
+        let and_prog = ExprProgram::new(and_code, 3, 2, vec![]);
+
+        let or_code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_COL_INT, 1, 2, 0,
+            EXPR_BOOL_OR, 2, 0, 1,
+        ];
+        let or_prog = ExprProgram::new(or_code, 3, 2, vec![]);
+
+        // AND cases
+        let (v, n) = eval_predicate(&and_prog, &mb, 0, 0);
+        assert_eq!(v, 0, "T AND F = F"); assert!(!n);
+        let (v, n) = eval_predicate(&and_prog, &mb, 1, 0);
+        assert_eq!(v, 0, "F AND T = F"); assert!(!n);
+        let (_, n) = eval_predicate(&and_prog, &mb, 2, 0);
+        assert!(n, "T AND NULL = NULL");
+        let (v, n) = eval_predicate(&and_prog, &mb, 3, 0);
+        assert_eq!(v, 0, "F AND NULL = F"); assert!(!n, "F AND NULL must not be null (SQL 3VL)");
+        let (_, n) = eval_predicate(&and_prog, &mb, 4, 0);
+        assert!(n, "NULL AND T = NULL");
+        let (v, n) = eval_predicate(&and_prog, &mb, 5, 0);
+        assert_eq!(v, 0, "NULL AND F = F"); assert!(!n, "NULL AND F must not be null (SQL 3VL)");
+        let (_, n) = eval_predicate(&and_prog, &mb, 6, 0);
+        assert!(n, "NULL AND NULL = NULL");
+
+        // OR cases
+        let (v, n) = eval_predicate(&or_prog, &mb, 0, 0);
+        assert_eq!(v, 1, "T OR F = T"); assert!(!n);
+        let (v, n) = eval_predicate(&or_prog, &mb, 1, 0);
+        assert_eq!(v, 1, "F OR T = T"); assert!(!n);
+        let (v, n) = eval_predicate(&or_prog, &mb, 2, 0);
+        assert_eq!(v, 1, "T OR NULL = T"); assert!(!n, "T OR NULL must not be null (SQL 3VL)");
+        let (_, n) = eval_predicate(&or_prog, &mb, 3, 0);
+        assert!(n, "F OR NULL = NULL");
+        let (v, n) = eval_predicate(&or_prog, &mb, 4, 0);
+        assert_eq!(v, 1, "NULL OR T = T"); assert!(!n, "NULL OR T must not be null (SQL 3VL)");
+        let (_, n) = eval_predicate(&or_prog, &mb, 5, 0);
+        assert!(n, "NULL OR F = NULL");
+        let (_, n) = eval_predicate(&or_prog, &mb, 6, 0);
+        assert!(n, "NULL OR NULL = NULL");
     }
 
     #[test]

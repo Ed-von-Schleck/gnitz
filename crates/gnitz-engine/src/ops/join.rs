@@ -151,7 +151,7 @@ fn semi_join_dt_swapped(
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
 
     let con_pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
-    let mut last_pk: u128 = u128::MAX;
+    let mut last_pk: Option<u128> = None;
 
     while cursor.valid {
         let t_pk = crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi);
@@ -163,7 +163,7 @@ fn semi_join_dt_swapped(
 
         // Skip duplicate PKs in trace (different payloads) — delta indices
         // were already pushed for the first occurrence of this PK.
-        if t_pk == last_pk {
+        if last_pk == Some(t_pk) {
             cursor.advance();
             continue;
         }
@@ -175,7 +175,7 @@ fn semi_join_dt_swapped(
             emit_indices.push(j as u32);
             j += 1;
         }
-        last_pk = t_pk;
+        last_pk = Some(t_pk);
         cursor.advance();
     }
 
@@ -1278,6 +1278,35 @@ mod tests {
     // -----------------------------------------------------------------------
     // Fix 4: Semi-join DT swapped weight inflation
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Fix: u128::MAX sentinel in semi_join_dt_swapped
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_semi_join_dt_swapped_max_pk() {
+        use std::sync::Arc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: PK=u64::MAX with positive weight — previously the sentinel
+        // last_pk = u128::MAX would match this on first occurrence and skip it.
+        let max_pk = u64::MAX;
+        let trace = Arc::new(make_batch(&schema, &[(max_pk, 1, 0)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Build 25 delta rows so n > trace_len triggers swapped path
+        let mut rows: Vec<(u64, i64, i64)> = (1u64..=24).map(|i| (i, 1, i as i64)).collect();
+        rows.push((max_pk, 1, 0));
+        rows.sort_by_key(|r| r.0);
+        let delta = make_batch(&schema, &rows);
+
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        // Only PK=u64::MAX from delta matches — must emit exactly 1 row
+        assert_eq!(out.count, 1, "PK=u64::MAX must match on swapped path");
+        assert_eq!((out.get_pk(0) as u64), max_pk);
+    }
 
     #[test]
     fn test_semi_join_dt_swapped_no_weight_inflation() {

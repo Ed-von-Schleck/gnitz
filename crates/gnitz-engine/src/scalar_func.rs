@@ -335,9 +335,14 @@ impl Plan {
                 let pki = schema.pk_index as usize;
                 if *is_float {
                     let pi = if ci < pki { ci } else { ci - 1 };
-                    let ptr = batch.get_col_ptr(row, pi, 8);
-                    let bits = i64::from_le_bytes(ptr.try_into().unwrap());
-                    let val = f64::from_ne_bytes(bits.to_ne_bytes());
+                    let col_size = schema.columns[ci].size as usize;
+                    let ptr = batch.get_col_ptr(row, pi, col_size);
+                    let val = if col_size == 4 {
+                        f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
+                    } else {
+                        let bits = i64::from_le_bytes(ptr.try_into().unwrap());
+                        f64::from_ne_bytes(bits.to_ne_bytes())
+                    };
                     let con = f64::from_ne_bytes((*val_bits as i64).to_ne_bytes());
                     match *op {
                         OP_EQ => val == con,
@@ -350,8 +355,17 @@ impl Plan {
                         batch.get_pk(row) as i64
                     } else {
                         let pi = if ci < pki { ci } else { ci - 1 };
-                        let ptr = batch.get_col_ptr(row, pi, 8);
-                        i64::from_le_bytes(ptr.try_into().unwrap())
+                        let col_size = schema.columns[ci].size as usize;
+                        let ptr = batch.get_col_ptr(row, pi, col_size);
+                        if matches!(schema.columns[ci].type_code,
+                            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
+                        {
+                            crate::schema::read_signed(ptr, col_size)
+                        } else {
+                            let mut buf = [0u8; 8];
+                            buf[..col_size].copy_from_slice(ptr);
+                            i64::from_le_bytes(buf)
+                        }
                     };
                     let con = *val_bits as i64;
                     match *op {

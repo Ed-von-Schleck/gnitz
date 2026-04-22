@@ -176,13 +176,16 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                     || col.type_code == type_code::I16
                     || col.type_code == type_code::I8
                 {
-                    let c_v = i64::from_le_bytes(c_bytes.try_into().unwrap());
-                    let b_v = i64::from_le_bytes(b_bytes.try_into().unwrap());
+                    let c_v = crate::schema::read_signed(c_bytes, cs);
+                    let b_v = crate::schema::read_signed(b_bytes, cs);
                     c_v.cmp(&b_v)
                 } else {
-                    let c_v = u64::from_le_bytes(c_bytes.try_into().unwrap());
-                    let b_v = u64::from_le_bytes(b_bytes.try_into().unwrap());
-                    c_v.cmp(&b_v)
+                    // Unsigned: zero-extend to u64 for any column width (1/2/4/8 bytes).
+                    let mut c_buf = [0u8; 8];
+                    let mut b_buf = [0u8; 8];
+                    c_buf[..cs].copy_from_slice(c_bytes);
+                    b_buf[..cs].copy_from_slice(b_bytes);
+                    u64::from_le_bytes(c_buf).cmp(&u64::from_le_bytes(b_buf))
                 }
             }
         };

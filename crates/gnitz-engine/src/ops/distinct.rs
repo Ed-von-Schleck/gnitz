@@ -167,6 +167,121 @@ mod tests {
         assert_eq!(out2.get_weight(0), -1);
     }
 
+    fn make_schema_u64_i32() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::I32, size: 4, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_schema_u64_i16() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::I16, size: 2, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_schema_u64_i8() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::I8, size: 1, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_batch_narrow<const N: usize>(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, i64)],
+    ) -> Batch {
+        let n = rows.len();
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        let col_size = N;
+        for &(pk, w, val) in rows {
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes()[..col_size]);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    // Regression tests for compare_cursor_payload_to_batch_row with sub-64-bit
+    // integer payload columns. Previously panicked on try_into().unwrap() because
+    // the slice had fewer than 8 bytes.
+
+    #[test]
+    fn test_distinct_i32_payload_no_panic() {
+        use std::sync::Arc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_i32();
+        let trace = Arc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Delta: same (PK=1, val=42) → stays +1 → no output
+        let delta = make_batch_narrow::<4>(&schema, &[(1, 1, 42)]);
+        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "I32: matching (PK,payload) should produce no output");
+
+        // New (PK=1, val=99) → new element → +1 output
+        let mut ch2 = CursorHandle::from_owned(
+            &[Arc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))],
+            schema,
+        );
+        let delta2 = make_batch_narrow::<4>(&schema, &[(1, 1, 99)]);
+        let (out2, _) = op_distinct(&delta2, ch2.cursor_mut(), &schema);
+        assert_eq!(out2.count, 1, "I32: new (PK,payload) should produce +1");
+    }
+
+    #[test]
+    fn test_distinct_i16_payload_no_panic() {
+        use std::sync::Arc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_i16();
+        let trace = Arc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        let delta = make_batch_narrow::<2>(&schema, &[(5, 1, -100)]);
+        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "I16: matching (PK,payload) should produce no output");
+    }
+
+    #[test]
+    fn test_distinct_i8_payload_no_panic() {
+        use std::sync::Arc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_i8();
+        let trace = Arc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        let delta = make_batch_narrow::<1>(&schema, &[(7, 1, -1)]);
+        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "I8: matching (PK,payload) should produce no output");
+    }
+
     #[test]
     fn test_op_distinct_consolidated_flag() {
         use std::sync::Arc;
