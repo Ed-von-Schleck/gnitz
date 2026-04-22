@@ -656,9 +656,9 @@ async fn handle_scan(
     // is_empty() re-check closes the race.
     loop {
         let snapshot: Vec<i64> = {
-            let tr = shared.tick_rows.borrow();
-            if tr.is_empty() { break; }
-            tr.keys().copied().collect()
+            let tids = shared.tick_tids.borrow();
+            if tids.is_empty() { break; }
+            tids.clone()
         };
         let (tx, rx) = oneshot::channel::<()>();
         shared.tick_tx.send(TickTrigger::Drain {
@@ -884,6 +884,61 @@ fn validate_schema_match(
                 i, expected.columns[i].type_code, wire.columns[i].type_code,
             ));
         }
+        if wire.columns[i].nullable != expected.columns[i].nullable {
+            return Err(format!(
+                "Schema mismatch at column {}: expected nullable={}, got {}",
+                i, expected.columns[i].nullable, wire.columns[i].nullable,
+            ));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{SchemaColumn, type_code};
+
+    fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
+        let mut sd = SchemaDescriptor::default();
+        sd.num_columns = 2;
+        sd.pk_index = 0;
+        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
+        sd.columns[1] = SchemaColumn::new(type_code::I64, col1_nullable);
+        sd
+    }
+
+    #[test]
+    fn validate_schema_match_ok() {
+        let sd = two_col_schema(0);
+        assert!(validate_schema_match(&sd, &sd).is_ok());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_column_count_mismatch() {
+        let mut wire = two_col_schema(0);
+        wire.num_columns = 1;
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_pk_index_mismatch() {
+        let mut wire = two_col_schema(0);
+        wire.pk_index = 1;
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_type_code_mismatch() {
+        let mut wire = two_col_schema(0);
+        wire.columns[1].type_code = type_code::F64;
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_nullable_mismatch() {
+        let wire     = two_col_schema(0); // col1 not-nullable
+        let expected = two_col_schema(1); // col1 nullable
+        assert!(validate_schema_match(&wire, &expected).is_err());
+    }
 }

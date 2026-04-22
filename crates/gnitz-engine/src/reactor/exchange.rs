@@ -20,10 +20,14 @@ use crate::storage::Batch;
 /// because `worker_watcher` (executor.rs) triggers reactor shutdown on
 /// any worker crash, tearing down all parked tasks.
 pub struct ExchangeAccumulator {
-    payloads: HashMap<(i64, i64), Vec<Option<Batch>>>,
-    counts:   HashMap<(i64, i64), usize>,
-    schemas:  HashMap<(i64, i64), SchemaDescriptor>,
+    rounds: HashMap<(i64, i64), ExchangeRound>,
     nw: usize,
+}
+
+struct ExchangeRound {
+    payloads: Vec<Option<Batch>>,
+    count:    usize,
+    schema:   Option<SchemaDescriptor>,
 }
 
 /// One completed exchange ready for relay.  The relay task owns this:
@@ -38,12 +42,7 @@ pub struct PendingRelay {
 
 impl ExchangeAccumulator {
     pub fn new(nw: usize) -> Self {
-        ExchangeAccumulator {
-            payloads: HashMap::new(),
-            counts:   HashMap::new(),
-            schemas:  HashMap::new(),
-            nw,
-        }
+        ExchangeAccumulator { rounds: HashMap::new(), nw }
     }
 
     /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once
@@ -57,33 +56,87 @@ impl ExchangeAccumulator {
         let key = (vid, source_id);
         let nw = self.nw;
 
-        let payloads = self.payloads
-            .entry(key)
-            .or_insert_with(|| vec![None; nw]);
-        let count = self.counts.entry(key).or_insert(0);
+        let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
+            payloads: vec![None; nw],
+            count:    0,
+            schema:   None,
+        });
 
-        payloads[w] = decoded.data_batch;
+        round.payloads[w] = decoded.data_batch;
         if let Some(schema) = decoded.schema {
-            self.schemas.insert(key, schema);
+            round.schema = Some(schema);
         }
-        *count += 1;
+        round.count += 1;
 
-        if *count == nw {
-            let schema = match self.schemas.remove(&key) {
+        if round.count == nw {
+            let round = self.rounds.remove(&key).unwrap();
+            let schema = match round.schema {
                 Some(s) => s,
                 None => {
                     crate::gnitz_warn!("exchange: no schema received for (view_id={}, source_id={})",
                         vid, source_id);
-                    self.payloads.remove(&key);
-                    self.counts.remove(&key);
                     return None;
                 }
             };
-            let payloads_vec = self.payloads.remove(&key).unwrap();
-            self.counts.remove(&key);
-            Some(PendingRelay { view_id: vid, payloads: payloads_vec, schema, source_id })
+            Some(PendingRelay { view_id: vid, payloads: round.payloads, schema, source_id })
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{DecodedWire, DecodedControl, FLAG_EXCHANGE};
+    use crate::schema::SchemaDescriptor;
+
+    fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {
+        DecodedWire {
+            control: DecodedControl {
+                status: 0,
+                client_id: 0,
+                target_id: view_id as u64,
+                flags: FLAG_EXCHANGE as u64,
+                seek_pk_lo: source_id as u64,
+                seek_pk_hi: 0,
+                seek_col_idx: 0,
+                request_id: 0,
+                error_msg: Vec::new(),
+            },
+            schema: if with_schema { Some(SchemaDescriptor::minimal_u64()) } else { None },
+            data_batch: None,
+            batch_backing: None,
+        }
+    }
+
+    #[test]
+    fn partial_round_returns_none() {
+        let mut acc = ExchangeAccumulator::new(3);
+        // First two of three workers report — round must stay pending.
+        assert!(acc.process(0, make_wire(10, 0, true)).is_none());
+        assert!(acc.process(1, make_wire(10, 0, false)).is_none());
+        assert!(!acc.rounds.is_empty(), "partial round must remain in map");
+    }
+
+    #[test]
+    fn complete_round_returns_relay_with_correct_ids() {
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(acc.process(0, make_wire(7, 3, true)).is_none());
+        let relay = acc.process(1, make_wire(7, 3, false))
+            .expect("complete round must return PendingRelay");
+        assert_eq!(relay.view_id, 7);
+        assert_eq!(relay.source_id, 3);
+        assert_eq!(relay.payloads.len(), 2);
+        assert!(acc.rounds.is_empty(), "completed round must be removed from map");
+    }
+
+    #[test]
+    fn schema_less_round_returns_none_and_cleans_up() {
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(acc.process(0, make_wire(5, 0, false)).is_none());
+        let result = acc.process(1, make_wire(5, 0, false));
+        assert!(result.is_none(), "schema-less round must return None");
+        assert!(acc.rounds.is_empty(), "completed schema-less round must not leak");
     }
 }

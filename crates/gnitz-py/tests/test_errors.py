@@ -101,3 +101,20 @@ class TestSchemaMismatch:
                 client.push(tid, batch)
         finally:
             _cleanup(client, sn, tables=["t"])
+
+    def test_wrong_nullable(self, client):
+        """Batch that marks a NOT NULL column as nullable must be rejected."""
+        sn = "err" + _uid()
+        try:
+            tid = self._make_table(client, sn)  # val BIGINT NOT NULL (nullable=0)
+            wrong_cols = [
+                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True),  # wrong
+            ]
+            wrong_schema = gnitz.Schema(wrong_cols)
+            batch = gnitz.ZSetBatch(wrong_schema)
+            batch.append(pk=1, val=42)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, batch)
+        finally:
+            _cleanup(client, sn, tables=["t"])

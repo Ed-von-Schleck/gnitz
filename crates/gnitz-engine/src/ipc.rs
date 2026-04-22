@@ -234,7 +234,7 @@ pub fn encode_wire(
     buf
 }
 
-/// Max regions per batch: 4 fixed + up to 63 payload + 1 blob = 68.
+/// Max regions per batch: 4 fixed + up to 63 payload + 1 blob = 68; +1 spare.
 const MAX_REGIONS_TOTAL: usize = 69;
 
 /// Compute the WAL block size for a given batch without allocating.
@@ -566,7 +566,11 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
     if a.num_columns != b.num_columns || a.pk_index != b.pk_index { return false; }
     for i in 0..a.num_columns as usize {
-        if a.columns[i].type_code != b.columns[i].type_code { return false; }
+        if a.columns[i].type_code != b.columns[i].type_code
+            || a.columns[i].nullable != b.columns[i].nullable
+        {
+            return false;
+        }
     }
     true
 }
@@ -812,7 +816,6 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 
 /// Result from SAL write (used by tests via `sal_write_group`).
 #[cfg(test)]
-#[repr(C)]
 pub(crate) struct SalWriteResult {
     /// 0 on success, -1 on error (SAL full).
     pub status: i32,
@@ -951,10 +954,12 @@ pub(crate) unsafe fn sal_write_group(
 // SAL read (worker reads its data from a group)
 // ---------------------------------------------------------------------------
 
+pub(crate) const SAL_STATUS_HAS_DATA: i32 = 0;
+pub(crate) const SAL_STATUS_NO_DATA_FOR_WORKER: i32 = 1;
+pub(crate) const SAL_STATUS_NO_MESSAGE: i32 = -1;
+
 /// Result from reading a SAL group header for a specific worker.
-#[repr(C)]
 pub(crate) struct SalReadResult {
-    /// 0 = has data, 1 = no data for this worker, -1 = no message yet
     pub status: i32,
     /// Bytes to advance read_cursor (8 + align8(payload_size))
     pub advance: u64,
@@ -994,7 +999,7 @@ pub(crate) unsafe fn sal_read_group_header(
     let payload_size = atomic_load_u64(sal_ptr.add(rc)) as usize;
     if payload_size == 0 {
         return SalReadResult {
-            status: -1, advance: 0, lsn: 0, flags: 0,
+            status: SAL_STATUS_NO_MESSAGE, advance: 0, lsn: 0, flags: 0,
             target_id: 0, epoch: 0, _pad: 0,
             data_ptr: std::ptr::null(), data_size: 0, _pad2: 0,
         };
@@ -1020,7 +1025,7 @@ pub(crate) unsafe fn sal_read_group_header(
         );
         let data_size = if my_offset + my_size <= payload_size { my_size as u32 } else { 0 };
         SalReadResult {
-            status: 0,
+            status: SAL_STATUS_HAS_DATA,
             advance,
             lsn,
             flags,
@@ -1033,7 +1038,7 @@ pub(crate) unsafe fn sal_read_group_header(
         }
     } else {
         SalReadResult {
-            status: 1,
+            status: SAL_STATUS_NO_DATA_FOR_WORKER,
             advance,
             lsn,
             flags,
@@ -1337,7 +1342,7 @@ impl SalReader {
             return None;
         }
         let new_cursor = cursor + result.advance;
-        let wire_data = if result.status == 0 && result.data_size > 0 && !result.data_ptr.is_null() {
+        let wire_data = if result.status == SAL_STATUS_HAS_DATA && result.data_size > 0 && !result.data_ptr.is_null() {
             Some(unsafe {
                 std::slice::from_raw_parts(result.data_ptr, result.data_size as usize)
             })
@@ -1676,9 +1681,9 @@ mod tests {
                 assert_eq!(rr.advance, res.new_cursor);
 
                 if bufs[w as usize].is_empty() {
-                    assert_eq!(rr.status, 1); // no data
+                    assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
                 } else {
-                    assert_eq!(rr.status, 0); // has data
+                    assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
                     let data = std::slice::from_raw_parts(
                         rr.data_ptr, rr.data_size as usize
                     );
@@ -1713,12 +1718,12 @@ mod tests {
             // Workers 0,1,3 see no data
             for w in [0u32, 1, 3] {
                 let rr = sal_read_group_header(ptr, 0, w);
-                assert_eq!(rr.status, 1);
+                assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
                 assert!(rr.advance > 0);
             }
             // Worker 2 sees data
             let rr = sal_read_group_header(ptr, 0, 2);
-            assert_eq!(rr.status, 0);
+            assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
             let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
             assert_eq!(data, buf.as_slice());
 
@@ -1751,7 +1756,7 @@ mod tests {
             let mut rc = 0u64;
             for g in 0..3u64 {
                 let rr = sal_read_group_header(ptr, rc, 0);
-                assert_eq!(rr.status, 0);
+                assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
                 assert_eq!(rr.lsn, g * 10);
                 assert_eq!(rr.target_id, g as u32);
                 let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
@@ -1760,7 +1765,7 @@ mod tests {
             }
             // No more messages
             let rr = sal_read_group_header(ptr, rc, 0);
-            assert_eq!(rr.status, -1);
+            assert_eq!(rr.status, SAL_STATUS_NO_MESSAGE);
 
             free_mmap(ptr, size);
         }
@@ -1840,7 +1845,7 @@ mod tests {
             assert!(r > 0, "eventfd timed out");
 
             let rr = sal_read_group_header(ptr, 0, 0);
-            assert_eq!(rr.status, 0);
+            assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
             assert_eq!(rr.lsn, 555);
             assert_eq!(rr.target_id, 99);
             let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
@@ -2360,6 +2365,55 @@ mod tests {
         let result = decode_wire(truncated);
         assert!(result.is_err(),
             "decode should reject truncated control block, got Ok");
+    }
+
+    #[test]
+    fn test_decode_wire_with_schema_rejects_nullable_mismatch() {
+        // Server schema: 2-col (U64 PK, U64 nullable payload).
+        let mut server_sd = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        server_sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        server_sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 1, _pad: 0 };
+
+        // Client schema: same shape but column 1 declared non-nullable.
+        let mut client_sd = server_sd;
+        client_sd.columns[1].nullable = 0;
+
+        let batch = make_simple_batch(1, 42);
+        let names: Vec<&[u8]> = vec![b"id", b"val"];
+        let wire = encode_wire(
+            1, 0, 0, 0, 0, 0, 0,
+            STATUS_OK, b"",
+            Some(&client_sd), Some(&names), Some(&batch),
+        );
+        let result = decode_wire_with_schema(&wire, &server_sd);
+        assert!(result.is_err(),
+            "decode_wire_with_schema should reject nullable mismatch but accepted it");
+    }
+
+    #[test]
+    fn test_decode_wire_with_schema_accepts_nullable_match() {
+        let mut server_sd = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        server_sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        server_sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 1, _pad: 0 };
+
+        let batch = make_simple_batch(1, 42);
+        let names: Vec<&[u8]> = vec![b"id", b"val"];
+        let wire = encode_wire(
+            1, 0, 0, 0, 0, 0, 0,
+            STATUS_OK, b"",
+            Some(&server_sd), Some(&names), Some(&batch),
+        );
+        let result = decode_wire_with_schema(&wire, &server_sd);
+        assert!(result.is_ok(),
+            "decode_wire_with_schema should accept matching nullable");
     }
 
     /// Concurrent W2M writer + reader on a small ring with high publish

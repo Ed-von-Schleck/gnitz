@@ -178,6 +178,9 @@ struct ReactorShared {
     /// dispatches it to the relay task via `relay_tx`.
     exchange_acc: RefCell<ExchangeAccumulator>,
     relay_tx: RefCell<Option<mpsc::Sender<PendingRelay>>>,
+    /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
+    /// iterates only this set (O(closing)) rather than all connections (O(all)).
+    closing_fds: RefCell<std::collections::HashSet<i32>>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -284,6 +287,7 @@ impl Reactor {
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
+            closing_fds: RefCell::new(std::collections::HashSet::new()),
         });
         Ok(Reactor { inner })
     }
@@ -682,6 +686,7 @@ impl Reactor {
     pub fn close_fd(&self, fd: i32) {
         if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
             conn.closing = true;
+            self.inner.closing_fds.borrow_mut().insert(fd);
         }
     }
 
@@ -896,6 +901,7 @@ impl Reactor {
 
         if res <= 0 || conn.closing {
             conn.closing = true;
+            self.inner.closing_fds.borrow_mut().insert(fd);
             self.inner.recv_closed.borrow_mut().insert(fd, true);
             if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
                 w.wake();
@@ -915,6 +921,7 @@ impl Reactor {
                 let plen = conn.recv_state.payload_len();
                 if plen > io::MAX_PAYLOAD_LEN {
                     conn.closing = true;
+                    self.inner.closing_fds.borrow_mut().insert(fd);
                     self.inner.recv_closed.borrow_mut().insert(fd, true);
                     if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
                         w.wake();
@@ -924,6 +931,7 @@ impl Reactor {
                 let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
                 if pbuf.is_null() {
                     conn.closing = true;
+                    self.inner.closing_fds.borrow_mut().insert(fd);
                     self.inner.recv_closed.borrow_mut().insert(fd, true);
                     if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
                         w.wake();
@@ -955,6 +963,7 @@ impl Reactor {
             }
             io::RecvAdvance::Disconnect => {
                 conn.closing = true;
+                self.inner.closing_fds.borrow_mut().insert(fd);
                 self.inner.recv_closed.borrow_mut().insert(fd, true);
                 if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
                     w.wake();
@@ -964,18 +973,21 @@ impl Reactor {
     }
 
     /// Reap connections that are closing and have no outstanding SQEs.
-    /// Called once per tick.
+    /// Called once per tick. Iterates only `closing_fds` (O(closing)),
+    /// not all connections.
     fn reap_closing_conns(&self) {
-        let mut to_remove: Vec<i32> = Vec::new();
-        {
-            let conns = self.inner.conns.borrow();
-            for (&fd, conn) in conns.iter() {
-                if conn.closing && !conn.has_outstanding() {
-                    to_remove.push(fd);
+        let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
+        if closing.is_empty() { return; }
+        for fd in closing {
+            let ready = {
+                let conns = self.inner.conns.borrow();
+                match conns.get(&fd) {
+                    Some(conn) => !conn.has_outstanding(),
+                    None => true,
                 }
-            }
-        }
-        for fd in to_remove {
+            };
+            if !ready { continue; }
+            self.inner.closing_fds.borrow_mut().remove(&fd);
             self.inner.conns.borrow_mut().remove(&fd);
             self.inner.recv_waiters.borrow_mut().remove(&fd);
             if let Some(queue) = self.inner.pending_recv.borrow_mut().remove(&fd) {
@@ -2661,5 +2673,59 @@ mod tests {
             libc::munmap(ptr as *mut libc::c_void, CAPACITY);
             libc::close(fd);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `closing_fds` sync: every path that sets conn.closing=true must
+    // also insert into closing_fds so reap_closing_conns finds the fd.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn handle_recv_cqe_error_populates_closing_fds() {
+        let r = make_reactor();
+        r.inner.conns.borrow_mut().insert(55, Box::new(io::Conn::new()));
+
+        r.inject_cqe(KIND_RECV, 55, -1);
+        r.drain_injected_cqes();
+
+        assert!(r.inner.closing_fds.borrow().contains(&55),
+            "res<=0 recv CQE must insert fd into closing_fds");
+        assert!(r.inner.recv_closed.borrow().get(&55).copied().unwrap_or(false),
+            "res<=0 recv CQE must set recv_closed sentinel");
+    }
+
+    #[test]
+    fn reap_closing_conns_removes_idle_closing_fd() {
+        let r = make_reactor();
+        // Insert a conn with no in-flight SQEs and mark it closing manually,
+        // as if handle_recv_cqe had already run.
+        let mut conn = Box::new(io::Conn::new());
+        conn.closing = true;
+        r.inner.conns.borrow_mut().insert(88, conn);
+        r.inner.closing_fds.borrow_mut().insert(88);
+
+        r.reap_closing_conns();
+
+        assert!(!r.inner.conns.borrow().contains_key(&88),
+            "idle closing conn must be removed from conns");
+        assert!(!r.inner.closing_fds.borrow().contains(&88),
+            "reaped fd must be removed from closing_fds");
+    }
+
+    #[test]
+    fn reap_closing_conns_defers_conn_with_outstanding_send() {
+        let r = make_reactor();
+        let mut conn = Box::new(io::Conn::new());
+        conn.closing = true;
+        conn.send_inflight = 1; // outstanding send SQE
+        r.inner.conns.borrow_mut().insert(77, conn);
+        r.inner.closing_fds.borrow_mut().insert(77);
+
+        r.reap_closing_conns();
+
+        assert!(r.inner.conns.borrow().contains_key(&77),
+            "conn with outstanding send must NOT be reaped yet");
+        assert!(r.inner.closing_fds.borrow().contains(&77),
+            "conn deferred by outstanding send must stay in closing_fds");
     }
 }

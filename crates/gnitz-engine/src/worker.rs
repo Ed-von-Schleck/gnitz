@@ -25,6 +25,24 @@ use crate::storage::Batch;
 // WorkerExchangeHandler
 // ---------------------------------------------------------------------------
 
+/// Lookup target for FLAG_HAS_PK requests.
+enum HasPkLookup {
+    /// Check the table's primary-key store.
+    PrimaryKey,
+    /// Check a unique secondary index on `col_idx` (0-indexed).
+    UniqueIndex(u32),
+}
+
+impl HasPkLookup {
+    fn from_wire(seek_col_idx: u64) -> Self {
+        if seek_col_idx > 0 {
+            HasPkLookup::UniqueIndex((seek_col_idx - 1) as u32)
+        } else {
+            HasPkLookup::PrimaryKey
+        }
+    }
+}
+
 /// A DDL_SYNC message received during an exchange wait, decoded eagerly.
 struct DeferredDdl {
     target_id: i64,
@@ -322,8 +340,8 @@ impl WorkerProcess {
         }
 
         if flags & FLAG_HAS_PK != 0 {
-            let col_hint = seek_col_idx as i32;
-            match self.handle_has_pk(target_id, batch, col_hint, request_id) {
+            let lookup = HasPkLookup::from_wire(seek_col_idx);
+            match self.handle_has_pk(target_id, batch, lookup, request_id) {
                 Ok(()) => {}
                 Err(msg) => return DispatchResult::Error(msg),
             }
@@ -523,48 +541,50 @@ impl WorkerProcess {
         &mut self,
         target_id: i64,
         batch: Option<Batch>,
-        col_hint: i32,
+        lookup: HasPkLookup,
         request_id: u64,
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
-        if col_hint > 0 {
-            let col_idx = (col_hint - 1) as u32;
-            let index_handle = self.cat().get_index_store_handle(target_id, col_idx);
-            if index_handle.is_null() {
-                return Err(format!(
-                    "No unique index on column {} for table {}", col_idx, target_id
-                ));
-            }
-            let schema = batch.as_ref()
-                .and_then(|b| b.schema)
-                .or_else(|| self.cat().get_schema_desc(target_id))
-                .ok_or_else(|| format!("no schema for tid={}", target_id))?;
-            let mut result = Batch::with_schema(schema, n);
-            if let Some(ref b) = batch {
-                let table = unsafe { &mut *index_handle };
-                for i in 0..n {
-                    let exists = table.has_pk(b.get_pk(i));
-                    result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+        match lookup {
+            HasPkLookup::UniqueIndex(col_idx) => {
+                let index_handle = self.cat().get_index_store_handle(target_id, col_idx);
+                if index_handle.is_null() {
+                    return Err(format!(
+                        "No unique index on column {} for table {}", col_idx, target_id
+                    ));
                 }
-            }
-            self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
-        } else {
-            let schema = self.cat().get_schema_desc(target_id)
-                .ok_or_else(|| format!("no schema for tid={}", target_id))?;
-            let ptable_handle = self.cat().get_ptable_handle(target_id);
-            let mut result = Batch::with_schema(schema, n);
-            if let Some(ref b) = batch {
-                for i in 0..n {
-                    let exists = if let Some(pt_ptr) = ptable_handle {
-                        unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i))
-                    } else {
-                        false
-                    };
-                    result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+                let schema = batch.as_ref()
+                    .and_then(|b| b.schema)
+                    .or_else(|| self.cat().get_schema_desc(target_id))
+                    .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                let mut result = Batch::with_schema(schema, n);
+                if let Some(ref b) = batch {
+                    let table = unsafe { &mut *index_handle };
+                    for i in 0..n {
+                        let exists = table.has_pk(b.get_pk(i));
+                        result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+                    }
                 }
+                self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
             }
-            self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
+            HasPkLookup::PrimaryKey => {
+                let schema = self.cat().get_schema_desc(target_id)
+                    .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                let ptable_handle = self.cat().get_ptable_handle(target_id);
+                let mut result = Batch::with_schema(schema, n);
+                if let Some(ref b) = batch {
+                    for i in 0..n {
+                        let exists = if let Some(pt_ptr) = ptable_handle {
+                            unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i))
+                        } else {
+                            false
+                        };
+                        result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+                    }
+                }
+                self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
+            }
         }
         Ok(())
     }
@@ -1186,6 +1206,28 @@ mod tests {
         unsafe {
             libc::munmap(region_ptr as *mut libc::c_void, region_size);
         }
+    }
+
+    #[test]
+    fn from_wire_zero_is_primary_key() {
+        assert!(matches!(HasPkLookup::from_wire(0), HasPkLookup::PrimaryKey));
+    }
+
+    #[test]
+    fn from_wire_one_is_unique_index_col0() {
+        assert!(matches!(HasPkLookup::from_wire(1), HasPkLookup::UniqueIndex(0)));
+    }
+
+    #[test]
+    fn from_wire_two_is_unique_index_col1() {
+        assert!(matches!(HasPkLookup::from_wire(2), HasPkLookup::UniqueIndex(1)));
+    }
+
+    #[test]
+    fn from_wire_large_value_is_unique_index_not_primary_key() {
+        // Before the fix, (u64::MAX as i32) = -1 < 0 would return PrimaryKey.
+        assert!(matches!(HasPkLookup::from_wire(u64::MAX), HasPkLookup::UniqueIndex(_)));
+        assert!(matches!(HasPkLookup::from_wire(i32::MAX as u64 + 1), HasPkLookup::UniqueIndex(_)));
     }
 
 }
