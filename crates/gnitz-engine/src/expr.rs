@@ -234,6 +234,38 @@ fn read_payload_as_i64(bytes: &[u8], size: usize, type_code: u8) -> i64 {
     }
 }
 
+/// Load an integer payload column, applying narrow-type sign/zero-extension.
+#[inline(always)]
+fn load_payload_int(prog: &ExprProgram, batch: &MemBatch, row: usize, pi: usize) -> i64 {
+    if prog.payload_col_sizes.is_empty() {
+        let ptr = batch.get_col_ptr(row, pi, 8);
+        i64::from_le_bytes(ptr.try_into().unwrap())
+    } else {
+        let col_size = prog.payload_col_sizes[pi] as usize;
+        let col_tc = prog.payload_col_type_codes[pi];
+        let ptr = batch.get_col_ptr(row, pi, col_size);
+        read_payload_as_i64(ptr, col_size, col_tc)
+    }
+}
+
+/// Load a float payload column, widening f32→f64 for narrow types.
+#[inline(always)]
+fn load_payload_float(prog: &ExprProgram, batch: &MemBatch, row: usize, pi: usize) -> i64 {
+    if prog.payload_col_sizes.is_empty() {
+        let ptr = batch.get_col_ptr(row, pi, 8);
+        i64::from_le_bytes(ptr.try_into().unwrap())
+    } else {
+        let col_size = prog.payload_col_sizes[pi] as usize;
+        let ptr = batch.get_col_ptr(row, pi, col_size);
+        if col_size == 4 {
+            let bits = u32::from_le_bytes(ptr.try_into().unwrap());
+            float_to_bits(f32::from_bits(bits) as f64)
+        } else {
+            i64::from_le_bytes(ptr.try_into().unwrap())
+        }
+    }
+}
+
 /// Check if a column is null for a given row.
 #[inline]
 fn is_col_null(null_word: u64, col_idx: usize, pk_index: usize) -> bool {
@@ -340,32 +372,12 @@ pub fn eval_predicate(
             EXPR_LOAD_PAYLOAD_INT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                if prog.payload_col_sizes.is_empty() {
-                    let ptr = batch.get_col_ptr(row, pi, 8);
-                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
-                } else {
-                    let col_size = prog.payload_col_sizes[pi] as usize;
-                    let col_tc = prog.payload_col_type_codes[pi];
-                    let ptr = batch.get_col_ptr(row, pi, col_size);
-                    regs[dst] = read_payload_as_i64(ptr, col_size, col_tc);
-                }
+                regs[dst] = load_payload_int(prog, batch, row, pi);
             }
             EXPR_LOAD_PAYLOAD_FLOAT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                if prog.payload_col_sizes.is_empty() {
-                    let ptr = batch.get_col_ptr(row, pi, 8);
-                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
-                } else {
-                    let col_size = prog.payload_col_sizes[pi] as usize;
-                    let ptr = batch.get_col_ptr(row, pi, col_size);
-                    regs[dst] = if col_size == 4 {
-                        let bits = u32::from_le_bytes(ptr.try_into().unwrap());
-                        float_to_bits(f32::from_bits(bits) as f64)
-                    } else {
-                        i64::from_le_bytes(ptr.try_into().unwrap())
-                    };
-                }
+                regs[dst] = load_payload_float(prog, batch, row, pi);
             }
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
@@ -755,32 +767,12 @@ pub fn eval_with_emit(
             EXPR_LOAD_PAYLOAD_INT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                if prog.payload_col_sizes.is_empty() {
-                    let ptr = batch.get_col_ptr(row, pi, 8);
-                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
-                } else {
-                    let col_size = prog.payload_col_sizes[pi] as usize;
-                    let col_tc = prog.payload_col_type_codes[pi];
-                    let ptr = batch.get_col_ptr(row, pi, col_size);
-                    regs[dst] = read_payload_as_i64(ptr, col_size, col_tc);
-                }
+                regs[dst] = load_payload_int(prog, batch, row, pi);
             }
             EXPR_LOAD_PAYLOAD_FLOAT => {
                 let pi = a1 as usize;
                 null_mask = set_null_bit(null_mask, dst, (null_word >> pi) & 1 != 0);
-                if prog.payload_col_sizes.is_empty() {
-                    let ptr = batch.get_col_ptr(row, pi, 8);
-                    regs[dst] = i64::from_le_bytes(ptr.try_into().unwrap());
-                } else {
-                    let col_size = prog.payload_col_sizes[pi] as usize;
-                    let ptr = batch.get_col_ptr(row, pi, col_size);
-                    regs[dst] = if col_size == 4 {
-                        let bits = u32::from_le_bytes(ptr.try_into().unwrap());
-                        float_to_bits(f32::from_bits(bits) as f64)
-                    } else {
-                        i64::from_le_bytes(ptr.try_into().unwrap())
-                    };
-                }
+                regs[dst] = load_payload_float(prog, batch, row, pi);
             }
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
