@@ -335,6 +335,37 @@ impl Batch {
         }
     }
 
+    /// Construct a `Batch` from fully pre-built, correctly-laid-out buffers.
+    ///
+    /// `data` must be at least `count * strides[i]` bytes starting at
+    /// `offsets[i]` for every `i < num_regions`, as produced by
+    /// `compute_offsets`.  Used by `slice_to_owned_batch` to avoid an
+    /// intermediate copy.
+    ///
+    /// # Safety
+    /// Caller must guarantee the layout invariant described above.
+    pub(super) unsafe fn from_prebuilt(
+        data: Vec<u8>,
+        blob: Vec<u8>,
+        strides: [u8; MAX_BATCH_REGIONS],
+        offsets: [u32; MAX_BATCH_REGIONS],
+        num_regions: u8,
+        count: usize,
+    ) -> Self {
+        Batch {
+            data,
+            blob,
+            offsets,
+            strides,
+            num_regions,
+            capacity: count as u32,
+            count,
+            sorted: false,
+            consolidated: false,
+            schema: None,
+        }
+    }
+
     // ── Schema installation ─────────────────────────────────────────────
 
     /// Install a schema on this batch after verifying its column count

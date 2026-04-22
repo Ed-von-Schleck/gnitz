@@ -450,67 +450,88 @@ impl MappedShard {
         row_count: usize,
         schema: &crate::schema::SchemaDescriptor,
     ) -> super::batch::Batch {
-        use super::batch::Batch;
-
-        let npc = schema.num_columns as usize - 1;
+        use super::batch::{compute_offsets, strides_from_schema, Batch};
 
         if row_count == 0 {
             return Batch::empty_with_schema(schema);
         }
 
-        let data = self.data();
+        let shard = self.data();
 
-        // Build region pointer/size arrays for from_regions.
-        let num_regions = 4 + npc + 1; // pk_lo, pk_hi, weight, null_bmp, cols..., blob
-        let mut region_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_regions);
+        // Compute the final columnar layout before allocating anything.
+        let (strides, num_regions_u8) = strides_from_schema(schema);
+        let nr = num_regions_u8 as usize; // 4 + npc
+        let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
 
-        let expand_region = |region: &RegionView, stride: usize| -> Vec<u8> {
+        // One allocation for all fixed-stride columnar data.
+        let mut data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
+            buf.clear();
+            buf.reserve(total_size);
+            unsafe { buf.set_len(total_size) };
+            buf
+        } else {
+            let mut v = Vec::with_capacity(total_size);
+            unsafe { v.set_len(total_size) };
+            v
+        };
+
+        // Write each region directly into its final slice — no intermediate buffers.
+        let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| {
             match region {
                 RegionView::Raw { offset, .. } => {
                     let begin = offset + start * stride;
-                    let end = begin + row_count * stride;
-                    data[begin..end].to_vec()
+                    dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
                 }
                 RegionView::Constant { value, .. } => {
-                    value[..stride].repeat(row_count)
+                    for chunk in dst.chunks_exact_mut(stride) {
+                        chunk.copy_from_slice(&value[..stride]);
+                    }
                 }
                 RegionView::TwoValue { value_a, value_b, bitvec_off } => {
                     let a_bytes = value_a.to_le_bytes();
                     let b_bytes = value_b.to_le_bytes();
-                    let mut v = vec![0u8; row_count * stride];
                     for i in 0..row_count {
                         let row = start + i;
-                        let bit = (data[bitvec_off + row / 8] >> (row % 8)) & 1;
+                        let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
                         let src = if bit == 0 { &a_bytes[..stride] } else { &b_bytes[..stride] };
-                        v[i * stride..(i + 1) * stride].copy_from_slice(src);
+                        dst[i * stride..(i + 1) * stride].copy_from_slice(src);
                     }
-                    v
                 }
             }
         };
 
-        region_bufs.push(expand_region(&self.pk_lo, 8));
-        region_bufs.push(expand_region(&self.pk_hi, 8));
-        region_bufs.push(expand_region(&self.weight, 8));
-        region_bufs.push(expand_region(&self.null_bmp, 8));
+        let sz8 = row_count * 8;
+        expand_into(&self.pk_lo,    8, &mut data[offsets[0] as usize..][..sz8]);
+        expand_into(&self.pk_hi,    8, &mut data[offsets[1] as usize..][..sz8]);
+        expand_into(&self.weight,   8, &mut data[offsets[2] as usize..][..sz8]);
+        expand_into(&self.null_bmp, 8, &mut data[offsets[3] as usize..][..sz8]);
 
-        for (reg_idx, _ci, col) in schema.payload_columns() {
-            let col_size = col.size as usize;
-            region_bufs.push(expand_region(&self.col_regions[reg_idx], col_size));
+        for (pi, _ci, col) in schema.payload_columns() {
+            let stride = col.size as usize;
+            let off = offsets[4 + pi] as usize;
+            let sz = row_count * stride;
+            expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }
 
-        // Blob region
-        let blob_data = if self.blob_len > 0 {
-            data[self.blob_off..self.blob_off + self.blob_len].to_vec()
+        // Blob: one allocation, copy entire blob region (string offsets stay valid).
+        let blob = if self.blob_len > 0 {
+            let src = &shard[self.blob_off..self.blob_off + self.blob_len];
+            if let Some(mut buf) = super::batch_pool::acquire_buf() {
+                buf.clear();
+                buf.reserve(self.blob_len);
+                unsafe { buf.set_len(self.blob_len) };
+                buf.copy_from_slice(src);
+                buf
+            } else {
+                src.to_vec()
+            }
         } else {
             Vec::new()
         };
-        region_bufs.push(blob_data);
 
-        let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
-        let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
-
-        let mut batch = unsafe { Batch::from_regions(&ptrs, &sizes, row_count, npc) };
+        let mut batch = unsafe {
+            Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count)
+        };
         batch.sorted = true;
         batch.consolidated = true;
         batch.set_schema(*schema);
