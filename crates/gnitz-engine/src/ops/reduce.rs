@@ -5,7 +5,7 @@ use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
 
 use super::util::{
-    consolidate_owned, append_cursor_row_to_batch, write_string_from_batch, payload_idx,
+    append_cursor_row_to_batch, write_string_from_batch, payload_idx,
     extract_group_key,
 };
 
@@ -538,13 +538,9 @@ pub fn op_reduce(
     });
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
-    let consolidated;
-    let working: &Batch = if all_linear {
-        delta
-    } else {
-        consolidated = consolidate_owned(delta, input_schema);
-        &consolidated
-    };
+    // Fast path (linear or already consolidated): borrow delta directly — no allocation.
+    let cs = if all_linear { None } else { Batch::consolidate_if_needed(delta, input_schema) };
+    let working: &Batch = cs.as_ref().unwrap_or(delta);
 
     let n = working.count;
     if n == 0 {
@@ -757,7 +753,7 @@ pub fn op_reduce(
                 }
 
                 // Consolidate replay and step all accumulators
-                let merged = consolidate_owned(&replay, input_schema);
+                let merged = replay.into_consolidated(input_schema);
                 for acc in accs.iter_mut() {
                     acc.reset();
                 }

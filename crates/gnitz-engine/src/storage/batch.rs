@@ -1172,6 +1172,51 @@ impl Batch {
         self.consolidated = false;
     }
 
+    /// Consume this batch, consolidating it if needed.
+    ///
+    /// Fast path: if already consolidated or empty, wraps `self` in a
+    /// `ConsolidatedBatch` without any allocation (free move).
+    /// Slow path: sorts and weight-folds into a fresh batch, then drops `self`.
+    pub fn into_consolidated(self, schema: &SchemaDescriptor) -> ConsolidatedBatch {
+        if self.consolidated || self.count == 0 {
+            return ConsolidatedBatch(self);
+        }
+        let mb = self.as_mem_batch();
+        let blob_cap = mb.blob.len().max(1);
+        let mut result = write_to_batch(schema, self.count, blob_cap, |writer| {
+            merge::sort_and_consolidate(&mb, schema, writer);
+        });
+        result.sorted = true;
+        result.consolidated = true;
+        result.set_schema(*schema);
+        ConsolidatedBatch(result)
+        // self dropped here → buffers recycled to pool
+    }
+
+    /// Consolidate a borrowed batch if needed. Returns `None` when the batch is already
+    /// consolidated or empty (caller borrows the original). Returns `Some(Batch)` when
+    /// a new consolidated batch was allocated (caller borrows that instead).
+    ///
+    /// Idiomatic usage:
+    /// ```ignore
+    /// let cs = Batch::consolidate_if_needed(delta, schema);
+    /// let c: &Batch = cs.as_ref().unwrap_or(delta);
+    /// ```
+    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
+        if batch.consolidated || batch.count == 0 {
+            return None;
+        }
+        let mb = batch.as_mem_batch();
+        let blob_cap = mb.blob.len().max(1);
+        let mut result = write_to_batch(schema, batch.count, blob_cap, |writer| {
+            merge::sort_and_consolidate(&mb, schema, writer);
+        });
+        result.sorted = true;
+        result.consolidated = true;
+        result.set_schema(*schema);
+        Some(result)
+    }
+
     #[cfg(test)]
     pub(crate) fn data_capacity(&self) -> usize { self.data.capacity() }
 
@@ -1204,6 +1249,23 @@ impl ColumnarSource for Batch {
     }
     #[inline]
     fn blob_slice(&self) -> &[u8] { &self.blob }
+}
+
+/// Owned `Batch` certified to be consolidated (sorted, no duplicate PKs, weights folded).
+///
+/// Obtain via `Batch::into_consolidated` (checked) or `new_unchecked` (caller asserts).
+#[repr(transparent)]
+pub struct ConsolidatedBatch(Batch);
+
+impl ConsolidatedBatch {
+    #[allow(dead_code)]
+    pub(crate) fn new_unchecked(batch: Batch) -> Self { ConsolidatedBatch(batch) }
+    pub fn into_inner(self) -> Batch { self.0 }
+}
+
+impl std::ops::Deref for ConsolidatedBatch {
+    type Target = Batch;
+    fn deref(&self) -> &Batch { &self.0 }
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via

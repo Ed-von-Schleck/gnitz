@@ -841,14 +841,16 @@ pub fn execute_epoch(
 
             Instr::Distinct { in_reg, hist_reg, out_reg, hist_table_idx } => {
                 let schema = reg!(*in_reg).schema;
+                let npc = reg!(*in_reg).batch.num_payload_cols();
+                let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc));
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
-                    let (output, consolidated) = ops::op_distinct(&reg!(*in_reg).batch, cursor, &schema);
+                    let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
                     reg_mut!(*out_reg).batch = output;
                     // Ingest consolidated delta into history table
                     if *hist_table_idx >= 0 {
                         let ptr = program.tables[*hist_table_idx as usize];
                         let table = unsafe { &mut *ptr };
-                        let _ = table.ingest_owned_batch(consolidated);
+                        let _ = table.ingest_owned_batch(consolidated.into_inner());
                     }
                 }
             }

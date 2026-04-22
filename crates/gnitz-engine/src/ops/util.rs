@@ -2,7 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{write_to_batch, Batch, MemBatch, ReadCursor, sort_and_consolidate};
+use crate::storage::{Batch, MemBatch, ReadCursor};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -46,22 +46,6 @@ pub fn write_string_from_raw(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-pub(super) fn consolidate_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
-    if batch.consolidated || batch.count == 0 {
-        return batch.clone_batch();
-    }
-    let mb = batch.as_mem_batch();
-    let blob_cap = mb.blob.len().max(1);
-    let mut consolidated =
-        write_to_batch(schema, batch.count, blob_cap, |writer| {
-            sort_and_consolidate(&mb, schema, writer);
-        });
-    consolidated.sorted = true;
-    consolidated.consolidated = true;
-    consolidated.set_schema(*schema);
-    consolidated
-}
 
 #[inline]
 pub(super) fn signum(x: i64) -> i64 {

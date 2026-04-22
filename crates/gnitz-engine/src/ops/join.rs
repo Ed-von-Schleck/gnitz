@@ -4,7 +4,7 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{write_to_batch, Batch, MemBatch, ReadCursor, scatter_copy};
 
-use super::util::{consolidate_owned, write_string_from_batch, write_string_from_raw};
+use super::util::{write_string_from_batch, write_string_from_raw};
 
 // ---------------------------------------------------------------------------
 // Anti-join delta-trace
@@ -17,7 +17,8 @@ pub fn op_anti_join_delta_trace(
     schema: &SchemaDescriptor,
 ) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let consolidated = consolidate_owned(delta, schema);
+    let cs = Batch::consolidate_if_needed(delta, schema);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(npc);
@@ -81,7 +82,8 @@ pub fn op_semi_join_delta_trace(
     schema: &SchemaDescriptor,
 ) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let consolidated = consolidate_owned(delta, schema);
+    let cs = Batch::consolidate_if_needed(delta, schema);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(npc);
@@ -210,7 +212,8 @@ pub fn op_join_delta_trace(
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
 
-    let consolidated = consolidate_owned(delta, left_schema);
+    let cs = Batch::consolidate_if_needed(delta, left_schema);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc);
@@ -218,10 +221,10 @@ pub fn op_join_delta_trace(
 
     let trace_len = cursor.estimated_length();
     if n > trace_len {
-        return join_dt_swapped(&consolidated, cursor, left_schema, right_schema);
+        return join_dt_swapped(consolidated, cursor, left_schema, right_schema);
     }
 
-    join_dt_merge_walk(&consolidated, cursor, left_schema, right_schema)
+    join_dt_merge_walk(consolidated, cursor, left_schema, right_schema)
 }
 
 fn join_dt_merge_walk(
@@ -331,7 +334,8 @@ pub fn op_join_delta_trace_outer(
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
 
-    let consolidated = consolidate_owned(delta, left_schema);
+    let cs = Batch::consolidate_if_needed(delta, left_schema);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc);
@@ -568,17 +572,15 @@ fn filter_join_dd_with_payload(
     schema: &SchemaDescriptor,
 ) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let ca = consolidate_owned(batch_a, schema);
-    let cb = consolidate_owned(batch_b, schema);
+    let cs_a = Batch::consolidate_if_needed(batch_a, schema);
+    let cs_b = Batch::consolidate_if_needed(batch_b, schema);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
     if n_a == 0 {
         return Batch::empty(npc);
-    }
-    if n_b == 0 {
-        gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
-        return ca;
     }
 
     let mb_a = ca.as_mem_batch();
@@ -619,7 +621,7 @@ fn filter_join_dd_with_payload(
                 }
             }
             if !matched {
-                output.append_batch(&ca, idx_a, idx_a + 1);
+                output.append_batch(ca, idx_a, idx_a + 1);
             }
             idx_a += 1;
         }
@@ -641,22 +643,15 @@ fn filter_join_dd(
     emit_on_match: bool,
 ) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let ca = consolidate_owned(batch_a, schema);
-    let cb = consolidate_owned(batch_b, schema);
+    let cs_a = Batch::consolidate_if_needed(batch_a, schema);
+    let cs_b = Batch::consolidate_if_needed(batch_b, schema);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
     if n_a == 0 {
         return Batch::empty(npc);
-    }
-    if n_b == 0 {
-        if emit_on_match {
-            gnitz_debug!("op_semi_join_dd: a={} b=0 out=0", n_a);
-            return Batch::empty(npc);
-        } else {
-            gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
-            return ca;
-        }
     }
 
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
@@ -690,7 +685,7 @@ fn filter_join_dd(
         }
 
         if has_match == emit_on_match {
-            output.append_batch(&ca, start_a, idx_a);
+            output.append_batch(ca, start_a, idx_a);
         }
     }
 
@@ -718,8 +713,10 @@ pub fn op_join_delta_delta(
     let right_npc = right_schema.num_columns as usize - 1;
     let out_npc = left_npc + right_npc;
 
-    let ca = consolidate_owned(batch_a, left_schema);
-    let cb = consolidate_owned(batch_b, right_schema);
+    let cs_a = Batch::consolidate_if_needed(batch_a, left_schema);
+    let cs_b = Batch::consolidate_if_needed(batch_b, right_schema);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -1033,9 +1030,10 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
         let b = make_batch(&schema, &[(2, 1, 20), (4, 1, 40)]);
+        let total = a.count;
         let anti = op_anti_join_delta_delta(&a, &b, &schema);
         let semi = op_semi_join_delta_delta(&a, &b, &schema);
-        assert_eq!(anti.count + semi.count, a.count);
+        assert_eq!(anti.count + semi.count, total);
     }
 
     // -----------------------------------------------------------------------
@@ -1081,16 +1079,14 @@ mod tests {
     fn test_join_dd_empty_inputs() {
         let ls = make_schema_u64_i64();
         let rs = make_schema_u64_i64();
-        let empty = make_batch(&ls, &[]);
-        let nonempty = make_batch(&rs, &[(1, 1, 100)]);
 
-        let out1 = op_join_delta_delta(&empty, &nonempty, &ls, &rs);
+        let out1 = op_join_delta_delta(&make_batch(&ls, &[]), &make_batch(&rs, &[(1, 1, 100)]), &ls, &rs);
         assert_eq!(out1.count, 0);
 
-        let out2 = op_join_delta_delta(&nonempty, &empty, &ls, &rs);
+        let out2 = op_join_delta_delta(&make_batch(&rs, &[(1, 1, 100)]), &make_batch(&ls, &[]), &ls, &rs);
         assert_eq!(out2.count, 0);
 
-        let out3 = op_join_delta_delta(&empty, &empty, &ls, &rs);
+        let out3 = op_join_delta_delta(&make_batch(&ls, &[]), &make_batch(&rs, &[]), &ls, &rs);
         assert_eq!(out3.count, 0);
     }
 

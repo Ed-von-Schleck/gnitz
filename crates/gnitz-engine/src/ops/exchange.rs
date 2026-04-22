@@ -857,7 +857,7 @@ mod tests {
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
         let (out, _consolidated) =
-            crate::ops::op_distinct(&delta, cursor_handle.cursor_mut(), &schema);
+            crate::ops::op_distinct(delta, cursor_handle.cursor_mut(), &schema);
 
         assert_eq!(
             out.count,

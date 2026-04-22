@@ -1,9 +1,9 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{write_to_batch, Batch, ReadCursor, scatter_copy};
+use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, ReadCursor, scatter_copy};
 
-use super::util::{consolidate_owned, signum, compare_cursor_payload_to_batch_row};
+use super::util::{signum, compare_cursor_payload_to_batch_row};
 
 // ---------------------------------------------------------------------------
 // Distinct
@@ -14,14 +14,14 @@ use super::util::{consolidate_owned, signum, compare_cursor_payload_to_batch_row
 /// Returns `(output_batch, consolidated_delta)`.
 /// The consolidated delta is returned so the caller can feed it to `ingest_batch`.
 pub fn op_distinct(
-    delta: &Batch,
+    delta: Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> (Batch, Batch) {
+) -> (Batch, ConsolidatedBatch) {
     let npc = schema.num_columns as usize - 1;
 
     // 1. Consolidate delta
-    let consolidated = consolidate_owned(delta, schema);
+    let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
     if n == 0 {
         return (Batch::empty(npc), consolidated);
@@ -148,7 +148,7 @@ mod tests {
 
         // Delta: pk=1 w=+3, pk=2 w=+1
         let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);
-        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         // 0→positive: both emit +1
         assert_eq!(out.count, 2);
         assert_eq!(out.get_weight(0), 1);
@@ -159,7 +159,7 @@ mod tests {
         let trace_batch = Arc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
         let mut ch2 = CursorHandle::from_owned(&[trace_batch], schema);
         let delta2 = make_batch(&schema, &[(1, -2, 10), (2, -1, 20)]);
-        let (out2, _) = op_distinct(&delta2, ch2.cursor_mut(), &schema);
+        let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
         // pk=1: 3→1, positive→positive, no change
         // pk=2: 1→0, positive→non-positive, emit -1
         assert_eq!(out2.count, 1);
@@ -241,7 +241,7 @@ mod tests {
 
         // Delta: same (PK=1, val=42) → stays +1 → no output
         let delta = make_batch_narrow::<4>(&schema, &[(1, 1, 42)]);
-        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 0, "I32: matching (PK,payload) should produce no output");
 
         // New (PK=1, val=99) → new element → +1 output
@@ -250,7 +250,7 @@ mod tests {
             schema,
         );
         let delta2 = make_batch_narrow::<4>(&schema, &[(1, 1, 99)]);
-        let (out2, _) = op_distinct(&delta2, ch2.cursor_mut(), &schema);
+        let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
         assert_eq!(out2.count, 1, "I32: new (PK,payload) should produce +1");
     }
 
@@ -264,7 +264,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         let delta = make_batch_narrow::<2>(&schema, &[(5, 1, -100)]);
-        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 0, "I16: matching (PK,payload) should produce no output");
     }
 
@@ -278,7 +278,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         let delta = make_batch_narrow::<1>(&schema, &[(7, 1, -1)]);
-        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 0, "I8: matching (PK,payload) should produce no output");
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
-        let (out, consolidated) = op_distinct(&delta, ch.cursor_mut(), &schema);
+        let (out, consolidated) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert!(out.consolidated, "distinct output must be consolidated");
         assert!(out.sorted, "distinct output must be sorted");
         assert!(consolidated.consolidated, "consolidated output must be consolidated");
