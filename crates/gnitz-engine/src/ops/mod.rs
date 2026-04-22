@@ -9,8 +9,9 @@ mod util;
 
 pub use distinct::op_distinct;
 pub use exchange::{
-    PartitionRouter, op_multi_scatter, op_relay_scatter, op_repartition_batch,
-    op_repartition_batches, op_repartition_batches_merged, worker_for_partition,
+    PartitionRouter, op_multi_scatter, op_relay_scatter, op_relay_scatter_consolidated,
+    op_repartition_batch, op_repartition_batches, op_repartition_batches_merged,
+    worker_for_partition,
 };
 pub use index::{AviDesc, GiDesc, op_integrate_with_indexes};
 pub use join::{

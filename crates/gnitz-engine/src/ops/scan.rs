@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
 
 use super::util::append_cursor_row_to_batch;
 
@@ -20,18 +20,18 @@ pub fn op_scan_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
     chunk_limit: i32,
-) -> Batch {
+) -> ConsolidatedBatch {
     // Fast path: bulk drain for single-source cursors without ghosts
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
     if let Some(batch) = cursor.drain_single_source(limit, schema) {
-        return batch;
+        return ConsolidatedBatch::new_unchecked(batch);
     }
 
     // Fallback: row-at-a-time scan
     let cap = if chunk_limit > 0 { chunk_limit as usize } else { 64 };
     let mut output = Batch::with_schema(*schema, cap);
-    output.sorted = true;       // cursor produces sorted order
-    output.consolidated = true; // cursor merges → consolidated
+    output.sorted = true;
+    output.consolidated = true;
 
     let mut scanned: i32 = 0;
     while cursor.valid {
@@ -46,7 +46,7 @@ pub fn op_scan_trace(
         cursor.advance();
     }
 
-    output
+    ConsolidatedBatch::new_unchecked(output)
 }
 
 // ---------------------------------------------------------------------------

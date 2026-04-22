@@ -16,9 +16,9 @@ use crate::ipc::{
     SalWriter, W2mReceiver,
 };
 use crate::reactor::PendingRelay;
-use crate::storage::{Batch, partition_for_key};
+use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
-    PartitionRouter, op_repartition_batch, op_relay_scatter,
+    PartitionRouter, op_repartition_batch, op_relay_scatter, op_relay_scatter_consolidated,
     worker_for_partition,
 };
 
@@ -518,12 +518,23 @@ impl MasterDispatcher {
             cat.dag.get_shard_cols(view_id)
         };
 
-        let sources: Vec<Option<&Batch>> = payloads.iter()
-            .map(|opt| opt.as_ref())
-            .collect();
-
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
-        let dest_batches = op_relay_scatter(&sources, &col_indices, &schema, self.num_workers);
+
+        let all_consolidated = payloads.iter().all(|opt| match opt {
+            Some(s) if s.count > 0 => s.consolidated,
+            _ => true,
+        });
+        let dest_batches = if all_consolidated {
+            let sources: Vec<Option<&ConsolidatedBatch>> = payloads.iter()
+                .map(|opt| opt.as_ref().map(ConsolidatedBatch::from_batch_ref_unchecked))
+                .collect();
+            op_relay_scatter_consolidated(&sources, &col_indices, &schema, self.num_workers)
+        } else {
+            let sources: Vec<Option<&Batch>> = payloads.iter()
+                .map(|opt| opt.as_ref())
+                .collect();
+            op_relay_scatter(&sources, &col_indices, &schema, self.num_workers)
+        };
 
         let (_, name_bytes) = self.get_schema_and_names(view_id);
 

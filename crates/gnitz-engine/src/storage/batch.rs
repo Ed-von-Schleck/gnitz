@@ -1258,9 +1258,13 @@ impl ColumnarSource for Batch {
 pub struct ConsolidatedBatch(Batch);
 
 impl ConsolidatedBatch {
-    #[allow(dead_code)]
     pub(crate) fn new_unchecked(batch: Batch) -> Self { ConsolidatedBatch(batch) }
     pub fn into_inner(self) -> Batch { self.0 }
+    /// Reinterpret `&Batch` as `&ConsolidatedBatch`. Caller asserts `batch.consolidated == true`.
+    // SAFETY: ConsolidatedBatch is #[repr(transparent)] over Batch.
+    pub(crate) fn from_batch_ref_unchecked(batch: &Batch) -> &Self {
+        unsafe { &*(batch as *const Batch as *const ConsolidatedBatch) }
+    }
 }
 
 impl std::ops::Deref for ConsolidatedBatch {

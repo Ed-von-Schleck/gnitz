@@ -778,7 +778,7 @@ pub fn execute_epoch(
                 let schema = reg!(*trace_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_scan_trace(cursor, &schema, *chunk_limit);
-                    reg_mut!(*out_reg).batch = result;
+                    reg_mut!(*out_reg).batch = result.into_inner();
                 }
             }
 
@@ -845,7 +845,7 @@ pub fn execute_epoch(
                 let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc));
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
                     let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
-                    reg_mut!(*out_reg).batch = output;
+                    reg_mut!(*out_reg).batch = output.into_inner();
                     // Ingest consolidated delta into history table
                     if *hist_table_idx >= 0 {
                         let ptr = program.tables[*hist_table_idx as usize];
@@ -884,28 +884,28 @@ pub fn execute_epoch(
                 let schema = reg!(*delta_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_anti_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result;
+                    reg_mut!(*out_reg).batch = result.into_inner();
                 }
             }
 
             Instr::AntiJoinDD { a_reg, b_reg, out_reg } => {
                 let schema = reg!(*a_reg).schema;
                 let result = ops::op_anti_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
-                reg_mut!(*out_reg).batch = result;
+                reg_mut!(*out_reg).batch = result.into_inner();
             }
 
             Instr::SemiJoinDT { delta_reg, trace_reg, out_reg } => {
                 let schema = reg!(*delta_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_semi_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result;
+                    reg_mut!(*out_reg).batch = result.into_inner();
                 }
             }
 
             Instr::SemiJoinDD { a_reg, b_reg, out_reg } => {
                 let schema = reg!(*a_reg).schema;
                 let result = ops::op_semi_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
-                reg_mut!(*out_reg).batch = result;
+                reg_mut!(*out_reg).batch = result.into_inner();
             }
 
             Instr::NullExtend { in_reg, out_reg, right_schema_idx } => {

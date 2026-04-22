@@ -1,9 +1,9 @@
-//! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter.
+//! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter_consolidated, op_relay_scatter, op_multi_scatter.
 
 use std::cell::RefCell;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, MemBatch, partition_for_key};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key};
 
 use super::util::{extract_group_key, payload_idx};
 
@@ -291,31 +291,44 @@ pub fn op_repartition_batches_merged(
         .collect()
 }
 
+/// Scatter pre-consolidated batches across workers using a merge-walk.
+/// All sources must satisfy the consolidated invariant (sorted, no duplicate PKs).
+/// Output batches are sorted but not consolidated (duplicate PKs can appear across sources).
+pub fn op_relay_scatter_consolidated(
+    sources: &[Option<&ConsolidatedBatch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Batch> {
+    let has_any = sources.iter().any(|src_opt| matches!(src_opt, Some(s) if s.count > 0));
+    gnitz_debug!(
+        "op_relay_scatter_consolidated: sources={}",
+        sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
+    );
+    if !has_any {
+        let npc = schema.num_columns as usize - 1;
+        return (0..num_workers).map(|_| Batch::empty(npc)).collect();
+    }
+    let plain: Vec<Option<&Batch>> = sources
+        .iter()
+        .copied()
+        .map(|opt| opt.map(|cb| -> &Batch { cb }))
+        .collect();
+    op_repartition_batches_merged(&plain, col_indices, schema, num_workers)
+}
+
+/// Scatter non-consolidated batches across workers by hashing each row.
 pub fn op_relay_scatter(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
-    let all_consolidated = sources.iter().all(|src_opt| match src_opt {
-        Some(s) if s.count > 0 => s.consolidated,
-        _ => true,
-    });
-    let has_any = sources.iter().any(|src_opt| matches!(src_opt, Some(s) if s.count > 0));
     gnitz_debug!(
-        "op_relay_scatter: sources={} merged={}",
+        "op_relay_scatter: sources={}",
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
-        all_consolidated
     );
-    if !has_any {
-        let npc = schema.num_columns as usize - 1;
-        return (0..num_workers).map(|_| Batch::empty(npc)).collect();
-    }
-    if all_consolidated {
-        op_repartition_batches_merged(sources, col_indices, schema, num_workers)
-    } else {
-        op_repartition_batches(sources, col_indices, schema, num_workers)
-    }
+    op_repartition_batches(sources, col_indices, schema, num_workers)
 }
 
 pub fn op_multi_scatter(
@@ -677,12 +690,11 @@ mod tests {
     fn test_relay_scatter_consolidated_path() {
         let schema = make_schema_u64_i64();
         let num_workers = 4;
-        let b0 = make_batch(&schema, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]);
-        let b1 = make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]);
-        assert!(b0.consolidated && b1.consolidated);
+        let b0 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]));
+        let b1 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]));
 
-        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-        let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
+        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 6);
         for sb in &result {
@@ -698,8 +710,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let num_workers = 4;
         let b0 = make_batch(&schema, &[(1, 1, 10)]);
-        let mut b1 = make_batch(&schema, &[(2, 1, 20)]);
-        b1.consolidated = false;
+        let b1 = make_batch(&schema, &[(2, 1, 20)]);
 
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
@@ -707,7 +718,7 @@ mod tests {
         assert_eq!(total_rows(&result), 2);
         for sb in &result {
             if sb.count > 0 {
-                assert!(!sb.consolidated, "fallback path output must not be consolidated");
+                assert!(!sb.consolidated, "non-consolidated path output must not be consolidated");
             }
         }
     }
@@ -827,10 +838,10 @@ mod tests {
         let num_workers = 4;
         // Two sources with identical (PK=1, val=10) rows — merged output must NOT
         // claim consolidated because it uses PK-only comparison.
-        let b0 = make_batch(&schema, &[(1, 1, 10)]);
-        let b1 = make_batch(&schema, &[(1, 1, 10)]);
-        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-        let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
+        let b0 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10)]));
+        let b1 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10)]));
+        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 2, "both rows must appear in output");
         for sb in &result {

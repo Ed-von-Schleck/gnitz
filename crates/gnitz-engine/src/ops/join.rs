@@ -2,7 +2,7 @@
 
 use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{write_to_batch, Batch, MemBatch, ReadCursor, scatter_copy};
+use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy};
 
 use super::util::{write_string_from_batch, write_string_from_raw};
 
@@ -15,13 +15,13 @@ pub fn op_anti_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> Batch {
+) -> ConsolidatedBatch {
     let npc = schema.num_columns as usize - 1;
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(npc);
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
     }
 
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
@@ -56,7 +56,7 @@ pub fn op_anti_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return Batch::empty(npc);
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -68,7 +68,7 @@ pub fn op_anti_join_delta_trace(
     output.sorted = true;
     output.consolidated = true;
     output.set_schema(*schema);
-    output
+    ConsolidatedBatch::new_unchecked(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,19 +80,19 @@ pub fn op_semi_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> Batch {
+) -> ConsolidatedBatch {
     let npc = schema.num_columns as usize - 1;
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(npc);
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
     }
 
     let trace_len = cursor.estimated_length();
     if n > trace_len {
         // Adaptive swap: iterate trace, binary-search delta
-        return semi_join_dt_swapped(&consolidated, cursor, schema);
+        return ConsolidatedBatch::new_unchecked(semi_join_dt_swapped(consolidated, cursor, schema));
     }
 
     // Merge-walk
@@ -128,7 +128,7 @@ pub fn op_semi_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return Batch::empty(npc);
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -140,7 +140,7 @@ pub fn op_semi_join_delta_trace(
     output.sorted = true;
     output.consolidated = true;
     output.set_schema(*schema);
-    output
+    ConsolidatedBatch::new_unchecked(output)
 }
 
 fn semi_join_dt_swapped(
@@ -191,8 +191,10 @@ fn semi_join_dt_swapped(
         write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &[], writer);
         });
-    // Swapped order: output is in trace key order, which is sorted
+    // Swapped order: output is in trace key order, which is sorted.
+    // Rows come from the consolidated delta so (PK, payload) pairs are unique.
     output.sorted = true;
+    output.consolidated = true;
     output.set_schema(*schema);
     output
 }
@@ -551,8 +553,8 @@ pub fn op_anti_join_delta_delta(
     batch_a: &Batch,
     batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> Batch {
-    filter_join_dd_with_payload(batch_a, batch_b, schema)
+) -> ConsolidatedBatch {
+    ConsolidatedBatch::new_unchecked(filter_join_dd_with_payload(batch_a, batch_b, schema))
 }
 
 /// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
@@ -560,8 +562,8 @@ pub fn op_semi_join_delta_delta(
     batch_a: &Batch,
     batch_b: &Batch,
     schema: &SchemaDescriptor,
-) -> Batch {
-    filter_join_dd(batch_a, batch_b, schema, true)
+) -> ConsolidatedBatch {
+    ConsolidatedBatch::new_unchecked(filter_join_dd(batch_a, batch_b, schema, true))
 }
 
 /// Payload-aware anti-join DD: excludes A rows only when B has a matching

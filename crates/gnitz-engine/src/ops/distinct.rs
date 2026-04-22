@@ -17,14 +17,14 @@ pub fn op_distinct(
     delta: Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-) -> (Batch, ConsolidatedBatch) {
+) -> (ConsolidatedBatch, ConsolidatedBatch) {
     let npc = schema.num_columns as usize - 1;
 
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
     if n == 0 {
-        return (Batch::empty(npc), consolidated);
+        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc)), consolidated);
     }
 
     // 2. Walk consolidated, collect emitting indices and weights
@@ -77,7 +77,7 @@ pub fn op_distinct(
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
-        return (Batch::empty(npc), consolidated);
+        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc)), consolidated);
     }
 
     let mb = consolidated.as_mem_batch();
@@ -90,7 +90,7 @@ pub fn op_distinct(
     output.consolidated = true;
     output.set_schema(*schema);
 
-    (output, consolidated)
+    (ConsolidatedBatch::new_unchecked(output), consolidated)
 }
 
 // ---------------------------------------------------------------------------
