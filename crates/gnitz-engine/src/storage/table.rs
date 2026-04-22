@@ -419,7 +419,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
-        if !self.shard_index.needs_compaction {
+        if !self.shard_index.should_compact() {
             return Ok(());
         }
         self.found_source = FoundSource::None;

@@ -146,7 +146,6 @@ pub(crate) struct ReadCursorEntry {
     source: CursorSource,
     position: usize,
     count: usize,
-    is_shard: bool,
 }
 
 impl ReadCursorEntry {
@@ -156,7 +155,6 @@ impl ReadCursorEntry {
             source: CursorSource::Batch(batch),
             position: 0,
             count,
-            is_shard: false,
         }
     }
 
@@ -166,7 +164,6 @@ impl ReadCursorEntry {
             source: CursorSource::Shard(shard),
             position: 0,
             count,
-            is_shard: true,
         };
         entry.skip_ghosts();
         entry
@@ -180,25 +177,19 @@ impl ReadCursorEntry {
     fn advance(&mut self) {
         if self.is_valid() {
             self.position += 1;
-            if self.is_shard {
-                self.skip_ghosts();
-            }
+            self.skip_ghosts();
         }
     }
 
     fn seek(&mut self, key: u128) {
         self.position = self.source.find_lower_bound(key);
-        if self.is_shard {
-            self.skip_ghosts();
-        }
+        self.skip_ghosts();
     }
 
     fn skip_ghosts(&mut self) {
-        if self.is_shard {
-            if let CursorSource::Shard(s) = &self.source {
-                if !s.has_ghosts { return; }
-            }
-        }
+        // Batch sources are always consolidated — no ghost rows.
+        let CursorSource::Shard(s) = &self.source else { return; };
+        if !s.has_ghosts { return; }
         while self.position < self.count {
             if self.source.get_weight(self.position) != 0 {
                 return;
@@ -469,7 +460,6 @@ impl ReadCursor {
     pub(crate) fn drain_single_source(
         &mut self,
         limit: usize,
-        schema: &SchemaDescriptor,
     ) -> Option<super::batch::Batch> {
         if !self.valid || self.entries.len() != 1 {
             return None;
@@ -478,6 +468,7 @@ impl ReadCursor {
         let start = entry.position;
         let remaining = entry.count - start;
         let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
+        let schema = &self.schema;
 
         let batch = match &entry.source {
             CursorSource::Batch(b) => {
@@ -782,7 +773,7 @@ mod tests {
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
-        let result = cursor.drain_single_source(0, &schema);
+        let result = cursor.drain_single_source(0);
         assert!(result.is_some());
         let out = result.unwrap();
         assert_eq!(out.count, 3);
@@ -799,14 +790,14 @@ mod tests {
         let mut cursor = ReadCursor::new(entries, schema);
 
         // Drain first 2
-        let out1 = cursor.drain_single_source(2, &schema).unwrap();
+        let out1 = cursor.drain_single_source(2).unwrap();
         assert_eq!(out1.count, 2);
         assert_eq!(out1.get_pk(0), 1);
         assert_eq!(out1.get_pk(1), 2);
         assert!(cursor.valid);
 
         // Drain remaining 2
-        let out2 = cursor.drain_single_source(0, &schema).unwrap();
+        let out2 = cursor.drain_single_source(0).unwrap();
         assert_eq!(out2.count, 2);
         assert_eq!(out2.get_pk(0), 3);
         assert_eq!(out2.get_pk(1), 4);
@@ -823,6 +814,6 @@ mod tests {
             ReadCursorEntry::new_batch(b2),
         ];
         let mut cursor = ReadCursor::new(entries, schema);
-        assert!(cursor.drain_single_source(0, &schema).is_none());
+        assert!(cursor.drain_single_source(0).is_none());
     }
 }

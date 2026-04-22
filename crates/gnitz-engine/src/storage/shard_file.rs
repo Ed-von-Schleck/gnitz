@@ -53,23 +53,17 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     let first = i64::from_le_bytes(data[..8].try_into().unwrap());
     let mut second: Option<i64> = None;
 
-    // We'll build the bitvec speculatively; discard if 3+ distinct.
-    let bitvec_len = (n + 7) / 8;
-    let mut bitvec = vec![0u8; bitvec_len];
-
+    // Pass 1: determine how many distinct values exist without allocating.
     for i in 1..n {
         let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
         if v == first {
-            // bit stays 0
+            // matches first value
         } else if let Some(b) = second {
-            if v == b {
-                bitvec[i / 8] |= 1 << (i % 8);
-            } else {
+            if v != b {
                 return RegionEncoding::Raw; // 3+ distinct values
             }
         } else {
             second = Some(v);
-            bitvec[i / 8] |= 1 << (i % 8);
         }
     }
 
@@ -79,11 +73,22 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
             value[..8].copy_from_slice(&first.to_le_bytes());
             RegionEncoding::Constant { value }
         }
-        Some(b) => RegionEncoding::TwoValue {
-            value_a: first,
-            value_b: b,
-            bitvec,
-        },
+        Some(second_val) => {
+            // Pass 2: exactly 2 distinct values — build the bitvec now.
+            let bitvec_len = (n + 7) / 8;
+            let mut bitvec = vec![0u8; bitvec_len];
+            for i in 1..n {
+                let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
+                if v != first {
+                    bitvec[i / 8] |= 1 << (i % 8);
+                }
+            }
+            RegionEncoding::TwoValue {
+                value_a: first,
+                value_b: second_val,
+                bitvec,
+            }
+        }
     }
 }
 
@@ -363,6 +368,11 @@ pub fn write_shard_streaming(
     };
 
     // --- Phase 4: build header + directory buffer ---
+    // For TwoValue regions, precompute the on-disk bytes now so they can be
+    // used for both the checksum and the later write (avoids building them
+    // twice).  Slot is None for Raw / Constant regions.
+    let mut two_value_bufs: Vec<Option<Vec<u8>>> = (0..num_regions).map(|_| None).collect();
+
     let hdr_dir_size = HEADER_SIZE + dir_size;
     let mut hdr_buf = vec![0u8; hdr_dir_size];
 
@@ -381,11 +391,13 @@ pub fn write_shard_streaming(
                 xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, elem_width) })
             }
             RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
-                let mut tmp = Vec::with_capacity(16 + bitvec.len());
-                tmp.extend_from_slice(&value_a.to_le_bytes());
-                tmp.extend_from_slice(&value_b.to_le_bytes());
-                tmp.extend_from_slice(bitvec);
-                xxh::checksum(&tmp)
+                let mut buf = Vec::with_capacity(16 + bitvec.len());
+                buf.extend_from_slice(&value_a.to_le_bytes());
+                buf.extend_from_slice(&value_b.to_le_bytes());
+                buf.extend_from_slice(bitvec);
+                let cs = xxh::checksum(&buf);
+                two_value_bufs[i] = Some(buf);
+                cs
             }
         };
 
@@ -408,12 +420,6 @@ pub fn write_shard_streaming(
     write_u64_le(&mut hdr_buf, OFF_TABLE_ID, table_id as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
-
-    // XOR8 filter data
-    if let Some(ref data) = xor8_data {
-        // Nothing to do here; written to file in phase 8
-        let _ = data;
-    }
 
     // --- Phase 5-9: open file, pwrite regions, sync, rename ---
     let base_bytes = basename.to_bytes();
@@ -464,12 +470,10 @@ pub fn write_shard_streaming(
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
                     pwrite_all(fd, src, r_off).map_err(|_| abort(fd))?;
                 }
-                RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
-                    let mut tmp = Vec::with_capacity(16 + bitvec.len());
-                    tmp.extend_from_slice(&value_a.to_le_bytes());
-                    tmp.extend_from_slice(&value_b.to_le_bytes());
-                    tmp.extend_from_slice(bitvec);
-                    pwrite_all(fd, &tmp, r_off).map_err(|_| abort(fd))?;
+                RegionEncoding::TwoValue { .. } => {
+                    // Reuse the buffer built in phase 4 — no second allocation.
+                    let buf = two_value_bufs[i].as_ref().expect("TwoValue buf precomputed");
+                    pwrite_all(fd, buf, r_off).map_err(|_| abort(fd))?;
                 }
             }
         }

@@ -183,11 +183,13 @@ impl MergeHeap {
                 self.min_indices.push(heap[idx].idx);
                 let right = 2 * idx + 2;
                 if right < heap.len() {
+                    debug_assert!(sp < stack.len(), "collect_min_indices stack overflow");
                     stack[sp] = right;
                     sp += 1;
                 }
                 let left = 2 * idx + 1;
                 if left < heap.len() {
+                    debug_assert!(sp < stack.len(), "collect_min_indices stack overflow");
                     stack[sp] = left;
                     sp += 1;
                 }

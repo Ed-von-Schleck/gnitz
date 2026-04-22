@@ -161,7 +161,7 @@ pub struct ShardIndex {
     l0: Vec<ShardEntry>,
     levels: Vec<FLSMLevel>,
 
-    pub needs_compaction: bool,
+    needs_compaction: bool,
     compact_seq: u64,
     pending_deletions: Vec<String>,
 }
@@ -206,6 +206,10 @@ impl ShardIndex {
 
     fn update_flags(&mut self) {
         self.needs_compaction = self.l0.len() > L0_COMPACT_THRESHOLD;
+    }
+
+    pub fn should_compact(&self) -> bool {
+        self.needs_compaction
     }
 
     pub fn all_shard_arcs(&self) -> Vec<Arc<MappedShard>> {
@@ -523,7 +527,7 @@ impl ShardIndex {
 
         let src_guard_key = self.levels[src_idx].guards[worst_idx].guard_key;
         let src_max_bound = if worst_idx + 1 < self.levels[src_idx].guards.len() {
-            self.levels[src_idx].guards[worst_idx + 1].guard_key - 1
+            self.levels[src_idx].guards[worst_idx + 1].guard_key.saturating_sub(1)
         } else {
             u128::MAX
         };
@@ -793,7 +797,7 @@ mod tests {
             all_pks.push(pk);
         }
 
-        assert!(idx.needs_compaction);
+        assert!(idx.should_compact());
         idx.run_compact().unwrap();
 
         // L0 should be empty after compaction
@@ -1006,7 +1010,7 @@ mod tests {
             all_pks.push(pk);
         }
 
-        assert!(idx.needs_compaction);
+        assert!(idx.should_compact());
         let l0_before = idx.l0.len();
 
         let result = idx.run_compact();
@@ -1016,7 +1020,7 @@ mod tests {
         assert_eq!(idx.l0.len(), l0_before, "L0 must not be modified on failure");
 
         // needs_compaction must still be true (update_flags was not called).
-        assert!(idx.needs_compaction, "needs_compaction must remain true after failure");
+        assert!(idx.should_compact(), "needs_compaction must remain true after failure");
 
         // All original keys must still be findable via L0.
         for pk in &all_pks {

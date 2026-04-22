@@ -16,8 +16,11 @@ use crate::util::{read_i64_le, read_u64_le};
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
 const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 
-/// Maximum regions: 4 fixed (pk_lo, pk_hi, weight, null_bmp) + up to 63
-/// payload columns.  Use 68 for alignment.
+/// Maximum regions tracked in the `offsets`/`strides` arrays:
+/// 4 fixed (pk_lo, pk_hi, weight, null_bmp) + up to 63 payload columns
+/// (schema max is 64 total columns, 1 is the PK).  The blob is not in this
+/// array; it lives in `self.blob` and is accounted for separately.
+/// 4 + 63 = 67, rounded up to 68 to keep the array size as a multiple of 4.
 pub(super) const MAX_BATCH_REGIONS: usize = 68;
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
@@ -545,15 +548,15 @@ impl Batch {
     }
 
     #[inline]
-    pub fn extend_pk_lo(&mut self, d: &[u8]) { self.extend_region(0, d); }
+    pub fn extend_pk_lo(&mut self, d: &[u8]) { self.extend_region(REG_PK_LO, d); }
     #[inline]
-    pub fn extend_pk_hi(&mut self, d: &[u8]) { self.extend_region(1, d); }
+    pub fn extend_pk_hi(&mut self, d: &[u8]) { self.extend_region(REG_PK_HI, d); }
     #[inline]
-    pub fn extend_weight(&mut self, d: &[u8]) { self.extend_region(2, d); }
+    pub fn extend_weight(&mut self, d: &[u8]) { self.extend_region(REG_WEIGHT, d); }
     #[inline]
-    pub fn extend_null_bmp(&mut self, d: &[u8]) { self.extend_region(3, d); }
+    pub fn extend_null_bmp(&mut self, d: &[u8]) { self.extend_region(REG_NULL_BMP, d); }
     #[inline]
-    pub fn extend_col(&mut self, pi: usize, d: &[u8]) { self.extend_region(4 + pi, d); }
+    pub fn extend_col(&mut self, pi: usize, d: &[u8]) { self.extend_region(REG_PAYLOAD_START + pi, d); }
 
     /// Fill `nbytes` of zeros at the current row position in a payload column.
     #[inline]
@@ -856,11 +859,10 @@ impl Batch {
                         self.extend_col(pi, &f32_val.to_le_bytes());
                     }
                     crate::schema::type_code::U128 => {
-                        self.extend_col(pi, &(lo_values[pi] as u64).to_le_bytes());
-                        // U128 second half goes into same cell at +8
-                        let r = 4 + pi;
-                        let off = self.offsets[r] as usize + self.count * self.strides[r] as usize + 8;
-                        self.data[off..off + 8].copy_from_slice(&hi_values[pi].to_le_bytes());
+                        let mut bytes = [0u8; 16];
+                        bytes[..8].copy_from_slice(&(lo_values[pi] as u64).to_le_bytes());
+                        bytes[8..].copy_from_slice(&hi_values[pi].to_le_bytes());
+                        self.extend_col(pi, &bytes);
                     }
                     _ => {
                         let bytes = lo_values[pi].to_le_bytes();
@@ -1262,7 +1264,11 @@ impl ColumnarSource for Batch {
 pub struct ConsolidatedBatch(Batch);
 
 impl ConsolidatedBatch {
-    pub(crate) fn new_unchecked(batch: Batch) -> Self { ConsolidatedBatch(batch) }
+    pub(crate) fn new_unchecked(batch: Batch) -> Self {
+        debug_assert!(batch.sorted || batch.count == 0, "ConsolidatedBatch must be sorted");
+        debug_assert!(batch.consolidated || batch.count == 0, "ConsolidatedBatch must be consolidated");
+        ConsolidatedBatch(batch)
+    }
     pub fn into_inner(self) -> Batch { self.0 }
     /// Reinterpret `&Batch` as `&ConsolidatedBatch`. Caller asserts `batch.consolidated == true`.
     // SAFETY: ConsolidatedBatch is #[repr(transparent)] over Batch.

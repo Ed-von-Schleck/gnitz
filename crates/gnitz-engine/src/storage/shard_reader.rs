@@ -197,7 +197,7 @@ impl MappedShard {
         }
 
         // Build RegionViews
-        fn build_region_view(data: &[u8], e: &DirEntry) -> RegionView {
+        let build_region_view = |e: &DirEntry| -> Result<RegionView, StorageError> {
             match e.encoding {
                 ENCODING_CONSTANT => {
                     let mut value = [0u8; 16];
@@ -205,24 +205,28 @@ impl MappedShard {
                         let copy_len = e.size.min(16);
                         value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
                     }
-                    RegionView::Constant { value, offset: e.offset }
+                    Ok(RegionView::Constant { value, offset: e.offset })
                 }
                 ENCODING_TWO_VALUE => {
+                    let expected_bitvec = (count + 7) / 8;
+                    if e.size < 16 + expected_bitvec {
+                        return Err(StorageError::InvalidShard);
+                    }
                     let value_a = read_i64_le(data, e.offset);
                     let value_b = read_i64_le(data, e.offset + 8);
                     let bitvec_off = e.offset + 16;
-                    RegionView::TwoValue { value_a, value_b, bitvec_off }
+                    Ok(RegionView::TwoValue { value_a, value_b, bitvec_off })
                 }
                 _ => {
-                    RegionView::Raw { offset: e.offset, size: e.size }
+                    Ok(RegionView::Raw { offset: e.offset, size: e.size })
                 }
             }
-        }
+        };
 
-        let pk_lo = build_region_view(data, &entries[0]);
-        let pk_hi = build_region_view(data, &entries[1]);
-        let weight = build_region_view(data, &entries[2]);
-        let null_bmp = build_region_view(data, &entries[3]);
+        let pk_lo = build_region_view(&entries[0])?;
+        let pk_hi = build_region_view(&entries[1])?;
+        let weight = build_region_view(&entries[2])?;
+        let null_bmp = build_region_view(&entries[3])?;
 
         // has_ghosts: true if any row could have weight == 0.
         let has_ghosts = match &weight {
@@ -243,7 +247,7 @@ impl MappedShard {
                 col_to_payload.push(usize::MAX);
             } else {
                 col_to_payload.push(col_regions.len());
-                col_regions.push(build_region_view(data, &entries[reg_idx]));
+                col_regions.push(build_region_view(&entries[reg_idx])?);
                 reg_idx += 1;
             }
         }
@@ -957,6 +961,43 @@ mod tests {
 
         let cpath = std::ffi::CString::new(path).unwrap();
         assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(StorageError::InvalidShard));
+    }
+
+    #[test]
+    fn two_value_truncated_bitvec_rejected() {
+        // Build a shard with TwoValue weight encoding, then corrupt it so the
+        // region size is shorter than the required bitvec (< 16 + ceil(n/8)).
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let n = 64usize;
+        let pks: Vec<u64> = (1..=n as u64).collect();
+        let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
+        let path = build_test_shard_weights(dir.path(), "twoval_trunc.db", &pks, &wts, &vals);
+        let schema = test_schema();
+
+        // The weight region must be TwoValue.  Shrink its size field in the
+        // directory entry so bitvec_len < ceil(n/8) = 8 bytes.  Weight
+        // region is entry index 2 in the directory.
+        let mut data = std::fs::read(&path).unwrap();
+        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
+        let weight_entry_off = dir_off + 2 * DIR_ENTRY_SIZE;
+        let orig_size = read_u64_le(&data, weight_entry_off + 8);
+        // Only write the two values (16 bytes), drop the bitvec.
+        let truncated_size = 16u64;
+        assert!(orig_size > truncated_size, "weight region must be larger than 16 bytes for this test");
+        // Patch the size field.  Checksum validation is disabled below so the
+        // stale checksum doesn't mask the InvalidShard we're expecting.
+        crate::util::write_u64_le(&mut data, weight_entry_off + 8, truncated_size);
+        std::fs::write(&path, &data).unwrap();
+
+        let cpath = std::ffi::CString::new(path).unwrap();
+        // Must be rejected — the bitvec is too short for 64 rows.
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, false).err(),
+            Some(StorageError::InvalidShard),
+            "truncated TwoValue bitvec must be rejected at open time"
+        );
     }
 
     #[test]

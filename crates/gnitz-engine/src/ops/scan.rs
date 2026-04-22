@@ -23,7 +23,7 @@ pub fn op_scan_trace(
 ) -> ConsolidatedBatch {
     // Fast path: bulk drain for single-source cursors without ghosts
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
-    if let Some(batch) = cursor.drain_single_source(limit, schema) {
+    if let Some(batch) = cursor.drain_single_source(limit) {
         return ConsolidatedBatch::new_unchecked(batch);
     }
 
