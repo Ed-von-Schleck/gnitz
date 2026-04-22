@@ -2,7 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{Batch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
 
 use super::util::{
     append_cursor_row_to_batch, write_string_from_batch, payload_idx,
@@ -793,19 +793,20 @@ pub fn op_reduce(
         num_groups += 1;
     }
 
-    // Output flags
-    raw_output.sorted = group_by_pk;
-    if group_by_pk {
-        raw_output.consolidated = true;
-    }
-
     gnitz_debug!(
         "op_reduce: in={} groups={} out={} fin={}",
         n, num_groups, raw_output.count,
         fin_output.as_ref().map_or(0, |b| b.count)
     );
 
-    (raw_output, fin_output)
+    if group_by_pk {
+        // PK-grouped output: one row per unique PK, sorted and weight-folded.
+        raw_output.sorted = true;
+        raw_output.consolidated = true;
+        (ConsolidatedBatch::new_unchecked(raw_output).into_inner(), fin_output)
+    } else {
+        (raw_output, fin_output)
+    }
 }
 
 /// Emit one reduce output row.
@@ -1285,7 +1286,7 @@ fn emit_gather_row(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -1303,7 +1304,7 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    ) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1317,7 +1318,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     fn make_schema_u64_f32() -> SchemaDescriptor {
@@ -1333,7 +1334,7 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> Batch {
+    fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1347,7 +1348,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     /// 3-column source schema: U64 pk (pk_index=0), I64 grp, STRING val (nullable).
@@ -1383,7 +1384,7 @@ mod tests {
     fn make_batch_3col_grp_str(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64, &str)],
-    ) -> Batch {
+    ) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1403,7 +1404,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     fn make_gi_schema() -> SchemaDescriptor {
@@ -1423,7 +1424,7 @@ mod tests {
     }
 
     /// Build a GI Batch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
-    fn make_gi_batch(rows: &[(u64, u64, i64)]) -> Batch {
+    fn make_gi_batch(rows: &[(u64, u64, i64)]) -> ConsolidatedBatch {
         let gi_schema = make_gi_schema();
         let n = rows.len();
         let mut b = Batch::with_schema(gi_schema, n.max(1));
@@ -1438,7 +1439,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     #[test]
@@ -1475,19 +1476,21 @@ mod tests {
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
-        let mut delta1 = Batch::with_schema(in_schema, 3);
-
-        for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
-            delta1.extend_pk_lo(&pk.to_le_bytes());
-            delta1.extend_pk_hi(&0u64.to_le_bytes());
-            delta1.extend_weight(&1i64.to_le_bytes());
-            delta1.extend_null_bmp(&0u64.to_le_bytes());
-            delta1.extend_col(0, &10i64.to_le_bytes()); // grp=10
-            delta1.extend_col(1, &val.to_le_bytes());
-            delta1.count += 1;
-        }
-        delta1.sorted = true;
-        delta1.consolidated = true;
+        let delta1 = {
+            let mut b = Batch::with_schema(in_schema, 3);
+            for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
+                b.extend_pk_lo(&pk.to_le_bytes());
+                b.extend_pk_hi(&0u64.to_le_bytes());
+                b.extend_weight(&1i64.to_le_bytes());
+                b.extend_null_bmp(&0u64.to_le_bytes());
+                b.extend_col(0, &10i64.to_le_bytes()); // grp=10
+                b.extend_col(1, &val.to_le_bytes());
+                b.count += 1;
+            }
+            b.sorted = true;
+            b.consolidated = true;
+            ConsolidatedBatch::new_unchecked(b)
+        };
 
         let agg = AggDescriptor {
             col_idx: 2, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
@@ -1508,17 +1511,19 @@ mod tests {
         let prev_out = Arc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
-        let mut delta2 = Batch::with_schema(in_schema, 1);
-
-        delta2.extend_pk_lo(&2u64.to_le_bytes());
-        delta2.extend_pk_hi(&0u64.to_le_bytes());
-        delta2.extend_weight(&(-1i64).to_le_bytes());
-        delta2.extend_null_bmp(&0u64.to_le_bytes());
-        delta2.extend_col(0, &10i64.to_le_bytes());
-        delta2.extend_col(1, &200i64.to_le_bytes());
-        delta2.count += 1;
-        delta2.sorted = true;
-        delta2.consolidated = true;
+        let delta2 = {
+            let mut b = Batch::with_schema(in_schema, 1);
+            b.extend_pk_lo(&2u64.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&(-1i64).to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &10i64.to_le_bytes());
+            b.extend_col(1, &200i64.to_le_bytes());
+            b.count += 1;
+            b.sorted = true;
+            b.consolidated = true;
+            ConsolidatedBatch::new_unchecked(b)
+        };
 
         let (out2, _) = op_reduce(
             &delta2, None, to_ch2.cursor_mut(),
@@ -1589,10 +1594,10 @@ mod tests {
         let ti_batch = Arc::new(make_batch_3col_grp_str(
             &input_schema,
             &[(1, 1, 1, "apple"), (1, 1, 1, "zebra")],
-        ));
+        ).into_inner());
 
         // GI: only PK=1 → group gc_u64=1
-        let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]));
+        let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
 
         // trace_out: empty (no previous aggregate, no retraction emitted)
         let to_batch = Arc::new(Batch::empty(output_schema.num_columns as usize - 1));
@@ -1815,7 +1820,7 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> Batch {
+    fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1829,10 +1834,10 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
-    fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> Batch {
+    fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1846,7 +1851,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     #[test]

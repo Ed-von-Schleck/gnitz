@@ -1614,6 +1614,7 @@ impl W2mReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ConsolidatedBatch;
 
     /// Helper: allocate an anonymous mmap region.
     unsafe fn alloc_mmap(size: usize) -> *mut u8 {
@@ -2015,7 +2016,7 @@ mod tests {
     }
 
     /// Helper: build a simple 1-row batch.
-    fn make_simple_batch(pk: u64, val: u64) -> Batch {
+    fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
         let sd = simple_schema();
         let mut b = Batch::with_schema(sd, 1);
         b.extend_pk_lo(&pk.to_le_bytes());
@@ -2026,7 +2027,7 @@ mod tests {
         b.count = 1;
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     #[test]

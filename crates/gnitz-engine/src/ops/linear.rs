@@ -2,7 +2,7 @@
 //! Also includes PK promotion for reindex (GROUP BY).
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch};
 use crate::scalar_func::ScalarFuncKind;
 use crate::xxh;
 
@@ -62,7 +62,8 @@ pub fn op_filter(
         append_range(&mut output, range_start as usize, n);
     }
 
-    if batch.consolidated {
+    // append_batch resets sorted+consolidated to false; restore them based on input.
+    if ConsolidatedBatch::from_batch_ref(batch).is_some() {
         output.sorted = true;
         output.consolidated = true;
     } else {
@@ -72,6 +73,15 @@ pub fn op_filter(
 
     gnitz_debug!("op_filter: in={} out={} func={}", n, output.count, func.kind_name());
     output
+}
+
+/// Filter a consolidated batch; the output is guaranteed consolidated.
+pub fn op_filter_consolidated(
+    batch: &ConsolidatedBatch,
+    func: &ScalarFuncKind,
+    schema: &SchemaDescriptor,
+) -> ConsolidatedBatch {
+    ConsolidatedBatch::new_unchecked(op_filter(batch, func, schema))
 }
 
 /// Map: transform batch via scalar function.
@@ -133,15 +143,15 @@ pub fn op_negate(batch: &Batch) -> Batch {
         weights[off..off + 8].copy_from_slice(&(-w).to_le_bytes());
     }
 
-    if batch.consolidated {
-        output.sorted = true;
-        output.consolidated = true;
-    } else {
-        output.sorted = batch.sorted;
-        output.consolidated = false;
-    }
+    // clone_batch preserves sorted and consolidated; negating weights does not change element
+    // identity, so both invariants survive as-is.
     gnitz_debug!("op_negate: count={}", batch.count);
     output
+}
+
+/// Negate a consolidated batch; the output is guaranteed consolidated.
+pub fn op_negate_consolidated(batch: &ConsolidatedBatch) -> ConsolidatedBatch {
+    ConsolidatedBatch::new_unchecked(op_negate(batch))
 }
 
 /// Union: algebraic addition of two Z-Set streams.
@@ -154,14 +164,8 @@ pub fn op_union(
     let b = match batch_b {
         Some(b) if b.count > 0 => b,
         _ => {
-            // Identity copy of batch_a
-            let mut output = batch_a.clone_batch();
-            if batch_a.consolidated {
-                output.sorted = true;
-                output.consolidated = true;
-            } else {
-                output.sorted = batch_a.sorted;
-            }
+            // Identity copy of batch_a; clone_batch preserves sorted and consolidated.
+            let output = batch_a.clone_batch();
             gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
             return output;
         }

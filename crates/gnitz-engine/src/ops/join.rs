@@ -848,7 +848,7 @@ fn write_join_row_from_batches(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -879,7 +879,7 @@ mod tests {
     fn make_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    ) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -893,13 +893,13 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     fn make_batch_str(
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, &str)],
-    ) -> Batch {
+    ) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -927,7 +927,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     fn read_str_payload(batch: &Batch, col: usize, row: usize) -> String {
@@ -1129,7 +1129,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=4 exist
-        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]));
+        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3
@@ -1151,7 +1151,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=3 exist with positive weight
-        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]));
+        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3,4
@@ -1174,7 +1174,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=1 exists
-        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
@@ -1210,7 +1210,7 @@ mod tests {
         let right_schema = make_schema_u64_i64();
 
         // Right trace: pk=1 val=100
-        let trace = Arc::new(make_batch(&right_schema, &[(1, 1, 100)]));
+        let trace = Arc::new(make_batch(&right_schema, &[(1, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
 
         // Delta (left): pk=1 val=10 (matches), pk=2 val=20 (no match → null fill)
@@ -1243,7 +1243,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
-        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
@@ -1262,7 +1262,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
-        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
@@ -1287,7 +1287,7 @@ mod tests {
         // Trace: PK=u64::MAX with positive weight — previously the sentinel
         // last_pk = u128::MAX would match this on first occurrence and skip it.
         let max_pk = u64::MAX;
-        let trace = Arc::new(make_batch(&schema, &[(max_pk, 1, 0)]));
+        let trace = Arc::new(make_batch(&schema, &[(max_pk, 1, 0)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Build 25 delta rows so n > trace_len triggers swapped path
@@ -1313,7 +1313,7 @@ mod tests {
         // This triggers the trace-has-many scenario
         let trace = Arc::new(make_batch(&schema, &[
             (1, 1, 100), (1, 1, 200), (1, 1, 300),
-        ]));
+        ]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: 20+ rows to trigger n > trace_len swap path

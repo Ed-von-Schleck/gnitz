@@ -378,17 +378,22 @@ pub fn op_multi_scatter(
             }
         }
 
-        // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source
+        // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
+        // consolidated implies sorted, so the two cases are mutually exclusive by invariant.
         for si in 0..n_specs {
             let spec = col_specs[si];
-            if spec.len() == 1 && spec[0] as usize == pki && (batch.sorted || batch.consolidated) {
-                for w in 0..num_workers {
-                    if results[si][w].count > 0 {
-                        if batch.sorted {
+            if spec.len() == 1 && spec[0] as usize == pki {
+                if ConsolidatedBatch::from_batch_ref(batch).is_some() {
+                    for w in 0..num_workers {
+                        if results[si][w].count > 0 {
                             results[si][w].sorted = true;
-                        }
-                        if batch.consolidated {
                             results[si][w].consolidated = true;
+                        }
+                    }
+                } else if batch.sorted {
+                    for w in 0..num_workers {
+                        if results[si][w].count > 0 {
+                            results[si][w].sorted = true;
                         }
                     }
                 }
@@ -486,7 +491,7 @@ mod tests {
         }
     }
 
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -500,10 +505,10 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -531,7 +536,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        b
+        ConsolidatedBatch::new_unchecked(b)
     }
 
     fn total_rows(batches: &[Batch]) -> usize {
@@ -690,8 +695,8 @@ mod tests {
     fn test_relay_scatter_consolidated_path() {
         let schema = make_schema_u64_i64();
         let num_workers = 4;
-        let b0 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]));
-        let b1 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]));
+        let b0 = make_batch(&schema, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]);
+        let b1 = make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]);
 
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
@@ -838,8 +843,8 @@ mod tests {
         let num_workers = 4;
         // Two sources with identical (PK=1, val=10) rows — merged output must NOT
         // claim consolidated because it uses PK-only comparison.
-        let b0 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10)]));
-        let b1 = ConsolidatedBatch::new_unchecked(make_batch(&schema, &[(1, 1, 10)]));
+        let b0 = make_batch(&schema, &[(1, 1, 10)]);
+        let b1 = make_batch(&schema, &[(1, 1, 10)]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
@@ -859,7 +864,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
-        let trace_batch = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let trace_batch = Arc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
         let mut cursor_handle = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.
@@ -868,7 +873,7 @@ mod tests {
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
         let (out, _consolidated) =
-            crate::ops::op_distinct(delta, cursor_handle.cursor_mut(), &schema);
+            crate::ops::op_distinct(delta.into_inner(), cursor_handle.cursor_mut(), &schema);
 
         assert_eq!(
             out.count,

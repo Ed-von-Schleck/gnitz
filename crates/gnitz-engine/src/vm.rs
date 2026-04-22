@@ -1480,11 +1480,10 @@ mod tests {
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
-        let mut input = make_batch(schema, &[
+        let input = make_batch(schema, &[
             (1, 0, 1, 10),
             (2, 0, 1, 20),
         ]);
-        input.consolidated = true;
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];
