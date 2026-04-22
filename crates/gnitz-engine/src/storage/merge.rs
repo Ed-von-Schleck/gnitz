@@ -430,33 +430,9 @@ pub fn sort_and_consolidate(
         ord => ord,
     });
 
-    let mut pending_idx = entries[0].idx as usize;
-    let mut pending_pk = entries[0].pk;
-    let mut pending_weight = batch.get_weight(pending_idx);
-
-    for pos in 1..n {
-        let e = entries[pos];
-        let cur_idx = e.idx as usize;
-
-        let same_group = e.pk == pending_pk
-            && columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx)
-                == Ordering::Equal;
-
-        if same_group {
-            pending_weight += batch.get_weight(cur_idx);
-        } else {
-            if pending_weight != 0 {
-                writer.write_row(batch, pending_idx, pending_weight);
-            }
-            pending_idx = cur_idx;
-            pending_pk = e.pk;
-            pending_weight = batch.get_weight(cur_idx);
-        }
-    }
-
-    if pending_weight != 0 {
-        writer.write_row(batch, pending_idx, pending_weight);
-    }
+    drain_groups_into(n, batch, schema, writer, |pos| {
+        (entries[pos].idx as usize, entries[pos].pk)
+    });
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -470,24 +446,38 @@ pub fn fold_sorted(
     if n == 0 {
         return;
     }
-    let mut pending_idx = 0usize;
-    let mut pending_pk = batch.get_pk(0);
-    let mut pending_weight = batch.get_weight(0);
+    drain_groups_into(n, batch, schema, writer, |pos| (pos, batch.get_pk(pos)));
+}
+
+/// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
+///
+/// `resolve(pos)` maps an iteration position to `(batch_row_idx, pk)`.
+/// For `sort_and_consolidate` this is an indirection through a sorted index array;
+/// for `fold_sorted` the input is already sorted so `pos == batch_row_idx`.
+fn drain_groups_into(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    resolve: impl Fn(usize) -> (usize, u128),
+) {
+    let (mut pending_idx, mut pending_pk) = resolve(0);
+    let mut pending_weight = batch.get_weight(pending_idx);
 
     for pos in 1..n {
-        let cur_pk = batch.get_pk(pos);
+        let (cur_idx, cur_pk) = resolve(pos);
         let same_group = cur_pk == pending_pk
-            && columnar::compare_rows(schema, batch, pending_idx, batch, pos) == Ordering::Equal;
+            && columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
 
         if same_group {
-            pending_weight += batch.get_weight(pos);
+            pending_weight += batch.get_weight(cur_idx);
         } else {
             if pending_weight != 0 {
                 writer.write_row(batch, pending_idx, pending_weight);
             }
-            pending_idx = pos;
+            pending_idx = cur_idx;
             pending_pk = cur_pk;
-            pending_weight = batch.get_weight(pos);
+            pending_weight = batch.get_weight(cur_idx);
         }
     }
     if pending_weight != 0 {

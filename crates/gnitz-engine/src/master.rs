@@ -520,20 +520,19 @@ impl MasterDispatcher {
 
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
 
-        let all_consolidated = payloads.iter().all(|opt| match opt {
-            Some(s) if s.count > 0 => s.consolidated,
-            _ => true,
-        });
-        let dest_batches = if all_consolidated {
-            let sources: Vec<Option<&ConsolidatedBatch>> = payloads.iter()
-                .map(|opt| opt.as_ref().map(ConsolidatedBatch::from_batch_ref_unchecked))
-                .collect();
-            op_relay_scatter_consolidated(&sources, &col_indices, &schema, self.num_workers)
-        } else {
-            let sources: Vec<Option<&Batch>> = payloads.iter()
-                .map(|opt| opt.as_ref())
-                .collect();
-            op_relay_scatter(&sources, &col_indices, &schema, self.num_workers)
+        let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads.iter()
+            .map(|opt| match opt {
+                None => Some(None),
+                Some(b) => ConsolidatedBatch::from_batch_ref(b).map(Some),
+            })
+            .collect();
+
+        let dest_batches = match consolidated_sources {
+            Some(sources) => op_relay_scatter_consolidated(&sources, &col_indices, &schema, self.num_workers),
+            None => {
+                let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
+                op_relay_scatter(&sources, &col_indices, &schema, self.num_workers)
+            }
         };
 
         let (_, name_bytes) = self.get_schema_and_names(view_id);

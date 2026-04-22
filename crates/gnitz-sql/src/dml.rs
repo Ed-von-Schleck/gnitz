@@ -671,14 +671,8 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)>
                 // the type's unsigned equivalent (not sign-extending to 64 bits).
                 let key_lo = match schema.columns[col_idx].type_code {
                     TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-                        let neg_buf;
-                        let s: &str = if negated {
-                            neg_buf = format!("-{}", n_str);
-                            &neg_buf
-                        } else {
-                            n_str
-                        };
-                        let v = s.parse::<i64>().ok()?;
+                        let v = n_str.parse::<i64>().ok()?;
+                        let v = if negated { v.checked_neg()? } else { v };
                         match schema.columns[col_idx].type_code {
                             TypeCode::I8  => (v as i8  as u8)  as u64,
                             TypeCode::I16 => (v as i16 as u16) as u64,

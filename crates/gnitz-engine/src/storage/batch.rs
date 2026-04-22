@@ -592,7 +592,7 @@ impl Batch {
     /// Fill `nbytes` of zeros at the current row position in a payload column.
     #[inline]
     pub fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
-        let r = 4 + pi;
+        let r = REG_PAYLOAD_START + pi;
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
@@ -1301,10 +1301,12 @@ impl ConsolidatedBatch {
         ConsolidatedBatch(batch)
     }
     pub fn into_inner(self) -> Batch { self.0 }
-    /// Reinterpret `&Batch` as `&ConsolidatedBatch`. Caller asserts `batch.consolidated == true`.
+    /// Reinterpret `&Batch` as `&ConsolidatedBatch` when `batch.consolidated` is set.
+    /// Empty batches are always considered consolidated.
     // SAFETY: ConsolidatedBatch is #[repr(transparent)] over Batch.
-    pub(crate) fn from_batch_ref_unchecked(batch: &Batch) -> &Self {
-        unsafe { &*(batch as *const Batch as *const ConsolidatedBatch) }
+    pub(crate) fn from_batch_ref(batch: &Batch) -> Option<&Self> {
+        (batch.consolidated || batch.count == 0)
+            .then(|| unsafe { &*(batch as *const Batch as *const ConsolidatedBatch) })
     }
 }
 
