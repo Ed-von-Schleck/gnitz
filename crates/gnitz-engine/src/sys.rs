@@ -94,18 +94,18 @@ pub fn server_create(path: &str) -> i32 {
         let mut addr: libc::sockaddr_un = std::mem::zeroed();
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let path_bytes = path.as_bytes();
-        let max_len = addr.sun_path.len() - 1;
-        let copy_len = path_bytes.len().min(max_len);
-        for i in 0..copy_len {
+        // Reject paths that would not fit with the null terminator.
+        // Consistent with the client-side check in gnitz-core/src/protocol/transport.rs.
+        if path_bytes.len() >= addr.sun_path.len() {
+            libc::close(fd);
+            return -1;
+        }
+        for i in 0..path_bytes.len() {
             addr.sun_path[i] = path_bytes[i] as libc::c_char;
         }
 
-        // Remove existing socket file
-        let mut path_buf = [0u8; 108];
-        let plen = path_bytes.len().min(107);
-        path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
-        path_buf[plen] = 0;
-        libc::unlink(path_buf.as_ptr() as *const libc::c_char);
+        // addr is zeroed so sun_path is already null-terminated after the copy above.
+        libc::unlink(addr.sun_path.as_ptr());
 
         if libc::bind(
             fd,
@@ -121,9 +121,12 @@ pub fn server_create(path: &str) -> i32 {
             return -3;
         }
 
-        // Set non-blocking for the listen socket
+        // Set non-blocking for the listen socket.
         let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            libc::close(fd);
+            return -4;
+        }
 
         fd
     }
@@ -225,5 +228,28 @@ mod tests {
             libc::close(fd);
             libc::unlink(format!("{}\0", path).as_ptr() as *const libc::c_char);
         }
+    }
+
+    #[test]
+    fn test_server_create_path_too_long() {
+        // sun_path is 108 bytes; a path of exactly 108 bytes has no room for the null terminator
+        let long_path = "/tmp/".to_string() + &"a".repeat(110);
+        assert!(long_path.len() >= 108);
+        let fd = server_create(&long_path);
+        assert!(fd < 0, "expected error for overlong path, got fd={}", fd);
+    }
+
+    #[test]
+    fn test_server_create_is_nonblocking() {
+        let path = "/tmp/gnitz_test_sys_server_nonblocking.sock";
+        let fd = server_create(path);
+        assert!(fd >= 0, "server_create failed: {}", fd);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        unsafe {
+            libc::close(fd);
+            libc::unlink(format!("{}\0", path).as_ptr() as *const libc::c_char);
+        }
+        assert!(flags >= 0, "F_GETFL failed: {}", flags);
+        assert!(flags & libc::O_NONBLOCK != 0, "socket is not non-blocking, flags={:#o}", flags);
     }
 }
