@@ -1,3 +1,19 @@
+#[macro_use]
+mod log;
+mod util;
+mod xxh;
+mod layout;
+mod schema;
+mod storage;
+mod expr;
+mod ops;
+mod vm;
+mod compiler;
+mod dag;
+mod sys;
+mod catalog;
+mod runtime;
+
 use std::env;
 use std::process;
 
@@ -23,17 +39,17 @@ Environment:
 
 fn parse_level(s: &str) -> u32 {
     match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => gnitz_engine::log::QUIET,
-        "normal" | "1" => gnitz_engine::log::NORMAL,
-        "verbose" | "debug" | "2" => gnitz_engine::log::DEBUG,
-        _ => gnitz_engine::log::QUIET,
+        "quiet" | "0" => log::QUIET,
+        "normal" | "1" => log::NORMAL,
+        "verbose" | "debug" | "2" => log::DEBUG,
+        _ => log::QUIET,
     }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut level = gnitz_engine::log::QUIET;
+    let mut level = log::QUIET;
     if let Ok(env_level) = env::var("GNITZ_LOG_LEVEL") {
         level = parse_level(&env_level);
     }
@@ -75,7 +91,7 @@ fn main() {
         process::exit(1);
     }
 
-    gnitz_engine::log::init(level, b"M");
-    let rc = gnitz_engine::runtime::server_main(&data_dir, &socket_path, num_workers, level);
+    log::init(level, b"M");
+    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level);
     process::exit(rc);
 }
