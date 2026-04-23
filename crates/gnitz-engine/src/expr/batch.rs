@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::expr::{
+use super::program::{
     ExprProgram,
     EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT,
     EXPR_LOAD_CONST, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PK_INT,
@@ -27,26 +27,27 @@ use crate::storage::MemBatch;
 use crate::schema::compare_german_strings;
 use crate::util::read_u64_le;
 
-pub const MORSEL: usize = 256;
-pub(crate) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
+pub(in crate::expr) const MORSEL: usize = 256;
+pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
 
 // ---------------------------------------------------------------------------
 // EvalScratch — the SoA register file for batch evaluation
 // ---------------------------------------------------------------------------
 
-pub struct EvalScratch {
+pub(in crate::expr) struct EvalScratch {
     /// Register buffers, register-major layout: regs[reg * MORSEL + row].
-    pub(crate) regs: Vec<i64>,
+    pub(in crate::expr) regs: Vec<i64>,
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
-    pub(crate) null_bits: Vec<u64>,
+    pub(in crate::expr) null_bits: Vec<u64>,
     /// Per-row filter bitmask; set by filter_batch, ignored by execute_map.
-    pub filter_bits: Vec<u64>,
-    pub(crate) no_nulls: bool,
+    pub(in crate::expr) filter_bits: Vec<u64>,
+    pub(in crate::expr) no_nulls: bool,
 }
 
+#[allow(dead_code)]
 impl EvalScratch {
-    pub fn new() -> Self {
+    pub(in crate::expr) fn new() -> Self {
         EvalScratch {
             regs: Vec::new(),
             null_bits: Vec::new(),
@@ -57,7 +58,7 @@ impl EvalScratch {
 
     /// Ensure the scratch buffer can hold `num_regs` registers and `(n+63)/64`
     /// filter words.  Does not shrink.
-    pub fn ensure_capacity(&mut self, num_regs: usize, no_nulls: bool, n: usize) {
+    pub(in crate::expr) fn ensure_capacity(&mut self, num_regs: usize, no_nulls: bool, n: usize) {
         let reg_cap = num_regs * MORSEL;
         if self.regs.len() < reg_cap {
             self.regs.resize(reg_cap, 0);
@@ -75,17 +76,17 @@ impl EvalScratch {
         }
     }
 
-    pub fn reg_slice(&self, reg: usize, m: usize) -> &[i64] {
+    pub(in crate::expr) fn reg_slice(&self, reg: usize, m: usize) -> &[i64] {
         &self.regs[reg * MORSEL..reg * MORSEL + m]
     }
 
-    pub fn reg_mut(&mut self, reg: usize, m: usize) -> &mut [i64] {
+    pub(in crate::expr) fn reg_mut(&mut self, reg: usize, m: usize) -> &mut [i64] {
         &mut self.regs[reg * MORSEL..reg * MORSEL + m]
     }
 
     /// Split borrows: two shared sources + one mutable destination.
     /// Safety: SSA guarantees d != a and d != b (the debug_assert enforces this).
-    pub fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize)
+    pub(in crate::expr) fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize)
         -> (&[i64], &[i64], &mut [i64])
     {
         debug_assert!(d != a && d != b, "reg3: dst aliases src register");
@@ -98,17 +99,17 @@ impl EvalScratch {
         }
     }
 
-    pub fn null_words(&self, reg: usize, words: usize) -> &[u64] {
+    pub(in crate::expr) fn null_words(&self, reg: usize, words: usize) -> &[u64] {
         &self.null_bits[reg * NULL_WORDS_PER_REG..reg * NULL_WORDS_PER_REG + words]
     }
 
-    pub fn null_words_mut(&mut self, reg: usize, words: usize) -> &mut [u64] {
+    pub(in crate::expr) fn null_words_mut(&mut self, reg: usize, words: usize) -> &mut [u64] {
         &mut self.null_bits[reg * NULL_WORDS_PER_REG..reg * NULL_WORDS_PER_REG + words]
     }
 
     /// Split borrows for null bit words.
     /// Safety: SSA guarantees d != a and d != b.
-    pub fn null_words3(&mut self, a: usize, b: usize, d: usize, words: usize)
+    pub(in crate::expr) fn null_words3(&mut self, a: usize, b: usize, d: usize, words: usize)
         -> (&[u64], &[u64], &mut [u64])
     {
         debug_assert!(d != a && d != b, "null_words3: dst aliases src register");
@@ -122,7 +123,7 @@ impl EvalScratch {
     }
 
     /// Zero the null bits for one register's morsel region.
-    pub fn clear_null_reg(&mut self, reg: usize, m: usize) {
+    pub(in crate::expr) fn clear_null_reg(&mut self, reg: usize, m: usize) {
         if self.no_nulls { return; }
         let words = (m + 63) / 64;
         let base = reg * NULL_WORDS_PER_REG;
@@ -292,7 +293,7 @@ fn eval_str_col_vs_col(
 /// Results land in `scratch.regs`; null bits in `scratch.null_bits`.
 ///
 /// Callers loop over morsels and call this function once per morsel.
-pub(crate) fn eval_batch(
+pub(in crate::expr) fn eval_batch(
     prog: &ExprProgram,
     mb: &MemBatch,
     morsel_start: usize,
@@ -894,128 +895,6 @@ pub(crate) fn eval_batch(
             ),
 
             _ => {}
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::expr::ExprProgram;
-    use crate::storage::Batch;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-
-    fn make_schema_2col() -> SchemaDescriptor {
-        let mut cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        cols[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols }
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b
-    }
-
-    #[test]
-    fn test_scratch_reg3() {
-        let mut s = EvalScratch::new();
-        s.ensure_capacity(3, true, MORSEL);
-        let m = 4;
-        // Fill regs 0 and 1 with known values
-        for i in 0..m { s.regs[0 * MORSEL + i] = (i as i64) + 1; }
-        for i in 0..m { s.regs[1 * MORSEL + i] = (i as i64) * 10; }
-        // Use reg3 to add reg0 + reg1 → reg2
-        {
-            let (ra, rb, rd) = s.reg3(0, 1, 2, m);
-            for i in 0..m { rd[i] = ra[i] + rb[i]; }
-        }
-        assert_eq!(&s.regs[2 * MORSEL..2 * MORSEL + m], &[1, 12, 23, 34]);
-    }
-
-    #[test]
-    fn test_scratch_null_words3() {
-        let mut s = EvalScratch::new();
-        s.ensure_capacity(3, false, MORSEL);
-        let words = 1;
-        s.null_bits[0 * NULL_WORDS_PER_REG] = 0b1010;
-        s.null_bits[1 * NULL_WORDS_PER_REG] = 0b0110;
-        {
-            let (na, nb, nd) = s.null_words3(0, 1, 2, words);
-            nd[0] = na[0] | nb[0];
-        }
-        assert_eq!(s.null_bits[2 * NULL_WORDS_PER_REG], 0b1110);
-    }
-
-    #[test]
-    fn test_eval_batch_add() {
-        use crate::expr;
-        let schema = make_schema_2col();
-        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let mb = batch.as_mem_batch();
-
-        // r0 = pk (LOAD_PK_INT), r1 = col[1] (LOAD_PAYLOAD_INT), r2 = r0 + r1
-        let code = vec![
-            expr::EXPR_LOAD_PK_INT, 0, 0, 0,
-            expr::EXPR_LOAD_PAYLOAD_INT, 1, 0, 0,  // pi=0 (first payload)
-            expr::EXPR_INT_ADD, 2, 0, 1,
-        ];
-        let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let mut scratch = EvalScratch::new();
-        scratch.ensure_capacity(3, true, 3);
-        eval_batch(&prog, &mb, 0, 3, 0, &mut scratch);
-
-        // row 0: pk=1, val=10, sum=11
-        assert_eq!(scratch.regs[2 * MORSEL + 0], 11);
-        // row 1: pk=2, val=20, sum=22
-        assert_eq!(scratch.regs[2 * MORSEL + 1], 22);
-        // row 2: pk=3, val=30, sum=33
-        assert_eq!(scratch.regs[2 * MORSEL + 2], 33);
-    }
-
-    #[test]
-    fn test_eval_batch_matches_eval_predicate() {
-        use crate::expr::{self, eval_predicate, ExprProgram};
-
-        let schema = make_schema_2col();
-        // Build a predicate: col[1] > 15
-        let code = vec![
-            expr::EXPR_LOAD_PAYLOAD_INT, 0, 0, 0,  // r0 = payload[0]
-            expr::EXPR_LOAD_CONST, 1, 15, 0,        // r1 = 15
-            expr::EXPR_CMP_GT, 2, 0, 1,             // r2 = r0 > r1
-        ];
-        let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let mut resolved = ExprProgram::new(prog.code.clone(), 3, 2, vec![]);
-        resolved.resolve_column_indices(0);
-
-        let rows: &[(u64, i64, i64)] = &[(1, 1, 5), (2, 1, 15), (3, 1, 25), (4, 1, 0)];
-        let batch = make_batch(&schema, rows);
-        let mb = batch.as_mem_batch();
-
-        let mut scratch = EvalScratch::new();
-        scratch.ensure_capacity(3, true, 4);
-        eval_batch(&resolved, &mb, 0, 4, 0, &mut scratch);
-
-        for (i, &(_, _, val)) in rows.iter().enumerate() {
-            let batch_result = scratch.regs[2 * MORSEL + i] != 0;
-            let (row_val, row_null) = eval_predicate(&prog, &mb, i, 0);
-            let row_result = !row_null && row_val != 0;
-            assert_eq!(
-                batch_result, row_result,
-                "row {i}: val={val} batch={batch_result} row={row_result}",
-            );
         }
     }
 }

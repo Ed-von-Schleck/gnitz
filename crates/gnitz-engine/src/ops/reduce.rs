@@ -911,57 +911,16 @@ fn emit_finalized_row(
     raw_schema: &SchemaDescriptor,
     fin_schema: &SchemaDescriptor,
 ) {
-    use crate::expr::{EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL};
+    use crate::expr::OutputColKind;
 
     let raw_mb = raw_output.as_mem_batch();
     let raw_pki = raw_schema.pk_index as usize;
     let fin_pki = fin_schema.pk_index as usize;
     let null_word = raw_mb.get_null_word(raw_row);
 
-    // Pre-scan bytecode: classify each output column as COPY_COL, EMIT, or EMIT_NULL
-    #[derive(Clone, Copy)]
-    enum OutCol {
-        CopyCol(usize), // source logical col in raw schema
-        Emit(usize),     // index in the eval emit sequence
-        EmitNull,
-    }
-
-    let mut out_cols: Vec<OutCol> = Vec::new();
-    let mut emit_count = 0usize;
-    for i in 0..prog.num_instrs as usize {
-        let base = i * 4;
-        let op = prog.code[base];
-        if op == EXPR_COPY_COL {
-            let src_col = prog.code[base + 2] as usize;
-            out_cols.push(OutCol::CopyCol(src_col));
-        } else if op == EXPR_EMIT {
-            out_cols.push(OutCol::Emit(emit_count));
-            emit_count += 1;
-        } else if op == EXPR_EMIT_NULL {
-            out_cols.push(OutCol::EmitNull);
-        }
-    }
-
-    // Create emit targets only for EMIT columns
-    let buf_rows = raw_row + 1;
-    let mut emit_bufs: Vec<Vec<u8>> = Vec::with_capacity(emit_count);
-    for _ in 0..emit_count {
-        emit_bufs.push(vec![0u8; buf_rows * 8]); // 8 bytes max per column
-    }
-
-    let emit_targets: Vec<crate::expr::EmitTarget> = emit_bufs
-        .iter_mut()
-        .enumerate()
-        .map(|(i, buf)| crate::expr::EmitTarget {
-            base: buf.as_mut_ptr(),
-            stride: 8,
-            payload_col: i,
-        })
-        .collect();
-
-    // Evaluate (only EMIT instructions write to targets)
-    let (_result, _is_null, eval_emit_mask) = crate::expr::eval_with_emit(
-        prog, &raw_mb, raw_row, raw_schema.pk_index, null_word, &emit_targets,
+    let out_cols = prog.classify_output_cols();
+    let (emit_bufs, eval_emit_mask) = prog.eval_finalized(
+        &raw_mb, raw_row, raw_schema.pk_index, null_word,
     );
 
     // Build the finalized output row
@@ -981,7 +940,7 @@ fn emit_finalized_row(
 
         if out_col_idx < out_cols.len() {
             match out_cols[out_col_idx] {
-                OutCol::CopyCol(src_col) => {
+                OutputColKind::CopyCol(src_col) => {
                     if src_col == raw_pki {
                         // Source is the PK column — read from pk_lo
                         let pk = raw_mb.get_pk(raw_row);
@@ -1003,18 +962,15 @@ fn emit_finalized_row(
                         }
                     }
                 }
-                OutCol::Emit(eidx) => {
+                OutputColKind::Emit(eidx) => {
                     if (eval_emit_mask >> eidx) & 1 != 0 {
                         fin_null_mask |= 1u64 << fpi;
                         fin_output.fill_col_zero(fpi, cs);
                     } else {
-                        let off = raw_row * 8;
-                        fin_output.extend_col(fpi,
-                            &emit_bufs[eidx][off..off + cs],
-                        );
+                        fin_output.extend_col(fpi, &emit_bufs[eidx][..cs]);
                     }
                 }
-                OutCol::EmitNull => {
+                OutputColKind::EmitNull => {
                     fin_null_mask |= 1u64 << fpi;
                     fin_output.fill_col_zero(fpi, cs);
                 }

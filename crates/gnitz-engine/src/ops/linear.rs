@@ -3,7 +3,7 @@
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch};
-use crate::scalar_func::ScalarFuncKind;
+use crate::expr::ScalarFuncKind;
 use crate::xxh;
 
 
@@ -611,8 +611,7 @@ mod tests {
 
     #[test]
     fn test_op_filter_basic() {
-        use crate::scalar_func::{Plan, ScalarFuncKind};
-        use crate::expr::ExprProgram;
+        use crate::expr::{ExprProgram, Plan};
 
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
@@ -633,8 +632,7 @@ mod tests {
 
     #[test]
     fn test_op_filter_consolidated_flag() {
-        use crate::scalar_func::{Plan, ScalarFuncKind};
-        use crate::expr::ExprProgram;
+        use crate::expr::{ExprProgram, Plan};
 
         let code = vec![
             3i64, 0, 1, 0,  // LOAD_CONST r0 = 1 (always true)
@@ -675,8 +673,7 @@ mod tests {
 
     #[test]
     fn test_op_map_empty_batch() {
-        use crate::scalar_func::{Plan, ScalarFuncKind};
-
+        use crate::expr::Plan;
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty(1);
 

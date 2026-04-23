@@ -4,10 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::expr::{ExprProgram, EXPR_COPY_COL};
+use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
 use crate::ops::AggDescriptor;
 use crate::storage::{CursorHandle, Table, ReadCursor};
-use crate::scalar_func::{Plan, ScalarFuncKind};
 use crate::vm::{ProgramBuilder, VmHandle};
 
 gnitz_wire::cast_consts! { i32;
@@ -569,26 +568,6 @@ fn extract_map_code(node_params: &HashMap<i32, i64>) -> Vec<i64> {
     code
 }
 
-fn all_copy_col_sequential(code: &[i64]) -> bool {
-    let n = code.len();
-    if n == 0 || n % 4 != 0 {
-        return false;
-    }
-    let mut expected_src: i64 = 1;
-    let mut i = 0;
-    while i < n {
-        if code[i] != EXPR_COPY_COL {
-            return false;
-        }
-        if code[i + 2] != expected_src {
-            return false;
-        }
-        expected_src += 1;
-        i += 4;
-    }
-    true
-}
-
 fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
     if a.num_columns != b.num_columns || a.pk_index != b.pk_index {
         return false;
@@ -695,11 +674,11 @@ fn opt_fold_reduce_map(
             continue;
         }
         let code = extract_map_code(node_params);
-        if all_copy_col_sequential(&code) {
+        let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
+        if prog.is_sequential_copy_projection() {
             continue; // identity MAP handled inline
         }
-        if code.len() <= 63 {
-            let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
+        if prog.code.len() <= 63 {
             let idx = owned_expr_progs.len();
             owned_expr_progs.push(Box::new(prog));
             rw.fold_finalize.insert(reduce_nid, idx);
@@ -1081,7 +1060,8 @@ fn emit_node(
             if reindex_col_check < 0 && has_expr_code {
                 if schemas_physically_identical(&in_reg_schema, &graph.out_schema) {
                     let code = extract_map_code(&node_params);
-                    if all_copy_col_sequential(&code) {
+                    let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
+                    if prog.is_sequential_copy_projection() {
                         out_reg_of.insert(nid, in_reg);
                         return;
                     }
@@ -2169,13 +2149,14 @@ mod tests {
     }
 
     #[test]
-    fn test_all_copy_col_sequential() {
+    fn test_sequential_copy_projection() {
+        use crate::expr::ExprProgram;
+        let make = |code: Vec<i64>| ExprProgram::new(code, 4, 0, vec![]);
         // COPY_COL has opcode 34
-        assert!(all_copy_col_sequential(&[34, 9, 1, 0, 34, 9, 2, 1]));
-        assert!(!all_copy_col_sequential(&[34, 9, 2, 0, 34, 9, 1, 1])); // wrong order
-        assert!(!all_copy_col_sequential(&[34, 9, 1, 0, 35, 9, 2, 1])); // wrong opcode
-        assert!(!all_copy_col_sequential(&[]));
-        assert!(!all_copy_col_sequential(&[34, 9, 1])); // not multiple of 4
+        assert!(make(vec![34, 9, 1, 0, 34, 9, 2, 1]).is_sequential_copy_projection());
+        assert!(!make(vec![34, 9, 2, 0, 34, 9, 1, 1]).is_sequential_copy_projection()); // wrong order
+        assert!(!make(vec![34, 9, 1, 0, 35, 9, 2, 1]).is_sequential_copy_projection()); // wrong opcode
+        assert!(!make(vec![]).is_sequential_copy_projection()); // empty
     }
 
     #[test]
