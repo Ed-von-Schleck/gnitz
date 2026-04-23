@@ -6,6 +6,7 @@ pub mod layout;
 pub mod schema;
 pub mod storage;
 pub mod expr;
+pub mod eval_batch;
 pub mod scalar_func;
 pub mod ops;
 pub mod vm;

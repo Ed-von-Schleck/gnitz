@@ -13,6 +13,8 @@ use crate::xxh;
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
+/// For batches of ≥ 16 rows with an Interpreted predicate, evaluates all rows
+/// via the batch evaluator and scans the resulting bitmask.
 pub fn op_filter(
     batch: &Batch,
     func: &ScalarFuncKind,
@@ -45,21 +47,56 @@ pub fn op_filter(
         }
     };
 
-    let mut range_start: isize = -1;
-    for i in 0..n {
-        if func.evaluate_predicate(&mb, i, schema) {
-            if range_start < 0 {
-                range_start = i as isize;
+    // Batch evaluator path: evaluate all n rows, scan resulting bitmask.
+    if let Some(bits) = func.filter_batch_bits(&mb, n, schema) {
+        let mut range_start: isize = -1;
+        let words = (n + 63) / 64;
+        for w in 0..words {
+            let word = bits[w];
+            let row_base = w * 64;
+            let chunk = (row_base + 64).min(n) - row_base;
+
+            if word == 0 {
+                if range_start >= 0 {
+                    append_range(&mut output, range_start as usize, row_base);
+                    range_start = -1;
+                }
+            } else if word == u64::MAX || (chunk < 64 && word == (1u64 << chunk) - 1) {
+                if range_start < 0 {
+                    range_start = row_base as isize;
+                }
+            } else {
+                for i in 0..chunk {
+                    let passes = (word >> i) & 1 != 0;
+                    let abs = row_base + i;
+                    if passes {
+                        if range_start < 0 { range_start = abs as isize; }
+                    } else if range_start >= 0 {
+                        append_range(&mut output, range_start as usize, abs);
+                        range_start = -1;
+                    }
+                }
             }
-        } else {
-            if range_start >= 0 {
+        }
+        if range_start >= 0 {
+            append_range(&mut output, range_start as usize, n);
+        }
+    } else {
+        // Per-row path (small batches or PassAll)
+        let mut range_start: isize = -1;
+        for i in 0..n {
+            if func.evaluate_predicate(&mb, i, schema) {
+                if range_start < 0 {
+                    range_start = i as isize;
+                }
+            } else if range_start >= 0 {
                 append_range(&mut output, range_start as usize, i);
                 range_start = -1;
             }
         }
-    }
-    if range_start >= 0 {
-        append_range(&mut output, range_start as usize, n);
+        if range_start >= 0 {
+            append_range(&mut output, range_start as usize, n);
+        }
     }
 
     // append_batch resets sorted+consolidated to false; restore them based on input.

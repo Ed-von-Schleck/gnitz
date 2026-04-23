@@ -124,7 +124,7 @@ impl ExprProgram {
             const_lengths.push(s.len() as u32);
         }
         gnitz_debug!("expr_program: instrs={} regs={} consts={}", num_instrs, num_regs, const_strings.len());
-        ExprProgram {
+        let prog = ExprProgram {
             code,
             num_regs,
             result_reg,
@@ -134,7 +134,46 @@ impl ExprProgram {
             const_lengths,
             payload_col_sizes: Vec::new(),
             payload_col_type_codes: Vec::new(),
+        };
+        // SSA assert: binary ALU ops must not alias dst with either source.
+        // Hard assert (not debug-only): fires at compile time for compiler bugs.
+        for instr in prog.code.chunks_exact(4) {
+            let (op, dst, a1, a2) = (instr[0], instr[1], instr[2], instr[3]);
+            if is_binary_alu_op(op) {
+                assert!(
+                    dst != a1 && dst != a2,
+                    "ExprProgram: register aliasing dst={dst} a1={a1} a2={a2} op={op}",
+                );
+            }
         }
+        prog
+    }
+
+    /// Returns true if no opcode in this program can produce a NULL result.
+    /// Used by the batch evaluator to skip null-bit tracking entirely.
+    pub fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
+        let pki = schema.pk_index as usize;
+        for instr in self.code.chunks_exact(4) {
+            let op = instr[0];
+            let a1 = instr[2] as usize;
+            match op {
+                // Division/modulo produce NULL on zero divisor
+                EXPR_INT_DIV | EXPR_INT_MOD | EXPR_FLOAT_DIV => return false,
+                // IS_NULL / IS_NOT_NULL read null bits from the batch
+                EXPR_IS_NULL | EXPR_IS_NOT_NULL => return false,
+                // Payload load: null if the underlying column is nullable
+                EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
+                    let pi = a1;
+                    // Physical payload index pi maps to column index ci
+                    let ci = if pi < pki { pi } else { pi + 1 };
+                    if ci < schema.num_columns as usize && schema.columns[ci].nullable != 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
     }
 }
 
@@ -144,6 +183,16 @@ impl ExprProgram {
 /// equivalent to lexicographic byte comparison of the first four characters.
 /// Both sides (column struct and const) zero-pad unused bytes, so the
 /// comparison is correct for any string length without masking.
+fn is_binary_alu_op(op: i64) -> bool {
+    matches!(op,
+        EXPR_INT_ADD | EXPR_INT_SUB | EXPR_INT_MUL | EXPR_INT_DIV | EXPR_INT_MOD |
+        EXPR_FLOAT_ADD | EXPR_FLOAT_SUB | EXPR_FLOAT_MUL | EXPR_FLOAT_DIV |
+        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
+        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE |
+        EXPR_BOOL_AND | EXPR_BOOL_OR
+    )
+}
+
 fn compute_prefix(s: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     let n = s.len().min(4);
@@ -320,7 +369,7 @@ fn get_str_struct<'a>(
 
 /// Compare a German String column value against a constant byte string.
 /// Returns Ordering.
-fn compare_col_string_vs_const(
+pub(crate) fn compare_col_string_vs_const(
     struct_bytes: &[u8],
     blob: &[u8],
     const_bytes: &[u8],
@@ -354,7 +403,7 @@ fn compare_col_string_vs_const(
 }
 
 /// Check equality of a German String column value against a constant byte string.
-fn col_string_equals_const(
+pub(crate) fn col_string_equals_const(
     struct_bytes: &[u8],
     blob: &[u8],
     const_bytes: &[u8],

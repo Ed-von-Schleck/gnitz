@@ -1188,9 +1188,15 @@ mod tests {
         // Negate flips weights: pk=1 w=-1, pk=3 w=-1
         let schema = schema_1i64();
 
-        // CompareConst filter uses schema column index (1 for the I64 payload col)
+        // Predicate: col[1] > 0  (col[1] is the I64 payload at logical index 1)
+        let pred_code = vec![
+            crate::expr::EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col[1]
+            crate::expr::EXPR_LOAD_CONST, 1, 0, 0,    // r1 = 0
+            crate::expr::EXPR_CMP_GT, 2, 0, 1,        // r2 = r0 > r1
+        ];
+        let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::scalar_func::Plan::from_compare(1, 2, 0, false),
+            crate::scalar_func::Plan::from_predicate(pred_prog, schema.pk_index),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -2117,8 +2123,14 @@ mod tests {
         // Verify that adding the same func/table pointer twice reuses the same index.
         let schema = schema_1i64();
 
+        let pred_code = vec![
+            crate::expr::EXPR_LOAD_COL_INT, 0, 1, 0,
+            crate::expr::EXPR_LOAD_CONST, 1, 0, 0,
+            crate::expr::EXPR_CMP_GT, 2, 0, 1,
+        ];
+        let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::scalar_func::Plan::from_compare(1, 2, 0, false),
+            crate::scalar_func::Plan::from_predicate(pred_prog, schema.pk_index),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 

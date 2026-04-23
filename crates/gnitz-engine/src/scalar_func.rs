@@ -5,12 +5,15 @@
 //! `ScalarFuncKind` wraps Plan behind a single enum so that the VM
 //! passes one opaque handle for any function type.
 
+use std::cell::RefCell;
+
 use crate::schema::{
     type_code, SchemaDescriptor, SHORT_STRING_THRESHOLD,
 };
-use crate::expr::{self, EmitTarget, ExprProgram};
+use crate::expr::{self, ExprProgram};
 use crate::storage::{Batch, MemBatch};
 use crate::util::read_u32_le;
+use crate::eval_batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
 
 // ---------------------------------------------------------------------------
 // ScalarFuncKind enum
@@ -19,11 +22,6 @@ use crate::util::read_u32_le;
 pub enum ScalarFuncKind {
     Plan(Plan),
 }
-
-// Function opcodes
-const OP_EQ: u8 = 1;
-const OP_GT: u8 = 2;
-const OP_LT: u8 = 3;
 
 impl ScalarFuncKind {
     pub fn kind_name(&self) -> &'static str {
@@ -40,6 +38,25 @@ impl ScalarFuncKind {
     ) -> bool {
         let ScalarFuncKind::Plan(p) = self;
         p.evaluate_predicate(batch, row, schema)
+    }
+
+    /// Try to evaluate the filter predicate for all `n` rows using the batch
+    /// evaluator.  Returns `Some(bitmask)` when the batch path is used (n ≥ 16
+    /// and the kernel is Interpreted), `None` to fall through to per-row.
+    pub fn filter_batch_bits(
+        &self,
+        mb: &MemBatch,
+        n: usize,
+        schema: &SchemaDescriptor,
+    ) -> Option<Vec<u64>> {
+        const THRESHOLD: usize = 16;
+        let ScalarFuncKind::Plan(plan) = self;
+        match &plan.filter {
+            FilterKernel::Interpreted(_) if n >= THRESHOLD => {
+                Some(plan.filter_batch(mb, n, schema))
+            }
+            _ => None,
+        }
     }
 
     /// Batch-level map: populate output batch from input batch.
@@ -189,12 +206,6 @@ pub struct ColMove {
 
 pub enum FilterKernel {
     PassAll,
-    CompareConst {
-        col_idx: u32,
-        op: u8,
-        val_bits: u64,
-        is_float: bool,
-    },
     Interpreted(ExprProgram),
 }
 
@@ -203,6 +214,7 @@ pub enum ComputeKernel {
     Interpreted {
         prog: ExprProgram,
         emit_payloads: Vec<usize>,
+        emit_regs: Vec<usize>,
     },
 }
 
@@ -211,30 +223,27 @@ pub struct Plan {
     col_moves: Vec<ColMove>,
     null_perm: NullPerm,
     compute: ComputeKernel,
+    pk_index: u32,
+    scratch: RefCell<EvalScratch>,
 }
 
 /// Empty plan with only a filter kernel set.
-fn filter_only(filter: FilterKernel) -> Plan {
+fn filter_only(filter: FilterKernel, pk_index: u32) -> Plan {
     Plan {
         filter,
         col_moves: Vec::new(),
         null_perm: NullPerm { pairs: Vec::new(), constant: 0 },
         compute: ComputeKernel::None,
+        pk_index,
+        scratch: RefCell::new(EvalScratch::new()),
     }
 }
 
 impl Plan {
-    /// Filter via constant comparison (replaces UniversalPredicate).
-    pub fn from_compare(col_idx: u32, op: u8, val_bits: u64, is_float: bool) -> Self {
-        filter_only(FilterKernel::CompareConst { col_idx, op, val_bits, is_float })
-    }
-
     /// Filter via interpreted expression (replaces ExprPredicate).
-    /// `pk_index` is used to resolve logical column indices to physical payload
-    /// indices once at construction time, removing the branch from the hot loop.
     pub fn from_predicate(mut prog: ExprProgram, pk_index: u32) -> Self {
         prog.resolve_column_indices(pk_index);
-        filter_only(FilterKernel::Interpreted(prog))
+        filter_only(FilterKernel::Interpreted(prog), pk_index)
     }
 
     /// Projection plan from source indices (replaces UniversalProjection).
@@ -255,6 +264,8 @@ impl Plan {
             col_moves,
             null_perm,
             compute: ComputeKernel::None,
+            pk_index,
+            scratch: RefCell::new(EvalScratch::new()),
         }
     }
 
@@ -266,6 +277,7 @@ impl Plan {
         let mut copy_type_codes = Vec::new();
         let mut null_payloads = Vec::new();
         let mut emit_payloads = Vec::new();
+        let mut emit_regs = Vec::new();
         let mut has_compute = false;
 
         for i in 0..prog.num_instrs as usize {
@@ -284,6 +296,7 @@ impl Plan {
             } else {
                 has_compute = true;
                 if op == expr::EXPR_EMIT {
+                    emit_regs.push(a1 as usize);
                     emit_payloads.push(a2 as usize);
                 }
             }
@@ -308,7 +321,7 @@ impl Plan {
         );
 
         let compute = if has_compute {
-            ComputeKernel::Interpreted { prog, emit_payloads }
+            ComputeKernel::Interpreted { prog, emit_payloads, emit_regs }
         } else {
             ComputeKernel::None
         };
@@ -318,10 +331,12 @@ impl Plan {
             col_moves,
             null_perm,
             compute,
+            pk_index,
+            scratch: RefCell::new(EvalScratch::new()),
         }
     }
 
-    /// Evaluate predicate for a single row.
+    /// Evaluate predicate for a single row (per-row fallback).
     pub fn evaluate_predicate(
         &self,
         batch: &MemBatch,
@@ -330,58 +345,63 @@ impl Plan {
     ) -> bool {
         match &self.filter {
             FilterKernel::PassAll => true,
-            FilterKernel::CompareConst { col_idx, op, val_bits, is_float } => {
-                let ci = *col_idx as usize;
-                let pki = schema.pk_index as usize;
-                if *is_float {
-                    let pi = if ci < pki { ci } else { ci - 1 };
-                    let col_size = schema.columns[ci].size as usize;
-                    let ptr = batch.get_col_ptr(row, pi, col_size);
-                    let val = if col_size == 4 {
-                        f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
-                    } else {
-                        let bits = i64::from_le_bytes(ptr.try_into().unwrap());
-                        f64::from_ne_bytes(bits.to_ne_bytes())
-                    };
-                    let con = f64::from_ne_bytes((*val_bits as i64).to_ne_bytes());
-                    match *op {
-                        OP_EQ => val == con,
-                        OP_GT => val > con,
-                        OP_LT => val < con,
-                        _ => true,
-                    }
-                } else {
-                    let raw = if ci == pki {
-                        batch.get_pk(row) as i64
-                    } else {
-                        let pi = if ci < pki { ci } else { ci - 1 };
-                        let col_size = schema.columns[ci].size as usize;
-                        let ptr = batch.get_col_ptr(row, pi, col_size);
-                        if matches!(schema.columns[ci].type_code,
-                            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
-                        {
-                            crate::schema::read_signed(ptr, col_size)
-                        } else {
-                            let mut buf = [0u8; 8];
-                            buf[..col_size].copy_from_slice(ptr);
-                            i64::from_le_bytes(buf)
-                        }
-                    };
-                    let con = *val_bits as i64;
-                    match *op {
-                        OP_EQ => raw == con,
-                        OP_GT => raw > con,
-                        OP_LT => raw < con,
-                        _ => true,
-                    }
-                }
-            }
             FilterKernel::Interpreted(prog) => {
                 let (val, is_null) =
                     expr::eval_predicate(prog, batch, row, schema.pk_index);
                 !is_null && val != 0
             }
         }
+    }
+
+    /// Batch filter: evaluate predicate for all n rows, return bitmask.
+    /// Bit i is set if row i passes the filter (non-null AND non-zero result).
+    /// Returns a Vec of `(n+63)/64` words.
+    pub fn filter_batch(
+        &self,
+        mb: &MemBatch,
+        n: usize,
+        in_schema: &SchemaDescriptor,
+    ) -> Vec<u64> {
+        let FilterKernel::Interpreted(prog) = &self.filter else {
+            // PassAll: all bits set
+            let words = (n + 63) / 64;
+            let mut bits = vec![u64::MAX; words];
+            // Mask out bits beyond n in the last word
+            if n % 64 != 0 {
+                bits[words - 1] = (1u64 << (n % 64)) - 1;
+            }
+            return bits;
+        };
+
+        let pki = self.pk_index as usize;
+        let no_nulls = prog.is_strictly_non_nullable(in_schema);
+        let num_regs = prog.num_regs as usize;
+        let result_reg = prog.result_reg as usize;
+
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.ensure_capacity(num_regs, no_nulls, n);
+
+        let words = (n + 63) / 64;
+        scratch.filter_bits[..words].fill(0);
+
+        for morsel_start in (0..n).step_by(MORSEL) {
+            let m = MORSEL.min(n - morsel_start);
+            eval_batch(prog, mb, morsel_start, m, pki, &mut scratch);
+
+            // Pack result register into filter_bits
+            let base_r = result_reg * MORSEL;
+            let base_null = result_reg * NULL_WORDS_PER_REG;
+            for i in 0..m {
+                let abs = morsel_start + i;
+                let is_null = !no_nulls &&
+                    (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
+                if !is_null && scratch.regs[base_r + i] != 0 {
+                    scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
+                }
+            }
+        }
+
+        scratch.filter_bits[..words].to_vec()
     }
 
     /// Execute map: system column clone → col_moves → NullPerm → compute.
@@ -418,25 +438,43 @@ impl Plan {
         output.null_bmp_data_mut().copy_from_slice(&null_bmp_result);
 
         // Compute kernel
-        if let ComputeKernel::Interpreted { prog, emit_payloads } = &self.compute {
-            let mut emit_targets: Vec<EmitTarget> = Vec::with_capacity(emit_payloads.len());
-            for &out_payload in emit_payloads {
-                let out_ci = payload_to_col(out_payload, out_pki);
-                let stride = out_schema.columns[out_ci].size as usize;
-                // Column is already zero-filled; get raw pointer for emit
-                let base = output.col_data_mut(out_payload).as_mut_ptr();
-                emit_targets.push(EmitTarget { base, stride, payload_col: out_payload });
-            }
+        if let ComputeKernel::Interpreted { prog, emit_payloads, emit_regs } = &self.compute {
+            let pki = self.pk_index as usize;
+            let no_nulls = prog.is_strictly_non_nullable(in_schema);
+            let num_regs = prog.num_regs as usize;
 
             let in_mb = in_batch.as_mem_batch();
+            let mut scratch = self.scratch.borrow_mut();
+            scratch.ensure_capacity(num_regs, no_nulls, n);
+
             let null_arr = output.null_bmp_data_mut().as_mut_ptr() as *mut u64;
-            for row in 0..n {
-                let in_null = in_batch.get_null_word(row);
-                let (_, _, mask) = expr::eval_with_emit(
-                    prog, &in_mb, row, in_schema.pk_index, in_null, &emit_targets,
-                );
-                unsafe {
-                    *null_arr.add(row) |= mask;
+
+            for morsel_start in (0..n).step_by(MORSEL) {
+                let m = MORSEL.min(n - morsel_start);
+                eval_batch(prog, &in_mb, morsel_start, m, pki, &mut scratch);
+
+                // EMIT: write each computed register to its output column
+                for (&out_payload, &reg) in emit_payloads.iter().zip(emit_regs.iter()) {
+                    let out_ci = payload_to_col(out_payload, out_pki);
+                    let stride = out_schema.columns[out_ci].size as usize;
+                    let dst8 = output.col_data_mut(out_payload);
+                    let base_r = reg * MORSEL;
+                    let base_null_r = reg * NULL_WORDS_PER_REG;
+                    for i in 0..m {
+                        let row = morsel_start + i;
+                        let is_null = !no_nulls &&
+                            (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
+                        let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
+                        dst8[row * stride..(row + 1) * stride]
+                            .copy_from_slice(&val.to_le_bytes()[..stride]);
+
+                        // Merge null bit into row-major output null bitmap
+                        if is_null {
+                            unsafe {
+                                *null_arr.add(row) |= 1u64 << out_payload;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -505,20 +543,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_predicate_int() {
-        let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
-        let batch = make_int_batch(&schema, &[
-            (1, 1, 0, &[42]),
-            (2, 1, 0, &[10]),
-        ]);
-        let mb = batch.as_mem_batch();
-
-        let func = ScalarFuncKind::Plan(Plan::from_compare(1, OP_EQ, 42u64, false));
-        assert!(func.evaluate_predicate(&mb, 0, &schema));
-        assert!(!func.evaluate_predicate(&mb, 1, &schema));
-    }
-
-    #[test]
     fn test_projection_batch() {
         let in_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
         let out_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
@@ -579,5 +603,58 @@ mod tests {
         ));
         let result = func.evaluate_map_batch(&batch, &schema, &schema);
         assert_eq!(result.count, 0);
+    }
+
+    #[test]
+    fn test_filter_batch_matches_per_row() {
+        use crate::ops::op_filter;
+        let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+
+        // 20 rows so n >= THRESHOLD=16 and the batch evaluator path is taken.
+        let batch = make_int_batch(&schema, &[
+            (1,  1, 0, &[5]),   // fail
+            (2,  1, 0, &[15]),  // pass
+            (3,  1, 0, &[25]),  // pass
+            (4,  1, 0, &[10]),  // fail (= not >)
+            (5,  1, 0, &[20]),  // pass
+            (6,  1, 0, &[3]),   // fail
+            (7,  1, 0, &[30]),  // pass
+            (8,  1, 0, &[10]),  // fail
+            (9,  1, 0, &[11]),  // pass
+            (10, 1, 0, &[0]),   // fail
+            (11, 1, 0, &[50]),  // pass
+            (12, 1, 0, &[9]),   // fail
+            (13, 1, 0, &[12]),  // pass
+            (14, 1, 0, &[8]),   // fail
+            (15, 1, 0, &[100]), // pass
+            (16, 1, 0, &[10]),  // fail
+            (17, 1, 0, &[1]),   // fail
+            (18, 1, 0, &[13]),  // pass
+            (19, 1, 0, &[7]),   // fail
+            (20, 1, 0, &[22]),  // pass
+        ]);
+
+        // Predicate: col[1] > 10
+        let code = vec![
+            expr::EXPR_LOAD_COL_INT, 0, 1, 0,
+            expr::EXPR_LOAD_CONST, 1, 10, 0,
+            expr::EXPR_CMP_GT, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
+
+        let out = op_filter(&batch, &func, &schema);
+        // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)
+        assert_eq!(out.count, 10, "expected 10 rows with val > 10");
+        assert_eq!(out.get_pk(0) as u64, 2);
+        assert_eq!(out.get_pk(1) as u64, 3);
+        assert_eq!(out.get_pk(2) as u64, 5);
+        assert_eq!(out.get_pk(3) as u64, 7);
+        assert_eq!(out.get_pk(4) as u64, 9);
+        assert_eq!(out.get_pk(5) as u64, 11);
+        assert_eq!(out.get_pk(6) as u64, 13);
+        assert_eq!(out.get_pk(7) as u64, 15);
+        assert_eq!(out.get_pk(8) as u64, 18);
+        assert_eq!(out.get_pk(9) as u64, 20);
     }
 }
