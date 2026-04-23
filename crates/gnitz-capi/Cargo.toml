@@ -12,7 +12,6 @@ integration = ["gnitz-core/integration"]
 
 [dependencies]
 gnitz-core     = { path = "../gnitz-core" }
-gnitz-protocol = { path = "../gnitz-protocol" }
 gnitz-sql      = { path = "../gnitz-sql" }
 
 [build-dependencies]

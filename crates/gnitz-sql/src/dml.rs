@@ -4,7 +4,7 @@ use sqlparser::ast::{
     FromTable, Assignment, AssignmentTarget,
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
-use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode, WireConflictMode};
+use gnitz_core::{Schema, ZSetBatch, ColData, TypeCode, WireConflictMode};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::Binder;
@@ -945,7 +945,7 @@ fn apply_projection(
     }
 
     let src_batch = batch.unwrap_or_else(|| ZSetBatch::new(schema));
-    let new_cols: Vec<gnitz_protocol::ColumnDef> = col_indices.iter()
+    let new_cols: Vec<gnitz_core::ColumnDef> = col_indices.iter()
         .map(|&i| schema.columns[i].clone())
         .collect();
     let new_pk_idx = col_indices.iter().position(|&i| i == schema.pk_index).unwrap_or(0);
@@ -1373,7 +1373,7 @@ pub fn execute_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gnitz_protocol::{ColumnDef, TypeCode, ZSetBatch, ColData, Schema};
+    use gnitz_core::{ColumnDef, TypeCode, ZSetBatch, ColData, Schema};
     use crate::logical_plan::{BoundExpr, BinOp};
 
     fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {

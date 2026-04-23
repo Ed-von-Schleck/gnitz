@@ -4,6 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sqlparser   = "0.56"
-gnitz-core     = { path = "../gnitz-core" }
-gnitz-protocol = { path = "../gnitz-protocol" }
+sqlparser  = "0.56"
+gnitz-core = { path = "../gnitz-core" }

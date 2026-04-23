@@ -1,5 +1,5 @@
 use std::fmt;
-use gnitz_protocol::ProtocolError;
+use crate::protocol::ProtocolError;
 
 #[derive(Debug)]
 pub enum ClientError {

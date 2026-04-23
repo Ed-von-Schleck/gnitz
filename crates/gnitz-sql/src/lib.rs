@@ -9,7 +9,7 @@ pub mod planner;
 pub use error::GnitzSqlError;
 
 use gnitz_core::GnitzClient;
-use gnitz_protocol::{Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 

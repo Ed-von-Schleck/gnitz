@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
-use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_sql::SqlPlanner;
 
 // ---------------------------------------------------------------------------

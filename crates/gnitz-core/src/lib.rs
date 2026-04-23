@@ -1,3 +1,4 @@
+pub mod protocol;
 pub mod error;
 pub mod connection;
 pub mod types;
@@ -12,7 +13,23 @@ pub use connection::{
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 pub use client::GnitzClient;
-pub use gnitz_protocol::WireConflictMode;
+pub use protocol::{
+    ProtocolError,
+    TypeCode, ColumnDef, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
+    Header,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,
+    FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK, FLAG_SEEK,
+    FLAG_SEEK_BY_INDEX, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
+    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
+    encode_wal_block, decode_wal_block, recompute_block_checksum, get_region_offset_size,
+    schema_to_batch, batch_to_schema,
+    connect, send_framed, send_framed_iov, recv_framed, close_fd,
+    Message, send_message, recv_message, encode_message,
+    parse_response, encode_control_block, decode_control_block,
+};
 pub use expr::{ExprBuilder, ExprProgram};
 pub use circuit::{CircuitBuilder, NodeId};
 pub use types::{

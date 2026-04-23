@@ -1,9 +1,0 @@
-[package]
-name = "gnitz-protocol"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-gnitz-wire = { path = "../gnitz-wire" }
-libc = "0.2"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }

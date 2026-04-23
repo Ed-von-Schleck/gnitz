@@ -1,11 +1,11 @@
-use std::os::unix::io::RawFd;
-use gnitz_protocol::{
+use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
+use crate::protocol::{
     Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
     FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
     send_message, recv_message,
-    connect as proto_connect, close_fd,
+    connect as proto_connect,
 };
 use crate::error::ClientError;
 
@@ -24,18 +24,20 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
 }
 
 pub struct Connection {
-    sock_fd:       RawFd,
+    sock:          OwnedFd,
     pub client_id: u64,
 }
 
 impl Connection {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
-        let sock_fd = proto_connect(socket_path)?;
-        Ok(Connection { sock_fd, client_id: std::process::id() as u64 })
+        let fd = proto_connect(socket_path)?;
+        // SAFETY: proto_connect returns a valid, exclusively-owned file descriptor.
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Connection { sock, client_id: std::process::id() as u64 })
     }
 
     pub fn close(self) {
-        close_fd(self.sock_fd);
+        // OwnedFd is dropped here, which closes the fd.
     }
 
     pub fn alloc_table_id(&self) -> Result<u64, ClientError> {
@@ -71,6 +73,7 @@ impl Connection {
         batch:     &ZSetBatch,
         mode:      WireConflictMode,
     ) -> Result<u64, ClientError> {
+        batch.validate(schema).map_err(ClientError::ServerError)?;
         let msg = self.roundtrip_push(target_id, schema, batch, mode)?;
         Ok(msg.seek_pk_lo)
     }
@@ -111,8 +114,8 @@ impl Connection {
         schema:    Option<&Schema>,
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock_fd, target_id, self.client_id, flags, 0, 0, 0, schema, data)?;
-        let msg = recv_message(self.sock_fd, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0, 0, 0, schema, data)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
 
@@ -129,11 +132,11 @@ impl Connection {
         let flags = FLAG_CONFLICT_MODE_PRESENT;
         let seek_col_idx = mode.as_u8() as u64;
         send_message(
-            self.sock_fd, target_id, self.client_id, flags,
+            self.sock.as_raw_fd(), target_id, self.client_id, flags,
             0, 0, seek_col_idx,
             Some(schema), Some(batch),
         )?;
-        let msg = recv_message(self.sock_fd, None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
 
@@ -144,8 +147,8 @@ impl Connection {
         key_lo:   u64,
         key_hi:   u64,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock_fd, table_id, self.client_id, FLAG_SEEK_BY_INDEX, key_lo, key_hi, col_idx, None, None)?;
-        let msg = recv_message(self.sock_fd, None)?;
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key_lo, key_hi, col_idx, None, None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
 
@@ -155,8 +158,8 @@ impl Connection {
         pk_lo:     u64,
         pk_hi:     u64,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock_fd, target_id, self.client_id, FLAG_SEEK, pk_lo, pk_hi, 0, None, None)?;
-        let msg = recv_message(self.sock_fd, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk_lo, pk_hi, 0, None, None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
 }

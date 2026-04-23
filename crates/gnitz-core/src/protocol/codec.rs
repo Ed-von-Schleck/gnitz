@@ -1,6 +1,6 @@
-use crate::error::ProtocolError;
-use crate::header::{META_FLAG_NULLABLE, META_FLAG_IS_PK};
-use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use super::error::ProtocolError;
+use super::header::{META_FLAG_NULLABLE, META_FLAG_IS_PK};
+use super::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
@@ -109,26 +109,26 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
-    use crate::wal_block::{encode_wal_block, decode_wal_block};
+    use crate::protocol::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
+    use crate::protocol::wal_block::{encode_wal_block, decode_wal_block};
 
     // ── TypeCode::try_from_u64 error paths ──────────────────────────────────
 
     #[test]
     fn test_unknown_type_code_zero() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         assert!(matches!(TypeCode::try_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
     }
 
     #[test]
     fn test_unknown_type_code_13() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         assert!(matches!(TypeCode::try_from_u64(13), Err(ProtocolError::UnknownTypeCode(13))));
     }
 
     #[test]
     fn test_unknown_type_code_max() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         assert!(matches!(TypeCode::try_from_u64(u64::MAX), Err(ProtocolError::UnknownTypeCode(_))));
     }
 
@@ -136,7 +136,7 @@ mod tests {
 
     /// Build a valid META_SCHEMA batch for `ncols` columns (all U64, col 0 is PK).
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
-        use crate::header::META_FLAG_IS_PK;
+        use crate::protocol::header::META_FLAG_IS_PK;
         let mut type_code_bytes = vec![];
         let mut flags_bytes     = vec![];
         let mut names           = vec![];
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_schema_no_pk_flag() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
         // Clear all IS_PK flags
         if let ColData::Fixed(ref mut v) = batch.columns[2] {
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_schema_col_idx_out_of_order() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
         batch.pk_lo.swap(0, 1); // [1, 0] instead of [0, 1]
         let res = batch_to_schema(&batch);
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_schema_col_idx_gap() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
         batch.pk_lo[1] = 5; // gap: [0, 5]
         let res = batch_to_schema(&batch);
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_schema_col_idx_duplicate() {
-        use crate::error::ProtocolError;
+        use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
         batch.pk_lo[1] = 0; // duplicate: [0, 0]
         let res = batch_to_schema(&batch);

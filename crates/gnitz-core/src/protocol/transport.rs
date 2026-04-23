@@ -1,6 +1,6 @@
 use std::mem::{size_of, zeroed};
 use std::os::unix::io::RawFd;
-use crate::error::ProtocolError;
+use super::error::ProtocolError;
 
 fn io_err() -> ProtocolError {
     ProtocolError::IoError(std::io::Error::last_os_error())
@@ -144,6 +144,10 @@ fn send_all_iov(sock_fd: RawFd, slices: &[&[u8]]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Maximum allowed payload length — guards against malformed or adversarial length prefixes
+/// that would cause a multi-gigabyte allocation before any data is read.
+const MAX_PAYLOAD_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+
 /// Receive a length-prefixed frame. Returns the payload bytes.
 pub fn recv_framed(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
     let mut hdr = [0u8; 4];
@@ -153,6 +157,11 @@ pub fn recv_framed(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
         return Err(ProtocolError::IoError(
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "zero-length close sentinel"),
         ));
+    }
+    if payload_len > MAX_PAYLOAD_SIZE {
+        return Err(ProtocolError::DecodeError(format!(
+            "payload length {} exceeds maximum {} bytes", payload_len, MAX_PAYLOAD_SIZE
+        )));
     }
     // Allocate without zeroing — recv_exact will overwrite all bytes.
     let mut buf = Vec::with_capacity(payload_len);
@@ -232,6 +241,18 @@ mod tests {
         send_framed_iov(a, &[&[], &data[..], &[]]).unwrap();
         let received = recv_framed(b).unwrap();
         assert_eq!(&received[..], &data[..]);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn test_recv_framed_payload_too_large() {
+        let (a, b) = make_socketpair();
+        // Claim MAX_PAYLOAD_SIZE + 1 bytes — must error before allocating.
+        let huge: u32 = (256 * 1024 * 1024 + 1) as u32;
+        let hdr = huge.to_le_bytes();
+        unsafe { libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0); }
+        let result = recv_framed(b);
+        assert!(matches!(result, Err(ProtocolError::DecodeError(ref s)) if s.contains("exceeds maximum")));
         unsafe { libc::close(a); libc::close(b); }
     }
 

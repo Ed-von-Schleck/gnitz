@@ -1,5 +1,5 @@
 use sqlparser::ast::{DataType, ExactNumberInfo};
-use gnitz_protocol::TypeCode;
+use gnitz_core::TypeCode;
 use crate::error::GnitzSqlError;
 
 pub fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {

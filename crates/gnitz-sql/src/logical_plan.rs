@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, TypeCode};
+use gnitz_core::{Schema, TypeCode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub enum AggFunc { Count, CountNonNull, Sum, Min, Max, Avg }

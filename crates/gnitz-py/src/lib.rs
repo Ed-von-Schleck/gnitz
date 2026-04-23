@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
-use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
 // ---------------------------------------------------------------------------
@@ -1436,21 +1436,21 @@ impl PyCircuitGraph {
 
 fn encode_push_payload(
     client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
-) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
-    gnitz_protocol::encode_message(target_id, client_id, 0, 0, 0, 0, Some(schema), Some(batch))
+) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
+    gnitz_core::encode_message(target_id, client_id, 0, 0, 0, 0, Some(schema), Some(batch))
 }
 
 fn encode_scan_payload(
     client_id: u64, target_id: u64,
-) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
-    gnitz_protocol::encode_message(target_id, client_id, 0, 0, 0, 0, None, None)
+) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
+    gnitz_core::encode_message(target_id, client_id, 0, 0, 0, 0, None, None)
 }
 
 fn encode_seek_payload(
     client_id: u64, target_id: u64, pk_lo: u64, pk_hi: u64,
-) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
-    gnitz_protocol::encode_message(
-        target_id, client_id, gnitz_protocol::FLAG_SEEK, pk_lo, pk_hi, 0, None, None,
+) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
+    gnitz_core::encode_message(
+        target_id, client_id, gnitz_core::FLAG_SEEK, pk_lo, pk_hi, 0, None, None,
     )
 }
 
@@ -1509,7 +1509,7 @@ impl PyAsyncTransport {
         set_result_fn: PyObject,
         set_exception_fn: PyObject,
     ) -> PyResult<Self> {
-        let sock_fd = gnitz_protocol::connect(socket_path)
+        let sock_fd = gnitz_core::connect(socket_path)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
         let client_id = std::process::id() as u64;
 
@@ -1608,27 +1608,27 @@ fn async_io_loop(
 
         // Send all requests in this batch.
         for req in &batch {
-            if let Err(e) = gnitz_protocol::send_framed(sock_fd, &req.payload) {
+            if let Err(e) = gnitz_core::send_framed(sock_fd, &req.payload) {
                 // Fatal send error — fail all futures (previous batches + this batch) and exit
                 for (fut, _) in pending_futures.drain(..) {
                     fail_future(&loop_ref, &se_fn, &fut, &e.to_string());
                 }
-                gnitz_protocol::close_fd(sock_fd);
+                gnitz_core::close_fd(sock_fd);
                 return;
             }
         }
 
         // Recv all responses for this batch (pure Rust, no GIL)
         let n = batch.len();
-        let mut results: Vec<Result<gnitz_protocol::Message, String>> = Vec::with_capacity(n);
+        let mut results: Vec<Result<gnitz_core::Message, String>> = Vec::with_capacity(n);
         let mut recv_failed = false;
         for _ in 0..n {
             if recv_failed {
                 results.push(Err("connection lost".to_string()));
                 continue;
             }
-            match gnitz_protocol::recv_framed(sock_fd) {
-                Ok(buf) => match gnitz_protocol::parse_response(&buf) {
+            match gnitz_core::recv_framed(sock_fd) {
+                Ok(buf) => match gnitz_core::parse_response(&buf) {
                     Ok(msg) => results.push(Ok(msg)),
                     Err(e)  => {
                         results.push(Err(e.to_string()));
@@ -1648,7 +1648,7 @@ fn async_io_loop(
                 let (fut, kind) = pending_futures.pop_front().unwrap();
                 match result {
                     Ok(msg) => {
-                        if msg.status == gnitz_protocol::STATUS_ERROR {
+                        if msg.status == gnitz_core::STATUS_ERROR {
                             let err_text = msg.error_text.unwrap_or_default();
                             let exc = GnitzError::new_err(err_text);
                             let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
@@ -1699,12 +1699,12 @@ fn async_io_loop(
                         (&se_fn, &fut, exc));
                 }
             });
-            gnitz_protocol::close_fd(sock_fd);
+            gnitz_core::close_fd(sock_fd);
             return;
         }
     }
 
-    gnitz_protocol::close_fd(sock_fd);
+    gnitz_core::close_fd(sock_fd);
 }
 
 fn fail_future(loop_ref: &Py<PyAny>, se_fn: &Py<PyAny>, fut: &Py<PyAny>, msg: &str) {

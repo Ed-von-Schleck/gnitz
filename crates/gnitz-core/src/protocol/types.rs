@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use crate::error::ProtocolError;
+use super::error::ProtocolError;
 
 use gnitz_wire::type_code as tc;
 
@@ -210,8 +210,9 @@ impl<'a> BatchAppender<'a> {
     /// Append a u64 value to the next Fixed column.
     pub fn u64_val(&mut self, v: u64) -> &mut Self {
         let ci = self.col_index();
-        if let ColData::Fixed(buf) = &mut self.batch.columns[ci] {
-            buf.extend_from_slice(&v.to_le_bytes());
+        match &mut self.batch.columns[ci] {
+            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
+            _ => panic!("BatchAppender: u64_val called on non-Fixed column at schema index {}", ci),
         }
         self.cursor += 1;
         self
@@ -220,8 +221,9 @@ impl<'a> BatchAppender<'a> {
     /// Append an i64 value to the next Fixed column.
     pub fn i64_val(&mut self, v: i64) -> &mut Self {
         let ci = self.col_index();
-        if let ColData::Fixed(buf) = &mut self.batch.columns[ci] {
-            buf.extend_from_slice(&v.to_le_bytes());
+        match &mut self.batch.columns[ci] {
+            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
+            _ => panic!("BatchAppender: i64_val called on non-Fixed column at schema index {}", ci),
         }
         self.cursor += 1;
         self
@@ -230,8 +232,9 @@ impl<'a> BatchAppender<'a> {
     /// Append a string value to the next Strings column.
     pub fn str_val(&mut self, s: &str) -> &mut Self {
         let ci = self.col_index();
-        if let ColData::Strings(v) = &mut self.batch.columns[ci] {
-            v.push(Some(s.to_string()));
+        match &mut self.batch.columns[ci] {
+            ColData::Strings(v) => v.push(Some(s.to_string())),
+            _ => panic!("BatchAppender: str_val called on non-Strings column at schema index {}", ci),
         }
         self.cursor += 1;
         self
@@ -240,8 +243,9 @@ impl<'a> BatchAppender<'a> {
     /// Append a SQL NULL to the next Strings column.
     pub fn str_null(&mut self) -> &mut Self {
         let ci = self.col_index();
-        if let ColData::Strings(v) = &mut self.batch.columns[ci] {
-            v.push(None);
+        match &mut self.batch.columns[ci] {
+            ColData::Strings(v) => v.push(None),
+            _ => panic!("BatchAppender: str_null called on non-Strings column at schema index {}", ci),
         }
         self.cursor += 1;
         self
@@ -250,8 +254,9 @@ impl<'a> BatchAppender<'a> {
     /// Append a u128 value (split as lo/hi) to the next U128s column.
     pub fn u128_val(&mut self, lo: u64, hi: u64) -> &mut Self {
         let ci = self.col_index();
-        if let ColData::U128s(v) = &mut self.batch.columns[ci] {
-            v.push(((hi as u128) << 64) | lo as u128);
+        match &mut self.batch.columns[ci] {
+            ColData::U128s(v) => v.push(((hi as u128) << 64) | lo as u128),
+            _ => panic!("BatchAppender: u128_val called on non-U128s column at schema index {}", ci),
         }
         self.cursor += 1;
         self
@@ -668,6 +673,78 @@ mod tests {
         if let ColData::Fixed(buf) = &batch.columns[3] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 30);
         } else { panic!("expected Fixed for col 3"); }
+    }
+
+    // --- Step 4: Type-mismatch panics ---
+
+    #[test]
+    #[should_panic(expected = "u64_val called on non-Fixed")]
+    fn test_appender_type_mismatch_u64_on_string() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).u64_val(42);
+    }
+
+    #[test]
+    #[should_panic(expected = "i64_val called on non-Fixed")]
+    fn test_appender_type_mismatch_i64_on_string() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).i64_val(-7);
+    }
+
+    #[test]
+    #[should_panic(expected = "str_val called on non-Strings")]
+    fn test_appender_type_mismatch_str_on_fixed() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).str_val("oops");
+    }
+
+    #[test]
+    #[should_panic(expected = "str_null called on non-Strings")]
+    fn test_appender_type_mismatch_str_null_on_fixed() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).str_null();
+    }
+
+    #[test]
+    #[should_panic(expected = "u128_val called on non-U128s")]
+    fn test_appender_type_mismatch_u128_on_fixed() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).u128_val(1, 0);
     }
 
     #[test]

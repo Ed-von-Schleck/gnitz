@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use gnitz_protocol::{Schema, ColumnDef, TypeCode};
+use crate::protocol::{Schema, ColumnDef, TypeCode};
 
 pub use gnitz_wire::{
     // System table IDs

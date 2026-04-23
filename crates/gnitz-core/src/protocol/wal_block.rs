@@ -1,7 +1,7 @@
 // gnitz-protocol/src/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
 
-use crate::error::ProtocolError;
-use crate::types::{ColData, Schema, TypeCode, ZSetBatch};
+use super::error::ProtocolError;
+use super::types::{ColData, Schema, TypeCode, ZSetBatch};
 
 use gnitz_wire::{
     WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
@@ -155,7 +155,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                     ColData::Fixed(v) => v,
                     _ => panic!("encode_wal_block: expected Fixed for column {}", ci),
                 };
-                debug_assert_eq!(fixed.len(), count * stride,
+                assert_eq!(fixed.len(), count * stride,
                     "col {} Fixed length {} != count*stride {}", ci, fixed.len(), count * stride);
                 col_regions.push(ColRegion::FixedRef(ci));
             }
@@ -422,7 +422,7 @@ pub fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, Schema, TypeCode, ZSetBatch, ColData};
+    use crate::protocol::types::{ColumnDef, Schema, TypeCode, ZSetBatch, ColData};
 
     fn u64_schema() -> Schema {
         Schema {

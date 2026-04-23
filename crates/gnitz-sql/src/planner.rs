@@ -5,7 +5,7 @@ use sqlparser::ast::{
     SetOperator, SetQuantifier,
     FunctionArguments, FunctionArg, FunctionArgExpr,
 };
-use gnitz_protocol::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
     GnitzClient, CircuitBuilder, ExprBuilder,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,

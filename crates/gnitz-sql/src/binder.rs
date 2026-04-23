@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Expr, BinaryOperator, UnaryOperator, Value,
     FunctionArguments, FunctionArg, FunctionArgExpr,
 };
-use gnitz_protocol::Schema;
+use gnitz_core::Schema;
 use gnitz_core::GnitzClient;
 use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp, AggFunc};

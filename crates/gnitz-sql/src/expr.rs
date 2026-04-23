@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, TypeCode};
+use gnitz_core::{Schema, TypeCode};
 use gnitz_core::ExprBuilder;
 use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp};

@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
+use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
 use crate::types::{
@@ -53,7 +53,7 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
 
 fn idx_tab_schema() -> &'static Schema {
     use std::sync::OnceLock;
-    use gnitz_protocol::ColumnDef;
+    use crate::protocol::ColumnDef;
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![

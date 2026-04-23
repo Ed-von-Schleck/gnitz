@@ -1,13 +1,13 @@
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
-use crate::error::ProtocolError;
-use crate::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
-use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
-use crate::codec::{schema_to_batch, batch_to_schema};
-use crate::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use crate::wal_block::{encode_wal_block, decode_wal_block};
-use crate::transport::{send_framed, recv_framed};
+use super::error::ProtocolError;
+use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
+use super::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
+use super::codec::{schema_to_batch, batch_to_schema};
+use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
+use super::wal_block::{encode_wal_block, decode_wal_block};
+use super::transport::{send_framed, recv_framed};
 
 pub struct Message {
     pub status:       u32,
@@ -328,8 +328,8 @@ pub fn recv_message(
 mod tests {
     use super::*;
     use std::os::unix::io::RawFd;
-    use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-    use crate::header::{Header, FLAG_PUSH, STATUS_ERROR};
+    use crate::protocol::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::header::{Header, FLAG_PUSH, STATUS_ERROR};
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
@@ -567,7 +567,7 @@ mod tests {
         let (a, b) = make_socketpair();
         let err_hdr = Header { status: STATUS_ERROR, ..Header::default() };
         let encoded = encode_control_block(&err_hdr, "something broke").unwrap();
-        crate::transport::send_framed(a, &encoded).unwrap();
+        crate::protocol::transport::send_framed(a, &encoded).unwrap();
         let msg = recv_message(b, None).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());

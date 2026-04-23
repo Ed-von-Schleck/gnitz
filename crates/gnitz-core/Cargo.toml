@@ -7,8 +7,6 @@ edition = "2021"
 integration = []
 
 [dependencies]
-gnitz-wire     = { path = "../gnitz-wire" }
-gnitz-protocol = { path = "../gnitz-protocol" }
-
-[dev-dependencies]
-libc = "0.2"
+gnitz-wire  = { path = "../gnitz-wire" }
+libc        = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
