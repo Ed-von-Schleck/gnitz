@@ -81,11 +81,17 @@ pub struct Shared {
 
 /// The committer task loop. Returns when all senders drop (shutdown).
 ///
-/// `sal_writer_excl` is held for the SAL emission window only — the
-/// write + signal + fsync-SQE-submit triple — and released BEFORE
-/// awaiting ACKs or the fsync CQE, so tick/relay tasks can make progress
-/// on other SAL writes during the wait. FLAG_FLUSH stays atomic with
-/// respect to other SAL writers because both phases re-acquire the lock.
+/// For normal commit groups `sal_writer_excl` is held only for the
+/// synchronous SAL write + signal + fsync-SQE-submit triple, then
+/// released before awaiting ACKs or the fsync CQE, so tick/relay tasks
+/// can make progress during the wait.
+///
+/// For checkpoint groups the lock is held across the ENTIRE sequence
+/// (write + ACK wait + checkpoint_post_ack). This is required: workers
+/// bump `expected_epoch` when they process FLAG_FLUSH, so any SAL group
+/// written between the FLAG_FLUSH and `checkpoint_post_ack` carries the
+/// old epoch and is silently skipped. `checkpoint_post_ack` then resets
+/// `write_cursor` to 0, permanently orphaning those groups.
 pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     loop {
         // Block for the first request, exit if no senders remain.
@@ -166,22 +172,26 @@ fn debounce_drain(
     (pushes, barrier_senders)
 }
 
-/// Emit a FLAG_FLUSH checkpoint group under `sal_writer_excl`, release the
-/// lock, await ACKs, then run post-ACK cleanup (flush system tables +
-/// advance SAL epoch).  The await deliberately happens AFTER the lock is
-/// dropped so a concurrent tick or relay can proceed on other SAL writes.
+/// Emit a FLAG_FLUSH checkpoint group and run the full post-ACK cleanup.
+///
+/// `sal_writer_excl` is held for the ENTIRE sequence: write + ACK wait +
+/// `checkpoint_post_ack`. Releasing the lock before the await would let
+/// concurrent tick/relay/DDL/fan-out tasks write SAL groups with the old
+/// epoch. Workers bump `expected_epoch` when they process FLAG_FLUSH, so
+/// those groups would be silently skipped. `checkpoint_post_ack` then
+/// resets `write_cursor` to 0, permanently orphaning the groups and
+/// leaving the writers waiting for ACKs that never arrive.
 async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
     let disp_ptr = shared.disp_ptr;
     let nw = shared.num_workers;
     let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
 
-    let reply_futs = {
-        let _sal_excl = shared.sal_writer_excl.lock().await;
-        unsafe {
-            let disp = &mut *disp_ptr;
-            disp.write_checkpoint_group(&req_ids)?;
-            disp.signal_all();
-        }
+    let _sal_excl = shared.sal_writer_excl.lock().await;
+
+    let reply_futs = unsafe {
+        let disp = &mut *disp_ptr;
+        disp.write_checkpoint_group(&req_ids)?;
+        disp.signal_all();
         req_ids.iter().map(|&id| shared.reactor.await_reply(id)).collect::<Vec<_>>()
     };
 
@@ -197,9 +207,9 @@ async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
 
 /// Commit one debounced batch of pushes. Emits every group's SAL writes
 /// under `sal_writer_excl` (alongside the signal + fsync SQE submit),
-/// releases the lock, THEN awaits the fsync CQE and worker ACKs. Post
-/// processing (unique-index filter + LSN assignment + `done.send`)
-/// happens outside the lock.
+/// releases the lock, THEN awaits worker ACKs (Phase C) and the fsync
+/// CQE (Phase D). LSN assignment and `done.send` happen after worker
+/// ACKs; unique-index filter update happens after fsync.
 async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
@@ -320,6 +330,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // Phase C (no lock): await push ACKs, assign LSNs, fire tick.
     // fsync is awaited separately in Phase D so DAG evaluation overlaps
     // with fdatasync (~5 ms gap eliminated).
+    // unique_filter_ingest_batch is NOT called here — per the invariant in
+    // async-invariants.md it must run only after fsync confirms durability.
     // ------------------------------------------------------------------
     {
         let decoded_vec = reactor::join_all(reply_futs).await;
@@ -333,8 +345,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             cursor += nw;
         }
 
-        // Successful groups: bump ingest_lsn (sequentially per group) and
-        // feed the unique-index filter. Wrap the filter calls per V.7.
+        // Successful groups: bump ingest_lsn. Filter update is deferred to
+        // Phase D (after fsync) per the unique-filter ordering invariant.
         let disp_ptr = shared.disp_ptr;
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
@@ -347,18 +359,6 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             let new_lsn = shared.ingest_lsn.get() + 1;
             shared.ingest_lsn.set(new_lsn);
             g.lsn = new_lsn;
-            if let Err(e) = guard_panic("unique_filter_ingest", || {
-                unsafe { (*disp_ptr).unique_filter_ingest_batch(g.tid, &g.merged); }
-                Ok(())
-            }) {
-                // Don't fail the commit — the data is durable. Invalidate so
-                // the next constrained INSERT re-validates from scratch.
-                let _ = guard_panic("unique_filter_invalidate", || {
-                    unsafe { (*disp_ptr).unique_filter_invalidate_table(g.tid); }
-                    Ok(())
-                });
-                crate::gnitz_warn!("{}", e);
-            }
         }
 
         // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
@@ -393,6 +393,27 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             crate::gnitz_fatal_abort!(
                 "SAL fdatasync (committer) failed rc={}", fsync_rc
             );
+        }
+    }
+
+    // Update unique-index filters now that fsync confirms durability.
+    // Wrap per V.7: a panic in the filter update must not fail the commit —
+    // the data is already durable. Invalidate on panic so the next
+    // constrained INSERT re-validates from scratch.
+    {
+        let disp_ptr = shared.disp_ptr;
+        for g in groups.iter_mut() {
+            if g.write_err.is_some() { continue; }
+            if let Err(e) = guard_panic("unique_filter_ingest", || {
+                unsafe { (*disp_ptr).unique_filter_ingest_batch(g.tid, &g.merged); }
+                Ok(())
+            }) {
+                let _ = guard_panic("unique_filter_invalidate", || {
+                    unsafe { (*disp_ptr).unique_filter_invalidate_table(g.tid); }
+                    Ok(())
+                });
+                crate::gnitz_warn!("{}", e);
+            }
         }
     }
 

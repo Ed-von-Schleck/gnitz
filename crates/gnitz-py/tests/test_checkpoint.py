@@ -10,8 +10,10 @@ The server is function-scoped (each test gets its own instance) so that a
 misbehaving checkpoint cannot corrupt state for other tests.
 """
 import os
+import random
 import subprocess
 import tempfile
+import threading
 import time
 import shutil
 import pytest
@@ -139,3 +141,259 @@ def test_no_rows_lost_with_view_during_checkpoints(checkpoint_client):
     table_live = sum(r.weight for r in client.scan(tid) if r.weight > 0)
     assert table_live == total, \
         f"Table count mismatch: expected {total}, got {table_live} — entries lost during checkpoint"
+
+
+# ---------------------------------------------------------------------------
+# Liveness regressions: fan-out ops must not hang during concurrent checkpoints
+# ---------------------------------------------------------------------------
+#
+# Before the fix, fan_out_seek_async, fan_out_scan_async, and
+# execute_pipeline_async did not hold sal_writer_excl while writing their SAL
+# group.  A request arriving in the FLAG_FLUSH ACK-wait window wrote with the
+# old epoch; workers skipped it; the operation hung forever.
+#
+# Each test below uses two connections in separate threads: a pusher that
+# floods the SAL (triggering frequent checkpoints) and a reader that exercises
+# one of the affected fan-out code paths.  Hang detection is via thread.join
+# with a timeout; assert-not-alive converts a permanent hang into a test
+# failure.
+
+def _filler_schema(client, sock_path):
+    """Return (socket_path, filler_tid, filler_schema, sn) after DDL."""
+    sn = "ck" + str(random.randint(100_000, 999_999))
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE filler (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    filler_tid, _ = client.resolve_table(sn, "filler")
+    cols = [
+        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+    ]
+    schema = gnitz.Schema(cols)
+    return filler_tid, schema, sn
+
+
+def _push_to_fill(client, filler_tid, schema, n_batches=25, batch_size=400):
+    """Push n_batches × batch_size rows into filler to trigger checkpoints."""
+    for i in range(n_batches):
+        batch = gnitz.ZSetBatch(schema)
+        for j in range(batch_size):
+            pk = i * batch_size + j
+            batch.append(pk=pk, val=pk)
+        client.push(filler_tid, batch)
+
+
+def test_seek_during_checkpoints(checkpoint_server):
+    """SEEK (single_worker_async) must not hang when checkpoints fire concurrently.
+
+    Regression: fan_out_seek_async wrote its SAL group without holding
+    sal_writer_excl.  A SEEK arriving in the FLAG_FLUSH ACK-wait window used
+    the old epoch; workers skipped it; the seek hung forever.
+    """
+    with gnitz.connect(checkpoint_server) as pusher, \
+         gnitz.connect(checkpoint_server) as seeker:
+
+        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+
+        # Create a target table with one row for the seeker.
+        pusher.execute_sql(
+            "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        pusher.execute_sql("INSERT INTO target VALUES (42, 999)", schema_name=sn)
+        target_tid, _ = pusher.resolve_table(sn, "target")
+
+        errors = []
+        push_started = threading.Event()
+
+        def push_loop():
+            try:
+                for i in range(25):
+                    batch = gnitz.ZSetBatch(filler_schema)
+                    for j in range(400):
+                        pk = i * 400 + j
+                        batch.append(pk=pk, val=pk)
+                    pusher.push(filler_tid, batch)
+                    if i == 0:
+                        push_started.set()
+            except Exception as exc:
+                errors.append(("push", exc))
+                push_started.set()
+
+        def seek_loop():
+            push_started.wait(timeout=15)
+            try:
+                for _ in range(80):
+                    seeker.seek(target_tid, pk=42)
+            except Exception as exc:
+                errors.append(("seek", exc))
+
+        push_t = threading.Thread(target=push_loop, daemon=True)
+        seek_t = threading.Thread(target=seek_loop, daemon=True)
+        push_t.start()
+        seek_t.start()
+
+        push_t.join(timeout=30)
+        seek_t.join(timeout=15)
+
+        assert not push_t.is_alive(), "push loop hung unexpectedly"
+        assert not seek_t.is_alive(), \
+            "seek hung during concurrent checkpoint (sal_writer_excl regression)"
+        for src, exc in errors:
+            raise AssertionError(f"{src} thread raised: {exc}")
+
+
+def test_scan_during_checkpoints(checkpoint_server):
+    """SCAN (dispatch_fanout) must not hang when checkpoints fire concurrently.
+
+    Regression: fan_out_scan_async wrote its SAL group without holding
+    sal_writer_excl.  Same epoch-mismatch hang as the seek regression.
+    """
+    with gnitz.connect(checkpoint_server) as pusher, \
+         gnitz.connect(checkpoint_server) as scanner:
+
+        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+
+        pusher.execute_sql(
+            "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        pusher.execute_sql("INSERT INTO target VALUES (1, 10), (2, 20)", schema_name=sn)
+        target_tid, _ = pusher.resolve_table(sn, "target")
+
+        errors = []
+        push_started = threading.Event()
+
+        def push_loop():
+            try:
+                for i in range(25):
+                    batch = gnitz.ZSetBatch(filler_schema)
+                    for j in range(400):
+                        pk = i * 400 + j
+                        batch.append(pk=pk, val=pk)
+                    pusher.push(filler_tid, batch)
+                    if i == 0:
+                        push_started.set()
+            except Exception as exc:
+                errors.append(("push", exc))
+                push_started.set()
+
+        def scan_loop():
+            push_started.wait(timeout=15)
+            try:
+                for _ in range(40):
+                    scanner.scan(target_tid)
+            except Exception as exc:
+                errors.append(("scan", exc))
+
+        push_t = threading.Thread(target=push_loop, daemon=True)
+        scan_t = threading.Thread(target=scan_loop, daemon=True)
+        push_t.start()
+        scan_t.start()
+
+        push_t.join(timeout=30)
+        scan_t.join(timeout=15)
+
+        assert not push_t.is_alive(), "push loop hung unexpectedly"
+        assert not scan_t.is_alive(), \
+            "scan hung during concurrent checkpoint (sal_writer_excl regression)"
+        for src, exc in errors:
+            raise AssertionError(f"{src} thread raised: {exc}")
+
+
+def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server):
+    """Unique filter must survive checkpoint cycles and keep rejecting duplicates.
+
+    Regression for unique_filter_ingest_batch ordering (Bug 3): the filter
+    update must be called exactly once per durably committed batch, and
+    checkpoint activity must not corrupt or reset the filter.
+
+    The test inserts rows with a unique indexed column while simultaneously
+    flooding the SAL with filler data (triggering frequent checkpoints).
+    After all inserts succeed, it verifies:
+      1. Every inserted row is visible — no silent data loss.
+      2. Inserting a duplicate unique value is rejected — filter still works.
+
+    If unique_filter_ingest_batch were accidentally removed (e.g. the move to
+    Phase D dropped it entirely), or if a checkpoint reset the filter, the
+    duplicate INSERT in step 2 would succeed and the assertion would fail.
+    """
+    with gnitz.connect(checkpoint_server) as pusher, \
+         gnitz.connect(checkpoint_server) as inserter:
+
+        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+
+        inserter.execute_sql(
+            "CREATE TABLE unique_t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL"
+            ")",
+            schema_name=sn,
+        )
+        inserter.execute_sql(
+            "CREATE UNIQUE INDEX ON unique_t(val)", schema_name=sn
+        )
+        unique_tid, _ = inserter.resolve_table(sn, "unique_t")
+
+        errors = []
+        push_started = threading.Event()
+
+        def push_loop():
+            try:
+                for i in range(25):
+                    batch = gnitz.ZSetBatch(filler_schema)
+                    for j in range(400):
+                        pk = i * 400 + j
+                        batch.append(pk=pk, val=pk)
+                    pusher.push(filler_tid, batch)
+                    if i == 0:
+                        push_started.set()
+            except Exception as exc:
+                errors.append(("push", exc))
+                push_started.set()
+
+        n_rows = 50
+
+        def insert_loop():
+            push_started.wait(timeout=15)
+            try:
+                for i in range(n_rows):
+                    inserter.execute_sql(
+                        f"INSERT INTO unique_t VALUES ({i}, {i * 10})",
+                        schema_name=sn,
+                    )
+            except Exception as exc:
+                errors.append(("insert", exc))
+
+        push_t = threading.Thread(target=push_loop, daemon=True)
+        insert_t = threading.Thread(target=insert_loop, daemon=True)
+        push_t.start()
+        insert_t.start()
+
+        push_t.join(timeout=30)
+        insert_t.join(timeout=30)
+
+        assert not push_t.is_alive(), "push loop hung unexpectedly"
+        assert not insert_t.is_alive(), \
+            "insert loop hung during concurrent checkpoint"
+        for src, exc in errors:
+            raise AssertionError(f"{src} thread raised: {exc}")
+
+        # 1. All rows must be visible.
+        live = sum(r.weight for r in inserter.scan(unique_tid) if r.weight > 0)
+        assert live == n_rows, f"Expected {n_rows} rows, got {live} after checkpoints"
+
+        # 2. Unique filter must still enforce the constraint.
+        #    val=0 was inserted as row 0 above; re-inserting it must fail.
+        try:
+            inserter.execute_sql(
+                f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)",
+                schema_name=sn,
+            )
+            raise AssertionError(
+                "Duplicate unique value was accepted — unique filter lost after checkpoint"
+            )
+        except gnitz.GnitzError:
+            pass  # expected

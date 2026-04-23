@@ -82,11 +82,21 @@ concurrent SAL writer permitted in that window. `maybe_checkpoint` must not
 be called from `fan_out_*_async`, `tick_loop_async`,
 `execute_pipeline_async`, `broadcast_ddl`, or `single_worker_async`.
 
+`sal_writer_excl` must be held for the **entire** checkpoint sequence (write
++ ACK wait + `checkpoint_post_ack`). Releasing it before the await would let
+concurrent writers write SAL groups with the old epoch; workers skip
+mismatched epochs, and `checkpoint_post_ack` then resets `write_cursor` to 0,
+permanently orphaning those groups and hanging the writers.
+
 **SAL-writer mutex** — `sal_writer_excl: Rc<AsyncMutex<()>>` serialises
-tick, commit, DDL, and relay SAL emissions. Non-reentrant: holders must not
-`.await` anything that could re-acquire it. Without it, a `FLAG_FLUSH`
-between `FLAG_TICK` and `FLAG_EXCHANGE_RELAY` bumps the worker epoch and
-silently drops the relay.
+tick, commit, DDL, relay, and all read-only fan-out SAL emissions (seek,
+scan, pipeline checks, unique-filter warmup). Non-reentrant: holders must not
+`.await` anything that could re-acquire it. For fan-out operations the lock
+covers only the synchronous write + signal phase and is dropped before
+awaiting replies; for checkpoint it spans the full sequence (see above).
+Without serialisation, a `FLAG_FLUSH` between `FLAG_TICK` and
+`FLAG_EXCHANGE_RELAY` bumps the worker epoch and silently drops the relay;
+likewise a fan-out writing during a checkpoint window would be orphaned.
 
 **Per-fd lifecycle** — `register_conn` must clear all sentinels from the
 previous incarnation (fd numbers reuse). `recv_closed[fd]` persists until

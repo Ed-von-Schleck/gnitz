@@ -16,7 +16,7 @@ use crate::runtime::sal::{
 };
 use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire};
 use crate::runtime::w2m::W2mReceiver;
-use crate::runtime::reactor::PendingRelay;
+use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_relay_scatter_consolidated,
@@ -598,19 +598,21 @@ impl MasterDispatcher {
     pub async fn fan_out_seek_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, pk_lo: u64, pk_hi: u64,
     ) -> Result<Option<Batch>, String> {
         let worker = unsafe {
             let pk = crate::util::make_pk(pk_lo, pk_hi);
             worker_for_partition(partition_for_key(pk), (*disp_ptr).num_workers)
         };
-        single_worker_async(disp_ptr, reactor, target_id, FLAG_SEEK,
+        single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
                             worker, pk_lo, pk_hi, 0, "seek").await
     }
 
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
     ) -> Result<Option<Batch>, String> {
         let cached = unsafe {
@@ -621,14 +623,14 @@ impl MasterDispatcher {
         if cached >= 0 {
             let worker = cached as usize;
             return single_worker_async(
-                disp_ptr, reactor, target_id, FLAG_SEEK_BY_INDEX,
+                disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK_BY_INDEX,
                 worker, key_lo, key_hi, col_idx as u64, "seek_by_index",
             ).await;
         }
 
         // Cache miss: broadcast to all workers with per-worker req_ids.
         let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             disp.write_group_with_req_ids(
                 target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
@@ -651,10 +653,11 @@ impl MasterDispatcher {
     pub async fn fan_out_scan_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
     ) -> Result<Option<Batch>, String> {
         let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             disp.write_group_with_req_ids(
                 target_id, 0, &[], &schema, &col_names,
@@ -681,9 +684,13 @@ impl MasterDispatcher {
 
     /// Async version of `execute_pipeline`. Writes each check with
     /// per-worker req_ids, signals once, and joins all replies.
+    ///
+    /// `sal_excl` is held only for the synchronous write + signal phase;
+    /// see `dispatch_fanout` for the rationale.
     async fn execute_pipeline_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         checks: Vec<PipelinedCheck>,
     ) -> Result<Vec<HashSet<u128>>, String> {
         let num_checks = checks.len();
@@ -691,28 +698,31 @@ impl MasterDispatcher {
             return Ok(Vec::new());
         }
 
-        let (nw, mut all_req_ids): (usize, Vec<Vec<u64>>) = unsafe {
-            let disp = &mut *disp_ptr;
-            let nw = disp.num_workers;
-            let mut rids: Vec<Vec<u64>> = Vec::with_capacity(num_checks);
-            for _ in 0..num_checks {
-                rids.push((0..nw).map(|_| reactor.alloc_request_id()).collect());
+        let (nw, mut all_req_ids): (usize, Vec<Vec<u64>>) = {
+            let _guard = sal_excl.lock().await;
+            unsafe {
+                let disp = &mut *disp_ptr;
+                let nw = disp.num_workers;
+                let mut rids: Vec<Vec<u64>> = Vec::with_capacity(num_checks);
+                for _ in 0..num_checks {
+                    rids.push((0..nw).map(|_| reactor.alloc_request_id()).collect());
+                }
+                for (idx, check) in checks.iter().enumerate() {
+                    let refs: Vec<Option<&Batch>> = match &check.payload {
+                        CheckPayload::Broadcast(batch) => (0..nw).map(|_| Some(batch)).collect(),
+                        CheckPayload::Partitioned(batches) => batches.iter()
+                            .map(|b| if b.count > 0 { Some(b) } else { None })
+                            .collect(),
+                    };
+                    disp.write_group_with_req_ids(
+                        check.target_id, check.flags, &refs,
+                        &check.schema, &[], 0, 0, check.col_hint,
+                        &rids[idx], -1,
+                    )?;
+                }
+                disp.signal_all();
+                (nw, rids)
             }
-            for (idx, check) in checks.iter().enumerate() {
-                let refs: Vec<Option<&Batch>> = match &check.payload {
-                    CheckPayload::Broadcast(batch) => (0..nw).map(|_| Some(batch)).collect(),
-                    CheckPayload::Partitioned(batches) => batches.iter()
-                        .map(|b| if b.count > 0 { Some(b) } else { None })
-                        .collect(),
-                };
-                disp.write_group_with_req_ids(
-                    check.target_id, check.flags, &refs,
-                    &check.schema, &[], 0, 0, check.col_hint,
-                    &rids[idx], -1,
-                )?;
-            }
-            disp.signal_all();
-            (nw, rids)
         };
 
         // Flatten futures in (check_idx, worker) order.
@@ -913,6 +923,7 @@ impl MasterDispatcher {
     pub async fn validate_all_distributed_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, num_workers) = unsafe {
@@ -1108,7 +1119,7 @@ impl MasterDispatcher {
         // ----- Phase 1 execute + interpret --------------------------------
         let mut existing_pks: HashSet<u128> = HashSet::new();
         if !p1_checks.is_empty() {
-            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, p1_checks).await?;
+            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, p1_checks).await?;
 
             for (idx, label) in p1_labels.iter().enumerate() {
                 match label {
@@ -1170,7 +1181,7 @@ impl MasterDispatcher {
 
         // Lazily warm the unique-index filters. In the async path this
         // may trigger a scan; the scan is itself async.
-        Self::ensure_unique_filters_warm_async(disp_ptr, reactor, target_id).await?;
+        Self::ensure_unique_filters_warm_async(disp_ptr, reactor, sal_excl, target_id).await?;
 
         let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p2_labels: Vec<P2Label> = Vec::new();
@@ -1280,7 +1291,7 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, p2_checks).await?;
+        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, p2_checks).await?;
 
         for (idx, label) in p2_labels.iter().enumerate() {
             match label {
@@ -1297,7 +1308,7 @@ impl MasterDispatcher {
                         let key_pk = crate::util::make_pk(key_lo, key_hi);
                         if !occupied.contains(&key_pk) { continue; }
                         match Self::fan_out_seek_by_index_async(
-                            disp_ptr, reactor, target_id, *col_idx, key_lo, key_hi,
+                            disp_ptr, reactor, sal_excl, target_id, *col_idx, key_lo, key_hi,
                         ).await {
                             Err(e) => return Err(e),
                             Ok(None) => {}
@@ -1337,6 +1348,7 @@ impl MasterDispatcher {
     async fn ensure_unique_filters_warm_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
         table_id: i64,
     ) -> Result<(), String> {
         let missing: Vec<UniqueIndexDesc> = unsafe {
@@ -1355,7 +1367,7 @@ impl MasterDispatcher {
             missing
         };
 
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, |disp, req_ids| {
+        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             disp.write_group_with_req_ids(
                 table_id, 0, &[], &schema, &col_names,
@@ -1481,13 +1493,18 @@ pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
     None
 }
 
-/// Allocate `nw` per-worker request ids, run `submit`, increment in-flight
-/// counters, signal all workers, then await every reply via `join_all`.
-/// Centralises the write + signal + await sequence every async fan-out
-/// repeats. Returns decoded replies in worker order.
+/// Allocate `nw` per-worker request ids, run `submit`, signal all workers,
+/// then await every reply via `join_all`. Returns decoded replies in worker order.
+///
+/// `sal_excl` is held only for the synchronous write + signal phase and
+/// released before awaiting replies. This serialises the SAL write against
+/// concurrent checkpoint FLAG_FLUSH groups: without the lock a fan-out
+/// could write with the old epoch during the checkpoint window, workers
+/// would skip it, and the caller would hang waiting for an ACK.
 pub(crate) async fn dispatch_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
+    sal_excl: &Rc<AsyncMutex<()>>,
     submit: F,
 ) -> Result<Vec<DecodedWire>, String>
 where
@@ -1495,10 +1512,13 @@ where
 {
     let nw = unsafe { (*disp_ptr).num_workers };
     let req_ids: Vec<u64> = (0..nw).map(|_| reactor.alloc_request_id()).collect();
-    unsafe {
-        let disp = &mut *disp_ptr;
-        submit(disp, &req_ids)?;
-        disp.signal_all();
+    {
+        let _guard = sal_excl.lock().await;
+        unsafe {
+            let disp = &mut *disp_ptr;
+            submit(disp, &req_ids)?;
+            disp.signal_all();
+        }
     }
     let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
     Ok(crate::runtime::reactor::join_all(futs).await)
@@ -1509,23 +1529,30 @@ where
 /// The closures in the public wrappers compute the worker; everything
 /// else is here so there is a single place to maintain the unsafe
 /// borrow-and-release pattern.
+///
+/// `sal_excl` is held only for the synchronous write + signal phase;
+/// see `dispatch_fanout` for the rationale.
 async fn single_worker_async(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
+    sal_excl: &Rc<AsyncMutex<()>>,
     target_id: i64,
     flags: u32,
     worker: usize,
     seek_pk_lo: u64, seek_pk_hi: u64, seek_col_idx: u64,
     op_name: &'static str,
 ) -> Result<Option<Batch>, String> {
-    let (schema, req_id) = unsafe {
-        let disp = &mut *disp_ptr;
-        let (schema, col_names) = disp.get_schema_and_names(target_id);
-        let req_id = reactor.alloc_request_id();
-        disp.write_group(target_id, flags, &[], &schema, &col_names,
-                         seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)?;
-        disp.signal_one(worker);
-        (schema, req_id)
+    let (schema, req_id) = {
+        let _guard = sal_excl.lock().await;
+        unsafe {
+            let disp = &mut *disp_ptr;
+            let (schema, col_names) = disp.get_schema_and_names(target_id);
+            let req_id = reactor.alloc_request_id();
+            disp.write_group(target_id, flags, &[], &schema, &col_names,
+                             seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)?;
+            disp.signal_one(worker);
+            (schema, req_id)
+        }
     };
     let decoded = reactor.await_reply(req_id).await;
     if decoded.control.status != 0 {

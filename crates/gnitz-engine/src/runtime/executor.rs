@@ -73,10 +73,10 @@ pub struct Shared {
     sal_fd: i32,
     committer_tx: mpsc::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
-    /// SAL-writer exclusivity (III.3b). Held by committer (checkpoint +
-    /// commit emission), tick task (per-tid emission), relay task
-    /// (FLAG_EXCHANGE_RELAY), and DDL (broadcast_ddl + fsync).  Replaces
-    /// the deleted `TickIdleBarrier` semantics.
+    /// SAL-writer exclusivity. Held by committer (checkpoint + commit
+    /// emission), tick (per-tid emission), relay (FLAG_EXCHANGE_RELAY),
+    /// DDL (broadcast_ddl + fsync), and all fan-out operations (seek,
+    /// scan, pipeline checks, unique-filter warmup). See async-invariants.md.
     sal_writer_excl: Rc<AsyncMutex<()>>,
     /// Tick trigger sender; senders include INSERT (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
@@ -545,7 +545,8 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         }
         // Distributed validation (FK / unique indices + UPSERT).
         if let Err(e) = MasterDispatcher::validate_all_distributed_async(
-            shared.dispatcher.0, &shared.reactor, target_id, &batch, mode,
+            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            target_id, &batch, mode,
         ).await {
             send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
             return;
@@ -593,7 +594,8 @@ async fn handle_seek(
     let schema = shared.get_schema_desc(target_id);
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_async(
-            shared.dispatcher.0, &shared.reactor, target_id, pk_lo, pk_hi,
+            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            target_id, pk_lo, pk_hi,
         ).await
     } else {
         let cat_ptr = shared.catalog.0;
@@ -617,7 +619,8 @@ async fn handle_seek_by_index(
     let schema = shared.get_schema_desc(target_id);
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_by_index_async(
-            shared.dispatcher.0, &shared.reactor, target_id, col_idx, key_lo, key_hi,
+            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            target_id, col_idx, key_lo, key_hi,
         ).await
     } else {
         let cat_ptr = shared.catalog.0;
@@ -657,7 +660,7 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher.0, &shared.reactor, target_id,
+        shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl, target_id,
     ).await;
     match result {
         Ok(batch) => {
