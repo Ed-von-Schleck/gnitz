@@ -355,20 +355,14 @@ async def test_error_push_bad_table(aconn):
 
 @pytest.mark.asyncio
 async def test_error_in_pipeline(aconn, table):
-    """An error for one request in a pipeline should not break the others."""
+    """A failure in any pipeline operation must raise from the async-with block."""
     tid, cols, _ = table
-    schema = gnitz.Schema(cols)
 
-    async with aconn.pipeline() as pipe:
-        pipe.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
-        pipe.push(0xDEAD_BEEF, _batch(cols, [{"pk": 2, "val": 2}]))  # bad table
-        pipe.push(tid, _batch(cols, [{"pk": 3, "val": 3}]))
-
-    # At least one should be an error
-    errors = [r for r in pipe.results if isinstance(r, Exception)]
-    successes = [r for r in pipe.results if isinstance(r, int)]
-    assert len(errors) >= 1
-    assert len(successes) >= 1
+    with pytest.raises(gnitz.GnitzError):
+        async with aconn.pipeline() as pipe:
+            pipe.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
+            pipe.push(0xDEAD_BEEF, _batch(cols, [{"pk": 2, "val": 2}]))  # bad table
+            pipe.push(tid, _batch(cols, [{"pk": 3, "val": 3}]))
 
 
 @pytest.mark.asyncio

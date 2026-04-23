@@ -3,7 +3,7 @@ test_ergonomics.py — Full coverage for the Python ergonomics API.
 
 Section 1: Offline (no server)
     TestTypeCode, TestColumnDef, TestSchema, TestStruct,
-    TestRow, TestZSetBatchErrors, TestScanResultOffline
+    TestRow, TestZSetBatchErrors, TestScanResultType
 
 Section 2: Online (server required, uses `client` fixture from conftest.py)
     TestZSetBatchExtend, TestScanResultMethods, TestRowAccess, TestStructOnline
@@ -204,39 +204,12 @@ class TestZSetBatchErrors:
         assert batch.extend([{"pk": 1, "val": 5}]) is batch
 
 
-class TestScanResultOffline:
-    """ScanResult(None, None) exercises all empty-batch edge cases."""
+class TestScanResultType:
+    """gnitz.ScanResult must be the native Rust type (not the old Python shim)."""
 
-    def _empty(self):
-        return ScanResult(None, None)
-
-    def test_len_zero(self):
-        assert len(self._empty()) == 0
-
-    def test_bool_false(self):
-        assert bool(self._empty()) is False
-
-    def test_iter_empty(self):
-        assert list(self._empty()) == []
-
-    def test_all_empty(self):
-        assert self._empty().all() == []
-
-    def test_first_none(self):
-        assert self._empty().first() is None
-
-    def test_one_raises(self):
-        with pytest.raises(ValueError):
-            self._empty().one()
-
-    def test_one_or_none_none(self):
-        assert self._empty().one_or_none() is None
-
-    def test_mappings_empty(self):
-        assert self._empty().mappings() == []
-
-    def test_scalars_empty(self):
-        assert self._empty().scalars() == []
+    def test_is_native_type(self):
+        import gnitz._native as _native
+        assert gnitz.ScanResult is _native.ScanResult
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +390,57 @@ class TestScanResultMethods:
         pass2 = list(result)
         assert len(pass1) == 3
         assert len(pass2) == 3
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_isinstance(self, client):
+        """scan() returns a gnitz.ScanResult (the native Rust type)."""
+        sn, tid, schema = _make_table(client)
+        result = client.scan(tid)
+        assert isinstance(result, gnitz.ScanResult)
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_len_zero(self, client):
+        sn, tid, schema = _make_table(client)
+        assert len(client.scan(tid)) == 0
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_iter(self, client):
+        sn, tid, schema = _make_table(client)
+        assert list(client.scan(tid)) == []
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_all(self, client):
+        sn, tid, schema = _make_table(client)
+        assert client.scan(tid).all() == []
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_first_none(self, client):
+        sn, tid, schema = _make_table(client)
+        assert client.scan(tid).first() is None
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_one_raises(self, client):
+        sn, tid, schema = _make_table(client)
+        with pytest.raises(ValueError):
+            client.scan(tid).one()
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_mappings(self, client):
+        sn, tid, schema = _make_table(client)
+        assert client.scan(tid).mappings() == []
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+    def test_empty_table_scalars(self, client):
+        sn, tid, schema = _make_table(client)
+        assert client.scan(tid).scalars() == []
         client.drop_table(sn, "t")
         client.drop_schema(sn)
 

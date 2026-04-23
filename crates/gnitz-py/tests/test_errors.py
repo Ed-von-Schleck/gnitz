@@ -118,3 +118,36 @@ class TestSchemaMismatch:
                 client.push(tid, batch)
         finally:
             _cleanup(client, sn, tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# Schema construction limits
+# ---------------------------------------------------------------------------
+
+class TestSchemaColumnLimit:
+    """Schema must reject invalid column counts — guards the u64 null bitmask."""
+
+    def test_zero_columns_raises(self):
+        with pytest.raises(ValueError):
+            gnitz.Schema([])
+
+    def test_exactly_65_columns_ok(self):
+        """1 PK + 64 payload = 65 total fills the u64 null bitmask exactly."""
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
+        cols += [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
+                 for i in range(64)]
+        s = gnitz.Schema(cols)
+        assert len(s.columns) == 65
+
+    def test_66_columns_raises(self):
+        """1 PK + 65 payload shifts by 64 bits — must be rejected."""
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
+        cols += [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
+                 for i in range(65)]
+        with pytest.raises(ValueError, match="65"):
+            gnitz.Schema(cols)
+
+    def test_100_columns_raises(self):
+        cols = [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64) for i in range(100)]
+        with pytest.raises(ValueError):
+            gnitz.Schema(cols)

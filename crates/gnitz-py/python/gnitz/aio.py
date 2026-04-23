@@ -142,10 +142,14 @@ class Pipeline:
         return self
 
     async def __aexit__(self, exc_type, *_):
-        if exc_type is None and self._futures:
-            self.results = list(await asyncio.gather(
-                *self._futures, return_exceptions=True,
-            ))
+        if self._futures:
+            if exc_type is None:
+                # Success path: raise on any failure instead of silently
+                # placing exception objects in self.results.
+                self.results = list(await asyncio.gather(*self._futures))
+            else:
+                # Failure path: drain futures without masking the user's exception.
+                await asyncio.gather(*self._futures, return_exceptions=True)
         return False
 
     def push(self, target_id, batch):

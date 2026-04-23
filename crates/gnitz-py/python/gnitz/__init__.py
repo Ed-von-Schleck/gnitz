@@ -1,7 +1,7 @@
-from gnitz._native   import GnitzError, ExprBuilder, ExprProgram, Row
+from gnitz._native   import GnitzError, ExprBuilder, ExprProgram, Row, ScanResult
 from gnitz._native   import ColumnDef, Schema
 from gnitz._types    import TypeCode
-from gnitz._batch    import ZSetBatch, ScanResult
+from gnitz._batch    import ZSetBatch
 from gnitz._client   import Connection
 from gnitz._builders import CircuitBuilder, CircuitGraph
 from gnitz._struct   import (Struct, field,

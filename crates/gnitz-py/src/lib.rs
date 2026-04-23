@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyDict, PyTuple};
+use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
 use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
@@ -95,6 +95,12 @@ impl PySchema {
     #[new]
     #[pyo3(signature = (columns, pk_index = None))]
     pub fn new(columns: Bound<'_, PyList>, pk_index: Option<usize>) -> PyResult<Self> {
+        let len = columns.len();
+        if len == 0 || len > 65 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Schema must have 1 to 65 columns (1 PK + up to 64 payload columns)",
+            ));
+        }
         let idx = match pk_index {
             Some(i) => i,
             None => {
@@ -261,8 +267,10 @@ impl PyRow {
 /// and batch without any Python→Rust re-extraction.
 #[pyclass(name = "ZSetBatch")]
 pub struct PyZSetBatch {
-    pub(crate) schema: Schema,
-    pub(crate) batch:  ZSetBatch,
+    pub(crate) schema:   Schema,
+    pub(crate) batch:    ZSetBatch,
+    /// Interned PyString for each column name — built once, reused across all appends.
+    col_keys: Vec<Py<PyString>>,
 }
 
 /// Private helpers — shared between append_row, append_dict, extend_from_dicts.
@@ -334,31 +342,27 @@ impl PyZSetBatch {
         Ok(())
     }
 
-    /// Shared logic for appending one row from a dict.
     fn append_from_dict_inner(
         &mut self,
         dict: &Bound<'_, PyDict>,
         weight: i64,
     ) -> PyResult<()> {
+        let py = dict.py();
         let pk_idx = self.schema.pk_index;
-        let pk_name = &self.schema.columns[pk_idx].name;
         let n_cols = self.schema.columns.len();
 
-        // Extract PK
-        let pk_val = dict.get_item(pk_name)?
+        let pk_val = dict.get_item(self.col_keys[pk_idx].bind(py))?
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!(
-                "Missing primary key column {:?}", pk_name,
+                "Missing primary key column {:?}", self.schema.columns[pk_idx].name,
             )))?;
         self.append_pk(&pk_val)?;
         self.batch.weights.push(weight);
 
-        // Non-PK columns
         let mut nulls: u64 = 0;
         for ci in 0..n_cols {
             if ci == pk_idx { continue; }
             let payload_idx = if ci < pk_idx { ci } else { ci - 1 };
-            let col_name = &self.schema.columns[ci].name;
-            match dict.get_item(col_name)? {
+            match dict.get_item(self.col_keys[ci].bind(py))? {
                 Some(val) => self.append_column_value(ci, payload_idx, &val, &mut nulls)?,
                 None => self.append_null_column(ci, payload_idx, &mut nulls)?,
             }
@@ -374,8 +378,11 @@ impl PyZSetBatch {
     #[pyo3(signature = (schema))]
     pub fn new(py: Python<'_>, schema: PyRef<'_, PySchema>) -> PyResult<Self> {
         let rust_schema = py_schema_to_rust(py, &schema)?;
+        let col_keys = rust_schema.columns.iter()
+            .map(|c| PyString::new(py, &c.name).unbind())
+            .collect();
         let batch = ZSetBatch::new(&rust_schema);
-        Ok(PyZSetBatch { schema: rust_schema, batch })
+        Ok(PyZSetBatch { schema: rust_schema, batch, col_keys })
     }
 
     /// Append a row given column-ordered values and a weight (backward compat).
@@ -421,14 +428,15 @@ impl PyZSetBatch {
     /// Rust call, eliminating per-row Python→Rust boundary crossings.
     #[pyo3(signature = (rows, weight = 1))]
     pub fn extend_from_dicts(
-        &mut self, _py: Python<'_>,
+        &mut self, py: Python<'_>,
         rows: Bound<'_, PyAny>,
         weight: i64,
     ) -> PyResult<()> {
+        let weight_key = pyo3::intern!(py, "_weight");
         for row_item in rows.try_iter()? {
             let row_item = row_item?;
             let dict: &Bound<'_, PyDict> = row_item.downcast()?;
-            let row_weight = match dict.get_item("_weight")? {
+            let row_weight = match dict.get_item(weight_key)? {
                 Some(w) => w.extract::<i64>()?,
                 None => weight,
             };
@@ -511,9 +519,13 @@ fn rust_batch_to_py(
     schema: &Schema,
     batch:  &ZSetBatch,
 ) -> PyResult<Py<PyZSetBatch>> {
+    let col_keys = schema.columns.iter()
+        .map(|c| PyString::new(py, &c.name).unbind())
+        .collect();
     Py::new(py, PyZSetBatch {
         schema: schema.clone(),
         batch:  batch.clone(),
+        col_keys,
     })
 }
 
@@ -1576,35 +1588,35 @@ fn async_io_loop(
             Err(_)  => break, // sender dropped → clean shutdown
         };
 
-        // Drain all additional queued requests (natural batching)
+        // Drain additional queued requests (natural batching), capped to
+        // avoid filling the socket send buffer before reading any responses.
         let mut batch = vec![first];
-        while let Ok(req) = rx.try_recv() {
-            batch.push(req);
+        while batch.len() < 1024 {
+            match rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(_)  => break,
+            }
         }
 
-        // Send all requests (blocking, existing code)
-        let send_ok = true;
-        for req in &batch {
-            if send_ok {
-                if let Err(e) = gnitz_protocol::send_framed(sock_fd, &req.payload) {
-                    // Fatal send error — fail all futures and exit
-                    for req2 in &batch {
-                        fail_future(&loop_ref, &se_fn, &req2.future, &e.to_string());
-                    }
-                    for (fut, _) in pending_futures.drain(..) {
-                        fail_future(&loop_ref, &se_fn, &fut, &e.to_string());
-                    }
-                    gnitz_protocol::close_fd(sock_fd);
-                    return;
-                }
-            }
-            Python::with_gil(|py| {
+        // Single GIL acquisition to register all futures before any sends,
+        // so error handling only needs to drain pending_futures once.
+        Python::with_gil(|py| {
+            for req in &batch {
                 pending_futures.push_back((req.future.clone_ref(py), req.kind));
-            });
+            }
+        });
+
+        // Send all requests in this batch.
+        for req in &batch {
+            if let Err(e) = gnitz_protocol::send_framed(sock_fd, &req.payload) {
+                // Fatal send error — fail all futures (previous batches + this batch) and exit
+                for (fut, _) in pending_futures.drain(..) {
+                    fail_future(&loop_ref, &se_fn, &fut, &e.to_string());
+                }
+                gnitz_protocol::close_fd(sock_fd);
+                return;
+            }
         }
-        // Note: req.future refs are consumed into pending_futures above.
-        // The IoRequest batch is dropped here; the Py<PyAny> in req.future
-        // may still be alive via pending_futures.
 
         // Recv all responses for this batch (pure Rust, no GIL)
         let n = batch.len();
