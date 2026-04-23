@@ -22,9 +22,7 @@ pub fn init(level: u32, tag: &[u8]) {
     LEVEL.store(level.min(DEBUG), Ordering::Relaxed);
     let len = tag.len().min(3);
     let mut bytes = [0u8; 4];
-    for i in 0..len {
-        bytes[i] = tag[i];
-    }
+    bytes[..len].copy_from_slice(&tag[..len]);
     bytes[3] = len as u8;
     TAG.store(u32::from_ne_bytes(bytes), Ordering::Relaxed);
 }

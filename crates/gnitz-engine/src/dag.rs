@@ -31,6 +31,7 @@ const PARAM_REINDEX_COL: i32 = 10;
 /// by CatalogEngine directly.
 pub enum StoreHandle {
     /// Owned single Table — used by views in single-worker mode.
+    #[allow(dead_code)]
     Single(Box<Table>),
     /// Owned PartitionedTable — used by base tables and views.
     Partitioned(Box<PartitionedTable>),
@@ -256,7 +257,6 @@ impl SysTableRefs {
 
 /// Cached exchange metadata for a view.
 pub struct ExchangeInfo {
-    pub shard_cols: Vec<i32>,
     pub is_trivial: bool,
     pub is_co_partitioned: bool,
 }
@@ -346,12 +346,6 @@ impl DagEngine {
         self.dep_map_valid = false;
     }
 
-    pub fn set_depth(&mut self, table_id: i64, depth: i32) {
-        if let Some(entry) = self.tables.get_mut(&table_id) {
-            entry.depth = depth;
-        }
-    }
-
     pub fn add_index_circuit(
         &mut self,
         table_id: i64,
@@ -420,11 +414,11 @@ impl DagEngine {
                             &ch.cursor, 3, &self.sys.dep_tab_schema,
                         );
                         if dep_tid > 0 {
-                            let views = self.dep_map.entry(dep_tid).or_insert_with(Vec::new);
+                            let views = self.dep_map.entry(dep_tid).or_default();
                             if !views.contains(&v_id) {
                                 views.push(v_id);
                             }
-                            let sources = self.source_map.entry(v_id).or_insert_with(Vec::new);
+                            let sources = self.source_map.entry(v_id).or_default();
                             if !sources.contains(&dep_tid) {
                                 sources.push(dep_tid);
                             }
@@ -517,7 +511,7 @@ impl DagEngine {
                 let value = compiler::cursor_read_i64(
                     &ch.cursor, 1, &self.sys.params_schema,
                 );
-                result.entry(node_id).or_insert_with(HashMap::new).insert(slot, value);
+                result.entry(node_id).or_default().insert(slot, value);
             }
             ch.cursor.advance();
         }
@@ -687,30 +681,10 @@ impl DagEngine {
         self.shard_cols_cache.insert(view_id, shard_cols.clone());
 
         self.exchange_info_cache.insert(view_id, ExchangeInfo {
-            shard_cols,
             is_trivial,
             is_co_partitioned,
         });
         &self.exchange_info_cache[&view_id]
-    }
-
-    /// Return [(view_id, shard_cols)] for trivial, non-co-partitioned views
-    /// that depend on source_table_id.
-    /// Port of `ProgramCache.get_preloadable_views()`.
-    pub fn get_preloadable_views(&mut self, source_table_id: i64) -> Vec<(i64, Vec<i32>)> {
-        self.get_dep_map();
-        let view_ids: Vec<i64> = self.dep_map
-            .get(&source_table_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut result = Vec::new();
-        for view_id in view_ids {
-            let info = self.get_exchange_info(view_id);
-            if info.is_trivial && !info.is_co_partitioned && !info.shard_cols.is_empty() {
-                result.push((view_id, info.shard_cols.clone()));
-            }
-        }
-        result
     }
 
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
@@ -811,21 +785,6 @@ impl DagEngine {
 
     // ── Compilation ─────────────────────────────────────────────────────
 
-    /// Get or compile a plan for the given view.
-    /// Port of `ProgramCache.get_program()`.
-    pub fn get_program(&mut self, view_id: i64) -> Option<&CachedPlan> {
-        if self.cache.contains_key(&view_id) {
-            return self.cache.get(&view_id);
-        }
-        match self.compile_view_internal(view_id) {
-            Some(plan) => {
-                self.cache.insert(view_id, plan);
-                self.cache.get(&view_id)
-            }
-            None => None,
-        }
-    }
-
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
     fn compile_view_internal(&self, view_id: i64) -> Option<CachedPlan> {
         let entry = self.tables.get(&view_id)?;
@@ -836,7 +795,6 @@ impl DagEngine {
         let ext_tables: Vec<ExternalTable> = self.tables.iter()
             .map(|(&tid, te)| ExternalTable {
                 table_id: tid,
-                handle: te.handle.table_ptr(),
                 schema: te.schema,
             })
             .collect();
@@ -926,23 +884,6 @@ impl DagEngine {
                 None
             }
         }
-    }
-
-    /// Execute just the post-plan of a view (after exchange IPC).
-    /// Used by multi-worker path.
-    pub fn execute_post_epoch(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-    ) -> Option<Batch> {
-        if !self.cache.contains_key(&view_id) {
-            if let Some(plan) = self.compile_view_internal(view_id) {
-                self.cache.insert(view_id, plan);
-            } else {
-                return None;
-            }
-        }
-        self.execute_plan_phase(view_id, false, input, 0)
     }
 
     /// Check if a source_id is co-partitioned for a view (from cached plan).
@@ -1438,6 +1379,7 @@ impl DagEngine {
 
     /// Build ext cursor handles indexed by register ID.
     /// Returns (cursor_ptrs, storage_owner). Storage must outlive cursor_ptrs.
+    #[allow(clippy::vec_box)]
     fn build_ext_cursors(
         &self,
         ext_trace_regs: &[(u16, i64)],
@@ -1819,7 +1761,6 @@ mod tests {
         let mut dag = DagEngine::new();
         dag.shard_cols_cache.insert(42, vec![0]);
         dag.exchange_info_cache.insert(42, ExchangeInfo {
-            shard_cols: vec![0],
             is_trivial: true,
             is_co_partitioned: false,
         });
@@ -1837,18 +1778,6 @@ mod tests {
         dag.shard_cols_cache.insert(99, vec![1]);
         dag.invalidate_all();
         assert!(dag.shard_cols_cache.is_empty());
-    }
-
-    #[test]
-    fn test_set_depth() {
-        let mut dag = DagEngine::new();
-        let schema = compiler::empty_schema();
-        let tbl = make_test_table("set_depth");
-        dag.register_table(50, StoreHandle::Single(tbl), schema, 1, false, String::new());
-        dag.set_depth(50, 3);
-        assert_eq!(dag.tables[&50].depth, 3);
-        dag.close();
-        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_set_depth");
     }
 
     #[test]

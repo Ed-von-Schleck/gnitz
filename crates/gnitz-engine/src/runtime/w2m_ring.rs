@@ -201,7 +201,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     // at phys(vwc). If capacity is not 8-aligned, phys(vwc) can sit fewer than
     // 8 bytes from the end of the buffer, causing those writes to cross the
     // mmap boundary.
-    assert!(capacity % 8 == 0, "W2M capacity={} must be 8-byte aligned", capacity);
+    assert!(capacity.is_multiple_of(8), "W2M capacity={} must be 8-byte aligned", capacity);
     // Zero the header first so re-init on a previously-live region
     // clears every byte, including padding.
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);

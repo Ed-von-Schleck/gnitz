@@ -131,6 +131,7 @@ struct ReactorShared {
     /// fire when the io_uring Timeout CQE arrives and a cancellation flag
     /// shared with the owning TimerFuture. If the future is dropped before
     /// the CQE, the flag is set and dispatch_cqe silently discards it.
+    #[allow(clippy::type_complexity)]
     timer_wakers: RefCell<HashMap<u64, (Waker, Rc<Cell<bool>>)>>,
     next_timer_id: Cell<u64>,
     #[cfg(test)]
@@ -212,7 +213,7 @@ fn probe_futex_waitv_support() {
 
 fn probe_futex_waitv_support_inner() {
     use std::sync::atomic::AtomicU32;
-    use io_uring::{opcode, types, IoUring};
+    use io_uring::{opcode, IoUring};
 
     let atomic = Box::new(AtomicU32::new(42));
     let futexv: Box<[FutexWaitV; 1]> = Box::new([
@@ -228,7 +229,7 @@ fn probe_futex_waitv_support_inner() {
             "reactor: probe io_uring init failed: {}", e,
         ),
     };
-    let entry = opcode::FutexWaitV::new(futexv.as_ptr() as *const types::FutexWaitV, 1)
+    let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1)
         .build()
         .user_data(0xFEEDu64);
     if unsafe { ring.submission().push(&entry) }.is_err() {
@@ -868,7 +869,7 @@ impl Reactor {
             }
             KIND_ACCEPT => {
                 if cqe.res >= 0 {
-                    self.inner.accept_queue.borrow_mut().push_back(cqe.res as i32);
+                    self.inner.accept_queue.borrow_mut().push_back(cqe.res);
                     if let Some(w) = self.inner.accept_waker.borrow_mut().take() {
                         w.wake();
                     }
@@ -1197,7 +1198,12 @@ impl Future for TimerFuture {
         if now >= self.deadline {
             return Poll::Ready(());
         }
-        if self.timer_id.is_none() {
+        if let Some(id) = self.timer_id {
+            // Re-poll: update the waker in case it changed.
+            if let Some(entry) = self.inner.timer_wakers.borrow_mut().get_mut(&id) {
+                entry.0 = cx.waker().clone();
+            }
+        } else {
             // First poll: submit the io_uring Timeout SQE and register the
             // waker. The SQE is flushed to the kernel by tick's
             // submit_and_wait_timeout call at the end of the same tick.
@@ -1208,12 +1214,6 @@ impl Future for TimerFuture {
             self.inner.timer_wakers.borrow_mut()
                 .insert(id, (cx.waker().clone(), Rc::clone(&self.cancelled)));
             self.timer_id = Some(id);
-        } else {
-            // Re-poll: update the waker in case it changed.
-            let id = self.timer_id.unwrap();
-            if let Some(entry) = self.inner.timer_wakers.borrow_mut().get_mut(&id) {
-                entry.0 = cx.waker().clone();
-            }
         }
         Poll::Pending
     }

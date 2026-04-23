@@ -70,7 +70,7 @@ impl EvalScratch {
                 self.null_bits.resize(null_cap, 0);
             }
         }
-        let filter_words = (n + 63) / 64;
+        let filter_words = n.div_ceil(64);
         if self.filter_bits.len() < filter_words {
             self.filter_bits.resize(filter_words, 0);
         }
@@ -125,7 +125,7 @@ impl EvalScratch {
     /// Zero the null bits for one register's morsel region.
     pub(in crate::expr) fn clear_null_reg(&mut self, reg: usize, m: usize) {
         if self.no_nulls { return; }
-        let words = (m + 63) / 64;
+        let words = m.div_ceil(64);
         let base = reg * NULL_WORDS_PER_REG;
         for w in 0..words { self.null_bits[base + w] = 0; }
     }
@@ -138,7 +138,7 @@ impl EvalScratch {
 /// Propagate binary null: dst_null = a_null | b_null (word-at-a-time).
 fn null_or2(s: &mut EvalScratch, dst: usize, a: usize, b: usize, m: usize) {
     if s.no_nulls { return; }
-    let words = (m + 63) / 64;
+    let words = m.div_ceil(64);
     let (na, nb, nd) = s.null_words3(a, b, dst, words);
     for w in 0..words { nd[w] = na[w] | nb[w]; }
 }
@@ -147,7 +147,7 @@ fn null_or2(s: &mut EvalScratch, dst: usize, a: usize, b: usize, m: usize) {
 fn null_or1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
     if s.no_nulls { return; }
     if dst == src { return; }
-    let words = (m + 63) / 64;
+    let words = m.div_ceil(64);
     let base_s = src * NULL_WORDS_PER_REG;
     let base_d = dst * NULL_WORDS_PER_REG;
     for w in 0..words {
@@ -165,7 +165,7 @@ fn fill_null_bits_pi(
     pi: usize,
 ) {
     if s.no_nulls { return; }
-    let words = (m + 63) / 64;
+    let words = m.div_ceil(64);
     let base = di * NULL_WORDS_PER_REG;
     for w in 0..words {
         let lo = w * 64;
@@ -204,6 +204,7 @@ fn fill_null_bits_ci(
 // String comparison helpers — shared by *_CONST and *_COL match arms
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn eval_str_col_vs_const(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
@@ -234,7 +235,7 @@ fn eval_str_col_vs_const(
     }
     // Zero out results for null rows using the already-computed null mask.
     if !scratch.no_nulls {
-        let words = (m + 63) / 64;
+        let words = m.div_ceil(64);
         for w in 0..words {
             let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
             if null_word != 0 {
@@ -250,6 +251,7 @@ fn eval_str_col_vs_const(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_str_col_vs_col(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
@@ -263,7 +265,7 @@ fn eval_str_col_vs_col(
 ) {
     fill_null_bits_ci(scratch, dst, mb.null_bmp, morsel_start, m, ci_a, pki);
     if !scratch.no_nulls {
-        let words = (m + 63) / 64;
+        let words = m.div_ceil(64);
         let pi_b = if ci_b < pki { ci_b } else { ci_b - 1 };
         for w in 0..words {
             let lo = w * 64;
@@ -292,7 +294,7 @@ fn eval_str_col_vs_col(
     }
     // Zero out results for null rows using the already-computed null mask.
     if !scratch.no_nulls {
-        let words = (m + 63) / 64;
+        let words = m.div_ceil(64);
         for w in 0..words {
             let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
             if null_word != 0 {
@@ -316,6 +318,7 @@ fn eval_str_col_vs_col(
 /// Results land in `scratch.regs`; null bits in `scratch.null_bits`.
 ///
 /// Callers loop over morsels and call this function once per morsel.
+#[allow(clippy::needless_range_loop)]
 pub(in crate::expr) fn eval_batch(
     prog: &ExprProgram,
     mb: &MemBatch,
@@ -508,7 +511,7 @@ pub(in crate::expr) fn eval_batch(
             EXPR_INT_DIV => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = (m + 63) / 64;
+                let words = m.div_ceil(64);
                 let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
                 {
                     let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
@@ -531,7 +534,7 @@ pub(in crate::expr) fn eval_batch(
             EXPR_INT_MOD => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = (m + 63) / 64;
+                let words = m.div_ceil(64);
                 let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
                 {
                     let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
@@ -606,7 +609,7 @@ pub(in crate::expr) fn eval_batch(
             EXPR_FLOAT_DIV => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = (m + 63) / 64;
+                let words = m.div_ceil(64);
                 let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
                 {
                     let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
@@ -761,7 +764,7 @@ pub(in crate::expr) fn eval_batch(
             EXPR_BOOL_AND => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = (m + 63) / 64;
+                let words = m.div_ceil(64);
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;
@@ -795,7 +798,7 @@ pub(in crate::expr) fn eval_batch(
             EXPR_BOOL_OR => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = (m + 63) / 64;
+                let words = m.div_ceil(64);
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;

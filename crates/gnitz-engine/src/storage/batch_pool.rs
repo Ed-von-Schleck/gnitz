@@ -13,7 +13,7 @@ use super::batch::Batch;
 const MAX_POOLED: usize = 64;
 
 thread_local! {
-    static BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+    static BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Take a buffer from the pool (retains previous capacity).

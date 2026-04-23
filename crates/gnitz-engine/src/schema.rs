@@ -134,7 +134,7 @@ pub(crate) fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
     dest[0..4].copy_from_slice(&src[0..4]);
     dest[4..8].copy_from_slice(&src[4..8]);
     if length <= SHORT_STRING_THRESHOLD {
-        let suffix_len = if length > 4 { length - 4 } else { 0 };
+        let suffix_len = length.saturating_sub(4);
         if suffix_len > 0 {
             dest[8..8 + suffix_len].copy_from_slice(&src[8..8 + suffix_len]);
         }

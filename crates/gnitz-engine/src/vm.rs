@@ -55,6 +55,7 @@ pub enum Instr {
         avi_group_cols_offset: u32,
         avi_group_cols_count: u16,
         avi_input_schema_idx: i16,  // -1 = use input schema
+        #[allow(dead_code)]
         avi_agg_col_idx: u32,
         // GI params — GI cursor is created fresh from the GI table each tick
         gi_table_idx: i16,    // -1 = no GI; index into Program::tables
@@ -273,6 +274,7 @@ impl ProgramBuilder {
         self.instructions.push(Instr::NullExtend { in_reg, out_reg, right_schema_idx });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_integrate(
         &mut self,
         in_reg: u16,
@@ -318,6 +320,7 @@ impl ProgramBuilder {
         self.instructions.push(Instr::Integrate { in_reg, table_idx, gi, avi });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_reduce(
         &mut self,
         in_reg: u16,
@@ -413,8 +416,10 @@ impl ProgramBuilder {
 
     // ── Build ────────────────────────────────────────────────────────────
 
-    /// Consume the builder, producing a boxed VmHandle (Program + RegisterFile).
-    /// `reg_schemas` and `reg_kinds` are parallel arrays of length `num_registers`.
+    /// Consume the builder, producing a simple VmHandle (no owned resources).
+    ///
+    /// Used by test code — production code uses `build_with_owned`.
+    #[cfg(test)]
     pub fn build(self, reg_schemas: &[SchemaDescriptor], reg_kinds: &[u8]) -> Box<VmHandle> {
         assert_eq!(reg_schemas.len(), self.num_registers as usize);
         assert_eq!(reg_kinds.len(), self.num_registers as usize);
@@ -457,6 +462,7 @@ impl ProgramBuilder {
 
     /// Consume the builder, producing a VmHandle that owns child tables,
     /// scalar functions, and expression programs created by the compiler.
+    #[allow(clippy::vec_box)]
     pub fn build_with_owned(
         self,
         reg_schemas: &[SchemaDescriptor],
@@ -514,6 +520,7 @@ impl ProgramBuilder {
 /// `program.tables` / `program.funcs` / `program.expr_progs` borrow via
 /// raw pointers.  Rust drop order (declaration order) ensures `program`
 /// drops before the owned vecs, so dangling pointers are never chased.
+#[allow(clippy::vec_box)]
 pub struct VmHandle {
     pub program: Program,
     pub regfile: RegisterFile,
@@ -522,9 +529,11 @@ pub struct VmHandle {
     pub owned_tables: Vec<Box<Table>>,
     /// Scalar functions created during compilation.
     /// `program.funcs` may point into these.  Dropped AFTER `program`.
+    #[allow(dead_code)]
     pub owned_funcs: Vec<Box<ScalarFuncKind>>,
     /// Expression programs created during compilation.
     /// `program.expr_progs` may point into these.  Dropped AFTER `program`.
+    #[allow(dead_code)]
     pub owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
     /// Trace registers backed by owned tables: `(reg_id, index into owned_tables)`.
     /// `execute_epoch` creates cursors from these before dispatch.
@@ -990,7 +999,7 @@ pub fn execute_epoch(
                 let mut avi_cursor_handle: Option<Box<CursorHandle>> = if *avi_table_idx >= 0 {
                     let avi_ptr = program.tables[*avi_table_idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
-                    avi_table.create_cursor().ok().map(|ch| Box::new(ch))
+                    avi_table.create_cursor().ok().map(Box::new)
                 } else {
                     None
                 };
@@ -999,7 +1008,7 @@ pub fn execute_epoch(
                 let mut gi_cursor_handle: Option<Box<CursorHandle>> = if *gi_table_idx >= 0 {
                     let gi_ptr = program.tables[*gi_table_idx as usize];
                     let gi_table = unsafe { &mut *gi_ptr };
-                    gi_table.create_cursor().ok().map(|ch| Box::new(ch))
+                    gi_table.create_cursor().ok().map(Box::new)
                 } else {
                     None
                 };
@@ -1033,30 +1042,30 @@ pub fn execute_epoch(
                     None
                 };
 
-                let mut ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
+                let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
                     Some(unsafe { &mut *ti_cursor_ptr })
                 } else {
                     None
                 };
-                let mut avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut()
+                let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut()
                     .map(|ch| ch.cursor_mut());
-                let mut gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut()
+                let gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut()
                     .map(|ch| ch.cursor_mut());
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
-                    ti_opt.as_deref_mut(),
+                    ti_opt,
                     unsafe { &mut *to_cursor_ptr },
                     &in_schema,
                     out_schema,
                     gcols,
                     aggs,
-                    avi_opt.as_deref_mut(),
+                    avi_opt,
                     *avi_for_max,
                     *avi_agg_col_type_code,
                     avi_gcols,
                     avi_in_schema,
-                    gi_opt.as_deref_mut(),
+                    gi_opt,
                     *gi_col_idx,
                     *gi_col_type_code,
                     fin_prog,

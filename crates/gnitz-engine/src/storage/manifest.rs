@@ -101,9 +101,8 @@ pub fn serialize(
     write_u64_le(out_buf, 24, global_max_lsn);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes)
-    for i in 0..count {
+    for (i, e) in entries.iter().enumerate().take(count) {
         let off = HEADER_SIZE + i * ENTRY_SIZE_V3;
-        let e = &entries[i];
         write_u64_le(out_buf, off,       e.table_id);
         write_u64_le(out_buf, off +   8, e.pk_min_lo);
         write_u64_le(out_buf, off +  16, e.pk_min_hi);
@@ -155,7 +154,7 @@ pub fn parse(
     }
 
     let n = count.min(max_entries as usize);
-    for i in 0..n {
+    for (i, out_entry) in out_entries.iter_mut().enumerate().take(n) {
         let off = HEADER_SIZE + i * entry_size;
         let mut entry = ManifestEntryRaw::zeroed();
 
@@ -181,7 +180,7 @@ pub fn parse(
         }
         // V2: level, guard_key_lo/hi already zeroed
 
-        out_entries[i] = entry;
+        *out_entry = entry;
     }
 
     Ok(n)

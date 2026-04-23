@@ -89,7 +89,6 @@ struct CircuitGraph {
 struct Annotation {
     trace_side_sources: HashSet<i32>,
     in_schema: SchemaDescriptor,
-    join_shard_map: HashMap<i64, Vec<i32>>,    // source_tid → [reindex_col]
     co_partitioned: HashSet<i64>,               // source_tid set
     is_distinct_at: HashSet<i32>,               // node_id set
 }
@@ -104,7 +103,6 @@ struct Rewrites {
 /// External table handle + schema.
 pub struct ExternalTable {
     pub table_id: i64,
-    pub handle: *mut Table,
     pub schema: SchemaDescriptor,
 }
 
@@ -116,7 +114,6 @@ pub struct ExternalTable {
 pub struct CompileOutput {
     pub pre_vm: Box<VmHandle>,
     pub post_vm: Option<Box<VmHandle>>,
-    pub out_schema: SchemaDescriptor,
     pub exchange_in_schema: Option<SchemaDescriptor>,
     pub pre_num_regs: u32,
     pub pre_in_reg: u16,
@@ -124,10 +121,7 @@ pub struct CompileOutput {
     pub post_num_regs: u32,
     pub post_in_reg: u16,
     pub post_out_reg: u16,
-    pub skip_exchange: bool,
-    pub shard_cols: Vec<i32>,
     pub source_reg_map: HashMap<i64, u16>,
-    pub join_shard_map: HashMap<i64, Vec<i32>>,
     pub co_partitioned: HashSet<i64>,
     pub pre_ext_trace_regs: Vec<(u16, i64)>,
     pub post_ext_trace_regs: Vec<(u16, i64)>,
@@ -291,6 +285,7 @@ fn load_sources(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> H
 }
 
 /// Load circuit params (int + string) from system table.
+#[allow(clippy::type_complexity)]
 fn load_params(
     table: *mut Table,
     view_id: u64,
@@ -546,7 +541,6 @@ fn annotate(
     let mut ann = Annotation {
         trace_side_sources,
         in_schema,
-        join_shard_map,
         co_partitioned,
         is_distinct_at: HashSet::new(),
     };
@@ -587,6 +581,7 @@ fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> b
 /// nodes in each plan half are valid for that half. This function partitions
 /// `progs` and re-indexes `fold_finalize` so each plan half gets zero-based
 /// indices into its own program slice.
+#[allow(clippy::vec_box)]
 fn split_fold_programs(
     rw: Rewrites,
     progs: Vec<Box<ExprProgram>>,
@@ -642,6 +637,7 @@ fn opt_distinct(graph: &CircuitGraph, ann: &Annotation, rw: &mut Rewrites) {
     }
 }
 
+#[allow(clippy::vec_box, clippy::ptr_arg)]
 fn opt_fold_reduce_map(
     graph: &CircuitGraph,
     _ann: &Annotation,
@@ -878,6 +874,7 @@ fn extract_const_strings(str_params: &HashMap<i32, HashMap<i32, Vec<u8>>>, nid: 
     consts
 }
 
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn create_expr_predicate(
     code: Vec<i64>,
     num_regs: i64,
@@ -896,6 +893,7 @@ fn create_expr_predicate(
     ptr
 }
 
+#[allow(clippy::vec_box, clippy::ptr_arg)]
 fn create_expr_map(
     code: Vec<i64>,
     num_regs: i64,
@@ -913,6 +911,7 @@ fn create_expr_map(
     ptr
 }
 
+#[allow(clippy::vec_box, clippy::ptr_arg)]
 fn create_universal_projection(
     src_indices: &[i32],
     src_types: &[u8],
@@ -955,7 +954,7 @@ struct EmitState {
 
 /// Emit instructions for a single circuit node.
 /// Returns true if this is an EXCHANGE_SHARD node (special handling needed).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_node(
     graph: &CircuitGraph,
     ann: &Annotation,
@@ -997,7 +996,6 @@ fn emit_node(
                         reg_schemas[reg_id as usize] = ext.schema;
                         reg_kinds[reg_id as usize] = 0;
                         source_reg_map.insert(join_source_table, reg_id);
-                    } else {
                     }
                     return;
                 }
@@ -1005,7 +1003,6 @@ fn emit_node(
                 reg_schemas[reg_id as usize] = ann.in_schema;
                 reg_kinds[reg_id as usize] = 0;
                 state.input_delta_reg_id = reg_id;
-                return;
             } else if ann.trace_side_sources.contains(&nid) {
                 // Trace side (join probe)
                 if let Some(ext) = ext_tables.iter().find(|t| t.table_id == table_id) {
@@ -1013,7 +1010,6 @@ fn emit_node(
                     reg_kinds[reg_id as usize] = 1;
                     ext_trace_regs.push((reg_id as u16, table_id));
                 }
-                return;
             } else {
                 // Non-trace SCAN_TRACE (e.g., view reading from a base table)
                 if let Some(ext) = ext_tables.iter().find(|t| t.table_id == table_id) {
@@ -1027,7 +1023,6 @@ fn emit_node(
                     out_reg_of.insert(nid, out_delta_id);
                     builder.add_scan_trace(reg_id as u16, out_delta_id as u16, chunk_limit);
                 }
-                return;
             }
         }
 
@@ -1057,15 +1052,14 @@ fn emit_node(
             let has_expr_code = num_regs > 0 || node_params.contains_key(&PARAM_EXPR_BASE);
 
             // Identity MAP optimization: sequential COPY_COL with matching schemas
-            if reindex_col_check < 0 && has_expr_code {
-                if schemas_physically_identical(&in_reg_schema, &graph.out_schema) {
+            if reindex_col_check < 0 && has_expr_code
+                && schemas_physically_identical(&in_reg_schema, &graph.out_schema) {
                     let code = extract_map_code(&node_params);
                     let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
                     if prog.is_sequential_copy_projection() {
                         out_reg_of.insert(nid, in_reg);
                         return;
                     }
-                }
             }
 
             // Folded MAP (into upstream REDUCE)
@@ -1355,7 +1349,7 @@ fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, table_ptr: *
 // REDUCE emission (complex enough to warrant its own function)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_reduce(
     graph: &CircuitGraph,
     _ann: &Annotation,
@@ -1587,7 +1581,7 @@ fn emit_reduce(
 // GATHER_REDUCE emission
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_gather_reduce(
     _graph: &CircuitGraph,
     nid: i32,
@@ -1675,7 +1669,7 @@ struct PlanBuildResult {
     source_reg_map: HashMap<i64, i32>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::vec_box)]
 fn build_plan(
     graph: &CircuitGraph,
     ann: &Annotation,
@@ -1832,6 +1826,7 @@ fn build_plan(
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn compile_view(
     view_id: u64,
     // System table handles (NULL if absent)
@@ -1924,15 +1919,6 @@ pub unsafe fn compile_view(
             }
         }
 
-        // Extract shard columns
-        let ex_params = graph.params.get(&ex_nid).cloned().unwrap_or_default();
-        let mut shard_cols = Vec::new();
-        let mut idx = 0;
-        while ex_params.contains_key(&(PARAM_SHARD_COL_BASE + idx)) {
-            shard_cols.push(ex_params[&(PARAM_SHARD_COL_BASE + idx)] as i32);
-            idx += 1;
-        }
-
         // Find the exchange input: the node feeding PORT_EXCHANGE_IN of ex_nid
         let mut exchange_input_nid: i32 = -1;
         for e in &graph.edges {
@@ -1972,20 +1958,12 @@ pub unsafe fn compile_view(
             post_progs,
         ).ok_or(-4)?;
 
-        // Determine skip_exchange
-        let is_trivial = pre.in_reg == pre.out_reg
-            || graph.incoming.get(&ex_nid).map(|v| v.len()).unwrap_or(0) == 1;
-        let skip_exchange = is_trivial
-            && shard_cols.len() == 1
-            && shard_cols[0] == ann.in_schema.pk_index as i32;
-
         let source_reg_map = pre.source_reg_map.iter()
             .map(|(&tid, &reg)| (tid, reg as u16)).collect();
 
         Ok(CompileOutput {
             pre_vm: pre.vm,
             post_vm: Some(post.vm),
-            out_schema: graph.out_schema,
             exchange_in_schema: Some(exchange_schema),
             pre_num_regs: pre.num_regs,
             pre_in_reg: pre.in_reg as u16,
@@ -1993,10 +1971,7 @@ pub unsafe fn compile_view(
             post_num_regs: post.num_regs,
             post_in_reg: post.in_reg as u16,
             post_out_reg: post.out_reg as u16,
-            skip_exchange,
-            shard_cols,
             source_reg_map,
-            join_shard_map: ann.join_shard_map,
             co_partitioned: ann.co_partitioned,
             pre_ext_trace_regs: pre.ext_trace_regs,
             post_ext_trace_regs: post.ext_trace_regs,
@@ -2016,7 +1991,6 @@ pub unsafe fn compile_view(
         Ok(CompileOutput {
             pre_vm: plan.vm,
             post_vm: None,
-            out_schema: graph.out_schema,
             exchange_in_schema: None,
             pre_num_regs: plan.num_regs,
             pre_in_reg: plan.in_reg as u16,
@@ -2024,10 +1998,7 @@ pub unsafe fn compile_view(
             post_num_regs: 0,
             post_in_reg: 0,
             post_out_reg: 0,
-            skip_exchange: false,
-            shard_cols: Vec::new(),
             source_reg_map,
-            join_shard_map: ann.join_shard_map,
             co_partitioned: ann.co_partitioned,
             pre_ext_trace_regs: plan.ext_trace_regs,
             post_ext_trace_regs: Vec::new(),

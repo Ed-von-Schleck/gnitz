@@ -208,7 +208,7 @@ impl MappedShard {
                     Ok(RegionView::Constant { value, offset: e.offset })
                 }
                 ENCODING_TWO_VALUE => {
-                    let expected_bitvec = (count + 7) / 8;
+                    let expected_bitvec = count.div_ceil(8);
                     if e.size < 16 + expected_bitvec {
                         return Err(StorageError::InvalidShard);
                     }
@@ -399,11 +399,6 @@ impl MappedShard {
         unsafe { self.mmap.ptr.add(self.blob_off) }
     }
 
-    #[inline]
-    pub fn blob_len(&self) -> usize {
-        self.blob_len
-    }
-
     pub fn has_xor8(&self) -> bool {
         self.xor8_filter.is_some()
     }
@@ -444,6 +439,7 @@ impl MappedShard {
 
     /// Bulk-copy a contiguous slice of rows into an Batch.
     /// Bypasses per-row cursor overhead entirely — one memcpy per column.
+    #[allow(clippy::uninit_vec)]
     pub(crate) fn slice_to_owned_batch(
         &self,
         start: usize,

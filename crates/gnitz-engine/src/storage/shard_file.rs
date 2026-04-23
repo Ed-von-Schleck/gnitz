@@ -32,7 +32,7 @@ enum RegionEncoding {
 /// Detect whether a fixed-width region is all-constant.
 /// Returns `Constant` if every element is identical, else `Raw`.
 fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
-    debug_assert!(!data.is_empty() && data.len() % element_width == 0);
+    debug_assert!(!data.is_empty() && data.len().is_multiple_of(element_width));
     let first = &data[..element_width];
     let n = data.len() / element_width;
     for i in 1..n {
@@ -48,7 +48,7 @@ fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
 
 /// Detect weight encoding: constant, two-value (bitvec), or raw.
 fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
-    debug_assert!(!data.is_empty() && data.len() % 8 == 0);
+    debug_assert!(!data.is_empty() && data.len().is_multiple_of(8));
     let n = data.len() / 8;
     let first = i64::from_le_bytes(data[..8].try_into().unwrap());
     let mut second: Option<i64> = None;
@@ -75,7 +75,7 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
         }
         Some(second_val) => {
             // Pass 2: exactly 2 distinct values — build the bitvec now.
-            let bitvec_len = (n + 7) / 8;
+            let bitvec_len = n.div_ceil(8);
             let mut bitvec = vec![0u8; bitvec_len];
             for i in 1..n {
                 let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -115,8 +115,7 @@ pub fn build_shard_image(
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
     let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
 
-    for i in 0..num_regions {
-        let (src_ptr, orig_sz) = regions[i];
+    for (i, &(src_ptr, orig_sz)) in regions.iter().enumerate().take(num_regions) {
         if n == 0 || i == last_region || orig_sz == 0 || src_ptr.is_null() {
             // Empty region, blob arena (last), or zero rows -> Raw passthrough
             encodings.push(RegionEncoding::Raw);
@@ -167,9 +166,9 @@ pub fn build_shard_image(
 
     let mut pos = align64(dir_offset + dir_size);
     let mut region_offsets = Vec::with_capacity(num_regions);
-    for i in 0..num_regions {
+    for &actual_sz in actual_sizes.iter().take(num_regions) {
         region_offsets.push(pos);
-        pos = align64(pos + actual_sizes[i]);
+        pos = align64(pos + actual_sz);
     }
     let data_end = if num_regions == 0 {
         HEADER_SIZE
@@ -177,7 +176,7 @@ pub fn build_shard_image(
         region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
     };
 
-    let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
+    let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
     let xor8_offset = if xor8_data.is_some() {
         align64(data_end)
     } else {
@@ -285,6 +284,7 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(
 ///
 /// Same output format as `build_shard_image` + `write_shard_at`, but peak memory
 /// is only the header+directory buffer instead of the entire shard image.
+#[allow(clippy::needless_range_loop)]
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
@@ -348,9 +348,9 @@ pub fn write_shard_streaming(
     let dir_offset = HEADER_SIZE;
     let mut pos = align64(dir_offset + dir_size);
     let mut region_offsets = Vec::with_capacity(num_regions);
-    for i in 0..num_regions {
+    for &actual_sz in actual_sizes.iter().take(num_regions) {
         region_offsets.push(pos);
-        pos = align64(pos + actual_sizes[i]);
+        pos = align64(pos + actual_sz);
     }
     let data_end = if num_regions == 0 {
         HEADER_SIZE
@@ -358,7 +358,7 @@ pub fn write_shard_streaming(
         region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
     };
 
-    let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
+    let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
     let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
     let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
     let total_size = if xor8_data.is_some() {
@@ -484,10 +484,8 @@ pub fn write_shard_streaming(
         }
 
         // Phase 9: sync and rename
-        if durable {
-            if libc::fdatasync(fd) < 0 {
-                return Err(abort(fd));
-            }
+        if durable && libc::fdatasync(fd) < 0 {
+            return Err(abort(fd));
         }
 
         libc::close(fd);

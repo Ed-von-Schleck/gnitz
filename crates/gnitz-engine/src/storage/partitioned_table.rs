@@ -27,6 +27,7 @@ pub struct PartitionedTable {
 }
 
 impl PartitionedTable {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dir: &str,
         name: &str,
@@ -60,10 +61,6 @@ impl PartitionedTable {
         })
     }
 
-    pub fn schema(&self) -> &SchemaDescriptor {
-        &self.schema
-    }
-
     pub fn num_partitions(&self) -> u32 {
         self.num_partitions
     }
@@ -76,6 +73,7 @@ impl PartitionedTable {
     // Ingest
     // ------------------------------------------------------------------
 
+    #[allow(clippy::needless_range_loop)]
     pub fn ingest_batch_from_regions(
         &mut self,
         ptrs: &[*const u8],
@@ -124,24 +122,6 @@ impl PartitionedTable {
         }
 
         Ok(())
-    }
-
-    pub fn ingest_batch_memonly_from_regions(
-        &mut self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-    ) -> Result<(), StorageError> {
-        debug_assert_eq!(
-            self.num_partitions, 1,
-            "ingest_batch_memonly_from_regions bypasses hash routing; \
-             only valid for single-partition (DDL-sync) tables"
-        );
-        if count == 0 || self.tables.is_empty() {
-            return Ok(());
-        }
-        self.tables[0].ingest_batch_memonly_from_regions(ptrs, sizes, count, num_payload_cols)
     }
 
     // ------------------------------------------------------------------
@@ -209,24 +189,6 @@ impl PartitionedTable {
         (w, found)
     }
 
-    pub fn get_weight_for_row<S: super::columnar::ColumnarSource>(
-        &mut self,
-        key: u128,
-        ref_source: &S,
-        ref_row: usize,
-    ) -> i64 {
-        if self.tables.is_empty() {
-            return 0;
-        }
-        if self.num_partitions == 1 {
-            return self.tables[0].get_weight_for_row(key, ref_source, ref_row);
-        }
-        match self.local_index(key) {
-            Some(local) => self.tables[local].get_weight_for_row(key, ref_source, ref_row),
-            None => 0,
-        }
-    }
-
     // ------------------------------------------------------------------
     // Found-row accessors
     // ------------------------------------------------------------------
@@ -266,28 +228,8 @@ impl PartitionedTable {
         Ok(any_wrote)
     }
 
-    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
-        for table in &mut self.tables {
-            table.compact_if_needed()?;
-        }
-        Ok(())
-    }
-
     pub fn current_lsn(&self) -> u64 {
         self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
-    }
-
-    pub fn bloom_add(&mut self, key: u128) {
-        if self.tables.is_empty() {
-            return;
-        }
-        if self.num_partitions == 1 {
-            self.tables[0].bloom_add(key);
-            return;
-        }
-        if let Some(local) = self.local_index(key) {
-            self.tables[local].bloom_add(key);
-        }
     }
 
     // ------------------------------------------------------------------
@@ -315,25 +257,6 @@ impl PartitionedTable {
 
     pub fn close(&mut self) {
         self.tables.clear();
-    }
-
-    /// Get the base directory for child table creation (partition 0's directory).
-    pub fn child_base_dir(&self) -> String {
-        if self.tables.is_empty() {
-            return String::new();
-        }
-        self.tables[0].directory().to_string()
-    }
-
-    pub fn create_child(
-        &self,
-        child_name: &str,
-        child_schema: SchemaDescriptor,
-    ) -> Result<Table, StorageError> {
-        if self.tables.is_empty() {
-            return Err(StorageError::InvalidPath);
-        }
-        self.tables[0].create_child(child_name, child_schema)
     }
 
     // ------------------------------------------------------------------

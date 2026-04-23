@@ -272,6 +272,7 @@ impl Batch {
     ///
     /// # Safety
     /// `ptrs[i]` must point to at least `sizes[i]` readable bytes.
+    #[allow(clippy::uninit_vec)]
     pub unsafe fn from_regions(
         ptrs: &[*const u8],
         sizes: &[u32],
@@ -430,8 +431,6 @@ impl Batch {
         &self.data[off..off + self.count * self.strides[r] as usize]
     }
     #[inline]
-    pub fn blob_data(&self) -> &[u8] { &self.blob }
-    #[inline]
     pub fn num_payload_cols(&self) -> usize {
         self.num_regions as usize - REG_PAYLOAD_START
     }
@@ -506,6 +505,7 @@ impl Batch {
     }
 
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
+    #[allow(clippy::uninit_vec, clippy::needless_range_loop)]
     pub(crate) fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity as usize { return; }
         let nr = self.num_regions as usize;
@@ -739,6 +739,7 @@ impl Batch {
 
     /// Clone all buffers into a new independent Batch.
     /// 2 allocations (data + blob) instead of N+7.
+    #[allow(clippy::uninit_vec, clippy::needless_range_loop)]
     pub fn clone_batch(&self) -> Self {
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
@@ -804,127 +805,6 @@ impl Batch {
         lo
     }
 
-    /// Append a single row from flat column data.
-    ///
-    /// # Safety
-    /// `col_ptrs[i]` must be valid for `col_sizes[i]` bytes.
-    pub unsafe fn append_row(
-        &mut self,
-        pk: u128,
-        weight: i64,
-        null_word: u64,
-        col_ptrs: &[*const u8],
-        col_sizes: &[u32],
-        blob_src: &[u8],
-    ) {
-        self.ensure_row_capacity();
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.extend_pk_hi(&pk_hi.to_le_bytes());
-        self.extend_weight(&weight.to_le_bytes());
-        self.extend_null_bmp(&null_word.to_le_bytes());
-
-        let schema = self.schema;
-        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index as usize);
-        let mut pi = 0;
-
-        for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
-            let ci = if pk_index == usize::MAX { ci_raw }
-                     else if ci_raw < pk_index { ci_raw }
-                     else { ci_raw + 1 };
-
-            let is_string = schema.map_or(false, |s| {
-                ci < s.num_columns as usize
-                    && s.columns[ci].type_code == crate::schema::type_code::STRING
-            });
-            let is_null = (null_word >> pi) & 1 != 0;
-            let col_size = sz as usize;
-
-            if is_null {
-                self.fill_col_zero(pi, col_size);
-            } else if is_string && col_size == 16 {
-                let src = std::slice::from_raw_parts(*ptr, 16);
-                let dest = crate::schema::relocate_german_string_vec(src, blob_src, &mut self.blob, None);
-                self.extend_col(pi, &dest);
-            } else {
-                let src = std::slice::from_raw_parts(*ptr, col_size);
-                self.extend_col(pi, src);
-            }
-            pi += 1;
-        }
-
-        self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
-    }
-
-    /// Append a row from RowBuilder-style value arrays.
-    ///
-    /// # Safety
-    /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes.
-    pub unsafe fn append_row_simple(
-        &mut self,
-        pk: u128, weight: i64, null_word: u64,
-        lo_values: &[i64],
-        hi_values: &[u64],
-        str_ptrs: &[*const u8],
-        str_lens: &[u32],
-    ) {
-        self.ensure_row_capacity();
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.extend_pk_hi(&pk_hi.to_le_bytes());
-        self.extend_weight(&weight.to_le_bytes());
-        self.extend_null_bmp(&null_word.to_le_bytes());
-
-        let schema = self.schema.expect("append_row_simple requires schema");
-
-        for (pi, _ci, col) in schema.payload_columns() {
-            let col_size = col.size as usize;
-            let is_null = (null_word >> pi) & 1 != 0;
-
-            if is_null {
-                self.fill_col_zero(pi, col_size);
-            } else {
-                match col.type_code {
-                    crate::schema::type_code::STRING => {
-                        let ptr = str_ptrs[pi];
-                        let slen = str_lens[pi] as usize;
-                        let bytes: &[u8] = if ptr.is_null() || slen == 0 {
-                            &[]
-                        } else {
-                            std::slice::from_raw_parts(ptr, slen)
-                        };
-                        let gs = crate::schema::encode_german_string(bytes, &mut self.blob);
-                        self.extend_col(pi, &gs);
-                    }
-                    crate::schema::type_code::F64 => {
-                        self.extend_col(pi, &lo_values[pi].to_le_bytes());
-                    }
-                    crate::schema::type_code::F32 => {
-                        let f64_val = f64::from_bits(lo_values[pi] as u64);
-                        let f32_val = f64_val as f32;
-                        self.extend_col(pi, &f32_val.to_le_bytes());
-                    }
-                    crate::schema::type_code::U128 => {
-                        let mut bytes = [0u8; 16];
-                        bytes[..8].copy_from_slice(&(lo_values[pi] as u64).to_le_bytes());
-                        bytes[8..].copy_from_slice(&hi_values[pi].to_le_bytes());
-                        self.extend_col(pi, &bytes);
-                    }
-                    _ => {
-                        let bytes = lo_values[pi].to_le_bytes();
-                        self.extend_col(pi, &bytes[..col_size]);
-                    }
-                }
-            }
-        }
-
-        self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
-    }
-
     /// Bulk-copy rows [start, end) from another Batch (same schema).
     ///
     /// `self` must have strides pre-set (see `empty_with_schema` / `with_schema`).
@@ -984,6 +864,7 @@ impl Batch {
         self.consolidated = false;
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn append_rows_inner(&mut self, src: &Batch, start: usize, end: usize, negate: bool) {
         let n = end - start;
         self.reserve_rows(n);
@@ -1080,6 +961,132 @@ impl Batch {
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
                 self.extend_col(pi, src_slice);
+            }
+        }
+
+        self.count += 1;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Append a single row from raw C-style region pointers.
+    ///
+    /// # Safety
+    /// `col_ptrs[i]` must point to at least `col_sizes[i]` readable bytes for
+    /// every non-null, non-STRING column.  For STRING columns the pointer must
+    /// point to a 16-byte German String struct.  `blob_src` must contain the
+    /// blob bytes referenced by any long-string structs.
+    #[cfg(test)]
+    pub unsafe fn append_row(
+        &mut self,
+        pk: u128,
+        weight: i64,
+        null_word: u64,
+        col_ptrs: &[*const u8],
+        col_sizes: &[u32],
+        blob_src: &[u8],
+    ) {
+        self.ensure_row_capacity();
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
+        self.extend_pk_lo(&pk_lo.to_le_bytes());
+        self.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.extend_weight(&weight.to_le_bytes());
+        self.extend_null_bmp(&null_word.to_le_bytes());
+
+        let schema = self.schema;
+        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index as usize);
+        let mut pi = 0;
+
+        for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
+            let ci = if pk_index == usize::MAX { ci_raw }
+                     else if ci_raw < pk_index { ci_raw }
+                     else { ci_raw + 1 };
+
+            let is_string = schema.map_or(false, |s| {
+                ci < s.num_columns as usize
+                    && s.columns[ci].type_code == crate::schema::type_code::STRING
+            });
+            let is_null = (null_word >> pi) & 1 != 0;
+            let col_size = sz as usize;
+
+            if is_null {
+                self.fill_col_zero(pi, col_size);
+            } else if is_string && col_size == 16 {
+                let src = std::slice::from_raw_parts(*ptr, 16);
+                let dest = crate::schema::relocate_german_string_vec(src, blob_src, &mut self.blob, None);
+                self.extend_col(pi, &dest);
+            } else {
+                let src = std::slice::from_raw_parts(*ptr, col_size);
+                self.extend_col(pi, src);
+            }
+            pi += 1;
+        }
+
+        self.count += 1;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Append a row from RowBuilder-style value arrays.
+    ///
+    /// # Safety
+    /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes.
+    #[cfg(test)]
+    pub unsafe fn append_row_simple(
+        &mut self,
+        pk: u128, weight: i64, null_word: u64,
+        lo_values: &[i64],
+        hi_values: &[u64],
+        str_ptrs: &[*const u8],
+        str_lens: &[u32],
+    ) {
+        self.ensure_row_capacity();
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
+        self.extend_pk_lo(&pk_lo.to_le_bytes());
+        self.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.extend_weight(&weight.to_le_bytes());
+        self.extend_null_bmp(&null_word.to_le_bytes());
+
+        let schema = self.schema.expect("append_row_simple requires schema");
+
+        for (pi, _ci, col) in schema.payload_columns() {
+            let col_size = col.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+
+            if is_null {
+                self.fill_col_zero(pi, col_size);
+            } else {
+                match col.type_code {
+                    crate::schema::type_code::STRING => {
+                        let ptr = str_ptrs[pi];
+                        let slen = str_lens[pi] as usize;
+                        let bytes: &[u8] = if ptr.is_null() || slen == 0 {
+                            &[]
+                        } else {
+                            std::slice::from_raw_parts(ptr, slen)
+                        };
+                        let gs = crate::schema::encode_german_string(bytes, &mut self.blob);
+                        self.extend_col(pi, &gs);
+                    }
+                    crate::schema::type_code::F64 => {
+                        self.extend_col(pi, &lo_values[pi].to_le_bytes());
+                    }
+                    crate::schema::type_code::F32 => {
+                        let f64_val = f64::from_bits(lo_values[pi] as u64);
+                        let f32_val = f64_val as f32;
+                        self.extend_col(pi, &f32_val.to_le_bytes());
+                    }
+                    crate::schema::type_code::U128 => {
+                        let mut bytes = [0u8; 16];
+                        bytes[..8].copy_from_slice(&(lo_values[pi] as u64).to_le_bytes());
+                        bytes[8..].copy_from_slice(&hi_values[pi].to_le_bytes());
+                        self.extend_col(pi, &bytes);
+                    }
+                    _ => {
+                        let bytes = lo_values[pi].to_le_bytes();
+                        self.extend_col(pi, &bytes[..col_size]);
+                    }
+                }
             }
         }
 
@@ -1292,6 +1299,7 @@ impl Batch {
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
 
     /// Byte count of the WAL-block encoding for this batch.
+    #[allow(clippy::needless_range_loop)]
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
         let nr = self.num_regions_total();
         let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
@@ -1463,8 +1471,8 @@ pub fn write_to_batch(
         let (null_bmp, mut rest) = rest.split_at_mut(fixed);
 
         let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - 4);
-        for i in 4..nr {
-            let col_sz = max_rows * strides[i] as usize;
+        for &stride in strides[4..nr].iter() {
+            let col_sz = max_rows * stride as usize;
             let (col, new_rest) = rest.split_at_mut(col_sz);
             col_slices.push(col);
             rest = new_rest;

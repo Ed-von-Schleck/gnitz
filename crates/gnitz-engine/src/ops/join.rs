@@ -11,6 +11,7 @@ use super::util::{write_string_from_batch, write_string_from_raw};
 // ---------------------------------------------------------------------------
 
 /// Emit delta rows whose key has NO positive-weight match in the trace.
+#[allow(clippy::needless_range_loop)]
 pub fn op_anti_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -76,6 +77,7 @@ pub fn op_anti_join_delta_trace(
 // ---------------------------------------------------------------------------
 
 /// Emit delta rows whose key HAS a positive-weight match in the trace.
+#[allow(clippy::needless_range_loop)]
 pub fn op_semi_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -239,6 +241,7 @@ pub fn op_join_delta_trace(
     join_dt_merge_walk(consolidated, cursor, left_schema, right_schema)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn join_dt_merge_walk(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -294,6 +297,7 @@ fn join_dt_merge_walk(
     output
 }
 
+#[allow(clippy::needless_range_loop)]
 fn join_dt_swapped(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -336,6 +340,7 @@ fn join_dt_swapped(
 // ---------------------------------------------------------------------------
 
 /// Left outer join: like inner join, but unmatched delta rows emit null-filled right side.
+#[allow(clippy::needless_range_loop)]
 pub fn op_join_delta_trace_outer(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -797,6 +802,7 @@ pub fn op_join_delta_delta(
 }
 
 /// Write one composite join output row where both sides come from MemBatch.
+#[allow(clippy::too_many_arguments)]
 fn write_join_row_from_batches(
     output: &mut Batch,
     left_batch: &MemBatch,

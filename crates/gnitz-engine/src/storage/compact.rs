@@ -118,7 +118,7 @@ fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
     let mut lo = 0usize;
     let mut hi = n - 1;
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         if guard_keys[mid] <= key {
             lo = mid;
         } else {
@@ -188,7 +188,7 @@ fn open_and_merge(
                 None
             }
         },
-        &shard_entry_less(&cursors, &shards, schema),
+        shard_entry_less(&cursors, &shards, schema),
     );
 
     let mut has_pending = false;
@@ -259,6 +259,7 @@ pub fn compact_shards(
     batch.write_as_shard(output_file, table_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn merge_and_route(
     input_files: &[&CStr],
     output_dir: &CStr,
@@ -304,8 +305,8 @@ pub fn merge_and_route(
         }
         let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
         if let Err(e) = batches[i].write_as_shard(&cpath, table_id) {
-            for j in 0..i {
-                let _ = std::fs::remove_file(&out_filenames[j]);
+            for fname in out_filenames.iter().take(i) {
+                let _ = std::fs::remove_file(fname);
             }
             return Err(e);
         }

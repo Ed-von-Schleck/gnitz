@@ -119,6 +119,7 @@ impl W2mReceiver {
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
+        #[allow(clippy::large_enum_variant)]
         enum Outcome {
             NoData(DecodedWire),
             HasData(Vec<u8>),

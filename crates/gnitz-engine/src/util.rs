@@ -149,6 +149,7 @@ where F: FnOnce() -> Result<T, String>,
 
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
 /// Called once per process via `std::sync::Once`; safe to invoke from any test.
+#[cfg(test)]
 pub fn raise_fd_limit_for_tests() {
     use std::sync::Once;
     static INIT: Once = Once::new();

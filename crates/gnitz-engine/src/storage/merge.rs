@@ -82,26 +82,8 @@ impl<'a> MemBatch<'a> {
         &self.col_data[payload_col][off..off + col_size]
     }
 
-    /// Binary search for the first row where PK >= key.
-    pub fn find_lower_bound(&self, key: u128) -> usize {
-        let mut lo = 0usize;
-        let mut hi = self.count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.get_pk(mid) < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    #[inline]
-    pub fn pk_matches(&self, row: usize, key: u128) -> bool {
-        self.get_pk(row) == key
-    }
 }
+
 
 impl<'a> ColumnarSource for MemBatch<'a> {
     #[inline]
@@ -343,7 +325,7 @@ pub fn merge_batches(
                 None
             }
         },
-        &merge_entry_less(&cursors, batches, schema),
+        merge_entry_less(&cursors, batches, schema),
     );
 
     let mut has_pending = false;

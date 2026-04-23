@@ -10,7 +10,9 @@ use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::memtable::MemTable;
-use super::batch::{Batch, ConsolidatedBatch};
+use super::batch::Batch;
+#[cfg(test)]
+use super::batch::ConsolidatedBatch;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
@@ -109,7 +111,6 @@ impl Table {
         &self.schema
     }
 
-    // ------------------------------------------------------------------
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
@@ -295,6 +296,18 @@ impl Table {
         self.shard_index.all_shard_arcs()
     }
 
+    /// Test helper: returns true when the memtable has no rows.
+    #[cfg(test)]
+    pub fn memtable_is_empty(&self) -> bool {
+        self.memtable.is_empty()
+    }
+
+    /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
+    #[cfg(test)]
+    pub fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
+        self.memtable.upsert_sorted_batch(batch)
+    }
+
     // ------------------------------------------------------------------
     // PK lookups
     // ------------------------------------------------------------------
@@ -432,54 +445,6 @@ impl Table {
         }
         self.shard_index.try_cleanup();
         Ok(())
-    }
-
-    // ------------------------------------------------------------------
-    // Accumulator support (delegated to MemTable)
-    // ------------------------------------------------------------------
-
-    pub fn bloom_add(&mut self, key: u128) {
-        self.memtable.bloom_add(key);
-    }
-
-    pub fn memtable_should_flush(&self) -> bool {
-        self.memtable.should_flush()
-    }
-
-    pub fn memtable_is_empty(&self) -> bool {
-        self.memtable.is_empty()
-    }
-
-    /// Upsert a consolidated batch directly into the memtable (no WAL).
-    /// Used by the accumulator flush path.
-    pub fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
-        self.memtable.upsert_sorted_batch(batch)
-    }
-
-    // ------------------------------------------------------------------
-    // Child table creation
-    // ------------------------------------------------------------------
-
-    pub fn create_child(
-        &self,
-        child_name: &str,
-        child_schema: SchemaDescriptor,
-    ) -> Result<Table, StorageError> {
-        let child_dir = format!("{}/scratch_{}", self.directory, child_name);
-        Table::new(
-            &child_dir,
-            child_name,
-            child_schema,
-            self.table_id,
-            // Use same arena size — rough estimate from schema stride
-            self.memtable.max_bytes() as u64,
-            false, // children are always ephemeral
-        )
-    }
-
-    /// Get the table's directory path.
-    pub fn directory(&self) -> &str {
-        &self.directory
     }
 
     // ------------------------------------------------------------------

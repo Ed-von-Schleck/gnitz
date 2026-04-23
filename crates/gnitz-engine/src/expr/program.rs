@@ -180,7 +180,7 @@ impl ExprProgram {
     /// An identity projection that the compiler can elide.
     pub(crate) fn is_sequential_copy_projection(&self) -> bool {
         let n = self.code.len();
-        if n == 0 || n % 4 != 0 {
+        if n == 0 || !n.is_multiple_of(4) {
             return false;
         }
         let mut expected_src: i64 = 1;

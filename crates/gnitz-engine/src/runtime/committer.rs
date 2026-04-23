@@ -37,6 +37,7 @@ const MAX_PENDING_ROWS: usize = 100_000;
 const TICK_COALESCE_ROWS: usize = 10_000;
 
 /// One request to the committer.
+#[allow(clippy::large_enum_variant)]
 pub enum CommitRequest {
     /// Buffer the batch for group commit. On completion, `done` resolves
     /// to `Ok(lsn)` or `Err(error_message)`.
@@ -251,9 +252,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             let merged = match guard_panic("commit_merge", || Ok(unsafe {
                 let schema = (*disp_ptr).schema_desc_for(tid);
                 let mut m = Batch::with_schema(schema, total_rows.max(1));
-                for k in run_start..run_end {
-                    let b = &pushes[k].batch;
-                    m.append_batch(b, 0, b.count);
+                for p in pushes[run_start..run_end].iter() {
+                    m.append_batch(&p.batch, 0, p.batch.count);
                 }
                 m
             })) {
@@ -296,7 +296,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             let mode = pushes[g.start].mode;
             let err = guard_panic("commit_write", || Ok(unsafe {
                 (*disp_ptr).write_commit_group(g.tid, &g.merged, mode, &g.req_ids).err()
-            })).unwrap_or_else(|panic_msg| Some(panic_msg));
+            })).unwrap_or_else(Some);
             g.write_err = err;
         }
 

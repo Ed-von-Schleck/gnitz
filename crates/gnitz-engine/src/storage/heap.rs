@@ -38,10 +38,10 @@ impl MergeHeap {
         let mut heap = Vec::with_capacity(n);
         let mut pos_map = vec![-1i32; n];
 
-        for i in 0..n {
+        for (i, pm) in pos_map.iter_mut().enumerate().take(n) {
             if let Some(k) = key_fn(i) {
                 let idx = heap.len();
-                pos_map[i] = idx as i32;
+                *pm = idx as i32;
                 heap.push(HeapNode { key: k, idx: i });
             }
         }

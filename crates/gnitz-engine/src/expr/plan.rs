@@ -210,6 +210,7 @@ enum FilterKernel {
     Interpreted(ExprProgram),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ComputeKernel {
     None,
     Interpreted {
@@ -365,10 +366,10 @@ impl Plan {
     ) -> Vec<u64> {
         let FilterKernel::Interpreted(prog) = &self.filter else {
             // PassAll: all bits set
-            let words = (n + 63) / 64;
+            let words = n.div_ceil(64);
             let mut bits = vec![u64::MAX; words];
             // Mask out bits beyond n in the last word
-            if n % 64 != 0 {
+            if !n.is_multiple_of(64) {
                 bits[words - 1] = (1u64 << (n % 64)) - 1;
             }
             return bits;
@@ -382,7 +383,7 @@ impl Plan {
         let mut scratch = self.scratch.borrow_mut();
         scratch.ensure_capacity(num_regs, no_nulls, n);
 
-        let words = (n + 63) / 64;
+        let words = n.div_ceil(64);
         scratch.filter_bits[..words].fill(0);
 
         for morsel_start in (0..n).step_by(MORSEL) {

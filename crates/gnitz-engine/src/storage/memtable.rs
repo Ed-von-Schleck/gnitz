@@ -94,11 +94,6 @@ impl MemTable {
         Ok(())
     }
 
-    /// Add a single PK to the bloom filter (for accumulator rows).
-    pub fn bloom_add(&mut self, key: u128) {
-        self.bloom.add(key);
-    }
-
     pub fn may_contain_pk(&self, key: u128) -> bool {
         self.bloom.may_contain(key)
     }
@@ -279,10 +274,6 @@ impl MemTable {
         );
         shard_file::write_shard_at(dirfd, basename, &image, durable)?;
         Ok(true)
-    }
-
-    pub fn max_bytes(&self) -> usize {
-        self.max_bytes
     }
 
     /// Clear all runs, bloom filter, and cache.  Ready for reuse.

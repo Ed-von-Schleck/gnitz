@@ -12,13 +12,9 @@ pub fn fallocate(fd: i32, length: i64) -> i32 {
 /// Useful for WAL files opened with O_APPEND — allocates extents so future
 /// writes avoid extent-tree allocation overhead on btrfs/XFS.
 /// Returns 0 on success, -1 on error (non-fatal).
+#[allow(dead_code)]
 pub fn fallocate_keep_size(fd: i32, length: i64) -> i32 {
     unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, length as libc::off_t) }
-}
-
-/// fdatasync a file descriptor. Returns 0 on success, -1 on error.
-pub fn fdatasync(fd: i32) -> i32 {
-    unsafe { libc::fdatasync(fd) }
 }
 
 /// Set file size via ftruncate. Returns 0 on success, -1 on error.
@@ -84,6 +80,7 @@ pub fn madvise_sequential(ptr: *mut u8, size: usize) {
 /// Sets the listen socket to non-blocking.
 /// Unlinks any existing socket at `path` before binding.
 /// Returns the server fd, or a negative value on error.
+#[allow(clippy::needless_range_loop)]
 pub fn server_create(path: &str) -> i32 {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -196,20 +193,6 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let raw_fd = tmp.as_file().as_raw_fd();
         let _ = try_set_nocow(raw_fd); // just verify no crash/panic
-    }
-
-    #[test]
-    fn test_fdatasync() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        use std::os::unix::io::AsRawFd;
-        let raw_fd = tmp.as_file().as_raw_fd();
-        // Write something first
-        unsafe {
-            let data = b"hello";
-            libc::write(raw_fd, data.as_ptr() as *const libc::c_void, 5);
-        }
-        let r = fdatasync(raw_fd);
-        assert_eq!(r, 0);
     }
 
     #[test]

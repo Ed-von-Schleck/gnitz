@@ -34,6 +34,7 @@ struct ShardEntry {
 }
 
 impl ShardEntry {
+    #[allow(clippy::arc_with_non_send_sync)]
     fn open(
         path: &str,
         schema: &SchemaDescriptor,
@@ -102,7 +103,7 @@ impl FLSMLevel {
         let mut lo = 0usize;
         let mut hi = n - 1;
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = (lo + hi).div_ceil(2);
             if self.guards[mid].guard_key <= key {
                 lo = mid;
             } else {
@@ -301,8 +302,7 @@ impl ShardIndex {
             Err(e) => return Err(e),
         };
 
-        for i in 0..count {
-            let raw = &entries[i];
+        for raw in entries.iter().take(count) {
             if raw.table_id != self.table_id as u64 {
                 continue;
             }
@@ -504,7 +504,7 @@ impl ShardIndex {
     }
 
     fn compact_guard_vertical(&mut self, src_level_num: usize) -> Result<(), StorageError> {
-        if src_level_num < 1 || src_level_num >= MAX_LEVELS {
+        if !(1..MAX_LEVELS).contains(&src_level_num) {
             return Ok(());
         }
         let src_idx = src_level_num - 1;

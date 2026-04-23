@@ -14,7 +14,7 @@ use super::util::{extract_group_key, payload_idx};
 // Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
 // steady-state repartition/scatter ops allocate nothing for routing tables.
 thread_local! {
-    static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
+    static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Build a 256-entry partition→worker lookup table, hoisting the division out
@@ -23,8 +23,8 @@ thread_local! {
 fn build_w_map(num_workers: usize) -> [usize; 256] {
     let mut map = [0usize; 256];
     let chunk = 256 / num_workers;
-    for p in 0..256 {
-        map[p] = (p / chunk).min(num_workers - 1);
+    for (p, item) in map.iter_mut().enumerate() {
+        *item = (p / chunk).min(num_workers - 1);
     }
     map
 }
@@ -331,18 +331,18 @@ pub fn op_relay_scatter(
     op_repartition_batches(sources, col_indices, schema, num_workers)
 }
 
+/// Scatter a single batch across workers using multiple independent column
+/// specifications in one pass.  Returns one `Vec<Batch>` per spec.
+///
+/// Only used in tests; retained as `#[cfg(test)]` so the helper doesn't
+/// bloat the production binary.
+#[cfg(test)]
 pub fn op_multi_scatter(
     batch: &Batch,
     col_specs: &[&[u32]],
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Vec<Batch>> {
-    gnitz_debug!(
-        "op_multi_scatter: count={} specs={} num_workers={}",
-        batch.count,
-        col_specs.len(),
-        num_workers
-    );
     let n = batch.count;
     let n_specs = col_specs.len();
     let npc = schema.num_columns as usize - 1;
@@ -379,11 +379,10 @@ pub fn op_multi_scatter(
         }
 
         // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
-        // consolidated implies sorted, so the two cases are mutually exclusive by invariant.
         for si in 0..n_specs {
             let spec = col_specs[si];
             if spec.len() == 1 && spec[0] as usize == pki {
-                if ConsolidatedBatch::from_batch_ref(batch).is_some() {
+                if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
                     for w in 0..num_workers {
                         if results[si][w].count > 0 {
                             results[si][w].sorted = true;

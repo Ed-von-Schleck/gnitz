@@ -50,9 +50,8 @@ pub fn op_filter(
     // Batch evaluator path: evaluate all n rows, scan resulting bitmask.
     if let Some(bits) = func.filter_batch_bits(&mb, n, schema) {
         let mut range_start: isize = -1;
-        let words = (n + 63) / 64;
-        for w in 0..words {
-            let word = bits[w];
+        let words = n.div_ceil(64);
+        for (w, &word) in bits[..words].iter().enumerate() {
             let row_base = w * 64;
             let chunk = (row_base + 64).min(n) - row_base;
 
@@ -110,15 +109,6 @@ pub fn op_filter(
 
     gnitz_debug!("op_filter: in={} out={} func={}", n, output.count, func.kind_name());
     output
-}
-
-/// Filter a consolidated batch; the output is guaranteed consolidated.
-pub fn op_filter_consolidated(
-    batch: &ConsolidatedBatch,
-    func: &ScalarFuncKind,
-    schema: &SchemaDescriptor,
-) -> ConsolidatedBatch {
-    ConsolidatedBatch::new_unchecked(op_filter(batch, func, schema))
 }
 
 /// Map: transform batch via scalar function.
@@ -184,11 +174,6 @@ pub fn op_negate(batch: &Batch) -> Batch {
     // identity, so both invariants survive as-is.
     gnitz_debug!("op_negate: count={}", batch.count);
     output
-}
-
-/// Negate a consolidated batch; the output is guaranteed consolidated.
-pub fn op_negate_consolidated(batch: &ConsolidatedBatch) -> ConsolidatedBatch {
-    ConsolidatedBatch::new_unchecked(op_negate(batch))
 }
 
 /// Union: algebraic addition of two Z-Set streams.

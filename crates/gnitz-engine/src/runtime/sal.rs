@@ -104,6 +104,7 @@ impl SalGroup {
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer of at least `mmap_size` bytes.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) unsafe fn sal_begin_group(
     sal_ptr: *mut u8,
     write_cursor: usize,
@@ -338,6 +339,7 @@ impl SalWriter {
     }
 
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn write_group_direct(
         &mut self,
         target_id: u32,
@@ -399,6 +401,7 @@ impl SalWriter {
 
     /// Encode once into worker 0's slot, memcpy to workers 1..N-1.
     /// Does NOT sync/signal.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_broadcast_direct(
         &mut self,
         target_id: u32,
@@ -420,7 +423,7 @@ impl SalWriter {
             STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
-        for w in 0..nw { worker_sizes[w] = wsz; }
+        for item in worker_sizes.iter_mut().take(nw) { *item = wsz; }
 
         let group = unsafe {
             sal_begin_group(

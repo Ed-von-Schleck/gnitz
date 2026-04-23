@@ -72,9 +72,9 @@ pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
 
 fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
     let mut pos = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
-    for i in 0..num_regions {
+    for &sz in region_sizes.iter().take(num_regions) {
         pos = align8(pos);
-        pos += region_sizes[i] as usize;
+        pos += sz as usize;
     }
     pos
 }
@@ -84,7 +84,7 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
     let num_payload = schema.num_columns as usize - 1;
     let num_regions = 4 + num_payload + 1;
     let mut sizes = [0u32; 128];
-    for i in 0..4 { sizes[i] = (8 * row_count) as u32; }
+    for item in sizes.iter_mut().take(4) { *item = (8 * row_count) as u32; }
     let mut pi = 0;
     for ci in 0..schema.num_columns as usize {
         if ci == pk_idx { continue; }
@@ -277,6 +277,7 @@ pub fn encode_wire(
 /// eliminating the `Batch` heap allocation on the hot SEEK/SCAN path. The
 /// caller must have computed the buffer size using `wire_size` with the same
 /// prebuilt slice.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_wire_into(
     out: &mut [u8],
     offset: usize,
@@ -333,7 +334,7 @@ pub fn encode_wire_into(
         b.count = 1;
         b
     };
-    let written = ctrl_batch.encode_to_wire(IPC_CONTROL_TID as u32, out, offset);
+    let written = ctrl_batch.encode_to_wire(IPC_CONTROL_TID, out, offset);
     let mut pos = offset + written;
 
     if has_schema {

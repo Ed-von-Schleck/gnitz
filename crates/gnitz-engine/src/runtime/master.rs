@@ -28,6 +28,7 @@ use crate::ops::{
 // ---------------------------------------------------------------------------
 
 /// How the check payload is routed to workers.
+#[allow(clippy::large_enum_variant)]
 enum CheckPayload {
     /// Replicate the same batch to every worker; each worker filters
     /// its local partition.
@@ -199,6 +200,7 @@ pub struct MasterDispatcher {
     // Cache: table_id → (schema, col_name_bytes).
     // Shared via Rc so cache hits cost a refcount bump, not a deep clone of
     // the name bytes. Populated lazily; table schemas are immutable.
+    #[allow(clippy::type_complexity)]
     schema_names_cache: HashMap<i64, (SchemaDescriptor, Rc<[Vec<u8>]>)>,
 }
 
@@ -254,6 +256,7 @@ impl MasterDispatcher {
     /// Sync callers pass `request_id=0` (or some single id) which is
     /// replicated across all workers. Async callers use
     /// `write_group_with_req_ids` to thread distinct per-worker ids.
+    #[allow(clippy::too_many_arguments)]
     fn write_group(
         &mut self,
         target_id: i64,
@@ -269,7 +272,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let nw = self.num_workers;
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-        for w in 0..nw { ids[w] = request_id; }
+        for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
             target_id, flags, worker_batches, schema, col_names,
             seek_pk_lo, seek_pk_hi, seek_col_idx, &ids[..nw], unicast_worker,
@@ -278,6 +281,7 @@ impl MasterDispatcher {
 
     /// Encode per-worker data with per-worker request ids. Used by async
     /// fan-outs that need distinct ids per worker for reply routing.
+    #[allow(clippy::too_many_arguments)]
     fn write_group_with_req_ids(
         &mut self,
         target_id: i64,
@@ -302,6 +306,7 @@ impl MasterDispatcher {
     }
 
     /// Encode batch once directly into SAL mmap, replicate to all workers.
+    #[allow(clippy::too_many_arguments)]
     fn write_broadcast(
         &mut self,
         target_id: i64,
@@ -324,6 +329,7 @@ impl MasterDispatcher {
     }
 
     /// Encode once, write to all workers, signal (no fdatasync).
+    #[allow(clippy::too_many_arguments)]
     fn send_broadcast(
         &mut self,
         target_id: i64,
@@ -349,6 +355,7 @@ impl MasterDispatcher {
 
 
     /// Write per-worker message group + signal all workers (no fdatasync).
+    #[allow(clippy::too_many_arguments)]
     fn send_to_workers(
         &mut self,
         target_id: i64,
@@ -377,6 +384,7 @@ impl MasterDispatcher {
     /// before the reactor is up, so we drive each worker's ring via
     /// `W2mReceiver::wait_for` (sync FUTEX_WAIT on `reader_seq`). The
     /// tail-chasing ring self-maintains — no reset needed.
+    #[allow(clippy::needless_range_loop)]
     fn wait_all_workers(&mut self) -> Result<Vec<Option<DecodedWire>>, String> {
         let nw = self.num_workers;
         let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
@@ -412,6 +420,7 @@ impl MasterDispatcher {
     /// reactor is up, so we walk each ring serially with
     /// `W2mReceiver::wait_for`. Maintains its own ExchangeAccumulator
     /// since the reactor's is not yet wired.
+    #[allow(clippy::needless_range_loop)]
     fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
         let mut collected = vec![false; nw];
@@ -544,6 +553,7 @@ impl MasterDispatcher {
                               source_id as u64, 0, 0, 0)
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn record_index_routing(
         &mut self, target_id: i64, schema: &SchemaDescriptor, per_worker_batches: &[Batch],
     ) {
@@ -784,7 +794,7 @@ impl MasterDispatcher {
             if pid <= 0 { continue; }
             let mut status: i32 = 0;
             let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if rpid < 0 || rpid > 0 {
+            if rpid != 0 {
                 return w as i32;
             }
         }
@@ -1518,6 +1528,7 @@ where
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase;
 /// see `dispatch_fanout` for the rationale.
+#[allow(clippy::too_many_arguments)]
 async fn single_worker_async(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,

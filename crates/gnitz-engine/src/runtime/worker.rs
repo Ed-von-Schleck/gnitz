@@ -736,7 +736,7 @@ impl WorkerProcess {
                     let relay_batch = decoded
                         .and_then(|d| d.data_batch)
                         .unwrap_or_else(|| {
-                            let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
+                            let empty_schema = schema.unwrap_or_default();
                             Batch::with_schema(empty_schema, 0)
                         });
                     let relay_key = (msg_target, relay_source_id);
@@ -835,7 +835,7 @@ impl WorkerProcess {
                         // dispatch_inner's FLAG_SHUTDOWN branch already called
                         // libc::_exit — unreachable in practice.
                         return Batch::with_schema(
-                            schema.unwrap_or(SchemaDescriptor::default()), 0,
+                            schema.unwrap_or_default(), 0,
                         );
                     }
                 }

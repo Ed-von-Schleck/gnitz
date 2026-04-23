@@ -93,7 +93,9 @@ pub struct Shared {
 }
 
 impl Shared {
+    #[allow(clippy::mut_from_ref)]
     fn cat(&self) -> &mut CatalogEngine { unsafe { &mut *self.catalog.0 } }
+    #[allow(clippy::mut_from_ref)]
     fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.dispatcher.0 } }
 
     fn get_schema_desc(&self, target_id: i64) -> SchemaDescriptor {
@@ -593,7 +595,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
     // ---------- System-table DML (catalog + optional DDL broadcast) ----------
     if target_id < FIRST_USER_TABLE_ID {
         handle_system_dml(shared, fd, client_id, target_id, decoded).await;
-        return;
     }
 
     // Fallthrough: ignore (should not happen).
@@ -797,6 +798,7 @@ async fn handle_system_dml(
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn encode_response_buffer(
     target_id: i64, client_id: u64,
     result: Option<&Batch>, status: u32, error_msg: &[u8],

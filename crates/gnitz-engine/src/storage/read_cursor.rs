@@ -243,7 +243,7 @@ impl ReadCursor {
                     None
                 }
             },
-            &less,
+            less,
         )
     }
 
@@ -394,6 +394,15 @@ impl ReadCursor {
         self.entries.iter().map(|e| e.count.saturating_sub(e.position)).sum()
     }
 
+    /// Return the current row's full 128-bit PK as a single `u128`.
+    ///
+    /// Convenience helper for test code — production code reads `current_key_lo`
+    /// and `current_key_hi` directly.
+    #[cfg(test)]
+    pub fn current_key(&self) -> u128 {
+        (self.current_key_hi as u128) << 64 | self.current_key_lo as u128
+    }
+
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     ///
     /// Returns null for the PK column — use `current_key_lo`/`current_key_hi`
@@ -438,12 +447,6 @@ impl ReadCursor {
             return 0;
         }
         self.entries[self.current_entry_idx].source.blob_slice().len()
-    }
-
-    /// Current row's PK as a single u128 (convenience over current_key_lo / current_key_hi).
-    #[inline]
-    pub fn current_key(&self) -> u128 {
-        (self.current_key_hi as u128) << 64 | self.current_key_lo as u128
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
@@ -547,12 +550,10 @@ pub struct CursorHandle {
 }
 
 impl CursorHandle {
-    /// Wrap a cursor.
-    pub fn from_cursor(cursor: ReadCursor) -> Self {
-        CursorHandle { cursor }
-    }
-
-    /// Build a CursorHandle from Rust-owned in-memory snapshots (no shards).
+    /// Build a CursorHandle from owned in-memory batches (no shards).
+    ///
+    /// Convenience wrapper used by test code.
+    #[cfg(test)]
     pub fn from_owned(
         snapshots: &[Arc<Batch>],
         schema: crate::schema::SchemaDescriptor,

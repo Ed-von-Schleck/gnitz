@@ -371,10 +371,10 @@ pub fn server_main(
             }
 
             // Close M2W eventfds of OTHER workers (W2M uses futex, no fd).
-            for j in 0..nw {
+            for (j, &efd) in m2w_efds.iter().enumerate().take(nw) {
                 if j != w {
                     unsafe {
-                        libc::close(m2w_efds[j]);
+                        libc::close(efd);
                     }
                 }
             }

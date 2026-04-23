@@ -508,6 +508,7 @@ fn apply_agg_from_value_index(
 // ---------------------------------------------------------------------------
 
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn op_reduce(
     delta: &Batch,
     trace_in_cursor: Option<&mut ReadCursor>,
@@ -544,7 +545,7 @@ pub fn op_reduce(
 
     let n = working.count;
     if n == 0 {
-        let empty_fin = finalize_out_schema.map(|fs| Batch::empty_with_schema(fs));
+        let empty_fin = finalize_out_schema.map(Batch::empty_with_schema);
         return (Batch::empty_with_schema(output_schema), empty_fin);
     }
 
@@ -556,7 +557,7 @@ pub fn op_reduce(
     let sorted_indices = if group_by_pk {
         (0..n as u32).collect()
     } else {
-        argsort_delta(&working, input_schema, group_by_cols)
+        argsort_delta(working, input_schema, group_by_cols)
     };
 
     let mb = working.as_mem_batch();
@@ -622,7 +623,7 @@ pub fn op_reduce(
             }
 
             let w = mb.get_weight(curr_idx);
-            for (_k, acc) in accs.iter_mut().enumerate() {
+            for acc in accs.iter_mut() {
                 if acc.is_linear() {
                     acc.step_from_batch(&mb, curr_idx, input_schema, w);
                 }
@@ -751,8 +752,8 @@ pub fn op_reduce(
                 }
 
                 // Append delta rows to replay
-                for k in group_start_pos..idx {
-                    let d_idx = sorted_indices[k] as usize;
+                for &d_idx_u32 in sorted_indices[group_start_pos..idx].iter() {
+                    let d_idx = d_idx_u32 as usize;
                     append_membatch_row_to_batch(replay, &mb, d_idx, input_schema);
                 }
 
@@ -814,6 +815,7 @@ pub fn op_reduce(
 }
 
 /// Emit one reduce output row.
+#[allow(clippy::too_many_arguments)]
 fn emit_reduce_row(
     output: &mut Batch,
     input_mb: &MemBatch,
@@ -905,6 +907,7 @@ fn emit_reduce_row(
 ///
 /// Handles COPY_COL (copy column from raw→finalized), EMIT (computed value),
 /// and EMIT_NULL (null column) instructions by pre-scanning the bytecode.
+#[allow(clippy::too_many_arguments)]
 fn emit_finalized_row(
     fin_output: &mut Batch,
     raw_output: &Batch,
@@ -1069,6 +1072,7 @@ fn cursor_matches_group(
 // ---------------------------------------------------------------------------
 
 /// Gather-reduce: merge partial aggregate deltas from workers.
+#[allow(clippy::needless_range_loop)]
 pub fn op_gather_reduce(
     partial_batch: &Batch,
     trace_out_cursor: &mut ReadCursor,
@@ -1177,6 +1181,7 @@ pub fn op_gather_reduce(
 }
 
 /// Emit one gather-reduce output row.
+#[allow(clippy::too_many_arguments)]
 fn emit_gather_row(
     output: &mut Batch,
     input_mb: &MemBatch,

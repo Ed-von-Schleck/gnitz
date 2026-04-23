@@ -32,9 +32,9 @@ use crate::util::align8;
 /// Compute the total byte size of a WAL block with the given regions.
 pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
     let mut pos = HEADER_SIZE + num_regions * 8;
-    for i in 0..num_regions {
+    for sz in region_sizes.iter().take(num_regions) {
         pos = align8(pos);
-        pos += region_sizes[i] as usize;
+        pos += *sz as usize;
     }
     pos
 }
@@ -49,6 +49,7 @@ pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 ///   [48B header][directory: num_regions * 8B][data regions, 8B-aligned]
 ///
 /// Directory entries store offsets relative to block start (not buffer start).
+#[allow(clippy::too_many_arguments)]
 pub fn encode(
     out_buf: &mut [u8],
     out_offset: usize,
@@ -107,6 +108,7 @@ pub fn encode(
 ///
 /// `out_region_offsets` and `out_region_sizes` must have at least `max_regions`
 /// entries. Only `min(num_regions, max_regions)` entries are written.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_and_parse(
     block: &[u8],
     out_lsn: &mut u64,
@@ -248,8 +250,8 @@ mod tests {
     #[test]
     fn alignment() {
         // Region of 5 bytes should still result in 8-byte aligned next region
-        let r0 = vec![1u8, 2, 3, 4, 5];
-        let r1 = vec![6u8, 7, 8, 9];
+        let r0 = [1u8, 2, 3, 4, 5];
+        let r1 = [6u8, 7, 8, 9];
         let ptrs = vec![r0.as_ptr(), r1.as_ptr()];
         let sizes = vec![5u32, 4];
         let mut buf = vec![0u8; 4096];
@@ -355,9 +357,9 @@ mod tests {
 
     #[test]
     fn buffer_too_small() {
-        let r0 = vec![0u8; 100];
-        let ptrs = vec![r0.as_ptr()];
-        let sizes = vec![100u32];
+        let r0 = [0u8; 100];
+        let ptrs = [r0.as_ptr()];
+        let sizes = [100u32];
         let mut buf = vec![0u8; 64]; // too small
 
         let rc = encode(&mut buf, 0, 0, 0, 0, &ptrs, &sizes, 0);
