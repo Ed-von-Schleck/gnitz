@@ -364,7 +364,7 @@ impl SalWriter {
             if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
             let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
             worker_sizes[w] = wire_size(
-                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
+                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
             ) as u32;
         }
 
@@ -386,7 +386,7 @@ impl SalWriter {
                 let written = encode_wire_into(
                     slot, 0, target_id as u64, 0, flags as u64,
                     seek_pk_lo, seek_pk_hi, seek_col_idx, req_ids[w],
-                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
+                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
                 );
                 debug_assert_eq!(written, wsz);
                 off += align8(wsz);
@@ -417,7 +417,7 @@ impl SalWriter {
         self.lsn += 1;
 
         let wsz = wire_size(
-            STATUS_OK, b"", Some(schema), col_names_opt, batch,
+            STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw { worker_sizes[w] = wsz; }
@@ -437,7 +437,7 @@ impl SalWriter {
             let written = encode_wire_into(
                 slot0, 0, target_id as u64, 0, flags as u64,
                 seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
-                STATUS_OK, b"", Some(schema), col_names_opt, batch,
+                STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
             );
             debug_assert_eq!(written, wsz);
             let mut off = GROUP_HEADER_SIZE + align8(wsz);

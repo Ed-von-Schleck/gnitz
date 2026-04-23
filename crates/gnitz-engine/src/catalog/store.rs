@@ -465,6 +465,17 @@ impl CatalogEngine {
         bytes
     }
 
+    /// Return the cached encoded schema wire block for `table_id`, or `None` if not yet built.
+    /// The caller is responsible for building and storing the block on a miss.
+    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<Rc<Vec<u8>>> {
+        self.caches.schema_wire_block.get(&table_id).cloned()
+    }
+
+    /// Store an encoded schema wire block in the cache.
+    pub fn set_schema_wire_block(&mut self, table_id: i64, block: Rc<Vec<u8>>) {
+        self.caches.schema_wire_block.insert(table_id, block);
+    }
+
     /// True if any lock is needed for inserts into this table.
     /// Cached: set on table/index create/drop, no per-call overhead.
     pub fn needs_table_lock(&self, table_id: i64) -> bool {

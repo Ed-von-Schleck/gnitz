@@ -14,7 +14,7 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire};
+use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire, col_names_as_refs};
 use crate::runtime::w2m::W2mReceiver;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
@@ -291,15 +291,8 @@ impl MasterDispatcher {
         req_ids: &[u64],
         unicast_worker: i32,
     ) -> Result<(), String> {
-        let mut name_refs = [&[] as &[u8]; 64];
-        for (i, n) in col_names.iter().enumerate().take(64) {
-            name_refs[i] = n.as_slice();
-        }
-        let col_names_opt = if col_names.is_empty() {
-            None
-        } else {
-            Some(&name_refs[..col_names.len()])
-        };
+        let (name_refs, n) = col_names_as_refs(col_names);
+        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_group_direct(
             target_id as u32, flags, worker_batches,
@@ -321,15 +314,8 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
-        let mut name_refs = [&[] as &[u8]; 64];
-        for (i, n) in col_names.iter().enumerate().take(64) {
-            name_refs[i] = n.as_slice();
-        }
-        let col_names_opt = if col_names.is_empty() {
-            None
-        } else {
-            Some(&name_refs[..col_names.len()])
-        };
+        let (name_refs, n) = col_names_as_refs(col_names);
+        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_broadcast_direct(
             target_id as u32, flags, batch, schema, col_names_opt,

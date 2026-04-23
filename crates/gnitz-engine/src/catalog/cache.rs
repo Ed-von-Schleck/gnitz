@@ -15,6 +15,10 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) pk_col_of:        HashMap<i64, u32>,
     pub(crate) col_names:        HashMap<i64, Vec<String>>,
     pub(crate) col_names_bytes:  HashMap<i64, Rc<Vec<Vec<u8>>>>,
+    /// Cached encoded schema wire block per table. Built from
+    /// (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
+    /// Invalidated alongside col_names when DDL modifies the table schema.
+    pub(crate) schema_wire_block: HashMap<i64, Rc<Vec<u8>>>,
     pub(crate) index_by_name:    HashMap<String, i64>,
     pub(crate) index_by_id:      HashMap<i64, String>,
     pub(crate) indices_by_owner: HashMap<i64, Vec<i64>>,
@@ -27,29 +31,31 @@ pub(crate) struct CatalogCacheSet {
 impl CatalogCacheSet {
     pub(crate) fn new() -> Self {
         CatalogCacheSet {
-            schema_by_name:   HashMap::new(),
-            schema_by_id:     HashMap::new(),
-            entity_by_qname:  HashMap::new(),
-            entity_by_id:     HashMap::new(),
-            schema_of:        HashMap::new(),
-            tables_by_schema: HashMap::new(),
-            views_by_schema:  HashMap::new(),
-            pk_col_of:        HashMap::new(),
-            col_names:        HashMap::new(),
-            col_names_bytes:  HashMap::new(),
-            index_by_name:    HashMap::new(),
-            index_by_id:      HashMap::new(),
-            indices_by_owner: HashMap::new(),
-            fk_by_child:      HashMap::new(),
-            fk_by_parent:     HashMap::new(),
-            needs_lock:       HashSet::new(),
-            cascade_enabled:  false,
+            schema_by_name:    HashMap::new(),
+            schema_by_id:      HashMap::new(),
+            entity_by_qname:   HashMap::new(),
+            entity_by_id:      HashMap::new(),
+            schema_of:         HashMap::new(),
+            tables_by_schema:  HashMap::new(),
+            views_by_schema:   HashMap::new(),
+            pk_col_of:         HashMap::new(),
+            col_names:         HashMap::new(),
+            col_names_bytes:   HashMap::new(),
+            schema_wire_block: HashMap::new(),
+            index_by_name:     HashMap::new(),
+            index_by_id:       HashMap::new(),
+            indices_by_owner:  HashMap::new(),
+            fk_by_child:       HashMap::new(),
+            fk_by_parent:      HashMap::new(),
+            needs_lock:        HashSet::new(),
+            cascade_enabled:   false,
         }
     }
 
     pub(crate) fn invalidate_col_names(&mut self, id: i64) {
         self.col_names.remove(&id);
         self.col_names_bytes.remove(&id);
+        self.schema_wire_block.remove(&id);
     }
 }
 

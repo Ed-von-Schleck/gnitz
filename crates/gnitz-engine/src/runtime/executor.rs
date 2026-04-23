@@ -101,8 +101,24 @@ impl Shared {
             .unwrap_or_else(SchemaDescriptor::minimal_u64)
     }
 
-    fn get_col_names_bytes(&self, target_id: i64) -> Rc<Vec<Vec<u8>>> {
-        self.cat().get_col_names_bytes(target_id)
+    /// Return (or build and cache) the encoded schema wire block for `target_id`.
+    /// The block is stable for the lifetime of the table schema — it is
+    /// invalidated alongside col_names whenever DDL modifies the table.
+    fn get_schema_wire_block(&self, target_id: i64) -> Rc<Vec<u8>> {
+        let cat = self.cat();
+        if let Some(block) = cat.get_cached_schema_wire_block(target_id) {
+            return block;
+        }
+        let schema = cat.get_schema_desc(target_id)
+            .unwrap_or_else(SchemaDescriptor::minimal_u64);
+        let col_names = cat.get_col_names_bytes(target_id);
+        let (name_refs, n) = ipc::col_names_as_refs(&col_names);
+        let names_slice = &name_refs[..n];
+        let block = Rc::new(ipc::build_schema_wire_block(
+            &schema, names_slice, target_id as u32,
+        ));
+        cat.set_schema_wire_block(target_id, block.clone());
+        block
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
@@ -780,10 +796,10 @@ async fn handle_system_dml(
 fn encode_response_buffer(
     target_id: i64, client_id: u64,
     result: Option<&Batch>, status: u32, error_msg: &[u8],
-    schema: &SchemaDescriptor, col_names_opt: Option<&[&[u8]]>,
+    schema: &SchemaDescriptor, prebuilt_schema: Option<&[u8]>,
     seek_pk_lo: u64,
 ) -> Vec<u8> {
-    let sz = ipc::wire_size(status, error_msg, Some(schema), col_names_opt, result);
+    let sz = ipc::wire_size(status, error_msg, Some(schema), None, result, prebuilt_schema);
     let total = 4 + sz;
     let mut buf: Vec<u8> = vec![0; total];
     buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
@@ -792,7 +808,7 @@ fn encode_response_buffer(
         target_id as u64, client_id,
         0, seek_pk_lo, 0, 0, 0,
         status, error_msg,
-        Some(schema), col_names_opt, result,
+        Some(schema), None, result, prebuilt_schema,
     );
     debug_assert_eq!(written, sz);
     buf
@@ -803,15 +819,10 @@ async fn send_ok_response(
     result: Option<&Batch>, client_id: u64,
     schema: &SchemaDescriptor, seek_pk_lo: u64,
 ) {
-    let col_names = shared.get_col_names_bytes(target_id);
-    let mut name_refs_arr = [&[] as &[u8]; 64];
-    for (i, n) in col_names.iter().enumerate().take(64) {
-        name_refs_arr[i] = n.as_slice();
-    }
-    let col_names_opt = Some(&name_refs_arr[..col_names.len().min(64)]);
+    let schema_block = shared.get_schema_wire_block(target_id);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
-        schema, col_names_opt, seek_pk_lo,
+        schema, Some(schema_block.as_slice()), seek_pk_lo,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -822,6 +833,8 @@ async fn send_error(
     error_msg: &[u8],
 ) {
     let schema = SchemaDescriptor::minimal_u64();
+    // STATUS_ERROR suppresses the schema block (has_schema = false), so
+    // prebuilt_schema = None is correct and saves the cache lookup.
     let buf = encode_response_buffer(
         target_id, client_id, None, STATUS_ERROR, error_msg,
         &schema, None, 0,
@@ -833,7 +846,7 @@ async fn send_error(
 async fn send_alloc(
     shared: &Rc<Shared>, fd: i32, new_id: i64, client_id: u64,
 ) {
-    let sz = ipc::wire_size(STATUS_OK, b"", None, None, None);
+    let sz = ipc::wire_size(STATUS_OK, b"", None, None, None, None);
     let total = 4 + sz;
     let mut buf: Vec<u8> = vec![0; total];
     buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
@@ -842,7 +855,7 @@ async fn send_alloc(
         new_id as u64, client_id,
         0, 0, 0, 0, 0,
         STATUS_OK, b"",
-        None, None, None,
+        None, None, None, None,
     );
     debug_assert_eq!(written, sz);
     let rc = shared.reactor.send_buffer(fd, buf).await;

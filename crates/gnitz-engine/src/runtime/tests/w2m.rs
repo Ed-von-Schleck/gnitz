@@ -27,12 +27,12 @@ fn test_w2m_concurrent_publish_consume_ordered() {
     let done_w = Arc::clone(&done);
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
-        let sz = wire_size(STATUS_OK, b"", None, None, None);
+        let sz = wire_size(STATUS_OK, b"", None, None, None, None);
         for req_id in 1..=N {
             writer.send_encoded(sz, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
-                    0, 0, 0, req_id, STATUS_OK, b"", None, None, None,
+                    0, 0, 0, req_id, STATUS_OK, b"", None, None, None, None,
                 );
             });
         }
@@ -99,12 +99,12 @@ fn test_w2m_concurrent_large_messages_ordered() {
     let pad_w = pad.clone();
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
-        let sz = wire_size(STATUS_OK, &pad_w, None, None, None);
+        let sz = wire_size(STATUS_OK, &pad_w, None, None, None, None);
         for req_id in 1..=N {
             writer.send_encoded(sz, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
-                    0, 0, 0, req_id, STATUS_OK, &pad_w, None, None, None,
+                    0, 0, 0, req_id, STATUS_OK, &pad_w, None, None, None, None,
                 );
             });
         }
@@ -197,11 +197,11 @@ fn test_w2m_control_only_reply_has_no_backing() {
     unsafe { w2m_ring::init_region_for_tests(region, CAP as u64); }
 
     let writer = W2mWriter::new(region, CAP as u64);
-    let sz = wire_size(STATUS_OK, b"", None, None, None);
+    let sz = wire_size(STATUS_OK, b"", None, None, None, None);
     writer.send_encoded(sz, |buf| {
         encode_wire_into(
             buf, 0, 0, 0, 0,
-            0, 0, 0, 42, STATUS_OK, b"", None, None, None,
+            0, 0, 0, 42, STATUS_OK, b"", None, None, None, None,
         );
     });
 

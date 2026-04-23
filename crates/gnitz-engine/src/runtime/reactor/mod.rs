@@ -2592,12 +2592,12 @@ mod tests {
             // any of them under the resulting drain-refresh-arm
             // race pressure.
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None,
+                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None, None,
                     );
                 });
             }
@@ -2698,12 +2698,12 @@ mod tests {
         assert!(pid >= 0);
         if pid == 0 {
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None,
+                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None, None,
                     );
                 });
             }

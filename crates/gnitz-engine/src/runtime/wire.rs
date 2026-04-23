@@ -99,6 +99,35 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
 // Schema ↔ batch conversion
 // ---------------------------------------------------------------------------
 
+/// Encode a schema descriptor + column names into a standalone WAL wire block.
+///
+/// The returned bytes are a self-contained schema block identical to what
+/// `encode_wire_into` would embed. Callers cache this per table and pass it
+/// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip the
+/// `Batch` allocation on every SEEK/SCAN response.
+pub fn build_schema_wire_block(
+    schema: &SchemaDescriptor,
+    col_names: &[&[u8]],
+    target_tid: u32,
+) -> Vec<u8> {
+    let schema_batch = schema_to_batch(schema, col_names);
+    let sz = schema_batch.wire_byte_size(target_tid);
+    let mut block = vec![0u8; sz];
+    schema_batch.encode_to_wire(target_tid, &mut block, 0);
+    block
+}
+
+/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; 64]`, capped
+/// at 64 (the wire protocol maximum). Returns the filled array and the fill count.
+pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; 64], usize) {
+    let mut refs = [&[][..]; 64];
+    let n = names.len().min(64);
+    for (i, name) in names.iter().take(n).enumerate() {
+        refs[i] = name;
+    }
+    (refs, n)
+}
+
 pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> Batch {
     let ncols = schema.num_columns as usize;
     let meta = META_SCHEMA_DESC;
@@ -173,12 +202,18 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
 // ---------------------------------------------------------------------------
 
 /// Compute total encoded wire size without allocating.
+///
+/// `prebuilt_schema_block`: when `Some`, use its length as the schema block
+/// size instead of computing it from `schema` / `col_names`. Pass the result
+/// of [`build_schema_wire_block`] here to avoid the `schema_wal_block_size`
+/// calculation on hot paths.
 pub fn wire_size(
     status: u32,
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
+    prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
@@ -189,13 +224,17 @@ pub fn wire_size(
     let mut total = schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob);
 
     if has_schema {
-        let s = schema.unwrap_or_else(|| data_batch.unwrap().schema.as_ref().unwrap());
-        let names = col_names.unwrap_or(&[]);
-        let ncols = s.num_columns as usize;
-        let schema_blob: usize = names.iter().take(ncols)
-            .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
-            .sum();
-        total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
+        if let Some(prebuilt) = prebuilt_schema_block {
+            total += prebuilt.len();
+        } else {
+            let s = schema.unwrap_or_else(|| data_batch.unwrap().schema.as_ref().unwrap());
+            let names = col_names.unwrap_or(&[]);
+            let ncols = s.num_columns as usize;
+            let schema_blob: usize = names.iter().take(ncols)
+                .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
+                .sum();
+            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
+        }
     }
 
     if has_data {
@@ -220,18 +259,24 @@ pub fn encode_wire(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
 ) -> Vec<u8> {
-    let sz = wire_size(status, error_msg, schema, col_names, data_batch);
+    let sz = wire_size(status, error_msg, schema, col_names, data_batch, None);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0, target_id, client_id, flags,
         seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
-        status, error_msg, schema, col_names, data_batch,
+        status, error_msg, schema, col_names, data_batch, None,
     );
     buf
 }
 
 /// Encode a full IPC wire message into a caller-provided buffer.
 /// Returns bytes written. Panics if the buffer is too small.
+///
+/// `prebuilt_schema_block`: when `Some`, the bytes are copied directly into the
+/// schema block slot rather than calling `schema_to_batch` + `encode_to_wire`,
+/// eliminating the `Batch` heap allocation on the hot SEEK/SCAN path. The
+/// caller must have computed the buffer size using `wire_size` with the same
+/// prebuilt slice.
 pub fn encode_wire_into(
     out: &mut [u8],
     offset: usize,
@@ -247,6 +292,7 @@ pub fn encode_wire_into(
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
+    prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
@@ -291,13 +337,21 @@ pub fn encode_wire_into(
     let mut pos = offset + written;
 
     if has_schema {
-        let eff_schema = if let Some(s) = schema { s } else {
-            data_batch.unwrap().schema.as_ref().unwrap()
-        };
-        let names = col_names.unwrap_or(&[]);
-        let schema_batch = schema_to_batch(eff_schema, names);
-        let written = schema_batch.encode_to_wire(target_id as u32, out, pos);
-        pos += written;
+        if let Some(prebuilt) = prebuilt_schema_block {
+            // Fast path: prebuilt bytes already hold the encoded schema block.
+            // Copy directly — skips Batch allocation and encode_to_wire overhead.
+            let end = pos + prebuilt.len();
+            out[pos..end].copy_from_slice(prebuilt);
+            pos = end;
+        } else {
+            let eff_schema = if let Some(s) = schema { s } else {
+                data_batch.unwrap().schema.as_ref().unwrap()
+            };
+            let names = col_names.unwrap_or(&[]);
+            let schema_batch = schema_to_batch(eff_schema, names);
+            let written = schema_batch.encode_to_wire(target_id as u32, out, pos);
+            pos += written;
+        }
     }
 
     if has_data {

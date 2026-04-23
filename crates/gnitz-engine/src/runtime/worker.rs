@@ -5,6 +5,7 @@
 //! per-worker W2M shared region.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
@@ -116,6 +117,10 @@ pub struct WorkerProcess {
     // Per-target schema cache: skip the 512-byte schema block parse on hot paths.
     // Populated lazily from decoded.schema on first non-DDL message per target.
     schema_cache: HashMap<i64, SchemaDescriptor>,
+    // Per-target encoded schema wire block (no col_names on the worker path).
+    // Built once on first send_response call for a target; invalidated whenever
+    // schema_cache is updated with a fresh descriptor from the wire.
+    schema_wire_block_cache: HashMap<i64, Rc<Vec<u8>>>,
 }
 
 impl WorkerProcess {
@@ -144,6 +149,7 @@ impl WorkerProcess {
             read_cursor: 0,
             expected_epoch: 1,
             schema_cache: HashMap::new(),
+            schema_wire_block_cache: HashMap::new(),
         }
     }
 
@@ -263,6 +269,9 @@ impl WorkerProcess {
                     if let Some(ref d) = d {
                         if let Some(s) = d.schema {
                             self.schema_cache.insert(target_id, s);
+                            // Invalidate the prebuilt wire block so the next
+                            // send_response rebuilds it from the new schema.
+                            self.schema_wire_block_cache.remove(&target_id);
                         }
                     }
                     d
@@ -415,39 +424,51 @@ impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
     fn send_ack(&self, target_id: u64, flags: u32, request_id: u64) {
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, flags as u64,
-                0, 0, 0, request_id, STATUS_OK, &[], None, None, None,
+                0, 0, 0, request_id, STATUS_OK, &[], None, None, None, None,
             );
         });
     }
 
     fn send_response(
-        &self,
+        &mut self,
         target_id: u64,
         result: Option<&Batch>,
         schema: Option<&SchemaDescriptor>,
         request_id: u64,
     ) {
-        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result);
+        // Build or reuse the encoded schema block for this target. Workers send
+        // no col_names, so the block is keyed by (target_id, SchemaDescriptor)
+        // and is invalidated whenever schema_cache is refreshed from the wire.
+        let tid_key = target_id as i64;
+        // Rc::clone releases the mutable borrow on schema_wire_block_cache before
+        // w2m_writer is accessed below.
+        let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
+            Rc::clone(self.schema_wire_block_cache
+                .entry(tid_key)
+                .or_insert_with(|| Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32))))
+        });
+        let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
+        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, 0,
                 0, 0, 0, request_id, STATUS_OK, &[],
-                schema, None, result,
+                schema, None, result, prebuilt,
             );
         });
     }
 
     fn send_error(&self, error_msg: &str, request_id: u64) {
         let msg = error_msg.as_bytes();
-        let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None);
+        let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, 0, 0, 0,
-                0, 0, 0, request_id, STATUS_ERROR, msg, None, None, None,
+                0, 0, 0, request_id, STATUS_ERROR, msg, None, None, None, None,
             );
         });
     }
@@ -649,12 +670,12 @@ impl WorkerProcess {
         }
 
         let schema = batch.schema;
-        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch));
+        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None);
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
                 source_id as u64, 0, 0, tick_request_id, STATUS_OK, &[],
-                schema.as_ref(), None, Some(batch),
+                schema.as_ref(), None, Some(batch), None,
             );
         });
 
@@ -1030,6 +1051,7 @@ mod tests {
                 read_cursor: 0,
                 expected_epoch: 1,
                 schema_cache: HashMap::new(),
+                schema_wire_block_cache: HashMap::new(),
             };
             let filtered = wp.filter_my_partition(batch.clone_batch());
             // Every row in the filtered batch must belong to this worker.
@@ -1059,6 +1081,7 @@ mod tests {
             read_cursor: 0,
             expected_epoch: 1,
             schema_cache: HashMap::new(),
+            schema_wire_block_cache: HashMap::new(),
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 0);
@@ -1088,6 +1111,7 @@ mod tests {
             read_cursor: 0,
             expected_epoch: 1,
             schema_cache: HashMap::new(),
+            schema_wire_block_cache: HashMap::new(),
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 1);
@@ -1173,7 +1197,7 @@ mod tests {
 
         let w2m_writer = W2mWriter::new(region_ptr, region_size as u64);
 
-        let wp = WorkerProcess {
+        let mut wp = WorkerProcess {
             worker_id: 0,
             num_workers: 1,
             master_pid: 0,
@@ -1185,6 +1209,7 @@ mod tests {
             read_cursor: 0,
             expected_epoch: 1,
             schema_cache: HashMap::new(),
+            schema_wire_block_cache: HashMap::new(),
         };
 
         let req_ack: u64 = 42;
