@@ -36,7 +36,7 @@ pub fn op_filter(
         && (0..schema.num_columns as usize)
             .any(|ci| schema.columns[ci].type_code == type_code::STRING);
     if blob_passthrough {
-        output.blob = batch.blob.clone();
+        output.share_blob_from(batch);
     }
 
     let append_range = |out: &mut Batch, start: usize, end: usize| {

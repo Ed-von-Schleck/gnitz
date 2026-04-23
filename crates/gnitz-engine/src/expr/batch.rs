@@ -224,16 +224,28 @@ fn eval_str_col_vs_const(
     let const_prefix = prog.const_prefixes[const_idx];
     let const_len = prog.const_lengths[const_idx];
     let base_d = dst * MORSEL;
+    // Compute results unconditionally (null rows produce a valid but irrelevant value).
+    // Keeping the comparison out of a branch-per-row allows LLVM to vectorize this loop.
     for i in 0..m {
-        let is_null = !scratch.no_nulls &&
-            (scratch.null_bits[dst * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
-        if is_null {
-            scratch.regs[base_d + i] = 0;
-        } else {
-            let off = (morsel_start + i) * 16;
-            let s = &col_data[off..off + 16];
-            scratch.regs[base_d + i] =
-                pred(compare_col_string_vs_const(s, blob, const_bytes, const_prefix, const_len)) as i64;
+        let off = (morsel_start + i) * 16;
+        let s = &col_data[off..off + 16];
+        scratch.regs[base_d + i] =
+            pred(compare_col_string_vs_const(s, blob, const_bytes, const_prefix, const_len)) as i64;
+    }
+    // Zero out results for null rows using the already-computed null mask.
+    if !scratch.no_nulls {
+        let words = (m + 63) / 64;
+        for w in 0..words {
+            let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
+            if null_word != 0 {
+                let lo = w * 64;
+                let hi = (lo + 64).min(m);
+                for bit in 0..(hi - lo) {
+                    if (null_word >> bit) & 1 != 0 {
+                        scratch.regs[base_d + lo + bit] = 0;
+                    }
+                }
+            }
         }
     }
 }
@@ -271,16 +283,27 @@ fn eval_str_col_vs_col(
     let col_b = mb.col_data[pi_b];
     let blob = mb.blob;
     let base_d = dst * MORSEL;
+    // Compute results unconditionally; null rows produce a valid but irrelevant value.
     for i in 0..m {
-        let is_null = !scratch.no_nulls &&
-            (scratch.null_bits[dst * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
-        if is_null {
-            scratch.regs[base_d + i] = 0;
-        } else {
-            let row = morsel_start + i;
-            let s1 = &col_a[row * 16..row * 16 + 16];
-            let s2 = &col_b[row * 16..row * 16 + 16];
-            scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob, s2, blob)) as i64;
+        let row = morsel_start + i;
+        let s1 = &col_a[row * 16..row * 16 + 16];
+        let s2 = &col_b[row * 16..row * 16 + 16];
+        scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob, s2, blob)) as i64;
+    }
+    // Zero out results for null rows using the already-computed null mask.
+    if !scratch.no_nulls {
+        let words = (m + 63) / 64;
+        for w in 0..words {
+            let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
+            if null_word != 0 {
+                let lo = w * 64;
+                let hi = (lo + 64).min(m);
+                for bit in 0..(hi - lo) {
+                    if (null_word >> bit) & 1 != 0 {
+                        scratch.regs[base_d + lo + bit] = 0;
+                    }
+                }
+            }
         }
     }
 }

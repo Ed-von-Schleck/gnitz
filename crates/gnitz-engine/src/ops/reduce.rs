@@ -584,6 +584,11 @@ pub fn op_reduce(
     let mut avi = avi_cursor;
     let mut gi = gi_cursor;
 
+    // Hoist replay batch outside the group loop: reuse the allocation across groups
+    // rather than allocating and dropping once per group (can be 100k+ times per epoch).
+    let mut replay = (!all_linear && avi.is_none())
+        .then(|| Batch::with_schema(*input_schema, 32));
+
     let mut idx = 0usize;
     let mut num_groups = 0usize;
     while idx < n {
@@ -679,9 +684,8 @@ pub fn op_reduce(
                 gnitz_debug!("reduce: AVI lookup gc={:#x} found={}", gc_u64, found);
             } else {
                 // Full replay path: build replay batch from trace_in + delta
-                let mut replay = Batch::with_schema(*input_schema, 32);
-                replay.sorted = false;
-                replay.consolidated = false;
+                let replay = replay.as_mut().unwrap();
+                replay.clear();
 
                 if let Some(ref mut ti_cursor) = trace_in {
                     if group_by_pk {
@@ -690,14 +694,14 @@ pub fn op_reduce(
                             && ti_cursor.current_key_lo == group_key_lo
                             && ti_cursor.current_key_hi == group_key_hi
                         {
-                            append_cursor_row_to_batch(&mut replay, ti_cursor, input_schema);
+                            append_cursor_row_to_batch(replay, ti_cursor, input_schema);
                             ti_cursor.advance();
                         }
                     } else if let Some(ref mut gi_c) = gi {
                         // GI path
                         let pki = input_schema.pk_index as usize;
                         let gi_ci = gi_col_idx as usize;
-                        let pi = if gi_ci < pki { gi_ci } else { gi_ci - 1 };
+                        let pi = payload_idx(gi_ci, pki);
                         let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
                         let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
                         gi_c.seek(crate::util::make_pk(0, gc_u64_val));
@@ -722,7 +726,7 @@ pub fn op_reduce(
                                         && ti.current_key_lo == spk_lo
                                         && ti.current_key_hi == spk_hi
                                     {
-                                        append_cursor_row_to_batch(&mut replay, ti, input_schema);
+                                        append_cursor_row_to_batch(replay, ti, input_schema);
                                         ti.advance();
                                     }
                                 }
@@ -739,7 +743,7 @@ pub fn op_reduce(
                                 ti_cursor, &mb, ti_mb_exemplar_row,
                                 input_schema, group_by_cols,
                             ) {
-                                append_cursor_row_to_batch(&mut replay, ti_cursor, input_schema);
+                                append_cursor_row_to_batch(replay, ti_cursor, input_schema);
                             }
                             ti_cursor.advance();
                         }
@@ -749,11 +753,12 @@ pub fn op_reduce(
                 // Append delta rows to replay
                 for k in group_start_pos..idx {
                     let d_idx = sorted_indices[k] as usize;
-                    append_membatch_row_to_batch(&mut replay, &mb, d_idx, input_schema);
+                    append_membatch_row_to_batch(replay, &mb, d_idx, input_schema);
                 }
 
-                // Consolidate replay and step all accumulators
-                let merged = replay.into_consolidated(input_schema);
+                // Consolidate replay and step all accumulators (borrow replay; don't consume it)
+                let merged_cs = Batch::consolidate_if_needed(replay, input_schema);
+                let merged: &Batch = merged_cs.as_deref().unwrap_or(&*replay);
                 for acc in accs.iter_mut() {
                     acc.reset();
                 }

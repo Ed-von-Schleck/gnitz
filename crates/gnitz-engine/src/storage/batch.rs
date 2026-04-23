@@ -5,12 +5,17 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use crate::util::{read_i64_le, read_u64_le};
+
+static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
+#[inline(always)]
+fn next_blob_id() -> u64 { BLOB_ID_CTR.fetch_add(1, Ordering::Relaxed) }
 
 /// Minimum allocation size to request transparent hugepage backing.
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
@@ -125,6 +130,11 @@ pub struct Batch {
     pub(crate) sorted: bool,
     pub(crate) consolidated: bool,
     pub schema: Option<SchemaDescriptor>,
+    /// Identity token for blob-sharing: two batches with equal `blob_id` have
+    /// identical blob content, making verbatim 16-byte German String struct
+    /// copies safe.  Set by `share_blob_from` and checked by
+    /// `append_batch_no_blob_reloc`.
+    pub(crate) blob_id: u64,
 }
 
 impl Batch {
@@ -154,6 +164,7 @@ impl Batch {
             sorted: true,
             consolidated: true,
             schema: None,
+            blob_id: next_blob_id(),
         }
     }
 
@@ -176,6 +187,7 @@ impl Batch {
             sorted: true,
             consolidated: true,
             schema: Some(*schema),
+            blob_id: next_blob_id(),
         }
     }
 
@@ -205,6 +217,7 @@ impl Batch {
             sorted: true,
             consolidated: true,
             schema: None,
+            blob_id: next_blob_id(),
         }
     }
 
@@ -248,6 +261,7 @@ impl Batch {
             sorted: true,
             consolidated: true,
             schema: Some(schema),
+            blob_id: next_blob_id(),
         }
     }
 
@@ -332,6 +346,7 @@ impl Batch {
             sorted: false,
             consolidated: false,
             schema: None,
+            blob_id: next_blob_id(),
         }
     }
 
@@ -363,6 +378,7 @@ impl Batch {
             sorted: false,
             consolidated: false,
             schema: None,
+            blob_id: next_blob_id(),
         }
     }
 
@@ -762,6 +778,7 @@ impl Batch {
             sorted: self.sorted,
             consolidated: self.consolidated,
             schema: self.schema,
+            blob_id: self.blob_id,
         }
     }
 
@@ -938,14 +955,15 @@ impl Batch {
     pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
         let end = end.min(src.count);
         if start >= end { return; }
-        // Weak guard for the precondition documented above: a differing
-        // blob length proves `self.blob` and `src.blob` aren't the same
-        // content, so verbatim copies of the 16-byte German String structs
-        // would leave dangling heap offsets in `self`.
+        // Guard for the precondition: both batches must share the same blob identity,
+        // established by calling `share_blob_from` (or `clone_batch`) before this.
+        // Matching IDs guarantees identical blob content; same-length-different-content
+        // blobs would produce dangling heap offsets in the copied German String structs.
         debug_assert_eq!(
-            self.blob.len(), src.blob.len(),
-            "append_batch_no_blob_reloc: self.blob and src.blob must be identical (self={}, src={})",
-            self.blob.len(), src.blob.len(),
+            self.blob_id, src.blob_id,
+            "append_batch_no_blob_reloc: blobs must be identical; \
+             call share_blob_from(&src) before appending (self.blob_id={}, src.blob_id={})",
+            self.blob_id, src.blob_id,
         );
         let n = end - start;
         self.reserve_rows(n);
@@ -1121,7 +1139,15 @@ impl Batch {
         self.blob.clear();
         self.sorted = true;
         self.consolidated = true;
+        self.blob_id = next_blob_id();
         // data buffer stays allocated — capacity and offsets remain valid.
+    }
+
+    /// Copy blob content from `src` and record that this batch shares `src`'s
+    /// blob identity.  Must be called before `append_batch_no_blob_reloc`.
+    pub fn share_blob_from(&mut self, src: &Batch) {
+        self.blob = src.blob.clone();
+        self.blob_id = src.blob_id;
     }
 
     /// Number of regions in the standard layout (including blob).
@@ -1384,6 +1410,7 @@ pub fn write_to_batch(
         offsets,
         strides,
         num_regions: nr as u8,
+        blob_id: next_blob_id(),
         capacity: max_rows as u32,
         count: actual_rows,
         sorted: false,
