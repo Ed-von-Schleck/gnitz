@@ -6,7 +6,7 @@
 // Internal — not accessible outside storage/
 mod bloom;
 mod xor8;
-pub(crate) mod wal;
+mod wal;
 mod manifest;
 mod columnar;
 mod heap;

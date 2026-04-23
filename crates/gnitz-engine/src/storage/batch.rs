@@ -1288,6 +1288,86 @@ impl Batch {
         let regions = self.regions();
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true)
     }
+
+    // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
+
+    /// Byte count of the WAL-block encoding for this batch.
+    pub fn wire_byte_size(&self, _table_id: u32) -> usize {
+        let nr = self.num_regions_total();
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..nr {
+            sizes[i] = self.region_size(i) as u32;
+        }
+        super::wal::block_size(nr, &sizes[..nr])
+    }
+
+    /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
+    pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
+        let nr = self.num_regions_total();
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..nr {
+            ptrs[i] = self.region_ptr(i);
+            sizes[i] = self.region_size(i) as u32;
+        }
+        let blob_size = self.blob.len() as u64;
+        let new_offset = super::wal::encode(
+            out, offset, 0, table_id, self.count as u32,
+            &ptrs[..nr], &sizes[..nr], blob_size,
+        ).expect("WAL encode failed: buffer too small");
+        new_offset - offset
+    }
+
+    /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
+    /// Does not set sorted/consolidated — caller derives those from wire header flags.
+    pub fn decode_from_wal_block(
+        data: &[u8],
+        schema: &SchemaDescriptor,
+    ) -> Result<(Self, usize), &'static str> {
+        let npc = schema.num_columns as usize - 1;
+        let expected_regions = 4 + npc + 1;
+
+        let mut lsn = 0u64;
+        let mut tid = 0u32;
+        let mut count = 0u32;
+        let mut num_regions = 0u32;
+        let mut blob_size = 0u64;
+        let mut offsets = [0u64; 128];
+        let mut sizes = [0u32; 128];
+
+        if super::wal::validate_and_parse(
+            data, &mut lsn, &mut tid, &mut count, &mut num_regions,
+            &mut blob_size, &mut offsets, &mut sizes, 128,
+        ).is_err() {
+            return Err("WAL block validation failed");
+        }
+        if (num_regions as usize) != expected_regions {
+            return Err("WAL block region count mismatch");
+        }
+
+        let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+
+        let nr = num_regions as usize;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
+        let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..nr {
+            let off = offsets[i] as usize;
+            let sz = sizes[i] as usize;
+            region_sizes[i] = sizes[i];
+            if sz > 0 && off + sz <= data.len() {
+                ptrs[i] = unsafe { data.as_ptr().add(off) };
+            }
+        }
+
+        let mut batch = unsafe {
+            Batch::from_regions(&ptrs[..nr], &region_sizes[..nr], count as usize, npc)
+        };
+        batch.set_schema(*schema);
+        Ok((batch, bytes_consumed))
+    }
+
+    pub fn mark_sorted(&mut self) { self.sorted = true; }
+    pub fn mark_consolidated(&mut self) { self.consolidated = true; }
 }
 
 impl Drop for Batch {

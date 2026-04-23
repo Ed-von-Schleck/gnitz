@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
-use crate::committer::{self, CommitRequest};
-use crate::ipc::{self, STATUS_OK, STATUS_ERROR};
-use crate::master::{MasterDispatcher, first_worker_error};
-use crate::reactor::{
+use crate::runtime::committer::{self, CommitRequest};
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
+use crate::runtime::master::{MasterDispatcher, first_worker_error};
+use crate::runtime::reactor::{
     AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, mpsc, oneshot, select2,
 };
 use crate::schema::SchemaDescriptor;
@@ -382,7 +382,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     let futs: Vec<_> = req_ids.iter().flatten()
         .map(|&id| shared.reactor.await_reply(id))
         .collect();
-    let replies = crate::reactor::join_all(futs).await;
+    let replies = crate::runtime::reactor::join_all(futs).await;
     if let Some(e) = first_worker_error("tick", &replies) {
         return Err(e);
     }

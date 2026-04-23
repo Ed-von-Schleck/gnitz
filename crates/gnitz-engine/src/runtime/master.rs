@@ -9,13 +9,14 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
-use crate::ipc::{
+use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
-    FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
-    SalWriter, W2mReceiver,
+    FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::reactor::PendingRelay;
+use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire};
+use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::reactor::PendingRelay;
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_relay_scatter_consolidated,
@@ -267,7 +268,7 @@ impl MasterDispatcher {
         unicast_worker: i32,
     ) -> Result<(), String> {
         let nw = self.num_workers;
-        let mut ids = [0u64; crate::ipc::MAX_WORKERS];
+        let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
         for w in 0..nw { ids[w] = request_id; }
         self.write_group_with_req_ids(
             target_id, flags, worker_batches, schema, col_names,
@@ -429,7 +430,7 @@ impl MasterDispatcher {
         let nw = self.num_workers;
         let mut collected = vec![false; nw];
         let mut remaining = nw;
-        let mut acc = crate::reactor::ExchangeAccumulator::new(nw);
+        let mut acc = crate::runtime::reactor::ExchangeAccumulator::new(nw);
 
         while remaining > 0 {
             // One full pass over all workers per iteration. If a pass
@@ -596,7 +597,7 @@ impl MasterDispatcher {
 
     pub async fn fan_out_seek_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64, pk_lo: u64, pk_hi: u64,
     ) -> Result<Option<Batch>, String> {
         let worker = unsafe {
@@ -609,7 +610,7 @@ impl MasterDispatcher {
 
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
     ) -> Result<Option<Batch>, String> {
         let cached = unsafe {
@@ -649,7 +650,7 @@ impl MasterDispatcher {
 
     pub async fn fan_out_scan_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64,
     ) -> Result<Option<Batch>, String> {
         let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
@@ -682,7 +683,7 @@ impl MasterDispatcher {
     /// per-worker req_ids, signals once, and joins all replies.
     async fn execute_pipeline_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         checks: Vec<PipelinedCheck>,
     ) -> Result<Vec<HashSet<u128>>, String> {
         let num_checks = checks.len();
@@ -721,7 +722,7 @@ impl MasterDispatcher {
                 futs.push(reactor.await_reply(rid));
             }
         }
-        let decoded_vec: Vec<DecodedWire> = crate::reactor::join_all(futs).await;
+        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all(futs).await;
 
         let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
             let cap = match &check.payload {
@@ -911,7 +912,7 @@ impl MasterDispatcher {
     /// runs without blocking the reactor.
     pub async fn validate_all_distributed_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
         let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, num_workers) = unsafe {
@@ -1335,7 +1336,7 @@ impl MasterDispatcher {
     /// processing loop, not the full concatenated batch.
     async fn ensure_unique_filters_warm_async(
         disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::reactor::Reactor,
+        reactor: &crate::runtime::reactor::Reactor,
         table_id: i64,
     ) -> Result<(), String> {
         let missing: Vec<UniqueIndexDesc> = unsafe {
@@ -1486,7 +1487,7 @@ pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
 /// repeats. Returns decoded replies in worker order.
 pub(crate) async fn dispatch_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
-    reactor: &crate::reactor::Reactor,
+    reactor: &crate::runtime::reactor::Reactor,
     submit: F,
 ) -> Result<Vec<DecodedWire>, String>
 where
@@ -1500,7 +1501,7 @@ where
         disp.signal_all();
     }
     let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
-    Ok(crate::reactor::join_all(futs).await)
+    Ok(crate::runtime::reactor::join_all(futs).await)
 }
 
 /// Common body for every single-worker async fan-out. Submits the SAL
@@ -1510,7 +1511,7 @@ where
 /// borrow-and-release pattern.
 async fn single_worker_async(
     disp_ptr: *mut MasterDispatcher,
-    reactor: &crate::reactor::Reactor,
+    reactor: &crate::runtime::reactor::Reactor,
     target_id: i64,
     flags: u32,
     worker: usize,

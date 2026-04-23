@@ -171,6 +171,7 @@ impl W2mRingHeader {
     pub fn waiter_flags(&self) -> &AtomicU32 { &self.waiter_flags }
     #[inline]
     pub fn capacity(&self) -> u64 { self.capacity }
+    #[cfg(test)]
     #[inline]
     pub fn writer_wrap_count(&self) -> u64 {
         self.writer_wrap_count.load(Ordering::Relaxed)
@@ -244,6 +245,7 @@ fn room_for(vwc: u64, vrc: u64, total: u64, cap: u64) -> bool {
 }
 
 /// Outcome of `try_publish`.
+#[cfg(test)]
 pub enum TryPublish {
     /// Published successfully; the new (virtual) write cursor is returned.
     Ok(u64),
@@ -298,6 +300,7 @@ pub enum TryReserve {
 /// `hdr` must be the header inside the same mmap region as `data_base`
 /// (which is the same pointer reinterpreted as `*mut u8`). The caller
 /// must be the sole producer on this ring.
+#[cfg(test)]
 pub unsafe fn try_publish(
     hdr: &W2mRingHeader,
     data_base: *mut u8,

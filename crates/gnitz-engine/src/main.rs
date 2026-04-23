@@ -76,6 +76,6 @@ fn main() {
     }
 
     gnitz_engine::log::init(level, b"M");
-    let rc = gnitz_engine::bootstrap::server_main(&data_dir, &socket_path, num_workers, level);
+    let rc = gnitz_engine::runtime::server_main(&data_dir, &socket_path, num_workers, level);
     process::exit(rc);
 }

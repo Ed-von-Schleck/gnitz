@@ -31,9 +31,11 @@ use std::time::Instant;
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::ipc::{DecodedWire, FLAG_EXCHANGE, W2mReceiver};
-use crate::ipc_sys::FUTEX2_SIZE_U32;
-use crate::w2m_ring::FLAG_MASTER_PARKED;
+use crate::runtime::wire::DecodedWire;
+use crate::runtime::sal::FLAG_EXCHANGE;
+use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::sys::FUTEX2_SIZE_U32;
+use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 
 use io_uring::types::FutexWaitV;
 
@@ -45,7 +47,9 @@ mod exchange;
 pub mod sync;
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
-pub use sync::{AsyncMutex, AsyncRwLock, Either, join2, join_all, oneshot, mpsc, select2};
+pub use sync::{AsyncMutex, AsyncRwLock, Either, join_all, oneshot, mpsc, select2};
+#[cfg(test)]
+pub use sync::join2;
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
@@ -387,6 +391,7 @@ impl Reactor {
 
     /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
     /// future as a task internally and returns its output via a shared cell.
+    #[cfg(test)]
     pub fn block_on<F, T>(&self, fut: F) -> T
     where
         F: Future<Output = T> + 'static,
@@ -699,6 +704,7 @@ impl Reactor {
     }
 
     /// Drive the reactor until the task slab is empty. Blocks.
+    #[cfg(test)]
     pub fn block_until_idle(&self) {
         while !self.inner.tasks.borrow().is_empty() {
             self.tick(true);
@@ -712,14 +718,14 @@ impl Reactor {
         self.inner.reply_wakers.borrow_mut().insert(req_id, w);
     }
 
-    /// True while at least one task is alive in the slab. Used by the
-    /// executor to decide whether to clamp the main-loop timeout.
+    /// True while at least one task is alive in the slab.
+    #[cfg(test)]
     pub fn has_pending_tasks(&self) -> bool {
         !self.inner.tasks.borrow().is_empty()
     }
 
-    /// Drive ready tasks and process CQEs without blocking. Intended for
-    /// the executor's main loop.
+    /// Drive ready tasks and process CQEs without blocking.
+    #[cfg(test)]
     pub fn poll_nonblocking(&self) {
         self.tick(false);
     }
@@ -1770,7 +1776,7 @@ mod tests {
     #[test]
     fn fsync_future_roundtrip() {
         let r = make_reactor();
-        let fd = crate::ipc_sys::memfd_create(b"reactor_fsync_future");
+        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_future");
         let rc: Rc<StdCell<i32>> = Rc::new(StdCell::new(1));
         let rc2 = Rc::clone(&rc);
         let fsync = r.fsync(fd);
@@ -1864,7 +1870,7 @@ mod tests {
     /// Build a minimal `DecodedWire` for tests — only `request_id` is
     /// load-bearing; every other field is zeroed / empty.
     fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
-        use crate::ipc::DecodedControl;
+        use crate::runtime::wire::DecodedControl;
         DecodedWire {
             control: DecodedControl {
                 status: 0,
@@ -1951,7 +1957,7 @@ mod tests {
     #[test]
     fn fsync_real_memfd_roundtrip() {
         let r = make_reactor();
-        let fd = crate::ipc_sys::memfd_create(b"reactor_fsync_ok");
+        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_ok");
         let id = r.submit_fsync(fd);
         let rc = r.block_on_fsync(id);
         unsafe { libc::close(fd); }
@@ -1982,7 +1988,7 @@ mod tests {
     #[test]
     fn fsync_submit_flushes_sqe_before_returning() {
         let r = make_reactor();
-        let fd = crate::ipc_sys::memfd_create(b"reactor_fsync_flush");
+        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_flush");
         let id = r.submit_fsync(fd);
 
         // Spin briefly (no further ticks driven from outside) until the
@@ -2257,7 +2263,8 @@ mod tests {
     }
 
     fn synthetic_exchange_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
-        use crate::ipc::{DecodedControl, FLAG_EXCHANGE};
+        use crate::runtime::wire::DecodedControl;
+        use crate::runtime::sal::FLAG_EXCHANGE;
         DecodedWire {
             control: DecodedControl {
                 status: 0,
@@ -2476,21 +2483,20 @@ mod tests {
     #[test]
     fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         use std::time::Duration;
-        use crate::ipc::{self, STATUS_OK, W2mReceiver, W2mWriter};
-        use crate::w2m_ring;
-        use crate::reactor::{join_all, select2, Either};
+        use crate::runtime::wire as ipc;
+        use crate::runtime::wire::STATUS_OK;
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::reactor::{join_all, select2, Either};
 
-        // 64 KiB cap forces multiple SKIP-wraps over 500 publishes
-        // of ~280 B each (~140 KiB total). Both the wake-race and
-        // the wrap-overwrite hazards are exercised.
-        const CAPACITY: usize = 64 * 1024; // 64 KiB
+        const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 500;
         const TIMEOUT_SECS: u64 = 30;
 
-        let fd = crate::ipc_sys::memfd_create(b"w2m_stress");
+        let fd = crate::runtime::sys::memfd_create(b"w2m_stress");
         assert!(fd >= 0, "memfd_create failed");
         assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::ipc_sys::mmap_shared(fd, CAPACITY);
+        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
         unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
 
@@ -2587,18 +2593,20 @@ mod tests {
     #[test]
     fn w2m_cross_process_stress_high_volume() {
         use std::time::Duration;
-        use crate::ipc::{self, STATUS_OK, W2mReceiver, W2mWriter};
-        use crate::w2m_ring;
-        use crate::reactor::{join_all, select2, Either};
+        use crate::runtime::wire as ipc;
+        use crate::runtime::wire::STATUS_OK;
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::reactor::{join_all, select2, Either};
 
         const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 5_000;
         const TIMEOUT_SECS: u64 = 60;
 
-        let fd = crate::ipc_sys::memfd_create(b"w2m_stress_hv");
+        let fd = crate::runtime::sys::memfd_create(b"w2m_stress_hv");
         assert!(fd >= 0);
         assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::ipc_sys::mmap_shared(fd, CAPACITY);
+        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null());
         unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
 

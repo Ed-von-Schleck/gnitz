@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ipc::DecodedWire;
+use crate::runtime::wire::DecodedWire;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 
@@ -88,7 +88,8 @@ impl ExchangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{DecodedWire, DecodedControl, FLAG_EXCHANGE};
+    use crate::runtime::wire::{DecodedWire, DecodedControl};
+    use crate::runtime::sal::FLAG_EXCHANGE;
     use crate::schema::SchemaDescriptor;
 
     fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {

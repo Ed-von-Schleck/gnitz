@@ -12,13 +12,15 @@ use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::storage::partition_for_key;
 use crate::ops::worker_for_partition;
-use crate::ipc::{
-    self, SAL_MMAP_SIZE, STATUS_OK, STATUS_ERROR,
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
+use crate::runtime::sal::{
+    SAL_MMAP_SIZE,
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
-    SalReader, SalMessage, W2mWriter,
+    SalReader, SalMessage,
 };
+use crate::runtime::w2m::W2mWriter;
 use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
@@ -1145,8 +1147,8 @@ mod tests {
     /// assert the ids round-trip.
     #[test]
     fn test_send_helpers_echo_request_id() {
-        use crate::ipc;
-        use crate::w2m_ring;
+        use crate::runtime::wire as ipc;
+        use crate::runtime::w2m_ring;
         // Use the production-sized region — the mmap reservation is
         // lazy-populated, so the 1 GiB backing is cheap.
         let region_size = w2m_ring::W2M_REGION_SIZE;
@@ -1163,7 +1165,7 @@ mod tests {
         let region_ptr = region_ptr as *mut u8;
         unsafe { w2m_ring::init_region(region_ptr, region_size as u64); }
 
-        let w2m_writer = ipc::W2mWriter::new(region_ptr, region_size as u64);
+        let w2m_writer = W2mWriter::new(region_ptr, region_size as u64);
 
         let wp = WorkerProcess {
             worker_id: 0,

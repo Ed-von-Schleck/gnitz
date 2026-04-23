@@ -27,9 +27,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
-use crate::ipc::WireConflictMode;
-use crate::master::{MasterDispatcher, first_worker_error};
-use crate::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
+use crate::runtime::wire::WireConflictMode;
+use crate::runtime::master::{MasterDispatcher, first_worker_error};
+use crate::runtime::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
 use crate::storage::Batch;
 use crate::util::guard_panic;
 

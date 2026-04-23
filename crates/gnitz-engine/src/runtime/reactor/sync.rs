@@ -392,6 +392,7 @@ impl Drop for WriteGuard {
 // join2 / join_all
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub async fn join2<A, B>(a: A, b: B) -> (A::Output, B::Output)
 where
     A: Future,
