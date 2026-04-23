@@ -164,7 +164,11 @@ impl Ring for IoUringRing {
 
     fn drain_cqes(&mut self, out: &mut [Cqe]) -> usize {
         let mut count = 0;
-        let mut timer_udatas: Vec<u64> = Vec::new();
+        // Collect timer user_data values on the stack so we can drop their
+        // Boxes after releasing the CQ borrow. The ring's SQ is bounded by
+        // `sq_entries` (≤ 256 at construction), so 256 slots is always enough.
+        let mut timer_udatas = [0u64; 256];
+        let mut timer_count = 0usize;
         {
             let cq = self.ring.completion();
             for cqe in cq {
@@ -181,12 +185,15 @@ impl Ring for IoUringRing {
                 // its user_data so we can drop the owning Box after the CQ
                 // iterator (and its borrow on self.ring) is released.
                 if self.timer_specs.contains_key(&udata) {
-                    timer_udatas.push(udata);
+                    if timer_count < timer_udatas.len() {
+                        timer_udatas[timer_count] = udata;
+                        timer_count += 1;
+                    }
                 }
                 count += 1;
             }
         }
-        for udata in timer_udatas {
+        for &udata in &timer_udatas[..timer_count] {
             self.timer_specs.remove(&udata);
         }
         count

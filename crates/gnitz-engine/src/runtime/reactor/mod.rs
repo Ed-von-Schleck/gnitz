@@ -347,6 +347,11 @@ impl Reactor {
             && Instant::now() < deadline
         {
             self.drain_cqes_into_wakers();
+            // Re-check before blocking: drain may have received both CQEs in
+            // one pass, making the 100 ms wait unnecessary.
+            if !self.inner.futex_waitv_armed.get() && self.inner.futex_waitv_cancelled.get() {
+                break;
+            }
             let _ = self.inner.ring.borrow_mut()
                 .submit_and_wait_timeout(1, 100);
         }

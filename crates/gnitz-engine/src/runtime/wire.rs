@@ -334,36 +334,75 @@ pub struct DecodedWire {
     pub batch_backing: Option<Vec<u8>>,
 }
 
+/// Decode all control fields directly from the WAL block's directory without
+/// allocating a `Batch`. Each directory entry stores (data_offset: u32,
+/// data_size: u32) at `HEADER_SIZE + region * 8`. For a 1-row control block
+/// every u64 region is exactly 8 bytes, so we can index the fields directly.
 fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     use gnitz_wire::control as ctrl;
 
-    let (batch, _) = Batch::decode_from_wal_block(data, &CONTROL_SCHEMA_DESC)
-        .map_err(|_| "control block invalid")?;
-    if batch.count != 1 {
-        return Err("control block must have 1 row");
+    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE; // 48
+    const DIR_ENTRY: usize = 8;                         // (offset u32, size u32)
+
+    let dir_end = HEADER + ctrl::NUM_REGIONS * DIR_ENTRY;
+    if data.len() < dir_end {
+        return Err("control block too small");
     }
 
-    let read_u64_col = |pi: usize| -> u64 {
-        u64::from_le_bytes(batch.col_data(pi)[0..8].try_into().unwrap())
+    // Validate WAL version and region count without computing the checksum.
+    let version = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    if version != gnitz_wire::WAL_FORMAT_VERSION {
+        return Err("control block wrong version");
+    }
+    let num_regions = u32::from_le_bytes(data[32..36].try_into().unwrap());
+    if num_regions as usize != ctrl::NUM_REGIONS {
+        return Err("control block wrong region count");
+    }
+
+    // Read the (data_offset, data_size) pair for region `r`.
+    let dir = |r: usize| -> (usize, usize) {
+        let base = HEADER + r * DIR_ENTRY;
+        let off  = u32::from_le_bytes(data[base    ..base + 4].try_into().unwrap()) as usize;
+        let sz   = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+        (off, sz)
     };
 
-    let null_bmp     = batch.get_null_word(0);
-    let status       = read_u64_col(ctrl::PAYLOAD_STATUS) as u32;
-    let client_id    = read_u64_col(ctrl::PAYLOAD_CLIENT_ID);
-    let target_id    = read_u64_col(ctrl::PAYLOAD_TARGET_ID);
-    let flags        = read_u64_col(ctrl::PAYLOAD_FLAGS);
-    let seek_pk_lo   = read_u64_col(ctrl::PAYLOAD_SEEK_PK_LO);
-    let seek_pk_hi   = read_u64_col(ctrl::PAYLOAD_SEEK_PK_HI);
-    let seek_col_idx = read_u64_col(ctrl::PAYLOAD_SEEK_COL_IDX);
-    let request_id   = read_u64_col(ctrl::PAYLOAD_REQUEST_ID);
+    // Read a u64 from a fixed-width u64 region (exactly 8 bytes for 1 row).
+    let read_u64 = |r: usize| -> Result<u64, &'static str> {
+        let (off, sz) = dir(r);
+        if sz < 8 || off + 8 > data.len() {
+            return Err("control block region out of bounds");
+        }
+        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+    };
+
+    let null_bmp     = read_u64(ctrl::REGION_NULL_BMP)?;
+    let status       = read_u64(ctrl::REGION_STATUS)? as u32;
+    let client_id    = read_u64(ctrl::REGION_CLIENT_ID)?;
+    let target_id    = read_u64(ctrl::REGION_TARGET_ID)?;
+    let flags        = read_u64(ctrl::REGION_FLAGS)?;
+    let seek_pk_lo   = read_u64(ctrl::REGION_SEEK_PK_LO)?;
+    let seek_pk_hi   = read_u64(ctrl::REGION_SEEK_PK_HI)?;
+    let seek_col_idx = read_u64(ctrl::REGION_SEEK_COL_IDX)?;
+    let request_id   = read_u64(ctrl::REGION_REQUEST_ID)?;
 
     let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let error_msg = if error_is_null {
         Vec::new()
     } else {
+        let (err_off, err_sz) = dir(ctrl::REGION_ERROR_MSG);
+        if err_sz < 16 || err_off + 16 > data.len() {
+            return Err("error_msg region out of bounds");
+        }
         let mut st = [0u8; 16];
-        st.copy_from_slice(&batch.col_data(ctrl::PAYLOAD_ERROR_MSG)[0..16]);
-        decode_german_string(&st, &batch.blob)
+        st.copy_from_slice(&data[err_off..err_off + 16]);
+        let (blob_off, blob_sz) = dir(ctrl::REGION_BLOB);
+        let blob = if blob_sz > 0 && blob_off + blob_sz <= data.len() {
+            &data[blob_off..blob_off + blob_sz]
+        } else {
+            &[]
+        };
+        decode_german_string(&st, blob)
     };
 
     Ok(DecodedControl {

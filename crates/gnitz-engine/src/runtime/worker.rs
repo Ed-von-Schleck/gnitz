@@ -234,6 +234,12 @@ impl WorkerProcess {
                 Some(v) => v,
                 None => return false,
             };
+            // Honour the epoch fence: a new epoch starts after FLAG_FLUSH
+            // resets the write cursor. Consuming a post-epoch message here
+            // would silently treat it as preloaded exchange data.
+            if next.epoch != self.expected_epoch {
+                return false;
+            }
             self.read_cursor = new_cursor;
             flags = next.flags;
             target_id = next.target_id as i64;
@@ -1208,6 +1214,48 @@ mod tests {
         unsafe {
             libc::munmap(region_ptr as *mut libc::c_void, region_size);
         }
+    }
+
+    #[test]
+    fn append_row_from_batch_copies_long_string_blob() {
+        use crate::schema::{SchemaColumn, type_code, encode_german_string, decode_german_string};
+        // Schema: pk (U64) + name (STRING, size=16).
+        let mut sd = SchemaDescriptor::default();
+        sd.num_columns = 2;
+        sd.pk_index = 0;
+        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
+        sd.columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+
+        let long_name = b"this name is definitely longer than twelve bytes";
+
+        // Build source batch with a long string stored in src.blob.
+        let mut src = Batch::with_schema(sd, 1);
+        src.extend_pk_lo(&7u64.to_le_bytes());
+        src.extend_pk_hi(&0u64.to_le_bytes());
+        src.extend_weight(&1i64.to_le_bytes());
+        src.extend_null_bmp(&0u64.to_le_bytes());
+        // payload column 0 = name (pi=0 in payload order)
+        let german = encode_german_string(long_name, &mut src.blob);
+        src.extend_col(0, &german);
+        src.count = 1;
+
+        // Destination batch: starts with an existing blob entry so the offset
+        // written into dest.blob is non-zero (verifies the offset is updated,
+        // not hard-coded to 0).
+        let mut dst = Batch::with_schema(sd, 1);
+        dst.blob.extend_from_slice(b"prefixdata"); // 10 bytes already in blob
+        dst.schema = Some(sd);
+
+        dst.append_row_from_batch(&src, 0, 2);
+
+        assert_eq!(dst.count, 1);
+        // The long string cell lives in col(0) of the payload (pi=0).
+        let cell = &dst.col_data(0)[0..16];
+        let decoded = decode_german_string(cell.try_into().unwrap(), &dst.blob);
+        assert_eq!(decoded, long_name, "blob content must round-trip through append_row_from_batch");
+        // The new blob offset must be >= 10 (after the prefix).
+        let new_offset = u64::from_le_bytes(cell[8..16].try_into().unwrap()) as usize;
+        assert!(new_offset >= 10, "blob offset should be past the pre-existing prefix data");
     }
 
     #[test]

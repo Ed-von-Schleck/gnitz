@@ -197,6 +197,11 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
         "W2M capacity={} too small; must be >= 2*MAX_W2M_MSG ({}) + HEADER ({}) + 16",
         capacity, 2 * MAX_W2M_MSG, W2M_HEADER_SIZE,
     );
+    // The SKIP-wrap path writes an 8-byte sentinel and an 8-byte size prefix
+    // at phys(vwc). If capacity is not 8-aligned, phys(vwc) can sit fewer than
+    // 8 bytes from the end of the buffer, causing those writes to cross the
+    // mmap boundary.
+    assert!(capacity % 8 == 0, "W2M capacity={} must be 8-byte aligned", capacity);
     // Zero the header first so re-init on a previously-live region
     // clears every byte, including padding.
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
@@ -392,6 +397,7 @@ pub unsafe fn try_reserve(
 #[cfg(test)]
 pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     assert!(capacity >= W2M_HEADER_SIZE as u64 + 16);
+    assert!(capacity % 8 == 0, "W2M capacity={} must be 8-byte aligned", capacity);
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
@@ -971,6 +977,34 @@ mod tests {
             );
 
             free_region(ptr, size);
+        }
+    }
+
+    /// `init_region` must reject non-8-aligned capacity: the SKIP-wrap
+    /// logic writes an 8-byte sentinel and a size prefix at `phys(vwc)`,
+    /// which can cross the end of the buffer when `cap` is not aligned.
+    #[test]
+    #[should_panic]
+    fn init_region_rejects_unaligned_capacity() {
+        unsafe {
+            // 7 bytes past the minimum valid capacity → not 8-aligned.
+            let cap = (2 * MAX_W2M_MSG) as usize + W2M_HEADER_SIZE + 16 + 7;
+            let ptr = alloc_region(cap);
+            init_region(ptr, cap as u64); // must panic
+            free_region(ptr, cap);
+        }
+    }
+
+    /// `init_region_for_tests` must also reject non-8-aligned capacity.
+    #[test]
+    #[should_panic]
+    fn init_region_for_tests_rejects_unaligned_capacity() {
+        unsafe {
+            // Smallest unaligned capacity that satisfies the size lower bound.
+            let cap = W2M_HEADER_SIZE + 16 + 1; // +1 makes it unaligned
+            let ptr = alloc_region(cap);
+            init_region_for_tests(ptr, cap as u64); // must panic
+            free_region(ptr, cap);
         }
     }
 

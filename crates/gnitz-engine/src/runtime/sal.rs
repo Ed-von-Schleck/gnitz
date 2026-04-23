@@ -117,11 +117,13 @@ pub(crate) unsafe fn sal_begin_group(
 ) -> Option<SalGroup> {
     if num_workers > MAX_WORKERS { return None; }
 
+    // payload_size starts as GROUP_HEADER_SIZE (576, a multiple of 8) and grows
+    // only by align8(sz) increments, so it is always a multiple of 8.
     let mut payload_size = GROUP_HEADER_SIZE;
     for &sz in &worker_sizes[..num_workers] {
         if sz > 0 { payload_size += align8(sz as usize); }
     }
-    let total = 8 + align8(payload_size);
+    let total = 8 + payload_size;
     if write_cursor + total > mmap_size { return None; }
 
     let base = write_cursor;

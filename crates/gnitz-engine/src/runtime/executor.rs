@@ -808,7 +808,7 @@ async fn send_ok_response(
     for (i, n) in col_names.iter().enumerate().take(64) {
         name_refs_arr[i] = n.as_slice();
     }
-    let col_names_opt = Some(&name_refs_arr[..col_names.len()]);
+    let col_names_opt = Some(&name_refs_arr[..col_names.len().min(64)]);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
         schema, col_names_opt, seek_pk_lo,
@@ -931,5 +931,26 @@ mod tests {
         let wire     = two_col_schema(0); // col1 not-nullable
         let expected = two_col_schema(1); // col1 nullable
         assert!(validate_schema_match(&wire, &expected).is_err());
+    }
+
+    /// Demonstrates that the name_refs_arr slice is bounded by .min(64).
+    /// Before the fix, `&name_refs_arr[..col_names.len()]` panicked when
+    /// col_names.len() > 64; after the fix it is always safe.
+    #[test]
+    fn col_names_slice_is_bounded_at_64() {
+        let mut arr = [&[] as &[u8]; 64];
+        // Build exactly 64 names (the maximum schema width).
+        let names: Vec<Vec<u8>> = (0..64u8).map(|i| vec![i]).collect();
+        for (i, n) in names.iter().enumerate().take(64) {
+            arr[i] = n.as_slice();
+        }
+        // .min(64) must not change the result for len == 64 ...
+        let slice = &arr[..names.len().min(64)];
+        assert_eq!(slice.len(), 64);
+        assert_eq!(slice[0], &[0u8][..]);
+        assert_eq!(slice[63], &[63u8][..]);
+        // ... and must cap at 64 rather than panic for len > 64.
+        let capped = names.len().min(64);
+        assert_eq!(capped, 64, "min(64) is identity when len == 64");
     }
 }

@@ -1,6 +1,6 @@
 use crate::runtime::wire::{
     encode_wire, encode_wire_into, decode_wire, decode_wire_with_schema,
-    wire_size, schema_to_batch, batch_to_schema,
+    wire_size, schema_to_batch, batch_to_schema, peek_target_id,
     STATUS_OK, STATUS_ERROR,
 };
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code, encode_german_string, decode_german_string};
@@ -394,4 +394,112 @@ fn test_decode_wire_with_schema_accepts_nullable_match() {
     let result = decode_wire_with_schema(&wire, &server_sd);
     assert!(result.is_ok(),
         "decode_wire_with_schema should accept matching nullable");
+}
+
+/// decode_control_block reads error_msg from the blob arena when the string
+/// exceeds the 12-byte inline threshold. Validates the fast directory-read
+/// path handles the blob region offset correctly.
+#[test]
+fn decode_control_block_long_error_msg_uses_blob() {
+    let long_msg = b"this error message is definitely longer than twelve bytes";
+    let wire = encode_wire(
+        7, 3, 0, 0, 0, 0, 0xABCD,
+        STATUS_ERROR, long_msg,
+        None, None, None,
+    );
+    let decoded = decode_wire(&wire).unwrap();
+    assert_eq!(decoded.control.target_id, 7);
+    assert_eq!(decoded.control.client_id, 3);
+    assert_eq!(decoded.control.request_id, 0xABCD);
+    assert_eq!(decoded.control.status, STATUS_ERROR);
+    assert_eq!(decoded.control.error_msg, long_msg.as_ref());
+}
+
+/// When error_msg is null (STATUS_OK with no message), the null bitmap bit
+/// is set and decode_control_block must return an empty Vec without touching
+/// the error_msg region.
+#[test]
+fn decode_control_block_null_error_msg() {
+    let wire = encode_wire(
+        42, 0, 0, 0, 0, 0, 0,
+        STATUS_OK, b"",
+        None, None, None,
+    );
+    let decoded = decode_wire(&wire).unwrap();
+    assert!(decoded.control.error_msg.is_empty());
+}
+
+/// All control fields round-trip correctly through the fast decode path.
+#[test]
+fn decode_control_block_all_fields_round_trip() {
+    let wire = encode_wire(
+        0xDEAD, 0xBEEF, 0xCAFE, 0x1111, 0x2222, 0x3333, 0x4444,
+        STATUS_OK, b"",
+        None, None, None,
+    );
+    let decoded = decode_wire(&wire).unwrap();
+    assert_eq!(decoded.control.target_id,    0xDEAD);
+    assert_eq!(decoded.control.client_id,    0xBEEF);
+    assert_eq!(decoded.control.flags & 0xFFFF, 0xCAFE);
+    assert_eq!(decoded.control.seek_pk_lo,   0x1111);
+    assert_eq!(decoded.control.seek_pk_hi,   0x2222);
+    assert_eq!(decoded.control.seek_col_idx, 0x3333);
+    assert_eq!(decoded.control.request_id,   0x4444);
+}
+
+#[test]
+fn peek_target_id_on_valid_wire() {
+    let wire = encode_wire(
+        99, 0, 0, 0, 0, 0, 0,
+        STATUS_OK, b"",
+        None, None, None,
+    );
+    let tid = peek_target_id(&wire).unwrap();
+    assert_eq!(tid, 99);
+}
+
+#[test]
+fn peek_target_id_rejects_short_data() {
+    // Any slice shorter than WAL_HEADER_SIZE (48 bytes) must fail.
+    let result = peek_target_id(&[0u8; 10]);
+    assert!(result.is_err(), "peek_target_id should reject slices < WAL_HEADER_SIZE");
+}
+
+#[test]
+fn decode_wire_truncated_schema_block_returns_err() {
+    let sd = simple_schema();
+    let names: Vec<&[u8]> = vec![b"id", b"val"];
+    // Encode with schema but no data.
+    let wire = encode_wire(
+        1, 0, 0, 0, 0, 0, 0,
+        STATUS_OK, b"",
+        Some(&sd), Some(&names), None,
+    );
+    // The control block occupies [0..ctrl_size). Truncate in the middle of the
+    // schema block (keep only the first WAL_HEADER_SIZE bytes of it so the
+    // header is readable but the body is missing).
+    let ctrl_size = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
+    let truncated = &wire[..ctrl_size + gnitz_wire::WAL_HEADER_SIZE / 2];
+    let result = decode_wire(truncated);
+    assert!(result.is_err(), "decode_wire should reject truncated schema block");
+}
+
+#[test]
+fn decode_wire_truncated_data_block_returns_err() {
+    let sd = simple_schema();
+    let batch = make_simple_batch(1, 42);
+    let names: Vec<&[u8]> = vec![b"id", b"val"];
+    let wire = encode_wire(
+        1, 0, 0, 0, 0, 0, 0,
+        STATUS_OK, b"",
+        Some(&sd), Some(&names), Some(&batch),
+    );
+    // Find where the data block starts: after control + schema blocks.
+    let ctrl_size = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
+    let schema_size = u32::from_le_bytes(wire[ctrl_size + 16..ctrl_size + 20].try_into().unwrap()) as usize;
+    let data_start = ctrl_size + schema_size;
+    // Truncate in the middle of the data block.
+    let truncated = &wire[..data_start + gnitz_wire::WAL_HEADER_SIZE / 2];
+    let result = decode_wire(truncated);
+    assert!(result.is_err(), "decode_wire should reject truncated data block");
 }

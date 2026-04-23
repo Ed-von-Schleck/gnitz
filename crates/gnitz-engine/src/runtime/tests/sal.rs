@@ -1,5 +1,6 @@
 use crate::runtime::sal::{
-    sal_write_group, sal_read_group_header,
+    sal_write_group, sal_read_group_header, sal_begin_group,
+    MAX_WORKERS,
     SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
 };
 use crate::runtime::sys as ipc_sys;
@@ -263,6 +264,40 @@ fn test_sal_checkpoint_reset() {
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, vec![0x22u8; 32].as_slice());
 
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn sal_begin_group_rejects_too_many_workers() {
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+        let sizes = [0u32; MAX_WORKERS + 1];
+        // num_workers = MAX_WORKERS + 1 must return None.
+        let result = sal_begin_group(
+            ptr, 0, size,
+            MAX_WORKERS + 1, 0, 0, 0, 1,
+            &sizes[..MAX_WORKERS + 1],
+        );
+        assert!(result.is_none(), "sal_begin_group must reject num_workers > MAX_WORKERS");
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn sal_begin_group_rejects_cursor_overflow() {
+    unsafe {
+        let size = 512usize;
+        let ptr = alloc_mmap(size);
+        // Push the cursor so close to the end that the group header won't fit.
+        let sizes = [0u32; 1];
+        let result = sal_begin_group(
+            ptr, size - 1, size,
+            1, 0, 0, 0, 1,
+            &sizes[..1],
+        );
+        assert!(result.is_none(), "sal_begin_group must reject when cursor + total > mmap_size");
         free_mmap(ptr, size);
     }
 }
