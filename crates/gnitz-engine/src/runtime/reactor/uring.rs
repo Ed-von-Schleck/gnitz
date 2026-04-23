@@ -164,37 +164,26 @@ impl Ring for IoUringRing {
 
     fn drain_cqes(&mut self, out: &mut [Cqe]) -> usize {
         let mut count = 0;
-        // Collect timer user_data values on the stack so we can drop their
-        // Boxes after releasing the CQ borrow. The ring's SQ is bounded by
-        // `sq_entries` (≤ 256 at construction), so 256 slots is always enough.
-        let mut timer_udatas = [0u64; 256];
-        let mut timer_count = 0usize;
         {
+            // CQ iterator borrows `self.ring`; `self.timer_specs` is a
+            // separate field and cannot be mutated while the iterator is live.
+            // Two-pass: collect CQEs into `out`, then remove timer entries
+            // from `timer_specs` by scanning `out[..count]`. Removes on
+            // non-timer keys are no-ops (HashMap returns None), so there is
+            // no need to pre-check membership.
             let cq = self.ring.completion();
             for cqe in cq {
-                if count >= out.len() {
-                    break;
-                }
-                let udata = cqe.user_data();
+                if count >= out.len() { break; }
                 out[count] = Cqe {
-                    user_data: udata,
+                    user_data: cqe.user_data(),
                     res: cqe.result(),
                     flags: cqe.flags(),
                 };
-                // If this CQE was produced by a `prep_timeout` SQE, record
-                // its user_data so we can drop the owning Box after the CQ
-                // iterator (and its borrow on self.ring) is released.
-                if self.timer_specs.contains_key(&udata) {
-                    if timer_count < timer_udatas.len() {
-                        timer_udatas[timer_count] = udata;
-                        timer_count += 1;
-                    }
-                }
                 count += 1;
             }
         }
-        for &udata in &timer_udatas[..timer_count] {
-            self.timer_specs.remove(&udata);
+        for cqe in &out[..count] {
+            self.timer_specs.remove(&cqe.user_data);
         }
         count
     }

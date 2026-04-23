@@ -201,7 +201,13 @@ impl<T> AsyncMutex<T> {
 
     fn release(&self) {
         self.locked.set(false);
-        if let Some(w) = self.waiters.borrow_mut().pop_front() { w.wake(); }
+        // Wake all waiters, not just one. A cancelled LockFuture leaves a
+        // stale waker in the queue; popping exactly one risks consuming
+        // that stale entry and permanently blocking every live waiter.
+        // On a single-threaded executor the thundering-herd cost is free:
+        // only the first task to poll acquires the lock; the rest re-park.
+        let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
+        for w in waiters { w.wake(); }
     }
 }
 
@@ -279,18 +285,25 @@ impl AsyncRwLock {
         let mut s = self.inner.borrow_mut();
         s.readers -= 1;
         if s.readers == 0 && s.writers_waiting > 0 {
-            if let Some(w) = s.write_waiters.pop_front() {
-                w.wake();
-            }
+            // Wake all queued write waiters. A single pop risks handing the
+            // baton to a stale waker from a cancelled WriteFuture, leaving
+            // every live write waiter permanently blocked.
+            let writers = std::mem::take(&mut s.write_waiters);
+            drop(s);
+            for w in writers { w.wake(); }
         }
     }
 
     fn release_write(&self) {
         let mut s = self.inner.borrow_mut();
         s.has_writer = false;
-        // Writer-preference: wake the next writer before any readers.
-        if let Some(w) = s.write_waiters.pop_front() {
-            w.wake();
+        // Writer-preference: wake all queued writers before any readers.
+        // A single pop risks handing the baton to a stale waker from a
+        // cancelled WriteFuture, leaving every live write waiter blocked.
+        let writers = std::mem::take(&mut s.write_waiters);
+        if !writers.is_empty() {
+            drop(s);
+            for w in writers { w.wake(); }
             return;
         }
         // No queued writer — wake all parked readers.
@@ -369,9 +382,27 @@ impl<'a> Drop for WriteFuture<'a> {
         if self.parked {
             let mut s = self.lock.inner.borrow_mut();
             s.writers_waiting -= 1;
-            // Cancelled: if no writer holds the lock and no other writer
-            // is waiting, wake any parked readers.
-            if !s.has_writer && s.writers_waiting == 0 {
+            if s.has_writer {
+                // Another writer holds the lock; it passes the baton on release.
+                return;
+            }
+            if s.readers == 0 {
+                // Lock is completely free. Pass the baton: wake any remaining
+                // write waiters (some may be stale from prior cancellations;
+                // stale wakes are harmless, live ones will acquire), and fall
+                // through to read waiters only when no write waiters remain.
+                let writers = std::mem::take(&mut s.write_waiters);
+                if !writers.is_empty() {
+                    drop(s);
+                    for w in writers { w.wake(); }
+                    return;
+                }
+                let readers = std::mem::take(&mut s.read_waiters);
+                drop(s);
+                for w in readers { w.wake(); }
+            } else if s.writers_waiting == 0 {
+                // Readers hold the lock; this was the last live write waiter.
+                // Readers blocked by `writers_waiting > 0` can now enter.
                 let readers = std::mem::take(&mut s.read_waiters);
                 drop(s);
                 for w in readers { w.wake(); }

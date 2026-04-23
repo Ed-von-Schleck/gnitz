@@ -1764,6 +1764,85 @@ mod tests {
         assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {:?}", o);
     }
 
+    /// A `LockFuture` dropped while parked (e.g. via `select2`) leaves a
+    /// stale waker in `AsyncMutex::waiters`.  `release()` must not pop
+    /// exactly one waker — doing so risks consuming the stale entry and
+    /// leaving all live waiters permanently blocked.
+    #[test]
+    fn async_mutex_cancelled_waiter_does_not_block_remaining() {
+        let r = make_reactor();
+        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        // Task A: holds the mutex, yields once (letting B and C park), then releases.
+        let m_a = Rc::clone(&mutex);
+        r.spawn(async move {
+            let _g = m_a.lock().await;
+            YieldOnce::new().await;
+        });
+
+        // Task B: races lock acquisition against an immediately-ready future.
+        // `select2` polls the LockFuture first (it parks its waker inside
+        // `waiters`), then `ready()` resolves. The LockFuture is dropped,
+        // but its stale waker remains in the queue.
+        let m_b = Rc::clone(&mutex);
+        r.spawn(async move {
+            let _ = select2(m_b.lock(), std::future::ready(())).await;
+        });
+
+        // Task C: must acquire the mutex once A releases — must not be
+        // blocked by B's stale waker absorbing the single-pop release signal.
+        let m_c = Rc::clone(&mutex);
+        let d = Rc::clone(&done);
+        r.spawn(async move {
+            let _g = m_c.lock().await;
+            d.set(true);
+        });
+
+        for _ in 0..20 { r.tick(false); }
+        assert!(done.get(),
+            "task C must acquire the mutex after task B's cancelled waiter");
+    }
+
+    /// A `WriteFuture` dropped while parked leaves a stale waker in
+    /// `AsyncRwLock::write_waiters`.  `release_write()` popping exactly
+    /// one waker risks consuming the stale entry and leaving all remaining
+    /// live write waiters permanently blocked.
+    #[test]
+    fn async_rwlock_cancelled_write_waiter_does_not_block_remaining() {
+        let r = make_reactor();
+        let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+        let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        // Task A: holds the write lock, yields once, then releases.
+        let l_a = Rc::clone(&lock);
+        r.spawn(async move {
+            let _g = l_a.write().await;
+            YieldOnce::new().await;
+        });
+
+        // Task B: races write acquisition against an immediately-ready future.
+        // Its WriteFuture parks (parked=true, writers_waiting bumped) then
+        // is dropped by select2 with its stale waker still in write_waiters.
+        let l_b = Rc::clone(&lock);
+        r.spawn(async move {
+            let _ = select2(l_b.write(), std::future::ready(())).await;
+        });
+
+        // Task C: must acquire the write lock after A releases — must not be
+        // blocked by B's stale waker absorbing the single-pop release signal.
+        let l_c = Rc::clone(&lock);
+        let d = Rc::clone(&done);
+        r.spawn(async move {
+            let _g = l_c.write().await;
+            d.set(true);
+        });
+
+        for _ in 0..20 { r.tick(false); }
+        assert!(done.get(),
+            "task C must acquire the write lock after task B's cancelled waiter");
+    }
+
     #[test]
     fn join2_waits_for_both() {
         let r = make_reactor();
@@ -2740,5 +2819,252 @@ mod tests {
             "conn with outstanding send must NOT be reaped yet");
         assert!(r.inner.closing_fds.borrow().contains(&77),
             "conn deferred by outstanding send must stay in closing_fds");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // RecvState state-machine unit tests.
+    //
+    // io.rs has zero unit tests even though RecvState has four distinct
+    // transitions (NeedMore, HeaderDone, MessageDone, Disconnect).
+    // These tests drive the state machine directly — no io_uring needed.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn recv_state_partial_header_accumulates() {
+        let mut rs = io::RecvState::new();
+        // Feed 2 of 4 header bytes.
+        assert!(matches!(rs.advance(2), io::RecvAdvance::NeedMore));
+        let (_, rem) = rs.remaining();
+        assert_eq!(rem, 2, "remaining must reflect the 2 consumed header bytes");
+    }
+
+    #[test]
+    fn recv_state_zero_payload_len_disconnects() {
+        let mut rs = io::RecvState::new();
+        // hdr_buf is all-zeros → payload_len = 0 → protocol violation.
+        assert!(matches!(rs.advance(4), io::RecvAdvance::Disconnect));
+    }
+
+    #[test]
+    fn recv_state_payload_accumulates_then_message_done() {
+        let mut rs = io::RecvState::new();
+        rs.hdr_buf = 8u32.to_le_bytes();
+        assert!(matches!(rs.advance(4), io::RecvAdvance::HeaderDone));
+
+        let buf = unsafe { libc::malloc(8) as *mut u8 };
+        rs.start_payload(buf, 8);
+
+        // Partial payload.
+        assert!(matches!(rs.advance(5), io::RecvAdvance::NeedMore));
+        // Remaining 3 bytes complete the message.
+        assert!(matches!(rs.advance(3), io::RecvAdvance::MessageDone));
+
+        let (ret_ptr, ret_len) = rs.take_message();
+        assert_eq!(ret_ptr, buf);
+        assert_eq!(ret_len, 8);
+
+        // After take_message the state must be back in header phase.
+        let (_, rem) = rs.remaining();
+        assert_eq!(rem, 4, "take_message must reset to header phase");
+
+        unsafe { libc::free(buf as *mut libc::c_void); }
+    }
+
+    #[test]
+    fn recv_state_free_payload_resets_to_header() {
+        let mut rs = io::RecvState::new();
+        let buf = unsafe { libc::malloc(4) as *mut u8 };
+        rs.start_payload(buf, 4);
+        // free_payload must release the allocation and reset the phase.
+        rs.free_payload();
+        let (_, rem) = rs.remaining();
+        assert_eq!(rem, 4, "free_payload must reset to Header{{pos:0}}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AsyncRwLock writer-preference: new readers blocked by a parked
+    // writer.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// When a write waiter is queued (writers_waiting > 0), ReadFuture
+    /// must block. The writer acquires the lock before the new reader.
+    #[test]
+    fn async_rwlock_new_readers_blocked_by_waiting_writer() {
+        let r = make_reactor();
+        let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+        let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Task A: holds read lock, yields once.
+        let l_a = Rc::clone(&lock);
+        let o_a = Rc::clone(&order);
+        r.spawn(async move {
+            let _g = l_a.read().await;
+            o_a.borrow_mut().push("R1");
+            YieldOnce::new().await;
+        });
+
+        // Task B: writer — parks while A holds the read lock.
+        let l_b = Rc::clone(&lock);
+        let o_b = Rc::clone(&order);
+        r.spawn(async move {
+            let _g = l_b.write().await;
+            o_b.borrow_mut().push("W");
+        });
+
+        // Task C: new reader — must be blocked by the waiting writer
+        // (writer-preference) and only enter after B releases.
+        let l_c = Rc::clone(&lock);
+        let o_c = Rc::clone(&order);
+        r.spawn(async move {
+            let _g = l_c.read().await;
+            o_c.borrow_mut().push("R2");
+        });
+
+        r.block_until_idle();
+        let o = order.borrow().clone();
+        let w_pos  = o.iter().position(|&s| s == "W").expect("W not seen");
+        let r2_pos = o.iter().position(|&s| s == "R2").expect("R2 not seen");
+        assert!(w_pos < r2_pos,
+            "writer-preference violated: W must precede R2, got {:?}", o);
+    }
+
+    /// WriteFuture::Drop path 3: readers hold the lock, the dropped
+    /// WriteFuture was the LAST live write waiter. Pending readers
+    /// blocked by `writers_waiting > 0` must be unblocked.
+    #[test]
+    fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
+        let r = make_reactor();
+        let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+        let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        // cancel channel: dropping the sender unblocks select2 in Task B.
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+        // Task A: holds read lock for many ticks so B stays parked.
+        let l_a = Rc::clone(&lock);
+        r.spawn(async move {
+            let _g = l_a.read().await;
+            for _ in 0..10 { YieldOnce::new().await; }
+        });
+
+        // Task B: races write acquisition vs cancel_rx. WriteFuture parks
+        // (writers_waiting=1); cancel_rx stays Pending until we drop cancel_tx.
+        let l_b = Rc::clone(&lock);
+        r.spawn(async move {
+            let _ = select2(l_b.write(), cancel_rx).await;
+        });
+
+        // Task C: new reader; parks in read_waiters while B is alive.
+        let l_c = Rc::clone(&lock);
+        let d = Rc::clone(&done);
+        r.spawn(async move {
+            let _g = l_c.read().await;
+            d.set(true);
+        });
+
+        // Let A, B, C all park (A acquires read, B parks write, C parks read).
+        for _ in 0..5 { r.tick(false); }
+        assert!(!done.get(),
+            "C must be blocked while write waiter B is alive");
+
+        // Cancel B: WriteFuture::Drop path 3 must wake C.
+        drop(cancel_tx);
+        for _ in 0..5 { r.tick(false); }
+        assert!(done.get(),
+            "C must unblock when the last write waiter (B) is cancelled");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // KIND_ACCEPT CQE dispatch.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_accept_queues_fd_when_res_non_negative() {
+        let r = make_reactor();
+        // flags=0 → CQE_F_MORE not set → re-arm attempted; server_fd=-1 guards it.
+        r.inject_cqe(KIND_ACCEPT, 0, 7);
+        r.drain_injected_cqes();
+        let q: Vec<i32> = r.inner.accept_queue.borrow().iter().copied().collect();
+        assert_eq!(q, vec![7], "KIND_ACCEPT res>=0 must push the fd to accept_queue");
+    }
+
+    #[test]
+    fn dispatch_accept_wakes_waiter_when_present() {
+        let r = make_reactor();
+        let waker = make_waker(42, Arc::clone(&r.inner.run_queue));
+        *r.inner.accept_waker.borrow_mut() = Some(waker);
+
+        r.inject_cqe(KIND_ACCEPT, 0, 5);
+        r.drain_injected_cqes();
+
+        let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
+        assert!(q.contains(&42), "KIND_ACCEPT must wake the registered accept_waker");
+        assert!(r.inner.accept_waker.borrow().is_none(),
+            "KIND_ACCEPT must consume (take) the accept_waker");
+    }
+
+    #[test]
+    fn dispatch_accept_ignores_error_result() {
+        let r = make_reactor();
+        r.inject_cqe(KIND_ACCEPT, 0, -libc::ECONNABORTED);
+        r.drain_injected_cqes();
+        assert!(r.inner.accept_queue.borrow().is_empty(),
+            "KIND_ACCEPT with res<0 must not push to accept_queue");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // join_all edge cases.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn join_all_empty_returns_empty_vec() {
+        let r = make_reactor();
+        let result = r.block_on(async {
+            join_all(std::iter::empty::<std::future::Ready<i32>>()).await
+        });
+        assert!(result.is_empty(), "join_all on empty iterator must return empty vec");
+    }
+
+    #[test]
+    fn join_all_single_future_completes() {
+        let r = make_reactor();
+        let result = r.block_on(async {
+            join_all(std::iter::once(async { 99u32 })).await
+        });
+        assert_eq!(result, vec![99u32]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // mpsc::try_recv: non-blocking drain used by the committer.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mpsc_try_recv_drains_queue_without_blocking() {
+        let (tx, mut rx) = mpsc::unbounded::<i32>();
+        tx.send(10);
+        tx.send(20);
+        tx.send(30);
+        assert_eq!(rx.try_recv(), Some(10));
+        assert_eq!(rx.try_recv(), Some(20));
+        assert_eq!(rx.try_recv(), Some(30));
+        assert_eq!(rx.try_recv(), None, "queue must be empty after full drain");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // alloc_request_id wrap: u64::MAX is reserved; the counter must
+    // skip it and wrap to 1.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn alloc_request_id_skips_max_and_wraps_to_one() {
+        let r = make_reactor();
+        // Position counter so the next allocation returns u64::MAX - 1
+        // and the one after would naturally hit u64::MAX (reserved).
+        r.inner.next_request_id.set(u64::MAX - 1);
+        let id1 = r.alloc_request_id();
+        assert_eq!(id1, u64::MAX - 1);
+        let id2 = r.alloc_request_id();
+        assert_eq!(id2, 1, "counter must skip u64::MAX and wrap to 1");
+        assert_ne!(id2, u64::MAX, "u64::MAX is reserved and must never be returned");
     }
 }

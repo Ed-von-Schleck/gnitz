@@ -135,9 +135,11 @@ after fsync. Never send `done` before fsync.
 `gnitz_fatal_abort!`. Workers may have observed un-persisted data;
 split-brain recovery is not implementable.
 
-**Panic isolation** — `reactor.poll_task` wraps in `catch_unwind`. Sync
-calls inside async handlers that can panic on malformed input must use
-`guard_panic` so the task survives and the handler returns `STATUS_ERROR`.
+**Panic isolation** — `reactor.poll_task` does NOT wrap in `catch_unwind`;
+a panic in any task propagates up through `tick` and crashes the process.
+Sync calls inside async handlers that can panic on malformed input must use
+`guard_panic` so the handler catches the panic, returns `STATUS_ERROR`, and
+the task itself remains live.
 
 Wrapped: `ingest_to_family`, `dag.evaluate_dag`, `validate_unique_indices`,
 `broadcast_ddl`, `build_merged + write_commit_group`,
@@ -159,8 +161,10 @@ these tasks that can panic must use `guard_panic`.
 
 ## Known latent issues
 
-- **L1** Cancelled lock acquires leave stale wakers (wasted wake, no
-  deadlock). Fix: Drop impl removes the entry.
+- **L1** ~~Cancelled lock acquires leave stale wakers~~ Fixed: `release()`,
+  `release_read()`, `release_write()`, and `WriteFuture::Drop` now wake all
+  waiters rather than one, so a stale waker cannot absorb the baton and block
+  live waiters.
 - **L2** `table_locks` grows unboundedly — no removal on DROP TABLE.
 - **L3** DDL first-fsync 500 ms+ (SAL mmap extent extension).
 - **L4** Scan paths not wrapped in `catch_unwind` — see panic isolation.
