@@ -89,6 +89,10 @@ pub fn op_semi_join_delta_trace(
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
     }
 
+    // Reset cursor to position 0 for the same reason as op_join_delta_trace:
+    // the same trace register may be shared across multiple ops in one tick.
+    cursor.seek(u128::MIN);
+
     let trace_len = cursor.estimated_length();
     if n > trace_len {
         // Adaptive swap: iterate trace, binary-search delta
@@ -220,6 +224,12 @@ pub fn op_join_delta_trace(
     if n == 0 {
         return Batch::empty(out_npc);
     }
+
+    // The same trace register may be reused by multiple join ops in one tick
+    // (e.g. both join_ba and correction_raw share trace_a in a LEFT JOIN circuit).
+    // Reset to position 0 so estimated_length() sees the full trace and
+    // join_dt_swapped iterates from the beginning.
+    cursor.seek(u128::MIN);
 
     let trace_len = cursor.estimated_length();
     if n > trace_len {
