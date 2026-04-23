@@ -36,11 +36,12 @@ pub fn may_contain(filter: &Xor8, key: u128) -> bool {
 /// Serialize an Xor8 filter to bytes.
 /// Format: [magic:4B "GXF1"][seed:u64 LE][block_length:u32 LE][fp_count:u32 LE][fingerprints]
 pub fn serialize(filter: &Xor8) -> Vec<u8> {
-    let fp_count = filter.fingerprints.len() as u32;
+    let fp_count = u32::try_from(filter.fingerprints.len()).expect("xor8 filter too large to serialize");
+    let block_length = u32::try_from(filter.block_length).expect("xor8 block_length too large to serialize");
     let mut buf = Vec::with_capacity(serialized_size(filter));
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&filter.seed.to_le_bytes());
-    buf.extend_from_slice(&(filter.block_length as u32).to_le_bytes());
+    buf.extend_from_slice(&block_length.to_le_bytes());
     buf.extend_from_slice(&fp_count.to_le_bytes());
     buf.extend_from_slice(&filter.fingerprints);
     buf
@@ -63,7 +64,7 @@ pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
         return None;
     }
     // Validate: fp_count should be 3 * block_length for a standard xor8
-    if fp_count != 3 * block_length {
+    if fp_count != block_length.checked_mul(3)? {
         return None;
     }
     if buf.len() < HEADER_SIZE + fp_count {
@@ -161,5 +162,35 @@ mod tests {
         let filter = build(&[1, 2, 3], &[0, 0, 0]).unwrap();
         let bytes = serialize(&filter);
         assert_eq!(bytes.len(), serialized_size(&filter));
+    }
+
+    fn make_header(block_length: u32, fp_count: u32, extra_bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; HEADER_SIZE + extra_bytes];
+        buf[..4].copy_from_slice(MAGIC);
+        // seed stays zero
+        buf[12..16].copy_from_slice(&block_length.to_le_bytes());
+        buf[16..20].copy_from_slice(&fp_count.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn deserialize_rejects_zero_block_length() {
+        // block_length=0 must be rejected even when fp_count also equals 3*0=0.
+        let buf = make_header(0, 0, 0);
+        assert!(deserialize(&buf).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_inconsistent_fp_count() {
+        // block_length=2, fp_count=8 — does not equal 3*2=6.
+        let buf = make_header(2, 8, 8);
+        assert!(deserialize(&buf).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_short_body() {
+        // block_length=1, fp_count=3, but body is only 1 byte instead of 3.
+        let buf = make_header(1, 3, 1);
+        assert!(deserialize(&buf).is_none());
     }
 }
