@@ -32,14 +32,6 @@ enum CursorSource {
 }
 
 impl CursorSource {
-    #[allow(dead_code)]
-    fn count(&self) -> usize {
-        match self {
-            CursorSource::Batch(b) => b.count,
-            CursorSource::Shard(s) => s.count,
-        }
-    }
-
     #[inline]
     fn get_pk(&self, row: usize) -> u128 {
         match self {
@@ -396,15 +388,22 @@ impl ReadCursor {
         self.valid = false;
     }
 
-    /// Approximate the total number of rows accessible via this cursor.
+    /// Approximate the number of rows remaining in this cursor (upper bound).
     /// Used by the adaptive-swap heuristic in join/semi-join operators.
     pub fn estimated_length(&self) -> usize {
-        self.entries.iter().map(|e| e.count).sum()
+        self.entries.iter().map(|e| e.count.saturating_sub(e.position)).sum()
     }
 
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
+    ///
+    /// Returns null for the PK column — use `current_key_lo`/`current_key_hi`
+    /// (or `current_key()`) instead.  Returning only `pk_lo` for a 16-byte PK
+    /// would silently truncate the high half regardless of backing source.
     pub fn col_ptr(&self, col_idx: usize, col_size: usize) -> *const u8 {
         if !self.valid {
+            return ptr::null();
+        }
+        if col_idx == self.schema.pk_index as usize {
             return ptr::null();
         }
         let entry = &self.entries[self.current_entry_idx];
@@ -414,19 +413,8 @@ impl ReadCursor {
         match &entry.source {
             CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
             CursorSource::Batch(b) => {
-                if col_idx == pk_index {
-                    // PK is accessed via current_key_lo / current_key_hi.
-                    // Returning pk_lo (8 bytes) for a 16-byte PK would silently
-                    // truncate the high half; return null so callers see no data
-                    // rather than corrupt data.
-                    return ptr::null();
-                }
                 // Map logical → payload index
-                let payload_idx = if col_idx < pk_index {
-                    col_idx
-                } else {
-                    col_idx - 1
-                };
+                let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
                 if payload_idx < b.num_payload_cols() {
                     b.get_col_ptr(row, payload_idx, col_size).as_ptr()
                 } else {
@@ -450,6 +438,12 @@ impl ReadCursor {
             return 0;
         }
         self.entries[self.current_entry_idx].source.blob_slice().len()
+    }
+
+    /// Current row's PK as a single u128 (convenience over current_key_lo / current_key_hi).
+    #[inline]
+    pub fn current_key(&self) -> u128 {
+        (self.current_key_hi as u128) << 64 | self.current_key_lo as u128
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
@@ -815,5 +809,71 @@ mod tests {
         ];
         let mut cursor = ReadCursor::new(entries, schema);
         assert!(cursor.drain_single_source(0).is_none());
+    }
+
+    #[test]
+    fn test_col_ptr_pk_returns_null() {
+        // PK (logical col 0, pk_index=0) must always return null — callers read
+        // the PK through current_key_lo / current_key_hi instead.
+        let schema = make_schema_i64();
+        let batch = make_batch(&[(42, 0, 1, 99)]);
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let cursor = ReadCursor::new(entries, schema);
+        assert!(cursor.valid);
+        let pk_index = cursor.schema.pk_index as usize; // 0
+        let ptr = cursor.col_ptr(pk_index, 16);
+        assert!(ptr.is_null(), "col_ptr for PK index must return null");
+    }
+
+    #[test]
+    fn test_col_ptr_payload_returns_valid_pointer() {
+        // Payload col at logical index 1 must return a non-null pointer with
+        // the correct value.
+        let schema = make_schema_i64();
+        let batch = make_batch(&[(7, 0, 1, 1234)]);
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let cursor = ReadCursor::new(entries, schema);
+        assert!(cursor.valid);
+        let ptr = cursor.col_ptr(1, 8); // logical col 1 = i64 payload
+        assert!(!ptr.is_null(), "col_ptr for payload col must not be null");
+        let val = i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) });
+        assert_eq!(val, 1234);
+    }
+
+    #[test]
+    fn test_col_ptr_invalid_cursor_returns_null() {
+        let schema = make_schema_i64();
+        let entries: Vec<ReadCursorEntry> = vec![];
+        let cursor = ReadCursor::new(entries, schema);
+        assert!(!cursor.valid);
+        assert!(cursor.col_ptr(1, 8).is_null());
+    }
+
+    #[test]
+    fn test_estimated_length_reflects_remaining() {
+        let schema = make_schema_i64();
+        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let mut cursor = ReadCursor::new(entries, schema);
+        assert_eq!(cursor.estimated_length(), 3);
+        cursor.advance();
+        assert_eq!(cursor.estimated_length(), 2);
+        cursor.advance();
+        assert_eq!(cursor.estimated_length(), 1);
+        cursor.advance();
+        assert_eq!(cursor.estimated_length(), 0);
+    }
+
+    #[test]
+    fn test_current_key_helper() {
+        let schema = make_schema_i64();
+        let batch = make_batch(&[(0xDEAD, 0xBEEF, 1, 0)]);
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let cursor = ReadCursor::new(entries, schema);
+        assert!(cursor.valid);
+        let expected = (0xBEEFu128 << 64) | 0xDEADu128;
+        assert_eq!(cursor.current_key(), expected);
+        assert_eq!(cursor.current_key_lo, 0xDEAD);
+        assert_eq!(cursor.current_key_hi, 0xBEEF);
     }
 }
