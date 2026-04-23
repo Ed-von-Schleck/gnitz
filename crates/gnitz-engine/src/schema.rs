@@ -67,6 +67,7 @@ impl SchemaDescriptor {
     /// region + null-bitmap bit position). Caller must ensure `col_idx != pk_index`.
     #[inline]
     pub fn payload_idx(&self, col_idx: usize) -> usize {
+        debug_assert!(col_idx != self.pk_index as usize, "payload_idx: col_idx must not be the pk_index");
         let pk = self.pk_index as usize;
         if col_idx < pk { col_idx } else { col_idx - 1 }
     }
@@ -82,12 +83,13 @@ pub(crate) const fn type_size(tc: u8) -> u8 {
 
 #[inline]
 pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
+    debug_assert!(bytes.len() >= size, "read_signed: buffer too short ({} < {})", bytes.len(), size);
     match size {
         1 => bytes[0] as i8 as i64,
         2 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
         4 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
         8 => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        _ => 0,
+        _ => unreachable!("read_signed: unexpected size {size}"),
     }
 }
 
@@ -99,6 +101,11 @@ pub(crate) fn promote_to_index_key(
     col_size: usize,
     type_code_val: u8,
 ) -> (u64, u64) {
+    debug_assert!(
+        col_data.len() >= offset + col_size,
+        "promote_to_index_key: buffer too short ({} < {})",
+        col_data.len(), offset + col_size,
+    );
     match type_code_val {
         type_code::U128 => {
             let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
@@ -121,6 +128,7 @@ pub(crate) fn promote_to_index_key(
 /// Returns (dest_struct, is_long_string).
 #[inline]
 pub(crate) fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
+    debug_assert!(src.len() >= 16, "prep_german_string_copy: src must be a 16-byte German string struct");
     let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
     let mut dest = [0u8; 16];
     dest[0..4].copy_from_slice(&src[0..4]);
@@ -149,7 +157,7 @@ pub(crate) fn blob_cache_lookup(
     let h = xxh::checksum(data);
     let key = (h, data.len());
     if let Some(&off) = cache.get(&key) {
-        if &existing_blob[off..off + data.len()] == data {
+        if existing_blob.get(off..off + data.len()) == Some(data) {
             return Some(off);
         }
     }
@@ -185,10 +193,10 @@ pub(crate) fn relocate_german_string_vec(
     let length = u32::from_le_bytes(src_cell[0..4].try_into().unwrap()) as usize;
     let old_offset = u64::from_le_bytes(src_cell[8..16].try_into().unwrap()) as usize;
     if old_offset.saturating_add(length) > src_blob.len() {
-        // Malformed: emit an empty string. prep_german_string_copy already
-        // zero-initialized dest and left dest[8..16] == 0 for long strings;
-        // overwriting the length to 0 makes this a valid short empty string.
-        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
+        // Malformed: emit an empty string. Zero the full inline header so no
+        // stale prefix bytes remain. dest[8..16] is already 0 (prep_german_string_copy
+        // zero-initialized the struct and left the long-string offset as 0).
+        dest[0..8].copy_from_slice(&0u64.to_le_bytes());
         return dest;
     }
     let src_data = &src_blob[old_offset..old_offset + length];
@@ -214,9 +222,15 @@ pub(crate) fn german_string_tail<'a>(
     s: &'a [u8], blob: &'a [u8], length: usize, end: usize,
 ) -> &'a [u8] {
     if length <= SHORT_STRING_THRESHOLD {
+        debug_assert!(s.len() >= 4 + end, "german_string_tail: short string struct too small");
         &s[8..4 + end]
     } else {
         let heap_offset = read_u64_le(s, 8) as usize;
+        debug_assert!(
+            heap_offset + end <= blob.len(),
+            "german_string_tail: long string [{}..{}) overruns blob (len={})",
+            heap_offset + 4, heap_offset + end, blob.len(),
+        );
         &blob[heap_offset + 4..heap_offset + end]
     }
 }
@@ -250,12 +264,18 @@ pub(crate) fn compare_german_strings(
 }
 
 /// Copy a German String from raw 16-byte struct + blob base ptr into the output.
-pub fn write_string_from_raw(
-    col_buf: &mut Vec<u8>,
+/// Returns the relocated 16-byte German string struct; the caller must append it
+/// to its column buffer.
+///
+/// # Safety
+/// `src_blob_ptr`, when non-null, must point to valid memory for at least
+/// `old_offset + length` bytes, where `length` and `old_offset` are read from
+/// the first 16 bytes of `src`.
+pub unsafe fn write_string_from_raw(
     blob: &mut Vec<u8>,
     src: &[u8],
     src_blob_ptr: *const u8,
-) {
+) -> [u8; 16] {
     let (mut dest, is_long) = prep_german_string_copy(src);
     if is_long {
         let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
@@ -266,5 +286,66 @@ pub fn write_string_from_raw(
         blob.extend_from_slice(src_data);
         dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
     }
-    col_buf.extend_from_slice(&dest);
+    dest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Claim 6: the malformed-long-string fallback must zero both the length
+    // field (dest[0..4]) AND the prefix field (dest[4..8]).  Before the fix,
+    // dest[4..8] was left containing the garbage bytes copied from the corrupt
+    // source cell.
+    #[test]
+    fn test_malformed_long_string_fallback_clean_header() {
+        let mut src_cell = [0u8; 16];
+        // length = 20  (> SHORT_STRING_THRESHOLD = 12)
+        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
+        // prefix = 0xDEADBEEF  (stale garbage that must be zeroed on fallback)
+        src_cell[4..8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+        // heap_offset = 999  (well beyond src_blob)
+        src_cell[8..16].copy_from_slice(&999u64.to_le_bytes());
+
+        let src_blob = vec![0u8; 4]; // far too small
+        let mut dst_blob: Vec<u8> = Vec::new();
+
+        let result = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, None);
+
+        assert_eq!(
+            u32::from_le_bytes(result[0..4].try_into().unwrap()), 0,
+            "fallback must emit length=0",
+        );
+        assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
+        assert_eq!(&result[8..16], &[0u8; 8], "fallback must leave blob offset zero");
+        assert!(dst_blob.is_empty(), "fallback must not extend dst_blob");
+    }
+
+    #[test]
+    fn test_blob_cache_lookup_hit_and_miss() {
+        let data = b"hello world test data";
+        let mut cache: HashMap<(u64, usize), usize> = HashMap::new();
+        // First lookup on empty blob: miss, populates cache at offset 0.
+        assert_eq!(blob_cache_lookup(data, &mut cache, &[], 0), None);
+        // Second lookup with the data in the blob: hit.
+        let blob: Vec<u8> = data.to_vec();
+        assert_eq!(blob_cache_lookup(data, &mut cache, &blob, 99), Some(0));
+    }
+
+    #[test]
+    fn test_blob_cache_lookup_empty_always_zero() {
+        let mut cache: HashMap<(u64, usize), usize> = HashMap::new();
+        assert_eq!(blob_cache_lookup(b"", &mut cache, &[], 42), Some(0));
+        assert!(cache.is_empty(), "empty string must not pollute the cache");
+    }
+
+    #[test]
+    fn test_payload_idx_around_pk() {
+        // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1.
+        let mut s = SchemaDescriptor::minimal_u64();
+        s.num_columns = 3;
+        s.pk_index = 1;
+        assert_eq!(s.payload_idx(0), 0);
+        assert_eq!(s.payload_idx(2), 1);
+    }
 }

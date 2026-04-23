@@ -474,12 +474,13 @@ fn write_join_row(
             if ptr.is_null() {
                 output.fill_col_zero(out_pi, 16);
             } else {
-                let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
-                let mut tmp = Vec::new();
-                write_string_from_raw(
-                    &mut tmp, &mut output.blob, src, right_blob,
-                );
-                output.extend_col(out_pi, &tmp);
+                // SAFETY: ptr is a valid col_ptr (non-null checked above);
+                // right_blob covers the full blob of the right cursor entry.
+                let dest = unsafe {
+                    let src = std::slice::from_raw_parts(ptr, 16);
+                    write_string_from_raw(&mut output.blob, src, right_blob)
+                };
+                output.extend_col(out_pi, &dest);
             }
         } else {
             let ptr = right_cursor.col_ptr(ci, cs);

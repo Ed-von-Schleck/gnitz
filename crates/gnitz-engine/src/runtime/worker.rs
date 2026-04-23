@@ -118,9 +118,11 @@ pub struct WorkerProcess {
     // Populated lazily from decoded.schema on first non-DDL message per target.
     schema_cache: HashMap<i64, SchemaDescriptor>,
     // Per-target encoded schema wire block (no col_names on the worker path).
-    // Built once on first send_response call for a target; invalidated whenever
-    // schema_cache is updated with a fresh descriptor from the wire.
-    schema_wire_block_cache: HashMap<i64, Rc<Vec<u8>>>,
+    // Keyed by target_id; value = (num_columns, pk_index, block) so a cached
+    // table block is not reused when send_response is called with an index
+    // schema for the same target_id (FLAG_HAS_PK UniqueIndex path). On
+    // fingerprint mismatch the block is built inline without evicting the cache.
+    schema_wire_block_cache: HashMap<i64, (u32, u32, Rc<Vec<u8>>)>,
 }
 
 impl WorkerProcess {
@@ -440,16 +442,23 @@ impl WorkerProcess {
         schema: Option<&SchemaDescriptor>,
         request_id: u64,
     ) {
-        // Build or reuse the encoded schema block for this target. Workers send
-        // no col_names, so the block is keyed by (target_id, SchemaDescriptor)
-        // and is invalidated whenever schema_cache is refreshed from the wire.
         let tid_key = target_id as i64;
-        // Rc::clone releases the mutable borrow on schema_wire_block_cache before
-        // w2m_writer is accessed below.
+        // Rc::clone releases the mutable borrow on schema_wire_block_cache
+        // before w2m_writer is accessed below. On fingerprint mismatch (index
+        // schema vs cached table schema for the same target_id) build inline
+        // without overwriting — the cached table block remains valid for SEEK/SCAN.
         let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
-            Rc::clone(self.schema_wire_block_cache
-                .entry(tid_key)
-                .or_insert_with(|| Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32))))
+            let nc = s.num_columns;
+            let pi = s.pk_index;
+            if let Some(entry) = self.schema_wire_block_cache.get(&tid_key) {
+                if entry.0 == nc && entry.1 == pi {
+                    return Rc::clone(&entry.2);
+                }
+                return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
+            }
+            let block = Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
+            self.schema_wire_block_cache.insert(tid_key, (nc, pi, block.clone()));
+            block
         });
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);

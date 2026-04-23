@@ -545,7 +545,8 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         }
         let needs_lock = shared.needs_table_lock(target_id);
         let _tlock = if needs_lock {
-            Some(shared.table_lock(target_id).lock().await)
+            let l = shared.table_lock(target_id).lock().await;
+            Some(l)
         } else {
             None
         };
@@ -634,16 +635,19 @@ async fn handle_seek_by_index(
     }
     let schema = shared.get_schema_desc(target_id);
     let result = if target_id >= FIRST_USER_TABLE_ID {
-        MasterDispatcher::fan_out_seek_by_index_async(
+        let r = MasterDispatcher::fan_out_seek_by_index_async(
             shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
             target_id, col_idx, key_lo, key_hi,
-        ).await
+        ).await;
+        r
     } else {
         let cat_ptr = shared.catalog.0;
         unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key_lo, key_hi) }
     };
     match result {
-        Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await,
+        Ok(batch) => {
+            send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await;
+        }
         Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }
 }
