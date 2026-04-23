@@ -144,9 +144,7 @@ fn send_all_iov(sock_fd: RawFd, slices: &[&[u8]]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-/// Maximum allowed payload length — guards against malformed or adversarial length prefixes
-/// that would cause a multi-gigabyte allocation before any data is read.
-const MAX_PAYLOAD_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+const MAX_PAYLOAD_SIZE: usize = gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT;
 
 /// Receive a length-prefixed frame. Returns the payload bytes.
 pub fn recv_framed(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
@@ -247,8 +245,7 @@ mod tests {
     #[test]
     fn test_recv_framed_payload_too_large() {
         let (a, b) = make_socketpair();
-        // Claim MAX_PAYLOAD_SIZE + 1 bytes — must error before allocating.
-        let huge: u32 = (256 * 1024 * 1024 + 1) as u32;
+        let huge: u32 = (MAX_PAYLOAD_SIZE + 1) as u32;
         let hdr = huge.to_le_bytes();
         unsafe { libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0); }
         let result = recv_framed(b);

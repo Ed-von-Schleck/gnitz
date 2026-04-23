@@ -74,6 +74,10 @@ fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
         return Err(ClientError::ServerError(
             format!("column index {} exceeds maximum 511", col_idx)));
     }
+    if owner_id > (u64::MAX >> 9) {
+        return Err(ClientError::ServerError(
+            format!("owner_id {} exceeds 55-bit maximum for column ID packing", owner_id)));
+    }
     Ok((owner_id << 9) | col_idx as u64)
 }
 
@@ -425,6 +429,8 @@ impl GnitzClient {
         circuit: CircuitGraph,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
+        circuit.validate().map_err(ClientError::ServerError)?;
+
         let vid = if circuit.view_id == 0 {
             self.conn.alloc_table_id()?
         } else {
@@ -757,5 +763,31 @@ impl GnitzClient {
             .u64_val(0);
         self.conn.push(VIEW_TAB, &view_s, &vb)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_col_id_rejects_col_idx_too_large() {
+        assert!(pack_col_id(1, 511).is_ok());
+        assert!(pack_col_id(1, 512).is_err());
+    }
+
+    #[test]
+    fn pack_col_id_rejects_owner_id_too_large() {
+        let max_valid = u64::MAX >> 9;
+        assert!(pack_col_id(max_valid, 0).is_ok());
+        assert!(pack_col_id(max_valid + 1, 0).is_err());
+        assert!(pack_col_id(u64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn pack_col_id_roundtrip() {
+        let id = pack_col_id(12345, 7).unwrap();
+        assert_eq!(id >> 9, 12345);
+        assert_eq!(id & 0x1FF, 7);
     }
 }

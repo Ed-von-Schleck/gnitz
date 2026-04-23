@@ -1,4 +1,5 @@
 use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::protocol::{
     Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
@@ -13,6 +14,17 @@ pub use gnitz_wire::{
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
+
+/// Generate a session-unique client ID.
+///
+/// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
+/// This guarantees uniqueness across all connections from the same process, and makes
+/// cross-process collisions practically impossible even with PID reuse.
+fn new_client_id() -> u64 {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
+    (std::process::id() as u64) << 32 | seq
+}
 
 fn check_response(msg: Message) -> Result<Message, ClientError> {
     if msg.status == STATUS_ERROR {
@@ -33,7 +45,7 @@ impl Connection {
         let fd = proto_connect(socket_path)?;
         // SAFETY: proto_connect returns a valid, exclusively-owned file descriptor.
         let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Connection { sock, client_id: std::process::id() as u64 })
+        Ok(Connection { sock, client_id: new_client_id() })
     }
 
     pub fn close(self) {

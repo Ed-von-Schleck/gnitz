@@ -201,6 +201,20 @@ pub const OWNER_KIND_TABLE: u64 = 0;
 pub const OWNER_KIND_VIEW:  u64 = 1;
 
 // ---------------------------------------------------------------------------
+// Frame size limits
+// ---------------------------------------------------------------------------
+
+/// Maximum frame payload the server will accept from a client.
+/// Tighter than the client limit: protects the master process from a
+/// misbehaving or malicious peer before any allocation occurs.
+pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024;  // 64 MB
+
+/// Maximum frame payload the client library will accept from the server.
+/// Larger than the server limit: a legitimate batch push can be hundreds
+/// of MB; the server is trusted so the risk model is different.
+pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
+
+// ---------------------------------------------------------------------------
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 

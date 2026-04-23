@@ -3,7 +3,7 @@
 //! only callers. Re-homed from `gnitz-transport::{conn,recv,send}` so
 //! the reactor's single io_uring owns the client ring in Stage 4.
 
-pub(super) const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_LEN: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 
 pub(super) enum RecvPhase {
     Header { pos: usize },

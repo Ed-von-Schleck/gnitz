@@ -177,3 +177,95 @@ pub struct CircuitGraph {
     pub const_strings: Vec<(u64, u64, String)>,   // (node_id, slot, string_value)
     pub dependencies:  Vec<u64>,                  // dep table_ids
 }
+
+impl CircuitGraph {
+    /// Verify that all param and const_string slots fit in 8 bits.
+    ///
+    /// The wire encoding packs `(node_id, slot)` as `node_id << 8 | slot` into
+    /// the low half of a U128 PK. Slots ≥ 256 silently corrupt the PK and cause
+    /// the server to load wrong bytecode params, producing incorrect query results.
+    /// Call this before sending any RPCs.
+    pub fn validate(&self) -> Result<(), String> {
+        for &(node_id, slot, _) in &self.params {
+            if slot > 255 {
+                return Err(format!(
+                    "node {} param slot {} exceeds 8-bit wire limit (max 255); \
+                     expression program or aggregate spec list is too large",
+                    node_id, slot
+                ));
+            }
+        }
+        for &(node_id, slot, _) in &self.const_strings {
+            if slot > 255 {
+                return Err(format!(
+                    "node {} const_string slot {} exceeds 8-bit wire limit (max 255); \
+                     expression has too many string constants",
+                    node_id, slot
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_graph() -> CircuitGraph {
+        CircuitGraph {
+            view_id: 1, primary_source_id: 2,
+            nodes: vec![], edges: vec![], sources: vec![],
+            params: vec![], group_cols: vec![], const_strings: vec![],
+            dependencies: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_max_slot() {
+        let mut g = empty_graph();
+        g.params.push((1, 255, 42));
+        g.const_strings.push((1, 255, "x".into()));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_param_slot_overflow() {
+        let mut g = empty_graph();
+        g.params.push((3, 256, 0));
+        let err = g.validate().unwrap_err();
+        assert!(err.contains("256"), "expected slot in message, got: {}", err);
+        assert!(err.contains("node 3"), "expected node id in message, got: {}", err);
+    }
+
+    #[test]
+    fn validate_rejects_const_string_slot_overflow() {
+        let mut g = empty_graph();
+        g.const_strings.push((2, 256, "hello".into()));
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn validate_expr_base_boundary() {
+        // PARAM_EXPR_BASE = 64; slot 64+191=255 is the last safe bytecode word.
+        // Slot 64+192=256 is the first to overflow.
+        use gnitz_wire::{PARAM_EXPR_BASE, PARAM_CONST_STR_BASE, PARAM_NULL_EXTEND_COL_BASE};
+        let mut g = empty_graph();
+        g.params.push((1, PARAM_EXPR_BASE + 191, 0)); // last safe expr word
+        assert!(g.validate().is_ok());
+        g.params.push((1, PARAM_EXPR_BASE + 192, 0)); // first overflowing expr word
+        assert!(g.validate().is_err());
+
+        let mut g2 = empty_graph();
+        g2.const_strings.push((1, PARAM_CONST_STR_BASE + 95, "a".into())); // safe
+        assert!(g2.validate().is_ok());
+        g2.const_strings.push((1, PARAM_CONST_STR_BASE + 96, "b".into())); // overflow
+        assert!(g2.validate().is_err());
+
+        let mut g3 = empty_graph();
+        g3.params.push((1, PARAM_NULL_EXTEND_COL_BASE + 63, 0)); // safe
+        assert!(g3.validate().is_ok());
+        g3.params.push((1, PARAM_NULL_EXTEND_COL_BASE + 64, 0)); // overflow
+        assert!(g3.validate().is_err());
+    }
+}
