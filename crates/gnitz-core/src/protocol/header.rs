@@ -24,8 +24,7 @@ pub struct Header {
     pub target_id:  u64,
     pub client_id:  u64,
     pub flags:      u64,
-    pub seek_pk_lo: u64,
-    pub seek_pk_hi: u64,
+    pub seek_pk:    u128,
     pub seek_col_idx: u64,
     /// Master-allocated reply-routing key. Clients send 0; the master
     /// sets a per-request value when fanning out to workers, and workers
@@ -36,10 +35,9 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn set_seek_by_index(&mut self, col_idx: u64, key_lo: u64, key_hi: u64) {
+    pub fn set_seek_by_index(&mut self, col_idx: u64, key: u128) {
         self.seek_col_idx = col_idx;
-        self.seek_pk_lo   = key_lo;
-        self.seek_pk_hi   = key_hi;
+        self.seek_pk      = key;
     }
 }
 
@@ -47,8 +45,7 @@ impl Default for Header {
     fn default() -> Self {
         Header {
             status: 0, target_id: 0, client_id: 0, flags: 0,
-            seek_pk_lo: 0, seek_pk_hi: 0, seek_col_idx: 0,
-            request_id: 0,
+            seek_pk: 0, seek_col_idx: 0, request_id: 0,
         }
     }
 }

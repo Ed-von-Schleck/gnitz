@@ -95,9 +95,7 @@ class AsyncConnection:
 
     async def seek(self, table_id, pk=0):
         """Point-lookup by primary key.  Returns a ``ScanResult``."""
-        pk_lo = pk & 0xFFFFFFFFFFFFFFFF
-        pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
-        return await self._transport.seek(table_id, pk_lo, pk_hi)
+        return await self._transport.seek(table_id, pk)
 
     async def aclose(self):
         """Close the connection."""
@@ -167,8 +165,6 @@ class Pipeline:
 
     def seek(self, table_id, pk=0):
         """Queue a seek.  Does not ``await`` — sends immediately."""
-        pk_lo = pk & 0xFFFFFFFFFFFFFFFF
-        pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
-        fut = self._conn._transport.seek(table_id, pk_lo, pk_hi)
+        fut = self._conn._transport.seek(table_id, pk)
         self._futures.append(fut)
         return fut

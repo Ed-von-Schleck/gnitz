@@ -85,8 +85,7 @@ pub enum ColData {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
-    pub pk_lo:   Vec<u64>,
-    pub pk_hi:   Vec<u64>,
+    pub pks:     Vec<u128>,
     pub weights: Vec<i64>,
     pub nulls:   Vec<u64>,
     /// One entry per schema column. Entry at pk_index is a placeholder (Fixed(vec![])).
@@ -107,8 +106,7 @@ impl ZSetBatch {
             }
         }).collect();
         ZSetBatch {
-            pk_lo: vec![],
-            pk_hi: vec![],
+            pks: vec![],
             weights: vec![],
             nulls: vec![],
             columns,
@@ -116,19 +114,16 @@ impl ZSetBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.pk_lo.len()
+        self.pks.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pk_lo.is_empty()
+        self.pks.is_empty()
     }
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
-        let n = self.pk_lo.len();
-        if self.pk_hi.len() != n {
-            return Err(format!("pk_hi length {} != row count {}", self.pk_hi.len(), n));
-        }
+        let n = self.pks.len();
         if self.weights.len() != n {
             return Err(format!("weights length {} != row count {}", self.weights.len(), n));
         }
@@ -191,9 +186,8 @@ impl<'a> BatchAppender<'a> {
     }
 
     /// Start a new row with the given primary key and weight.
-    pub fn add_row(&mut self, pk_lo: u64, pk_hi: u64, weight: i64) -> &mut Self {
-        self.batch.pk_lo.push(pk_lo);
-        self.batch.pk_hi.push(pk_hi);
+    pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
+        self.batch.pks.push(pk);
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
@@ -414,9 +408,9 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
-            a.add_row(1, 0, 1).i64_val(10).str_val("a");
-            a.add_row(2, 0, 1).i64_val(20).str_val("b");
-            a.add_row(3, 0, 1).i64_val(30).str_null();
+            a.add_row(1u128, 1).i64_val(10).str_val("a");
+            a.add_row(2u128, 1).i64_val(20).str_val("b");
+            a.add_row(3u128, 1).i64_val(30).str_null();
         }
         assert!(batch.validate(&schema).is_ok());
     }
@@ -430,8 +424,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pk_lo.push(1);
-        batch.pk_hi.push(0);
+        batch.pks.push(1);
         // weights is empty — mismatch
         let err = batch.validate(&schema).unwrap_err();
         assert!(err.contains("weights"));
@@ -447,8 +440,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pk_lo.push(1);
-        batch.pk_hi.push(0);
+        batch.pks.push(1);
         batch.weights.push(1);
         batch.nulls.push(0);
         // Strings column is empty — mismatch
@@ -466,8 +458,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pk_lo.push(1);
-        batch.pk_hi.push(0);
+        batch.pks.push(1);
         batch.weights.push(1);
         batch.nulls.push(0);
         // Fixed column 1 is empty (needs 8 bytes) — mismatch
@@ -509,11 +500,11 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(42, 0, 1)
+            .add_row(42u128, 1)
             .u64_val(100)
             .u64_val(200);
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch.pk_lo[0], 42);
+        assert_eq!(batch.pks[0], 42);
         assert_eq!(batch.weights[0], 1);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
@@ -535,12 +526,12 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
-            a.add_row(1, 0, 1).u64_val(10);
-            a.add_row(2, 0, 1).u64_val(20);
-            a.add_row(3, 0, -1).u64_val(30);
+            a.add_row(1u128, 1).u64_val(10);
+            a.add_row(2u128, 1).u64_val(20);
+            a.add_row(3u128, -1).u64_val(30);
         }
         assert_eq!(batch.len(), 3);
-        assert_eq!(batch.pk_lo, vec![1, 2, 3]);
+        assert_eq!(batch.pks, vec![1u128, 2u128, 3u128]);
         assert_eq!(batch.weights, vec![1, 1, -1]);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(buf.len(), 24);
@@ -562,7 +553,7 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(1, 0, 1)
+            .add_row(1u128, 1)
             .u64_val(42)
             .str_val("hello");
         assert_eq!(batch.len(), 1);
@@ -582,7 +573,7 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(1, 0, 1)
+            .add_row(1u128, 1)
             .null_mask(0x02)
             .u64_val(0);
         assert_eq!(batch.nulls[0], 0x02);
@@ -599,7 +590,7 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(1, 0, 1)
+            .add_row(1u128, 1)
             .u128_val(0xDEAD, 0xBEEF);
         if let ColData::U128s(v) = &batch.columns[1] {
             assert_eq!(v[0], ((0xBEEF_u128) << 64) | 0xDEAD);
@@ -621,7 +612,7 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(1, 0, 1)
+            .add_row(1u128, 1)
             .u64_val(100)
             .str_val("hello")
             .i64_val(-5)
@@ -655,12 +646,12 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
-            .add_row(99, 0, 1)
+            .add_row(99u128, 1)
             .u64_val(10)   // cursor 0 -> ci 0 (A)
             .u64_val(20)   // cursor 1 -> ci 1 (B)
             .u64_val(30);  // cursor 2 -> ci 3 (C), skips pk_index=2
 
-        assert_eq!(batch.pk_lo[0], 99);
+        assert_eq!(batch.pks[0], 99);
         if let ColData::Fixed(buf) = &batch.columns[0] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
         } else { panic!("expected Fixed for col 0"); }
@@ -688,7 +679,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).u64_val(42);
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u64_val(42);
     }
 
     #[test]
@@ -702,7 +693,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).i64_val(-7);
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).i64_val(-7);
     }
 
     #[test]
@@ -716,7 +707,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).str_val("oops");
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_val("oops");
     }
 
     #[test]
@@ -730,7 +721,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).str_null();
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_null();
     }
 
     #[test]
@@ -744,7 +735,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1, 0, 1).u128_val(1, 0);
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1, 0);
     }
 
     #[test]
@@ -760,8 +751,8 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
-            a.add_row(1, 0, 1).i64_val(10).str_val("hello");
-            a.add_row(2, 0, -1).i64_val(20).str_null();
+            a.add_row(1u128, 1).i64_val(10).str_val("hello");
+            a.add_row(2u128, -1).i64_val(20).str_null();
         }
         assert!(batch.validate(&schema).is_ok());
     }

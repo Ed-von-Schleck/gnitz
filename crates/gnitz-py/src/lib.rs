@@ -284,11 +284,9 @@ impl PyZSetBatch {
         }
         if self.schema.columns[pk_idx].type_code == TypeCode::U128 {
             let pk = pk_val.extract::<u128>()?;
-            self.batch.pk_lo.push(pk as u64);
-            self.batch.pk_hi.push((pk >> 64) as u64);
+            self.batch.pks.push(pk);
         } else {
-            self.batch.pk_lo.push(pk_val.extract::<u64>()?);
-            self.batch.pk_hi.push(0);
+            self.batch.pks.push(pk_val.extract::<u64>()? as u128);
         }
         Ok(())
     }
@@ -445,14 +443,9 @@ impl PyZSetBatch {
         Ok(())
     }
 
-    // Backward-compat getters — materialize Python lists from Rust Vecs on demand.
     #[getter]
-    pub fn pk_lo(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(PyList::new(py, &self.batch.pk_lo)?.unbind())
-    }
-    #[getter]
-    pub fn pk_hi(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(PyList::new(py, &self.batch.pk_hi)?.unbind())
+    pub fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new(py, &self.batch.pks)?.unbind())
     }
     #[getter]
     pub fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
@@ -557,13 +550,11 @@ fn build_row_values_into(
 
     for ci in 0..schema.columns.len() {
         if ci == pk_idx {
-            let pk_lo = batch.pk_lo[row];
-            let pk_hi = batch.pk_hi[row];
+            let pk = batch.pks[row];
             if schema.columns[ci].type_code == TypeCode::U128 {
-                let val = (pk_lo as u128) | ((pk_hi as u128) << 64);
-                out.push(val.into_pyobject(py)?.into_any().unbind());
+                out.push(pk.into_pyobject(py)?.into_any().unbind());
             } else {
-                out.push(pk_lo.into_pyobject(py)?.into_any().unbind());
+                out.push((pk as u64).into_pyobject(py)?.into_any().unbind());
             }
         } else {
             if null_word & (1u64 << payload_idx) != 0 {
@@ -601,8 +592,7 @@ fn build_row_values_into(
 #[pyclass(name = "RustBatch")]
 pub struct PyRustBatch {
     data: Arc<SharedBatchData>,
-    cached_pk_lo:   Option<Py<PyList>>,
-    cached_pk_hi:   Option<Py<PyList>>,
+    cached_pks:     Option<Py<PyList>>,
     cached_weights: Option<Py<PyList>>,
     cached_nulls:   Option<Py<PyList>>,
     cached_columns: Option<Py<PyList>>,
@@ -611,22 +601,12 @@ pub struct PyRustBatch {
 #[pymethods]
 impl PyRustBatch {
     #[getter]
-    fn pk_lo(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        if let Some(ref cached) = self.cached_pk_lo {
+    fn pks(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_pks {
             return Ok(cached.clone_ref(py));
         }
-        let list = PyList::new(py, &self.data.batch.pk_lo)?.unbind();
-        self.cached_pk_lo = Some(list.clone_ref(py));
-        Ok(list)
-    }
-
-    #[getter]
-    fn pk_hi(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        if let Some(ref cached) = self.cached_pk_hi {
-            return Ok(cached.clone_ref(py));
-        }
-        let list = PyList::new(py, &self.data.batch.pk_hi)?.unbind();
-        self.cached_pk_hi = Some(list.clone_ref(py));
+        let list = PyList::new(py, &self.data.batch.pks)?.unbind();
+        self.cached_pks = Some(list.clone_ref(py));
         Ok(list)
     }
 
@@ -746,8 +726,7 @@ impl PyScanResult {
             Some(d) => {
                 let rb = Py::new(py, PyRustBatch {
                     data: Arc::clone(d),
-                    cached_pk_lo:   None,
-                    cached_pk_hi:   None,
+                    cached_pks:     None,
                     cached_weights: None,
                     cached_nulls:   None,
                     cached_columns: None,
@@ -867,17 +846,11 @@ impl PyScanResult {
         // Specialize by column kind to avoid per-row dispatch through read_row_value.
         let pk_idx = data.schema.pk_index;
         if col_idx == pk_idx {
-            // PK column: read directly from pk_lo (bulk conversion for non-U128)
             if data.schema.columns[col_idx].type_code == TypeCode::U128 {
-                let items: Vec<PyObject> = (0..n)
-                    .map(|i| {
-                        let v = (data.batch.pk_lo[i] as u128) | ((data.batch.pk_hi[i] as u128) << 64);
-                        Ok(v.into_pyobject(py)?.into_any().unbind())
-                    })
-                    .collect::<PyResult<_>>()?;
-                return Ok(PyList::new(py, items)?.unbind());
+                return Ok(PyList::new(py, &data.batch.pks)?.unbind());
             }
-            return Ok(PyList::new(py, &data.batch.pk_lo)?.unbind());
+            let items: Vec<u64> = data.batch.pks.iter().map(|&x| x as u64).collect();
+            return Ok(PyList::new(py, items)?.unbind());
         }
 
         let payload_idx = if col_idx < pk_idx { col_idx } else { col_idx - 1 };
@@ -1116,10 +1089,7 @@ impl PyGnitzClient {
         pks: Vec<u128>,
     ) -> PyResult<()> {
         let rust_schema = py_schema_to_rust(py, &schema)?;
-        let pk_pairs: Vec<(u64, u64)> = pks.into_iter()
-            .map(|pk| (pk as u64, (pk >> 64) as u64))
-            .collect();
-        client!(self).delete(target_id, &rust_schema, &pk_pairs)
+        client!(self).delete(target_id, &rust_schema, &pks)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -1177,17 +1147,16 @@ impl PyGnitzClient {
         client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    /// seek_by_index(table_id, col_idx, key_lo, key_hi) -> (Schema | None, ZSetBatch | None, view_lsn: int)
+    /// seek_by_index(table_id, col_idx, key) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek_by_index(
-        &self, py: Python<'_>, table_id: u64, col_idx: u64,
-        key_lo: u64, key_hi: u64,
+        &self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
     ) -> PyResult<PyObject> {
-        response_to_py_tuple(py, client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi))
+        response_to_py_tuple(py, client!(self).seek_by_index(table_id, col_idx, key))
     }
 
-    /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None, view_lsn: int)
-    pub fn seek(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<PyObject> {
-        response_to_py_tuple(py, client!(self).seek(table_id, pk_lo, pk_hi))
+    /// seek(table_id, pk) -> (Schema | None, ZSetBatch | None, view_lsn: int)
+    pub fn seek(&self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<PyObject> {
+        response_to_py_tuple(py, client!(self).seek(table_id, pk))
     }
 
     // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
@@ -1197,17 +1166,16 @@ impl PyGnitzClient {
         response_to_lazy(py, client!(self).scan(target_id))
     }
 
-    /// seek_lazy(table_id, pk_lo, pk_hi) -> ScanResult (native)
-    pub fn seek_lazy(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<Py<PyScanResult>> {
-        response_to_lazy(py, client!(self).seek(table_id, pk_lo, pk_hi))
+    /// seek_lazy(table_id, pk) -> ScanResult (native)
+    pub fn seek_lazy(&self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<Py<PyScanResult>> {
+        response_to_lazy(py, client!(self).seek(table_id, pk))
     }
 
-    /// seek_by_index_lazy(table_id, col_idx, key_lo, key_hi) -> ScanResult (native)
+    /// seek_by_index_lazy(table_id, col_idx, key) -> ScanResult (native)
     pub fn seek_by_index_lazy(
-        &self, py: Python<'_>, table_id: u64, col_idx: u64,
-        key_lo: u64, key_hi: u64,
+        &self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
     ) -> PyResult<Py<PyScanResult>> {
-        response_to_lazy(py, client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi))
+        response_to_lazy(py, client!(self).seek_by_index(table_id, col_idx, key))
     }
 
     /// execute_sql(schema_name, sql) -> list of result dicts
@@ -1437,20 +1405,20 @@ impl PyCircuitGraph {
 fn encode_push_payload(
     client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0, 0, 0, Some(schema), Some(batch))
+    gnitz_core::encode_message(target_id, client_id, 0, 0u128, 0, Some(schema), Some(batch))
 }
 
 fn encode_scan_payload(
     client_id: u64, target_id: u64,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0, 0, 0, None, None)
+    gnitz_core::encode_message(target_id, client_id, 0, 0u128, 0, None, None)
 }
 
 fn encode_seek_payload(
-    client_id: u64, target_id: u64, pk_lo: u64, pk_hi: u64,
+    client_id: u64, target_id: u64, pk: u128,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
     gnitz_core::encode_message(
-        target_id, client_id, gnitz_core::FLAG_SEEK, pk_lo, pk_hi, 0, None, None,
+        target_id, client_id, gnitz_core::FLAG_SEEK, pk, 0, None, None,
     )
 }
 
@@ -1460,7 +1428,7 @@ fn encode_seek_payload(
 
 #[derive(Clone, Copy)]
 enum ResponseKind {
-    Push,  // resolve with u64 (seek_pk_lo = ingest LSN)
+    Push,  // resolve with u64 (seek_pk as u64 = ingest LSN)
     Scan,  // resolve with PyScanResult
 }
 
@@ -1547,9 +1515,9 @@ impl PyAsyncTransport {
     }
 
     fn seek(
-        &self, py: Python<'_>, target_id: u64, pk_lo: u64, pk_hi: u64,
+        &self, py: Python<'_>, target_id: u64, pk: u128,
     ) -> PyResult<PyObject> {
-        let payload = encode_seek_payload(self.client_id, target_id, pk_lo, pk_hi)
+        let payload = encode_seek_payload(self.client_id, target_id, pk)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
         self.enqueue(py, payload, ResponseKind::Scan)
     }
@@ -1656,10 +1624,10 @@ fn async_io_loop(
                         } else {
                             let py_val = match kind {
                                 ResponseKind::Push => {
-                                    msg.seek_pk_lo.into_pyobject(py).unwrap().into_any().unbind()
+                                    (msg.seek_pk as u64).into_pyobject(py).unwrap().into_any().unbind()
                                 }
                                 ResponseKind::Scan => {
-                                    let lsn = msg.seek_pk_lo;
+                                    let lsn = msg.seek_pk as u64;
                                     let data = match (msg.schema, msg.data_batch) {
                                         (Some(s), Some(b)) => {
                                             let names: Vec<&str> = s.columns.iter()

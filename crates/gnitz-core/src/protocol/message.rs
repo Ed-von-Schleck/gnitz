@@ -14,8 +14,7 @@ pub struct Message {
     pub target_id:    u64,
     pub client_id:    u64,
     pub flags:        u64,
-    pub seek_pk_lo:   u64,
-    pub seek_pk_hi:   u64,
+    pub seek_pk:      u128,
     pub seek_col_idx: u64,
     pub request_id:   u64,
     pub schema:       Option<Schema>,     // derived from schema_batch (avoids re-deriving)
@@ -33,22 +32,20 @@ pub struct Message {
 
 fn control_schema() -> &'static Schema {
     use gnitz_wire::control as ctrl;
-    // Compile-time check: this builder must match NUM_COLUMNS.
-    const _: () = assert!(ctrl::NUM_COLUMNS == 10,
+    const _: () = assert!(ctrl::NUM_COLUMNS == 9,
         "control_schema column list out of sync with gnitz_wire::control::NUM_COLUMNS");
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "msg_idx".into(),     type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "status".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "client_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "target_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "flags".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "seek_pk_lo".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "seek_pk_hi".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "seek_col_idx".into(),type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "request_id".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "error_msg".into(),   type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "msg_idx".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "status".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "client_id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "target_id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "flags".into(),        type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "seek_pk".into(),      type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "seek_col_idx".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "request_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "error_msg".into(),    type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     })
@@ -63,37 +60,21 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
     let has_error = !error_msg.is_empty();
     let nulls_val: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
 
-    // U64 payload columns in payload-index order (status..request_id).
-    let u64_vals: [u64; 8] = [
-        header.status as u64,
-        header.client_id,
-        header.target_id,
-        header.flags,
-        header.seek_pk_lo,
-        header.seek_pk_hi,
-        header.seek_col_idx,
-        header.request_id,
-    ];
-    debug_assert_eq!(u64_vals.len(), ctrl::PAYLOAD_ERROR_MSG,
-        "u64 payload count must equal PAYLOAD_ERROR_MSG");
-
-    let mut ctrl_bytes = [0u8; 64];
-    for (i, &v) in u64_vals.iter().enumerate() {
-        ctrl_bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
-    }
-
     let mut columns: Vec<ColData> = Vec::with_capacity(ctrl::NUM_COLUMNS);
     columns.push(ColData::Fixed(vec![]));   // col 0: pk placeholder
-    for i in 0..u64_vals.len() {
-        columns.push(ColData::Fixed(ctrl_bytes[i * 8..(i + 1) * 8].to_vec()));
-    }
+    columns.push(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
+    columns.push(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
+    columns.push(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
+    columns.push(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
+    columns.push(ColData::U128s(vec![header.seek_pk]));
+    columns.push(ColData::Fixed(header.seek_col_idx.to_le_bytes().to_vec()));
+    columns.push(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
     columns.push(ColData::Strings(vec![
         if has_error { Some(error_msg.to_string()) } else { None }
     ]));
 
     let batch = ZSetBatch {
-        pk_lo:   vec![0u64],
-        pk_hi:   vec![0u64],
+        pks:     vec![0u128],
         weights: vec![1i64],
         nulls:   vec![nulls_val],
         columns,
@@ -134,12 +115,23 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
         }
     }
 
+    fn read_u128_col(batch: &ZSetBatch, ci: usize) -> Result<u128, ProtocolError> {
+        match &batch.columns[ci] {
+            ColData::U128s(v) if v.len() == 1 => Ok(v[0]),
+            ColData::U128s(v) => Err(ProtocolError::DecodeError(format!(
+                "control block col {} U128s len {} != 1", ci, v.len()
+            ))),
+            _ => Err(ProtocolError::DecodeError(format!(
+                "control block col {} is not U128s", ci
+            ))),
+        }
+    }
+
     let status       = read_u64_col(&batch, ctrl::COL_STATUS)? as u32;
     let client_id    = read_u64_col(&batch, ctrl::COL_CLIENT_ID)?;
     let target_id    = read_u64_col(&batch, ctrl::COL_TARGET_ID)?;
     let flags        = read_u64_col(&batch, ctrl::COL_FLAGS)?;
-    let seek_pk_lo   = read_u64_col(&batch, ctrl::COL_SEEK_PK_LO)?;
-    let seek_pk_hi   = read_u64_col(&batch, ctrl::COL_SEEK_PK_HI)?;
+    let seek_pk      = read_u128_col(&batch, ctrl::COL_SEEK_PK)?;
     let seek_col_idx = read_u64_col(&batch, ctrl::COL_SEEK_COL_IDX)?;
     let request_id   = read_u64_col(&batch, ctrl::COL_REQUEST_ID)?;
 
@@ -160,7 +152,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
 
     let header = Header {
         status, target_id, client_id, flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
+        seek_pk, seek_col_idx, request_id,
     };
     Ok((header, error_msg))
 }
@@ -172,8 +164,7 @@ pub fn encode_message(
     target_id:    u64,
     client_id:    u64,
     flags:        u64,
-    seek_pk_lo:   u64,
-    seek_pk_hi:   u64,
+    seek_pk:      u128,
     seek_col_idx: u64,
     schema:       Option<&Schema>,
     data_batch:   Option<&ZSetBatch>,
@@ -187,7 +178,7 @@ pub fn encode_message(
 
     let ctrl_hdr = Header {
         status: STATUS_OK, target_id, client_id, flags: flags_out,
-        seek_pk_lo, seek_pk_hi, seek_col_idx,
+        seek_pk, seek_col_idx,
         request_id: 0,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "")?;
@@ -217,15 +208,14 @@ pub fn send_message(
     target_id:    u64,
     client_id:    u64,
     flags:        u64,
-    seek_pk_lo:   u64,
-    seek_pk_hi:   u64,
+    seek_pk:      u128,
     seek_col_idx: u64,
     schema:       Option<&Schema>,
     data_batch:   Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
     let payload = encode_message(
         target_id, client_id, flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx,
+        seek_pk, seek_col_idx,
         schema, data_batch,
     )?;
     send_framed(sock_fd, &payload)
@@ -301,8 +291,7 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
         target_id:    ctrl_header.target_id,
         client_id:    ctrl_header.client_id,
         flags:        ctrl_header.flags,
-        seek_pk_lo:   ctrl_header.seek_pk_lo,
-        seek_pk_hi:   ctrl_header.seek_pk_hi,
+        seek_pk:      ctrl_header.seek_pk,
         seek_col_idx: ctrl_header.seek_col_idx,
         request_id:   ctrl_header.request_id,
         schema,
@@ -346,8 +335,7 @@ mod tests {
             target_id:  0x1234_5678_9ABC_DEF0,
             client_id:  0xDEAD_BEEF_0000_0001,
             flags:      FLAG_PUSH | FLAG_HAS_SCHEMA,
-            seek_pk_lo: 42,
-            seek_pk_hi: 99,
+            seek_pk:    42u128 | (99u128 << 64),
             seek_col_idx: 7,
             request_id: 0xCAFE_BABE_DEAD_F00D,
         };
@@ -359,8 +347,7 @@ mod tests {
         assert_eq!(decoded.target_id,  h.target_id);
         assert_eq!(decoded.client_id,  h.client_id);
         assert_eq!(decoded.flags,      h.flags);
-        assert_eq!(decoded.seek_pk_lo, h.seek_pk_lo);
-        assert_eq!(decoded.seek_pk_hi, h.seek_pk_hi);
+        assert_eq!(decoded.seek_pk,    h.seek_pk);
         assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
         assert_eq!(decoded.request_id, h.request_id);
         assert_eq!(err, "test error");
@@ -403,7 +390,7 @@ mod tests {
 
         let empty_batch = ZSetBatch::new(&schema);
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&empty_batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&empty_batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         // Schema was sent, data was not (empty batch)
@@ -424,8 +411,7 @@ mod tests {
         };
 
         let n = 100usize;
-        let pk_lo: Vec<u64>   = (0..n as u64).collect();
-        let pk_hi: Vec<u64>   = vec![0; n];
+        let pks: Vec<u128>    = (0..n as u128).collect();
         let weights: Vec<i64> = vec![1; n];
         let nulls: Vec<u64>   = vec![0; n];
 
@@ -438,8 +424,7 @@ mod tests {
         for &v in &f64_vals { f64_bytes.extend_from_slice(&v.to_le_bytes()); }
 
         let batch = ZSetBatch {
-            pk_lo: pk_lo.clone(),
-            pk_hi: pk_hi.clone(),
+            pks: pks.clone(),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -450,12 +435,11 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
-        assert_eq!(data.pk_lo,   pk_lo);
-        assert_eq!(data.pk_hi,   pk_hi);
+        assert_eq!(data.pks,     pks);
         assert_eq!(data.weights, weights);
 
         match &data.columns[1] {
@@ -482,8 +466,7 @@ mod tests {
         };
 
         let n = 50usize;
-        let pk_lo: Vec<u64>   = (0..n as u64).collect();
-        let pk_hi: Vec<u64>   = vec![0; n];
+        let pks: Vec<u128>    = (0..n as u128).collect();
         let weights: Vec<i64> = vec![1; n];
         // Every 3rd row: s1 is null → payload bit 0 set
         let nulls: Vec<u64>   = (0..n).map(|i| if i % 3 == 0 { 1u64 } else { 0u64 }).collect();
@@ -494,8 +477,7 @@ mod tests {
         let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{}", i))).collect();
 
         let batch = ZSetBatch {
-            pk_lo: pk_lo.clone(),
-            pk_hi: pk_hi.clone(),
+            pks: pks.clone(),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -506,7 +488,7 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -528,7 +510,7 @@ mod tests {
     fn test_message_no_schema_no_data() {
         // Control-only message (scan/alloc style)
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, None, None).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, None, None).unwrap();
         let msg = recv_message(b, None).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
@@ -538,16 +520,16 @@ mod tests {
     #[test]
     fn test_message_recv_control_fields() {
         // Verify that send_message/recv_message correctly propagates all control
-        // fields into the flat Message struct: target_id, client_id, seek_pk_lo,
-        // seek_pk_hi, seek_col_idx.  Regression for Step 5b rename (p4→seek_col_idx).
+        // fields into the flat Message struct: target_id, client_id, seek_pk,
+        // seek_col_idx.
+        let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
         let (a, b) = make_socketpair();
         send_message(
             a,
             0xDEAD_BEEF_1234_5678,  // target_id
             0xCAFE_BABE_0000_0001,  // client_id
             FLAG_PUSH,              // flags
-            0xAAAA_BBBB_CCCC_DDDD,  // seek_pk_lo
-            0x1111_2222_3333_4444,  // seek_pk_hi
+            seek_pk,
             7,                      // seek_col_idx
             None,
             None,
@@ -555,8 +537,7 @@ mod tests {
         let msg = recv_message(b, None).unwrap();
         assert_eq!(msg.target_id,    0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.client_id,    0xCAFE_BABE_0000_0001);
-        assert_eq!(msg.seek_pk_lo,   0xAAAA_BBBB_CCCC_DDDD);
-        assert_eq!(msg.seek_pk_hi,   0x1111_2222_3333_4444);
+        assert_eq!(msg.seek_pk,      seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
         unsafe { libc::close(a); libc::close(b); }
     }
@@ -578,16 +559,16 @@ mod tests {
 
     #[test]
     fn test_encode_parse_control_only() {
+        let seek_pk = 42u128 | (99u128 << 64);
         let payload = encode_message(
             0xDEAD, 0xBEEF, FLAG_PUSH,
-            42, 99, 7,
+            seek_pk, 7,
             None, None,
         ).unwrap();
         let msg = parse_response(&payload).unwrap();
-        assert_eq!(msg.target_id, 0xDEAD);
-        assert_eq!(msg.client_id, 0xBEEF);
-        assert_eq!(msg.seek_pk_lo, 42);
-        assert_eq!(msg.seek_pk_hi, 99);
+        assert_eq!(msg.target_id,    0xDEAD);
+        assert_eq!(msg.client_id,    0xBEEF);
+        assert_eq!(msg.seek_pk,      seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
@@ -608,8 +589,7 @@ mod tests {
             val_bytes.extend_from_slice(&v.to_le_bytes());
         }
         let batch = ZSetBatch {
-            pk_lo:   vec![1, 2, 3],
-            pk_hi:   vec![0, 0, 0],
+            pks:     vec![1u128, 2u128, 3u128],
             weights: vec![1, 1, 1],
             nulls:   vec![0, 0, 0],
             columns: vec![
@@ -619,14 +599,14 @@ mod tests {
         };
 
         let payload = encode_message(
-            42, 1, 0, 0, 0, 0,
+            42, 1, 0, 0u128, 0,
             Some(&schema), Some(&batch),
         ).unwrap();
         let msg = parse_response(&payload).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
         let data = msg.data_batch.unwrap();
-        assert_eq!(data.pk_lo, vec![1, 2, 3]);
+        assert_eq!(data.pks, vec![1u128, 2u128, 3u128]);
         assert_eq!(data.weights, vec![1, 1, 1]);
     }
 
@@ -641,7 +621,7 @@ mod tests {
         let empty = ZSetBatch::new(&schema);
 
         let payload = encode_message(
-            10, 1, 0, 0, 0, 0,
+            10, 1, 0, 0u128, 0,
             Some(&schema), Some(&empty),
         ).unwrap();
         let msg = parse_response(&payload).unwrap();

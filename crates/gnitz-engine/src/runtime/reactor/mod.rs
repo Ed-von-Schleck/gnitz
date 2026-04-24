@@ -1961,8 +1961,7 @@ mod tests {
                 client_id: 0,
                 target_id: 0,
                 flags: 0,
-                seek_pk_lo: 0,
-                seek_pk_hi: 0,
+                seek_pk: 0,
                 seek_col_idx: 0,
                 request_id: req_id,
                 error_msg: Vec::new(),
@@ -2355,8 +2354,7 @@ mod tests {
                 client_id: 0,
                 target_id: view_id as u64,
                 flags: FLAG_EXCHANGE as u64,
-                seek_pk_lo: source_id as u64,
-                seek_pk_hi: 0,
+                seek_pk: source_id as u128,
                 seek_col_idx: 0,
                 request_id: req_id,
                 error_msg: Vec::new(),
@@ -2597,7 +2595,7 @@ mod tests {
                 writer.send_encoded(sz, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None, None,
+                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
                     );
                 });
             }
@@ -2703,7 +2701,7 @@ mod tests {
                 writer.send_encoded(sz, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                        0, 0, 0, req_id, STATUS_OK, &[], None, None, None, None,
+                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
                     );
                 });
             }

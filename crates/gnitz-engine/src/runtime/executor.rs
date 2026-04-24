@@ -505,15 +505,14 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
     if flags & FLAG_SEEK != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek(shared, fd, client_id, target_id,
-                    decoded.control.seek_pk_lo, decoded.control.seek_pk_hi).await;
+                    decoded.control.seek_pk).await;
         return;
     }
     if flags & FLAG_SEEK_BY_INDEX != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index(shared, fd, client_id, target_id,
                              decoded.control.seek_col_idx as u32,
-                             decoded.control.seek_pk_lo,
-                             decoded.control.seek_pk_hi).await;
+                             decoded.control.seek_pk).await;
         return;
     }
 
@@ -580,7 +579,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         match commit_result {
             Ok(Ok(lsn)) => {
                 let schema = shared.get_schema_desc(target_id);
-                send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn).await;
+                send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn as u128).await;
             }
             Ok(Err(e)) => {
                 send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
@@ -602,7 +601,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
 
 async fn handle_seek(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, pk_lo: u64, pk_hi: u64,
+    target_id: i64, pk: u128,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -613,11 +612,11 @@ async fn handle_seek(
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_async(
             shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
-            target_id, pk_lo, pk_hi,
+            target_id, pk,
         ).await
     } else {
         let cat_ptr = shared.catalog.0;
-        unsafe { (*cat_ptr).seek_family(target_id, pk_lo, pk_hi) }
+        unsafe { (*cat_ptr).seek_family(target_id, pk) }
     };
     match result {
         Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await,
@@ -627,7 +626,7 @@ async fn handle_seek(
 
 async fn handle_seek_by_index(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
+    target_id: i64, col_idx: u32, key: u128,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -638,12 +637,12 @@ async fn handle_seek_by_index(
     let result = if target_id >= FIRST_USER_TABLE_ID {
         let r = MasterDispatcher::fan_out_seek_by_index_async(
             shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
-            target_id, col_idx, key_lo, key_hi,
+            target_id, col_idx, key,
         ).await;
         r
     } else {
         let cat_ptr = shared.catalog.0;
-        unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key_lo, key_hi) }
+        unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key) }
     };
     match result {
         Ok(batch) => {
@@ -686,7 +685,7 @@ async fn handle_scan(
     match result {
         Ok(batch) => {
             let arc = batch.map(Arc::new);
-            send_ok_response(shared, fd, target_id, arc.as_deref(), client_id, &schema, lsn).await;
+            send_ok_response(shared, fd, target_id, arc.as_deref(), client_id, &schema, lsn as u128).await;
         }
         Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }
@@ -710,7 +709,7 @@ async fn handle_system_dml(
             Ok(b) => {
                 let batch_ref = if b.count > 0 { Some(b) } else { None };
                 send_ok_response(shared, fd, target_id, batch_ref.as_deref(),
-                                 client_id, &schema, shared.last_tick_lsn.get()).await;
+                                 client_id, &schema, shared.last_tick_lsn.get() as u128).await;
             }
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -777,7 +776,7 @@ async fn handle_system_dml(
         gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
     }
 
-    send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn).await;
+    send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn as u128).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {
@@ -803,7 +802,7 @@ fn encode_response_buffer(
     target_id: i64, client_id: u64,
     result: Option<&Batch>, status: u32, error_msg: &[u8],
     schema: &SchemaDescriptor, prebuilt_schema: Option<&[u8]>,
-    seek_pk_lo: u64,
+    seek_pk: u128,
 ) -> Vec<u8> {
     let sz = ipc::wire_size(status, error_msg, Some(schema), None, result, prebuilt_schema);
     let total = 4 + sz;
@@ -812,7 +811,7 @@ fn encode_response_buffer(
     let written = ipc::encode_wire_into(
         &mut buf[4..total], 0,
         target_id as u64, client_id,
-        0, seek_pk_lo, 0, 0, 0,
+        0, seek_pk, 0, 0,
         status, error_msg,
         Some(schema), None, result, prebuilt_schema,
     );
@@ -823,12 +822,12 @@ fn encode_response_buffer(
 async fn send_ok_response(
     shared: &Rc<Shared>, fd: i32, target_id: i64,
     result: Option<&Batch>, client_id: u64,
-    schema: &SchemaDescriptor, seek_pk_lo: u64,
+    schema: &SchemaDescriptor, seek_pk: u128,
 ) {
     let schema_block = shared.get_schema_wire_block(target_id);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
-        schema, Some(schema_block.as_slice()), seek_pk_lo,
+        schema, Some(schema_block.as_slice()), seek_pk,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -859,7 +858,7 @@ async fn send_alloc(
     let written = ipc::encode_wire_into(
         &mut buf[4..total], 0,
         new_id as u64, client_id,
-        0, 0, 0, 0, 0,
+        0, 0u128, 0, 0,
         STATUS_OK, b"",
         None, None, None, None,
     );

@@ -87,7 +87,7 @@ impl Connection {
     ) -> Result<u64, ClientError> {
         batch.validate(schema).map_err(ClientError::ServerError)?;
         let msg = self.roundtrip_push(target_id, schema, batch, mode)?;
-        Ok(msg.seek_pk_lo)
+        Ok(msg.seek_pk as u64)
     }
 
     pub fn scan(
@@ -95,28 +95,26 @@ impl Connection {
         target_id: u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
         let msg = self.roundtrip(target_id, 0, None, None)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk_lo))
+        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     pub fn seek(
         &self,
         target_id: u64,
-        pk_lo:     u64,
-        pk_hi:     u64,
+        pk:        u128,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        let msg = self.roundtrip_seek(target_id, pk_lo, pk_hi)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk_lo))
+        let msg = self.roundtrip_seek(target_id, pk)?;
+        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     pub fn seek_by_index(
         &self,
         table_id: u64,
         col_idx:  u64,
-        key_lo:   u64,
-        key_hi:   u64,
+        key:      u128,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        let msg = self.roundtrip_seek_by_index(table_id, col_idx, key_lo, key_hi)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk_lo))
+        let msg = self.roundtrip_seek_by_index(table_id, col_idx, key)?;
+        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     fn roundtrip(
@@ -126,7 +124,7 @@ impl Connection {
         schema:    Option<&Schema>,
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0, 0, 0, schema, data)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, schema, data)?;
         let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
@@ -145,7 +143,7 @@ impl Connection {
         let seek_col_idx = mode.as_u8() as u64;
         send_message(
             self.sock.as_raw_fd(), target_id, self.client_id, flags,
-            0, 0, seek_col_idx,
+            0u128, seek_col_idx,
             Some(schema), Some(batch),
         )?;
         let msg = recv_message(self.sock.as_raw_fd(), None)?;
@@ -156,10 +154,9 @@ impl Connection {
         &self,
         table_id: u64,
         col_idx:  u64,
-        key_lo:   u64,
-        key_hi:   u64,
+        key:      u128,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key_lo, key_hi, col_idx, None, None)?;
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, col_idx, None, None)?;
         let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }
@@ -167,10 +164,9 @@ impl Connection {
     fn roundtrip_seek(
         &self,
         target_id: u64,
-        pk_lo:     u64,
-        pk_hi:     u64,
+        pk:        u128,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk_lo, pk_hi, 0, None, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk, 0, None, None)?;
         let msg = recv_message(self.sock.as_raw_fd(), None)?;
         check_response(msg)
     }

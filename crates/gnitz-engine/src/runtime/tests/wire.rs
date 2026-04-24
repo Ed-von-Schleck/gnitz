@@ -46,7 +46,7 @@ fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
 #[test]
 fn test_encode_decode_roundtrip_no_data() {
     let wire = encode_wire(
-        42, 7, 0x100, 10, 20, 3, 0,
+        42, 7, 0x100, 10u128 | (20u128 << 64), 3, 0,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -54,8 +54,7 @@ fn test_encode_decode_roundtrip_no_data() {
     assert_eq!(decoded.control.target_id, 42);
     assert_eq!(decoded.control.client_id, 7);
     assert_eq!(decoded.control.flags & 0xFFFF, 0x100);
-    assert_eq!(decoded.control.seek_pk_lo, 10);
-    assert_eq!(decoded.control.seek_pk_hi, 20);
+    assert_eq!(decoded.control.seek_pk, 10u128 | (20u128 << 64));
     assert_eq!(decoded.control.seek_col_idx, 3);
     assert_eq!(decoded.control.request_id, 0);
     assert_eq!(decoded.control.status, STATUS_OK);
@@ -69,7 +68,7 @@ fn test_encode_decode_roundtrip_with_schema() {
     let sd = simple_schema();
     let names: Vec<&[u8]> = vec![b"id", b"value"];
     let wire = encode_wire(
-        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), None,
     );
@@ -89,7 +88,7 @@ fn test_encode_decode_roundtrip_with_data() {
     let batch = make_simple_batch(100, 999);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = encode_wire(
-        5, 0, 0, 0, 0, 0, 0,
+        5, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );
@@ -109,7 +108,7 @@ fn test_encode_decode_roundtrip_with_data() {
 #[test]
 fn test_encode_decode_error_msg() {
     let wire = encode_wire(
-        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0u128, 0, 0,
         STATUS_ERROR, b"something went wrong",
         None, None, None,
     );
@@ -122,7 +121,7 @@ fn test_encode_decode_error_msg() {
 fn test_encode_decode_request_id_nonzero() {
     let req_id: u64 = 0xDEAD_BEEF_CAFE_F00D;
     let wire = encode_wire(
-        42, 7, 0, 0, 0, 0, req_id,
+        42, 7, 0, 0u128, 0, req_id,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -133,7 +132,7 @@ fn test_encode_decode_request_id_nonzero() {
 #[test]
 fn test_encode_decode_request_id_max() {
     let wire = encode_wire(
-        1, 2, 3, 4, 5, 6, u64::MAX,
+        1, 2, 3, 4u128 | (5u128 << 64), 6, u64::MAX,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -145,7 +144,7 @@ fn test_encode_decode_request_id_max() {
 fn test_encode_decode_request_id_with_error() {
     let req_id: u64 = 0x1122_3344_5566_7788;
     let wire = encode_wire(
-        10, 20, 30, 40, 50, 60, req_id,
+        10, 20, 30, 40u128 | (50u128 << 64), 60, req_id,
         STATUS_ERROR, b"boom",
         None, None, None,
     );
@@ -159,14 +158,14 @@ fn test_encode_decode_request_id_with_error() {
 fn test_wire_size_includes_request_id() {
     let sz = wire_size(STATUS_OK, b"", None, None, None, None);
     let wire = encode_wire(
-        0, 0, 0, 0, 0, 0, 0xAAAA_BBBB_CCCC_DDDD,
+        0, 0, 0, 0u128, 0, 0xAAAA_BBBB_CCCC_DDDD,
         STATUS_OK, b"",
         None, None, None,
     );
     assert_eq!(sz, wire.len());
     let sz2 = wire_size(STATUS_ERROR, b"err", None, None, None, None);
     let wire2 = encode_wire(
-        0, 0, 0, 0, 0, 0, u64::MAX,
+        0, 0, 0, 0u128, 0, u64::MAX,
         STATUS_ERROR, b"err",
         None, None, None,
     );
@@ -196,7 +195,7 @@ fn test_flag_has_data_requires_schema() {
     let batch = make_simple_batch(1, 2);
     let names: Vec<&[u8]> = vec![b"a", b"b"];
     let mut wire = encode_wire(
-        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );
@@ -242,7 +241,7 @@ fn test_encode_decode_string_column() {
 
     let names: Vec<&[u8]> = vec![b"id", b"val", b"name"];
     let wire = encode_wire(
-        10, 0, 0, 0, 0, 0, 0,
+        10, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );
@@ -264,22 +263,22 @@ fn test_encode_decode_string_column() {
 #[test]
 fn wire_size_matches_encode() {
     let sz = wire_size(STATUS_OK, b"", None, None, None, None);
-    let wire = encode_wire(42, 7, 0x100, 10, 20, 3, 0, STATUS_OK, b"", None, None, None);
+    let wire = encode_wire(42, 7, 0x100, 10u128 | (20u128 << 64), 3, 0, STATUS_OK, b"", None, None, None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
 
     let sd = simple_schema();
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), None, None);
-    let wire = encode_wire(1, 0, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
+    let wire = encode_wire(1, 0, 0, 0u128, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (schema only)");
 
     let batch = make_simple_batch(100, 999);
     let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None);
-    let wire = encode_wire(5, 0, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+    let wire = encode_wire(5, 0, 0, 0u128, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
     assert_eq!(sz, wire.len(), "wire_size mismatch (with data)");
 
     let sz = wire_size(STATUS_ERROR, b"something went wrong", None, None, None, None);
-    let wire = encode_wire(0, 0, 0, 0, 0, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
+    let wire = encode_wire(0, 0, 0, 0u128, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (error msg)");
 }
 
@@ -293,7 +292,7 @@ fn encode_wire_into_roundtrip() {
     let mut buf = vec![0u8; sz];
     let written = encode_wire_into(
         &mut buf, 0,
-        5, 0, 0, 0, 0, 0, 0,
+        5, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch), None,
     );
@@ -317,7 +316,7 @@ fn encode_wire_into_matches_encode_wire() {
     let names: Vec<&[u8]> = vec![b"id", b"val"];
 
     let wire = encode_wire(
-        10, 3, 0x200, 5, 6, 7, 0,
+        10, 3, 0x200, 5u128 | (6u128 << 64), 7, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );
@@ -326,7 +325,7 @@ fn encode_wire_into_matches_encode_wire() {
     let mut buf = vec![0u8; sz];
     let written = encode_wire_into(
         &mut buf, 0,
-        10, 3, 0x200, 5, 6, 7, 0,
+        10, 3, 0x200, 5u128 | (6u128 << 64), 7, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch), None,
     );
@@ -345,7 +344,7 @@ fn prebuilt_schema_block_matches_inline_encode() {
 
     // Inline path (no prebuilt).
     let inline = encode_wire(
-        target_id, 0, 0, 0, 0, 0, 0,
+        target_id, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );
@@ -356,7 +355,7 @@ fn prebuilt_schema_block_matches_inline_encode() {
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0,
-        target_id, 0, 0, 0, 0, 0, 0,
+        target_id, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), None, Some(&batch), Some(&prebuilt),
     );
@@ -373,7 +372,7 @@ fn prebuilt_schema_block_no_col_names_roundtrips() {
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0,
-        5, 0, 0, 0, 0, 0, 0,
+        5, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), None, None, Some(&prebuilt),
     );
@@ -385,7 +384,7 @@ fn prebuilt_schema_block_no_col_names_roundtrips() {
 #[test]
 fn test_decode_truncated_control_block_returns_err() {
     let wire = encode_wire(
-        1, 2, 3, 4, 5, 6, 7,
+        1, 2, 3, 4u128 | (5u128 << 64), 6, 7,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -411,7 +410,7 @@ fn test_decode_wire_with_schema_rejects_nullable_mismatch() {
     let batch = make_simple_batch(1, 42);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = encode_wire(
-        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&client_sd), Some(&names), Some(&batch),
     );
@@ -433,7 +432,7 @@ fn test_decode_wire_with_schema_accepts_nullable_match() {
     let batch = make_simple_batch(1, 42);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = encode_wire(
-        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&server_sd), Some(&names), Some(&batch),
     );
@@ -449,7 +448,7 @@ fn test_decode_wire_with_schema_accepts_nullable_match() {
 fn decode_control_block_long_error_msg_uses_blob() {
     let long_msg = b"this error message is definitely longer than twelve bytes";
     let wire = encode_wire(
-        7, 3, 0, 0, 0, 0, 0xABCD,
+        7, 3, 0, 0u128, 0, 0xABCD,
         STATUS_ERROR, long_msg,
         None, None, None,
     );
@@ -467,7 +466,7 @@ fn decode_control_block_long_error_msg_uses_blob() {
 #[test]
 fn decode_control_block_null_error_msg() {
     let wire = encode_wire(
-        42, 0, 0, 0, 0, 0, 0,
+        42, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -479,7 +478,7 @@ fn decode_control_block_null_error_msg() {
 #[test]
 fn decode_control_block_all_fields_round_trip() {
     let wire = encode_wire(
-        0xDEAD, 0xBEEF, 0xCAFE, 0x1111, 0x2222, 0x3333, 0x4444,
+        0xDEAD, 0xBEEF, 0xCAFE, 0x1111u128 | (0x2222u128 << 64), 0x3333, 0x4444,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -487,8 +486,7 @@ fn decode_control_block_all_fields_round_trip() {
     assert_eq!(decoded.control.target_id,    0xDEAD);
     assert_eq!(decoded.control.client_id,    0xBEEF);
     assert_eq!(decoded.control.flags & 0xFFFF, 0xCAFE);
-    assert_eq!(decoded.control.seek_pk_lo,   0x1111);
-    assert_eq!(decoded.control.seek_pk_hi,   0x2222);
+    assert_eq!(decoded.control.seek_pk,      0x1111u128 | (0x2222u128 << 64));
     assert_eq!(decoded.control.seek_col_idx, 0x3333);
     assert_eq!(decoded.control.request_id,   0x4444);
 }
@@ -496,7 +494,7 @@ fn decode_control_block_all_fields_round_trip() {
 #[test]
 fn peek_target_id_on_valid_wire() {
     let wire = encode_wire(
-        99, 0, 0, 0, 0, 0, 0,
+        99, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         None, None, None,
     );
@@ -517,7 +515,7 @@ fn decode_wire_truncated_schema_block_returns_err() {
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     // Encode with schema but no data.
     let wire = encode_wire(
-        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), None,
     );
@@ -536,7 +534,7 @@ fn decode_wire_truncated_data_block_returns_err() {
     let batch = make_simple_batch(1, 42);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = encode_wire(
-        1, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         Some(&sd), Some(&names), Some(&batch),
     );

@@ -185,14 +185,14 @@ fn test_ingest_scan_seek_family() {
     assert_eq!(scan_batch.count, 3);
 
     // Seek existing
-    let found = engine.seek_family(tid, 2, 0).unwrap();
+    let found = engine.seek_family(tid, 2u128).unwrap();
     assert!(found.is_some());
     let row = found.unwrap();
     assert_eq!(row.count, 1);
     assert_eq!(row.get_pk(0), 2);
 
     // Seek missing
-    let not_found = engine.seek_family(tid, 99, 0).unwrap();
+    let not_found = engine.seek_family(tid, 99u128).unwrap();
     assert!(not_found.is_none());
 
     engine.close();
@@ -405,7 +405,7 @@ fn test_circuit_table_surface_restricted() {
     assert_eq!(scan.count, 0, "scan_family must not expose CIRCUIT_NODES data");
 
     // seek_family must also return None (already correct, assert for consistency).
-    let seek = engine.seek_family(CIRCUIT_NODES_TAB_ID, 42, 0).unwrap();
+    let seek = engine.seek_family(CIRCUIT_NODES_TAB_ID, 42u128).unwrap();
     assert!(seek.is_none(), "seek_family must not expose CIRCUIT_NODES data");
 
     engine.close();

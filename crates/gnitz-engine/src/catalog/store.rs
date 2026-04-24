@@ -177,7 +177,7 @@ impl CatalogEngine {
     }
 
     /// Point lookup by PK. Returns a single-row batch if found, None otherwise.
-    pub fn seek_family(&mut self, table_id: i64, pk_lo: u64, pk_hi: u64) -> Result<Option<Batch>, String> {
+    pub fn seek_family(&mut self, table_id: i64, pk: u128) -> Result<Option<Batch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
@@ -206,9 +206,9 @@ impl CatalogEngine {
             Err(_) => return Ok(None),
         };
 
-        cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
+        cursor.cursor.seek(pk);
         if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key_lo() != pk_lo || cursor.cursor.current_key_hi() != pk_hi {
+        if cursor.cursor.current_key != pk {
             return Ok(None);
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
@@ -219,7 +219,7 @@ impl CatalogEngine {
     }
 
     /// Index-assisted lookup: look up by secondary index key, resolve to source row.
-    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, key_lo: u64, key_hi: u64)
+    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, key: u128)
         -> Result<Option<Batch>, String>
     {
         let entry = self.dag.tables.get(&table_id)
@@ -233,9 +233,9 @@ impl CatalogEngine {
         // Seek in index table
         let idx_table = ic.table_mut();
         let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
-        cursor.cursor.seek(crate::util::make_pk(key_lo, key_hi));
+        cursor.cursor.seek(key);
         if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key_lo() != key_lo || cursor.cursor.current_key_hi() != key_hi {
+        if cursor.cursor.current_key != key {
             return Ok(None);
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
@@ -247,18 +247,16 @@ impl CatalogEngine {
         let pk_size = idx_schema.columns[payload_col_idx].size as usize;
         let ptr = cursor.cursor.col_ptr(payload_col_idx, pk_size);
         if ptr.is_null() { return Ok(None); }
-        let (src_pk_lo, src_pk_hi) = if pk_size == 16 {
-            let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
-            let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
-            (lo, hi)
+        let src_pk: u128 = if pk_size == 16 {
+            u128::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 16) }.try_into().unwrap())
         } else {
             let mut buf = [0u8; 8];
             let copy_len = pk_size.min(8);
             unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len) };
-            (u64::from_le_bytes(buf), 0u64)
+            u64::from_le_bytes(buf) as u128
         };
 
-        self.seek_family(table_id, src_pk_lo, src_pk_hi)
+        self.seek_family(table_id, src_pk)
     }
 
     /// Flush a table's WAL.
@@ -551,11 +549,11 @@ impl CatalogEngine {
             Ok(c) => c,
             Err(_) => return Ok(Vec::new()),
         };
-        cursor.cursor.seek(crate::util::make_pk(start_pk, 0));
+        cursor.cursor.seek(start_pk as u128);
 
         let mut defs = Vec::new();
         while cursor.cursor.valid {
-            let pk = cursor.cursor.current_key_lo();
+            let pk = cursor.cursor.current_key as u64;
             if pk >= end_pk { break; }
             if cursor.cursor.current_weight > 0 {
                 let type_code = cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8;

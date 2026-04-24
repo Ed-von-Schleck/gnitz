@@ -80,14 +80,10 @@ class Connection:
         return self.resolve_table(schema_name, table_name)
 
     def seek(self, table_id: int, pk: int = 0):
-        pk_lo = pk & 0xFFFFFFFFFFFFFFFF
-        pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
-        return self._client.seek_lazy(table_id, pk_lo, pk_hi)
+        return self._client.seek_lazy(table_id, pk)
 
     def seek_by_index(self, table_id: int, col_idx: int, key: int = 0):
-        key_lo = key & 0xFFFFFFFFFFFFFFFF
-        key_hi = (key >> 64) & 0xFFFFFFFFFFFFFFFF
-        return self._client.seek_by_index_lazy(table_id, col_idx, key_lo, key_hi)
+        return self._client.seek_by_index_lazy(table_id, col_idx, key)
 
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
         return self._client.execute_sql(schema_name, sql)

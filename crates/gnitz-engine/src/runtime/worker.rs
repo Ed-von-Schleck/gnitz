@@ -315,8 +315,7 @@ impl WorkerProcess {
         request_id: u64,
     ) -> DispatchResult {
         // Extract control fields before consuming decoded
-        let seek_pk_lo = decoded.as_ref().map(|d| d.control.seek_pk_lo).unwrap_or(0);
-        let seek_pk_hi = decoded.as_ref().map(|d| d.control.seek_pk_hi).unwrap_or(0);
+        let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
 
         // Extract batch (consumes decoded)
@@ -391,7 +390,7 @@ impl WorkerProcess {
 
         if flags & FLAG_SEEK_BY_INDEX != 0 {
             let col_idx = seek_col_idx as u32;
-            match self.cat().seek_by_index(target_id, col_idx, seek_pk_lo, seek_pk_hi) {
+            match self.cat().seek_by_index(target_id, col_idx, seek_pk) {
                 Ok(result) => {
                     let schema = self.cat().get_schema_desc(target_id);
                     self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
@@ -402,7 +401,7 @@ impl WorkerProcess {
         }
 
         if flags & FLAG_SEEK != 0 {
-            match self.cat().seek_family(target_id, seek_pk_lo, seek_pk_hi) {
+            match self.cat().seek_family(target_id, seek_pk) {
                 Ok(result) => {
                     let schema = self.cat().get_schema_desc(target_id);
                     self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
@@ -430,7 +429,7 @@ impl WorkerProcess {
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, flags as u64,
-                0, 0, 0, request_id, STATUS_OK, &[], None, None, None, None,
+                0u128, 0, request_id, STATUS_OK, &[], None, None, None, None,
             );
         });
     }
@@ -465,7 +464,7 @@ impl WorkerProcess {
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, 0, 0,
-                0, 0, 0, request_id, STATUS_OK, &[],
+                0u128, 0, request_id, STATUS_OK, &[],
                 schema, None, result, prebuilt,
             );
         });
@@ -477,7 +476,7 @@ impl WorkerProcess {
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, 0, 0, 0,
-                0, 0, 0, request_id, STATUS_ERROR, msg, None, None, None, None,
+                0u128, 0, request_id, STATUS_ERROR, msg, None, None, None, None,
             );
         });
     }
@@ -687,7 +686,7 @@ impl WorkerProcess {
         self.w2m_writer.send_encoded(sz, |buf| {
             ipc::encode_wire_into(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u64, 0, 0, tick_request_id, STATUS_OK, &[],
+                source_id as u128, 0, tick_request_id, STATUS_OK, &[],
                 schema.as_ref(), None, Some(batch), None,
             );
         });
@@ -735,7 +734,7 @@ impl WorkerProcess {
                     // taking the batch out.
                     let decoded = msg_wire.and_then(|d| ipc::decode_wire(d).ok());
                     let relay_source_id = decoded.as_ref()
-                        .map(|d| d.control.seek_pk_lo as i64)
+                        .map(|d| d.control.seek_pk as i64)
                         .unwrap_or(0);
                     let relay_batch = decoded
                         .and_then(|d| d.data_batch)

@@ -1277,52 +1277,27 @@ impl Batch {
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
 
     /// Byte count of the WAL-block encoding for this batch.
-    #[allow(clippy::needless_range_loop)]
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
-        // WAL V2 wire format: pk_lo (8B/row) + pk_hi (8B/row) instead of pk (16B/row)
-        // so num_regions = (in-memory nr - 1) + 2 = in-memory nr + 1.
-        let nr_mem = self.num_regions_total();
-        let nr_wire = nr_mem + 1;
-        let n = self.count;
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 2];
-        sizes[0] = (n * 8) as u32; // pk_lo
-        sizes[1] = (n * 8) as u32; // pk_hi
-        // weight, null_bmp, payload cols, blob (shift from mem layout by +1)
-        for i in 1..nr_mem {
-            sizes[i + 1] = self.region_size(i) as u32;
+        // V3 wire format: pk (16B/row) — same layout as in-memory, no split.
+        let nr_wire = self.num_regions_total();
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..nr_wire {
+            sizes[i] = self.region_size(i) as u32;
         }
         super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
-    /// Encode self into WAL V2 wire format at out[offset..]. Returns bytes written.
+    /// Encode self into WAL V3 wire format at out[offset..]. Returns bytes written.
     ///
-    /// Splits the unified 16B/row pk region into pk_lo (8B/row) + pk_hi (8B/row)
-    /// to maintain WAL V2 compatibility until Phase 4.
+    /// V3: pk stays as 16B/row — pass in-memory layout directly to WAL encode.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
-        let n = self.count;
-        let pk_data = self.pk_data();
-
-        // Split unified pk into pk_lo and pk_hi for the wire format.
-        let mut pk_lo = vec![0u8; n * 8];
-        let mut pk_hi = vec![0u8; n * 8];
-        for i in 0..n {
-            pk_lo[i * 8..i * 8 + 8].copy_from_slice(&pk_data[i * 16..i * 16 + 8]);
-            pk_hi[i * 8..i * 8 + 8].copy_from_slice(&pk_data[i * 16 + 8..i * 16 + 16]);
+        let nr_wire = self.num_regions_total();
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..nr_wire {
+            ptrs[i] = self.region_ptr(i);
+            sizes[i] = self.region_size(i) as u32;
         }
-
-        let nr_mem = self.num_regions_total();
-        let nr_wire = nr_mem + 1;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 2];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 2];
-        ptrs[0] = pk_lo.as_ptr();
-        ptrs[1] = pk_hi.as_ptr();
-        sizes[0] = (n * 8) as u32;
-        sizes[1] = (n * 8) as u32;
-        for i in 1..nr_mem {
-            ptrs[i + 1] = self.region_ptr(i);
-            sizes[i + 1] = self.region_size(i) as u32;
-        }
-
         let blob_size = self.blob.len() as u64;
         let new_offset = super::wal::encode(
             out, offset, 0, table_id, self.count as u32,
@@ -1334,16 +1309,15 @@ impl Batch {
     /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
     /// Does not set sorted/consolidated — caller derives those from wire header flags.
     ///
-    /// WAL V2 wire format has 4 fixed regions: pk_lo (8B/row), pk_hi (8B/row),
-    /// weight (8B/row), null_bmp (8B/row). This function merges pk_lo + pk_hi
-    /// into the unified 16B/row pk region expected by the in-memory Batch.
+    /// V3 wire format has 3 fixed regions: pk (16B/row), weight (8B/row),
+    /// null_bmp (8B/row). Regions map directly to the in-memory layout.
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
     ) -> Result<(Self, usize), &'static str> {
         let npc = schema.num_columns as usize - 1;
-        // WAL V2 has 4 fixed regions (pk_lo, pk_hi, weight, null_bmp)
-        let expected_regions = 4 + npc + 1;
+        // V3: 3 fixed regions (pk 16B, weight 8B, null_bmp 8B) + npc payload + blob
+        let expected_regions = 3 + npc + 1;
 
         let mut lsn = 0u64;
         let mut tid = 0u32;
@@ -1366,36 +1340,17 @@ impl Batch {
         let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let n = count as usize;
 
-        // Merge pk_lo (region 0, 8B/row) and pk_hi (region 1, 8B/row)
-        // into a unified pk buffer (16B/row) for the in-memory layout.
-        let mut pk_merged: Vec<u8> = vec![0u8; n * 16];
-        if n > 0 {
-            let lo_off = offsets[0] as usize;
-            let hi_off = offsets[1] as usize;
-            for i in 0..n {
-                pk_merged[i * 16..i * 16 + 8]
-                    .copy_from_slice(&data[lo_off + i * 8..lo_off + i * 8 + 8]);
-                pk_merged[i * 16 + 8..i * 16 + 16]
-                    .copy_from_slice(&data[hi_off + i * 8..hi_off + i * 8 + 8]);
-            }
-        }
-
-        // Build ptrs/sizes for from_regions in the 3-region in-memory layout:
-        // [pk(16B), weight(8B), null_bmp(8B), col_0, ..., col_{npc-1}, blob]
-        let nr_mem = 3 + npc + 1;
+        // V3: pk region 0 is already 16B/row — map directly to in-memory layout.
+        let nr_mem = expected_regions;
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
         let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
 
-        ptrs[0] = pk_merged.as_ptr();
-        region_sizes[0] = (n * 16) as u32;
-
-        // weight (was region 2), null_bmp (was region 3), payload (was regions 4..4+npc), blob
-        for (dst, src) in (1..nr_mem).zip(2..) {
-            let off = offsets[src] as usize;
-            let sz = sizes[src] as usize;
-            region_sizes[dst] = sizes[src];
+        for i in 0..nr_mem {
+            let off = offsets[i] as usize;
+            let sz = sizes[i] as usize;
+            region_sizes[i] = sizes[i];
             if sz > 0 && off + sz <= data.len() {
-                ptrs[dst] = unsafe { data.as_ptr().add(off) };
+                ptrs[i] = unsafe { data.as_ptr().add(off) };
             }
         }
 

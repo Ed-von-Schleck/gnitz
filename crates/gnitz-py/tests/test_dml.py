@@ -430,13 +430,13 @@ class TestDeleteSQL:
 
             # Confirm row is found via index before delete
             before = client.seek_by_index(tid, col_idx=2, key=10)
-            assert before.batch is not None and len(before.batch.pk_lo) == 1
+            assert before.batch is not None and len(before.batch.pks) == 1
 
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
 
             # After delete the index should return empty
             after = client.seek_by_index(tid, col_idx=2, key=10)
-            empty = after.batch is None or len(after.batch.pk_lo) == 0
+            empty = after.batch is None or len(after.batch.pks) == 0
             assert empty
         finally:
             _drop_idx_and_table(client, sn, idx)

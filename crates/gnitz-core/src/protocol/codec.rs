@@ -6,8 +6,7 @@ use super::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 /// Mirrors Python's `schema_to_batch`.
 pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     let ncols = schema.columns.len();
-    let mut pk_lo   = Vec::with_capacity(ncols);
-    let mut pk_hi   = Vec::with_capacity(ncols);
+    let mut pks     = Vec::with_capacity(ncols);
     let mut weights = Vec::with_capacity(ncols);
     let mut nulls   = Vec::with_capacity(ncols);
 
@@ -17,8 +16,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     let mut names: Vec<Option<String>> = Vec::with_capacity(ncols);
 
     for (ci, col) in schema.columns.iter().enumerate() {
-        pk_lo.push(ci as u64);
-        pk_hi.push(0u64);
+        pks.push(ci as u128);
         weights.push(1i64);
         nulls.push(0u64);
 
@@ -33,8 +31,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     }
 
     ZSetBatch {
-        pk_lo,
-        pk_hi,
+        pks,
         weights,
         nulls,
         columns: vec![
@@ -67,7 +64,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     };
 
     for i in 0..count {
-        let col_idx = batch.pk_lo[i];
+        let col_idx = batch.pks[i] as u64;
         if col_idx != i as u64 {
             return Err(ProtocolError::DecodeError(format!(
                 "schema batch col_idx out of order: expected {}, got {}", i, col_idx
@@ -147,8 +144,7 @@ mod tests {
             names.push(Some(format!("col{}", i)));
         }
         ZSetBatch {
-            pk_lo:   (0..ncols as u64).collect(),
-            pk_hi:   vec![0; ncols],
+            pks:     (0..ncols as u128).collect(),
             weights: vec![1; ncols],
             nulls:   vec![0; ncols],
             columns: vec![
@@ -176,7 +172,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_out_of_order() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pk_lo.swap(0, 1); // [1, 0] instead of [0, 1]
+        batch.pks.swap(0, 1); // [1, 0] instead of [0, 1]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -185,7 +181,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_gap() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pk_lo[1] = 5; // gap: [0, 5]
+        batch.pks[1] = 5; // gap: [0, 5]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -194,7 +190,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_duplicate() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pk_lo[1] = 0; // duplicate: [0, 0]
+        batch.pks[1] = 0; // duplicate: [0, 0]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }

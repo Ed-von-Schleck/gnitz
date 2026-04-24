@@ -280,7 +280,7 @@ pub const META_FLAG_IS_PK:    u64 = 2;
 // ---------------------------------------------------------------------------
 
 pub const WAL_HEADER_SIZE:   usize = 48;
-pub const WAL_FORMAT_VERSION: u32  = 2;
+pub const WAL_FORMAT_VERSION: u32  = 3;
 pub const IPC_CONTROL_TID:    u32  = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
@@ -321,8 +321,8 @@ pub const SHORT_STRING_THRESHOLD: usize = 12;
 //   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
 //   other      -- master-allocated, monotonic per request
 pub mod control {
-    /// Total number of columns in CONTROL_SCHEMA.
-    pub const NUM_COLUMNS: usize = 10;
+    /// Total number of columns in CONTROL_SCHEMA (9: msg_idx PK + 7 U64 + seek_pk U128 + error_msg String).
+    pub const NUM_COLUMNS: usize = 9;
 
     // Schema column indices (the column number, including the PK placeholder).
     pub const COL_MSG_IDX:      usize = 0;
@@ -330,11 +330,10 @@ pub mod control {
     pub const COL_CLIENT_ID:    usize = 2;
     pub const COL_TARGET_ID:    usize = 3;
     pub const COL_FLAGS:        usize = 4;
-    pub const COL_SEEK_PK_LO:   usize = 5;
-    pub const COL_SEEK_PK_HI:   usize = 6;
-    pub const COL_SEEK_COL_IDX: usize = 7;
-    pub const COL_REQUEST_ID:   usize = 8;
-    pub const COL_ERROR_MSG:    usize = 9;
+    pub const COL_SEEK_PK:      usize = 5;  // U128; replaces seek_pk_lo + seek_pk_hi
+    pub const COL_SEEK_COL_IDX: usize = 6;
+    pub const COL_REQUEST_ID:   usize = 7;
+    pub const COL_ERROR_MSG:    usize = 8;
 
     /// Payload index = schema column index − 1 (PK at col 0 is excluded
     /// from the payload). Used by encoders that index payload columns
@@ -343,8 +342,7 @@ pub mod control {
     pub const PAYLOAD_CLIENT_ID:    usize = COL_CLIENT_ID - 1;
     pub const PAYLOAD_TARGET_ID:    usize = COL_TARGET_ID - 1;
     pub const PAYLOAD_FLAGS:        usize = COL_FLAGS - 1;
-    pub const PAYLOAD_SEEK_PK_LO:   usize = COL_SEEK_PK_LO - 1;
-    pub const PAYLOAD_SEEK_PK_HI:   usize = COL_SEEK_PK_HI - 1;
+    pub const PAYLOAD_SEEK_PK:      usize = COL_SEEK_PK - 1;
     pub const PAYLOAD_SEEK_COL_IDX: usize = COL_SEEK_COL_IDX - 1;
     pub const PAYLOAD_REQUEST_ID:   usize = COL_REQUEST_ID - 1;
     pub const PAYLOAD_ERROR_MSG:    usize = COL_ERROR_MSG - 1;
@@ -353,27 +351,24 @@ pub mod control {
     /// Equals the payload index of the column.
     pub const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
 
-    /// WAL region count for a CONTROL_SCHEMA block: 4 fixed regions
-    /// (pk_lo, pk_hi, weight, null_bmp) + (NUM_COLUMNS - 1) payload columns
+    /// WAL region count for a CONTROL_SCHEMA block (V3 format):
+    /// 3 fixed regions (pk 16B, weight, null_bmp) + (NUM_COLUMNS - 1) payload columns
     /// + 1 blob region.
-    pub const NUM_REGIONS: usize = 4 + (NUM_COLUMNS - 1) + 1;
+    pub const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
 
-    // Region indices for offsets/sizes arrays returned by wal::validate_and_parse.
-    // Offsets 0..3 are the fixed regions; offsets 4..(4+NUM_PAYLOAD-1) line up
-    // with payload columns (in payload order), and the last region is the blob.
-    pub const REGION_PK_LO:        usize = 0;
-    pub const REGION_PK_HI:        usize = 1;
-    pub const REGION_WEIGHT:       usize = 2;
-    pub const REGION_NULL_BMP:     usize = 3;
-    pub const REGION_STATUS:       usize = 4 + PAYLOAD_STATUS;
-    pub const REGION_CLIENT_ID:    usize = 4 + PAYLOAD_CLIENT_ID;
-    pub const REGION_TARGET_ID:    usize = 4 + PAYLOAD_TARGET_ID;
-    pub const REGION_FLAGS:        usize = 4 + PAYLOAD_FLAGS;
-    pub const REGION_SEEK_PK_LO:   usize = 4 + PAYLOAD_SEEK_PK_LO;
-    pub const REGION_SEEK_PK_HI:   usize = 4 + PAYLOAD_SEEK_PK_HI;
-    pub const REGION_SEEK_COL_IDX: usize = 4 + PAYLOAD_SEEK_COL_IDX;
-    pub const REGION_REQUEST_ID:   usize = 4 + PAYLOAD_REQUEST_ID;
-    pub const REGION_ERROR_MSG:    usize = 4 + PAYLOAD_ERROR_MSG;
+    // Region indices. V3 format: 3 system regions (pk=0, weight=1, null_bmp=2)
+    // followed by payload columns in schema order, then blob last.
+    pub const REGION_PK:           usize = 0;
+    pub const REGION_WEIGHT:       usize = 1;
+    pub const REGION_NULL_BMP:     usize = 2;
+    pub const REGION_STATUS:       usize = 3 + PAYLOAD_STATUS;
+    pub const REGION_CLIENT_ID:    usize = 3 + PAYLOAD_CLIENT_ID;
+    pub const REGION_TARGET_ID:    usize = 3 + PAYLOAD_TARGET_ID;
+    pub const REGION_FLAGS:        usize = 3 + PAYLOAD_FLAGS;
+    pub const REGION_SEEK_PK:      usize = 3 + PAYLOAD_SEEK_PK;
+    pub const REGION_SEEK_COL_IDX: usize = 3 + PAYLOAD_SEEK_COL_IDX;
+    pub const REGION_REQUEST_ID:   usize = 3 + PAYLOAD_REQUEST_ID;
+    pub const REGION_ERROR_MSG:    usize = 3 + PAYLOAD_ERROR_MSG;
     pub const REGION_BLOB:         usize = NUM_REGIONS - 1;
 }
 

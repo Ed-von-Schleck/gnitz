@@ -61,7 +61,7 @@ class TestIndexDdl:
             assert batch_obj is not None
             found = False
             tid, _ = client.resolve_table(sn, "t")
-            for i in range(len(batch_obj.pk_lo)):
+            for i in range(len(batch_obj.pks)):
                 if batch_obj.weights[i] <= 0:
                     continue
                 owner_id = batch_obj.columns[1][i] if batch_obj.columns[1] else None
@@ -94,7 +94,7 @@ class TestIndexDdl:
             _, batch_obj, _ = raw
             assert batch_obj is not None
             tid, _ = client.resolve_table(sn, "t")
-            for i in range(len(batch_obj.pk_lo)):
+            for i in range(len(batch_obj.pks)):
                 if batch_obj.weights[i] <= 0:
                     continue
                 owner_id = batch_obj.columns[1][i]
@@ -125,7 +125,7 @@ class TestIndexDdl:
             _, batch_obj, _ = client._client.scan(IDX_TAB)
             if batch_obj is not None:
                 tid, _ = client.resolve_table(sn, "t")
-                for i in range(len(batch_obj.pk_lo)):
+                for i in range(len(batch_obj.pks)):
                     if batch_obj.weights[i] <= 0:
                         continue
                     assert batch_obj.columns[1][i] != tid, "IdxTab row should be gone"
@@ -229,8 +229,8 @@ class TestIndexSeek:
 
             result = client.seek_by_index(tid, col_idx=1, key=42)
             assert result.batch is not None
-            assert len(result.batch.pk_lo) == 1
-            assert result.batch.pk_lo[0] == 1
+            assert len(result.batch.pks) == 1
+            assert result.batch.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -247,7 +247,7 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
             result = client.seek_by_index(tid, col_idx=1, key=999)
-            assert result.batch is None or len(result.batch.pk_lo) == 0
+            assert result.batch is None or len(result.batch.pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -266,8 +266,8 @@ class TestIndexSeek:
 
             result = client.seek_by_index(tid, col_idx=1, key=77)
             assert result.batch is not None
-            assert len(result.batch.pk_lo) == 1
-            assert result.batch.pk_lo[0] == 10
+            assert len(result.batch.pks) == 1
+            assert result.batch.pks[0] == 10
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -283,8 +283,8 @@ class TestIndexSeek:
 
             result = client.seek_by_index(tid, col_idx=1, key=55)
             assert result.batch is not None
-            assert len(result.batch.pk_lo) == 1
-            assert result.batch.pk_lo[0] == 5
+            assert len(result.batch.pks) == 1
+            assert result.batch.pks[0] == 5
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -312,8 +312,8 @@ class TestIndexSql:
             )
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pk_lo) == 1
-            assert rows.batch.pk_lo[0] == 1
+            assert len(rows.batch.pks) == 1
+            assert rows.batch.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -334,7 +334,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE pk = 7", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert results[0]["rows"].batch.pk_lo[0] == 7
+            assert results[0]["rows"].batch.pks[0] == 7
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -374,8 +374,8 @@ class TestIndexSql:
             )
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pk_lo) == 1
-            assert rows.batch.pk_lo[0] == 1
+            assert len(rows.batch.pks) == 1
+            assert rows.batch.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -397,7 +397,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE val = 999", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].batch.pk_lo) == 0
+            assert len(results[0]["rows"].batch.pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -424,8 +424,8 @@ class TestIndexSql:
                 )
                 assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pk_lo) == 1, f"expected 1 row for score={val}"
-                assert rows.batch.pk_lo[0] == pk, f"wrong pk for score={val}"
+                assert len(rows.batch.pks) == 1, f"expected 1 row for score={val}"
+                assert rows.batch.pks[0] == pk, f"wrong pk for score={val}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_score"],
@@ -452,8 +452,8 @@ class TestIndexSql:
                 )
                 assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pk_lo) == 1, f"expected 1 row for score={val}"
-                assert rows.batch.pk_lo[0] == pk, f"wrong pk for score={val}"
+                assert len(rows.batch.pks) == 1, f"expected 1 row for score={val}"
+                assert rows.batch.pks[0] == pk, f"wrong pk for score={val}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_score"],
@@ -475,7 +475,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE val = -99", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].batch.pk_lo) == 0
+            assert len(results[0]["rows"].batch.pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -539,7 +539,7 @@ class TestIndexIntegrity:
             vid, _ = client.resolve_table(sn, "v")
             result = client.scan(vid)
             assert result.batch is not None
-            assert len(result.batch.pk_lo) == 1
+            assert len(result.batch.pks) == 1
         finally:
             _drop_all(client, sn, views=["v"], tables=["t"])
 
@@ -623,7 +623,7 @@ class TestIndexIntegrity:
             tid, _ = client.resolve_table(sn, "t")
             result = client.scan(tid)
             assert result.batch is not None
-            assert len(result.batch.pk_lo) == 1
+            assert len(result.batch.pks) == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -785,8 +785,8 @@ class TestIndexReadBarrier:
                 "SELECT * FROM t WHERE val = 42", schema_name=sn)
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pk_lo) == 1
-            assert rows.batch.pk_lo[0] == 1
+            assert len(rows.batch.pks) == 1
+            assert rows.batch.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -815,8 +815,8 @@ class TestIndexReadBarrier:
                 )
                 assert results[0]["type"] == "Rows"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pk_lo) == 1
-                assert rows.batch.pk_lo[0] == i + 1
+                assert len(rows.batch.pks) == 1
+                assert rows.batch.pks[0] == i + 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],

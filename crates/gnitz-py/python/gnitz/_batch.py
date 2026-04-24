@@ -20,10 +20,7 @@ class ZSetBatch:
         return self
 
     @property
-    def pk_lo(self):   return self._raw.pk_lo
-
-    @property
-    def pk_hi(self):   return self._raw.pk_hi
+    def pks(self):     return self._raw.pks
 
     @property
     def weights(self): return self._raw.weights

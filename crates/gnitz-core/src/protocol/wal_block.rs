@@ -34,6 +34,17 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
+/// Serialize `&[u128]` into `buf` at 8-byte alignment as 16-byte LE values.
+fn append_16byte_region(buf: &mut Vec<u8>, vals: &[u128]) -> (u32, u32) {
+    let aligned = align8(buf.len());
+    buf.resize(aligned, 0);
+    for &v in vals {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let sz = vals.len() * 16;
+    (aligned as u32, sz as u32)
+}
+
 fn xxh3_64(data: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(data)
 }
@@ -92,13 +103,13 @@ fn read_64bit_region<T: Copy + Default>(
 
 /// Encode a ZSetBatch into a WAL block `Vec<u8>`.
 ///
-/// Region order: pk_lo, pk_hi, weight, null, [non-PK cols in schema order], blob.
-/// num_regions = 4 + (ncols - 1) + 1.
+/// Region order: pk (16B each), weight, null, [non-PK cols in schema order], blob.
+/// num_regions = 3 + (ncols - 1) + 1.
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let count = batch.len();
     let ncols = schema.columns.len();
     let num_non_pk = if ncols > 0 { ncols - 1 } else { 0 };
-    let num_regions = 4 + num_non_pk + 1;
+    let num_regions = 3 + num_non_pk + 1;
 
     // --- Pre-build String/U128 column region data (needs blob arena) ---
     // Fixed columns are appended directly to buf later (no clone).
@@ -171,8 +182,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_64bit_region(&mut buf, &batch.pk_lo));
-    dir_entries.push(append_64bit_region(&mut buf, &batch.pk_hi));
+    dir_entries.push(append_16byte_region(&mut buf, &batch.pks));
     dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
     dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 
@@ -265,7 +275,7 @@ pub fn decode_wal_block(
     }
 
     // Validate num_regions
-    let expected_num_regions = 4 + (schema.columns.len() - 1) + 1;
+    let expected_num_regions = 3 + (schema.columns.len() - 1) + 1;
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
             "WAL block num_regions mismatch: expected {}, got {}",
@@ -301,15 +311,26 @@ pub fn decode_wal_block(
     // Read system regions
     let mut region_idx = 0;
 
-    let (pk_lo_off,  pk_lo_sz)  = dir[region_idx]; region_idx += 1;
-    let (pk_hi_off,  pk_hi_sz)  = dir[region_idx]; region_idx += 1;
-    let (wt_off,     wt_sz)     = dir[region_idx]; region_idx += 1;
-    let (null_off,   null_sz)   = dir[region_idx]; region_idx += 1;
+    let (pk_off,   pk_sz)   = dir[region_idx]; region_idx += 1;
+    let (wt_off,   wt_sz)   = dir[region_idx]; region_idx += 1;
+    let (null_off, null_sz) = dir[region_idx]; region_idx += 1;
 
-    let pk_lo: Vec<u64>   = read_64bit_region(data, pk_lo_off, pk_lo_sz, count, "pk_lo")?;
-    let pk_hi: Vec<u64>   = read_64bit_region(data, pk_hi_off, pk_hi_sz, count, "pk_hi")?;
-    let weights: Vec<i64> = read_64bit_region(data, wt_off,    wt_sz,    count, "weights")?;
-    let nulls: Vec<u64>   = read_64bit_region(data, null_off,  null_sz,  count, "nulls")?;
+    let expected_pk_sz = count * 16;
+    if pk_sz != expected_pk_sz {
+        return Err(ProtocolError::DecodeError(format!(
+            "pk region size mismatch: expected {}, got {}", expected_pk_sz, pk_sz
+        )));
+    }
+    let mut pks: Vec<u128> = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = pk_off + i * 16;
+        if base + 16 > total_size {
+            return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
+        }
+        pks.push(u128::from_le_bytes(data[base..base + 16].try_into().unwrap()));
+    }
+    let weights: Vec<i64> = read_64bit_region(data, wt_off,   wt_sz,   count, "weights")?;
+    let nulls: Vec<u64>   = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
 
     // Blob region (always last)
     let (blob_off, blob_sz) = dir[num_regions - 1];
@@ -393,7 +414,7 @@ pub fn decode_wal_block(
         }
     }
 
-    Ok((ZSetBatch { pk_lo, pk_hi, weights, nulls, columns }, table_id, lsn))
+    Ok((ZSetBatch { pks, weights, nulls, columns }, table_id, lsn))
 }
 
 /// Recompute and write the WAL block checksum in-place.
@@ -529,8 +550,7 @@ mod tests {
     fn test_encode_decode_fixed() {
         let schema = u64_schema();
         let n = 10usize;
-        let pk_lo: Vec<u64>   = (0..n as u64).collect();
-        let pk_hi: Vec<u64>   = vec![0; n];
+        let pks: Vec<u128>    = (0..n as u128).collect();
         let weights: Vec<i64> = vec![1; n];
         let nulls: Vec<u64>   = vec![0; n];
         let vals: Vec<i64>    = (0..n as i64).map(|x| x * -7).collect();
@@ -538,7 +558,7 @@ mod tests {
         for &v in &vals { val_bytes.extend_from_slice(&v.to_le_bytes()); }
 
         let batch = ZSetBatch {
-            pk_lo: pk_lo.clone(), pk_hi: pk_hi.clone(),
+            pks: pks.clone(),
             weights: weights.clone(), nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes.clone())],
         };
@@ -547,8 +567,7 @@ mod tests {
         let (decoded, tid, _lsn) = decode_wal_block(&encoded, &schema).unwrap();
 
         assert_eq!(tid, 42);
-        assert_eq!(decoded.pk_lo, pk_lo);
-        assert_eq!(decoded.pk_hi, pk_hi);
+        assert_eq!(decoded.pks, pks);
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -572,8 +591,7 @@ mod tests {
         ];
 
         let batch = ZSetBatch {
-            pk_lo: (0..n as u64).collect(),
-            pk_hi: vec![0; n],
+            pks: (0..n as u128).collect(),
             weights: vec![1; n],
             nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Strings(vals.clone())],
@@ -596,8 +614,7 @@ mod tests {
         let n = vals.len();
 
         let batch = ZSetBatch {
-            pk_lo: vals.iter().map(|&v| v as u64).collect(),
-            pk_hi: vals.iter().map(|&v| (v >> 64) as u64).collect(),
+            pks: vals.clone(),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), ColData::U128s(vals.clone())],
@@ -616,7 +633,7 @@ mod tests {
     fn test_encode_decode_empty() {
         let schema = u64_schema();
         let empty = ZSetBatch {
-            pk_lo: vec![], pk_hi: vec![], weights: vec![], nulls: vec![],
+            pks: vec![], weights: vec![], nulls: vec![],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
         };
         let encoded = encode_wal_block(&schema, 7, &empty);
@@ -629,7 +646,7 @@ mod tests {
     fn test_bad_checksum() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pk_lo: vec![1], pk_hi: vec![0], weights: vec![1], nulls: vec![0],
+            pks: vec![1u128], weights: vec![1], nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
         };
         let mut encoded = encode_wal_block(&schema, 0, &batch);
@@ -643,7 +660,7 @@ mod tests {
     fn test_bad_version() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pk_lo: vec![1], pk_hi: vec![0], weights: vec![1], nulls: vec![0],
+            pks: vec![1u128], weights: vec![1], nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
         };
         let mut encoded = encode_wal_block(&schema, 0, &batch);

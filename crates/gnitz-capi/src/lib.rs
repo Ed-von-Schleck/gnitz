@@ -238,8 +238,7 @@ fn append_row_inner(
     null_mask: u64,
     col_data:  &[u8],
 ) -> Result<(), String> {
-    b.batch.pk_lo.push(pk_lo);
-    b.batch.pk_hi.push(pk_hi);
+    b.batch.pks.push(pk_lo as u128 | (pk_hi as u128) << 64);
     b.batch.weights.push(weight);
     b.batch.nulls.push(null_mask);
 
@@ -301,10 +300,10 @@ pub extern "C" fn gnitz_batch_set_string(
     };
     match &mut b.batch.columns[col_idx] {
         ColData::Strings(v) => {
-            if v.len() >= b.batch.pk_lo.len() {
+            if v.len() >= b.batch.pks.len() {
                 set_error(format!(
                     "col {}: already has {} strings for {} rows",
-                    col_idx, v.len(), b.batch.pk_lo.len()
+                    col_idx, v.len(), b.batch.pks.len()
                 ));
                 return -1;
             }
@@ -325,18 +324,18 @@ pub extern "C" fn gnitz_batch_len(batch: *const GnitzBatch) -> usize {
     check_ptr!(batch, 0).batch.len()
 }
 
-/// pk_lo for row i. Returns 0 on null or out-of-range.
+/// pk_lo (lower 64 bits of the 128-bit PK) for row i. Returns 0 on out-of-range.
 #[no_mangle]
 pub extern "C" fn gnitz_batch_get_pk_lo(batch: *const GnitzBatch, row: usize) -> u64 {
     let b = check_ptr!(batch, 0);
-    *b.batch.pk_lo.get(row).unwrap_or(&0)
+    b.batch.pks.get(row).copied().unwrap_or(0) as u64
 }
 
-/// pk_hi for row i.
+/// pk_hi (upper 64 bits of the 128-bit PK) for row i. Returns 0 on out-of-range.
 #[no_mangle]
 pub extern "C" fn gnitz_batch_get_pk_hi(batch: *const GnitzBatch, row: usize) -> u64 {
     let b = check_ptr!(batch, 0);
-    *b.batch.pk_hi.get(row).unwrap_or(&0)
+    (b.batch.pks.get(row).copied().unwrap_or(0) >> 64) as u64
 }
 
 /// Weight for row i.
@@ -549,7 +548,9 @@ pub extern "C" fn gnitz_delete(
     if pks_lo.is_null() || pks_hi.is_null() { set_error("null pk arrays"); return -1; }
     let lo = unsafe { std::slice::from_raw_parts(pks_lo, n_rows) };
     let hi = unsafe { std::slice::from_raw_parts(pks_hi, n_rows) };
-    let pks: Vec<(u64, u64)> = lo.iter().copied().zip(hi.iter().copied()).collect();
+    let pks: Vec<u128> = lo.iter().copied().zip(hi.iter().copied())
+        .map(|(lo, hi)| lo as u128 | (hi as u128) << 64)
+        .collect();
     match c.0.delete(table_id, &s.0, &pks) {
         Ok(()) => 0, Err(e) => { set_error(e); -1 }
     }
@@ -929,7 +930,7 @@ pub unsafe extern "C" fn gnitz_seek(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    match c.0.seek(table_id, pk_lo, pk_hi) {
+    match c.0.seek(table_id, pk_lo as u128 | (pk_hi as u128) << 64) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
@@ -959,7 +960,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    match c.0.seek_by_index(table_id, col_idx, key_lo, key_hi) {
+    match c.0.seek_by_index(table_id, col_idx, key_lo as u128 | (key_hi as u128) << 64) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
@@ -1043,8 +1044,7 @@ mod tests {
 
         // Manually add row metadata (gnitz_batch_append_row errors on String columns)
         unsafe {
-            (*b).batch.pk_lo.push(1);
-            (*b).batch.pk_hi.push(0);
+            (*b).batch.pks.push(1u128);
             (*b).batch.weights.push(1);
             (*b).batch.nulls.push(0);
         }
@@ -1070,8 +1070,7 @@ mod tests {
 
         // Manually add row metadata
         unsafe {
-            (*b).batch.pk_lo.push(1);
-            (*b).batch.pk_hi.push(0);
+            (*b).batch.pks.push(1u128);
             (*b).batch.weights.push(1);
             (*b).batch.nulls.push(0);
         }

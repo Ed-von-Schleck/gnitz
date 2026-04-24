@@ -264,8 +264,7 @@ impl MasterDispatcher {
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
         unicast_worker: i32,
@@ -275,7 +274,7 @@ impl MasterDispatcher {
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
             target_id, flags, worker_batches, schema, col_names,
-            seek_pk_lo, seek_pk_hi, seek_col_idx, &ids[..nw], unicast_worker,
+            seek_pk, seek_col_idx, &ids[..nw], unicast_worker,
         )
     }
 
@@ -289,8 +288,7 @@ impl MasterDispatcher {
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
@@ -301,7 +299,7 @@ impl MasterDispatcher {
         self.sal.write_group_direct(
             target_id as u32, flags, worker_batches,
             schema, col_names_opt,
-            seek_pk_lo, seek_pk_hi, seek_col_idx, req_ids, unicast_worker,
+            seek_pk, seek_col_idx, req_ids, unicast_worker,
         )
     }
 
@@ -314,8 +312,7 @@ impl MasterDispatcher {
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
@@ -324,7 +321,7 @@ impl MasterDispatcher {
 
         self.sal.write_broadcast_direct(
             target_id as u32, flags, batch, schema, col_names_opt,
-            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
+            seek_pk, seek_col_idx, request_id,
         )
     }
 
@@ -337,13 +334,12 @@ impl MasterDispatcher {
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
         self.write_broadcast(target_id, flags, batch, schema, col_names,
-                            seek_pk_lo, seek_pk_hi, seek_col_idx, request_id)?;
+                            seek_pk, seek_col_idx, request_id)?;
         self.signal_all();
         Ok(())
     }
@@ -363,13 +359,12 @@ impl MasterDispatcher {
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
         self.write_group(target_id, flags, worker_batches, schema, col_names,
-                         seek_pk_lo, seek_pk_hi, seek_col_idx, request_id, -1)?;
+                         seek_pk, seek_col_idx, request_id, -1)?;
         self.signal_all();
         Ok(())
     }
@@ -482,7 +477,7 @@ impl MasterDispatcher {
 
     fn do_checkpoint(&mut self) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
-        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0, 0)?;
+        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
         self.collect_acks()?;
         self.checkpoint_post_ack();
         Ok(())
@@ -550,7 +545,7 @@ impl MasterDispatcher {
         // the wrong source's relay to a waiting exchange and the worker
         // demuxes against the wrong sharding columns.
         self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
-                              source_id as u64, 0, 0, 0)
+                              source_id as u128, 0, 0)
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -582,7 +577,7 @@ impl MasterDispatcher {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         self.send_broadcast(source_id, FLAG_BACKFILL, None, &schema, &col_names,
-                           view_id as u64, 0, 0, 0)?;
+                           view_id as u128, 0, 0)?;
         self.collect_acks_and_relay(source_id)
     }
 
@@ -595,32 +590,31 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, pk_lo: u64, pk_hi: u64,
+        target_id: i64, pk: u128,
     ) -> Result<Option<Batch>, String> {
         let worker = unsafe {
-            let pk = crate::util::make_pk(pk_lo, pk_hi);
             worker_for_partition(partition_for_key(pk), (*disp_ptr).num_workers)
         };
         single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
-                            worker, pk_lo, pk_hi, 0, "seek").await
+                            worker, pk, 0, "seek").await
     }
 
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
+        target_id: i64, col_idx: u32, key: u128,
     ) -> Result<Option<Batch>, String> {
         let cached = unsafe {
             (*disp_ptr).router.worker_for_index_key(
-                target_id as u32, col_idx, key_lo,
+                target_id as u32, col_idx, key as u64,
             )
         };
         if cached >= 0 {
             let worker = cached as usize;
             return single_worker_async(
                 disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK_BY_INDEX,
-                worker, key_lo, key_hi, col_idx as u64, "seek_by_index",
+                worker, key, col_idx as u64, "seek_by_index",
             ).await;
         }
 
@@ -630,7 +624,7 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             disp.write_group_with_req_ids(
                 target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
-                key_lo, key_hi, col_idx as u64, req_ids, -1,
+                key, col_idx as u64, req_ids, -1,
             )
         }).await?;
         if let Some(e) = first_worker_error("seek_by_index", &decoded_vec) {
@@ -657,7 +651,7 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             disp.write_group_with_req_ids(
                 target_id, 0, &[], &schema, &col_names,
-                0, 0, 0, req_ids, -1,
+                0, 0, req_ids, -1,
             )
         }).await?;
         if let Some(e) = first_worker_error("scan", &decoded_vec) {
@@ -712,7 +706,7 @@ impl MasterDispatcher {
                     };
                     disp.write_group_with_req_ids(
                         check.target_id, check.flags, &refs,
-                        &check.schema, &[], 0, 0, check.col_hint,
+                        &check.schema, &[], 0, check.col_hint,
                         &rids[idx], -1,
                     )?;
                 }
@@ -759,7 +753,7 @@ impl MasterDispatcher {
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
-                            0, 0, 0, 0)?;
+                            0, 0, 0)?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.count);
         Ok(())
@@ -780,7 +774,7 @@ impl MasterDispatcher {
         let (schema, col_names) = self.get_schema_and_names(tid);
         self.write_group_with_req_ids(
             tid, FLAG_TICK, &[], &schema, &col_names,
-            0, 0, 0, req_ids, -1,
+            0, 0, req_ids, -1,
         )
     }
 
@@ -803,7 +797,7 @@ impl MasterDispatcher {
 
     pub fn shutdown_workers(&mut self) {
         let schema = SchemaDescriptor::minimal_u64();
-        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0, 0);
+        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid > 0 {
@@ -1304,7 +1298,8 @@ impl MasterDispatcher {
                         let key_pk = crate::util::make_pk(key_lo, key_hi);
                         if !occupied.contains(&key_pk) { continue; }
                         match Self::fan_out_seek_by_index_async(
-                            disp_ptr, reactor, sal_excl, target_id, *col_idx, key_lo, key_hi,
+                            disp_ptr, reactor, sal_excl, target_id, *col_idx,
+                            crate::util::make_pk(key_lo, key_hi),
                         ).await {
                             Err(e) => return Err(e),
                             Ok(None) => {}
@@ -1367,7 +1362,7 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             disp.write_group_with_req_ids(
                 table_id, 0, &[], &schema, &col_names,
-                0, 0, 0, req_ids, -1,
+                0, 0, req_ids, -1,
             )
         }).await?;
 
@@ -1412,7 +1407,7 @@ impl MasterDispatcher {
             .collect();
         self.write_group_with_req_ids(
             target_id, FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT, &refs,
-            &schema, &col_names, 0, 0, mode.as_u8() as u64, req_ids, -1,
+            &schema, &col_names, 0, mode.as_u8() as u64, req_ids, -1,
         )
     }
 
@@ -1426,7 +1421,7 @@ impl MasterDispatcher {
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, FLAG_FLUSH, &refs, &schema, &[], 0, 0, 0, req_ids, -1,
+            0, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1,
         )
     }
 
@@ -1536,7 +1531,7 @@ async fn single_worker_async(
     target_id: i64,
     flags: u32,
     worker: usize,
-    seek_pk_lo: u64, seek_pk_hi: u64, seek_col_idx: u64,
+    seek_pk: u128, seek_col_idx: u64,
     op_name: &'static str,
 ) -> Result<Option<Batch>, String> {
     let (schema, req_id) = {
@@ -1546,7 +1541,7 @@ async fn single_worker_async(
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let req_id = reactor.alloc_request_id();
             disp.write_group(target_id, flags, &[], &schema, &col_names,
-                             seek_pk_lo, seek_pk_hi, seek_col_idx, req_id, worker as i32)?;
+                             seek_pk, seek_col_idx, req_id, worker as i32)?;
             disp.signal_one(worker);
             (schema, req_id)
         }

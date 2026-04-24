@@ -1139,12 +1139,12 @@ mod tests {
         make_schema(&[(type_code::I64, 8)])
     }
 
-    /// Create a batch from (pk_lo, pk_hi, weight, col0_i64) tuples.
-    fn make_batch(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
+    /// Create a batch from (pk, weight, col0_i64) tuples.
+    fn make_batch(schema: SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(schema, n);
-        for &(pk_lo, pk_hi, w, c0) in rows {
-            b.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
+        for &(pk, w, c0) in rows {
+            b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &c0.to_le_bytes());
@@ -1156,11 +1156,11 @@ mod tests {
     }
 
     /// Create a batch with two I64 payload columns.
-    fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u64, u64, i64, i64, i64)]) -> Batch {
+    fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u128, i64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(schema, n);
-        for &(pk_lo, pk_hi, w, c0, c1) in rows {
-            b.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
+        for &(pk, w, c0, c1) in rows {
+            b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &c0.to_le_bytes());
@@ -1172,14 +1172,14 @@ mod tests {
         b
     }
 
-    /// Extract rows from a batch as (pk_lo, weight, col0_i64) tuples.
+    /// Extract rows from a batch as (pk, weight, col0_i64) tuples.
     fn extract_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
         let mut rows = Vec::new();
         for i in 0..b.count {
-            let pk_lo = b.get_pk(i) as u64;
+            let pk = b.get_pk(i) as u64;
             let w = i64::from_le_bytes(b.weight_data()[i*8..(i+1)*8].try_into().unwrap());
             let c0 = i64::from_le_bytes(b.col_data(0)[i*8..(i+1)*8].try_into().unwrap());
-            rows.push((pk_lo, w, c0));
+            rows.push((pk, w, c0));
         }
         rows
     }
@@ -1212,9 +1212,9 @@ mod tests {
         builder.add_halt();
 
         let input = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, -5),
-            (3, 0, 1, 20),
+            (1u128, 1, 10),
+            (2u128, 1, -5),
+            (3u128, 1, 20),
         ]);
 
         let reg_schemas = [schema; 3];
@@ -1302,18 +1302,18 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: z⁻¹[0] = 0 → None
-        let input0 = make_batch(schema, &[(1, 0, 1, 10)]);
+        let input0 = make_batch(schema, &[(1u128, 1, 10)]);
         let r0 = execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none(), "tick 0 must return None (z⁻¹[0] = 0)");
 
         // Tick 1: output = tick 0's input
-        let input1 = make_batch(schema, &[(2, 0, 1, 20)]);
+        let input1 = make_batch(schema, &[(2u128, 1, 20)]);
         let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap().unwrap();
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1, vec![(1, 1, 10)]);
 
         // Tick 2: output = tick 1's input
-        let input2 = make_batch(schema, &[(3, 0, 1, 30)]);
+        let input2 = make_batch(schema, &[(3u128, 1, 30)]);
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors, &[]).unwrap().unwrap();
         let rows2 = extract_rows(&r2);
         assert_eq!(rows2, vec![(2, 1, 20)]);
@@ -1332,7 +1332,7 @@ mod tests {
         let vm = *builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
 
-        let input = make_batch(schema, &[(1, 0, 1, 99)]);
+        let input = make_batch(schema, &[(1u128, 1, 99)]);
         let r = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[]).unwrap();
         assert!(r.is_none(), "tick 0 must always return None regardless of input");
     }
@@ -1352,7 +1352,7 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: non-empty input → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: empty input → tick 0's input replayed
@@ -1360,7 +1360,7 @@ mod tests {
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: non-empty input → empty (tick 1's empty was stored)
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 2, &cursors, &[]).unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2u128, 1, 20)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r2.is_none(), "tick 2 output should be empty (tick 1 input was empty)");
 
         // Tick 3: empty input → tick 2's input replayed
@@ -1382,11 +1382,11 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: insertion → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: retraction → tick 0's insertion replayed
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, -1, 10)]), 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, -1, 10)]), 0, 2, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: empty → tick 1's retraction replayed
@@ -1418,15 +1418,15 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 5];
 
         // Tick 0: no output yet
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 4, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 4, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: still no output (need 2 ticks of delay)
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 4, &cursors, &[]).unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2u128, 1, 20)]), 0, 4, &cursors, &[]).unwrap();
         assert!(r1.is_none());
 
         // Tick 2: tick 0's input arrives
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(3, 0, 1, 30)]), 0, 4, &cursors, &[]).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(3u128, 1, 30)]), 0, 4, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r2), vec![(1, 1, 10)]);
 
         // Tick 3: empty input → tick 1's input arrives
@@ -1449,11 +1449,11 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
 
-        let input0 = make_batch(schema, &[(1, 0, 1, 10)]);
+        let input0 = make_batch(schema, &[(1u128, 1, 10)]);
         execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
         assert_eq!(vm.regfile.registers[1].batch.count, 1, "state_reg must hold tick 0's input");
 
-        let input1 = make_batch(schema, &[(2, 0, 1, 20), (3, 0, 1, 30)]);
+        let input1 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
         execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap();
         assert_eq!(vm.regfile.registers[1].batch.count, 2, "state_reg must hold tick 1's input");
     }
@@ -1470,7 +1470,7 @@ mod tests {
         builder.add_union(0, 0, false, 1);
         builder.add_halt();
 
-        let input = make_batch(schema, &[(1, 0, 1, 10), (2, 0, 1, 20)]);
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];
@@ -1493,8 +1493,8 @@ mod tests {
         builder.add_halt();
 
         let input = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
+            (1u128, 1, 10),
+            (2u128, 1, 20),
         ]);
 
         let reg_schemas = [schema; 2];
@@ -1526,14 +1526,14 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 2];
 
         // Tick 1
-        let input1 = make_batch(schema, &[(1, 0, 1, 10)]);
+        let input1 = make_batch(schema, &[(1u128, 1, 10)]);
         let r1 = execute_epoch(
             &vm.program, &mut vm.regfile, input1, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
         assert_eq!(r1.count, 1);
 
         // Tick 2 with different data
-        let input2 = make_batch(schema, &[(2, 0, 1, 20), (3, 0, 1, 30)]);
+        let input2 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
         let r2 = execute_epoch(
             &vm.program, &mut vm.regfile, input2, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
@@ -1564,8 +1564,8 @@ mod tests {
         builder.add_halt();
 
         let input = make_batch_2col(in_schema, &[
-            (1, 0, 1, 10, 100),
-            (2, 0, 1, 20, 200),
+            (1u128, 1, 10, 100),
+            (2u128, 1, 20, 200),
         ]);
 
         let reg_schemas = [in_schema, out_schema];
@@ -1610,7 +1610,7 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
 
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
-        let input1 = make_batch(schema, &[(1, 0, 3, 42)]);
+        let input1 = make_batch(schema, &[(1u128, 3, 42)]);
         // Need to create a cursor for the history register
         let cursor1 = table.create_cursor().unwrap();
         let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
@@ -1631,7 +1631,7 @@ mod tests {
         let cursor2 = table.create_cursor().unwrap();
         let ch2 = Box::into_raw(Box::new(cursor2)) as *mut libc::c_void;
         let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
-        let input2 = make_batch(schema, &[(1, 0, -1, 42)]);
+        let input2 = make_batch(schema, &[(1u128, -1, 42)]);
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
         unsafe { drop(Box::from_raw(ch2 as *mut CursorHandle)); }
@@ -1641,7 +1641,7 @@ mod tests {
         let cursor3 = table.create_cursor().unwrap();
         let ch3 = Box::into_raw(Box::new(cursor3)) as *mut libc::c_void;
         let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
-        let input3 = make_batch(schema, &[(1, 0, -2, 42)]);
+        let input3 = make_batch(schema, &[(1u128, -2, 42)]);
         let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3, &[])
             .unwrap()
             .unwrap();
@@ -1673,7 +1673,7 @@ mod tests {
         ).unwrap();
 
         // Ingest trace data
-        let trace_batch = make_batch(right_schema, &[(10, 0, 1, 200)]);
+        let trace_batch = make_batch(right_schema, &[(10u128, 1, 200)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.create_cursor().unwrap();
@@ -1690,7 +1690,7 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
-        let input = make_batch(left_schema, &[(10, 0, 1, 100)]);
+        let input = make_batch(left_schema, &[(10u128, 1, 100)]);
         let result = execute_epoch(
             &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
@@ -1727,9 +1727,9 @@ mod tests {
 
         // Ingest 3 trace rows with same PK but different payloads
         let trace_batch = make_batch(right_schema, &[
-            (10, 0, 1, 100),
-            (10, 0, 1, 200),
-            (10, 0, 1, 300),
+            (10u128, 1, 100),
+            (10u128, 1, 200),
+            (10u128, 1, 300),
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
@@ -1745,7 +1745,7 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
-        let input = make_batch(left_schema, &[(10, 0, 2, 50)]); // weight=2
+        let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
         let result = execute_epoch(
             &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
@@ -1774,9 +1774,9 @@ mod tests {
         ).unwrap();
 
         let batch = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+            (3u128, 1, 30),
         ]);
         table.ingest_owned_batch(batch).unwrap();
 
@@ -1805,7 +1805,7 @@ mod tests {
         builder.add_halt();
 
         // Already-consolidated input: weights were summed before VM entry
-        let input = make_batch(schema, &[(1, 0, 5, 42)]);
+        let input = make_batch(schema, &[(1u128, 5, 42)]);
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];
@@ -1833,8 +1833,8 @@ mod tests {
 
         // Trace has pk=1 and pk=3
         let trace_batch = make_batch(schema, &[
-            (1, 0, 1, 100),
-            (3, 0, 1, 300),
+            (1u128, 1, 100),
+            (3u128, 1, 300),
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
@@ -1852,9 +1852,9 @@ mod tests {
 
         // Delta has pk=1, pk=2, pk=3. Only pk=2 should survive anti-join.
         let input = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+            (3u128, 1, 30),
         ]);
         let result = execute_epoch(
             &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
@@ -1880,8 +1880,8 @@ mod tests {
         ).unwrap();
 
         let trace_batch = make_batch(schema, &[
-            (1, 0, 1, 100),
-            (3, 0, 1, 300),
+            (1u128, 1, 100),
+            (3u128, 1, 300),
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
@@ -1898,9 +1898,9 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
         let input = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+            (3u128, 1, 30),
         ]);
         let result = execute_epoch(
             &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
@@ -2007,8 +2007,8 @@ mod tests {
 
         // Tick 1: Insert group=1 with values 10, 20
         let input1 = make_batch_2col(in_schema, &[
-            (1, 0, 1, 1, 10),  // pk=1, group=1, val=10
-            (2, 0, 1, 1, 20),  // pk=2, group=1, val=20
+            (1u128, 1, 1, 10),  // pk=1, group=1, val=10
+            (2u128, 1, 1, 20),  // pk=2, group=1, val=20
         ]);
 
         // Create cursors for trace registers
@@ -2052,9 +2052,9 @@ mod tests {
         ).unwrap();
 
         let trace_batch = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (5, 0, 1, 50),
-            (10, 0, 1, 100),
+            (1u128, 1, 10),
+            (5u128, 1, 50),
+            (10u128, 1, 100),
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
@@ -2073,7 +2073,7 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
         // Input: a batch with pk=5 (used as seek key)
-        let input = make_batch(schema, &[(5, 0, 1, 0)]);
+        let input = make_batch(schema, &[(5u128, 1, 0)]);
         let result = execute_epoch(
             &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
@@ -2105,7 +2105,7 @@ mod tests {
         builder.add_join_dd(1, 2, 3, schema);
         builder.add_halt();
 
-        let input = make_batch(schema, &[(10, 0, 2, 100)]);
+        let input = make_batch(schema, &[(10u128, 2, 100)]);
 
         let reg_schemas = [schema, schema, schema, join_schema];
         let reg_kinds = [0u8; 4];
@@ -2177,9 +2177,9 @@ mod tests {
 
         // Trace has pk=1, pk=3, pk=5
         let trace_batch = make_batch(schema, &[
-            (1, 0, 1, 100),
-            (3, 0, 1, 300),
-            (5, 0, 1, 500),
+            (1u128, 1, 100),
+            (3u128, 1, 300),
+            (5u128, 1, 500),
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
@@ -2198,8 +2198,8 @@ mod tests {
 
         // Delta has pk=1,2,3,4,5
         let input_aj = make_batch(schema, &[
-            (1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30),
-            (4, 0, 1, 40), (5, 0, 1, 50),
+            (1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30),
+            (4u128, 1, 40), (5u128, 1, 50),
         ]);
         let r_aj = execute_epoch(
             &vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj, &[],
@@ -2217,8 +2217,8 @@ mod tests {
         let cursors_sj = vec![std::ptr::null_mut(), ch_sj, std::ptr::null_mut()];
 
         let input_sj = make_batch(schema, &[
-            (1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30),
-            (4, 0, 1, 40), (5, 0, 1, 50),
+            (1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30),
+            (4u128, 1, 40), (5u128, 1, 50),
         ]);
         let r_sj = execute_epoch(
             &vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj, &[],
@@ -2271,11 +2271,11 @@ mod tests {
         builder.add_halt();
 
         let input = make_batch(schema, &[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
-            (4, 0, 1, 40),
-            (5, 0, 1, 50),
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+            (3u128, 1, 30),
+            (4u128, 1, 40),
+            (5u128, 1, 50),
         ]);
 
         let reg_schemas = [schema; 2];
@@ -2368,9 +2368,9 @@ mod tests {
 
         // Input: 3 rows all with pk=1, vals 10, 20, 30
         let input = make_batch(in_schema, &[
-            (1, 0, 1, 10),
-            (1, 0, 1, 20),
-            (1, 0, 1, 30),
+            (1u128, 1, 10),
+            (1u128, 1, 20),
+            (1u128, 1, 30),
         ]);
 
         let tr_out_cursor = trace_out_table.create_cursor().unwrap();
@@ -2414,7 +2414,7 @@ mod tests {
         builder.add_map(0, 1, std::ptr::null(), schema, -1);
         builder.add_halt();
 
-        let input = make_batch(schema, &[(1, 0, 1, 10), (2, 0, 1, 20)]);
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];

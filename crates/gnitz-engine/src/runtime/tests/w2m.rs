@@ -32,7 +32,7 @@ fn test_w2m_concurrent_publish_consume_ordered() {
             writer.send_encoded(sz, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
-                    0, 0, 0, req_id, STATUS_OK, b"", None, None, None, None,
+                     0u128, 0, req_id, STATUS_OK, b"", None, None, None, None,
                 );
             });
         }
@@ -104,7 +104,7 @@ fn test_w2m_concurrent_large_messages_ordered() {
             writer.send_encoded(sz, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
-                    0, 0, 0, req_id, STATUS_OK, &pad_w, None, None, None, None,
+                     0u128, 0, req_id, STATUS_OK, &pad_w, None, None, None, None,
                 );
             });
         }
@@ -201,7 +201,7 @@ fn test_w2m_control_only_reply_has_no_backing() {
     writer.send_encoded(sz, |buf| {
         encode_wire_into(
             buf, 0, 0, 0, 0,
-            0, 0, 0, 42, STATUS_OK, b"", None, None, None, None,
+             0u128, 0, 42, STATUS_OK, b"", None, None, None, None,
         );
     });
 

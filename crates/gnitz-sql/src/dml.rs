@@ -123,9 +123,8 @@ pub fn execute_insert(
     let n = rows.len();
 
     for row in rows {
-        let (pk_lo, pk_hi) = extract_pk_value(row, &schema)?;
-        batch.pk_lo.push(pk_lo);
-        batch.pk_hi.push(pk_hi);
+        let pk = extract_pk_value(row, &schema)?;
+        batch.pks.push(pk);
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
@@ -133,7 +132,7 @@ pub fn execute_insert(
         let mut payload_idx = 0usize;
         for (ci, col_def) in schema.columns.iter().enumerate() {
             if ci == schema.pk_index {
-                // pk column: the actual data is in pk_lo/pk_hi, ColData stays empty
+                // pk column: the actual data is in pks, ColData stays empty
                 // we still skip one item from the VALUES row for the PK
                 col_data_idx += 1;
                 continue;
@@ -175,7 +174,7 @@ pub fn execute_insert(
         ConflictPlan::DoUpdatePk { assignments } => {
             let merged =
                 client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
-            if !merged.pk_lo.is_empty() {
+            if !merged.pks.is_empty() {
                 // Use Update mode: merged batch contains both +1 (new
                 // merged rows, which may UPSERT) and untouched +1 rows
                 // for non-conflicting inserts. Workers handle the
@@ -270,16 +269,16 @@ fn client_side_filter_do_nothing(
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(ZSetBatch, usize), GnitzSqlError> {
-    let mut seen_pks: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
-    let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pk_lo.len());
+    let mut seen_pks: std::collections::HashSet<u128> = std::collections::HashSet::new();
+    let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
 
-    for i in 0..batch.pk_lo.len() {
-        let pk = (batch.pk_lo[i], batch.pk_hi[i]);
+    for i in 0..batch.pks.len() {
+        let pk = batch.pks[i];
         // Intra-batch duplicate: drop everything after the first.
         if !seen_pks.insert(pk) { continue; }
         // Existing-store check.
-        let (_sch, found, _lsn) = client.seek(tid, pk.0, pk.1)?;
-        let exists = matches!(found, Some(b) if !b.pk_lo.is_empty());
+        let (_sch, found, _lsn) = client.seek(tid, pk)?;
+        let exists = matches!(found, Some(b) if !b.pks.is_empty());
         if exists { continue; }
         surviving_indices.push(i);
     }
@@ -315,11 +314,11 @@ fn client_side_merge_do_update(
         asn_by_col[*ci] = Some(rhs);
     }
 
-    let mut seen_pks: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut seen_pks: std::collections::HashSet<u128> = std::collections::HashSet::new();
     let mut out = ZSetBatch::new(schema);
 
-    for i in 0..batch.pk_lo.len() {
-        let pk = (batch.pk_lo[i], batch.pk_hi[i]);
+    for i in 0..batch.pks.len() {
+        let pk = batch.pks[i];
         if !seen_pks.insert(pk) {
             return Err(GnitzSqlError::Bind(
                 "ON CONFLICT DO UPDATE cannot affect row a second time \
@@ -327,16 +326,15 @@ fn client_side_merge_do_update(
             ));
         }
 
-        let (_sch, existing_opt, _lsn) = client.seek(tid, pk.0, pk.1)?;
-        let existing = existing_opt.filter(|b| !b.pk_lo.is_empty());
+        let (_sch, existing_opt, _lsn) = client.seek(tid, pk)?;
+        let existing = existing_opt.filter(|b| !b.pks.is_empty());
 
         match existing {
             None => {
                 copy_batch_row(batch, i, &mut out, schema);
             }
             Some(existing_batch) => {
-                out.pk_lo.push(pk.0);
-                out.pk_hi.push(pk.1);
+                out.pks.push(pk);
                 out.weights.push(1);
 
                 // Start with the existing row's null bits; assignments
@@ -423,17 +421,8 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
     }
 }
 
-/// Split a u128 into (lo, hi) halves for the pk_lo/pk_hi representation.
-#[inline]
-fn u128_lo_hi(v: u128) -> (u64, u64) {
-    (v as u64, (v >> 64) as u64)
-}
-
-/// Extract the primary key from a VALUES row, returning (pk_lo, pk_hi).
-///
-/// For U128 PKs the 128-bit value is split into (lo, hi) halves.
-/// For all other numeric PK types hi is always 0.
-fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<(u64, u64), GnitzSqlError> {
+/// Extract the primary key from a VALUES row, returning a u128.
+fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError> {
     let pk_expr = row.get(schema.pk_index).ok_or_else(|| {
         GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
     })?;
@@ -441,15 +430,14 @@ fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<(u64, u64), GnitzSq
         Expr::Value(vws) => match &vws.value {
             Value::Number(n, _) => {
                 if schema.columns[schema.pk_index].type_code == TypeCode::U128 {
-                    let val = n.parse::<u128>().map_err(|_| {
+                    n.parse::<u128>().map_err(|_| {
                         GnitzSqlError::Bind(format!("PK value is not a valid u128: {}", n))
-                    })?;
-                    Ok(u128_lo_hi(val))
+                    })
                 } else {
                     let val = n.parse::<u64>().map_err(|_| {
                         GnitzSqlError::Bind(format!("PK value is not a valid u64: {}", n))
                     })?;
-                    Ok((val, 0))
+                    Ok(val as u128)
                 }
             }
             _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
@@ -573,12 +561,12 @@ pub fn execute_select(
 
     // Check WHERE clause
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
-        if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-            client.seek(tid, pk_lo, pk_hi)?
-        } else if let Some((col_idx, key_lo, key_hi, residual)) =
+        if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
+            client.seek(tid, pk)?
+        } else if let Some((col_idx, key, residual)) =
             try_extract_index_seek(where_expr, &schema, binder, tid, false)?
         {
-            let (s, b, lsn) = client.seek_by_index(tid, col_idx as u64, key_lo, key_hi)?;
+            let (s, b, lsn) = client.seek_by_index(tid, col_idx as u64, key)?;
             let (s2, b2) = apply_residual_filter((s, b), residual.as_ref(), &schema)?;
             (s2, b2, lsn)
         } else {
@@ -622,16 +610,14 @@ fn extract_limit(query: &Query) -> Option<usize> {
     }
 }
 
-/// Returns Some((pk_lo, pk_hi)) if the expression is `pk_col = literal`, else None.
-fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<(u64, u64)> {
-    let (col_idx, key_lo, key_hi) = try_col_eq_literal(expr, schema)?;
-    if col_idx == schema.pk_index { Some((key_lo, key_hi)) } else { None }
+/// Returns Some(pk) if the expression is `pk_col = literal`, else None.
+fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<u128> {
+    let (col_idx, key) = try_col_eq_literal(expr, schema)?;
+    if col_idx == schema.pk_index { Some(key) } else { None }
 }
 
-/// Extracts (col_idx, key_lo, key_hi) from `col = integer_literal`. Does NOT check index existence.
-///
-/// For U128 columns the 128-bit literal is split into (lo, hi); for all other types hi is 0.
-fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)> {
+/// Extracts (col_idx, key) from `col = integer_literal`. Does NOT check index existence.
+fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
             // sqlparser represents negative number literals as UnaryOp(Minus, Number("N")).
@@ -663,36 +649,35 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)>
             if schema.columns[col_idx].type_code == TypeCode::U128 {
                 if negated { return None; }
                 let val = n_str.parse::<u128>().ok()?;
-                let (lo, hi) = u128_lo_hi(val);
-                Some((col_idx, lo, hi))
+                Some((col_idx, val))
             } else {
                 // Secondary indexes store column values as zero-extended LE bytes cast to u64.
                 // For signed types, we must produce the same bit pattern by casting through
                 // the type's unsigned equivalent (not sign-extending to 64 bits).
-                let key_lo = match schema.columns[col_idx].type_code {
+                let key = match schema.columns[col_idx].type_code {
                     TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
                         let v = n_str.parse::<i64>().ok()?;
                         let v = if negated { v.checked_neg()? } else { v };
                         match schema.columns[col_idx].type_code {
-                            TypeCode::I8  => (v as i8  as u8)  as u64,
-                            TypeCode::I16 => (v as i16 as u16) as u64,
-                            TypeCode::I32 => (v as i32 as u32) as u64,
-                            _             => v as u64,
+                            TypeCode::I8  => (v as i8  as u8)  as u128,
+                            TypeCode::I16 => (v as i16 as u16) as u128,
+                            TypeCode::I32 => (v as i32 as u32) as u128,
+                            _             => v as u64 as u128,
                         }
                     }
                     _ => {
                         if negated { return None; }
-                        n_str.parse::<u64>().ok()?
+                        n_str.parse::<u64>().ok()? as u128
                     }
                 };
-                Some((col_idx, key_lo, 0u64))
+                Some((col_idx, key))
             }
         }
         _ => None,
     }
 }
 
-/// Returns Some((col_idx, key_lo, key_hi, residual)) when WHERE contains an equality on an indexed column.
+/// Returns Some((col_idx, key, residual)) when WHERE contains an equality on an indexed column.
 /// When `require_unique` is true, only matches indexes where `is_unique` is set.
 fn try_extract_index_seek(
     expr:           &Expr,
@@ -700,13 +685,13 @@ fn try_extract_index_seek(
     binder:         &mut Binder<'_>,
     table_id:       u64,
     require_unique: bool,
-) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError> {
+) -> Result<Option<(usize, u128, Option<BoundExpr>)>, GnitzSqlError> {
     // Case 1: simple `col = literal`
-    if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(expr, schema) {
+    if let Some((col_idx, key)) = try_col_eq_literal(expr, schema) {
         if col_idx != schema.pk_index {
             if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
                 if !require_unique || is_unique {
-                    return Ok(Some((col_idx, key_lo, key_hi, None)));
+                    return Ok(Some((col_idx, key, None)));
                 }
             }
         }
@@ -717,12 +702,12 @@ fn try_extract_index_seek(
             (left.as_ref(), right.as_ref()),
             (right.as_ref(), left.as_ref()),
         ] {
-            if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(candidate, schema) {
+            if let Some((col_idx, key)) = try_col_eq_literal(candidate, schema) {
                 if col_idx != schema.pk_index {
                     if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
                         if !require_unique || is_unique {
                             let residual = binder.bind_expr(other, schema)?;
-                            return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
+                            return Ok(Some((col_idx, key, Some(residual))));
                         }
                     }
                 }
@@ -749,7 +734,7 @@ fn apply_residual_filter(
     let actual_schema = schema_opt.as_ref().unwrap_or(schema);
     let mut new_batch = ZSetBatch::new(actual_schema);
 
-    for i in 0..batch.pk_lo.len() {
+    for i in 0..batch.pks.len() {
         if eval_pred_row(pred, &batch, i, actual_schema)? {
             copy_batch_row(&batch, i, &mut new_batch, actual_schema);
         }
@@ -886,8 +871,7 @@ fn eval_expr(
 }
 
 fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
-    dst.pk_lo.push(src.pk_lo[i]);
-    dst.pk_hi.push(src.pk_hi[i]);
+    dst.pks.push(src.pks[i]);
     dst.weights.push(src.weights[i]);
     dst.nulls.push(src.nulls[i]);
     for (ci, col_def) in schema.columns.iter().enumerate() {
@@ -952,10 +936,9 @@ fn apply_projection(
     let new_schema = Schema { columns: new_cols, pk_index: new_pk_idx };
 
     // Destructure src_batch so system columns can be moved (not cloned)
-    let ZSetBatch { pk_lo, pk_hi, weights, nulls, columns: src_columns } = src_batch;
+    let ZSetBatch { pks, weights, nulls, columns: src_columns } = src_batch;
     let mut new_batch = ZSetBatch::new(&new_schema);
-    new_batch.pk_lo   = pk_lo;
-    new_batch.pk_hi   = pk_hi;
+    new_batch.pks     = pks;
     new_batch.weights = weights;
     new_batch.nulls   = nulls;
 
@@ -980,11 +963,10 @@ fn apply_projection(
 }
 
 fn apply_limit(mut batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch {
-    let n = batch.pk_lo.len();
+    let n = batch.pks.len();
     if n <= limit { return batch; }
 
-    batch.pk_lo.truncate(limit);
-    batch.pk_hi.truncate(limit);
+    batch.pks.truncate(limit);
     batch.weights.truncate(limit);
     batch.nulls.truncate(limit);
 
@@ -1092,8 +1074,7 @@ fn write_set_columns(
     schema:      &Schema,
     dst:         &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    dst.pk_lo.push(current.pk_lo[row_idx]);
-    dst.pk_hi.push(current.pk_hi[row_idx]);
+    dst.pks.push(current.pks[row_idx]);
     dst.weights.push(1);
     // Start with the existing row's null bits; each assignment updates only
     // its own column's bit (set for a NULL result, clear for non-NULL).
@@ -1126,7 +1107,7 @@ fn write_set_columns(
     Ok(())
 }
 
-fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<(u64, u64)>> {
+fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
     if let Expr::InList { expr: col_expr, list, negated, .. } = expr {
         if *negated { return None; }
         let col_name = match col_expr.as_ref() {
@@ -1139,7 +1120,7 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<(u64, u64)>> {
         for item in list {
             if let Expr::Value(vws) = item {
                 if let Value::Number(n, _) = &vws.value {
-                    pks.push((n.parse::<u64>().ok()?, 0u64));
+                    pks.push(n.parse::<u64>().ok()? as u128);
                     continue;
                 }
             }
@@ -1190,11 +1171,11 @@ pub fn execute_update(
 
     if let Some(where_expr) = selection {
         // Path 1: PK equality
-        if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-            let (schema_opt, batch_opt, _) = client.seek(table_id, pk_lo, pk_hi)?;
+        if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
+            let (schema_opt, batch_opt, _) = client.seek(table_id, pk)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
-                Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
@@ -1205,14 +1186,14 @@ pub fn execute_update(
         }
 
         // Path 2: Unique index seek
-        if let Some((col_idx, key_lo, key_hi, residual)) =
+        if let Some((col_idx, key, residual)) =
             try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
         {
             let (schema_opt, batch_opt, _) =
-                client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
+                client.seek_by_index(table_id, col_idx as u64, key)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
-                Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
@@ -1234,7 +1215,7 @@ pub fn execute_update(
         let mut updates = ZSetBatch::new(actual_schema);
         let mut count = 0usize;
         if let Some(ref scan_batch) = batch_opt {
-            for i in 0..scan_batch.pk_lo.len() {
+            for i in 0..scan_batch.pks.len() {
                 if !eval_pred_row(&pred, scan_batch, i, actual_schema)? { continue; }
                 write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
                 count += 1;
@@ -1253,7 +1234,7 @@ pub fn execute_update(
     match batch_opt {
         None => Ok(SqlResult::RowsAffected { count: 0 }),
         Some(ref scan_batch) => {
-            let n = scan_batch.pk_lo.len();
+            let n = scan_batch.pks.len();
             for i in 0..n {
                 write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
             }
@@ -1301,21 +1282,19 @@ pub fn execute_delete(
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
-            let n = batch.pk_lo.len();
+            let n = batch.pks.len();
             if n == 0 { return Ok(SqlResult::RowsAffected { count: 0 }); }
-            let pks: Vec<(u64, u64)> =
-                (0..n).map(|i| (batch.pk_lo[i], batch.pk_hi[i])).collect();
-            client.delete(table_id, actual_schema, &pks)?;
+            client.delete(table_id, actual_schema, &batch.pks)?;
             Ok(SqlResult::RowsAffected { count: n })
         }
         Some(where_expr) => {
             // Path 1: PK equality — seek first for accurate count
-            if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-                let (schema_opt, batch_opt, _) = client.seek(table_id, pk_lo, pk_hi)?;
+            if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
+                let (schema_opt, batch_opt, _) = client.seek(table_id, pk)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
-                let exists = batch_opt.map_or(false, |b| !b.pk_lo.is_empty());
+                let exists = batch_opt.map_or(false, |b| !b.pks.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
-                client.delete(table_id, actual_schema, &[(pk_lo, pk_hi)])?;
+                client.delete(table_id, actual_schema, &[pk])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
@@ -1327,15 +1306,15 @@ pub fn execute_delete(
             }
 
             // Path 3: Unique index seek
-            if let Some((col_idx, key_lo, key_hi, residual)) =
+            if let Some((col_idx, key, residual)) =
                 try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
             {
                 let (schema_opt, batch_opt, _) =
-                    client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
+                    client.seek_by_index(table_id, col_idx as u64, key)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let batch = match batch_opt {
                     None => return Ok(SqlResult::RowsAffected { count: 0 }),
-                    Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                    Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) => b,
                 };
                 if let Some(pred) = residual {
@@ -1343,7 +1322,7 @@ pub fn execute_delete(
                         return Ok(SqlResult::RowsAffected { count: 0 });
                     }
                 }
-                client.delete(table_id, actual_schema, &[(batch.pk_lo[0], batch.pk_hi[0])])?;
+                client.delete(table_id, actual_schema, &[batch.pks[0]])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
@@ -1351,11 +1330,11 @@ pub fn execute_delete(
             let pred = binder.bind_expr(where_expr, &schema)?;
             let (schema_opt, batch_opt, _) = client.scan(table_id)?;
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
-            let mut pks: Vec<(u64, u64)> = Vec::new();
+            let mut pks: Vec<u128> = Vec::new();
             if let Some(ref scan_batch) = batch_opt {
-                for i in 0..scan_batch.pk_lo.len() {
+                for i in 0..scan_batch.pks.len() {
                     if eval_pred_row(&pred, scan_batch, i, actual_schema)? {
-                        pks.push((scan_batch.pk_lo[i], scan_batch.pk_hi[i]));
+                        pks.push(scan_batch.pks[i]);
                     }
                 }
             }
@@ -1393,7 +1372,7 @@ mod tests {
     fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
         let schema = two_col(val_tc);
         let mut b = ZSetBatch::new(&schema);
-        b.pk_lo.push(1); b.pk_hi.push(0); b.weights.push(1); b.nulls.push(null_bits);
+        b.pks.push(1u128); b.weights.push(1); b.nulls.push(null_bits);
         if let ColData::Fixed(ref mut buf) = b.columns[1] { buf.extend(val_bytes); }
         b
     }
@@ -1528,7 +1507,7 @@ mod tests {
             pk_index: 0,
         };
         let mut current = ZSetBatch::new(&schema);
-        current.pk_lo.push(1); current.pk_hi.push(0);
+        current.pks.push(1u128);
         current.weights.push(1);
         current.nulls.push(0b10); // payload bit 1 (b) is NULL; bit 0 (a) is non-null
         if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }
@@ -1557,7 +1536,7 @@ mod tests {
             pk_index: 0,
         };
         let mut current = ZSetBatch::new(&schema);
-        current.pk_lo.push(1); current.pk_hi.push(0);
+        current.pks.push(1u128);
         current.weights.push(1);
         current.nulls.push(0b10); // b is NULL, a is not
         if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }

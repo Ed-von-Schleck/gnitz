@@ -78,9 +78,9 @@ def test_index_maintained_on_all_workers(client):
         tid, _ = client.resolve_table(sn, "t")
         for i in range(1, n + 1):
             result = client.seek_by_index(tid, col_idx=1, key=i * 100)
-            assert result.batch is not None and len(result.batch.pk_lo) == 1, \
+            assert result.batch is not None and len(result.batch.pks) == 1, \
                 f"cust_id={i * 100} not found via index"
-            assert result.batch.pk_lo[0] == i
+            assert result.batch.pks[0] == i
     finally:
         _drop_all(client, sn, indices=[f"{sn}__t__idx_cust_id"], tables=["t"])
 
@@ -125,8 +125,8 @@ def test_seek_routes_to_correct_worker(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.seek(tid, pk=42)
-        assert result.batch is not None and len(result.batch.pk_lo) == 1
-        assert result.batch.pk_lo[0] == 42
+        assert result.batch is not None and len(result.batch.pks) == 1
+        assert result.batch.pks[0] == 42
     finally:
         _drop_all(client, sn, tables=["t"])
 
@@ -146,8 +146,8 @@ def test_seek_by_index_broadcast(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.seek_by_index(tid, col_idx=1, key=1234)
-        assert result.batch is not None and len(result.batch.pk_lo) == 1
-        assert result.batch.pk_lo[0] == 7
+        assert result.batch is not None and len(result.batch.pks) == 1
+        assert result.batch.pks[0] == 7
     finally:
         _drop_all(client, sn, indices=[f"{sn}__t__idx_cust_id"], tables=["t"])
 

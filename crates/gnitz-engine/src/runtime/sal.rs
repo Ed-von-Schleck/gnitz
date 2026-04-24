@@ -347,8 +347,7 @@ impl SalWriter {
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
@@ -387,7 +386,7 @@ impl SalWriter {
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
                     slot, 0, target_id as u64, 0, flags as u64,
-                    seek_pk_lo, seek_pk_hi, seek_col_idx, req_ids[w],
+                    seek_pk, seek_col_idx, req_ids[w],
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
                 );
                 debug_assert_eq!(written, wsz);
@@ -409,8 +408,7 @@ impl SalWriter {
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
-        seek_pk_lo: u64,
-        seek_pk_hi: u64,
+        seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
@@ -439,7 +437,7 @@ impl SalWriter {
             let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
             let written = encode_wire_into(
                 slot0, 0, target_id as u64, 0, flags as u64,
-                seek_pk_lo, seek_pk_hi, seek_col_idx, request_id,
+                seek_pk, seek_col_idx, request_id,
                 STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
             );
             debug_assert_eq!(written, wsz);

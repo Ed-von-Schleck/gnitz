@@ -222,7 +222,7 @@ fn test_seek_by_index_found() {
     engine.flush_family(tid).unwrap();
 
     // Seek by index: val=200 → should find PK=20
-    let result = engine.seek_by_index(tid, 1, 200, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, 200u128).unwrap();
     assert!(result.is_some());
     let row = result.unwrap();
     assert_eq!(row.count, 1);
@@ -247,7 +247,7 @@ fn test_seek_by_index_not_found() {
     engine.flush_family(tid).unwrap();
 
     // Seek by index: val=999 → should return None
-    let result = engine.seek_by_index(tid, 1, 999, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, 999u128).unwrap();
     assert!(result.is_none());
 
     engine.close();
@@ -274,15 +274,15 @@ fn test_seek_by_index_negative_i64() {
     engine.flush_family(tid).unwrap();
 
     // Index stores I64 values as their raw bit pattern (2's complement).
-    let result = engine.seek_by_index(tid, 1, (-1i64) as u64, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, (-1i64) as u64 as u128).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
-    let result2 = engine.seek_by_index(tid, 1, (-5i64) as u64, 0).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, (-5i64) as u64 as u128).unwrap();
     assert!(result2.is_some(), "index must find row with score=-5");
     assert_eq!(result2.unwrap().get_pk(0), 1);
 
-    let result3 = engine.seek_by_index(tid, 1, 10, 0).unwrap();
+    let result3 = engine.seek_by_index(tid, 1, 10u128).unwrap();
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 4);
 
@@ -309,11 +309,11 @@ fn test_seek_by_index_negative_i32() {
     engine.flush_family(tid).unwrap();
 
     // I32 values are zero-extended to u64 in the index (NOT sign-extended).
-    let result = engine.seek_by_index(tid, 1, (-1i32) as u32 as u64, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, (-1i32) as u32 as u128).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
-    let result2 = engine.seek_by_index(tid, 1, (-100i32) as u32 as u64, 0).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, (-100i32) as u32 as u128).unwrap();
     assert!(result2.is_some(), "index must find row with score=-100");
     assert_eq!(result2.unwrap().get_pk(0), 2);
 
@@ -338,11 +338,11 @@ fn test_seek_by_index_u8_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, 1, 42, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, 42u128).unwrap();
     assert!(result.is_some(), "U8 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 10);
 
-    let result2 = engine.seek_by_index(tid, 1, 99, 0).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, 99u128).unwrap();
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 20);
 
@@ -365,7 +365,7 @@ fn test_seek_by_index_u16_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, 1, 443, 0).unwrap();
+    let result = engine.seek_by_index(tid, 1, 443u128).unwrap();
     assert!(result.is_some(), "U16 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
@@ -419,13 +419,13 @@ fn test_seek_by_index_i32_negative_value() {
     engine.flush_family(tid).unwrap();
 
     // Seek negative value: key = zero-extended u32 representation of -5
-    let neg5_key = (-5i32) as u32 as u64;
-    let result = engine.seek_by_index(tid, 1, neg5_key, 0).unwrap();
+    let neg5_key = (-5i32) as u32 as u128;
+    let result = engine.seek_by_index(tid, 1, neg5_key).unwrap();
     assert!(result.is_some(), "I32 negative index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
     // Seek positive value
-    let result2 = engine.seek_by_index(tid, 1, 10, 0).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, 10u128).unwrap();
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 2);
 

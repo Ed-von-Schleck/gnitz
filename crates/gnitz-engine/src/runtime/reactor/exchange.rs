@@ -52,7 +52,7 @@ impl ExchangeAccumulator {
     /// malformed relay.
     pub fn process(&mut self, w: usize, decoded: DecodedWire) -> Option<PendingRelay> {
         let vid = decoded.control.target_id as i64;
-        let source_id = decoded.control.seek_pk_lo as i64;
+        let source_id = decoded.control.seek_pk as i64;
         let key = (vid, source_id);
         let nw = self.nw;
 
@@ -99,8 +99,7 @@ mod tests {
                 client_id: 0,
                 target_id: view_id as u64,
                 flags: FLAG_EXCHANGE as u64,
-                seek_pk_lo: source_id as u64,
-                seek_pk_hi: 0,
+                seek_pk: source_id as u128,
                 seek_col_idx: 0,
                 request_id: 0,
                 error_msg: Vec::new(),
