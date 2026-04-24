@@ -238,15 +238,13 @@ impl Batch {
             crate::sys::madvise_hugepage(v.as_mut_ptr(), total_size);
             v
         } else {
-            match super::batch_pool::acquire_buf() {
-                Some(mut buf) if buf.capacity() >= total_size => {
-                    buf.resize(total_size, 0);
-                    buf
-                }
-                other => {
-                    if let Some(buf) = other { super::batch_pool::recycle_buf(buf); }
-                    vec![0u8; total_size]
-                }
+            let mut buf = super::batch_pool::acquire_buf();
+            if buf.capacity() >= total_size {
+                buf.resize(total_size, 0);
+                buf
+            } else {
+                super::batch_pool::recycle_buf(buf);
+                vec![0u8; total_size]
             }
         };
 
@@ -295,16 +293,10 @@ impl Batch {
         // stride>0. compute_offsets packs regions back-to-back, so total_size is
         // fully covered. Bytes belonging to a stride-0 or null-ptr region are
         // zero bytes that no accessor reads (count*stride == 0 for those slots).
-        let mut data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-            buf.clear();
-            buf.reserve(total_size);
-            unsafe { buf.set_len(total_size); }
-            buf
-        } else {
-            let mut v = Vec::with_capacity(total_size);
-            unsafe { v.set_len(total_size); }
-            v
-        };
+        let mut data = super::batch_pool::acquire_buf();
+        data.clear();
+        data.reserve(total_size);
+        unsafe { data.set_len(total_size); }
 
         // Copy each region into the contiguous buffer.
         for i in 0..nr {
@@ -320,16 +312,10 @@ impl Batch {
         let blob_sz = sizes[blob_idx] as usize;
         let blob = if blob_sz > 0 && !ptrs[blob_idx].is_null() {
             // SAFETY: copy_nonoverlapping below writes all blob_sz bytes.
-            let mut v = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-                buf.clear();
-                buf.reserve(blob_sz);
-                unsafe { buf.set_len(blob_sz); }
-                buf
-            } else {
-                let mut v = Vec::with_capacity(blob_sz);
-                unsafe { v.set_len(blob_sz); }
-                v
-            };
+            let mut v = super::batch_pool::acquire_buf();
+            v.clear();
+            v.reserve(blob_sz);
+            unsafe { v.set_len(blob_sz); }
             std::ptr::copy_nonoverlapping(ptrs[blob_idx], v.as_mut_ptr(), blob_sz);
             v
         } else {
@@ -526,20 +512,15 @@ impl Batch {
                 crate::sys::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
                 v
             } else {
-                match super::batch_pool::acquire_buf() {
-                    Some(mut buf) if buf.capacity() >= new_total => {
-                        unsafe { buf.set_len(new_total); }
-                        buf
-                    }
-                    other => {
-                        // Return undersized buffer to pool if we got one.
-                        if let Some(buf) = other {
-                            super::batch_pool::recycle_buf(buf);
-                        }
-                        let mut v = Vec::with_capacity(new_total);
-                        unsafe { v.set_len(new_total); }
-                        v
-                    }
+                let mut buf = super::batch_pool::acquire_buf();
+                if buf.capacity() >= new_total {
+                    unsafe { buf.set_len(new_total); }
+                    buf
+                } else {
+                    super::batch_pool::recycle_buf(buf);
+                    let mut v = Vec::with_capacity(new_total);
+                    unsafe { v.set_len(new_total); }
+                    v
                 }
             };
 
@@ -744,7 +725,7 @@ impl Batch {
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
         let (packed_offsets, packed_size) = compute_offsets(&self.strides, nr, self.count);
-        let mut new_data = super::batch_pool::acquire_buf().unwrap_or_default();
+        let mut new_data = super::batch_pool::acquire_buf();
         new_data.clear();
         new_data.reserve(packed_size);
         // SAFETY: copy_nonoverlapping fills all `packed_size` bytes below;
@@ -765,7 +746,7 @@ impl Batch {
                 }
             }
         }
-        let mut new_blob = super::batch_pool::acquire_buf().unwrap_or_default();
+        let mut new_blob = super::batch_pool::acquire_buf();
         new_blob.clear();
         new_blob.extend_from_slice(&self.blob);
         Batch {
@@ -1447,17 +1428,13 @@ pub fn write_to_batch(
     // Sized for max_rows; blob is separate.
     let (offsets, arena_size) = compute_offsets(&strides, nr, max_rows);
 
-    let mut data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-        buf.resize(arena_size, 0);
-        buf
-    } else {
-        alloc_large_zeroed(arena_size)
+    let mut data = {
+        let mut buf = super::batch_pool::acquire_buf();
+        if buf.capacity() > 0 { buf.resize(arena_size, 0); buf } else { alloc_large_zeroed(arena_size) }
     };
-    let mut blob = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-        buf.resize(max_blob, 0);
-        buf
-    } else {
-        alloc_large_zeroed(max_blob)
+    let mut blob = {
+        let mut buf = super::batch_pool::acquire_buf();
+        if buf.capacity() > 0 { buf.resize(max_blob, 0); buf } else { alloc_large_zeroed(max_blob) }
     };
 
     let actual_rows;

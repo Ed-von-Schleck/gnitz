@@ -460,16 +460,10 @@ impl MappedShard {
         let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
 
         // One allocation for all fixed-stride columnar data.
-        let mut data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-            buf.clear();
-            buf.reserve(total_size);
-            unsafe { buf.set_len(total_size) };
-            buf
-        } else {
-            let mut v = Vec::with_capacity(total_size);
-            unsafe { v.set_len(total_size) };
-            v
-        };
+        let mut data = super::batch_pool::acquire_buf();
+        data.clear();
+        data.reserve(total_size);
+        unsafe { data.set_len(total_size) };
 
         // Write each region directly into its final slice — no intermediate buffers.
         let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| {
@@ -512,15 +506,12 @@ impl MappedShard {
         // Blob: one allocation, copy entire blob region (string offsets stay valid).
         let blob = if self.blob_len > 0 {
             let src = &shard[self.blob_off..self.blob_off + self.blob_len];
-            if let Some(mut buf) = super::batch_pool::acquire_buf() {
-                buf.clear();
-                buf.reserve(self.blob_len);
-                unsafe { buf.set_len(self.blob_len) };
-                buf.copy_from_slice(src);
-                buf
-            } else {
-                src.to_vec()
-            }
+            let mut buf = super::batch_pool::acquire_buf();
+            buf.clear();
+            buf.reserve(self.blob_len);
+            unsafe { buf.set_len(self.blob_len) };
+            buf.copy_from_slice(src);
+            buf
         } else {
             Vec::new()
         };

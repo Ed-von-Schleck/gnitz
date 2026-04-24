@@ -1212,7 +1212,7 @@ mod tests {
     fn drop_recycles_buffers() {
         use crate::storage::batch_pool::{acquire_buf, recycle_buf};
         // Drain pool first.
-        while acquire_buf().is_some() {}
+        while acquire_buf().capacity() > 0 {}
 
         let schema = make_u64_i64_schema();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
@@ -1224,7 +1224,9 @@ mod tests {
         // May also have blob buf (if non-zero cap). Drain and check.
         let mut found = false;
         let mut drained = Vec::new();
-        while let Some(buf) = acquire_buf() {
+        loop {
+            let buf = acquire_buf();
+            if buf.capacity() == 0 { break; }
             if buf.capacity() >= data_cap { found = true; }
             drained.push(buf);
         }
@@ -1235,7 +1237,7 @@ mod tests {
     #[test]
     fn clone_drops_independently() {
         use crate::storage::batch_pool::acquire_buf;
-        while acquire_buf().is_some() {}
+        while acquire_buf().capacity() > 0 {}
 
         let schema = make_u64_i64_schema();
         let batch = make_batch(&schema, &[(1, 1, 10)]);
@@ -1247,20 +1249,20 @@ mod tests {
         // Original had data + blob, clone has data + blob.
         // Some may be zero-cap (empty blob), so just verify at least 2 buffers.
         let mut count = 0;
-        while acquire_buf().is_some() { count += 1; }
+        while acquire_buf().capacity() > 0 { count += 1; }
         assert!(count >= 2, "expected at least 2 recycled buffers, got {}", count);
     }
 
     #[test]
     fn empty_batch_drop_is_noop() {
         use crate::storage::batch_pool::acquire_buf;
-        while acquire_buf().is_some() {}
+        while acquire_buf().capacity() > 0 {}
 
         let batch = Batch::empty(2);
         assert_eq!(batch.data_capacity(), 0);
         drop(batch);
 
         // Zero-capacity buffers should NOT be pooled.
-        assert!(acquire_buf().is_none(), "empty batch should not pollute pool");
+        assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
     }
 }
