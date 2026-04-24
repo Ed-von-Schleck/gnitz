@@ -1,12 +1,12 @@
 use super::error::ProtocolError;
 use super::header::{META_FLAG_NULLABLE, META_FLAG_IS_PK};
-use super::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use super::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
 pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     let ncols = schema.columns.len();
-    let mut pks     = Vec::with_capacity(ncols);
+    let mut pks: Vec<u64> = Vec::with_capacity(ncols);
     let mut weights = Vec::with_capacity(ncols);
     let mut nulls   = Vec::with_capacity(ncols);
 
@@ -16,7 +16,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     let mut names: Vec<Option<String>> = Vec::with_capacity(ncols);
 
     for (ci, col) in schema.columns.iter().enumerate() {
-        pks.push(ci as u128);
+        pks.push(ci as u64);
         weights.push(1i64);
         nulls.push(0u64);
 
@@ -31,7 +31,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     }
 
     ZSetBatch {
-        pks,
+        pks: PkColumn::U64s(pks),
         weights,
         nulls,
         columns: vec![
@@ -64,7 +64,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     };
 
     for i in 0..count {
-        let col_idx = batch.pks[i] as u64;
+        let col_idx = batch.pks.get(i) as u64;
         if col_idx != i as u64 {
             return Err(ProtocolError::DecodeError(format!(
                 "schema batch col_idx out of order: expected {}, got {}", i, col_idx
@@ -106,7 +106,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
+    use crate::protocol::types::{ColData, PkColumn, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
     use crate::protocol::wal_block::{encode_wal_block, decode_wal_block};
 
     // ── TypeCode::try_from_u64 error paths ──────────────────────────────────
@@ -144,7 +144,7 @@ mod tests {
             names.push(Some(format!("col{}", i)));
         }
         ZSetBatch {
-            pks:     (0..ncols as u128).collect(),
+            pks:     PkColumn::U64s((0..ncols as u64).collect()),
             weights: vec![1; ncols],
             nulls:   vec![0; ncols],
             columns: vec![
@@ -181,7 +181,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_gap() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pks[1] = 5; // gap: [0, 5]
+        batch.pks.set_u128(1, 5); // gap: [0, 5]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -190,7 +190,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_duplicate() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pks[1] = 0; // duplicate: [0, 0]
+        batch.pks.set_u128(1, 0); // duplicate: [0, 0]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }

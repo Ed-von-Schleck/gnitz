@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use super::error::ProtocolError;
 use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
-use super::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
+use super::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, meta_schema};
 use super::codec::{schema_to_batch, batch_to_schema};
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
 use super::wal_block::{encode_wal_block, decode_wal_block};
@@ -74,7 +74,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
     ]));
 
     let batch = ZSetBatch {
-        pks:     vec![0u128],
+        pks:     PkColumn::U64s(vec![0u64]),
         weights: vec![1i64],
         nulls:   vec![nulls_val],
         columns,
@@ -317,7 +317,7 @@ pub fn recv_message(
 mod tests {
     use super::*;
     use std::os::unix::io::RawFd;
-    use crate::protocol::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::types::{ColData, PkColumn, ColumnDef, Schema, TypeCode, ZSetBatch};
     use crate::protocol::header::{Header, FLAG_PUSH, STATUS_ERROR};
 
     fn make_socketpair() -> (RawFd, RawFd) {
@@ -424,7 +424,7 @@ mod tests {
         for &v in &f64_vals { f64_bytes.extend_from_slice(&v.to_le_bytes()); }
 
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -477,7 +477,7 @@ mod tests {
         let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{}", i))).collect();
 
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -589,7 +589,7 @@ mod tests {
             val_bytes.extend_from_slice(&v.to_le_bytes());
         }
         let batch = ZSetBatch {
-            pks:     vec![1u128, 2u128, 3u128],
+            pks:     PkColumn::U64s(vec![1u64, 2u64, 3u64]),
             weights: vec![1, 1, 1],
             nulls:   vec![0, 0, 0],
             columns: vec![

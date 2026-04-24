@@ -17,7 +17,7 @@ use gnitz_protocol::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     STATUS_OK, STATUS_ERROR,
     META_FLAG_IS_PK,
-    TypeCode, ColumnDef, Schema, ZSetBatch, ColData,
+    TypeCode, ColumnDef, Schema, ZSetBatch, ColData, PkColumn,
     encode_wal_block,
     encode_control_block, decode_control_block,
     schema_to_batch, meta_schema,
@@ -139,7 +139,7 @@ fn make_schema_block_multi_pk(schema: &Schema) -> Vec<u8> {
 fn make_schema_block_bad_col_idx(schema: &Schema, row: usize, bad_idx: u64) -> Vec<u8> {
     let ms = meta_schema();
     let mut sbatch = schema_to_batch(schema);
-    sbatch.pks[row] = bad_idx as u128;
+    sbatch.pks.set_u128(row, bad_idx as u128);
     encode_wal_block(ms, 0, &sbatch)
 }
 
@@ -189,7 +189,7 @@ fn three_col() -> Schema {
 
 fn simple_batch_i64(schema: &Schema, pk: u64, val: i64) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    batch.pks.push(pk as u128);
+    batch.pks.push_u128(pk as u128);
     batch.weights.push(1);
     batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[1] {
@@ -340,8 +340,8 @@ fn test_schema_col_idx_out_of_order() {
     // col_idx [1, 0] instead of [0, 1]
     let ms = meta_schema();
     let mut sbatch = schema_to_batch(&schema);
-    sbatch.pks[0] = 1;
-    sbatch.pks[1] = 0;
+    sbatch.pks.set_u128(0, 1);
+    sbatch.pks.set_u128(1, 0);
     let sb = encode_wal_block(ms, 0, &sbatch);
     let msg = assemble(SCHEMA_TAB, Some(sb), None);
     let (status, err, _) = raw.send_recv(&msg);
@@ -417,7 +417,7 @@ fn test_data_block_bad_checksum() {
     let schema_block = make_schema_block(&schema);
     // data col: need the string column too for three_col schema
     let mut full_batch = ZSetBatch::new(&schema);
-    full_batch.pks.push(1u128);
+    full_batch.pks.push_u128(1u128);
     full_batch.weights.push(1); full_batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = full_batch.columns[1] {
         v.extend_from_slice(&42i64.to_le_bytes());
@@ -468,7 +468,7 @@ fn test_schema_mismatch_wrong_column_count_more() {
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push(1u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
     for ci in 1..4usize {
         if let ColData::Fixed(ref mut v) = batch.columns[ci] {
             v.extend_from_slice(&1i64.to_le_bytes());
@@ -497,7 +497,7 @@ fn test_schema_mismatch_wrong_column_type() {
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push(1u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&42i64.to_le_bytes()); }
     if let ColData::Fixed(ref mut v) = batch.columns[2] { v.extend_from_slice(&999i64.to_le_bytes()); }
     let db = encode_wal_block(&wrong, tid as u32, &batch);
@@ -523,7 +523,7 @@ fn test_schema_mismatch_wrong_pk_index() {
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push(1u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[0] { v.extend_from_slice(&99i64.to_le_bytes()); }
     if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("x".into())); }
     let db = encode_wal_block(&wrong, tid as u32, &batch);
@@ -744,7 +744,7 @@ fn test_push_valid_data_to_real_table() {
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push(9000u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(9000u128); batch.weights.push(1); batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&77i64.to_le_bytes()); }
     if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("raw_push".into())); }
     let db = encode_wal_block(&schema, tid as u32, &batch);
@@ -761,7 +761,7 @@ fn test_push_retraction_weight_minus_one() {
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push(9000u128); batch.weights.push(-1); batch.nulls.push(0);
+    batch.pks.push_u128(9000u128); batch.weights.push(-1); batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&77i64.to_le_bytes()); }
     if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("retract".into())); }
     let db = encode_wal_block(&schema, tid as u32, &batch);
@@ -778,7 +778,7 @@ fn test_push_with_empty_string() {
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push(9100u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(9100u128); batch.weights.push(1); batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&1i64.to_le_bytes()); }
     if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("".into())); }
     let db = encode_wal_block(&schema, tid as u32, &batch);
@@ -796,7 +796,7 @@ fn test_push_multiple_rows() {
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
     for &(pk, val, name) in &[(9001u64, 1i64, "alpha"), (9002, 2, "beta"), (9003, 3, "gamma")] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1); batch.nulls.push(0);
         if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&val.to_le_bytes()); }
         if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some(name.into())); }

@@ -175,7 +175,7 @@ impl GnitzClient {
             let source_col_idx = col_u64(&idx_batch.columns[3], i)?;
             if owner_id == table_id && source_col_idx == col_idx as u64 {
                 let is_unique = col_u64(&idx_batch.columns[5], i)? != 0;
-                return Ok(Some((idx_batch.pks[i] as u64, is_unique)));
+                return Ok(Some((idx_batch.pks.get(i) as u64, is_unique)));
             }
         }
         Ok(None)
@@ -219,7 +219,7 @@ impl GnitzClient {
             let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
             if name != index_name { continue; }
 
-            let index_id   = idx_batch.pks[i] as u64;
+            let index_id   = idx_batch.pks.get(i) as u64;
             let owner_id   = col_u64(&idx_batch.columns[1], i)?;
             let owner_kind = col_u64(&idx_batch.columns[2], i)?;
             let src_col    = col_u64(&idx_batch.columns[3], i)?;
@@ -674,7 +674,7 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
     for i in 0..batch.len() {
         if batch.weights[i] <= 0 { continue; }
         if col_str(&batch.columns[1], i)? == Some(name) {
-            return Ok(batch.pks[i] as u64);
+            return Ok(batch.pks.get(i) as u64);
         }
     }
     Err(ClientError::ServerError(format!("Schema '{}' not found", name)))
@@ -690,7 +690,7 @@ fn find_table_record(
         if col_u64(&batch.columns[1], i)? != schema_id { continue; }
         if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
         return Ok(TableRecord {
-            tid:         batch.pks[i] as u64,
+            tid:         batch.pks.get(i) as u64,
             schema_id,
             name:        table_name.to_string(),
             directory:   col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
@@ -712,7 +712,7 @@ fn find_view_record(
         if col_u64(&batch.columns[1], i)? != schema_id { continue; }
         if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
         return Ok(ViewRecord {
-            vid:             batch.pks[i] as u64,
+            vid:             batch.pks.get(i) as u64,
             schema_id,
             name:            view_name.to_string(),
             sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),

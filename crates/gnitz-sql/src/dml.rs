@@ -124,7 +124,7 @@ pub fn execute_insert(
 
     for row in rows {
         let pk = extract_pk_value(row, &schema)?;
-        batch.pks.push(pk);
+        batch.pks.push_u128(pk);
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
@@ -273,7 +273,7 @@ fn client_side_filter_do_nothing(
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks[i];
+        let pk = batch.pks.get(i);
         // Intra-batch duplicate: drop everything after the first.
         if !seen_pks.insert(pk) { continue; }
         // Existing-store check.
@@ -318,7 +318,7 @@ fn client_side_merge_do_update(
     let mut out = ZSetBatch::new(schema);
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks[i];
+        let pk = batch.pks.get(i);
         if !seen_pks.insert(pk) {
             return Err(GnitzSqlError::Bind(
                 "ON CONFLICT DO UPDATE cannot affect row a second time \
@@ -334,7 +334,7 @@ fn client_side_merge_do_update(
                 copy_batch_row(batch, i, &mut out, schema);
             }
             Some(existing_batch) => {
-                out.pks.push(pk);
+                out.pks.push_u128(pk);
                 out.weights.push(1);
 
                 // Start with the existing row's null bits; assignments
@@ -871,7 +871,7 @@ fn eval_expr(
 }
 
 fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
-    dst.pks.push(src.pks[i]);
+    dst.pks.push_u128(src.pks.get(i));
     dst.weights.push(src.weights[i]);
     dst.nulls.push(src.nulls[i]);
     for (ci, col_def) in schema.columns.iter().enumerate() {
@@ -1074,7 +1074,7 @@ fn write_set_columns(
     schema:      &Schema,
     dst:         &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    dst.pks.push(current.pks[row_idx]);
+    dst.pks.push_u128(current.pks.get(row_idx));
     dst.weights.push(1);
     // Start with the existing row's null bits; each assignment updates only
     // its own column's bit (set for a NULL result, clear for non-NULL).
@@ -1284,7 +1284,7 @@ pub fn execute_delete(
             };
             let n = batch.pks.len();
             if n == 0 { return Ok(SqlResult::RowsAffected { count: 0 }); }
-            client.delete(table_id, actual_schema, &batch.pks)?;
+            client.delete(table_id, actual_schema, &batch.pks.to_vec_u128())?;
             Ok(SqlResult::RowsAffected { count: n })
         }
         Some(where_expr) => {
@@ -1322,7 +1322,7 @@ pub fn execute_delete(
                         return Ok(SqlResult::RowsAffected { count: 0 });
                     }
                 }
-                client.delete(table_id, actual_schema, &[batch.pks[0]])?;
+                client.delete(table_id, actual_schema, &[batch.pks.get(0)])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
@@ -1334,7 +1334,7 @@ pub fn execute_delete(
             if let Some(ref scan_batch) = batch_opt {
                 for i in 0..scan_batch.pks.len() {
                     if eval_pred_row(&pred, scan_batch, i, actual_schema)? {
-                        pks.push(scan_batch.pks[i]);
+                        pks.push(scan_batch.pks.get(i));
                     }
                 }
             }
@@ -1372,7 +1372,7 @@ mod tests {
     fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
         let schema = two_col(val_tc);
         let mut b = ZSetBatch::new(&schema);
-        b.pks.push(1u128); b.weights.push(1); b.nulls.push(null_bits);
+        b.pks.push_u128(1u128); b.weights.push(1); b.nulls.push(null_bits);
         if let ColData::Fixed(ref mut buf) = b.columns[1] { buf.extend(val_bytes); }
         b
     }
@@ -1507,7 +1507,7 @@ mod tests {
             pk_index: 0,
         };
         let mut current = ZSetBatch::new(&schema);
-        current.pks.push(1u128);
+        current.pks.push_u128(1u128);
         current.weights.push(1);
         current.nulls.push(0b10); // payload bit 1 (b) is NULL; bit 0 (a) is non-null
         if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }
@@ -1536,7 +1536,7 @@ mod tests {
             pk_index: 0,
         };
         let mut current = ZSetBatch::new(&schema);
-        current.pks.push(1u128);
+        current.pks.push_u128(1u128);
         current.weights.push(1);
         current.nulls.push(0b10); // b is NULL, a is not
         if let ColData::Fixed(ref mut buf) = current.columns[1] { buf.extend_from_slice(&5i64.to_le_bytes()); }
@@ -1589,7 +1589,7 @@ mod tests {
         let expr = eq_expr("val", neg_num_expr("1"));
         let result = super::try_col_eq_literal(&expr, &schema);
         // -1i64 as u64 = u64::MAX
-        assert_eq!(result, Some((1, (-1i64) as u64, 0)));
+        assert_eq!(result, Some((1, ((-1i64) as u64) as u128)));
     }
 
     #[test]
@@ -1598,7 +1598,7 @@ mod tests {
         let expr = eq_expr("val", neg_num_expr("1"));
         let result = super::try_col_eq_literal(&expr, &schema);
         // I32 -1 stored as 4 bytes zero-padded → (-1i32 as u32) as u64
-        assert_eq!(result, Some((1, (-1i32 as u32) as u64, 0)));
+        assert_eq!(result, Some((1, ((-1i32 as u32) as u64) as u128)));
     }
 
     #[test]
@@ -1606,7 +1606,7 @@ mod tests {
         let schema = make_schema_col(TypeCode::I16);
         let expr = eq_expr("val", neg_num_expr("1"));
         let result = super::try_col_eq_literal(&expr, &schema);
-        assert_eq!(result, Some((1, (-1i16 as u16) as u64, 0)));
+        assert_eq!(result, Some((1, ((-1i16 as u16) as u64) as u128)));
     }
 
     #[test]
@@ -1614,7 +1614,7 @@ mod tests {
         let schema = make_schema_col(TypeCode::I8);
         let expr = eq_expr("val", neg_num_expr("5"));
         let result = super::try_col_eq_literal(&expr, &schema);
-        assert_eq!(result, Some((1, (-5i8 as u8) as u64, 0)));
+        assert_eq!(result, Some((1, ((-5i8 as u8) as u64) as u128)));
     }
 
     #[test]
@@ -1625,7 +1625,7 @@ mod tests {
             span:  sqlparser::tokenizer::Span::empty(),
         }));
         let result = super::try_col_eq_literal(&expr, &schema);
-        assert_eq!(result, Some((1, 42u64, 0)));
+        assert_eq!(result, Some((1, 42u128)));
     }
 
     #[test]

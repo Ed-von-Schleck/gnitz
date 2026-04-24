@@ -74,6 +74,53 @@ pub fn meta_schema() -> &'static Schema {
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PkColumn {
+    U64s(Vec<u64>),
+    U128s(Vec<u128>),
+}
+
+impl PkColumn {
+    pub fn for_type(tc: TypeCode) -> Self {
+        if tc == TypeCode::U128 { PkColumn::U128s(vec![]) } else { PkColumn::U64s(vec![]) }
+    }
+    pub fn len(&self) -> usize {
+        match self { PkColumn::U64s(v) => v.len(), PkColumn::U128s(v) => v.len() }
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn get(&self, i: usize) -> u128 {
+        match self { PkColumn::U64s(v) => v[i] as u128, PkColumn::U128s(v) => v[i] }
+    }
+    pub fn push_u128(&mut self, pk: u128) {
+        match self { PkColumn::U64s(v) => v.push(pk as u64), PkColumn::U128s(v) => v.push(pk) }
+    }
+    pub fn set_u128(&mut self, i: usize, pk: u128) {
+        match self { PkColumn::U64s(v) => v[i] = pk as u64, PkColumn::U128s(v) => v[i] = pk }
+    }
+    pub fn swap(&mut self, i: usize, j: usize) {
+        match self { PkColumn::U64s(v) => v.swap(i, j), PkColumn::U128s(v) => v.swap(i, j) }
+    }
+    pub fn clear(&mut self) {
+        match self { PkColumn::U64s(v) => v.clear(), PkColumn::U128s(v) => v.clear() }
+    }
+    pub fn truncate(&mut self, len: usize) {
+        match self { PkColumn::U64s(v) => v.truncate(len), PkColumn::U128s(v) => v.truncate(len) }
+    }
+    pub fn to_vec_u128(&self) -> Vec<u128> {
+        match self {
+            PkColumn::U64s(v) => v.iter().map(|&x| x as u128).collect(),
+            PkColumn::U128s(v) => v.clone(),
+        }
+    }
+}
+
+impl PartialEq<Vec<u128>> for PkColumn {
+    fn eq(&self, other: &Vec<u128>) -> bool {
+        if self.len() != other.len() { return false; }
+        (0..self.len()).all(|i| self.get(i) == other[i])
+    }
+}
+
 /// Per-column payload data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColData {
@@ -85,7 +132,7 @@ pub enum ColData {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
-    pub pks:     Vec<u128>,
+    pub pks:     PkColumn,
     pub weights: Vec<i64>,
     pub nulls:   Vec<u64>,
     /// One entry per schema column. Entry at pk_index is a placeholder (Fixed(vec![])).
@@ -106,7 +153,7 @@ impl ZSetBatch {
             }
         }).collect();
         ZSetBatch {
-            pks: vec![],
+            pks: PkColumn::for_type(schema.columns[schema.pk_index].type_code),
             weights: vec![],
             nulls: vec![],
             columns,
@@ -187,7 +234,7 @@ impl<'a> BatchAppender<'a> {
 
     /// Start a new row with the given primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
-        self.batch.pks.push(pk);
+        self.batch.pks.push_u128(pk);
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
@@ -424,7 +471,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pks.push(1);
+        batch.pks.push_u128(1);
         // weights is empty — mismatch
         let err = batch.validate(&schema).unwrap_err();
         assert!(err.contains("weights"));
@@ -440,7 +487,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pks.push(1);
+        batch.pks.push_u128(1);
         batch.weights.push(1);
         batch.nulls.push(0);
         // Strings column is empty — mismatch
@@ -458,7 +505,7 @@ mod tests {
             pk_index: 0,
         };
         let mut batch = ZSetBatch::new(&schema);
-        batch.pks.push(1);
+        batch.pks.push_u128(1);
         batch.weights.push(1);
         batch.nulls.push(0);
         // Fixed column 1 is empty (needs 8 bytes) — mismatch
@@ -504,7 +551,7 @@ mod tests {
             .u64_val(100)
             .u64_val(200);
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch.pks[0], 42);
+        assert_eq!(batch.pks.get(0), 42);
         assert_eq!(batch.weights[0], 1);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
@@ -651,7 +698,7 @@ mod tests {
             .u64_val(20)   // cursor 1 -> ci 1 (B)
             .u64_val(30);  // cursor 2 -> ci 3 (C), skips pk_index=2
 
-        assert_eq!(batch.pks[0], 99);
+        assert_eq!(batch.pks.get(0), 99);
         if let ColData::Fixed(buf) = &batch.columns[0] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
         } else { panic!("expected Fixed for col 0"); }

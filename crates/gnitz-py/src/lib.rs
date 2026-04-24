@@ -284,9 +284,9 @@ impl PyZSetBatch {
         }
         if self.schema.columns[pk_idx].type_code == TypeCode::U128 {
             let pk = pk_val.extract::<u128>()?;
-            self.batch.pks.push(pk);
+            self.batch.pks.push_u128(pk);
         } else {
-            self.batch.pks.push(pk_val.extract::<u64>()? as u128);
+            self.batch.pks.push_u128(pk_val.extract::<u64>()? as u128);
         }
         Ok(())
     }
@@ -445,7 +445,8 @@ impl PyZSetBatch {
 
     #[getter]
     pub fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(PyList::new(py, &self.batch.pks)?.unbind())
+        let vals: Vec<u128> = (0..self.batch.pks.len()).map(|i| self.batch.pks.get(i)).collect();
+        Ok(PyList::new(py, &vals)?.unbind())
     }
     #[getter]
     pub fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
@@ -550,7 +551,7 @@ fn build_row_values_into(
 
     for ci in 0..schema.columns.len() {
         if ci == pk_idx {
-            let pk = batch.pks[row];
+            let pk = batch.pks.get(row);
             if schema.columns[ci].type_code == TypeCode::U128 {
                 out.push(pk.into_pyobject(py)?.into_any().unbind());
             } else {
@@ -605,7 +606,8 @@ impl PyRustBatch {
         if let Some(ref cached) = self.cached_pks {
             return Ok(cached.clone_ref(py));
         }
-        let list = PyList::new(py, &self.data.batch.pks)?.unbind();
+        let vals: Vec<u128> = (0..self.data.batch.pks.len()).map(|i| self.data.batch.pks.get(i)).collect();
+        let list = PyList::new(py, &vals)?.unbind();
         self.cached_pks = Some(list.clone_ref(py));
         Ok(list)
     }
@@ -847,9 +849,10 @@ impl PyScanResult {
         let pk_idx = data.schema.pk_index;
         if col_idx == pk_idx {
             if data.schema.columns[col_idx].type_code == TypeCode::U128 {
-                return Ok(PyList::new(py, &data.batch.pks)?.unbind());
+                let vals: Vec<u128> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i)).collect();
+                return Ok(PyList::new(py, &vals)?.unbind());
             }
-            let items: Vec<u64> = data.batch.pks.iter().map(|&x| x as u64).collect();
+            let items: Vec<u64> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i) as u64).collect();
             return Ok(PyList::new(py, items)?.unbind());
         }
 

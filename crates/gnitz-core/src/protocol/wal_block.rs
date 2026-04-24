@@ -1,7 +1,7 @@
 // gnitz-protocol/src/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
 
 use super::error::ProtocolError;
-use super::types::{ColData, Schema, TypeCode, ZSetBatch};
+use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
 
 use gnitz_wire::{
     WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
@@ -34,14 +34,21 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// Serialize `&[u128]` into `buf` using only the low `stride` bytes of each value.
-fn append_pk_region(buf: &mut Vec<u8>, pks: &[u128], stride: usize) -> (u32, u32) {
+/// Serialize a `PkColumn` into `buf` at 8-byte alignment.
+/// U64 variant writes 8 bytes/row; U128 variant writes 16 bytes/row.
+fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn) -> (u32, u32) {
     let aligned = align8(buf.len());
     buf.resize(aligned, 0);
     let off = aligned as u32;
-    for &v in pks {
-        buf.extend_from_slice(&v.to_le_bytes()[..stride]);
+    match pks {
+        PkColumn::U64s(v) => {
+            for &x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+        }
+        PkColumn::U128s(v) => {
+            for &x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+        }
     }
+    let stride = match pks { PkColumn::U64s(_) => 8, PkColumn::U128s(_) => 16 };
     (off, (pks.len() * stride) as u32)
 }
 
@@ -108,7 +115,6 @@ fn read_64bit_region<T: Copy + Default>(
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let count = batch.len();
     let ncols = schema.columns.len();
-    let pk_stride = schema.columns[schema.pk_index].type_code.wire_stride();
     let num_non_pk = if ncols > 0 { ncols - 1 } else { 0 };
     let num_regions = 3 + num_non_pk + 1;
 
@@ -183,7 +189,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_pk_region(&mut buf, &batch.pks, pk_stride));
+    dir_entries.push(append_pk_region(&mut buf, &batch.pks));
     dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
     dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 
@@ -323,16 +329,29 @@ pub fn decode_wal_block(
             "pk region size mismatch: expected {}, got {}", expected_pk_sz, pk_sz
         )));
     }
-    let mut pks: Vec<u128> = Vec::with_capacity(count);
-    let mut pk_buf = [0u8; 16];
-    for i in 0..count {
-        let base = pk_off + i * pk_stride;
-        if base + pk_stride > total_size {
-            return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
+    let pks: PkColumn = if pk_stride == 8 {
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = pk_off + i * 8;
+            if base + 8 > total_size {
+                return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
+            }
+            v.push(u64::from_le_bytes(data[base..base+8].try_into().unwrap()));
         }
-        pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
-        pks.push(u128::from_le_bytes(pk_buf));
-    }
+        PkColumn::U64s(v)
+    } else {
+        let mut v = Vec::with_capacity(count);
+        let mut pk_buf = [0u8; 16];
+        for i in 0..count {
+            let base = pk_off + i * pk_stride;
+            if base + pk_stride > total_size {
+                return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
+            }
+            pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
+            v.push(u128::from_le_bytes(pk_buf));
+        }
+        PkColumn::U128s(v)
+    };
     let weights: Vec<i64> = read_64bit_region(data, wt_off,   wt_sz,   count, "weights")?;
     let nulls: Vec<u64>   = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
 
@@ -447,7 +466,7 @@ pub fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{ColumnDef, Schema, TypeCode, ZSetBatch, ColData};
+    use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ColData};
 
     fn u64_schema() -> Schema {
         Schema {
@@ -562,7 +581,7 @@ mod tests {
         for &v in &vals { val_bytes.extend_from_slice(&v.to_le_bytes()); }
 
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
             weights: weights.clone(), nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes.clone())],
         };
@@ -595,7 +614,7 @@ mod tests {
         ];
 
         let batch = ZSetBatch {
-            pks: (0..n as u128).collect(),
+            pks: PkColumn::U64s((0..n as u64).collect()),
             weights: vec![1; n],
             nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Strings(vals.clone())],
@@ -618,7 +637,7 @@ mod tests {
         let n = vals.len();
 
         let batch = ZSetBatch {
-            pks: vals.clone(),
+            pks: PkColumn::U128s(vals.clone()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), ColData::U128s(vals.clone())],
@@ -637,7 +656,7 @@ mod tests {
     fn test_encode_decode_empty() {
         let schema = u64_schema();
         let empty = ZSetBatch {
-            pks: vec![], weights: vec![], nulls: vec![],
+            pks: PkColumn::U64s(vec![]), weights: vec![], nulls: vec![],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
         };
         let encoded = encode_wal_block(&schema, 7, &empty);
@@ -650,7 +669,7 @@ mod tests {
     fn test_bad_checksum() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pks: vec![1u128], weights: vec![1], nulls: vec![0],
+            pks: PkColumn::U64s(vec![1u64]), weights: vec![1], nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
         };
         let mut encoded = encode_wal_block(&schema, 0, &batch);
@@ -664,7 +683,7 @@ mod tests {
     fn test_bad_version() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pks: vec![1u128], weights: vec![1], nulls: vec![0],
+            pks: PkColumn::U64s(vec![1u64]), weights: vec![1], nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
         };
         let mut encoded = encode_wal_block(&schema, 0, &batch);
@@ -683,7 +702,7 @@ mod tests {
         let pks = vec![1u128, 2, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![
@@ -711,7 +730,7 @@ mod tests {
         let pks = vec![1u128, 2, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U128s(pks.clone()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![
@@ -735,7 +754,7 @@ mod tests {
         let weights = vec![1i64, -1, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: pks.clone(),
+            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
             weights: weights.clone(),
             nulls: vec![0; n],
             columns: vec![
@@ -748,6 +767,49 @@ mod tests {
         assert_eq!(tid, 5);
         assert_eq!(decoded.pks, pks);
         assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
+    }
+
+    #[test]
+    fn test_batch_appender_round_trip_u64_pk() {
+        use crate::protocol::types::BatchAppender;
+        let schema = u64_schema();
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            a.add_row(1u128, 1).i64_val(10);
+            a.add_row(100u128, 1).i64_val(200);
+            a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
+        }
+        let encoded = encode_wal_block(&schema, 7, &batch);
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        assert_eq!(tid, 7);
+        assert_eq!(decoded.pks.len(), 3);
+        assert_eq!(decoded.pks.get(0), 1u128);
+        assert_eq!(decoded.pks.get(1), 100u128);
+        assert_eq!(decoded.pks.get(2), (u32::MAX as u128) + 1);
+        assert!(matches!(decoded.pks, PkColumn::U64s(_)), "U64 schema must decode to PkColumn::U64s");
+    }
+
+    #[test]
+    fn test_batch_appender_round_trip_u128_pk() {
+        use crate::protocol::types::BatchAppender;
+        let schema = u128_schema();
+        let pks = vec![0u128, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            for &pk in &pks {
+                a.add_row(pk, 1).u128_val(pk as u64, (pk >> 64) as u64);
+            }
+        }
+        let encoded = encode_wal_block(&schema, 9, &batch);
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        assert_eq!(tid, 9);
+        assert_eq!(decoded.pks.len(), pks.len());
+        for (i, &expected) in pks.iter().enumerate() {
+            assert_eq!(decoded.pks.get(i), expected);
+        }
+        assert!(matches!(decoded.pks, PkColumn::U128s(_)), "U128 schema must decode to PkColumn::U128s");
     }
 
     #[test]

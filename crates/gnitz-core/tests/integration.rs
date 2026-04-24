@@ -72,7 +72,7 @@ fn test_push_scan_roundtrip() {
 
     // Filter for our PKs (server may have other system schema records)
     let our_pks: std::collections::HashSet<u64> = pks.into_iter().collect();
-    let found: Vec<_> = data.pks.iter().map(|&x| x as u64)
+    let found: Vec<_> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(pk, _)| our_pks.contains(pk))
         .collect();
@@ -124,7 +124,7 @@ fn test_create_drop_schema() {
     let (_, data, _) = client.scan(SCHEMA_TAB).unwrap();
     let data = data.unwrap();
     let found = (0..data.len()).any(|i| {
-        data.weights[i] > 0 && data.pks[i] as u64 == sid
+        data.weights[i] > 0 && data.pks.get(i) as u64 == sid
     });
     assert!(found, "newly created schema {} not found in scan", sid);
 
@@ -135,7 +135,7 @@ fn test_create_drop_schema() {
     let (_, data2, _) = client.scan(SCHEMA_TAB).unwrap();
     let data2 = data2.unwrap();
     let still_present = (0..data2.len()).any(|i| {
-        data2.weights[i] > 0 && data2.pks[i] as u64 == sid
+        data2.weights[i] > 0 && data2.pks.get(i) as u64 == sid
     });
     assert!(!still_present, "schema {} still present after drop", sid);
 
@@ -190,7 +190,7 @@ fn test_push_and_scan() {
     // Push 3 rows: (10, 100), (20, 200), (30, 300)
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(10u64, 100i64), (20, 200), (30, 300)] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
@@ -203,7 +203,7 @@ fn test_push_and_scan() {
     let data = data.unwrap();
     assert_eq!(data.len(), 3, "expected 3 rows; got {}", data.len());
 
-    let mut pks: Vec<u64> = data.pks.iter().map(|&x| x as u64).collect();
+    let mut pks: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64).collect();
     pks.sort_unstable();
     assert_eq!(pks, vec![10, 20, 30]);
 
@@ -231,7 +231,7 @@ fn test_delete_rows() {
     // Push rows with pk 10, 11, 12
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(10u64, 1i64), (11, 2), (12, 3)] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
@@ -245,7 +245,7 @@ fn test_delete_rows() {
 
     let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
-    let positive: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let positive: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -275,7 +275,7 @@ fn test_string_columns() {
     // Push 2 rows: (1, "hello", Some("world")) and (2, "foo", None)
     let mut batch = ZSetBatch::new(&table_schema);
     for &pk in &[1u64, 2u64] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
     }
@@ -296,7 +296,7 @@ fn test_string_columns() {
     let data = data.unwrap();
     assert_eq!(data.len(), 2, "expected 2 rows");
 
-    let idx1 = data.pks.iter().position(|&x| x as u64 == 1).expect("row pk=1 missing");
+    let idx1 = (0..data.pks.len()).position(|i| data.pks.get(i) as u64 == 1).expect("row pk=1 missing");
     if let ColData::Strings(labels) = &data.columns[1] {
         assert_eq!(labels[idx1].as_deref(), Some("hello"));
     }
@@ -304,7 +304,7 @@ fn test_string_columns() {
         assert_eq!(notes[idx1].as_deref(), Some("world"));
     }
 
-    let idx2 = data.pks.iter().position(|&x| x as u64 == 2).expect("row pk=2 missing");
+    let idx2 = (0..data.pks.len()).position(|i| data.pks.get(i) as u64 == 2).expect("row pk=2 missing");
     if let ColData::Strings(notes) = &data.columns[2] {
         assert!(notes[idx2].is_none(), "expected null note for pk=2");
     }
@@ -383,7 +383,7 @@ fn test_filter_view() {
 
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(1u64, 10i64), (2, 30), (3, 50), (4, 70), (5, 90)] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
@@ -394,7 +394,7 @@ fn test_filter_view() {
 
     let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
-    let mut positive_pks: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let mut positive_pks: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -439,7 +439,7 @@ fn test_reduce_view() {
     // group=1: vals 10, 20 → sum=30
     // group=2: vals 30, 40 → sum=70
     for &(pk, gid, val) in &[(1u64, 1i64, 10i64), (2, 1, 20), (3, 2, 30), (4, 2, 40)] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] { buf.extend_from_slice(&gid.to_le_bytes()); }
@@ -482,7 +482,7 @@ fn test_join_view() {
     // Pre-populate B with pk=1,2,3
     let mut batch_b = ZSetBatch::new(&table_schema);
     for &pk in &[1u64, 2, 3] {
-        batch_b.pks.push(pk as u128);
+        batch_b.pks.push_u128(pk as u128);
         batch_b.weights.push(1);
         batch_b.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch_b.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
@@ -501,7 +501,7 @@ fn test_join_view() {
     // Push A rows: pk=1 (matches B), pk=4 (no match)
     let mut batch_a = ZSetBatch::new(&table_schema);
     for &pk in &[1u64, 4] {
-        batch_a.pks.push(pk as u128);
+        batch_a.pks.push_u128(pk as u128);
         batch_a.weights.push(1);
         batch_a.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch_a.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
@@ -510,7 +510,7 @@ fn test_join_view() {
 
     let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
-    let positive_pks: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let positive_pks: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -538,7 +538,7 @@ fn test_anti_join_view() {
     // Pre-populate B with pk=1,2
     let mut batch_b = ZSetBatch::new(&table_schema);
     for &pk in &[1u64, 2] {
-        batch_b.pks.push(pk as u128);
+        batch_b.pks.push_u128(pk as u128);
         batch_b.weights.push(1);
         batch_b.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch_b.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
@@ -557,7 +557,7 @@ fn test_anti_join_view() {
     // Push A rows: pk=1,2,3; only pk=3 has no match in B
     let mut batch_a = ZSetBatch::new(&table_schema);
     for &pk in &[1u64, 2, 3] {
-        batch_a.pks.push(pk as u128);
+        batch_a.pks.push_u128(pk as u128);
         batch_a.weights.push(1);
         batch_a.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch_a.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
@@ -566,7 +566,7 @@ fn test_anti_join_view() {
 
     let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
-    let positive_pks: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let positive_pks: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -592,7 +592,7 @@ fn test_exchange_multi_worker() {
     // Push 1000 rows
     let mut batch = ZSetBatch::new(&table_schema);
     for pk in 1u64..=1000 {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
     }
@@ -600,7 +600,7 @@ fn test_exchange_multi_worker() {
 
     let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
-    let mut pks: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let mut pks: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -646,7 +646,7 @@ fn test_incremental_update() {
     // Tick 1: push pk=1,2 (group=1, vals=10,20) and pk=3,4 (group=2, vals=30,40)
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, gid, val) in &[(1u64, 1i64, 10i64), (2, 1, 20), (3, 2, 30), (4, 2, 40)] {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] { buf.extend_from_slice(&gid.to_le_bytes()); }
@@ -721,7 +721,7 @@ fn test_bulk_filter() {
     // Push 100 000 rows: pk=i, val=i
     let mut batch = ZSetBatch::new(&table_schema);
     for pk in 1u64..=100_000 {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
@@ -732,7 +732,7 @@ fn test_bulk_filter() {
 
     let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
-    let positive: Vec<u64> = data.pks.iter().map(|&x| x as u64)
+    let positive: Vec<u64> = data.pks.to_vec_u128().into_iter().map(|x| x as u64)
         .zip(data.weights.iter().copied())
         .filter(|(_, w)| *w > 0)
         .map(|(pk, _)| pk)
@@ -760,7 +760,7 @@ fn test_bulk_exchange_multi_worker() {
     // Push 500 000 rows in a single batch
     let mut batch = ZSetBatch::new(&table_schema);
     for pk in 1u64..=500_000 {
-        batch.pks.push(pk as u128);
+        batch.pks.push_u128(pk as u128);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {

@@ -238,7 +238,7 @@ fn append_row_inner(
     null_mask: u64,
     col_data:  &[u8],
 ) -> Result<(), String> {
-    b.batch.pks.push(pk_lo as u128 | (pk_hi as u128) << 64);
+    b.batch.pks.push_u128(pk_lo as u128 | (pk_hi as u128) << 64);
     b.batch.weights.push(weight);
     b.batch.nulls.push(null_mask);
 
@@ -328,14 +328,14 @@ pub extern "C" fn gnitz_batch_len(batch: *const GnitzBatch) -> usize {
 #[no_mangle]
 pub extern "C" fn gnitz_batch_get_pk_lo(batch: *const GnitzBatch, row: usize) -> u64 {
     let b = check_ptr!(batch, 0);
-    b.batch.pks.get(row).copied().unwrap_or(0) as u64
+    if row < b.batch.pks.len() { b.batch.pks.get(row) as u64 } else { 0 }
 }
 
 /// pk_hi (upper 64 bits of the 128-bit PK) for row i. Returns 0 on out-of-range.
 #[no_mangle]
 pub extern "C" fn gnitz_batch_get_pk_hi(batch: *const GnitzBatch, row: usize) -> u64 {
     let b = check_ptr!(batch, 0);
-    (b.batch.pks.get(row).copied().unwrap_or(0) >> 64) as u64
+    if row < b.batch.pks.len() { (b.batch.pks.get(row) >> 64) as u64 } else { 0 }
 }
 
 /// Weight for row i.
@@ -1044,7 +1044,7 @@ mod tests {
 
         // Manually add row metadata (gnitz_batch_append_row errors on String columns)
         unsafe {
-            (*b).batch.pks.push(1u128);
+            (*b).batch.pks.push_u128(1u128);
             (*b).batch.weights.push(1);
             (*b).batch.nulls.push(0);
         }
@@ -1070,7 +1070,7 @@ mod tests {
 
         // Manually add row metadata
         unsafe {
-            (*b).batch.pks.push(1u128);
+            (*b).batch.pks.push_u128(1u128);
             (*b).batch.weights.push(1);
             (*b).batch.nulls.push(0);
         }
