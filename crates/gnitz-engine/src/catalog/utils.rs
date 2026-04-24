@@ -313,12 +313,6 @@ pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
     batch
 }
 
-/// Returns true if any non-PK payload column has STRING type, meaning bulk
-/// copy would require out-of-line blob relocation and must fall back.
-pub(crate) fn schema_has_string_columns(schema: &SchemaDescriptor) -> bool {
-    schema.payload_columns().any(|(_pi, _ci, col)| col.type_code == type_code::STRING)
-}
-
 /// Scan `[pk_lo_start, pk_lo_end)` on `pk_hi == 0` and emit a weight=-1 batch
 /// of every positive-weight row in the range. Used for U64-PK system tables
 /// where rows belonging to one owner share a packed PK prefix (e.g.
@@ -335,6 +329,20 @@ pub(crate) fn retract_rows_by_pk_lo_range(
         Err(_) => return batch,
     };
     cursor.cursor.seek(crate::util::make_pk(pk_lo_start, 0));
+
+    // Bulk path: single consolidated MemBatch source.
+    if let Some((src, start)) = cursor.cursor.single_mem_batch() {
+        let mut end = start;
+        while end < src.count
+            && crate::util::read_u64_le(src.pk_lo, end * 8) < pk_lo_end
+        {
+            end += 1;
+        }
+        batch.append_mem_batch_range(&src, start, end, -1);
+        return batch;
+    }
+
+    // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid {
         if cursor.cursor.current_key_lo >= pk_lo_end { break; }
         if cursor.cursor.current_weight > 0 {
@@ -356,26 +364,21 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     };
     cursor.cursor.seek(crate::util::make_pk(0, pk_hi));
 
-    // Bulk path: single consolidated MemBatch source, no out-of-line strings.
-    // Consolidated MemBatch rows always have positive weight (no ghosts), so
-    // the weight>0 filter is trivially satisfied and we can copy the range in
-    // one pass per column instead of one call to copy_cursor_row_with_weight
-    // per row.
-    if !schema_has_string_columns(schema) {
-        if let Some((src, start)) = cursor.cursor.single_mem_batch() {
-            // Find the end of the contiguous pk_hi == pk_hi run (sorted by pk).
-            let mut end = start;
-            while end < src.count
-                && crate::util::read_u64_le(src.pk_hi, end * 8) == pk_hi
-            {
-                end += 1;
-            }
-            batch.append_mem_batch_range(&src, start, end, -1);
-            return batch;
+    // Bulk path: single consolidated MemBatch source. Consolidated rows always
+    // have positive weight, so the weight>0 filter is trivially satisfied and
+    // we get one copy_from_slice per column instead of one call per row.
+    if let Some((src, start)) = cursor.cursor.single_mem_batch() {
+        let mut end = start;
+        while end < src.count
+            && crate::util::read_u64_le(src.pk_hi, end * 8) == pk_hi
+        {
+            end += 1;
         }
+        batch.append_mem_batch_range(&src, start, end, -1);
+        return batch;
     }
 
-    // Row-at-a-time fallback for multi-source cursors or schemas with strings.
+    // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, &mut batch, -1);

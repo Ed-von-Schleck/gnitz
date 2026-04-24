@@ -27,7 +27,7 @@ pub fn op_scan_trace(
     }
 
     // Fallback: row-at-a-time scan
-    let cap = if chunk_limit > 0 { chunk_limit as usize } else { 64 };
+    let cap = if chunk_limit > 0 { chunk_limit as usize } else { cursor.estimated_length().max(64) };
     let mut output = Batch::with_schema(*schema, cap);
     output.sorted = true;
     output.consolidated = true;

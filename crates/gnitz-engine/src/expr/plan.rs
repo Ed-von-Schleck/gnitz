@@ -95,15 +95,19 @@ fn copy_column(
         let out_ci = payload_to_col(cm.dst_payload, out_pki);
         let stride = out_schema.columns[out_ci].size as usize;
         let dst = output.col_data_mut(cm.dst_payload);
-        for row in 0..n {
-            let pk_lo = in_batch.get_pk(row) as u64;
-            dst[row * stride..row * stride + 8]
-                .copy_from_slice(&pk_lo.to_le_bytes());
+        if stride == 8 {
+            dst[..n * 8].copy_from_slice(in_batch.pk_lo_data());
+        } else {
+            for row in 0..n {
+                let pk_lo = in_batch.get_pk(row) as u64;
+                dst[row * stride..row * stride + 8].copy_from_slice(&pk_lo.to_le_bytes());
+            }
         }
     } else if cm.type_code == type_code::STRING {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
         let stride = in_schema.columns[cm.src_ci].size as usize;
         let src_col = in_batch.col_data(in_pi);
+        output.blob.reserve(in_batch.blob.len());
         for row in 0..n {
             let off = row * stride;
             let cell = crate::schema::relocate_german_string_vec(

@@ -451,7 +451,6 @@ impl ReadCursor {
 
     /// Copy the current row into `batch` with an explicit weight.
     pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        batch.ensure_row_capacity();
         batch.extend_pk_lo(&self.current_key_lo.to_le_bytes());
         batch.extend_pk_hi(&self.current_key_hi.to_le_bytes());
         batch.extend_weight(&weight.to_le_bytes());
@@ -494,6 +493,8 @@ impl ReadCursor {
         }
         let estimated = self.estimated_length().max(8);
         let mut batch = Batch::with_schema(self.schema, estimated);
+        let total_blob: usize = self.entries.iter().map(|e| e.source.blob_slice().len()).sum();
+        if total_blob > 0 { batch.blob.reserve(total_blob); }
         while self.valid {
             if self.current_weight > 0 {
                 let w = self.current_weight;

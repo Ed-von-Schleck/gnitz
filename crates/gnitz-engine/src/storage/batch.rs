@@ -610,10 +610,8 @@ impl Batch {
     /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`, writing
     /// `weight_override` into the weight column instead of the source weights.
     ///
-    /// One `copy_from_slice` per column region replaces the per-row extend loop
-    /// used by `copy_cursor_row_with_weight`. The caller must ensure the source
-    /// has no out-of-line string blobs (i.e. no STRING-typed payload columns with
-    /// long values that require blob-offset relocation).
+    /// Non-STRING payload columns: one `copy_from_slice` per region.
+    /// STRING payload columns: per-row blob relocation via `relocate_string_cell`.
     ///
     /// Preconditions:
     /// - `start <= end <= src.count`
@@ -628,9 +626,9 @@ impl Batch {
         let n = end - start;
         if n == 0 { return; }
         self.reserve_rows(n);
+        if !src.blob.is_empty() { self.blob.reserve(src.blob.len()); }
         self.bulk_copy_region(REG_PK_LO, src.pk_lo, start, end);
         self.bulk_copy_region(REG_PK_HI, src.pk_hi, start, end);
-        // Fill weight region with the constant override value.
         {
             let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
             let w_bytes = weight_override.to_le_bytes();
@@ -640,8 +638,28 @@ impl Batch {
             }
         }
         self.bulk_copy_region(REG_NULL_BMP, src.null_bmp, start, end);
-        for pi in 0..src.col_data.len() {
-            self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data[pi], start, end);
+        let npc = src.col_data.len();
+        let mut is_string_at = [false; MAX_BATCH_REGIONS];
+        if let Some(s) = self.schema {
+            for (pi, _ci, col) in s.payload_columns() {
+                if pi >= npc { break; }
+                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING;
+            }
+        }
+        for pi in 0..npc {
+            let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
+            if is_string_at[pi] && cs == 16 {
+                for row in start..end {
+                    let src_off = row * 16;
+                    let src_struct = &src.col_data[pi][src_off..src_off + 16];
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize
+                        + (self.count + row - start) * 16;
+                    relocate_string_cell(src_struct, src.blob,
+                        &mut self.data[dst_off..dst_off + 16], &mut self.blob);
+                }
+            } else if cs > 0 {
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data[pi], start, end);
+            }
         }
         self.count += n;
     }
