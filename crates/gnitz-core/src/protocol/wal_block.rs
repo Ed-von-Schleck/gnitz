@@ -324,12 +324,12 @@ pub fn decode_wal_block(
         )));
     }
     let mut pks: Vec<u128> = Vec::with_capacity(count);
+    let mut pk_buf = [0u8; 16];
     for i in 0..count {
         let base = pk_off + i * pk_stride;
         if base + pk_stride > total_size {
             return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
         }
-        let mut pk_buf = [0u8; 16];
         pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
         pks.push(u128::from_le_bytes(pk_buf));
     }

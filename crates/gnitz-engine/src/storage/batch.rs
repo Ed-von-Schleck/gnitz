@@ -148,6 +148,7 @@ impl Batch {
     ///
     /// Intended for zero-row return values and swap-placeholder slots.
     pub fn empty(num_payload_cols: usize, pk_stride: u8) -> Self {
+        debug_assert!(pk_stride == 8 || pk_stride == 16, "pk_stride must be 8 or 16, got {pk_stride}");
         let nr = REG_PAYLOAD_START + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         strides[REG_PK] = pk_stride;
@@ -445,16 +446,14 @@ impl Batch {
 
     // ── Row accessors ───────────────────────────────────────────────────
 
-    #[inline]
+    #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] as usize + row * stride;
         if stride == 16 {
             u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
         } else {
-            let mut buf = [0u8; 16];
-            buf[..8].copy_from_slice(&self.data[off..off + 8]);
-            u128::from_le_bytes(buf)
+            u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128
         }
     }
     #[inline]

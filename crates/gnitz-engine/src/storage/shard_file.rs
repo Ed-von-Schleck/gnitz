@@ -12,6 +12,7 @@ use crate::layout::*;
 use crate::util::write_u64_le;
 use super::error::StorageError;
 use super::xor8;
+use xorf::Xor8;
 use crate::xxh;
 
 fn align64(val: usize) -> usize {
@@ -92,6 +93,22 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     }
 }
 
+fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Option<Xor8> {
+    if pk_ptr.is_null() || n == 0 || pk_sz == 0 {
+        return None;
+    }
+    let stride = pk_sz / n;
+    let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
+    let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
+        if stride == 16 {
+            u128::from_le_bytes(c.try_into().unwrap())
+        } else {
+            u64::from_le_bytes(c.try_into().unwrap()) as u128
+        }
+    }).collect();
+    xor8::build(&pks)
+}
+
 /// Build a complete shard file image from pre-built region buffers.
 ///
 /// `regions` is an array of (pointer, size) pairs in the canonical order:
@@ -142,18 +159,7 @@ pub fn build_shard_image(
 
     let xor8_filter = if row_count > 0 && num_regions >= 1 {
         let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && n > 0 && pk_sz > 0 {
-            let stride = pk_sz / n;
-            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-            let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
-                let mut buf = [0u8; 16];
-                buf[..stride].copy_from_slice(c);
-                u128::from_le_bytes(buf)
-            }).collect();
-            xor8::build(&pks)
-        } else {
-            None
-        }
+        build_xor8_from_pk_region(pk_ptr, pk_sz, n)
     } else {
         None
     };
@@ -326,18 +332,7 @@ pub fn write_shard_streaming(
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
     let xor8_filter = if row_count > 0 && num_regions >= 1 {
         let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && n > 0 && pk_sz > 0 {
-            let stride = pk_sz / n;
-            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-            let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
-                let mut buf = [0u8; 16];
-                buf[..stride].copy_from_slice(c);
-                u128::from_le_bytes(buf)
-            }).collect();
-            xor8::build(&pks)
-        } else {
-            None
-        }
+        build_xor8_from_pk_region(pk_ptr, pk_sz, n)
     } else {
         None
     };

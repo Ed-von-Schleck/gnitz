@@ -278,15 +278,18 @@ impl MappedShard {
         self.mmap.as_slice()
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
             RegionView::Raw { offset, .. } => {
-                let mut buf = [0u8; 16];
-                buf[..stride].copy_from_slice(&data[offset + row * stride..offset + row * stride + stride]);
-                u128::from_le_bytes(buf)
+                let src = &data[offset + row * stride..offset + row * stride + stride];
+                if stride == 16 {
+                    u128::from_le_bytes(src.try_into().unwrap())
+                } else {
+                    u64::from_le_bytes(src.try_into().unwrap()) as u128
+                }
             }
             RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
             RegionView::TwoValue { .. } => unreachable!(),

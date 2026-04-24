@@ -56,15 +56,13 @@ pub struct MemBatch<'a> {
 }
 
 impl<'a> MemBatch<'a> {
-    #[inline]
+    #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
         if stride == 16 {
             u128::from_le_bytes(self.pk[row * 16..row * 16 + 16].try_into().unwrap())
         } else {
-            let mut buf = [0u8; 16];
-            buf[..8].copy_from_slice(&self.pk[row * 8..row * 8 + 8]);
-            u128::from_le_bytes(buf)
+            u64::from_le_bytes(self.pk[row * 8..row * 8 + 8].try_into().unwrap()) as u128
         }
     }
     #[inline]
