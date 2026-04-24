@@ -155,7 +155,7 @@ pub(super) fn extract_group_key(
     row: usize,
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
-) -> (u64, u64) {
+) -> u128 {
     let pki = schema.pk_index as usize;
 
     if group_by_cols.len() == 1 {
@@ -165,14 +165,12 @@ pub(super) fn extract_group_key(
             let pi = payload_idx(c_idx, pki);
             let ptr = mb.get_col_ptr(row, pi, 8);
             let v = u64::from_le_bytes(ptr.try_into().unwrap());
-            return (v, 0);
+            return v as u128;
         }
         if tc == type_code::U128 {
             let pi = payload_idx(c_idx, pki);
             let ptr = mb.get_col_ptr(row, pi, 16);
-            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
-            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
-            return (lo, hi);
+            return u128::from_le_bytes(ptr[0..16].try_into().unwrap());
         }
     }
 
@@ -204,5 +202,5 @@ pub(super) fn extract_group_key(
         h = mix64(h ^ col_hash ^ (i as u64));
     }
     let h_hi = mix64(h ^ (group_by_cols.len() as u64));
-    (h, h_hi)
+    ((h_hi as u128) << 64) | (h as u128)
 }

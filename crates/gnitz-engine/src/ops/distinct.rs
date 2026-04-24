@@ -36,8 +36,6 @@ pub fn op_distinct(
 
     for i in 0..n {
         let key = consolidated.get_pk(i);
-        let key_lo = key as u64;
-        let key_hi = (key >> 64) as u64;
         let w_delta = consolidated.get_weight(i);
 
         if key != prev_key {
@@ -46,10 +44,7 @@ pub fn op_distinct(
         prev_key = key;
 
         let w_old: i64 = loop {
-            if !cursor.valid
-                || cursor.current_key_lo != key_lo
-                || cursor.current_key_hi != key_hi
-            {
+            if !cursor.valid || cursor.current_key != key {
                 break 0;
             }
             match compare_cursor_payload_to_batch_row(cursor, &consolidated_mb, i, schema) {
@@ -123,8 +118,7 @@ mod tests {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -214,8 +208,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
         let col_size = N;
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes()[..col_size]);

@@ -31,8 +31,7 @@ fn make_int_batch(
     let mut batch = Batch::with_schema(*schema, rows.len().max(1));
     batch.count = 0;
     for &(pk, weight, null_word, cols) in rows {
-        batch.extend_pk_lo(&pk.to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         let mut pi = 0;
@@ -287,8 +286,7 @@ fn test_string_eq_const() {
     // Build a batch with a short string "hello"
     let mut batch = Batch::with_schema(schema, 1);
     batch.count = 0;
-    batch.extend_pk_lo(&1u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     // German string struct for "hello" (5 bytes, inline)
@@ -584,8 +582,7 @@ fn test_string_lt_le_const() {
     let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
     let mut batch = Batch::with_schema(schema, 1);
     batch.count = 0;
-    batch.extend_pk_lo(&1u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     let mut gs = [0u8; 16];
@@ -628,8 +625,7 @@ fn test_string_col_eq_col() {
     batch.count = 0;
 
     // Row 0: str_a="abc", str_b="abc" (equal)
-    batch.extend_pk_lo(&1u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     let mut gs_a = [0u8; 16];
@@ -643,8 +639,7 @@ fn test_string_col_eq_col() {
     batch.count += 1;
 
     // Row 1: str_a="abc", str_b="xyz" (not equal)
-    batch.extend_pk_lo(&2u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(2u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &gs_a);
@@ -834,8 +829,7 @@ fn make_single_string_batch(schema: SchemaDescriptor, s: &[u8]) -> Batch {
     let gs = make_german_string(s);
     let mut batch = Batch::with_schema(schema, 1);
     batch.count = 0;
-    batch.extend_pk_lo(&1u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &gs);

@@ -37,16 +37,13 @@ pub fn op_anti_join_delta_trace(
             // Same PK as previous row (different payload) — re-seek cursor.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi) < d_pk {
+            while cursor.valid && cursor.current_key < d_pk {
                 cursor.advance();
             }
         }
 
-        let d_lo = d_pk as u64;
-        let d_hi = (d_pk >> 64) as u64;
         let in_trace = cursor.valid
-            && cursor.current_key_lo == d_lo
-            && cursor.current_key_hi == d_hi
+            && cursor.current_key == d_pk
             && cursor.current_weight > 0;
 
         if !in_trace {
@@ -114,16 +111,13 @@ pub fn op_semi_join_delta_trace(
             // Same PK as previous row (different payload) — re-seek cursor.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi) < d_pk {
+            while cursor.valid && cursor.current_key < d_pk {
                 cursor.advance();
             }
         }
 
-        let d_lo = d_pk as u64;
-        let d_hi = (d_pk >> 64) as u64;
         let in_trace = cursor.valid
-            && cursor.current_key_lo == d_lo
-            && cursor.current_key_hi == d_hi
+            && cursor.current_key == d_pk
             && cursor.current_weight > 0;
 
         if in_trace {
@@ -162,7 +156,7 @@ fn semi_join_dt_swapped(
     let mut last_pk: Option<u128> = None;
 
     while cursor.valid {
-        let t_pk = crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi);
+        let t_pk = cursor.current_key;
 
         if cursor.current_weight <= 0 {
             cursor.advance();
@@ -265,20 +259,18 @@ fn join_dt_merge_walk(
 
     for i in 0..n {
         let d_pk = pks[i];
-        let d_lo = d_pk as u64;
-        let d_hi = (d_pk >> 64) as u64;
         let w_delta = delta.get_weight(i);
 
         if i > 0 && prev_pk == d_pk {
             // Multiset delta: same PK, different payload — re-seek trace.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi) < d_pk {
+            while cursor.valid && cursor.current_key < d_pk {
                 cursor.advance();
             }
         }
 
-        while cursor.valid && cursor.current_key_lo == d_lo && cursor.current_key_hi == d_hi {
+        while cursor.valid && cursor.current_key == d_pk {
             let w_trace = cursor.current_weight;
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
@@ -311,7 +303,7 @@ fn join_dt_swapped(
     let delta_pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
 
     while cursor.valid {
-        let t_pk = crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi);
+        let t_pk = cursor.current_key;
         let w_trace = cursor.current_weight;
 
         // Binary search in consolidated delta
@@ -367,20 +359,18 @@ pub fn op_join_delta_trace_outer(
 
     for i in 0..n {
         let d_pk = pks[i];
-        let d_lo = d_pk as u64;
-        let d_hi = (d_pk >> 64) as u64;
         let w_delta = consolidated.get_weight(i);
 
         if i > 0 && prev_pk == d_pk {
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && crate::util::make_pk(cursor.current_key_lo, cursor.current_key_hi) < d_pk {
+            while cursor.valid && cursor.current_key < d_pk {
                 cursor.advance();
             }
         }
 
         let mut matched = false;
-        while cursor.valid && cursor.current_key_lo == d_lo && cursor.current_key_hi == d_hi {
+        while cursor.valid && cursor.current_key == d_pk {
             let w_trace = cursor.current_weight;
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
@@ -455,16 +445,13 @@ fn write_join_row(
     right_schema: &SchemaDescriptor,
 ) {
     let pk = left_batch.get_pk(left_row);
-    let pk_lo = pk as u64;
-    let pk_hi = (pk >> 64) as u64;
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_cursor.current_null_word;
 
     let left_npc = left_schema.num_columns as usize - 1;
     let null_word = left_null | (right_null << left_npc);
 
-    output.extend_pk_lo(&pk_lo.to_le_bytes());
-    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_pk(pk);
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -522,8 +509,6 @@ fn write_join_row_null_right(
     right_schema: &SchemaDescriptor,
 ) {
     let pk = left_batch.get_pk(left_row);
-    let pk_lo = pk as u64;
-    let pk_hi = (pk >> 64) as u64;
     let left_null = left_batch.get_null_word(left_row);
 
     let left_npc = left_schema.num_columns as usize - 1;
@@ -535,8 +520,7 @@ fn write_join_row_null_right(
     };
     let null_word = left_null | (right_null_bits << left_npc);
 
-    output.extend_pk_lo(&pk_lo.to_le_bytes());
-    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_pk(pk);
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -814,16 +798,13 @@ fn write_join_row_from_batches(
     right_schema: &SchemaDescriptor,
 ) {
     let pk = left_batch.get_pk(left_row);
-    let pk_lo = pk as u64;
-    let pk_hi = (pk >> 64) as u64;
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_batch.get_null_word(right_row);
 
     let left_npc = left_schema.num_columns as usize - 1;
     let null_word = left_null | (right_null << left_npc);
 
-    output.extend_pk_lo(&pk_lo.to_le_bytes());
-    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_pk(pk);
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -901,8 +882,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -921,8 +901,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, s) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
 
@@ -1119,8 +1098,7 @@ mod tests {
         let mut b = Batch::with_schema(rs, 2);
 
         for &(pk, w, val) in &[(1u64, 1i64, 100i64), (1u64, -1i64, 100i64)] {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1197,8 +1175,7 @@ mod tests {
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
         let mut delta = Batch::with_schema(schema, 2);
         for (pk, w, val) in [(1u64, 2i64, 10i64), (1u64, 3i64, 10i64)] {
-            delta.extend_pk_lo(&pk.to_le_bytes());
-            delta.extend_pk_hi(&0u64.to_le_bytes());
+            delta.extend_pk(pk as u128);
             delta.extend_weight(&w.to_le_bytes());
             delta.extend_null_bmp(&0u64.to_le_bytes());
             delta.extend_col(0, &val.to_le_bytes());

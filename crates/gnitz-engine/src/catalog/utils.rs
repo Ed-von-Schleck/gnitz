@@ -28,8 +28,7 @@ impl BatchBuilder {
     /// Begin a new row with the given PK and weight.
     pub(crate) fn begin_row(&mut self, pk_lo: u64, pk_hi: u64, weight: i64) {
         self.batch.ensure_row_capacity();
-        self.batch.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.batch.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.batch.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
         self.batch.extend_weight(&weight.to_le_bytes());
         self.curr_null_word = 0;
         self.curr_col = 0;
@@ -245,7 +244,7 @@ pub(crate) fn collect_for_schema(
             if c.cursor.current_weight > 0 {
                 let row_sid = cursor_read_u64(&c, schema_col) as i64;
                 if row_sid == sid {
-                    let eid = c.cursor.current_key_lo as i64;
+                    let eid = c.cursor.current_key_lo() as i64;
                     if let Some((sn, en)) = id_to_qualified.get(&eid) {
                         result.push(format!("{}.{}", sn, en));
                     }
@@ -304,8 +303,8 @@ pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
     };
     cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
     if cursor.cursor.valid
-        && cursor.cursor.current_key_lo == pk_lo
-        && cursor.cursor.current_key_hi == pk_hi
+        && cursor.cursor.current_key_lo() == pk_lo
+        && cursor.cursor.current_key_hi() == pk_hi
         && cursor.cursor.current_weight > 0
     {
         copy_cursor_row_with_weight(&cursor, &mut batch, -1);
@@ -344,7 +343,7 @@ pub(crate) fn retract_rows_by_pk_lo_range(
 
     // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid {
-        if cursor.cursor.current_key_lo >= pk_lo_end { break; }
+        if cursor.cursor.current_key_lo() >= pk_lo_end { break; }
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }
@@ -379,7 +378,7 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     }
 
     // Row-at-a-time fallback for multi-source cursors.
-    while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
+    while cursor.cursor.valid && cursor.cursor.current_key_hi() == pk_hi {
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }

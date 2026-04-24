@@ -194,8 +194,8 @@ impl<'a> DirectWriter<'a> {
         let out_row = self.count;
         self.count += 1;
 
-        let pk_lo = batch.get_pk_lo(row);
-        let pk_hi = batch.get_pk_hi(row);
+        let pk = batch.get_pk(row);
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
         let null_word = batch.get_null_word(row);
 
         self.pk_lo[out_row * 8..out_row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());

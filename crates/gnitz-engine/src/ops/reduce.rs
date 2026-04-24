@@ -295,8 +295,8 @@ pub(super) fn extract_gc_u64(
             return u64::from_le_bytes(buf);
         }
     }
-    let (lo, _hi) = extract_group_key(mb, row, schema, group_by_cols);
-    lo
+    let key_u128 = extract_group_key(mb, row, schema, group_by_cols);
+    key_u128 as u64
 }
 
 /// Reverse IEEE order-preserving encoding.
@@ -472,15 +472,15 @@ fn apply_agg_from_value_index(
     avi_cursor.seek(crate::util::make_pk(0, gc_u64));
     gnitz_debug!("avi_lookup: seek(0, {:#x}) valid={}", gc_u64, avi_cursor.valid);
     while avi_cursor.valid {
-        let k_hi = avi_cursor.current_key_hi;
-        let k_lo = avi_cursor.current_key_lo;
+        let k_hi = (avi_cursor.current_key >> 64) as u64;
+        let k_lo = avi_cursor.current_key as u64;
         let w = avi_cursor.current_weight;
         gnitz_debug!("avi_lookup: at pk_lo={:#x} pk_hi={:#x} w={}", k_lo, k_hi, w);
         if k_hi != gc_u64 {
             break;
         }
         if avi_cursor.current_weight > 0 {
-            let mut encoded = avi_cursor.current_key_lo;
+            let mut encoded = avi_cursor.current_key as u64;
             if for_max {
                 encoded = !encoded;
             }
@@ -596,9 +596,8 @@ pub fn op_reduce(
         let group_start_pos = idx;
         let group_start_idx = sorted_indices[group_start_pos] as usize;
 
-        let (group_key_lo, group_key_hi) = if group_by_pk {
-            let pk = mb.get_pk(group_start_idx);
-            (pk as u64, (pk >> 64) as u64)
+        let group_key: u128 = if group_by_pk {
+            mb.get_pk(group_start_idx)
         } else {
             extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
         };
@@ -611,7 +610,7 @@ pub fn op_reduce(
             let curr_idx = sorted_indices[idx] as usize;
             if group_by_pk {
                 let curr_pk = mb.get_pk(curr_idx);
-                if curr_pk != crate::util::make_pk(group_key_lo, group_key_hi) {
+                if curr_pk != group_key {
                     break;
                 }
             } else {
@@ -632,10 +631,9 @@ pub fn op_reduce(
         }
 
         // Retraction: read old value from trace_out
-        trace_out_cursor.seek(crate::util::make_pk(group_key_lo, group_key_hi));
+        trace_out_cursor.seek(group_key);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_key_lo == group_key_lo
-            && trace_out_cursor.current_key_hi == group_key_hi;
+            && trace_out_cursor.current_key == group_key;
 
         if has_old {
             // Read old agg values from trace_out
@@ -652,7 +650,7 @@ pub fn op_reduce(
             // Emit retraction row (weight=-1)
             emit_reduce_row(
                 &mut raw_output, &mb, group_start_idx,
-                group_key_lo, group_key_hi, -1,
+                group_key, -1,
                 &old_vals, true, // use_old_val=true
                 &accs, input_schema, output_schema,
                 group_by_cols, use_natural_pk, num_aggs,
@@ -662,7 +660,7 @@ pub fn op_reduce(
             {
                 emit_finalized_row(
                     fin_out, &raw_output, raw_output.count - 1,
-                    group_key_lo, group_key_hi, -1,
+                    group_key, -1,
                     prog, output_schema, fin_schema,
                 );
             }
@@ -690,10 +688,9 @@ pub fn op_reduce(
 
                 if let Some(ref mut ti_cursor) = trace_in {
                     if group_by_pk {
-                        ti_cursor.seek(crate::util::make_pk(group_key_lo, group_key_hi));
+                        ti_cursor.seek(group_key);
                         while ti_cursor.valid
-                            && ti_cursor.current_key_lo == group_key_lo
-                            && ti_cursor.current_key_hi == group_key_hi
+                            && ti_cursor.current_key == group_key
                         {
                             ti_cursor.copy_current_row_into(replay, ti_cursor.current_weight);
                             ti_cursor.advance();
@@ -707,12 +704,12 @@ pub fn op_reduce(
                         let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
                         gi_c.seek(crate::util::make_pk(0, gc_u64_val));
                         while gi_c.valid {
-                            let gk_hi = gi_c.current_key_hi;
+                            let gk_hi = (gi_c.current_key >> 64) as u64;
                             if gk_hi != gc_u64_val {
                                 break;
                             }
                             if gi_c.current_weight > 0 {
-                                let spk_lo = gi_c.current_key_lo;
+                                let spk_lo = gi_c.current_key as u64;
                                 // spk_hi is in payload col 1 (first payload col = col index 1)
                                 let spk_hi_ptr = gi_c.col_ptr(1, 8);
                                 let spk_hi = if !spk_hi_ptr.is_null() {
@@ -721,12 +718,10 @@ pub fn op_reduce(
                                 } else {
                                     0
                                 };
+                                let trace_key = crate::util::make_pk(spk_lo, spk_hi);
                                 if let Some(ref mut ti) = trace_in {
-                                    ti.seek(crate::util::make_pk(spk_lo, spk_hi));
-                                    while ti.valid
-                                        && ti.current_key_lo == spk_lo
-                                        && ti.current_key_hi == spk_hi
-                                    {
+                                    ti.seek(trace_key);
+                                    while ti.valid && ti.current_key == trace_key {
                                         ti.copy_current_row_into(replay, ti.current_weight);
                                         ti.advance();
                                     }
@@ -780,7 +775,7 @@ pub fn op_reduce(
         if any_nonzero {
             emit_reduce_row(
                 &mut raw_output, &mb, group_start_idx,
-                group_key_lo, group_key_hi, 1,
+                group_key, 1,
                 &old_vals, false, // use_old_val=false
                 &accs, input_schema, output_schema,
                 group_by_cols, use_natural_pk, num_aggs,
@@ -790,7 +785,7 @@ pub fn op_reduce(
             {
                 emit_finalized_row(
                     fin_out, &raw_output, raw_output.count - 1,
-                    group_key_lo, group_key_hi, 1,
+                    group_key, 1,
                     prog, output_schema, fin_schema,
                 );
             }
@@ -820,8 +815,7 @@ fn emit_reduce_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
-    group_key_lo: u64,
-    group_key_hi: u64,
+    group_key: u128,
     weight: i64,
     old_vals: &[u64],
     use_old_val: bool,
@@ -836,8 +830,7 @@ fn emit_reduce_row(
     let in_pki = input_schema.pk_index as usize;
     let num_out_cols = output_schema.num_columns as usize;
 
-    output.extend_pk_lo(&group_key_lo.to_le_bytes());
-    output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    output.extend_pk(group_key);
     output.extend_weight(&weight.to_le_bytes());
 
     // Build null word and payload columns
@@ -912,8 +905,7 @@ fn emit_finalized_row(
     fin_output: &mut Batch,
     raw_output: &Batch,
     raw_row: usize,
-    group_key_lo: u64,
-    group_key_hi: u64,
+    group_key: u128,
     weight: i64,
     prog: &crate::expr::ExprProgram,
     raw_schema: &SchemaDescriptor,
@@ -932,8 +924,7 @@ fn emit_finalized_row(
     );
 
     // Build the finalized output row
-    fin_output.extend_pk_lo(&group_key_lo.to_le_bytes());
-    fin_output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    fin_output.extend_pk(group_key);
     fin_output.extend_weight(&weight.to_le_bytes());
 
     let mut fin_null_mask: u64 = 0;
@@ -1003,8 +994,7 @@ fn append_membatch_row_to_batch(
     schema: &SchemaDescriptor,
 ) {
     let pk = mb.get_pk(row);
-    output.extend_pk_lo(&(pk as u64).to_le_bytes());
-    output.extend_pk_hi(&((pk >> 64) as u64).to_le_bytes());
+    output.extend_pk(pk);
     output.extend_weight(&mb.get_weight(row).to_le_bytes());
     let null_word = mb.get_null_word(row);
     output.extend_null_bmp(&null_word.to_le_bytes());
@@ -1104,8 +1094,6 @@ pub fn op_gather_reduce(
     let mut idx = 0usize;
     while idx < n {
         let group_pk = smb_pks[idx];
-        let group_key_lo = group_pk as u64;
-        let group_key_hi = (group_pk >> 64) as u64;
         let exemplar_row = idx;
 
         for acc in accs.iter_mut() {
@@ -1133,8 +1121,7 @@ pub fn op_gather_reduce(
         // Read old global from trace_out
         trace_out_cursor.seek(group_pk);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_key_lo == group_key_lo
-            && trace_out_cursor.current_key_hi == group_key_hi;
+            && trace_out_cursor.current_key == group_pk;
 
         if has_old {
             for k in 0..num_aggs {
@@ -1151,7 +1138,7 @@ pub fn op_gather_reduce(
             // Emit retraction
             emit_gather_row(
                 &mut output, &smb, exemplar_row,
-                group_key_lo, group_key_hi, -1,
+                group_pk, -1,
                 &old_vals, true,
                 &accs, partial_schema, num_aggs,
             );
@@ -1168,7 +1155,7 @@ pub fn op_gather_reduce(
         if any_nonzero {
             emit_gather_row(
                 &mut output, &smb, exemplar_row,
-                group_key_lo, group_key_hi, 1,
+                group_pk, 1,
                 &old_vals, false,
                 &accs, partial_schema, num_aggs,
             );
@@ -1186,8 +1173,7 @@ fn emit_gather_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
-    group_key_lo: u64,
-    group_key_hi: u64,
+    group_key: u128,
     weight: i64,
     old_vals: &[u64],
     use_old_val: bool,
@@ -1198,8 +1184,7 @@ fn emit_gather_row(
     let num_cols = schema.num_columns as usize;
     let agg_base = num_cols - num_aggs;
 
-    output.extend_pk_lo(&group_key_lo.to_le_bytes());
-    output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    output.extend_pk(group_key);
     output.extend_weight(&weight.to_le_bytes());
 
     let mut null_word: u64 = 0;
@@ -1274,8 +1259,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1304,8 +1288,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_bits().to_le_bytes());
@@ -1354,8 +1337,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, grp, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &grp.to_le_bytes());
@@ -1395,8 +1377,7 @@ mod tests {
         let mut b = Batch::with_schema(gi_schema, n.max(1));
 
         for &(ck_lo, gc_u64, spk_hi) in rows {
-            b.extend_pk_lo(&ck_lo.to_le_bytes());
-            b.extend_pk_hi(&gc_u64.to_le_bytes());
+            b.extend_pk(((gc_u64 as u128) << 64) | (ck_lo as u128));
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &spk_hi.to_le_bytes());
@@ -1444,8 +1425,7 @@ mod tests {
         let delta1 = {
             let mut b = Batch::with_schema(in_schema, 3);
             for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
-                b.extend_pk_lo(&pk.to_le_bytes());
-                b.extend_pk_hi(&0u64.to_le_bytes());
+                b.extend_pk(pk as u128);
                 b.extend_weight(&1i64.to_le_bytes());
                 b.extend_null_bmp(&0u64.to_le_bytes());
                 b.extend_col(0, &10i64.to_le_bytes()); // grp=10
@@ -1478,8 +1458,7 @@ mod tests {
 
         let delta2 = {
             let mut b = Batch::with_schema(in_schema, 1);
-            b.extend_pk_lo(&2u64.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(2u128);
             b.extend_weight(&(-1i64).to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &10i64.to_le_bytes());
@@ -1652,8 +1631,7 @@ mod tests {
 
         // Two entries for same group key (pk=1), count=2 each
         for count in [2i64, 2] {
-            partial1.extend_pk_lo(&1u64.to_le_bytes());
-            partial1.extend_pk_hi(&0u64.to_le_bytes());
+            partial1.extend_pk(1u128);
             partial1.extend_weight(&1i64.to_le_bytes());
             partial1.extend_null_bmp(&0u64.to_le_bytes());
             partial1.extend_col(0, &count.to_le_bytes());
@@ -1676,8 +1654,7 @@ mod tests {
         let mut partial2 = Batch::with_schema(schema, 2);
 
         for count in [-1i64, -1] {
-            partial2.extend_pk_lo(&1u64.to_le_bytes());
-            partial2.extend_pk_hi(&0u64.to_le_bytes());
+            partial2.extend_pk(1u128);
             partial2.extend_weight(&1i64.to_le_bytes());
             partial2.extend_null_bmp(&0u64.to_le_bytes());
             partial2.extend_col(0, &count.to_le_bytes());
@@ -1790,8 +1767,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1807,8 +1783,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1980,8 +1955,7 @@ mod tests {
 
         let mut partial1 = Batch::with_schema(schema, 1);
 
-        partial1.extend_pk_lo(&1u64.to_le_bytes());
-        partial1.extend_pk_hi(&0u64.to_le_bytes());
+        partial1.extend_pk(1u128);
         partial1.extend_weight(&1i64.to_le_bytes());
         partial1.extend_null_bmp(&0u64.to_le_bytes());
         partial1.extend_col(0, &5i64.to_le_bytes());
@@ -2003,8 +1977,7 @@ mod tests {
 
         let mut partial2 = Batch::with_schema(schema, 1);
 
-        partial2.extend_pk_lo(&1u64.to_le_bytes());
-        partial2.extend_pk_hi(&0u64.to_le_bytes());
+        partial2.extend_pk(1u128);
         partial2.extend_weight(&1i64.to_le_bytes());
         partial2.extend_null_bmp(&0u64.to_le_bytes());
         partial2.extend_col(0, &3i64.to_le_bytes());

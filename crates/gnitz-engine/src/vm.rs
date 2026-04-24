@@ -1145,8 +1145,7 @@ mod tests {
         let n = rows.len();
         let mut b = Batch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0) in rows {
-            b.extend_pk_lo(&pk_lo.to_le_bytes());
-            b.extend_pk_hi(&pk_hi.to_le_bytes());
+            b.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &c0.to_le_bytes());
@@ -1162,8 +1161,7 @@ mod tests {
         let n = rows.len();
         let mut b = Batch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0, c1) in rows {
-            b.extend_pk_lo(&pk_lo.to_le_bytes());
-            b.extend_pk_hi(&pk_hi.to_le_bytes());
+            b.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &c0.to_le_bytes());

@@ -576,15 +576,40 @@ impl Batch {
     }
 
     #[inline]
-    pub fn extend_pk_lo(&mut self, d: &[u8]) { self.extend_region(REG_PK_LO, d); }
+    pub(super) fn extend_pk_lo(&mut self, d: &[u8]) { self.extend_region(REG_PK_LO, d); }
     #[inline]
-    pub fn extend_pk_hi(&mut self, d: &[u8]) { self.extend_region(REG_PK_HI, d); }
+    pub(super) fn extend_pk_hi(&mut self, d: &[u8]) { self.extend_region(REG_PK_HI, d); }
     #[inline]
     pub fn extend_weight(&mut self, d: &[u8]) { self.extend_region(REG_WEIGHT, d); }
     #[inline]
     pub fn extend_null_bmp(&mut self, d: &[u8]) { self.extend_region(REG_NULL_BMP, d); }
     #[inline]
     pub fn extend_col(&mut self, pi: usize, d: &[u8]) { self.extend_region(REG_PAYLOAD_START + pi, d); }
+
+    /// Append a 128-bit primary key at the current row position.
+    #[inline]
+    pub fn extend_pk(&mut self, pk: u128) {
+        let (lo, hi) = crate::util::split_pk(pk);
+        self.extend_region(REG_PK_LO, &lo.to_le_bytes());
+        self.extend_region(REG_PK_HI, &hi.to_le_bytes());
+    }
+
+    /// Overwrite the PK at `row` with a new 128-bit value.
+    #[inline]
+    pub fn set_pk_at(&mut self, row: usize, pk: u128) {
+        let (lo, hi) = crate::util::split_pk(pk);
+        let lo_off = self.offsets[REG_PK_LO] as usize + row * 8;
+        let hi_off = self.offsets[REG_PK_HI] as usize + row * 8;
+        self.data[lo_off..lo_off + 8].copy_from_slice(&lo.to_le_bytes());
+        self.data[hi_off..hi_off + 8].copy_from_slice(&hi.to_le_bytes());
+    }
+
+    /// Iterate PKs as `u128`.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn pk_iter(&self) -> impl Iterator<Item = u128> + '_ {
+        (0..self.count).map(|row| self.get_pk(row))
+    }
 
     /// Fill `nbytes` of zeros at the current row position in a payload column.
     #[inline]
@@ -1499,5 +1524,62 @@ pub fn write_to_batch(
         sorted: false,
         consolidated: false,
         schema: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+
+    fn single_col_u128_pk_schema() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U128, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    #[test]
+    fn extend_pk_roundtrip_across_u64_boundary() {
+        let schema = single_col_u128_pk_schema();
+        let mut b = Batch::with_schema(schema, 8);
+        let keys: [u128; 5] = [
+            0,
+            1,
+            u64::MAX as u128,
+            (u64::MAX as u128) + 1,
+            u128::MAX,
+        ];
+        for &pk in &keys {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        for (i, &pk) in keys.iter().enumerate() {
+            assert_eq!(b.get_pk(i), pk, "row {} pk roundtrip", i);
+        }
+        let iter_pks: Vec<u128> = b.pk_iter().collect();
+        assert_eq!(iter_pks, keys);
+    }
+
+    #[test]
+    fn set_pk_at_overwrites_existing_row() {
+        let schema = single_col_u128_pk_schema();
+        let mut b = Batch::with_schema(schema, 4);
+        for pk in [10u128, 20, 30, 40] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let new_pk = (u64::MAX as u128) + 7;
+        b.set_pk_at(2, new_pk);
+        assert_eq!(b.get_pk(0), 10);
+        assert_eq!(b.get_pk(1), 20);
+        assert_eq!(b.get_pk(2), new_pk);
+        assert_eq!(b.get_pk(3), 40);
     }
 }

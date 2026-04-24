@@ -1592,8 +1592,7 @@ fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
     for k in 0..lo_list.len() {
         batch.ensure_row_capacity();
-        batch.extend_pk_lo(&lo_list[k].to_le_bytes());
-        batch.extend_pk_hi(&hi_list[k].to_le_bytes());
+        batch.extend_pk(crate::util::make_pk(lo_list[k], hi_list[k]));
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         for c in 0..npc {

@@ -675,7 +675,7 @@ mod tests {
 
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo, 10);
+        assert_eq!(cursor.cursor.current_key_lo(), 10);
         // Don't need to iterate further — cursor creation works
     }
 
@@ -787,7 +787,7 @@ mod tests {
         // Cursor must yield rows in ascending PK order
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo, 10, "cursor should start at PK=10 (smallest)");
+        assert_eq!(cursor.cursor.current_key_lo(), 10, "cursor should start at PK=10 (smallest)");
     }
 
     /// When upsert_and_maybe_flush hits ERR_CAPACITY and rebuilds batch2 from
@@ -822,7 +822,7 @@ mod tests {
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo, 1, "cursor should start at PK=1 from flushed shard");
+        assert_eq!(cursor.cursor.current_key_lo(), 1, "cursor should start at PK=1 from flushed shard");
     }
 
     /// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → retract_pk.

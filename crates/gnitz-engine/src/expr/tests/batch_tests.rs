@@ -13,8 +13,7 @@ fn make_schema_2col() -> SchemaDescriptor {
 fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
-        b.extend_pk_lo(&pk.to_le_bytes());
-        b.extend_pk_hi(&0u64.to_le_bytes());
+        b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());

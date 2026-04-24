@@ -142,9 +142,8 @@ pub fn op_map(
 
     // Overwrite PK with promoted values from reindex column
     for row in 0..output.count {
-        let (pk_lo, pk_hi) = promote_col_to_pk(&in_mb, row, ri_col, in_schema);
-        output.pk_lo_data_mut()[row * 8..row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());
-        output.pk_hi_data_mut()[row * 8..row * 8 + 8].copy_from_slice(&pk_hi.to_le_bytes());
+        let pk = promote_col_to_pk(&in_mb, row, ri_col, in_schema);
+        output.set_pk_at(row, pk);
     }
 
     output.sorted = false;
@@ -408,43 +407,39 @@ fn mix64(mut v: u64) -> u64 {
     v
 }
 
-/// Promote a column value to a (lo, hi) PK pair for reindexing.
+/// Promote a column value to a 128-bit PK for reindexing.
 pub(super) fn promote_col_to_pk(
     batch: &MemBatch,
     row: usize,
     col_idx: usize,
     schema: &SchemaDescriptor,
-) -> (u64, u64) {
+) -> u128 {
     let tc = schema.columns[col_idx].type_code;
     let pki = schema.pk_index as usize;
 
-    // If reindexing by the PK column itself, read from pk_lo/pk_hi directly.
+    // If reindexing by the PK column itself, read from the batch's PK.
     if col_idx == pki {
-        let lo = crate::util::read_u64_le(batch.pk_lo, row * 8);
-        let hi = crate::util::read_u64_le(batch.pk_hi, row * 8);
-        return (lo, hi);
+        return batch.get_pk(row);
     }
 
     match tc {
         type_code::U128 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 16);
-            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
-            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
-            (lo, hi)
+            u128::from_le_bytes(ptr[0..16].try_into().unwrap())
         }
         type_code::U64 | type_code::I64 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let val = u64::from_le_bytes(ptr.try_into().unwrap());
-            (val, 0)
+            val as u128
         }
         type_code::STRING => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let struct_bytes = batch.get_col_ptr(row, pi, 16);
             let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
             if length == 0 {
-                return (0, 0);
+                return 0;
             }
             // Hash the string bytes
             let h = if length <= SHORT_STRING_THRESHOLD {
@@ -456,25 +451,25 @@ pub(super) fn promote_col_to_pk(
                 xxh::checksum(&batch.blob[heap_offset..heap_offset + length])
             };
             let h_hi = mix64(h);
-            (h, h_hi)
+            ((h_hi as u128) << 64) | (h as u128)
         }
         type_code::F64 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let bits = u64::from_le_bytes(ptr.try_into().unwrap());
-            (bits, 0)
+            bits as u128
         }
         type_code::F32 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 4);
             let bits = u32::from_le_bytes(ptr.try_into().unwrap()) as u64;
-            (bits, 0)
+            bits as u128
         }
         _ => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let val = u64::from_le_bytes(ptr.try_into().unwrap());
-            (val, 0)
+            val as u128
         }
     }
 }
@@ -509,8 +504,7 @@ mod tests {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());

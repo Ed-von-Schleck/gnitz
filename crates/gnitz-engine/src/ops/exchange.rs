@@ -127,8 +127,8 @@ fn hash_row_for_partition(
     if col_indices.len() == 1 && col_indices[0] as usize == pki {
         return partition_for_key(mb.get_pk(row));
     }
-    let (lo, hi) = extract_group_key(mb, row, schema, col_indices);
-    partition_for_key(crate::util::make_pk(lo, hi))
+    let pk = extract_group_key(mb, row, schema, col_indices);
+    partition_for_key(pk)
 }
 
 pub fn op_repartition_batch(
@@ -495,8 +495,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -512,8 +511,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, s) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
 
@@ -551,8 +549,7 @@ mod tests {
         let mut b = Batch::with_schema(schema, pk_vals.len());
 
         for &pk in pk_vals {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &0i64.to_le_bytes());
@@ -588,8 +585,7 @@ mod tests {
         let mut b = Batch::with_schema(schema, n);
 
         for &(lo, hi) in pk_pairs {
-            b.extend_pk_lo(&lo.to_le_bytes());
-            b.extend_pk_hi(&hi.to_le_bytes());
+            b.extend_pk(crate::util::make_pk(lo, hi));
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &0i64.to_le_bytes());
@@ -620,8 +616,7 @@ mod tests {
         let mut b = Batch::with_schema(schema, 4);
 
         for pk in [1u64, 2, 3, 4] {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &same_val.to_le_bytes());
@@ -772,8 +767,7 @@ mod tests {
         let mut b = Batch::with_schema(schema, vals.len());
 
         for (i, &v) in vals.iter().enumerate() {
-            b.extend_pk_lo(&((i + 1) as u64).to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk((i + 1) as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &v.to_le_bytes());

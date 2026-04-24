@@ -9,6 +9,7 @@ const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_co
 ///
 /// Duplicate PKs are deduplicated before building — shard files may contain
 /// retraction rows where the same PK appears with different payloads/weights.
+#[deprecated(note = "use build_from_u128s; halves API removed in Phase 3 (shard V5)")]
 pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
     let n = pk_lo.len().min(pk_hi.len());
     if n == 0 {
@@ -19,6 +20,21 @@ pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
         .zip(pk_hi[..n].iter())
         .map(|(&lo, &hi)| xxh::hash_u128(crate::util::make_pk(lo, hi)))
         .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(Xor8::from(keys.as_slice()))
+}
+
+/// Build an Xor8 filter from a slice of u128 PKs. Deduplicates before building.
+#[allow(dead_code)]
+pub fn build_from_u128s(pks: &[u128]) -> Option<Xor8> {
+    if pks.is_empty() {
+        return None;
+    }
+    let mut keys: Vec<u64> = pks.iter().map(|&k| xxh::hash_u128(k)).collect();
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
@@ -84,6 +100,7 @@ pub fn serialized_size(filter: &Xor8) -> usize {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -192,5 +209,25 @@ mod tests {
         // block_length=1, fp_count=3, but body is only 1 byte instead of 3.
         let buf = make_header(1, 3, 1);
         assert!(deserialize(&buf).is_none());
+    }
+
+    #[test]
+    fn build_from_u128s_crossing_u64_boundary() {
+        let pks: [u128; 5] = [
+            0,
+            1,
+            u64::MAX as u128,
+            (u64::MAX as u128) + 1,
+            u128::MAX,
+        ];
+        let filter = build_from_u128s(&pks).unwrap();
+        for &pk in &pks {
+            assert!(may_contain(&filter, pk), "false negative for pk {:#034x}", pk);
+        }
+    }
+
+    #[test]
+    fn build_from_u128s_empty_returns_none() {
+        assert!(build_from_u128s(&[]).is_none());
     }
 }

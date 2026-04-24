@@ -219,8 +219,7 @@ pub struct ReadCursor {
     schema: SchemaDescriptor,
     // Current row state
     pub valid: bool,
-    pub current_key_lo: u64,
-    pub current_key_hi: u64,
+    pub current_key: u128,
     pub current_weight: i64,
     pub current_null_word: u64,
     current_entry_idx: usize,
@@ -259,8 +258,7 @@ impl ReadCursor {
             tree,
             schema,
             valid: false,
-            current_key_lo: 0,
-            current_key_hi: 0,
+            current_key: 0,
             current_weight: 0,
             current_null_word: 0,
             current_entry_idx: 0,
@@ -318,9 +316,7 @@ impl ReadCursor {
             if e.is_valid() {
                 let pos = e.position;
                 self.valid = true;
-                let pk = e.source.get_pk(pos);
-                self.current_key_lo = pk as u64;
-                self.current_key_hi = (pk >> 64) as u64;
+                self.current_key = e.source.get_pk(pos);
                 self.current_weight = e.source.get_weight(pos);
                 self.current_null_word = e.source.get_null_word(pos);
                 self.current_entry_idx = 0;
@@ -358,9 +354,7 @@ impl ReadCursor {
                 let exemplar = tree.min_indices[0];
                 let pos = self.entries[exemplar].position;
                 self.valid = true;
-                let pk = self.entries[exemplar].source.get_pk(pos);
-                self.current_key_lo = pk as u64;
-                self.current_key_hi = (pk >> 64) as u64;
+                self.current_key = self.entries[exemplar].source.get_pk(pos);
                 self.current_weight = net_weight;
                 self.current_null_word = self.entries[exemplar].source.get_null_word(pos);
                 self.current_entry_idx = exemplar;
@@ -394,20 +388,16 @@ impl ReadCursor {
         self.entries.iter().map(|e| e.count.saturating_sub(e.position)).sum()
     }
 
-    /// Return the current row's full 128-bit PK as a single `u128`.
-    ///
-    /// Convenience helper for test code — production code reads `current_key_lo`
-    /// and `current_key_hi` directly.
-    #[cfg(test)]
-    pub fn current_key(&self) -> u128 {
-        (self.current_key_hi as u128) << 64 | self.current_key_lo as u128
-    }
+    #[inline]
+    pub fn current_key_lo(&self) -> u64 { self.current_key as u64 }
+    #[inline]
+    pub fn current_key_hi(&self) -> u64 { (self.current_key >> 64) as u64 }
 
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     ///
-    /// Returns null for the PK column — use `current_key_lo`/`current_key_hi`
-    /// (or `current_key()`) instead.  Returning only `pk_lo` for a 16-byte PK
-    /// would silently truncate the high half regardless of backing source.
+    /// Returns null for the PK column — use `current_key` instead.
+    /// Returning only `pk_lo` for a 16-byte PK would silently truncate the
+    /// high half regardless of backing source.
     pub fn col_ptr(&self, col_idx: usize, col_size: usize) -> *const u8 {
         if !self.valid {
             return ptr::null();
@@ -451,8 +441,7 @@ impl ReadCursor {
 
     /// Copy the current row into `batch` with an explicit weight.
     pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        batch.extend_pk_lo(&self.current_key_lo.to_le_bytes());
-        batch.extend_pk_hi(&self.current_key_hi.to_le_bytes());
+        batch.extend_pk(self.current_key);
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&self.current_null_word.to_le_bytes());
         let blob_ptr = self.blob_ptr();
@@ -679,8 +668,7 @@ mod tests {
         let schema = make_schema_i64();
         let mut b = Batch::with_schema(schema, rows.len().max(1));
         for &(lo, hi, w, val) in rows {
-            b.extend_pk_lo(&lo.to_le_bytes());
-            b.extend_pk_hi(&hi.to_le_bytes());
+            b.extend_pk(crate::util::make_pk(lo, hi));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -695,8 +683,8 @@ mod tests {
         let mut rows = Vec::new();
         while cursor.valid {
             rows.push((
-                cursor.current_key_lo,
-                cursor.current_key_hi,
+                cursor.current_key as u64,
+                (cursor.current_key >> 64) as u64,
                 cursor.current_weight,
             ));
             cursor.advance();
@@ -771,12 +759,12 @@ mod tests {
         // Seek to pk >= 5
         cursor.seek(5);
         assert!(cursor.valid);
-        assert_eq!(cursor.current_key_lo, 5);
+        assert_eq!(cursor.current_key, 5);
 
         // Seek to pk >= 7 → lands on 10
         cursor.seek(7);
         assert!(cursor.valid);
-        assert_eq!(cursor.current_key_lo, 10);
+        assert_eq!(cursor.current_key, 10);
 
         // Seek past end
         cursor.seek(100);
@@ -929,8 +917,8 @@ mod tests {
         let cursor = ReadCursor::new(entries, schema);
         assert!(cursor.valid);
         let expected = (0xBEEFu128 << 64) | 0xDEADu128;
-        assert_eq!(cursor.current_key(), expected);
-        assert_eq!(cursor.current_key_lo, 0xDEAD);
-        assert_eq!(cursor.current_key_hi, 0xBEEF);
+        assert_eq!(cursor.current_key, expected);
+        assert_eq!(cursor.current_key_lo(), 0xDEAD);
+        assert_eq!(cursor.current_key_hi(), 0xBEEF);
     }
 }

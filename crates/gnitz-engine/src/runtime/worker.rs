@@ -887,9 +887,7 @@ impl Batch {
     fn append_row_from_batch(&mut self, src: &Batch, row: usize, weight: i64) {
         if row >= src.count { return; }
         let pk = src.get_pk(row);
-        let (lo, hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&lo.to_le_bytes());
-        self.extend_pk_hi(&hi.to_le_bytes());
+        self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
         let null_word = src.get_null_word(row);
         self.extend_null_bmp(&null_word.to_le_bytes());
@@ -984,8 +982,7 @@ mod tests {
         let batch1 = Batch::with_schema(schema, 0);
         let mut batch2 = Batch::with_schema(schema, 1);
         // Add a row to batch2 to distinguish
-        batch2.extend_pk_lo(&100u64.to_le_bytes());
-        batch2.extend_pk_hi(&0u64.to_le_bytes());
+        batch2.extend_pk(100u128);
         batch2.extend_weight(&1i64.to_le_bytes());
         batch2.extend_null_bmp(&0u64.to_le_bytes());
         batch2.extend_col(0, &99u64.to_le_bytes());
@@ -1003,16 +1000,14 @@ mod tests {
         let mut pending: HashMap<i64, Batch> = HashMap::new();
 
         let mut b1 = Batch::with_schema(schema, 1);
-        b1.extend_pk_lo(&1u64.to_le_bytes());
-        b1.extend_pk_hi(&0u64.to_le_bytes());
+        b1.extend_pk(1u128);
         b1.extend_weight(&1i64.to_le_bytes());
         b1.extend_null_bmp(&0u64.to_le_bytes());
         b1.extend_col(0, &10u64.to_le_bytes());
         b1.count = 1;
 
         let mut b2 = Batch::with_schema(schema, 1);
-        b2.extend_pk_lo(&2u64.to_le_bytes());
-        b2.extend_pk_hi(&0u64.to_le_bytes());
+        b2.extend_pk(2u128);
         b2.extend_weight(&1i64.to_le_bytes());
         b2.extend_null_bmp(&0u64.to_le_bytes());
         b2.extend_col(0, &20u64.to_le_bytes());
@@ -1033,8 +1028,7 @@ mod tests {
     fn make_batch(schema: SchemaDescriptor, pks: &[u64]) -> Batch {
         let mut b = Batch::with_schema(schema, pks.len());
         for &pk in pks {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &pk.to_le_bytes());
@@ -1104,8 +1098,7 @@ mod tests {
     fn test_filter_my_partition_no_schema_passthrough() {
         let schema = test_schema();
         let mut batch = Batch::with_schema(schema, 1);
-        batch.extend_pk_lo(&1u64.to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.extend_col(0, &1u64.to_le_bytes());
@@ -1268,8 +1261,7 @@ mod tests {
 
         // Build source batch with a long string stored in src.blob.
         let mut src = Batch::with_schema(sd, 1);
-        src.extend_pk_lo(&7u64.to_le_bytes());
-        src.extend_pk_hi(&0u64.to_le_bytes());
+        src.extend_pk(7u128);
         src.extend_weight(&1i64.to_le_bytes());
         src.extend_null_bmp(&0u64.to_le_bytes());
         // payload column 0 = name (pi=0 in payload order)

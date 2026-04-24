@@ -33,8 +33,7 @@ fn string_schema() -> SchemaDescriptor {
 fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
     let sd = simple_schema();
     let mut b = Batch::with_schema(sd, 1);
-    b.extend_pk_lo(&pk.to_le_bytes());
-    b.extend_pk_hi(&0u64.to_le_bytes());
+    b.extend_pk(pk as u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &val.to_le_bytes());
@@ -224,8 +223,7 @@ fn test_encode_decode_string_column() {
     let sd = string_schema();
     let mut batch = Batch::with_schema(sd, 2);
 
-    batch.extend_pk_lo(&1u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &42u64.to_le_bytes());
@@ -233,8 +231,7 @@ fn test_encode_decode_string_column() {
     batch.extend_col(1, &st1);
     batch.count += 1;
 
-    batch.extend_pk_lo(&2u64.to_le_bytes());
-    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_pk(2u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &99u64.to_le_bytes());

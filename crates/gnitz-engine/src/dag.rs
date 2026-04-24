@@ -387,7 +387,7 @@ impl DagEngine {
                     let w = ch.cursor.current_weight;
                     if w > 0 {
                         // DepTab PK = view_id, dep_table_id is a payload column.
-                        let v_id = ch.cursor.current_key_hi as i64;
+                        let v_id = ch.cursor.current_key_hi() as i64;
                         let dep_tid = compiler::cursor_read_i64(
                             &ch.cursor, 3, &self.sys.dep_tab_schema,
                         );
@@ -429,9 +429,9 @@ impl DagEngine {
             Err(_) => return result,
         };
         ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
+        while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
             if ch.cursor.current_weight > 0 {
-                let node_id = ch.cursor.current_key_lo as i32;
+                let node_id = ch.cursor.current_key_lo() as i32;
                 let opcode = compiler::cursor_read_i64(
                     &ch.cursor, 1, &self.sys.nodes_schema,
                 ) as i32;
@@ -452,9 +452,9 @@ impl DagEngine {
             Err(_) => return result,
         };
         ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
+        while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
             if ch.cursor.current_weight > 0 {
-                let edge_id = ch.cursor.current_key_lo as i32;
+                let edge_id = ch.cursor.current_key_lo() as i32;
                 let src = compiler::cursor_read_i64(
                     &ch.cursor, 1, &self.sys.edges_schema,
                 ) as i32;
@@ -481,9 +481,9 @@ impl DagEngine {
             Err(_) => return result,
         };
         ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
+        while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
             if ch.cursor.current_weight > 0 {
-                let lo64 = ch.cursor.current_key_lo;
+                let lo64 = ch.cursor.current_key_lo();
                 let node_id = (lo64 >> 8) as i32;
                 let slot = (lo64 & 0xFF) as i32;
                 let value = compiler::cursor_read_i64(
@@ -506,9 +506,9 @@ impl DagEngine {
             Err(_) => return result,
         };
         ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
+        while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
             if ch.cursor.current_weight > 0 {
-                let node_id = ch.cursor.current_key_lo as i32;
+                let node_id = ch.cursor.current_key_lo() as i32;
                 let table_id = compiler::cursor_read_i64(
                     &ch.cursor, 1, &self.sys.sources_schema,
                 );
@@ -1667,8 +1667,7 @@ impl DagEngine {
             let src_pk = src.get_pk(row);
             let (src_pk_lo, src_pk_hi) = crate::util::split_pk(src_pk);
 
-            out.extend_pk_lo(&key_lo.to_le_bytes());
-            out.extend_pk_hi(&key_hi.to_le_bytes());
+            out.extend_pk(crate::util::make_pk(key_lo, key_hi));
             out.extend_weight(&weight.to_le_bytes());
             out.extend_null_bmp(&0u64.to_le_bytes());
 

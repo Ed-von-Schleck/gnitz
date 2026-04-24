@@ -31,8 +31,7 @@ fn make_int_batch(
 ) -> Batch {
     let mut batch = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, weight, null_word, cols) in rows {
-        batch.extend_pk_lo(&pk.to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         let mut pi = 0;

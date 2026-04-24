@@ -143,8 +143,7 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
         let name = if ci < col_names.len() { col_names[ci] } else { b"" };
         let name_st = encode_german_string(name, &mut batch.blob);
 
-        batch.extend_pk_lo(&(ci as u64).to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(ci as u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.extend_col(0, &type_code_val.to_le_bytes());
@@ -313,8 +312,7 @@ pub fn encode_wire_into(
         let mut b = Batch::with_schema(cs, 1);
         let has_error = !error_msg.is_empty();
         let null_word: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
-        b.extend_pk_lo(&0u64.to_le_bytes());
-        b.extend_pk_hi(&0u64.to_le_bytes());
+        b.extend_pk(0u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&null_word.to_le_bytes());
         b.extend_col(ctrl::PAYLOAD_STATUS,       &(status as u64).to_le_bytes());

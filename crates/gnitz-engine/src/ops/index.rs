@@ -88,7 +88,7 @@ fn extract_gc_u64(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u64 {
-    super::util::extract_group_key(mb, row, schema, group_by_cols).0
+    super::util::extract_group_key(mb, row, schema, group_by_cols) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +195,7 @@ pub fn op_integrate_with_indexes(
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = source_pk_lo, ck_hi = gc_u64
-            gi_batch.extend_pk_lo(&source_pk_lo.to_le_bytes());
-            gi_batch.extend_pk_hi(&gc_u64.to_le_bytes());
+            gi_batch.extend_pk(((gc_u64 as u128) << 64) | (source_pk_lo as u128));
             gi_batch.extend_weight(&weight.to_le_bytes());
             gi_batch.extend_null_bmp(&0u64.to_le_bytes());
             // Payload: spk_hi (source pk high 64 bits) as I64
@@ -242,8 +241,7 @@ pub fn op_integrate_with_indexes(
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = av_u64, ck_hi = gc_u64
-            avi_batch.extend_pk_lo(&av_u64.to_le_bytes());
-            avi_batch.extend_pk_hi(&gc_u64.to_le_bytes());
+            avi_batch.extend_pk(((gc_u64 as u128) << 64) | (av_u64 as u128));
             avi_batch.extend_weight(&weight.to_le_bytes());
             avi_batch.extend_null_bmp(&0u64.to_le_bytes());
             // No payload columns (AVI schema is U128 PK only)

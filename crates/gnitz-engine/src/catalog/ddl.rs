@@ -381,7 +381,7 @@ impl CatalogEngine {
             .map_err(|e| format!("cursor error: {}", e))?;
         cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
 
-        if !cursor.cursor.valid || cursor.cursor.current_key_lo != idx_id as u64 {
+        if !cursor.cursor.valid || cursor.cursor.current_key_lo() != idx_id as u64 {
             return Err(format!("Index {} not found in catalog", index_name));
         }
 

@@ -208,7 +208,7 @@ impl CatalogEngine {
 
         cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
         if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key_lo != pk_lo || cursor.cursor.current_key_hi != pk_hi {
+        if cursor.cursor.current_key_lo() != pk_lo || cursor.cursor.current_key_hi() != pk_hi {
             return Ok(None);
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
@@ -235,7 +235,7 @@ impl CatalogEngine {
         let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
         cursor.cursor.seek(crate::util::make_pk(key_lo, key_hi));
         if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key_lo != key_lo || cursor.cursor.current_key_hi != key_hi {
+        if cursor.cursor.current_key_lo() != key_lo || cursor.cursor.current_key_hi() != key_hi {
             return Ok(None);
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
@@ -555,7 +555,7 @@ impl CatalogEngine {
 
         let mut defs = Vec::new();
         while cursor.cursor.valid {
-            let pk = cursor.cursor.current_key_lo;
+            let pk = cursor.cursor.current_key_lo();
             if pk >= end_pk { break; }
             if cursor.cursor.current_weight > 0 {
                 let type_code = cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8;

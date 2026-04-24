@@ -151,7 +151,9 @@ pub fn build_shard_image(
         {
             let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
             let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
-            xor8::build(lo, hi)
+            #[allow(deprecated)]
+            let f = xor8::build(lo, hi);
+            f
         } else {
             None
         }
@@ -335,7 +337,9 @@ pub fn write_shard_streaming(
         {
             let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
             let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
-            xor8::build(lo, hi)
+            #[allow(deprecated)]
+            let f = xor8::build(lo, hi);
+            f
         } else {
             None
         }
