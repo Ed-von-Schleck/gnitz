@@ -19,18 +19,8 @@ pub(super) fn write_string_from_batch(
     payload_col: usize,
 ) {
     let src = batch.get_col_ptr(row, payload_col, 16);
-    let blob_ptr = if batch.blob.is_empty() { std::ptr::null() } else { batch.blob.as_ptr() };
-    let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
-    if is_long {
-        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-        assert!(!blob_ptr.is_null(), "write_string_from_batch: long string but src blob is empty");
-        let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
-        let src_data = unsafe { std::slice::from_raw_parts(blob_ptr.add(old_offset), length) };
-        let new_offset = output.blob.len();
-        output.blob.extend_from_slice(src_data);
-        dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-    }
-    output.extend_col(out_pi, &dest);
+    let cell = crate::schema::relocate_german_string_vec(src, &batch.blob, &mut output.blob, None);
+    output.extend_col(out_pi, &cell);
 }
 
 /// Copy a German String from raw 16-byte struct + blob base ptr into the output.
@@ -56,53 +46,6 @@ pub(super) fn signum(x: i64) -> i64 {
     if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
 }
 
-/// Append a row from a ReadCursor to an Batch.
-pub(super) fn append_cursor_row_to_batch(
-    output: &mut Batch,
-    cursor: &ReadCursor,
-    schema: &SchemaDescriptor,
-) {
-    output.extend_pk_lo(&cursor.current_key_lo.to_le_bytes());
-    output.extend_pk_hi(&cursor.current_key_hi.to_le_bytes());
-    output.extend_weight(&cursor.current_weight.to_le_bytes());
-    output.extend_null_bmp(&cursor.current_null_word.to_le_bytes());
-
-    let blob_base = cursor.blob_ptr();
-    for (pi, ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
-        let is_null = (cursor.current_null_word >> pi) & 1 != 0;
-        if is_null {
-            output.fill_col_zero(pi, cs);
-        } else if col.type_code == TYPE_STRING {
-            let ptr = cursor.col_ptr(ci, 16);
-            if ptr.is_null() {
-                output.fill_col_zero(pi, 16);
-            } else {
-                let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
-                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
-                if is_long {
-                    let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-                    assert!(!blob_base.is_null(), "append_cursor_row_to_batch: long string but blob_base is null");
-                    let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
-                    let src_data = unsafe { std::slice::from_raw_parts(blob_base.add(old_offset), length) };
-                    let new_offset = output.blob.len();
-                    output.blob.extend_from_slice(src_data);
-                    dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-                }
-                output.extend_col(pi, &dest);
-            }
-        } else {
-            let ptr = cursor.col_ptr(ci, cs);
-            if ptr.is_null() {
-                output.fill_col_zero(pi, cs);
-            } else {
-                let src = unsafe { std::slice::from_raw_parts(ptr, cs) };
-                output.extend_col(pi, src);
-            }
-        }
-    }
-    output.count += 1;
-}
 
 /// Compare a cursor's current payload to a batch row's payload, returning their ordering.
 ///

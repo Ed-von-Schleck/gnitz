@@ -386,3 +386,28 @@ fn test_get_column_names_cached() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_circuit_table_surface_restricted() {
+    let dir = temp_dir("circuit_surface");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
+    let schema = circuit_nodes_schema();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(42, 0, 1);
+    bb.put_u64(11); // opcode
+    bb.end_row();
+    engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
+
+    // scan_family must return empty (CIRCUIT_* tables not on the client surface).
+    let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
+    assert_eq!(scan.count, 0, "scan_family must not expose CIRCUIT_NODES data");
+
+    // seek_family must also return None (already correct, assert for consistency).
+    let seek = engine.seek_family(CIRCUIT_NODES_TAB_ID, 42, 0).unwrap();
+    assert!(seek.is_none(), "seek_family must not expose CIRCUIT_NODES data");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

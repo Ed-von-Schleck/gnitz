@@ -32,6 +32,6 @@ pub use merge::{MemBatch, scatter_copy};
 pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use read_cursor::{ReadCursor, create_cursor_from_snapshots};
+pub(crate) use read_cursor::ReadCursor;
 pub(crate) use columnar::compare_rows;
 

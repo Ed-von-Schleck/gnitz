@@ -80,28 +80,6 @@ impl StoreHandle {
     // same storage may be live across the call.
     // ------------------------------------------------------------------
 
-    /// Get `&mut Table` for Single/Borrowed variants, or the sole
-    /// partition of a 1-partition Partitioned. None for multi-partition.
-    #[allow(clippy::mut_from_ref)]
-    pub fn as_single_mut(&self) -> Option<&mut Table> {
-        unsafe {
-            match self {
-                StoreHandle::Single(t) => {
-                    Some(&mut *(std::ptr::addr_of!(**t) as *mut Table))
-                }
-                StoreHandle::Borrowed(ptr) => Some(&mut **ptr),
-                StoreHandle::Partitioned(pt) => {
-                    let ptbl = &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable);
-                    if ptbl.num_partitions() == 1 {
-                        Some(ptbl.table_mut(0))
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
-    }
-
     /// Get `&mut PartitionedTable` if this handle is Partitioned.
     #[allow(clippy::mut_from_ref)]
     pub fn as_partitioned_mut(&self) -> Option<&mut PartitionedTable> {

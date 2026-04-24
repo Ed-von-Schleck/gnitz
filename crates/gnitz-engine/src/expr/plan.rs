@@ -7,12 +7,9 @@
 
 use std::cell::RefCell;
 
-use crate::schema::{
-    type_code, SchemaDescriptor, SHORT_STRING_THRESHOLD,
-};
+use crate::schema::{type_code, SchemaDescriptor};
 use super::program::{self as expr, ExprProgram};
 use crate::storage::{Batch, MemBatch};
-use crate::util::read_u32_le;
 use super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
 
 // ---------------------------------------------------------------------------
@@ -107,20 +104,12 @@ fn copy_column(
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
         let stride = in_schema.columns[cm.src_ci].size as usize;
         let src_col = in_batch.col_data(in_pi);
-        output.col_data_mut(cm.dst_payload).copy_from_slice(&src_col[..n * stride]);
         for row in 0..n {
             let off = row * stride;
-            let src_struct = &src_col[off..off + stride];
-            let length = read_u32_le(src_struct, 0) as usize;
-            if length > SHORT_STRING_THRESHOLD {
-                let old_offset =
-                    u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-                let src_data = &in_batch.blob[old_offset..old_offset + length];
-                let new_offset = output.blob.len();
-                output.blob.extend_from_slice(src_data);
-                output.col_data_mut(cm.dst_payload)[off + 8..off + 16]
-                    .copy_from_slice(&(new_offset as u64).to_le_bytes());
-            }
+            let cell = crate::schema::relocate_german_string_vec(
+                &src_col[off..off + stride], &in_batch.blob, &mut output.blob, None,
+            );
+            output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
         }
     } else {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };

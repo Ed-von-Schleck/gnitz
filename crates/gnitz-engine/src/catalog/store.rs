@@ -75,6 +75,8 @@ impl CatalogEngine {
         if drop_ids.is_empty() {
             return Ok(());
         }
+        drop_ids.sort_unstable();
+        drop_ids.dedup();
 
         if table_id == TABLE_TAB_ID {
             for &tid in &drop_ids {
@@ -101,7 +103,8 @@ impl CatalogEngine {
 
     /// Drain the pending-broadcast queue. Master calls this once per
     /// top-level DDL and forwards each entry to `broadcast_ddl`. Workers
-    /// never call this — the queue simply grows unread on them.
+    /// receive system-table changes via FLAG_DDL_SYNC → `ddl_sync`, which
+    /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub fn drain_pending_broadcasts(&mut self) -> Vec<(i64, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
     }
@@ -162,6 +165,14 @@ impl CatalogEngine {
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Unknown table_id {}", table_id))?
         };
+        // CIRCUIT_* tables are internal DBSP bookkeeping, not part of the
+        // client catalog surface.  Consistent with seek_family returning None.
+        if matches!(table_id,
+            CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_SOURCES_TAB_ID |
+            CIRCUIT_PARAMS_TAB_ID | CIRCUIT_GROUP_COLS_TAB_ID)
+        {
+            return Ok(Arc::new(Batch::empty_with_schema(&schema)));
+        }
         Ok(self.scan_store(table_id, &schema))
     }
 
@@ -203,7 +214,7 @@ impl CatalogEngine {
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
 
         let mut batch = Batch::with_schema(schema, 1);
-        self.copy_cursor_row_to_batch(&cursor, &schema, &mut batch);
+        self.copy_cursor_row_to_batch(&cursor, &mut batch);
         Ok(Some(batch))
     }
 
@@ -698,45 +709,9 @@ impl CatalogEngine {
             Some(e) => e,
             None => return Arc::new(Batch::empty_with_schema(schema)),
         };
-
-        // Single-Table path: try fast paths, then build cursor from already-computed data
-        let mut cursor = if let Some(table) = entry.handle.as_single_mut() {
-            let _ = table.compact_if_needed();
-            let snapshot = table.get_snapshot();
-            let shards = table.all_shard_arcs();
-
-            if shards.is_empty() {
-                // Snapshot is consolidated → all weights > 0 → every row passes filter.
-                // Empty-everywhere case returns an empty batch without building a cursor.
-                return if snapshot.count > 0 {
-                    snapshot
-                } else {
-                    Arc::new(Batch::empty_with_schema(schema))
-                };
-            }
-
-            // All weights non-zero and shard is sorted+consolidated
-            if snapshot.count == 0 && shards.len() == 1 && !shards[0].has_ghosts {
-                return Arc::new(shards[0].to_owned_batch(schema));
-            }
-
-            crate::storage::create_cursor_from_snapshots(&[snapshot], &shards, *schema)
-        } else {
-            // Multi-partition: delegate to PartitionedTable
-            match entry.handle.create_cursor() {
-                Ok(c) => c,
-                Err(_) => return Arc::new(Batch::empty_with_schema(schema)),
-            }
-        };
-
-        let estimated = cursor.cursor.estimated_length().max(8);
-        let mut batch = Batch::with_schema(*schema, estimated);
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
-                self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
-            }
-            cursor.cursor.advance();
+        match entry.handle.create_cursor() {
+            Ok(c) => c.cursor.materialize(),
+            Err(_) => Arc::new(Batch::empty_with_schema(schema)),
         }
-        Arc::new(batch)
     }
 }

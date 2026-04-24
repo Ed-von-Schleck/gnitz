@@ -351,7 +351,7 @@ impl CatalogEngine {
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 // Copy row into batch
-                self.copy_cursor_row_to_batch(&cursor, &schema, &mut batch);
+                self.copy_cursor_row_to_batch(&cursor, &mut batch);
                 count += 1;
 
                 if count >= 512 {
@@ -373,10 +373,9 @@ impl CatalogEngine {
     pub(crate) fn copy_cursor_row_to_batch(
         &self,
         cursor: &CursorHandle,
-        schema: &SchemaDescriptor,
         batch: &mut Batch,
     ) {
-        copy_cursor_row_with_weight(cursor, schema, batch, cursor.cursor.current_weight);
+        copy_cursor_row_with_weight(cursor, batch, cursor.cursor.current_weight);
     }
 
     // -- Close engine ------------------------------------------------------

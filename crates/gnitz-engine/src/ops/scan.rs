@@ -3,7 +3,6 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
 
-use super::util::append_cursor_row_to_batch;
 
 // ---------------------------------------------------------------------------
 // Scan trace (source operator)
@@ -40,7 +39,7 @@ pub fn op_scan_trace(
         }
         // Skip zero-weight rows
         if cursor.current_weight != 0 {
-            append_cursor_row_to_batch(&mut output, cursor, schema);
+            cursor.copy_current_row_into(&mut output, cursor.current_weight);
             scanned += 1;
         }
         cursor.advance();

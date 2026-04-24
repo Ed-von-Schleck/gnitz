@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::batch::Batch;
 use super::columnar::{self, ColumnarSource};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, type_code};
 use super::heap::MergeHeap;
 use super::merge::MemBatch;
 use super::shard_reader::MappedShard;
@@ -447,6 +447,61 @@ impl ReadCursor {
             return 0;
         }
         self.entries[self.current_entry_idx].source.blob_slice().len()
+    }
+
+    /// Copy the current row into `batch` with an explicit weight.
+    pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
+        batch.ensure_row_capacity();
+        batch.extend_pk_lo(&self.current_key_lo.to_le_bytes());
+        batch.extend_pk_hi(&self.current_key_hi.to_le_bytes());
+        batch.extend_weight(&weight.to_le_bytes());
+        batch.extend_null_bmp(&self.current_null_word.to_le_bytes());
+        let blob_ptr = self.blob_ptr();
+        let src_blob: &[u8] = if blob_ptr.is_null() { &[] } else {
+            unsafe { std::slice::from_raw_parts(blob_ptr, self.blob_len()) }
+        };
+        for (payload_idx, ci, col) in self.schema.payload_columns() {
+            let col_size = col.size as usize;
+            let ptr = self.col_ptr(ci, col_size);
+            if !ptr.is_null() {
+                let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
+                if col.type_code == type_code::STRING && col_size == 16 {
+                    let cell = crate::schema::relocate_german_string_vec(data, src_blob, &mut batch.blob, None);
+                    batch.extend_col(payload_idx, &cell);
+                } else {
+                    batch.extend_col(payload_idx, data);
+                }
+            } else {
+                batch.fill_col_zero(payload_idx, col_size);
+            }
+        }
+        batch.count += 1;
+    }
+
+    /// Materialize all positive-weight rows into an owned `Arc<Batch>`.
+    pub(crate) fn materialize(mut self) -> Arc<Batch> {
+        if self.entries.len() == 1 && self.entries[0].position == 0 {
+            match &self.entries[0].source {
+                CursorSource::Batch(arc) if arc.consolidated => return Arc::clone(arc),
+                CursorSource::Shard(arc) if !arc.has_ghosts => {
+                    return Arc::new(arc.to_owned_batch(&self.schema));
+                }
+                _ => {}
+            }
+        }
+        if !self.valid {
+            return Arc::new(Batch::empty_with_schema(&self.schema));
+        }
+        let estimated = self.estimated_length().max(8);
+        let mut batch = Batch::with_schema(self.schema, estimated);
+        while self.valid {
+            if self.current_weight > 0 {
+                let w = self.current_weight;
+                self.copy_current_row_into(&mut batch, w);
+            }
+            self.advance();
+        }
+        Arc::new(batch)
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing

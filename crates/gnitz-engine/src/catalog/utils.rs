@@ -285,52 +285,13 @@ pub(crate) fn fsync_dir(path: &str) {
 
 /// Copy a single cursor row into `batch` with an explicit weight.
 /// Handles out-of-line German strings by copying blob data and rewriting offsets.
+/// The schema is taken from the cursor (always matches the table schema).
 pub(crate) fn copy_cursor_row_with_weight(
     cursor: &CursorHandle,
-    schema: &SchemaDescriptor,
     batch: &mut Batch,
     weight: i64,
 ) {
-        let pk_lo = cursor.cursor.current_key_lo;
-        let pk_hi = cursor.cursor.current_key_hi;
-        let null_word = cursor.cursor.current_null_word;
-
-        batch.ensure_row_capacity();
-        batch.extend_pk_lo(&pk_lo.to_le_bytes());
-        batch.extend_pk_hi(&pk_hi.to_le_bytes());
-        batch.extend_weight(&weight.to_le_bytes());
-        batch.extend_null_bmp(&null_word.to_le_bytes());
-
-        let src_blob_ptr = cursor.cursor.blob_ptr();
-        for (payload_idx, ci, col) in schema.payload_columns() {
-            let col_size = col.size as usize;
-            let ptr = cursor.cursor.col_ptr(ci, col_size);
-            if !ptr.is_null() {
-                let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
-                // For out-of-line strings, rewrite blob offset to target batch.blob
-                if col.type_code == type_code::STRING && col_size == 16 {
-                    let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                    if len > crate::schema::SHORT_STRING_THRESHOLD && !src_blob_ptr.is_null() {
-                        let src_offset = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-                        let new_offset = batch.blob.len() as u64;
-                        let src_bytes = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(src_offset), len) };
-                        batch.blob.extend_from_slice(src_bytes);
-                        let mut cell = [0u8; 16];
-                        cell[..8].copy_from_slice(&data[..8]); // len + prefix
-                        cell[8..16].copy_from_slice(&new_offset.to_le_bytes());
-                        batch.extend_col(payload_idx, &cell);
-                    } else {
-                        batch.extend_col(payload_idx, data);
-                    }
-                } else {
-                    batch.extend_col(payload_idx, data);
-                }
-            } else {
-                batch.fill_col_zero(payload_idx, col_size);
-            }
-        }
-
-        batch.count += 1;
+    cursor.cursor.copy_current_row_into(batch, weight);
 }
 
 /// Seek a system table by PK, copy the matching row with weight=-1.
@@ -347,7 +308,7 @@ pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
         && cursor.cursor.current_key_hi == pk_hi
         && cursor.cursor.current_weight > 0
     {
-        copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+        copy_cursor_row_with_weight(&cursor, &mut batch, -1);
     }
     batch
 }
@@ -377,7 +338,7 @@ pub(crate) fn retract_rows_by_pk_lo_range(
     while cursor.cursor.valid {
         if cursor.cursor.current_key_lo >= pk_lo_end { break; }
         if cursor.cursor.current_weight > 0 {
-            copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+            copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }
         cursor.cursor.advance();
     }
@@ -417,7 +378,7 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     // Row-at-a-time fallback for multi-source cursors or schemas with strings.
     while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
         if cursor.cursor.current_weight > 0 {
-            copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+            copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }
         cursor.cursor.advance();
     }

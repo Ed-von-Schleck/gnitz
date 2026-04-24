@@ -493,7 +493,7 @@ impl WorkerProcess {
     }
 
     fn handle_push(
-        &mut self, target_id: i64, batch: Batch, request_id: u64,
+        &mut self, target_id: i64, batch: Batch, _request_id: u64,
     ) -> Result<(), String> {
         // Filter to only rows belonging to this worker's partitions.
         let batch = self.filter_my_partition(batch);
@@ -502,9 +502,13 @@ impl WorkerProcess {
         }
         let row_count = batch.count;
         if target_id < FIRST_USER_TABLE_ID {
-            self.cat().ingest_to_family(target_id, &batch)?;
-            self.flush_family_best_effort(target_id);
-            self.evaluate_dag(target_id, batch, request_id);
+            // Master never sends FLAG_PUSH for system tables; system-table
+            // changes arrive via FLAG_DDL_SYNC → ddl_sync. Reaching here
+            // means a protocol invariant was violated.
+            return Err(format!(
+                "W{}: FLAG_PUSH for system table_id={}; expected DDL_SYNC",
+                self.worker_id, target_id
+            ));
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
             self.flush_family_best_effort(target_id);

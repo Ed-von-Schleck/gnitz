@@ -5,7 +5,7 @@ use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
 
 use super::util::{
-    append_cursor_row_to_batch, write_string_from_batch, payload_idx,
+    write_string_from_batch, payload_idx,
     extract_group_key,
 };
 
@@ -695,7 +695,7 @@ pub fn op_reduce(
                             && ti_cursor.current_key_lo == group_key_lo
                             && ti_cursor.current_key_hi == group_key_hi
                         {
-                            append_cursor_row_to_batch(replay, ti_cursor, input_schema);
+                            ti_cursor.copy_current_row_into(replay, ti_cursor.current_weight);
                             ti_cursor.advance();
                         }
                     } else if let Some(ref mut gi_c) = gi {
@@ -727,7 +727,7 @@ pub fn op_reduce(
                                         && ti.current_key_lo == spk_lo
                                         && ti.current_key_hi == spk_hi
                                     {
-                                        append_cursor_row_to_batch(replay, ti, input_schema);
+                                        ti.copy_current_row_into(replay, ti.current_weight);
                                         ti.advance();
                                     }
                                 }
@@ -744,7 +744,7 @@ pub fn op_reduce(
                                 ti_cursor, &mb, ti_mb_exemplar_row,
                                 input_schema, group_by_cols,
                             ) {
-                                append_cursor_row_to_batch(replay, ti_cursor, input_schema);
+                                ti_cursor.copy_current_row_into(replay, ti_cursor.current_weight);
                             }
                             ti_cursor.advance();
                         }
