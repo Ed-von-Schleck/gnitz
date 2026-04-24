@@ -696,7 +696,7 @@ mod tests {
         values: &[i64],
     ) -> String {
         let n = pks.len();
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| (p as u128).to_le_bytes()).collect();
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
         let weights = vec![1i64; n];
         let nulls = vec![0u64; n];
         let blob: Vec<u8> = Vec::new();

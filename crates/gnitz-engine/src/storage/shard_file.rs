@@ -95,7 +95,7 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
 /// Build a complete shard file image from pre-built region buffers.
 ///
 /// `regions` is an array of (pointer, size) pairs in the canonical order:
-///   pk (16 bytes/row), weight, null_bitmap, [non-PK columns...], blob_arena.
+///   pk (pk_stride bytes/row), weight, null_bitmap, [non-PK columns...], blob_arena.
 ///
 /// The XOR8 filter is built internally from region[0] (pk) when `row_count > 0`.
 ///
@@ -108,32 +108,6 @@ pub fn build_shard_image(
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
-
-    // Phase 1 shim: Batch PK region may be 8B/row; V5 shard requires 16B/row.
-    let padded_pk_buf: Vec<u8>;
-    let padded_regions: Option<Vec<(*const u8, usize)>> = if n > 0 && num_regions >= 1 {
-        let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && pk_sz == n * 8 {
-            padded_pk_buf = unsafe { std::slice::from_raw_parts(pk_ptr, n * 8) }
-                .chunks_exact(8)
-                .flat_map(|c| { let mut b = [0u8; 16]; b[..8].copy_from_slice(c); b })
-                .collect();
-            let mut r = regions.to_vec();
-            r[0] = (padded_pk_buf.as_ptr(), n * 16);
-            Some(r)
-        } else {
-            padded_pk_buf = Vec::new();
-            None
-        }
-    } else {
-        padded_pk_buf = Vec::new();
-        None
-    };
-    let regions: &[(*const u8, usize)] = match &padded_regions {
-        Some(r) => r.as_slice(),
-        None => regions,
-    };
-    let _ = &padded_pk_buf; // keep alive
 
     // --- Phase 1: detect encodings and compute actual sizes ---
 
@@ -164,15 +138,18 @@ pub fn build_shard_image(
         }
     }
 
-    // --- XOR8 filter built from unified pk region (16 bytes/row) ---
+    // --- XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
 
     let xor8_filter = if row_count > 0 && num_regions >= 1 {
         let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && pk_sz >= n * 16 {
-            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, n * 16) };
-            let pks: Vec<u128> = pk_bytes.chunks_exact(16)
-                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+        if !pk_ptr.is_null() && n > 0 && pk_sz > 0 {
+            let stride = pk_sz / n;
+            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
+            let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
+                let mut buf = [0u8; 16];
+                buf[..stride].copy_from_slice(c);
+                u128::from_le_bytes(buf)
+            }).collect();
             xor8::build(&pks)
         } else {
             None
@@ -319,32 +296,6 @@ pub fn write_shard_streaming(
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
 
-    // Phase 1 shim: Batch PK region may be 8B/row; V5 shard requires 16B/row.
-    let padded_pk_buf: Vec<u8>;
-    let padded_regions: Option<Vec<(*const u8, usize)>> = if n > 0 && num_regions >= 1 {
-        let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && pk_sz == n * 8 {
-            padded_pk_buf = unsafe { std::slice::from_raw_parts(pk_ptr, n * 8) }
-                .chunks_exact(8)
-                .flat_map(|c| { let mut b = [0u8; 16]; b[..8].copy_from_slice(c); b })
-                .collect();
-            let mut r = regions.to_vec();
-            r[0] = (padded_pk_buf.as_ptr(), n * 16);
-            Some(r)
-        } else {
-            padded_pk_buf = Vec::new();
-            None
-        }
-    } else {
-        padded_pk_buf = Vec::new();
-        None
-    };
-    let regions: &[(*const u8, usize)] = match &padded_regions {
-        Some(r) => r.as_slice(),
-        None => regions,
-    };
-    let _ = &padded_pk_buf; // keep alive
-
     // --- Phase 1: detect encodings and compute actual sizes ---
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
     let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
@@ -372,14 +323,17 @@ pub fn write_shard_streaming(
         }
     }
 
-    // --- Phase 2: XOR8 filter built from unified pk region (16 bytes/row) ---
+    // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
     let xor8_filter = if row_count > 0 && num_regions >= 1 {
         let (pk_ptr, pk_sz) = regions[0];
-        if !pk_ptr.is_null() && pk_sz >= n * 16 {
-            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, n * 16) };
-            let pks: Vec<u128> = pk_bytes.chunks_exact(16)
-                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+        if !pk_ptr.is_null() && n > 0 && pk_sz > 0 {
+            let stride = pk_sz / n;
+            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
+            let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
+                let mut buf = [0u8; 16];
+                buf[..stride].copy_from_slice(c);
+                u128::from_le_bytes(buf)
+            }).collect();
             xor8::build(&pks)
         } else {
             None
@@ -628,7 +582,7 @@ mod tests {
     #[test]
     fn build_image_roundtrip() {
         let row_count = 3u32;
-        let pks: Vec<u128> = vec![10, 20, 30];
+        let pks: Vec<u64> = vec![10, 20, 30];
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
@@ -671,7 +625,7 @@ mod tests {
             std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
 
         let row_count = 2u32;
-        let pks: Vec<u128> = vec![1, 2];
+        let pks: Vec<u64> = vec![1, 2];
         let weights: Vec<i64> = vec![1, 1];
         let nulls: Vec<u64> = vec![0, 0];
         let vals: Vec<i64> = vec![42, 99];
@@ -732,7 +686,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let row_count = 3u32;
-        let pks: Vec<u128> = vec![10, 20, 30];
+        let pks: Vec<u64> = vec![10, 20, 30];
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
@@ -766,6 +720,81 @@ mod tests {
         assert!(shard.xor8_may_contain(30));
     }
 
+    #[test]
+    fn u64_pk_shard_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u64pk.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let n = 5u32;
+        let pks: Vec<u64> = vec![100, 200, 300, 400, 500];
+        let weights: Vec<i64> = vec![1; n as usize];
+        let nulls: Vec<u64> = vec![0; n as usize];
+        let vals: Vec<i64> = vec![10, 20, 30, 40, 50];
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        assert_eq!(pk_bytes.len(), n as usize * 8, "U64 PK region must be 8B/row");
+        let blob: Vec<u8> = vec![];
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let image = build_shard_image(99, n, &regions);
+        assert_eq!(
+            crate::util::read_u64_le(&image, OFF_VERSION),
+            SHARD_VERSION,
+            "must write V6"
+        );
+        write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+
+        let schema = make_schema_desc(2, 0);
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.pk_stride, 8, "pk_stride must be 8 for U64 schema");
+        assert_eq!(shard.count, n as usize);
+        for (i, &expected_pk) in pks.iter().enumerate() {
+            assert_eq!(shard.get_pk(i), expected_pk as u128, "get_pk row {i}");
+        }
+        assert!(shard.has_xor8());
+        for &pk in &pks {
+            assert!(shard.xor8_may_contain(pk as u128), "XOR8 must contain PK {pk}");
+        }
+    }
+
+    #[test]
+    fn u64_pk_constant_shard() {
+        // All rows share the same PK → Constant encoding for the PK region.
+        let n = 6u32;
+        let pk_val: u64 = 42;
+        let pks: Vec<u64> = vec![pk_val; n as usize];
+        let weights: Vec<i64> = vec![1; n as usize];
+        let nulls: Vec<u64> = vec![0; n as usize];
+        let vals: Vec<i64> = (1..=n as i64).collect();
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let blob: Vec<u8> = vec![];
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let image = build_shard_image(1, n, &regions);
+
+        // PK region should be Constant-encoded → directory entry size == 8 (one elem).
+        let dir_off = crate::util::read_u64_le(&image, OFF_DIR_OFFSET) as usize;
+        let pk_region_sz = crate::util::read_u64_le(&image, dir_off + 8) as usize;
+        assert_eq!(pk_region_sz, 8, "Constant PK region must store a single 8B value");
+
+        // Verify encoding byte is ENCODING_CONSTANT.
+        assert_eq!(image[dir_off + 24], ENCODING_CONSTANT, "PK region must use Constant encoding");
+    }
+
     /// Bug 3: streaming write with regions that trigger Constant encoding.
     #[test]
     fn test_write_shard_streaming_encodings() {
@@ -774,7 +803,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let row_count = 4u32;
-        let pks: Vec<u128> = vec![1, 2, 3, 4];
+        let pks: Vec<u64> = vec![1, 2, 3, 4];
         let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
         let nulls: Vec<u64> = vec![0, 0, 0, 0];   // all-zero → Constant encoding
         let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding

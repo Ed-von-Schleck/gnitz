@@ -1300,14 +1300,10 @@ impl Batch {
         for i in 0..nr_wire {
             sizes[i] = self.region_size(i) as u32;
         }
-        // Phase 1 shim: V3 wire uses 16B/row PK; pad size for narrow Batch.
-        if self.strides[REG_PK] == 8 {
-            sizes[0] = (self.count * 16) as u32;
-        }
         super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
-    /// Encode self into WAL V3 wire format at out[offset..]. Returns bytes written.
+    /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
         let nr_wire = self.num_regions_total();
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
@@ -1315,17 +1311,6 @@ impl Batch {
         for i in 0..nr_wire {
             ptrs[i] = self.region_ptr(i);
             sizes[i] = self.region_size(i) as u32;
-        }
-        // Phase 1 shim: narrow PK region → pad to 16B/row for V3 wire format.
-        let padded_pk: Vec<u8>;
-        if self.strides[REG_PK] == 8 {
-            padded_pk = self.pk_data().chunks_exact(8).flat_map(|c| {
-                let mut buf = [0u8; 16];
-                buf[..8].copy_from_slice(c);
-                buf
-            }).collect();
-            ptrs[0] = padded_pk.as_ptr();
-            sizes[0] = (self.count * 16) as u32;
         }
         let blob_size = self.blob.len() as u64;
         let new_offset = super::wal::encode(
@@ -1342,7 +1327,7 @@ impl Batch {
         schema: &SchemaDescriptor,
     ) -> Result<(Self, usize), &'static str> {
         let npc = schema.num_columns as usize - 1;
-        // V3: 3 fixed regions (pk 16B, weight 8B, null_bmp 8B) + npc payload + blob
+        // V4: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + npc payload + blob
         let expected_regions = 3 + npc + 1;
 
         let mut lsn = 0u64;
@@ -1377,18 +1362,6 @@ impl Batch {
             if sz > 0 && off + sz <= data.len() {
                 ptrs[i] = unsafe { data.as_ptr().add(off) };
             }
-        }
-
-        // Phase 1 shim: V3 WAL has 16B/row PK; Batch may need 8B/row for U64 schema.
-        let pk_stride_needed = pk_stride(schema) as usize;
-        let narrow_pk: Vec<u8>;
-        if pk_stride_needed == 8 && n > 0 && region_sizes[0] as usize == n * 16 {
-            let wire_pk = unsafe { std::slice::from_raw_parts(ptrs[0], n * 16) };
-            narrow_pk = wire_pk.chunks_exact(16)
-                .flat_map(|c| c[..8].iter().copied())
-                .collect();
-            ptrs[0] = narrow_pk.as_ptr();
-            region_sizes[0] = (n * 8) as u32;
         }
 
         let mut batch = unsafe {

@@ -34,15 +34,15 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// Serialize `&[u128]` into `buf` at 8-byte alignment as 16-byte LE values.
-fn append_16byte_region(buf: &mut Vec<u8>, vals: &[u128]) -> (u32, u32) {
+/// Serialize `&[u128]` into `buf` using only the low `stride` bytes of each value.
+fn append_pk_region(buf: &mut Vec<u8>, pks: &[u128], stride: usize) -> (u32, u32) {
     let aligned = align8(buf.len());
     buf.resize(aligned, 0);
-    for &v in vals {
-        buf.extend_from_slice(&v.to_le_bytes());
+    let off = aligned as u32;
+    for &v in pks {
+        buf.extend_from_slice(&v.to_le_bytes()[..stride]);
     }
-    let sz = vals.len() * 16;
-    (aligned as u32, sz as u32)
+    (off, (pks.len() * stride) as u32)
 }
 
 fn xxh3_64(data: &[u8]) -> u64 {
@@ -103,11 +103,12 @@ fn read_64bit_region<T: Copy + Default>(
 
 /// Encode a ZSetBatch into a WAL block `Vec<u8>`.
 ///
-/// Region order: pk (16B each), weight, null, [non-PK cols in schema order], blob.
+/// Region order: pk (pk_stride bytes each), weight, null, [non-PK cols in schema order], blob.
 /// num_regions = 3 + (ncols - 1) + 1.
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let count = batch.len();
     let ncols = schema.columns.len();
+    let pk_stride = schema.columns[schema.pk_index].type_code.wire_stride();
     let num_non_pk = if ncols > 0 { ncols - 1 } else { 0 };
     let num_regions = 3 + num_non_pk + 1;
 
@@ -182,7 +183,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_16byte_region(&mut buf, &batch.pks));
+    dir_entries.push(append_pk_region(&mut buf, &batch.pks, pk_stride));
     dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
     dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 
@@ -282,6 +283,7 @@ pub fn decode_wal_block(
             expected_num_regions, num_regions
         )));
     }
+    let pk_stride = schema.columns[schema.pk_index].type_code.wire_stride();
 
     // Parse directory
     let dir_start = WAL_BLOCK_HEADER_SIZE;
@@ -315,7 +317,7 @@ pub fn decode_wal_block(
     let (wt_off,   wt_sz)   = dir[region_idx]; region_idx += 1;
     let (null_off, null_sz) = dir[region_idx]; region_idx += 1;
 
-    let expected_pk_sz = count * 16;
+    let expected_pk_sz = count * pk_stride;
     if pk_sz != expected_pk_sz {
         return Err(ProtocolError::DecodeError(format!(
             "pk region size mismatch: expected {}, got {}", expected_pk_sz, pk_sz
@@ -323,11 +325,13 @@ pub fn decode_wal_block(
     }
     let mut pks: Vec<u128> = Vec::with_capacity(count);
     for i in 0..count {
-        let base = pk_off + i * 16;
-        if base + 16 > total_size {
+        let base = pk_off + i * pk_stride;
+        if base + pk_stride > total_size {
             return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
         }
-        pks.push(u128::from_le_bytes(data[base..base + 16].try_into().unwrap()));
+        let mut pk_buf = [0u8; 16];
+        pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
+        pks.push(u128::from_le_bytes(pk_buf));
     }
     let weights: Vec<i64> = read_64bit_region(data, wt_off,   wt_sz,   count, "weights")?;
     let nulls: Vec<u64>   = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
@@ -669,6 +673,81 @@ mod tests {
         // Note: checksum covers buf[48..] so changing header bytes does NOT invalidate checksum
         let res = decode_wal_block(&encoded, &schema);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
+    }
+
+    // ── pk_stride roundtrips ───────────────────────────────────────────────
+
+    #[test]
+    fn pk_stride_wal_roundtrip_u64() {
+        let schema = u64_schema();
+        let pks = vec![1u128, 2, 3];
+        let n = pks.len();
+        let batch = ZSetBatch {
+            pks: pks.clone(),
+            weights: vec![1; n],
+            nulls: vec![0; n],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Fixed(vec![0u8; n * 8]),
+            ],
+        };
+        let encoded = encode_wal_block(&schema, 0, &batch);
+
+        // PK region is region 0 in the directory.
+        let (pk_off, pk_sz) = get_region_offset_size(&encoded, 0);
+        assert_eq!(pk_sz, n * 8, "U64 PK region must be 8B/row");
+
+        // First PK value in the region is 1u64 LE.
+        let expected_first = 1u64.to_le_bytes();
+        assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
+
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema).unwrap();
+        assert_eq!(decoded.pks, pks);
+    }
+
+    #[test]
+    fn pk_stride_wal_roundtrip_u128() {
+        let schema = u128_schema();
+        let pks = vec![1u128, 2, 3];
+        let n = pks.len();
+        let batch = ZSetBatch {
+            pks: pks.clone(),
+            weights: vec![1; n],
+            nulls: vec![0; n],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::U128s(pks.clone()),
+            ],
+        };
+        let encoded = encode_wal_block(&schema, 0, &batch);
+
+        let (_, pk_sz) = get_region_offset_size(&encoded, 0);
+        assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
+
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema).unwrap();
+        assert_eq!(decoded.pks, pks);
+    }
+
+    #[test]
+    fn wal_retraction_u64() {
+        let schema = u64_schema();
+        let pks = vec![10u128, 20, 30];
+        let weights = vec![1i64, -1, 3];
+        let n = pks.len();
+        let batch = ZSetBatch {
+            pks: pks.clone(),
+            weights: weights.clone(),
+            nulls: vec![0; n],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Fixed(vec![0u8; n * 8]),
+            ],
+        };
+        let encoded = encode_wal_block(&schema, 5, &batch);
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        assert_eq!(tid, 5);
+        assert_eq!(decoded.pks, pks);
+        assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
     }
 
     #[test]

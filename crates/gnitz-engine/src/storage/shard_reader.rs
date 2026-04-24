@@ -1,7 +1,7 @@
 //! Memory-mapped columnar shard reader.
 //!
 //! Used by compaction (`compact.rs`) and query-time reads (`read_cursor.rs`).
-//! Supports shard format v5 (32-byte dir entries, unified 16-byte pk region).
+//! Supports shard format v6 (32-byte dir entries, schema-width pk region).
 
 use std::ffi::CStr;
 use std::ptr;
@@ -113,6 +113,8 @@ pub struct MappedShard {
     /// True if weight region is Raw (may contain zero-weight ghosts).
     /// False for Constant/TwoValue (non-zero weights guaranteed).
     pub(crate) has_ghosts: bool,
+    /// Physical byte width of each PK value on disk (8 for U64, 16 for U128/String).
+    pub(crate) pk_stride: u8,
 }
 
 impl MappedShard {
@@ -140,6 +142,7 @@ impl MappedShard {
 
         let num_cols = schema.num_columns as usize;
         let pk_index = schema.pk_index as usize;
+        let pk_stride = schema.columns[pk_index].size; // 8 for U64, 16 for U128/String
         let num_non_pk = num_cols - 1;
         let num_regions = 3 + num_non_pk + 1;
 
@@ -266,6 +269,7 @@ impl MappedShard {
             col_to_payload,
             xor8_filter,
             has_ghosts,
+            pk_stride,
         })
     }
 
@@ -276,10 +280,13 @@ impl MappedShard {
 
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
+        let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
             RegionView::Raw { offset, .. } => {
-                u128::from_le_bytes(data[offset + row * 16..offset + row * 16 + 16].try_into().unwrap())
+                let mut buf = [0u8; 16];
+                buf[..stride].copy_from_slice(&data[offset + row * stride..offset + row * stride + stride]);
+                u128::from_le_bytes(buf)
             }
             RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
             RegionView::TwoValue { .. } => unreachable!(),
@@ -335,11 +342,12 @@ impl MappedShard {
         let payload_idx = self.col_to_payload[col_idx];
         let base = self.mmap.ptr;
         if payload_idx == usize::MAX {
-            // PK column (16 bytes)
+            // PK column (pk_stride bytes)
             match &self.pk {
                 RegionView::Raw { offset, .. } => {
-                    let off = offset + row * 16;
-                    if off + 16 > self.mmap.len {
+                    let stride = self.pk_stride as usize;
+                    let off = offset + row * stride;
+                    if off + stride > self.mmap.len {
                         return ptr::null();
                     }
                     return unsafe { base.add(off) };
@@ -469,19 +477,9 @@ impl MappedShard {
             }
         };
 
-        let pk_stride = strides[0] as usize;
+        let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
-        // Phase 1 shim: V5 shard has 16B/row PK; output Batch may want 8B/row for U64.
-        if pk_stride == 16 {
-            expand_into(&self.pk, 16, &mut data[offsets[0] as usize..][..row_count * 16]);
-        } else {
-            let mut tmp = vec![0u8; row_count * 16];
-            expand_into(&self.pk, 16, &mut tmp);
-            let dst = &mut data[offsets[0] as usize..][..row_count * 8];
-            for r in 0..row_count {
-                dst[r * 8..r * 8 + 8].copy_from_slice(&tmp[r * 16..r * 16 + 8]);
-            }
-        }
+        expand_into(&self.pk, pk_stride, &mut data[offsets[0] as usize..][..row_count * pk_stride]);
         expand_into(&self.weight,   8,  &mut data[offsets[1] as usize..][..sz8]);
         expand_into(&self.null_bmp, 8,  &mut data[offsets[2] as usize..][..sz8]);
 
@@ -546,13 +544,13 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
 
-    /// Build a v5 shard via build_shard_image (uses encoding detection).
+    /// Build a v6 shard via build_shard_image (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
         let path = dir.join("test.db");
         let count = rows.len() as u32;
 
         let pk_bytes: Vec<u8> = rows.iter()
-            .flat_map(|&(pk, _)| (pk as u128).to_le_bytes())
+            .flat_map(|&(pk, _)| pk.to_le_bytes())
             .collect();
         let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
         let null_bm: Vec<u64> = rows.iter().map(|_| 0u64).collect();
@@ -572,7 +570,7 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
-    /// Build a v5 shard with custom weights.
+    /// Build a v6 shard with custom weights.
     fn build_test_shard_weights(
         dir: &std::path::Path,
         name: &str,
@@ -582,7 +580,7 @@ mod tests {
     ) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| (p as u128).to_le_bytes()).collect();
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
 
@@ -1030,5 +1028,45 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         let batch = shard.slice_to_owned_batch(0, 0, &schema);
         assert_eq!(batch.count, 0);
+    }
+
+    #[test]
+    fn u64_pk_open_and_read() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300)];
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.pk_stride, 8, "pk_stride must be 8 for U64 schema");
+        assert_eq!(shard.count, 3);
+        assert_eq!(shard.get_pk(0), 10u128);
+        assert_eq!(shard.get_pk(1), 20u128);
+        assert_eq!(shard.get_pk(2), 30u128);
+        assert_eq!(shard.find_lower_bound(15), 1);
+        assert_eq!(shard.find_lower_bound(10), 0);
+        assert_eq!(shard.find_lower_bound(31), 3);
+    }
+
+    #[test]
+    fn u64_pk_slice_to_owned_batch() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1u64..=8).map(|i| (i * 10, i as i64 * 100)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        let batch = shard.slice_to_owned_batch(0, 8, &schema);
+
+        assert_eq!(batch.count, 8);
+        // pk_data() length = count * pk_stride = 8 * 8
+        assert_eq!(batch.pk_data().len(), 8 * 8, "pk region must be 8B/row for U64 schema");
+        for i in 0..8usize {
+            assert_eq!(batch.get_pk(i), (i as u128 + 1) * 10, "PK row {i}");
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Shared shard file format constants.
 
 pub const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-pub const SHARD_VERSION: u64 = 5;
+pub const SHARD_VERSION: u64 = 6;
 pub const HEADER_SIZE: usize = 64;
 pub const DIR_ENTRY_SIZE: usize = 32;
 pub const ALIGNMENT: usize = 64;

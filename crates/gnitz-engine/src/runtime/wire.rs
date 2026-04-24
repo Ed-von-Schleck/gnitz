@@ -84,13 +84,14 @@ fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
     let pk_idx = schema.pk_index as usize;
+    let pk_stride = schema.columns[pk_idx].size as usize;
     let num_payload = schema.num_columns as usize - 1;
-    // V3 wire format: 3 fixed regions (pk 16B, weight 8B, null_bmp 8B) + payload + blob
+    // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
     let mut sizes = [0u32; 128];
-    sizes[0] = (16 * row_count) as u32; // pk: always 16 bytes per row
-    sizes[1] = (8  * row_count) as u32; // weight
-    sizes[2] = (8  * row_count) as u32; // null_bmp
+    sizes[0] = (pk_stride * row_count) as u32; // pk: pk_stride bytes per row
+    sizes[1] = (8 * row_count) as u32; // weight
+    sizes[2] = (8 * row_count) as u32; // null_bmp
     let mut pi = 0;
     for ci in 0..schema.num_columns as usize {
         if ci == pk_idx { continue; }
