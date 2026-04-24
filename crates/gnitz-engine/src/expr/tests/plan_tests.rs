@@ -103,7 +103,7 @@ fn test_map_copy_and_emit() {
 #[test]
 fn test_empty_batch() {
     let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
-    let batch = Batch::empty(1);
+    let batch = Batch::empty(1, 16);
 
     let func = ScalarFuncKind::Plan(Plan::from_projection(
         &[1], &[type_code::I64], schema.pk_index,

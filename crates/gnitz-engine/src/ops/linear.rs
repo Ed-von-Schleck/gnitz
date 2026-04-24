@@ -23,7 +23,7 @@ pub fn op_filter(
     let n = batch.count;
     if n == 0 {
         let npc = schema.num_columns as usize - 1;
-        return Batch::empty(npc);
+        return Batch::empty(npc, 16);
     }
 
     let mb = batch.as_mem_batch();
@@ -121,8 +121,7 @@ pub fn op_map(
     reindex_col: i32,
 ) -> Batch {
     if batch.count == 0 {
-        let out_npc = out_schema.num_columns as usize - 1;
-        return Batch::empty(out_npc);
+        return Batch::empty_with_schema(out_schema);
     }
 
     if reindex_col < 0 {
@@ -155,7 +154,7 @@ pub fn op_map(
 /// Negate: flip the sign of every weight.
 pub fn op_negate(batch: &Batch) -> Batch {
     if batch.count == 0 {
-        return Batch::empty(batch.num_payload_cols());
+        return Batch::empty(batch.num_payload_cols(), 16);
     }
 
     // clone_batch copies all column regions and the blob verbatim — no
@@ -333,7 +332,7 @@ pub fn op_null_extend(
     let n = batch.count;
 
     if n == 0 {
-        return Batch::empty(out_npc);
+        return Batch::empty(out_npc, 16);
     }
 
     // Build a merged schema for the output batch.
@@ -653,7 +652,7 @@ mod tests {
     fn test_op_map_empty_batch() {
         use crate::expr::Plan;
         let schema = make_schema_u64_i64();
-        let empty_batch = Batch::empty(1);
+        let empty_batch = Batch::empty(1, 16);
 
         let func = ScalarFuncKind::Plan(Plan::from_projection(
             &[1], &[type_code::I64], schema.pk_index,

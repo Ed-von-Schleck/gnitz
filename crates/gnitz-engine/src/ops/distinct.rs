@@ -24,7 +24,7 @@ pub fn op_distinct(
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
     if n == 0 {
-        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc)), consolidated);
+        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16)), consolidated);
     }
 
     // 2. Walk consolidated, collect emitting indices and weights
@@ -72,7 +72,7 @@ pub fn op_distinct(
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
-        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc)), consolidated);
+        return (ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16)), consolidated);
     }
 
     let mb = consolidated.as_mem_batch();
@@ -137,7 +137,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
-        let empty = Arc::new(Batch::empty(1));
+        let empty = Arc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty.clone()], schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
@@ -281,7 +281,7 @@ mod tests {
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(Batch::empty(1));
+        let empty = Arc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);

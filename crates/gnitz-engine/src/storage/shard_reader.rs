@@ -469,9 +469,19 @@ impl MappedShard {
             }
         };
 
-        let sz16 = row_count * 16;
+        let pk_stride = strides[0] as usize;
         let sz8 = row_count * 8;
-        expand_into(&self.pk,       16, &mut data[offsets[0] as usize..][..sz16]);
+        // Phase 1 shim: V5 shard has 16B/row PK; output Batch may want 8B/row for U64.
+        if pk_stride == 16 {
+            expand_into(&self.pk, 16, &mut data[offsets[0] as usize..][..row_count * 16]);
+        } else {
+            let mut tmp = vec![0u8; row_count * 16];
+            expand_into(&self.pk, 16, &mut tmp);
+            let dst = &mut data[offsets[0] as usize..][..row_count * 8];
+            for r in 0..row_count {
+                dst[r * 8..r * 8 + 8].copy_from_slice(&tmp[r * 16..r * 16 + 8]);
+            }
+        }
         expand_into(&self.weight,   8,  &mut data[offsets[1] as usize..][..sz8]);
         expand_into(&self.null_bmp, 8,  &mut data[offsets[2] as usize..][..sz8]);
 

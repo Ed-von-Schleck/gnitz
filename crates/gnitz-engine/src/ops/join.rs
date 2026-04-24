@@ -22,7 +22,7 @@ pub fn op_anti_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
     }
 
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
@@ -54,7 +54,7 @@ pub fn op_anti_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -85,7 +85,7 @@ pub fn op_semi_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
     }
 
     // Reset cursor to position 0 for the same reason as op_join_delta_trace:
@@ -128,7 +128,7 @@ pub fn op_semi_join_delta_trace(
     }
 
     if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -182,7 +182,7 @@ fn semi_join_dt_swapped(
     }
 
     if emit_indices.is_empty() {
-        return Batch::empty(npc);
+        return Batch::empty(npc, 16);
     }
 
     let mb = consolidated.as_mem_batch();
@@ -218,7 +218,7 @@ pub fn op_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(out_npc);
+        return Batch::empty(out_npc, 16);
     }
 
     // The same trace register may be reused by multiple join ops in one tick
@@ -247,7 +247,7 @@ fn join_dt_merge_walk(
     let out_npc = left_npc + right_npc;
     let n = delta.count;
     if n == 0 {
-        return Batch::empty(out_npc);
+        return Batch::empty(out_npc, 16);
     }
 
     let delta_mb = delta.as_mem_batch();
@@ -347,7 +347,7 @@ pub fn op_join_delta_trace_outer(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(out_npc);
+        return Batch::empty(out_npc, 16);
     }
 
     let delta_mb = consolidated.as_mem_batch();
@@ -582,7 +582,7 @@ fn filter_join_dd_with_payload(
     let n_b = cb.count;
 
     if n_a == 0 {
-        return Batch::empty(npc);
+        return Batch::empty(npc, 16);
     }
 
     let mb_a = ca.as_mem_batch();
@@ -653,7 +653,7 @@ fn filter_join_dd(
     let n_b = cb.count;
 
     if n_a == 0 {
-        return Batch::empty(npc);
+        return Batch::empty(npc, 16);
     }
 
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
@@ -724,7 +724,7 @@ pub fn op_join_delta_delta(
 
     if n_a == 0 || n_b == 0 {
         gnitz_debug!("op_join_dd: a={} b={} out=0", n_a, n_b);
-        return Batch::empty(out_npc);
+        return Batch::empty(out_npc, 16);
     }
 
     let mb_a = ca.as_mem_batch();

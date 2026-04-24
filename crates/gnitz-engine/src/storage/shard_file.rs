@@ -109,6 +109,32 @@ pub fn build_shard_image(
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
 
+    // Phase 1 shim: Batch PK region may be 8B/row; V5 shard requires 16B/row.
+    let padded_pk_buf: Vec<u8>;
+    let padded_regions: Option<Vec<(*const u8, usize)>> = if n > 0 && num_regions >= 1 {
+        let (pk_ptr, pk_sz) = regions[0];
+        if !pk_ptr.is_null() && pk_sz == n * 8 {
+            padded_pk_buf = unsafe { std::slice::from_raw_parts(pk_ptr, n * 8) }
+                .chunks_exact(8)
+                .flat_map(|c| { let mut b = [0u8; 16]; b[..8].copy_from_slice(c); b })
+                .collect();
+            let mut r = regions.to_vec();
+            r[0] = (padded_pk_buf.as_ptr(), n * 16);
+            Some(r)
+        } else {
+            padded_pk_buf = Vec::new();
+            None
+        }
+    } else {
+        padded_pk_buf = Vec::new();
+        None
+    };
+    let regions: &[(*const u8, usize)] = match &padded_regions {
+        Some(r) => r.as_slice(),
+        None => regions,
+    };
+    let _ = &padded_pk_buf; // keep alive
+
     // --- Phase 1: detect encodings and compute actual sizes ---
 
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
@@ -292,6 +318,32 @@ pub fn write_shard_streaming(
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
+
+    // Phase 1 shim: Batch PK region may be 8B/row; V5 shard requires 16B/row.
+    let padded_pk_buf: Vec<u8>;
+    let padded_regions: Option<Vec<(*const u8, usize)>> = if n > 0 && num_regions >= 1 {
+        let (pk_ptr, pk_sz) = regions[0];
+        if !pk_ptr.is_null() && pk_sz == n * 8 {
+            padded_pk_buf = unsafe { std::slice::from_raw_parts(pk_ptr, n * 8) }
+                .chunks_exact(8)
+                .flat_map(|c| { let mut b = [0u8; 16]; b[..8].copy_from_slice(c); b })
+                .collect();
+            let mut r = regions.to_vec();
+            r[0] = (padded_pk_buf.as_ptr(), n * 16);
+            Some(r)
+        } else {
+            padded_pk_buf = Vec::new();
+            None
+        }
+    } else {
+        padded_pk_buf = Vec::new();
+        None
+    };
+    let regions: &[(*const u8, usize)] = match &padded_regions {
+        Some(r) => r.as_slice(),
+        None => regions,
+    };
+    let _ = &padded_pk_buf; // keep alive
 
     // --- Phase 1: detect encodings and compute actual sizes ---
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);

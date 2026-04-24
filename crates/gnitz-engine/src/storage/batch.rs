@@ -97,10 +97,15 @@ fn fill_payload_strides(
     idx
 }
 
+/// Physical byte stride for the PK region: 8 for U64 PK, 16 for U128 PK.
+pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
+    schema.columns[schema.pk_index as usize].size
+}
+
 /// Build a strides array from a SchemaDescriptor.
 pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
-    strides[REG_PK] = 16;
+    strides[REG_PK] = pk_stride(schema);
     strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
     strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
     let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
@@ -142,10 +147,10 @@ impl Batch {
     /// `append_batch` — use `empty_with_schema` or `with_schema` for that.
     ///
     /// Intended for zero-row return values and swap-placeholder slots.
-    pub fn empty(num_payload_cols: usize) -> Self {
+    pub fn empty(num_payload_cols: usize, pk_stride: u8) -> Self {
         let nr = REG_PAYLOAD_START + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK] = 16;
+        strides[REG_PK] = pk_stride;
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
         strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         Batch {
@@ -195,7 +200,7 @@ impl Batch {
         right_schema: &SchemaDescriptor,
     ) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK] = 16;
+        strides[REG_PK] = pk_stride(left_schema);
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
         strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         let mid = fill_payload_strides(left_schema, &mut strides, REG_PAYLOAD_START);
@@ -272,7 +277,7 @@ impl Batch {
         num_payload_cols: usize,
     ) -> Self {
         if count == 0 {
-            return Self::empty(num_payload_cols);
+            return Self::empty(num_payload_cols, 16);
         }
 
         let nr = REG_PAYLOAD_START + num_payload_cols;
@@ -387,7 +392,7 @@ impl Batch {
     #[inline]
     pub fn pk_data(&self) -> &[u8] {
         let off = self.offsets[REG_PK] as usize;
-        &self.data[off..off + self.count * 16]
+        &self.data[off..off + self.count * self.strides[REG_PK] as usize]
     }
     #[inline]
     pub fn weight_data(&self) -> &[u8] {
@@ -415,7 +420,7 @@ impl Batch {
     #[inline]
     pub fn pk_data_mut(&mut self) -> &mut [u8] {
         let off = self.offsets[REG_PK] as usize;
-        let end = off + self.count * 16;
+        let end = off + self.count * self.strides[REG_PK] as usize;
         &mut self.data[off..end]
     }
     #[inline]
@@ -442,8 +447,15 @@ impl Batch {
 
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        let off = self.offsets[REG_PK] as usize + row * 16;
-        u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
+        let stride = self.strides[REG_PK] as usize;
+        let off = self.offsets[REG_PK] as usize + row * stride;
+        if stride == 16 {
+            u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&self.data[off..off + 8]);
+            u128::from_le_bytes(buf)
+        }
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -561,14 +573,18 @@ impl Batch {
     /// Append a 128-bit primary key at the current row position.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
-        self.extend_region(REG_PK, &pk.to_le_bytes());
+        let stride = self.strides[REG_PK] as usize;
+        debug_assert!(stride == 16 || pk >> 64 == 0, "extend_pk: U64 batch requires high bits == 0");
+        self.extend_region(REG_PK, &pk.to_le_bytes()[..stride]);
     }
 
     /// Overwrite the PK at `row` with a new 128-bit value.
     #[inline]
     pub fn set_pk_at(&mut self, row: usize, pk: u128) {
-        let off = self.offsets[REG_PK] as usize + row * 16;
-        self.data[off..off + 16].copy_from_slice(&pk.to_le_bytes());
+        let stride = self.strides[REG_PK] as usize;
+        debug_assert!(stride == 16 || pk >> 64 == 0, "set_pk_at: U64 batch requires high bits == 0");
+        let off = self.offsets[REG_PK] as usize + row * stride;
+        self.data[off..off + stride].copy_from_slice(&pk.to_le_bytes()[..stride]);
     }
 
     /// Iterate PKs as `u128`.
@@ -666,6 +682,7 @@ impl Batch {
         }
         MemBatch {
             pk: self.pk_data(),
+            pk_stride: self.strides[REG_PK],
             weight: self.weight_data(),
             null_bmp: self.null_bmp_data(),
             col_data: col_slices,
@@ -700,7 +717,7 @@ impl Batch {
         schema: &SchemaDescriptor,
     ) -> Self {
         if indices.is_empty() {
-            return Self::empty(schema.num_columns as usize - 1);
+            return Self::empty_with_schema(schema);
         }
         let blob_cap = batch.blob.len().max(1);
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
@@ -1278,18 +1295,19 @@ impl Batch {
 
     /// Byte count of the WAL-block encoding for this batch.
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
-        // V3 wire format: pk (16B/row) — same layout as in-memory, no split.
         let nr_wire = self.num_regions_total();
         let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
         for i in 0..nr_wire {
             sizes[i] = self.region_size(i) as u32;
         }
+        // Phase 1 shim: V3 wire uses 16B/row PK; pad size for narrow Batch.
+        if self.strides[REG_PK] == 8 {
+            sizes[0] = (self.count * 16) as u32;
+        }
         super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
     /// Encode self into WAL V3 wire format at out[offset..]. Returns bytes written.
-    ///
-    /// V3: pk stays as 16B/row — pass in-memory layout directly to WAL encode.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
         let nr_wire = self.num_regions_total();
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
@@ -1297,6 +1315,17 @@ impl Batch {
         for i in 0..nr_wire {
             ptrs[i] = self.region_ptr(i);
             sizes[i] = self.region_size(i) as u32;
+        }
+        // Phase 1 shim: narrow PK region → pad to 16B/row for V3 wire format.
+        let padded_pk: Vec<u8>;
+        if self.strides[REG_PK] == 8 {
+            padded_pk = self.pk_data().chunks_exact(8).flat_map(|c| {
+                let mut buf = [0u8; 16];
+                buf[..8].copy_from_slice(c);
+                buf
+            }).collect();
+            ptrs[0] = padded_pk.as_ptr();
+            sizes[0] = (self.count * 16) as u32;
         }
         let blob_size = self.blob.len() as u64;
         let new_offset = super::wal::encode(
@@ -1308,9 +1337,6 @@ impl Batch {
 
     /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
     /// Does not set sorted/consolidated — caller derives those from wire header flags.
-    ///
-    /// V3 wire format has 3 fixed regions: pk (16B/row), weight (8B/row),
-    /// null_bmp (8B/row). Regions map directly to the in-memory layout.
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
@@ -1340,7 +1366,6 @@ impl Batch {
         let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let n = count as usize;
 
-        // V3: pk region 0 is already 16B/row — map directly to in-memory layout.
         let nr_mem = expected_regions;
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
         let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
@@ -1352,6 +1377,18 @@ impl Batch {
             if sz > 0 && off + sz <= data.len() {
                 ptrs[i] = unsafe { data.as_ptr().add(off) };
             }
+        }
+
+        // Phase 1 shim: V3 WAL has 16B/row PK; Batch may need 8B/row for U64 schema.
+        let pk_stride_needed = pk_stride(schema) as usize;
+        let narrow_pk: Vec<u8>;
+        if pk_stride_needed == 8 && n > 0 && region_sizes[0] as usize == n * 16 {
+            let wire_pk = unsafe { std::slice::from_raw_parts(ptrs[0], n * 16) };
+            narrow_pk = wire_pk.chunks_exact(16)
+                .flat_map(|c| c[..8].iter().copied())
+                .collect();
+            ptrs[0] = narrow_pk.as_ptr();
+            region_sizes[0] = (n * 8) as u32;
         }
 
         let mut batch = unsafe {
@@ -1447,7 +1484,7 @@ pub fn write_to_batch(
     let actual_blob;
     {
         // Carve non-overlapping mutable slices via split_at_mut.
-        let pk_sz = max_rows * 16;
+        let pk_sz = max_rows * strides[REG_PK] as usize;
         let (pk, rest) = data.split_at_mut(pk_sz);
         let fixed = max_rows * 8;
         let (weight, rest) = rest.split_at_mut(fixed);
@@ -1544,5 +1581,61 @@ mod tests {
         assert_eq!(b.get_pk(1), 20);
         assert_eq!(b.get_pk(2), new_pk);
         assert_eq!(b.get_pk(3), 40);
+    }
+
+    fn minimal_u64_with_i64_schema() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    #[test]
+    fn pk_stride_u64_roundtrip() {
+        let schema = minimal_u64_with_i64_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(4);
+        for &pk in &[0u64, 1, 1 << 32, u64::MAX] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        assert_eq!(b.strides[REG_PK], 8);
+        assert_eq!(b.pk_data().len(), 4 * 8);
+        for (i, &pk) in [0u64, 1, 1 << 32, u64::MAX].iter().enumerate() {
+            assert_eq!(b.get_pk(i), pk as u128);
+        }
+    }
+
+    #[test]
+    fn pk_stride_u128_roundtrip() {
+        let schema = single_col_u128_pk_schema();
+        let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(pks.len());
+        for &pk in pks {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        assert_eq!(b.strides[REG_PK], 16);
+        assert_eq!(b.pk_data().len(), pks.len() * 16);
+        for (i, &pk) in pks.iter().enumerate() {
+            assert_eq!(b.get_pk(i), pk);
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn extend_pk_u64_batch_rejects_wide_pk() {
+        let schema = minimal_u64_with_i64_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(1);
+        b.extend_pk((u64::MAX as u128) + 1);
     }
 }

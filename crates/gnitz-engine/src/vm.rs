@@ -644,7 +644,7 @@ impl RegisterFile {
             let batch = if m.schema.num_columns > 0 {
                 Batch::with_schema(m.schema, if m.kind == RegisterKind::Delta { 16 } else { 0 })
             } else {
-                Batch::empty(0)
+                Batch::empty(0, 16)
             };
             registers.push(Register {
                 kind: m.kind,
@@ -778,7 +778,7 @@ pub fn execute_epoch(
 
             Instr::Delay { src, state_reg, dst } => {
                 let npc = reg!(*src).batch.num_payload_cols();
-                let curr = std::mem::replace(&mut reg_mut!(*src).batch, Batch::empty(npc));
+                let curr = std::mem::replace(&mut reg_mut!(*src).batch, Batch::empty(npc, 16));
                 let prev = std::mem::replace(&mut reg_mut!(*state_reg).batch, curr);
                 reg_mut!(*dst).batch = prev;
             }
@@ -850,7 +850,7 @@ pub fn execute_epoch(
             Instr::Distinct { in_reg, hist_reg, out_reg, hist_table_idx } => {
                 let schema = reg!(*in_reg).schema;
                 let npc = reg!(*in_reg).batch.num_payload_cols();
-                let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc));
+                let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, 16));
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
                     let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
                     reg_mut!(*out_reg).batch = output.into_inner();
@@ -1101,7 +1101,7 @@ pub fn execute_epoch(
     let out = &mut regfile.registers[output_reg as usize];
     if out.batch.count > 0 {
         let npc = out.batch.num_payload_cols();
-        let result = std::mem::replace(&mut out.batch, Batch::empty(npc));
+        let result = std::mem::replace(&mut out.batch, Batch::empty(npc, 16));
         Ok(Some(result))
     } else {
         Ok(None)

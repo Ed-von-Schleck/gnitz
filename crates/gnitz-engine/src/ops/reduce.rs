@@ -1418,7 +1418,7 @@ mod tests {
         };
 
         // Empty trace_out
-        let empty_out = Arc::new(Batch::empty(2));
+        let empty_out = Arc::new(Batch::empty(2, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
@@ -1500,7 +1500,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
@@ -1544,7 +1544,7 @@ mod tests {
         let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
 
         // trace_out: empty (no previous aggregate, no retraction emitted)
-        let to_batch = Arc::new(Batch::empty(output_schema.num_columns as usize - 1));
+        let to_batch = Arc::new(Batch::empty(output_schema.num_columns as usize - 1, 16));
 
         // delta: retract apple at PK=1
         let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);
@@ -1624,7 +1624,7 @@ mod tests {
         };
 
         // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = Batch::with_schema(schema, 2);
@@ -1814,7 +1814,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I32 values, group by PK
@@ -1861,7 +1861,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
@@ -1905,7 +1905,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I16 values, all same PK
@@ -1950,7 +1950,7 @@ mod tests {
         };
 
         // Tick 1: partial MIN=5 from one worker → global MIN=5
-        let empty_out = Arc::new(Batch::empty(1));
+        let empty_out = Arc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = Batch::with_schema(schema, 1);

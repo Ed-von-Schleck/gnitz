@@ -163,7 +163,7 @@ pub fn op_repartition_batch(
         }
         result
             .into_iter()
-            .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
+            .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc, 16)))
             .collect()
     })
 }
@@ -208,7 +208,7 @@ pub fn op_repartition_batches(
     });
 
     dest.into_iter()
-        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc)))
+        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc, 16)))
         .collect()
 }
 
@@ -286,7 +286,7 @@ pub fn op_repartition_batches_merged(
                 d.set_schema(*schema);
                 d
             }
-            None => Batch::empty(npc),
+            None => Batch::empty(npc, 16),
         })
         .collect()
 }
@@ -307,7 +307,7 @@ pub fn op_relay_scatter_consolidated(
     );
     if !has_any {
         let npc = schema.num_columns as usize - 1;
-        return (0..num_workers).map(|_| Batch::empty(npc)).collect();
+        return (0..num_workers).map(|_| Batch::empty(npc, 16)).collect();
     }
     let plain: Vec<Option<&Batch>> = sources
         .iter()
@@ -366,7 +366,7 @@ pub fn op_multi_scatter(
         }
 
         let mut results: Vec<Vec<Batch>> = (0..n_specs)
-            .map(|_| (0..num_workers).map(|_| Batch::empty(npc)).collect())
+            .map(|_| (0..num_workers).map(|_| Batch::empty(npc, 16)).collect())
             .collect();
 
         for si in 0..n_specs {

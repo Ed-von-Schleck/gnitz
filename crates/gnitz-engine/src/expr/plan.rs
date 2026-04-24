@@ -404,17 +404,25 @@ impl Plan {
         out_schema: &SchemaDescriptor,
     ) -> Batch {
         let n = in_batch.count;
-        let out_npc = out_schema.num_columns as usize - 1;
         if n == 0 {
-            return Batch::empty(out_npc);
+            return Batch::empty_with_schema(out_schema);
         }
 
         let out_pki = out_schema.pk_index as usize;
         let mut output = Batch::with_schema(*out_schema, n);
         output.count = n;
 
-        // System columns
-        output.pk_data_mut().copy_from_slice(in_batch.pk_data());
+        // PK copy: bulk when strides match, row-by-row when they differ
+        // (e.g. U64 input table → U128 synthetic PK in reindex maps).
+        let in_pk = in_batch.pk_data();
+        let out_pk = output.pk_data_mut();
+        if in_pk.len() == out_pk.len() {
+            out_pk.copy_from_slice(in_pk);
+        } else {
+            for r in 0..n {
+                output.set_pk_at(r, in_batch.get_pk(r));
+            }
+        }
         output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 
         // Column moves

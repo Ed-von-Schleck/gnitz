@@ -122,7 +122,7 @@ mod tests {
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(Batch::empty(1));
+        let empty = Arc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let out = op_scan_trace(ch.cursor_mut(), &schema, 10);

@@ -25,15 +25,14 @@ fn consolidate_batches(
     batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
 ) -> Batch {
-    let num_payload_cols = schema.num_columns as usize - 1;
     if batches.is_empty() {
-        return Batch::empty(num_payload_cols);
+        return Batch::empty_with_schema(schema);
     }
 
     let total_rows: usize = batches.iter().map(|b| b.count).sum();
     let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
     if total_rows == 0 {
-        return Batch::empty(num_payload_cols);
+        return Batch::empty_with_schema(schema);
     }
 
     let mut result = write_to_batch(schema, total_rows, total_blob, |writer| {
@@ -120,8 +119,6 @@ impl MemTable {
     /// Get a consolidated snapshot.  Caches the merged result of all runs.
     /// Returns an `Arc<Batch>` — cheap to clone for multiple consumers.
     pub fn get_snapshot(&mut self) -> Arc<Batch> {
-        let num_payload_cols = self.schema.num_columns as usize - 1;
-
         if self.cached_consolidated.is_none() && !self.runs.is_empty() {
             let batches = self.runs_as_sorted();
             let consolidated = consolidate_batches(&batches, &self.schema);
@@ -130,7 +127,7 @@ impl MemTable {
 
         match &self.cached_consolidated {
             Some(arc) => Arc::clone(arc),
-            None => Arc::new(Batch::empty(num_payload_cols)),
+            None => Arc::new(Batch::empty_with_schema(&self.schema)),
         }
     }
 
@@ -627,7 +624,7 @@ mod tests {
         // Schema has 2 columns: PK (U64) + payload (I64)
         // Regions: pk(0), weight(1), null(2), col0(3), blob(4)
         assert_eq!(batch.num_regions_total(), 5);
-        assert_eq!(batch.region_size(0), 16); // pk: 1 row * 16 bytes
+        assert_eq!(batch.region_size(0), 8);  // pk: 1 row * 8 bytes (U64 PK)
         assert_eq!(batch.region_size(3), 8);  // col0: 1 row * 8 bytes
         assert!(!batch.region_ptr(0).is_null());
     }
@@ -1083,11 +1080,12 @@ mod tests {
     #[test]
     fn test_inline_consolidate_should_flush() {
         let schema = make_u64_i64_schema();
-        // Each 1-row batch ≈ 40 bytes.  max_bytes = 700 → threshold = 525.
-        // After 14 insertions: runs_bytes ≈ 560 > 525 → should_flush true.
-        // After 8 retractions (total 16 batches): consolidation fires,
-        // net 6 rows ≈ 240 < 525 → should_flush false.
-        let mut mt = MemTable::new(schema, 700);
+        // Each 1-row batch = 32 bytes (U64 PK=8, weight=8, null=8, col=8).
+        // max_bytes = 560 → threshold = 420.
+        // After 14 insertions: runs_bytes = 448 > 420 → should_flush true.
+        // After 2 retractions (total 16 batches): consolidation fires,
+        // net 12 rows = 384 < 420 → should_flush false.
+        let mut mt = MemTable::new(schema, 560);
 
         // 8 insertions
         for i in 0..8u64 {
@@ -1255,7 +1253,7 @@ mod tests {
         use crate::storage::batch_pool::acquire_buf;
         while acquire_buf().capacity() > 0 {}
 
-        let batch = Batch::empty(2);
+        let batch = Batch::empty(2, 16);
         assert_eq!(batch.data_capacity(), 0);
         drop(batch);
 

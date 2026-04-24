@@ -309,7 +309,7 @@ mod tests {
     fn make_regions(rows: &[(u64, i64, i64)]) -> (Vec<*const u8>, Vec<u32>) {
         let n = rows.len();
         let pk: Vec<u8> = rows.iter()
-            .flat_map(|r| (r.0 as u128).to_le_bytes())
+            .flat_map(|r| r.0.to_le_bytes())
             .collect();
         let weight: Vec<u8> = rows.iter().flat_map(|r| r.1.to_le_bytes()).collect();
         let null_bmp: Vec<u8> = vec![0u8; n * 8];
@@ -320,7 +320,7 @@ mod tests {
         let col0 = col0.leak(); let blob = blob.leak();
         (vec![pk.as_ptr(), weight.as_ptr(),
               null_bmp.as_ptr(), col0.as_ptr(), blob.as_ptr()],
-         vec![(n*16) as u32, (n*8) as u32,
+         vec![(n*8) as u32, (n*8) as u32,
               (n*8) as u32, (n*8) as u32, 0])
     }
 

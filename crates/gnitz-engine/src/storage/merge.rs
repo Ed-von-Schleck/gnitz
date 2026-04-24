@@ -46,7 +46,8 @@ impl<'a> std::ops::Deref for SortedMemBatch<'a> {
 
 #[derive(Clone)]
 pub struct MemBatch<'a> {
-    pub pk: &'a [u8],        // count * 16 (u128 LE per row)
+    pub pk: &'a [u8],        // count * pk_stride bytes
+    pub pk_stride: u8,       // 8 for U64 PK, 16 for U128 PK
     pub weight: &'a [u8],    // count * 8
     pub null_bmp: &'a [u8],  // count * 8
     pub col_data: Vec<&'a [u8]>,  // one slice per payload column
@@ -57,7 +58,14 @@ pub struct MemBatch<'a> {
 impl<'a> MemBatch<'a> {
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        u128::from_le_bytes(self.pk[row * 16..row * 16 + 16].try_into().unwrap())
+        let stride = self.pk_stride as usize;
+        if stride == 16 {
+            u128::from_le_bytes(self.pk[row * 16..row * 16 + 16].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&self.pk[row * 8..row * 8 + 8]);
+            u128::from_le_bytes(buf)
+        }
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -138,6 +146,7 @@ impl MemBatchCursor {
 
 pub struct DirectWriter<'a> {
     pk: &'a mut [u8],
+    pk_stride: u8,
     weight: &'a mut [u8],
     null_bmp: &'a mut [u8],
     col_bufs: Vec<&'a mut [u8]>,
@@ -157,8 +166,10 @@ impl<'a> DirectWriter<'a> {
         blob: &'a mut [u8],
         schema: SchemaDescriptor,
     ) -> Self {
+        let pk_stride = super::batch::pk_stride(&schema);
         DirectWriter {
             pk,
+            pk_stride,
             weight,
             null_bmp,
             col_bufs,
@@ -185,7 +196,10 @@ impl<'a> DirectWriter<'a> {
         let pk = batch.get_pk(row);
         let null_word = batch.get_null_word(row);
 
-        self.pk[out_row * 16..out_row * 16 + 16].copy_from_slice(&pk.to_le_bytes());
+        let stride = self.pk_stride as usize;
+        debug_assert!(stride == 16 || pk >> 64 == 0, "write_row: U64 batch requires high bits == 0");
+        self.pk[out_row * stride..out_row * stride + stride]
+            .copy_from_slice(&pk.to_le_bytes()[..stride]);
         self.weight[out_row * 8..out_row * 8 + 8].copy_from_slice(&weight.to_le_bytes());
         self.null_bmp[out_row * 8..out_row * 8 + 8].copy_from_slice(&null_word.to_le_bytes());
 
@@ -506,7 +520,7 @@ pub fn sort_only(
 
 /// Parse a single batch from flat region arrays.
 ///
-/// Region layout: pk (16-byte/row), weight, null_bmp,
+/// Region layout: pk, weight, null_bmp,
 /// payload_col_0 .. payload_col_{N-1}, blob.
 pub unsafe fn parse_single_batch_from_regions<'a>(
     in_ptrs: &[*const u8],
@@ -515,6 +529,7 @@ pub unsafe fn parse_single_batch_from_regions<'a>(
     num_payload_cols: usize,
 ) -> MemBatch<'a> {
     let pk = std::slice::from_raw_parts(in_ptrs[0], in_sizes[0] as usize);
+    let pk_stride = if count > 0 { (in_sizes[0] as usize / count) as u8 } else { 16 };
     let weight = std::slice::from_raw_parts(in_ptrs[1], in_sizes[1] as usize);
     let null_bmp = std::slice::from_raw_parts(in_ptrs[2], in_sizes[2] as usize);
 
@@ -529,6 +544,7 @@ pub unsafe fn parse_single_batch_from_regions<'a>(
 
     MemBatch {
         pk,
+        pk_stride,
         weight,
         null_bmp,
         col_data,
@@ -590,8 +606,10 @@ mod tests {
         col0: &'a [u8],
         count: usize,
     ) -> MemBatch<'a> {
+        let pk_stride = if count > 0 { (pk.len() / count) as u8 } else { 16 };
         MemBatch {
             pk,
+            pk_stride,
             weight,
             null_bmp,
             col_data: vec![col0],
@@ -623,6 +641,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
+                pk_stride: 16,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -770,6 +789,7 @@ mod tests {
         let schema = make_schema_i64();
         let empty = MemBatch {
             pk: &[],
+            pk_stride: 16,
             weight: &[],
             null_bmp: &[],
             col_data: vec![&[]],
@@ -950,6 +970,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
+                pk_stride: 16,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -979,7 +1000,7 @@ mod tests {
     fn test_consolidate_empty() {
         let schema = make_schema_i64();
         let b = MemBatch {
-            pk: &[], weight: &[], null_bmp: &[],
+            pk: &[], pk_stride: 16, weight: &[], null_bmp: &[],
             col_data: vec![&[]], blob: &[], count: 0,
         };
         let result = run_consolidate(&b, &schema);
@@ -1123,6 +1144,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
+                pk_stride: 16,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1216,6 +1238,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
+                pk_stride: 16,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
