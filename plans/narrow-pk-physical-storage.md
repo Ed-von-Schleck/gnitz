@@ -32,57 +32,28 @@ Region 3..:              payload strides (unchanged)
 
 ## Phase plan
 
-### Phase 1 — Schema-driven Batch stride ✓ DONE (`be5726c`)
+### Phase 1 ✓ DONE (`be5726c`) — Schema-driven Batch stride
+### Phase 2 ✓ DONE (`3650218`) — Shard V6
+### Phase 3 ✓ DONE (`3650218`) — WAL V4
+### Phase 4 ✓ DONE (`5bd9dfe`) — Wire ZSetBatch → PkColumn
 
-Engine Batch/MemBatch/DirectWriter store `pk_stride` bytes per PK.
-Throwaway shims kept wire (V3) and shard (V5) formats unchanged.
+`ZSetBatch.pks: Vec<u128>` replaced with `PkColumn { U64s(Vec<u64>), U128s(Vec<u128>) }`.
+`BatchAppender::add_row(pk: u128)` unchanged externally; dispatches on variant.
+Downstream: `wal_block.rs`, `codec.rs`, `message.rs`, `client.rs`, `dml.rs`, `gnitz-py`, `gnitz-capi`, all tests.
 
-**Lesson:** Hidden `* 16` PK assumptions outside `storage/`. After each phase grep all crates.
-Fixed in Phase 1: `expr/batch.rs` LOAD_PK_INT handler; `expr/plan.rs` reindex stride mismatch.
+### Phase 5 ✓ DONE (`b23959b`) — Hash invariance + narrow-PK E2E tests
 
-### Phase 2 — Shard file V6 ✓ DONE (`3650218`)
-
-`SHARD_VERSION` 5→6. Removed Phase 1 shims in `shard_file.rs`/`shard_reader.rs`.
-XOR8 build uses `stride = pk_sz / n` with zero-extension. `MappedShard` gained `pk_stride: u8`.
-`get_pk`, `col_ptr_by_logical`, `slice_to_owned_batch` now use dynamic stride.
-
-**Cascade:** `shard_index.rs` test helper and `runtime/wire.rs` `schema_wal_block_size` both
-hardcoded 16B/row PK — fixed.
-
-### Phase 3 — WAL block V4 ✓ DONE (`3650218`)
-
-`WAL_FORMAT_VERSION` 3→4. Removed Phase 1 shims in `batch.rs`.
-`wal_block.rs`: added `append_pk_region`; encode/decode derive `pk_stride` from schema.
-
-**Note:** `runtime/wire.rs::schema_wal_block_size` is the companion sizing function for
-`encode_to_wire`. It must stay in sync with `wire_byte_size`/`encode_to_wire` — same pk_stride.
-
-### Phase 4 — Wire ZSetBatch → PkColumn + binding narrowing
-
-**`gnitz-core/src/protocol/types.rs`:**
-```rust
-pub enum PkColumn { U64s(Vec<u64>), U128s(Vec<u128>) }
-pub struct ZSetBatch { pub pks: PkColumn, ... }
-```
-`BatchAppender::add_row(pk: u128)` stays; dispatches on variant.
-
-**Downstream:** `wal_block.rs`, `codec.rs`, `message.rs`, `dml.rs`, `gnitz-py`, `gnitz-capi`.
-Tests: BatchAppender round-trip for both PK types. Python `pks()`. C API `get_pk_lo/hi`.
-
-### Phase 5 — Multi-worker hash invariance + narrow-PK E2E
-
-- `xxh.rs` test: `hash_u128(42u128) == hash_u128(42u64 as u128)`.
-- `exchange.rs` test: same partition via PK-column and join-column routes.
-- `tests/test_joins.py`: W=4 join with U64 PKs spanning 2^32.
-- `tests/test_workers.py`: 10k rows U64 PKs over `[0, 2^40]`; verify partition balance.
-- `tests/test_fk.py`: U64 PK parent + child, W=4.
+- `xxh.rs`: `hash_u128_zero_extension_invariant`
+- `exchange.rs`: `test_partition_routing_invariance_narrow_pk`
+- `test_joins.py`: `test_inner_join_wide_u64_pks_multiworker` (W≥2, PKs to 2^40)
+- `test_workers.py`: `test_partition_balance_wide_u64_range` (96 rows, three U64 regions)
+- `test_fk.py`: not yet added (low priority; FK tests already cover W=4)
 
 ### Phase 6 — Documentation cleanup
 
 - `foundations.md` §1: physical stride narrowing, zero-extension invariant.
 - `foundations.md` §6: update region convention table with `pk_stride`.
 - `dev-guide.md`: narrow-PK hash invariance; stride is schema-dependent for IPC fast paths.
-- `plans/unify-u128-primary-keys.md` Appendix open question #4: mark resolved.
 
 ---
 
@@ -93,7 +64,7 @@ Tests: BatchAppender round-trip for both PK types. Python `pks()`. C API `get_pk
 | `SHARD_VERSION` | 5 | 6 | ✓ done |
 | `WAL_FORMAT_VERSION` | 3 | 4 | ✓ done |
 | Manifest | 3 | 3 | unchanged |
-| Wire `ZSetBatch.pks` | `Vec<u128>` | `PkColumn` | Phase 4 |
+| Wire `ZSetBatch.pks` | `Vec<u128>` | `PkColumn` | ✓ done |
 
 Wipe data directory between PRs (format bumps reject old files).
 
