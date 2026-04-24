@@ -432,7 +432,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_d = dst * MORSEL;
                 for i in 0..m {
                     scratch.regs[base_d + i] =
-                        read_u64_le(mb.pk_lo, (morsel_start + i) * 8) as i64;
+                        read_u64_le(mb.pk, (morsel_start + i) * 16) as i64;
                 }
                 scratch.clear_null_reg(dst, m);
             }
@@ -452,7 +452,7 @@ pub(in crate::expr) fn eval_batch(
                 if ci == pki {
                     for i in 0..m {
                         scratch.regs[base_d + i] =
-                            read_u64_le(mb.pk_lo, (morsel_start + i) * 8) as i64;
+                            read_u64_le(mb.pk, (morsel_start + i) * 16) as i64;
                     }
                 } else {
                     let pi = if ci < pki { ci } else { ci - 1 };

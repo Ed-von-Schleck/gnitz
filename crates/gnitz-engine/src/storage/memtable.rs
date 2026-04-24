@@ -343,8 +343,7 @@ mod tests {
         let mut b = Batch::with_schema(*schema, n.max(1));
 
         for &(pk, w, val) in rows {
-            b.extend_pk_lo(&pk.to_le_bytes());
-            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -626,10 +625,10 @@ mod tests {
         let batch = make_batch(&schema, &[(10, 1, 100)]);
 
         // Schema has 2 columns: PK (U64) + payload (I64)
-        // Regions: pk_lo(0), pk_hi(1), weight(2), null(3), col0(4), blob(5)
-        assert_eq!(batch.num_regions_total(), 6);
-        assert_eq!(batch.region_size(0), 8); // pk_lo: 1 row * 8 bytes
-        assert_eq!(batch.region_size(4), 8); // col0: 1 row * 8 bytes
+        // Regions: pk(0), weight(1), null(2), col0(3), blob(4)
+        assert_eq!(batch.num_regions_total(), 5);
+        assert_eq!(batch.region_size(0), 16); // pk: 1 row * 16 bytes
+        assert_eq!(batch.region_size(3), 8);  // col0: 1 row * 8 bytes
         assert!(!batch.region_ptr(0).is_null());
     }
 
@@ -665,8 +664,7 @@ mod tests {
         let mut b = Batch::with_schema(schema, n.max(1));
 
         for &(plo, phi, w, gv, av) in rows {
-            b.extend_pk_lo(&plo.to_le_bytes());
-            b.extend_pk_hi(&phi.to_le_bytes());
+            b.extend_pk(crate::util::make_pk(plo, phi));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &gv.to_le_bytes());
@@ -1187,8 +1185,7 @@ mod tests {
         str_struct[8..16].copy_from_slice(&bad_offset.to_le_bytes());
 
         src.ensure_row_capacity();
-        src.extend_pk_lo(&42u64.to_le_bytes());
-        src.extend_pk_hi(&0u64.to_le_bytes());
+        src.extend_pk(42u128);
         src.extend_weight(&1i64.to_le_bytes());
         src.extend_null_bmp(&0u64.to_le_bytes());
         src.extend_col(0, &str_struct);

@@ -4,33 +4,12 @@ use xorf::{Filter, Xor8};
 const MAGIC: &[u8; 4] = b"GXF1";
 const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_count
 
-/// Build an Xor8 filter from parallel arrays of (pk_lo, pk_hi).
+/// Build an Xor8 filter from a slice of u128 PKs. Deduplicates before building.
 /// Returns None if the input is empty.
 ///
 /// Duplicate PKs are deduplicated before building — shard files may contain
 /// retraction rows where the same PK appears with different payloads/weights.
-#[deprecated(note = "use build_from_u128s; halves API removed in Phase 3 (shard V5)")]
-pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
-    let n = pk_lo.len().min(pk_hi.len());
-    if n == 0 {
-        return None;
-    }
-    let mut keys: Vec<u64> = pk_lo[..n]
-        .iter()
-        .zip(pk_hi[..n].iter())
-        .map(|(&lo, &hi)| xxh::hash_u128(crate::util::make_pk(lo, hi)))
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
-    if keys.is_empty() {
-        return None;
-    }
-    Some(Xor8::from(keys.as_slice()))
-}
-
-/// Build an Xor8 filter from a slice of u128 PKs. Deduplicates before building.
-#[allow(dead_code)]
-pub fn build_from_u128s(pks: &[u128]) -> Option<Xor8> {
+pub fn build(pks: &[u128]) -> Option<Xor8> {
     if pks.is_empty() {
         return None;
     }
@@ -100,28 +79,25 @@ pub fn serialized_size(filter: &Xor8) -> usize {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
     #[test]
     fn build_and_query_no_false_negatives() {
-        let lo: Vec<u64> = (0..1000).collect();
-        let hi: Vec<u64> = vec![0; 1000];
-        let filter = build(&lo, &hi).unwrap();
-        for i in 0..1000u64 {
-            assert!(may_contain(&filter, i as u128), "false negative for key {}", i);
+        let pks: Vec<u128> = (0u128..1000).collect();
+        let filter = build(&pks).unwrap();
+        for &pk in &pks {
+            assert!(may_contain(&filter, pk), "false negative for key {}", pk);
         }
     }
 
     #[test]
     fn false_positive_rate() {
-        let lo: Vec<u64> = (0..2000).collect();
-        let hi: Vec<u64> = vec![0; 2000];
-        let filter = build(&lo, &hi).unwrap();
+        let pks: Vec<u128> = (0u128..2000).collect();
+        let filter = build(&pks).unwrap();
         let mut fp = 0u32;
-        for i in 10_000u64..20_000 {
-            if may_contain(&filter, i as u128) {
+        for i in 10_000u128..20_000 {
+            if may_contain(&filter, i) {
                 fp += 1;
             }
         }
@@ -131,30 +107,29 @@ mod tests {
 
     #[test]
     fn small_set() {
-        let filter = build(&[100, 200], &[0, 0]).unwrap();
+        let filter = build(&[100u128, 200]).unwrap();
         assert!(may_contain(&filter, 100));
         assert!(may_contain(&filter, 200));
     }
 
     #[test]
     fn empty_returns_none() {
-        assert!(build(&[], &[]).is_none());
+        assert!(build(&[]).is_none());
     }
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let lo: Vec<u64> = (0..500).collect();
-        let hi: Vec<u64> = vec![42; 500];
-        let filter = build(&lo, &hi).unwrap();
+        let pks: Vec<u128> = (0u128..500)
+            .map(|i| crate::util::make_pk(i as u64, 42))
+            .collect();
+        let filter = build(&pks).unwrap();
         let bytes = serialize(&filter);
         let restored = deserialize(&bytes).unwrap();
 
-        // Verify all original keys found in restored filter
-        for i in 0..500u64 {
+        for &pk in &pks {
             assert!(
-                may_contain(&restored, crate::util::make_pk(i, 42)),
-                "roundtrip false negative for key {}",
-                i
+                may_contain(&restored, pk),
+                "roundtrip false negative for key {:#034x}", pk,
             );
         }
     }
@@ -176,7 +151,7 @@ mod tests {
 
     #[test]
     fn serialized_size_matches() {
-        let filter = build(&[1, 2, 3], &[0, 0, 0]).unwrap();
+        let filter = build(&[1u128, 2, 3]).unwrap();
         let bytes = serialize(&filter);
         assert_eq!(bytes.len(), serialized_size(&filter));
     }
@@ -192,27 +167,24 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_zero_block_length() {
-        // block_length=0 must be rejected even when fp_count also equals 3*0=0.
         let buf = make_header(0, 0, 0);
         assert!(deserialize(&buf).is_none());
     }
 
     #[test]
     fn deserialize_rejects_inconsistent_fp_count() {
-        // block_length=2, fp_count=8 — does not equal 3*2=6.
         let buf = make_header(2, 8, 8);
         assert!(deserialize(&buf).is_none());
     }
 
     #[test]
     fn deserialize_rejects_short_body() {
-        // block_length=1, fp_count=3, but body is only 1 byte instead of 3.
         let buf = make_header(1, 3, 1);
         assert!(deserialize(&buf).is_none());
     }
 
     #[test]
-    fn build_from_u128s_crossing_u64_boundary() {
+    fn build_crossing_u64_boundary() {
         let pks: [u128; 5] = [
             0,
             1,
@@ -220,14 +192,9 @@ mod tests {
             (u64::MAX as u128) + 1,
             u128::MAX,
         ];
-        let filter = build_from_u128s(&pks).unwrap();
+        let filter = build(&pks).unwrap();
         for &pk in &pks {
             assert!(may_contain(&filter, pk), "false negative for pk {:#034x}", pk);
         }
-    }
-
-    #[test]
-    fn build_from_u128s_empty_returns_none() {
-        assert!(build_from_u128s(&[]).is_none());
     }
 }

@@ -342,8 +342,7 @@ mod tests {
         let mut batch = Batch::with_schema(*schema, pks.len());
 
         for i in 0..pks.len() {
-            batch.extend_pk_lo(&pks[i].to_le_bytes());
-            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_pk(pks[i] as u128);
             batch.extend_weight(&weights[i].to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
 
@@ -668,8 +667,7 @@ mod tests {
         // Build shard with short strings
         let mut batch = Batch::with_schema(schema, 3);
         for pk in [1u64, 2, 3] {
-            batch.extend_pk_lo(&pk.to_le_bytes());
-            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_pk(pk as u128);
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
 
@@ -724,16 +722,14 @@ mod tests {
         // Build shard: key 1 = non-null (42), key 2 = null
         let mut batch = Batch::with_schema(schema, 2);
         // Row 1: non-null
-        batch.extend_pk_lo(&1u64.to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes()); // no nulls
         batch.extend_col(0, &42i64.to_le_bytes());
         batch.count += 1;
 
         // Row 2: null column
-        batch.extend_pk_lo(&2u64.to_le_bytes());
-        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_pk(2u128);
         batch.extend_weight(&1i64.to_le_bytes());
         // null bit for col_idx=1, pk_index=0 → payload_idx = 0 → bit 0
         batch.extend_null_bmp(&1u64.to_le_bytes());
@@ -786,8 +782,7 @@ mod tests {
     ) {
         let mut batch = Batch::with_schema(*schema, rows.len());
         for &(pk, w, c1, c2) in rows {
-            batch.extend_pk_lo(&pk.to_le_bytes());
-            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_pk(pk as u128);
             batch.extend_weight(&w.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
             batch.extend_col(0, &c1.to_le_bytes());

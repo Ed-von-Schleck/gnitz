@@ -95,10 +95,9 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
 /// Build a complete shard file image from pre-built region buffers.
 ///
 /// `regions` is an array of (pointer, size) pairs in the canonical order:
-///   pk_lo, pk_hi, weight, null_bitmap, [non-PK columns...], blob_arena.
+///   pk (16 bytes/row), weight, null_bitmap, [non-PK columns...], blob_arena.
 ///
-/// The XOR8 filter is built internally from the first two regions (pk_lo,
-/// pk_hi) when `row_count > 0`.
+/// The XOR8 filter is built internally from region[0] (pk) when `row_count > 0`.
 ///
 /// Returns the complete file image ready for writing.
 pub fn build_shard_image(
@@ -123,7 +122,7 @@ pub fn build_shard_image(
         } else {
             let elem_width = orig_sz / n;
             let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
-            let enc = if i == 2 {
+            let enc = if i == 1 {
                 // weight region
                 detect_weight_encoding(src)
             } else {
@@ -139,21 +138,16 @@ pub fn build_shard_image(
         }
     }
 
-    // --- XOR8 filter (from raw caller pointers, unchanged) ---
+    // --- XOR8 filter built from unified pk region (16 bytes/row) ---
 
-    let xor8_filter = if row_count > 0 && num_regions >= 2 {
-        let (pk_lo_ptr, pk_lo_sz) = regions[0];
-        let (pk_hi_ptr, pk_hi_sz) = regions[1];
-        if !pk_lo_ptr.is_null()
-            && !pk_hi_ptr.is_null()
-            && pk_lo_sz >= n * 8
-            && pk_hi_sz >= n * 8
-        {
-            let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
-            let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
-            #[allow(deprecated)]
-            let f = xor8::build(lo, hi);
-            f
+    let xor8_filter = if row_count > 0 && num_regions >= 1 {
+        let (pk_ptr, pk_sz) = regions[0];
+        if !pk_ptr.is_null() && pk_sz >= n * 16 {
+            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, n * 16) };
+            let pks: Vec<u128> = pk_bytes.chunks_exact(16)
+                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            xor8::build(&pks)
         } else {
             None
         }
@@ -311,7 +305,7 @@ pub fn write_shard_streaming(
         } else {
             let elem_width = orig_sz / n;
             let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
-            let enc = if i == 2 {
+            let enc = if i == 1 {
                 detect_weight_encoding(src)
             } else {
                 detect_encoding(src, elem_width)
@@ -326,20 +320,15 @@ pub fn write_shard_streaming(
         }
     }
 
-    // --- Phase 2: XOR8 filter ---
-    let xor8_filter = if row_count > 0 && num_regions >= 2 {
-        let (pk_lo_ptr, pk_lo_sz) = regions[0];
-        let (pk_hi_ptr, pk_hi_sz) = regions[1];
-        if !pk_lo_ptr.is_null()
-            && !pk_hi_ptr.is_null()
-            && pk_lo_sz >= n * 8
-            && pk_hi_sz >= n * 8
-        {
-            let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
-            let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
-            #[allow(deprecated)]
-            let f = xor8::build(lo, hi);
-            f
+    // --- Phase 2: XOR8 filter built from unified pk region (16 bytes/row) ---
+    let xor8_filter = if row_count > 0 && num_regions >= 1 {
+        let (pk_ptr, pk_sz) = regions[0];
+        if !pk_ptr.is_null() && pk_sz >= n * 16 {
+            let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, n * 16) };
+            let pks: Vec<u128> = pk_bytes.chunks_exact(16)
+                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            xor8::build(&pks)
         } else {
             None
         }
@@ -587,32 +576,19 @@ mod tests {
     #[test]
     fn build_image_roundtrip() {
         let row_count = 3u32;
-        let pk_lo: Vec<u64> = vec![10, 20, 30];
-        let pk_hi: Vec<u64> = vec![0, 0, 0];
+        let pks: Vec<u128> = vec![10, 20, 30];
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
 
-        let pk_lo_bytes = unsafe {
-            std::slice::from_raw_parts(pk_lo.as_ptr() as *const u8, pk_lo.len() * 8)
-        };
-        let pk_hi_bytes = unsafe {
-            std::slice::from_raw_parts(pk_hi.as_ptr() as *const u8, pk_hi.len() * 8)
-        };
-        let weight_bytes = unsafe {
-            std::slice::from_raw_parts(weights.as_ptr() as *const u8, weights.len() * 8)
-        };
-        let null_bytes = unsafe {
-            std::slice::from_raw_parts(nulls.as_ptr() as *const u8, nulls.len() * 8)
-        };
-        let val_bytes = unsafe {
-            std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
-        };
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let null_bytes: Vec<u8> = nulls.iter().flat_map(|n| n.to_le_bytes()).collect();
+        let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_lo_bytes.as_ptr(), pk_lo_bytes.len()),
-            (pk_hi_bytes.as_ptr(), pk_hi_bytes.len()),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weight_bytes.as_ptr(), weight_bytes.len()),
             (null_bytes.as_ptr(), null_bytes.len()),
             (val_bytes.as_ptr(), val_bytes.len()),
@@ -643,16 +619,15 @@ mod tests {
             std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
 
         let row_count = 2u32;
-        let pk_lo: Vec<u64> = vec![1, 2];
-        let pk_hi: Vec<u64> = vec![0, 0];
+        let pks: Vec<u128> = vec![1, 2];
         let weights: Vec<i64> = vec![1, 1];
         let nulls: Vec<u64> = vec![0, 0];
         let vals: Vec<i64> = vec![42, 99];
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
-            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (nulls.as_ptr() as *const u8, nulls.len() * 8),
             (vals.as_ptr() as *const u8, vals.len() * 8),
@@ -686,7 +661,6 @@ mod tests {
             (std::ptr::null(), 0),
             (std::ptr::null(), 0),
             (std::ptr::null(), 0),
-            (std::ptr::null(), 0),
         ];
 
         let image = build_shard_image(1, 0, &regions);
@@ -706,16 +680,15 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let row_count = 3u32;
-        let pk_lo: Vec<u64> = vec![10, 20, 30];
-        let pk_hi: Vec<u64> = vec![0, 0, 0];
+        let pks: Vec<u128> = vec![10, 20, 30];
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
-            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (nulls.as_ptr() as *const u8, nulls.len() * 8),
             (vals.as_ptr() as *const u8, vals.len() * 8),
@@ -749,16 +722,15 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let row_count = 4u32;
-        let pk_lo: Vec<u64> = vec![1, 2, 3, 4];
-        let pk_hi: Vec<u64> = vec![0, 0, 0, 0]; // all-zero → Constant encoding
+        let pks: Vec<u128> = vec![1, 2, 3, 4];
         let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
         let nulls: Vec<u64> = vec![0, 0, 0, 0];   // all-zero → Constant encoding
         let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
-            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (nulls.as_ptr() as *const u8, nulls.len() * 8),
             (vals.as_ptr() as *const u8, vals.len() * 8),

@@ -688,22 +688,21 @@ mod tests {
         sd
     }
 
-    /// Build and write a shard file with the given PK/value pairs. All pk_hi = 0.
+    /// Build and write a shard file with the given PK/value pairs.
     fn write_test_shard(
         dir: &std::path::Path,
         name: &str,
-        pk_los: &[u64],
+        pks: &[u64],
         values: &[i64],
     ) -> String {
-        let n = pk_los.len();
-        let pk_hi = vec![0u64; n];
+        let n = pks.len();
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| (p as u128).to_le_bytes()).collect();
         let weights = vec![1i64; n];
         let nulls = vec![0u64; n];
         let blob: Vec<u8> = Vec::new();
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_los.as_ptr() as *const u8, n * 8),
-            (pk_hi.as_ptr() as *const u8, n * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, n * 8),
             (nulls.as_ptr() as *const u8, n * 8),
             (values.as_ptr() as *const u8, n * 8),

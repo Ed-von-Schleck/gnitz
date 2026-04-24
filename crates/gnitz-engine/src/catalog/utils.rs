@@ -333,7 +333,7 @@ pub(crate) fn retract_rows_by_pk_lo_range(
     if let Some((src, start)) = cursor.cursor.single_mem_batch() {
         let mut end = start;
         while end < src.count
-            && crate::util::read_u64_le(src.pk_lo, end * 8) < pk_lo_end
+            && (src.get_pk(end) as u64) < pk_lo_end
         {
             end += 1;
         }
@@ -369,7 +369,7 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     if let Some((src, start)) = cursor.cursor.single_mem_batch() {
         let mut end = start;
         while end < src.count
-            && crate::util::read_u64_le(src.pk_hi, end * 8) == pk_hi
+            && ((src.get_pk(end) >> 64) as u64) == pk_hi
         {
             end += 1;
         }

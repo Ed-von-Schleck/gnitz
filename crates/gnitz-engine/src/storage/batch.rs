@@ -22,25 +22,22 @@ fn next_blob_id() -> u64 { BLOB_ID_CTR.fetch_add(1, Ordering::Relaxed) }
 const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Maximum regions tracked in the `offsets`/`strides` arrays:
-/// 4 fixed (pk_lo, pk_hi, weight, null_bmp) + up to 63 payload columns
+/// 3 fixed (pk, weight, null_bmp) + up to 63 payload columns
 /// (schema max is 64 total columns, 1 is the PK).  The blob is not in this
 /// array; it lives in `self.blob` and is accounted for separately.
-/// 4 + 63 = 67, rounded up to 68 to keep the array size as a multiple of 4.
+/// 3 + 63 = 66, rounded up to 68 to keep the array size as a multiple of 4.
 pub(super) const MAX_BATCH_REGIONS: usize = 68;
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
-// The first four regions are fixed (one 8-byte word per row each); payload
-// columns start at index 4 and continue for `num_payload_cols()` slots.  Use
-// these constants instead of bare numeric literals — naming the slots makes
-// the layout self-documenting and turns an off-by-one in this file into a
-// compile-time grep target.
-const REG_PK_LO: usize = 0;
-const REG_PK_HI: usize = 1;
-const REG_WEIGHT: usize = 2;
-const REG_NULL_BMP: usize = 3;
-const REG_PAYLOAD_START: usize = 4;
-/// Stride (in bytes) of each of the four fixed regions.
+// Three fixed regions (PK is 16 bytes/row; weight and null_bmp are 8 bytes/row);
+// payload columns start at index 3 and continue for `num_payload_cols()` slots.
+// Use these constants instead of bare numeric literals.
+const REG_PK: usize = 0;
+const REG_WEIGHT: usize = 1;
+const REG_NULL_BMP: usize = 2;
+const REG_PAYLOAD_START: usize = 3;
+/// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
 
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
@@ -103,8 +100,7 @@ fn fill_payload_strides(
 /// Build a strides array from a SchemaDescriptor.
 pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
-    strides[REG_PK_LO] = FIXED_REGION_STRIDE;
-    strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+    strides[REG_PK] = 16;
     strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
     strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
     let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
@@ -114,9 +110,9 @@ pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_
 /// Owned columnar batch.  All fixed-stride column data lives in a single
 /// contiguous `data` buffer.  Blob data is separate (variable-length).
 ///
-/// Layout of `data`: `[pk_lo | pk_hi | weight | null_bmp | col_0 | ... | col_{N-1}]`
+/// Layout of `data`: `[pk | weight | null_bmp | col_0 | ... | col_{N-1}]`
 /// Each region has `capacity * stride` bytes allocated; `count * stride` bytes
-/// contain data.
+/// contain data.  The PK region uses 16 bytes/row (unified u128 in LE order).
 ///
 /// **2 heap allocations** (data + blob) instead of N+7.
 pub struct Batch {
@@ -140,8 +136,8 @@ pub struct Batch {
 impl Batch {
     // ── Constructors ────────────────────────────────────────────────────
 
-    /// Create an empty, zero-allocation placeholder batch with only the four
-    /// fixed regions (pk_lo/pk_hi/weight/null_bmp) described.  Payload strides
+    /// Create an empty, zero-allocation placeholder batch with only the three
+    /// fixed regions (pk/weight/null_bmp) described.  Payload strides
     /// remain zero, so the batch is NOT safe to populate via `extend_*` or
     /// `append_batch` — use `empty_with_schema` or `with_schema` for that.
     ///
@@ -149,8 +145,7 @@ impl Batch {
     pub fn empty(num_payload_cols: usize) -> Self {
         let nr = REG_PAYLOAD_START + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK_LO] = FIXED_REGION_STRIDE;
-        strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+        strides[REG_PK] = 16;
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
         strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         Batch {
@@ -200,8 +195,7 @@ impl Batch {
         right_schema: &SchemaDescriptor,
     ) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK_LO] = FIXED_REGION_STRIDE;
-        strides[REG_PK_HI] = FIXED_REGION_STRIDE;
+        strides[REG_PK] = 16;
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
         strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         let mid = fill_payload_strides(left_schema, &mut strides, REG_PAYLOAD_START);
@@ -265,7 +259,7 @@ impl Batch {
 
     /// Construct by copying data in from region pointers.
     ///
-    /// Region layout: pk_lo, pk_hi, weight, null_bmp,
+    /// Region layout: pk (16 bytes/row), weight, null_bmp,
     /// payload_col_0 .. payload_col_{N-1}, blob.
     ///
     /// # Safety
@@ -391,14 +385,9 @@ impl Batch {
     // ── Read accessors ──────────────────────────────────────────────────
 
     #[inline]
-    pub fn pk_lo_data(&self) -> &[u8] {
-        let off = self.offsets[REG_PK_LO] as usize;
-        &self.data[off..off + self.count * 8]
-    }
-    #[inline]
-    pub fn pk_hi_data(&self) -> &[u8] {
-        let off = self.offsets[REG_PK_HI] as usize;
-        &self.data[off..off + self.count * 8]
+    pub fn pk_data(&self) -> &[u8] {
+        let off = self.offsets[REG_PK] as usize;
+        &self.data[off..off + self.count * 16]
     }
     #[inline]
     pub fn weight_data(&self) -> &[u8] {
@@ -424,15 +413,9 @@ impl Batch {
     // ── Mutable slice accessors ─────────────────────────────────────────
 
     #[inline]
-    pub fn pk_lo_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[REG_PK_LO] as usize;
-        let end = off + self.count * 8;
-        &mut self.data[off..end]
-    }
-    #[inline]
-    pub fn pk_hi_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[REG_PK_HI] as usize;
-        let end = off + self.count * 8;
+    pub fn pk_data_mut(&mut self) -> &mut [u8] {
+        let off = self.offsets[REG_PK] as usize;
+        let end = off + self.count * 16;
         &mut self.data[off..end]
     }
     #[inline]
@@ -458,16 +441,9 @@ impl Batch {
     // ── Row accessors ───────────────────────────────────────────────────
 
     #[inline]
-    fn get_pk_lo(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[REG_PK_LO] as usize..], row * 8)
-    }
-    #[inline]
-    fn get_pk_hi(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[REG_PK_HI] as usize..], row * 8)
-    }
-    #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
+        let off = self.offsets[REG_PK] as usize + row * 16;
+        u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -576,10 +552,6 @@ impl Batch {
     }
 
     #[inline]
-    pub(super) fn extend_pk_lo(&mut self, d: &[u8]) { self.extend_region(REG_PK_LO, d); }
-    #[inline]
-    pub(super) fn extend_pk_hi(&mut self, d: &[u8]) { self.extend_region(REG_PK_HI, d); }
-    #[inline]
     pub fn extend_weight(&mut self, d: &[u8]) { self.extend_region(REG_WEIGHT, d); }
     #[inline]
     pub fn extend_null_bmp(&mut self, d: &[u8]) { self.extend_region(REG_NULL_BMP, d); }
@@ -589,19 +561,14 @@ impl Batch {
     /// Append a 128-bit primary key at the current row position.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
-        let (lo, hi) = crate::util::split_pk(pk);
-        self.extend_region(REG_PK_LO, &lo.to_le_bytes());
-        self.extend_region(REG_PK_HI, &hi.to_le_bytes());
+        self.extend_region(REG_PK, &pk.to_le_bytes());
     }
 
     /// Overwrite the PK at `row` with a new 128-bit value.
     #[inline]
     pub fn set_pk_at(&mut self, row: usize, pk: u128) {
-        let (lo, hi) = crate::util::split_pk(pk);
-        let lo_off = self.offsets[REG_PK_LO] as usize + row * 8;
-        let hi_off = self.offsets[REG_PK_HI] as usize + row * 8;
-        self.data[lo_off..lo_off + 8].copy_from_slice(&lo.to_le_bytes());
-        self.data[hi_off..hi_off + 8].copy_from_slice(&hi.to_le_bytes());
+        let off = self.offsets[REG_PK] as usize + row * 16;
+        self.data[off..off + 16].copy_from_slice(&pk.to_le_bytes());
     }
 
     /// Iterate PKs as `u128`.
@@ -652,8 +619,7 @@ impl Batch {
         if n == 0 { return; }
         self.reserve_rows(n);
         if !src.blob.is_empty() { self.blob.reserve(src.blob.len()); }
-        self.bulk_copy_region(REG_PK_LO, src.pk_lo, start, end);
-        self.bulk_copy_region(REG_PK_HI, src.pk_hi, start, end);
+        self.bulk_copy_region(REG_PK, src.pk, start, end);
         {
             let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
             let w_bytes = weight_override.to_le_bytes();
@@ -699,8 +665,7 @@ impl Batch {
             col_slices.push(self.col_data(pi));
         }
         MemBatch {
-            pk_lo: self.pk_lo_data(),
-            pk_hi: self.pk_hi_data(),
+            pk: self.pk_data(),
             weight: self.weight_data(),
             null_bmp: self.null_bmp_data(),
             col_data: col_slices,
@@ -746,7 +711,7 @@ impl Batch {
     /// Produce region pointer/size arrays for `Table::ingest_batch_from_regions`.
     pub fn to_region_ptrs(&self) -> (Vec<*const u8>, Vec<u32>) {
         let npc = self.num_payload_cols();
-        // 4 fixed regions + npc payload regions + 1 blob region.
+        // 3 fixed regions + npc payload regions + 1 blob region.
         let cap = REG_PAYLOAD_START + npc + 1;
         let mut ptrs = Vec::with_capacity(cap);
         let mut sizes = Vec::with_capacity(cap);
@@ -871,9 +836,8 @@ impl Batch {
         );
         let n = end - start;
         self.reserve_rows(n);
-        // All four system regions
-        self.bulk_copy_region(REG_PK_LO, &src.data[src.offsets[REG_PK_LO] as usize..], start, end);
-        self.bulk_copy_region(REG_PK_HI, &src.data[src.offsets[REG_PK_HI] as usize..], start, end);
+        // All three system regions
+        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK] as usize..], start, end);
         self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT] as usize..], start, end);
         self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP] as usize..], start, end);
         // Payload columns — string structs copied verbatim (blob already shared)
@@ -894,8 +858,7 @@ impl Batch {
         self.reserve_rows(n);
 
         // Fixed columns: bulk copy from src's data buffer.
-        self.bulk_copy_region(REG_PK_LO, &src.data[src.offsets[REG_PK_LO] as usize..], start, end);
-        self.bulk_copy_region(REG_PK_HI, &src.data[src.offsets[REG_PK_HI] as usize..], start, end);
+        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK] as usize..], start, end);
         if negate {
             let w_off = self.offsets[REG_WEIGHT] as usize;
             for i in start..end {
@@ -952,9 +915,7 @@ impl Batch {
         let schema = self.schema.expect("append_row_from_ptable_found requires schema");
         let null_word = ptable.found_null_word();
 
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -1011,9 +972,7 @@ impl Batch {
         blob_src: &[u8],
     ) {
         self.ensure_row_capacity();
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -1065,9 +1024,7 @@ impl Batch {
         str_lens: &[u32],
     ) {
         self.ensure_row_capacity();
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
-        self.extend_pk_lo(&pk_lo.to_le_bytes());
-        self.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -1139,9 +1096,7 @@ impl Batch {
         for &idx in indices {
             let row = idx as usize;
             let pk = src.get_pk(row);
-            let (lo, hi) = crate::util::split_pk(pk);
-            self.extend_pk_lo(&lo.to_le_bytes());
-            self.extend_pk_hi(&hi.to_le_bytes());
+            self.extend_pk(pk);
             self.extend_weight(&src.get_weight(row).to_le_bytes());
             let null_word = src.get_null_word(row);
             self.extend_null_bmp(&null_word.to_le_bytes());
@@ -1233,8 +1188,7 @@ impl Batch {
         self.ensure_row_capacity();
         let schema = self.schema.expect("append_row_from_source requires schema");
 
-        self.extend_pk_lo(&(key as u64).to_le_bytes());
-        self.extend_pk_hi(&((key >> 64) as u64).to_le_bytes());
+        self.extend_pk(key);
         self.extend_weight(&weight.to_le_bytes());
         let null_word = source.get_null_word(row);
         self.extend_null_bmp(&null_word.to_le_bytes());
@@ -1325,38 +1279,70 @@ impl Batch {
     /// Byte count of the WAL-block encoding for this batch.
     #[allow(clippy::needless_range_loop)]
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
-        let nr = self.num_regions_total();
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..nr {
-            sizes[i] = self.region_size(i) as u32;
+        // WAL V2 wire format: pk_lo (8B/row) + pk_hi (8B/row) instead of pk (16B/row)
+        // so num_regions = (in-memory nr - 1) + 2 = in-memory nr + 1.
+        let nr_mem = self.num_regions_total();
+        let nr_wire = nr_mem + 1;
+        let n = self.count;
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 2];
+        sizes[0] = (n * 8) as u32; // pk_lo
+        sizes[1] = (n * 8) as u32; // pk_hi
+        // weight, null_bmp, payload cols, blob (shift from mem layout by +1)
+        for i in 1..nr_mem {
+            sizes[i + 1] = self.region_size(i) as u32;
         }
-        super::wal::block_size(nr, &sizes[..nr])
+        super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
-    /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
+    /// Encode self into WAL V2 wire format at out[offset..]. Returns bytes written.
+    ///
+    /// Splits the unified 16B/row pk region into pk_lo (8B/row) + pk_hi (8B/row)
+    /// to maintain WAL V2 compatibility until Phase 4.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
-        let nr = self.num_regions_total();
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..nr {
-            ptrs[i] = self.region_ptr(i);
-            sizes[i] = self.region_size(i) as u32;
+        let n = self.count;
+        let pk_data = self.pk_data();
+
+        // Split unified pk into pk_lo and pk_hi for the wire format.
+        let mut pk_lo = vec![0u8; n * 8];
+        let mut pk_hi = vec![0u8; n * 8];
+        for i in 0..n {
+            pk_lo[i * 8..i * 8 + 8].copy_from_slice(&pk_data[i * 16..i * 16 + 8]);
+            pk_hi[i * 8..i * 8 + 8].copy_from_slice(&pk_data[i * 16 + 8..i * 16 + 16]);
         }
+
+        let nr_mem = self.num_regions_total();
+        let nr_wire = nr_mem + 1;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 2];
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 2];
+        ptrs[0] = pk_lo.as_ptr();
+        ptrs[1] = pk_hi.as_ptr();
+        sizes[0] = (n * 8) as u32;
+        sizes[1] = (n * 8) as u32;
+        for i in 1..nr_mem {
+            ptrs[i + 1] = self.region_ptr(i);
+            sizes[i + 1] = self.region_size(i) as u32;
+        }
+
         let blob_size = self.blob.len() as u64;
         let new_offset = super::wal::encode(
             out, offset, 0, table_id, self.count as u32,
-            &ptrs[..nr], &sizes[..nr], blob_size,
+            &ptrs[..nr_wire], &sizes[..nr_wire], blob_size,
         ).expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
     /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
     /// Does not set sorted/consolidated — caller derives those from wire header flags.
+    ///
+    /// WAL V2 wire format has 4 fixed regions: pk_lo (8B/row), pk_hi (8B/row),
+    /// weight (8B/row), null_bmp (8B/row). This function merges pk_lo + pk_hi
+    /// into the unified 16B/row pk region expected by the in-memory Batch.
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
     ) -> Result<(Self, usize), &'static str> {
         let npc = schema.num_columns as usize - 1;
+        // WAL V2 has 4 fixed regions (pk_lo, pk_hi, weight, null_bmp)
         let expected_regions = 4 + npc + 1;
 
         let mut lsn = 0u64;
@@ -1378,21 +1364,43 @@ impl Batch {
         }
 
         let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let n = count as usize;
 
-        let nr = num_regions as usize;
+        // Merge pk_lo (region 0, 8B/row) and pk_hi (region 1, 8B/row)
+        // into a unified pk buffer (16B/row) for the in-memory layout.
+        let mut pk_merged: Vec<u8> = vec![0u8; n * 16];
+        if n > 0 {
+            let lo_off = offsets[0] as usize;
+            let hi_off = offsets[1] as usize;
+            for i in 0..n {
+                pk_merged[i * 16..i * 16 + 8]
+                    .copy_from_slice(&data[lo_off + i * 8..lo_off + i * 8 + 8]);
+                pk_merged[i * 16 + 8..i * 16 + 16]
+                    .copy_from_slice(&data[hi_off + i * 8..hi_off + i * 8 + 8]);
+            }
+        }
+
+        // Build ptrs/sizes for from_regions in the 3-region in-memory layout:
+        // [pk(16B), weight(8B), null_bmp(8B), col_0, ..., col_{npc-1}, blob]
+        let nr_mem = 3 + npc + 1;
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
         let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..nr {
-            let off = offsets[i] as usize;
-            let sz = sizes[i] as usize;
-            region_sizes[i] = sizes[i];
+
+        ptrs[0] = pk_merged.as_ptr();
+        region_sizes[0] = (n * 16) as u32;
+
+        // weight (was region 2), null_bmp (was region 3), payload (was regions 4..4+npc), blob
+        for (dst, src) in (1..nr_mem).zip(2..) {
+            let off = offsets[src] as usize;
+            let sz = sizes[src] as usize;
+            region_sizes[dst] = sizes[src];
             if sz > 0 && off + sz <= data.len() {
-                ptrs[i] = unsafe { data.as_ptr().add(off) };
+                ptrs[dst] = unsafe { data.as_ptr().add(off) };
             }
         }
 
         let mut batch = unsafe {
-            Batch::from_regions(&ptrs[..nr], &region_sizes[..nr], count as usize, npc)
+            Batch::from_regions(&ptrs[..nr_mem], &region_sizes[..nr_mem], n, npc)
         };
         batch.set_schema(*schema);
         Ok((batch, bytes_consumed))
@@ -1467,7 +1475,7 @@ pub fn write_to_batch(
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
 
-    // Arena layout: [pk_lo | pk_hi | weight | null | col_0 | ... | col_{N-1}]
+    // Arena layout: [pk | weight | null | col_0 | ... | col_{N-1}]
     // Sized for max_rows; blob is separate.
     let (offsets, arena_size) = compute_offsets(&strides, nr, max_rows);
 
@@ -1484,14 +1492,14 @@ pub fn write_to_batch(
     let actual_blob;
     {
         // Carve non-overlapping mutable slices via split_at_mut.
+        let pk_sz = max_rows * 16;
+        let (pk, rest) = data.split_at_mut(pk_sz);
         let fixed = max_rows * 8;
-        let (pk_lo, rest) = data.split_at_mut(fixed);
-        let (pk_hi, rest) = rest.split_at_mut(fixed);
         let (weight, rest) = rest.split_at_mut(fixed);
         let (null_bmp, mut rest) = rest.split_at_mut(fixed);
 
-        let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - 4);
-        for &stride in strides[4..nr].iter() {
+        let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - 3);
+        for &stride in strides[3..nr].iter() {
             let col_sz = max_rows * stride as usize;
             let (col, new_rest) = rest.split_at_mut(col_sz);
             col_slices.push(col);
@@ -1499,7 +1507,7 @@ pub fn write_to_batch(
         }
 
         let mut writer = merge::DirectWriter::new(
-            pk_lo, pk_hi, weight, null_bmp,
+            pk, weight, null_bmp,
             col_slices, &mut blob, *schema,
         );
         write_fn(&mut writer);

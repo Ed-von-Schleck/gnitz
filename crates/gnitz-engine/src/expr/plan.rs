@@ -95,13 +95,10 @@ fn copy_column(
         let out_ci = payload_to_col(cm.dst_payload, out_pki);
         let stride = out_schema.columns[out_ci].size as usize;
         let dst = output.col_data_mut(cm.dst_payload);
-        if stride == 8 {
-            dst[..n * 8].copy_from_slice(in_batch.pk_lo_data());
-        } else {
-            for row in 0..n {
-                let pk_lo = in_batch.get_pk(row) as u64;
-                dst[row * stride..row * stride + 8].copy_from_slice(&pk_lo.to_le_bytes());
-            }
+        for row in 0..n {
+            let pk = in_batch.get_pk(row);
+            let bytes = pk.to_le_bytes();
+            dst[row * stride..row * stride + stride].copy_from_slice(&bytes[..stride]);
         }
     } else if cm.type_code == type_code::STRING {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
@@ -417,8 +414,7 @@ impl Plan {
         output.count = n;
 
         // System columns
-        output.pk_lo_data_mut().copy_from_slice(in_batch.pk_lo_data());
-        output.pk_hi_data_mut().copy_from_slice(in_batch.pk_hi_data());
+        output.pk_data_mut().copy_from_slice(in_batch.pk_data());
         output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 
         // Column moves

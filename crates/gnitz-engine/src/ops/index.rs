@@ -252,10 +252,9 @@ pub fn op_integrate_with_indexes(
             gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
                 avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
             for i in 0..avi_batch.count {
-                let lo = u64::from_le_bytes(avi_batch.pk_lo_data()[i*8..(i+1)*8].try_into().unwrap());
-                let hi = u64::from_le_bytes(avi_batch.pk_hi_data()[i*8..(i+1)*8].try_into().unwrap());
+                let pk = avi_batch.get_pk(i);
                 let w = i64::from_le_bytes(avi_batch.weight_data()[i*8..(i+1)*8].try_into().unwrap());
-                gnitz_debug!("  avi[{}]: pk_lo={:#x} pk_hi={:#x} w={}", i, lo, hi, w);
+                gnitz_debug!("  avi[{}]: pk={:#034x} w={}", i, pk, w);
             }
             let avi_table = unsafe { &mut *avi_desc.table };
             let avi_schema = avi_table.schema();

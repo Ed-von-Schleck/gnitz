@@ -359,8 +359,7 @@ pub fn op_null_extend(
     output.count = n;
 
     // Copy system columns
-    output.pk_lo_data_mut().copy_from_slice(batch.pk_lo_data());
-    output.pk_hi_data_mut().copy_from_slice(batch.pk_hi_data());
+    output.pk_data_mut().copy_from_slice(batch.pk_data());
     output.weight_data_mut().copy_from_slice(batch.weight_data());
 
     // Copy input payload columns

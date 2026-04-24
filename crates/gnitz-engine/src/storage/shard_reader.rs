@@ -1,8 +1,7 @@
 //! Memory-mapped columnar shard reader.
 //!
 //! Used by compaction (`compact.rs`) and query-time reads (`read_cursor.rs`).
-//! Supports shard format v3 (24-byte dir entries, all raw) and v4 (32-byte
-//! dir entries with per-region encoding byte).
+//! Supports shard format v5 (32-byte dir entries, unified 16-byte pk region).
 
 use std::ffi::CStr;
 use std::ptr;
@@ -99,8 +98,7 @@ pub struct MappedShard {
     /// of the `MappedShard`.
     mmap: Mmap,
     pub(crate) count: usize,
-    pub(crate) pk_lo: RegionView,
-    pub(crate) pk_hi: RegionView,
+    pub(crate) pk: RegionView,
     pub(crate) weight: RegionView,
     pub(crate) null_bmp: RegionView,
     /// Non-PK column regions indexed by payload position.
@@ -133,10 +131,9 @@ impl MappedShard {
             return Err(StorageError::InvalidMagic);
         }
         let version = read_u64_le(data, OFF_VERSION);
-        if version != SHARD_VERSION && version != SHARD_VERSION_V3 {
+        if version != SHARD_VERSION {
             return Err(StorageError::InvalidVersion);
         }
-        let dir_entry_size = if version >= 4 { DIR_ENTRY_SIZE } else { DIR_ENTRY_SIZE_V3 };
 
         let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
@@ -144,7 +141,7 @@ impl MappedShard {
         let num_cols = schema.num_columns as usize;
         let pk_index = schema.pk_index as usize;
         let num_non_pk = num_cols - 1;
-        let num_regions = 4 + num_non_pk + 1;
+        let num_regions = 3 + num_non_pk + 1;
 
         // Parse directory entries
         struct DirEntry {
@@ -156,30 +153,26 @@ impl MappedShard {
 
         let mut entries: Vec<DirEntry> = Vec::with_capacity(num_regions);
         for i in 0..num_regions {
-            let entry_off = dir_off + i * dir_entry_size;
-            if entry_off + dir_entry_size > file_size {
+            let entry_off = dir_off + i * DIR_ENTRY_SIZE;
+            if entry_off + DIR_ENTRY_SIZE > file_size {
                 return Err(StorageError::InvalidShard);
             }
             let r_off = read_u64_le(data, entry_off) as usize;
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
             let r_cs = read_u64_le(data, entry_off + 16);
 
-            let encoding = if version >= 4 {
-                let enc = data[entry_off + 24];
-                // Validate reserved bytes [25..32] are all zero
-                for b in &data[entry_off + 25..entry_off + 32] {
-                    if *b != 0 {
-                        return Err(StorageError::InvalidShard);
-                    }
-                }
-                // Validate known encoding
-                if enc != ENCODING_RAW && enc != ENCODING_CONSTANT && enc != ENCODING_TWO_VALUE {
+            let enc = data[entry_off + 24];
+            // Validate reserved bytes [25..32] are all zero
+            for b in &data[entry_off + 25..entry_off + 32] {
+                if *b != 0 {
                     return Err(StorageError::InvalidShard);
                 }
-                enc
-            } else {
-                ENCODING_RAW
-            };
+            }
+            // Validate known encoding
+            if enc != ENCODING_RAW && enc != ENCODING_CONSTANT && enc != ENCODING_TWO_VALUE {
+                return Err(StorageError::InvalidShard);
+            }
+            let encoding = enc;
 
             if r_off.saturating_add(r_sz) > file_size {
                 return Err(StorageError::InvalidShard);
@@ -223,10 +216,9 @@ impl MappedShard {
             }
         };
 
-        let pk_lo = build_region_view(&entries[0])?;
-        let pk_hi = build_region_view(&entries[1])?;
-        let weight = build_region_view(&entries[2])?;
-        let null_bmp = build_region_view(&entries[3])?;
+        let pk = build_region_view(&entries[0])?;
+        let weight = build_region_view(&entries[1])?;
+        let null_bmp = build_region_view(&entries[2])?;
 
         // has_ghosts: true if any row could have weight == 0.
         let has_ghosts = match &weight {
@@ -241,7 +233,7 @@ impl MappedShard {
 
         let mut col_to_payload = Vec::with_capacity(num_cols);
         let mut col_regions = Vec::with_capacity(num_non_pk);
-        let mut reg_idx = 4;
+        let mut reg_idx = 3;
         for ci in 0..num_cols {
             if ci == pk_index {
                 col_to_payload.push(usize::MAX);
@@ -265,8 +257,7 @@ impl MappedShard {
         Ok(MappedShard {
             mmap,
             count,
-            pk_lo,
-            pk_hi,
+            pk,
             weight,
             null_bmp,
             col_regions,
@@ -285,23 +276,12 @@ impl MappedShard {
 
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
-    }
-
-    #[inline]
-    fn get_pk_lo(&self, row: usize) -> u64 {
-        match &self.pk_lo {
-            RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
-            RegionView::TwoValue { .. } => unreachable!(),
-        }
-    }
-
-    #[inline]
-    fn get_pk_hi(&self, row: usize) -> u64 {
-        match &self.pk_hi {
-            RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
+        let data = self.data();
+        match &self.pk {
+            RegionView::Raw { offset, .. } => {
+                u128::from_le_bytes(data[offset + row * 16..offset + row * 16 + 16].try_into().unwrap())
+            }
+            RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -345,8 +325,7 @@ impl MappedShard {
     }
 
     /// Get a raw pointer to a column value, indexed by *logical* column index.
-    /// For the PK column, returns a pointer to the pk_lo region (always 8 bytes).
-    /// Callers requiring the full u128 PK must use get_pk_lo / get_pk_hi directly.
+    /// For the PK column, returns a pointer into the pk region (16 bytes).
     /// Returns null for out-of-range column indices.
     #[inline]
     pub fn col_ptr_by_logical(&self, row: usize, col_idx: usize, col_size: usize) -> *const u8 {
@@ -356,11 +335,11 @@ impl MappedShard {
         let payload_idx = self.col_to_payload[col_idx];
         let base = self.mmap.ptr;
         if payload_idx == usize::MAX {
-            // PK column
-            match &self.pk_lo {
+            // PK column (16 bytes)
+            match &self.pk {
                 RegionView::Raw { offset, .. } => {
-                    let off = offset + row * 8;
-                    if off + 8 > self.mmap.len {
+                    let off = offset + row * 16;
+                    if off + 16 > self.mmap.len {
                         return ptr::null();
                     }
                     return unsafe { base.add(off) };
@@ -490,15 +469,15 @@ impl MappedShard {
             }
         };
 
+        let sz16 = row_count * 16;
         let sz8 = row_count * 8;
-        expand_into(&self.pk_lo,    8, &mut data[offsets[0] as usize..][..sz8]);
-        expand_into(&self.pk_hi,    8, &mut data[offsets[1] as usize..][..sz8]);
-        expand_into(&self.weight,   8, &mut data[offsets[2] as usize..][..sz8]);
-        expand_into(&self.null_bmp, 8, &mut data[offsets[3] as usize..][..sz8]);
+        expand_into(&self.pk,       16, &mut data[offsets[0] as usize..][..sz16]);
+        expand_into(&self.weight,   8,  &mut data[offsets[1] as usize..][..sz8]);
+        expand_into(&self.null_bmp, 8,  &mut data[offsets[2] as usize..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
             let stride = col.size as usize;
-            let off = offsets[4 + pi] as usize;
+            let off = offsets[3 + pi] as usize;
             let sz = row_count * stride;
             expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }
@@ -556,90 +535,22 @@ impl super::columnar::ColumnarSource for MappedShard {
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::util::write_u64_le;
 
-    /// Build a minimal v3 shard file (24-byte dir entries) for backward-compat testing.
-    fn build_test_shard_v3(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
-        let path = dir.join("test.db");
-        let num_cols = 2usize;
-        let num_non_pk = num_cols - 1;
-        let num_regions = 4 + num_non_pk + 1;
-        let count = rows.len();
-        let dir_entry_size = DIR_ENTRY_SIZE_V3;
-        let dir_size = num_regions * dir_entry_size;
-        let dir_offset = HEADER_SIZE;
-        let alignment = 64;
-
-        let mut pk_lo = Vec::new();
-        let mut pk_hi = Vec::new();
-        let mut weights = Vec::new();
-        let mut null_bm = Vec::new();
-        let mut col1_data = Vec::new();
-
-        for &(pk, val) in rows {
-            pk_lo.extend_from_slice(&pk.to_le_bytes());
-            pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            weights.extend_from_slice(&1i64.to_le_bytes());
-            null_bm.extend_from_slice(&0u64.to_le_bytes());
-            col1_data.extend_from_slice(&val.to_le_bytes());
-        }
-        let blob: Vec<u8> = Vec::new();
-
-        let regions_data: Vec<&[u8]> = vec![&pk_lo, &pk_hi, &weights, &null_bm, &col1_data, &blob];
-
-        fn align(v: usize, a: usize) -> usize { (v + a - 1) & !(a - 1) }
-        let mut pos = align(dir_offset + dir_size, alignment);
-        let mut offsets = Vec::new();
-        for r in &regions_data {
-            offsets.push(pos);
-            pos = align(pos + r.len(), alignment);
-        }
-        let total = pos;
-
-        let mut image = vec![0u8; total];
-        write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
-        write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION_V3);
-        write_u64_le(&mut image, OFF_ROW_COUNT, count as u64);
-        write_u64_le(&mut image, OFF_DIR_OFFSET, dir_offset as u64);
-
-        for i in 0..num_regions {
-            let r_off = offsets[i];
-            let r_sz = regions_data[i].len();
-            image[r_off..r_off + r_sz].copy_from_slice(regions_data[i]);
-            let cs = if r_sz > 0 { crate::xxh::checksum(&image[r_off..r_off + r_sz]) } else { 0 };
-            let d = dir_offset + i * dir_entry_size;
-            write_u64_le(&mut image, d, r_off as u64);
-            write_u64_le(&mut image, d + 8, r_sz as u64);
-            write_u64_le(&mut image, d + 16, cs);
-        }
-
-        std::fs::write(&path, &image).unwrap();
-        path.to_str().unwrap().to_string()
-    }
-
-    /// Build a v4 shard via build_shard_image (uses encoding detection).
+    /// Build a v5 shard via build_shard_image (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
         let path = dir.join("test.db");
         let count = rows.len() as u32;
 
-        let mut pk_lo: Vec<u64> = Vec::new();
-        let mut pk_hi: Vec<u64> = Vec::new();
-        let mut weights: Vec<i64> = Vec::new();
-        let mut null_bm: Vec<u64> = Vec::new();
-        let mut col1_data: Vec<i64> = Vec::new();
-
-        for &(pk, val) in rows {
-            pk_lo.push(pk);
-            pk_hi.push(0);
-            weights.push(1);
-            null_bm.push(0);
-            col1_data.push(val);
-        }
+        let pk_bytes: Vec<u8> = rows.iter()
+            .flat_map(|&(pk, _)| (pk as u128).to_le_bytes())
+            .collect();
+        let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
+        let null_bm: Vec<u64> = rows.iter().map(|_| 0u64).collect();
+        let col1_data: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
         let blob: Vec<u8> = Vec::new();
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
-            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
             (col1_data.as_ptr() as *const u8, col1_data.len() * 8),
@@ -651,7 +562,7 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
-    /// Build a v4 shard with custom weights.
+    /// Build a v5 shard with custom weights.
     fn build_test_shard_weights(
         dir: &std::path::Path,
         name: &str,
@@ -661,13 +572,12 @@ mod tests {
     ) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
-        let pk_hi: Vec<u64> = vec![0; pks.len()];
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| (p as u128).to_le_bytes()).collect();
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (pks.as_ptr() as *const u8, pks.len() * 8),
-            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (pk_bytes.as_ptr(), pk_bytes.len()),
             (wts.as_ptr() as *const u8, wts.len() * 8),
             (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
             (vals.as_ptr() as *const u8, vals.len() * 8),
@@ -855,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_pk_hi_roundtrip() {
+    fn constant_pk_roundtrip() {
         crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 128;
@@ -916,26 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn v3_backward_compat() {
-        crate::util::raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64 * 100)).collect();
-        let path = build_test_shard_v3(dir.path(), &rows);
-        let schema = test_schema();
-        let cpath = std::ffi::CString::new(path).unwrap();
-
-        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert_eq!(shard.count, 5);
-        assert!(shard.has_ghosts); // v3 -> all Raw
-        for i in 0..5 {
-            assert_eq!(shard.get_pk(i), (i + 1) as u128);
-            assert_eq!(shard.get_weight(i), 1);
-            assert_eq!(shard.get_null_word(i), 0);
-        }
-        assert_eq!(shard.find_row_index(3), Some(2));
-    }
-
-    #[test]
     fn unknown_encoding_rejected() {
         crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
@@ -986,10 +876,10 @@ mod tests {
 
         // The weight region must be TwoValue.  Shrink its size field in the
         // directory entry so bitvec_len < ceil(n/8) = 8 bytes.  Weight
-        // region is entry index 2 in the directory.
+        // region is entry index 1 in the directory.
         let mut data = std::fs::read(&path).unwrap();
         let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        let weight_entry_off = dir_off + 2 * DIR_ENTRY_SIZE;
+        let weight_entry_off = dir_off + 1 * DIR_ENTRY_SIZE;
         let orig_size = read_u64_le(&data, weight_entry_off + 8);
         // Only write the two values (16 bytes), drop the bitvec.
         let truncated_size = 16u64;
@@ -1053,7 +943,7 @@ mod tests {
 
     #[test]
     fn to_owned_batch_constant_regions() {
-        // All weights = 1 (Constant), all pk_hi = 0 (Constant), all null = 0 (Constant)
+        // All weights = 1 (Constant), all null = 0 (Constant), all vals = 42 (Constant)
         crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 20;

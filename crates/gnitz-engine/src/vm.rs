@@ -794,10 +794,9 @@ pub fn execute_epoch(
             Instr::SeekTrace { trace_reg, key_reg } => {
                 let kb = &reg!(*key_reg).batch;
                 if kb.count > 0 {
-                    let key_lo = u64::from_le_bytes(kb.pk_lo_data()[..8].try_into().unwrap());
-                    let key_hi = u64::from_le_bytes(kb.pk_hi_data()[..8].try_into().unwrap());
+                    let key = kb.get_pk(0);
                     if let Some(cursor) = cursor_mut!(*trace_reg) {
-                        cursor.seek(crate::util::make_pk(key_lo, key_hi));
+                        cursor.seek(key);
                     }
                 }
             }
@@ -1177,7 +1176,7 @@ mod tests {
     fn extract_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
         let mut rows = Vec::new();
         for i in 0..b.count {
-            let pk_lo = u64::from_le_bytes(b.pk_lo_data()[i*8..(i+1)*8].try_into().unwrap());
+            let pk_lo = b.get_pk(i) as u64;
             let w = i64::from_le_bytes(b.weight_data()[i*8..(i+1)*8].try_into().unwrap());
             let c0 = i64::from_le_bytes(b.col_data(0)[i*8..(i+1)*8].try_into().unwrap());
             rows.push((pk_lo, w, c0));
@@ -2081,7 +2080,7 @@ mod tests {
 
         // After seeking to pk=5, scan should find pk=5 and pk=10 (2 rows from pk=5 onwards)
         assert!(result.count >= 2);
-        let pk0 = u64::from_le_bytes(result.pk_lo_data()[0..8].try_into().unwrap());
+        let pk0 = result.get_pk(0) as u64;
         assert_eq!(pk0, 5);
 
         unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }

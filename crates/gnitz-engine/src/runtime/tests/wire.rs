@@ -98,7 +98,7 @@ fn test_encode_decode_roundtrip_with_data() {
     assert!(decoded.data_batch.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
     assert_eq!(db.count, 1);
-    let pk = u64::from_le_bytes(db.pk_lo_data()[0..8].try_into().unwrap());
+    let pk = db.get_pk(0) as u64;
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);
@@ -304,7 +304,7 @@ fn encode_wire_into_roundtrip() {
     assert!(decoded.schema.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
     assert_eq!(db.count, 1);
-    let pk = u64::from_le_bytes(db.pk_lo_data()[0..8].try_into().unwrap());
+    let pk = db.get_pk(0) as u64;
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);

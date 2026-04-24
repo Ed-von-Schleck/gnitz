@@ -1,6 +1,6 @@
 //! In-memory N-way merge for MemTable consolidation.
 //!
-//! Operates on flat columnar buffers: pk_lo[u64], pk_hi[u64], weight[i64],
+//! Operates on flat columnar buffers: pk[u128 LE], weight[i64],
 //! null_bitmap[u64], payload columns, blob arena.
 //!
 //! The merge is a fused k-way merge + inline consolidation: rows with the same
@@ -46,8 +46,7 @@ impl<'a> std::ops::Deref for SortedMemBatch<'a> {
 
 #[derive(Clone)]
 pub struct MemBatch<'a> {
-    pub pk_lo: &'a [u8],     // count * 8
-    pub pk_hi: &'a [u8],     // count * 8
+    pub pk: &'a [u8],        // count * 16 (u128 LE per row)
     pub weight: &'a [u8],    // count * 8
     pub null_bmp: &'a [u8],  // count * 8
     pub col_data: Vec<&'a [u8]>,  // one slice per payload column
@@ -57,16 +56,8 @@ pub struct MemBatch<'a> {
 
 impl<'a> MemBatch<'a> {
     #[inline]
-    fn get_pk_lo(&self, row: usize) -> u64 {
-        read_u64_le(self.pk_lo, row * 8)
-    }
-    #[inline]
-    fn get_pk_hi(&self, row: usize) -> u64 {
-        read_u64_le(self.pk_hi, row * 8)
-    }
-    #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
+        u128::from_le_bytes(self.pk[row * 16..row * 16 + 16].try_into().unwrap())
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -146,8 +137,7 @@ impl MemBatchCursor {
 // ---------------------------------------------------------------------------
 
 pub struct DirectWriter<'a> {
-    pk_lo: &'a mut [u8],
-    pk_hi: &'a mut [u8],
+    pk: &'a mut [u8],
     weight: &'a mut [u8],
     null_bmp: &'a mut [u8],
     col_bufs: Vec<&'a mut [u8]>,
@@ -160,8 +150,7 @@ pub struct DirectWriter<'a> {
 
 impl<'a> DirectWriter<'a> {
     pub fn new(
-        pk_lo: &'a mut [u8],
-        pk_hi: &'a mut [u8],
+        pk: &'a mut [u8],
         weight: &'a mut [u8],
         null_bmp: &'a mut [u8],
         col_bufs: Vec<&'a mut [u8]>,
@@ -169,8 +158,7 @@ impl<'a> DirectWriter<'a> {
         schema: SchemaDescriptor,
     ) -> Self {
         DirectWriter {
-            pk_lo,
-            pk_hi,
+            pk,
             weight,
             null_bmp,
             col_bufs,
@@ -195,11 +183,9 @@ impl<'a> DirectWriter<'a> {
         self.count += 1;
 
         let pk = batch.get_pk(row);
-        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
         let null_word = batch.get_null_word(row);
 
-        self.pk_lo[out_row * 8..out_row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());
-        self.pk_hi[out_row * 8..out_row * 8 + 8].copy_from_slice(&pk_hi.to_le_bytes());
+        self.pk[out_row * 16..out_row * 16 + 16].copy_from_slice(&pk.to_le_bytes());
         self.weight[out_row * 8..out_row * 8 + 8].copy_from_slice(&weight.to_le_bytes());
         self.null_bmp[out_row * 8..out_row * 8 + 8].copy_from_slice(&null_word.to_le_bytes());
 
@@ -519,29 +505,30 @@ pub fn sort_only(
 }
 
 /// Parse a single batch from flat region arrays.
+///
+/// Region layout: pk (16-byte/row), weight, null_bmp,
+/// payload_col_0 .. payload_col_{N-1}, blob.
 pub unsafe fn parse_single_batch_from_regions<'a>(
     in_ptrs: &[*const u8],
     in_sizes: &[u32],
     count: usize,
     num_payload_cols: usize,
 ) -> MemBatch<'a> {
-    let pk_lo = std::slice::from_raw_parts(in_ptrs[0], in_sizes[0] as usize);
-    let pk_hi = std::slice::from_raw_parts(in_ptrs[1], in_sizes[1] as usize);
-    let weight = std::slice::from_raw_parts(in_ptrs[2], in_sizes[2] as usize);
-    let null_bmp = std::slice::from_raw_parts(in_ptrs[3], in_sizes[3] as usize);
+    let pk = std::slice::from_raw_parts(in_ptrs[0], in_sizes[0] as usize);
+    let weight = std::slice::from_raw_parts(in_ptrs[1], in_sizes[1] as usize);
+    let null_bmp = std::slice::from_raw_parts(in_ptrs[2], in_sizes[2] as usize);
 
     let mut col_data = Vec::with_capacity(num_payload_cols);
     for ci in 0..num_payload_cols {
-        let ri = 4 + ci;
+        let ri = 3 + ci;
         col_data.push(std::slice::from_raw_parts(in_ptrs[ri], in_sizes[ri] as usize));
     }
 
-    let blob_ri = 4 + num_payload_cols;
+    let blob_ri = 3 + num_payload_cols;
     let blob = std::slice::from_raw_parts(in_ptrs[blob_ri], in_sizes[blob_ri] as usize);
 
     MemBatch {
-        pk_lo,
-        pk_hi,
+        pk,
         weight,
         null_bmp,
         col_data,
@@ -578,42 +565,43 @@ mod tests {
         }
     }
 
-    fn make_batch_i64(rows: &[(u64, u64, i64, i64)]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn make_batch_i64(rows: &[(u64, u64, i64, i64)]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let n = rows.len();
-        let mut pk_lo = Vec::with_capacity(n * 8);
-        let mut pk_hi = Vec::with_capacity(n * 8);
+        let mut pk = Vec::with_capacity(n * 16);
         let mut weight = Vec::with_capacity(n * 8);
         let mut null_bmp = Vec::with_capacity(n * 8);
         let mut col0 = Vec::with_capacity(n * 8);
 
         for &(lo, hi, w, val) in rows {
-            pk_lo.extend_from_slice(&lo.to_le_bytes());
-            pk_hi.extend_from_slice(&hi.to_le_bytes());
+            let pk_val = crate::util::make_pk(lo, hi);
+            pk.extend_from_slice(&pk_val.to_le_bytes());
             weight.extend_from_slice(&w.to_le_bytes());
             null_bmp.extend_from_slice(&0u64.to_le_bytes());
             col0.extend_from_slice(&val.to_le_bytes());
         }
 
-        (pk_lo, pk_hi, weight, null_bmp, col0)
+        (pk, weight, null_bmp, col0)
     }
 
     fn to_mem_batch<'a>(
-        pk_lo: &'a [u8],
-        pk_hi: &'a [u8],
+        pk: &'a [u8],
         weight: &'a [u8],
         null_bmp: &'a [u8],
         col0: &'a [u8],
         count: usize,
     ) -> MemBatch<'a> {
         MemBatch {
-            pk_lo,
-            pk_hi,
+            pk,
             weight,
             null_bmp,
             col_data: vec![col0],
             blob: &[],
             count,
         }
+    }
+
+    fn read_pk_u128(out_pk: &[u8], i: usize) -> u128 {
+        u128::from_le_bytes(out_pk[i * 16..(i + 1) * 16].try_into().unwrap())
     }
 
     // Takes &[MemBatch] so test call sites don't need to construct SortedMemBatch.
@@ -625,8 +613,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.count).sum();
         let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
 
-        let mut out_pk_lo = vec![0u8; total_rows * 8];
-        let mut out_pk_hi = vec![0u8; total_rows * 8];
+        let mut out_pk = vec![0u8; total_rows * 16];
         let mut out_weight = vec![0u8; total_rows * 8];
         let mut out_null = vec![0u8; total_rows * 8];
         let mut out_col0 = vec![0u8; total_rows * 8];
@@ -635,8 +622,7 @@ mod tests {
 
         {
             let mut writer = DirectWriter {
-                pk_lo: &mut out_pk_lo,
-                pk_hi: &mut out_pk_hi,
+                pk: &mut out_pk,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -652,8 +638,9 @@ mod tests {
             let count = writer.row_count();
             let mut result = Vec::with_capacity(count);
             for i in 0..count {
-                let lo = read_u64_le(&out_pk_lo, i * 8);
-                let hi = read_u64_le(&out_pk_hi, i * 8);
+                let pk = read_pk_u128(&out_pk, i);
+                let lo = pk as u64;
+                let hi = (pk >> 64) as u64;
                 let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
                 let v = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
                 result.push((lo, hi, w, v));
@@ -665,12 +652,12 @@ mod tests {
     #[test]
     fn test_single_batch_passthrough() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, weight, null_bmp, col0) = make_batch_i64(&[
+        let (pk, weight, null_bmp, col0) = make_batch_i64(&[
             (10, 0, 1, 100),
             (20, 0, 1, 200),
             (30, 0, 1, 300),
         ]);
-        let batch = to_mem_batch(&pk_lo, &pk_hi, &weight, &null_bmp, &col0, 3);
+        let batch = to_mem_batch(&pk, &weight, &null_bmp, &col0, 3);
         let result = run_merge(&[batch], &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (10, 0, 1, 100));
@@ -681,16 +668,16 @@ mod tests {
     #[test]
     fn test_two_batch_interleave() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
             (30, 0, 1, 300),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (20, 0, 1, 200),
             (40, 0, 1, 400),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 2);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 2);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 2);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 2);
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], (10, 0, 1, 100));
@@ -702,14 +689,14 @@ mod tests {
     #[test]
     fn test_consolidation_same_pk_same_payload() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (10, 0, 2, 100),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 1);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 1);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 1);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 1);
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (10, 0, 3, 100));
@@ -718,14 +705,14 @@ mod tests {
     #[test]
     fn test_consolidation_cancellation() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (10, 0, -1, 100),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 1);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 1);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 1);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 1);
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 0);
     }
@@ -733,14 +720,14 @@ mod tests {
     #[test]
     fn test_same_pk_different_payload() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (10, 0, 1, 200),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 1);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 1);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 1);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 1);
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 10);
@@ -750,21 +737,21 @@ mod tests {
     #[test]
     fn test_three_way_merge() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
             (40, 0, 1, 400),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (20, 0, 1, 200),
             (50, 0, 1, 500),
         ]);
-        let (pk_lo3, pk_hi3, w3, n3, c3) = make_batch_i64(&[
+        let (pk3, w3, n3, c3) = make_batch_i64(&[
             (30, 0, 1, 300),
             (60, 0, 1, 600),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 2);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 2);
-        let b3 = to_mem_batch(&pk_lo3, &pk_hi3, &w3, &n3, &c3, 2);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 2);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 2);
+        let b3 = to_mem_batch(&pk3, &w3, &n3, &c3, 2);
         let result = run_merge(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 6);
         let pks: Vec<u64> = result.iter().map(|r| r.0).collect();
@@ -782,18 +769,17 @@ mod tests {
     fn test_one_empty_one_nonempty() {
         let schema = make_schema_i64();
         let empty = MemBatch {
-            pk_lo: &[],
-            pk_hi: &[],
+            pk: &[],
             weight: &[],
             null_bmp: &[],
             col_data: vec![&[]],
             blob: &[],
             count: 0,
         };
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (10, 0, 1, 100),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 1);
+        let b = to_mem_batch(&pk, &w, &n, &c, 1);
         let result = run_merge(&[empty, b], &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (10, 0, 1, 100));
@@ -803,21 +789,21 @@ mod tests {
     fn test_partial_cancellation_three_batches() {
         let schema = make_schema_i64();
         // Insert PK=10 w=+1, PK=20 w=+1
-        let (pk1, ph1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
             (20, 0, 1, 200),
         ]);
         // Delete PK=10 w=-1
-        let (pk2, ph2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (10, 0, -1, 100),
         ]);
         // Insert PK=30 w=+1
-        let (pk3, ph3, w3, n3, c3) = make_batch_i64(&[
+        let (pk3, w3, n3, c3) = make_batch_i64(&[
             (30, 0, 1, 300),
         ]);
-        let b1 = to_mem_batch(&pk1, &ph1, &w1, &n1, &c1, 2);
-        let b2 = to_mem_batch(&pk2, &ph2, &w2, &n2, &c2, 1);
-        let b3 = to_mem_batch(&pk3, &ph3, &w3, &n3, &c3, 1);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 2);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 1);
+        let b3 = to_mem_batch(&pk3, &w3, &n3, &c3, 1);
         let result = run_merge(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (20, 0, 1, 200));
@@ -827,14 +813,14 @@ mod tests {
     #[test]
     fn test_pk_hi_differentiation() {
         let schema = make_schema_i64();
-        let (pk_lo1, pk_hi1, w1, n1, c1) = make_batch_i64(&[
+        let (pk1, w1, n1, c1) = make_batch_i64(&[
             (10, 0, 1, 100),
         ]);
-        let (pk_lo2, pk_hi2, w2, n2, c2) = make_batch_i64(&[
+        let (pk2, w2, n2, c2) = make_batch_i64(&[
             (10, 1, 1, 200),
         ]);
-        let b1 = to_mem_batch(&pk_lo1, &pk_hi1, &w1, &n1, &c1, 1);
-        let b2 = to_mem_batch(&pk_lo2, &pk_hi2, &w2, &n2, &c2, 1);
+        let b1 = to_mem_batch(&pk1, &w1, &n1, &c1, 1);
+        let b2 = to_mem_batch(&pk2, &w2, &n2, &c2, 1);
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (10, 0, 1, 100));
@@ -848,21 +834,20 @@ mod tests {
         for _ in 0..5 {
             all_rows.push((42, 0, 1i64, 999i64));
         }
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&all_rows);
+        let (pk, w, n, c) = make_batch_i64(&all_rows);
         // Put them in 5 separate single-row batches
         let mut batches = Vec::new();
         let mut bufs = Vec::new();
         for i in 0..5 {
             bufs.push((
-                pk_lo[i * 8..(i + 1) * 8].to_vec(),
-                pk_hi[i * 8..(i + 1) * 8].to_vec(),
+                pk[i * 16..(i + 1) * 16].to_vec(),
                 w[i * 8..(i + 1) * 8].to_vec(),
                 n[i * 8..(i + 1) * 8].to_vec(),
                 c[i * 8..(i + 1) * 8].to_vec(),
             ));
         }
         for buf in &bufs {
-            batches.push(to_mem_batch(&buf.0, &buf.1, &buf.2, &buf.3, &buf.4, 1));
+            batches.push(to_mem_batch(&buf.0, &buf.1, &buf.2, &buf.3, 1));
         }
         let result = run_merge(&batches, &schema);
         assert_eq!(result.len(), 1);
@@ -872,11 +857,11 @@ mod tests {
     #[test]
     fn test_weight_zero_skip() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (10, 0, 0, 100),
             (20, 0, 1, 200),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         let result = run_merge(&[b], &schema);
         // Zero-weight rows just pass through the merge (they don't get consolidated out
         // unless they cancel with another row). A single zero-weight row is still zero.
@@ -904,7 +889,7 @@ mod tests {
         }
         let batches: Vec<MemBatch> = bufs
             .iter()
-            .map(|(pk_lo, pk_hi, w, n, c)| to_mem_batch(pk_lo, pk_hi, w, n, c, 10))
+            .map(|(pk, w, n, c)| to_mem_batch(pk, w, n, c, 10))
             .collect();
         let result = run_merge(&batches, &schema);
         assert_eq!(result.len(), 100);
@@ -917,12 +902,12 @@ mod tests {
     fn test_within_cursor_duplicates() {
         // Two rows with the same PK within a single sorted batch
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (10, 0, 1, 100),
             (10, 0, 1, 100),
             (20, 0, 1, 200),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_merge(&[b], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (10, 0, 2, 100));
@@ -933,12 +918,12 @@ mod tests {
     fn test_within_cursor_dup_different_payload() {
         // Two rows with same PK but different payload within one batch
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (10, 0, 1, 100),
             (10, 0, 1, 200),
             (20, 0, 1, 300),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_merge(&[b], &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (10, 0, 1, 100));
@@ -954,8 +939,7 @@ mod tests {
         let n = batch.count;
         let total_blob = batch.blob.len();
 
-        let mut out_pk_lo = vec![0u8; n * 8];
-        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_pk = vec![0u8; n * 16];
         let mut out_weight = vec![0u8; n * 8];
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
@@ -965,8 +949,7 @@ mod tests {
         let count;
         {
             let mut writer = DirectWriter {
-                pk_lo: &mut out_pk_lo,
-                pk_hi: &mut out_pk_hi,
+                pk: &mut out_pk,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -982,8 +965,9 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let lo = read_u64_le(&out_pk_lo, i * 8);
-            let hi = read_u64_le(&out_pk_hi, i * 8);
+            let pk = read_pk_u128(&out_pk, i);
+            let lo = pk as u64;
+            let hi = (pk >> 64) as u64;
             let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
             let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
             result.push((lo, hi, w, val));
@@ -995,7 +979,7 @@ mod tests {
     fn test_consolidate_empty() {
         let schema = make_schema_i64();
         let b = MemBatch {
-            pk_lo: &[], pk_hi: &[], weight: &[], null_bmp: &[],
+            pk: &[], weight: &[], null_bmp: &[],
             col_data: vec![&[]], blob: &[], count: 0,
         };
         let result = run_consolidate(&b, &schema);
@@ -1005,8 +989,8 @@ mod tests {
     #[test]
     fn test_consolidate_single_row() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[(5, 0, 1, 42)]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 1);
+        let (pk, w, n, c) = make_batch_i64(&[(5, 0, 1, 42)]);
+        let b = to_mem_batch(&pk, &w, &n, &c, 1);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (5, 0, 1, 42));
@@ -1015,12 +999,12 @@ mod tests {
     #[test]
     fn test_consolidate_already_sorted_no_dups() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (1, 0, 1, 10),
             (2, 0, 1, 20),
             (3, 0, 1, 30),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (1, 0, 1, 10));
@@ -1031,12 +1015,12 @@ mod tests {
     #[test]
     fn test_consolidate_unsorted_no_dups() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (3, 0, 1, 30),
             (1, 0, 1, 10),
             (2, 0, 1, 20),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 3);
         // Should be sorted by PK
@@ -1049,11 +1033,11 @@ mod tests {
     fn test_consolidate_dup_weight_accumulation() {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and +1 → merged to +2
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (5, 0, 1, 42),
             (5, 0, 1, 42),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (5, 0, 2, 42));
@@ -1063,11 +1047,11 @@ mod tests {
     fn test_consolidate_ghost_elimination() {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and -1 → ghost, eliminated
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (5, 0, 1, 42),
             (5, 0, -1, 42),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
     }
@@ -1076,11 +1060,11 @@ mod tests {
     fn test_consolidate_same_pk_different_payload() {
         let schema = make_schema_i64();
         // Same PK but different payloads → both survive, sorted by payload
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (5, 0, 1, 200),
             (5, 0, 1, 100),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 2);
         // Sorted by payload (I64 signed comparison: 100 < 200)
@@ -1092,13 +1076,13 @@ mod tests {
     fn test_consolidate_unsorted_mixed() {
         let schema = make_schema_i64();
         // Unsorted: insert + retract + different PKs
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (10, 0, 1, 100),   // insert pk=10 val=100
             (5, 0, 1, 50),     // insert pk=5 val=50
             (10, 0, -1, 100),  // retract pk=10 val=100
             (5, 0, 1, 50),     // duplicate insert pk=5 val=50
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 4);
+        let b = to_mem_batch(&pk, &w, &n, &c, 4);
         let result = run_consolidate(&b, &schema);
         // pk=10 val=100: +1-1=0 → ghost
         // pk=5 val=50: +1+1=+2
@@ -1109,13 +1093,13 @@ mod tests {
     #[test]
     fn test_consolidate_all_cancel() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (1, 0, 1, 10),
             (1, 0, -1, 10),
             (2, 0, 3, 20),
             (2, 0, -3, 20),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 4);
+        let b = to_mem_batch(&pk, &w, &n, &c, 4);
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
     }
@@ -1128,8 +1112,7 @@ mod tests {
         let n = batch.count;
         let total_blob = batch.blob.len();
 
-        let mut out_pk_lo = vec![0u8; n * 8];
-        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_pk = vec![0u8; n * 16];
         let mut out_weight = vec![0u8; n * 8];
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
@@ -1139,8 +1122,7 @@ mod tests {
         let count;
         {
             let mut writer = DirectWriter {
-                pk_lo: &mut out_pk_lo,
-                pk_hi: &mut out_pk_hi,
+                pk: &mut out_pk,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1156,8 +1138,9 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let lo = read_u64_le(&out_pk_lo, i * 8);
-            let hi = read_u64_le(&out_pk_hi, i * 8);
+            let pk = read_pk_u128(&out_pk, i);
+            let lo = pk as u64;
+            let hi = (pk >> 64) as u64;
             let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
             let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
             result.push((lo, hi, w, val));
@@ -1168,12 +1151,12 @@ mod tests {
     #[test]
     fn test_sort_unsorted() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (3, 0, 1, 30),
             (1, 0, 1, 10),
             (2, 0, 1, 20),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_sort(&b, &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (1, 0, 1, 10));
@@ -1185,12 +1168,12 @@ mod tests {
     fn test_sort_preserves_duplicates() {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and -1 — both MUST survive (no consolidation)
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (5, 0, -1, 42),
             (5, 0, 1, 42),
             (10, 0, 1, 100),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         let result = run_sort(&b, &schema);
         assert_eq!(result.len(), 3); // ALL rows preserved
         assert_eq!(result[0].0, 5);
@@ -1201,11 +1184,11 @@ mod tests {
     #[test]
     fn test_sort_already_sorted() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (1, 0, 1, 10),
             (2, 0, 1, 20),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         let result = run_sort(&b, &schema);
         assert_eq!(result, vec![(1, 0, 1, 10), (2, 0, 1, 20)]);
     }
@@ -1222,8 +1205,7 @@ mod tests {
     ) -> Vec<(u64, u64, i64, i64)> {
         let n = indices.len();
         let total_blob = batch.blob.len();
-        let mut out_pk_lo = vec![0u8; n * 8];
-        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_pk = vec![0u8; n * 16];
         let mut out_weight = vec![0u8; n * 8];
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
@@ -1233,8 +1215,7 @@ mod tests {
         let count;
         {
             let mut writer = DirectWriter {
-                pk_lo: &mut out_pk_lo,
-                pk_hi: &mut out_pk_hi,
+                pk: &mut out_pk,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1250,8 +1231,9 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let lo = read_u64_le(&out_pk_lo, i * 8);
-            let hi = read_u64_le(&out_pk_hi, i * 8);
+            let pk = read_pk_u128(&out_pk, i);
+            let lo = pk as u64;
+            let hi = (pk >> 64) as u64;
             let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
             let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
             result.push((lo, hi, w, val));
@@ -1262,12 +1244,12 @@ mod tests {
     #[test]
     fn test_scatter_basic() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (1, 0, 1, 10),
             (2, 0, 1, 20),
             (3, 0, 1, 30),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let b = to_mem_batch(&pk, &w, &n, &c, 3);
         // Pick rows 2 and 0 (out of order)
         let result = run_scatter(&b, &[2, 0], &[], &schema);
         assert_eq!(result.len(), 2);
@@ -1278,8 +1260,8 @@ mod tests {
     #[test]
     fn test_scatter_empty_indices() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[(1, 0, 1, 10)]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 1);
+        let (pk, w, n, c) = make_batch_i64(&[(1, 0, 1, 10)]);
+        let b = to_mem_batch(&pk, &w, &n, &c, 1);
         let result = run_scatter(&b, &[], &[], &schema);
         assert_eq!(result.len(), 0);
     }
@@ -1287,11 +1269,11 @@ mod tests {
     #[test]
     fn test_scatter_with_explicit_weights() {
         let schema = make_schema_i64();
-        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+        let (pk, w, n, c) = make_batch_i64(&[
             (1, 0, 1, 10),
             (2, 0, 1, 20),
         ]);
-        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let b = to_mem_batch(&pk, &w, &n, &c, 2);
         // Override weights: row 1 gets w=5, row 0 gets w=-1
         let result = run_scatter(&b, &[1, 0], &[5, -1], &schema);
         assert_eq!(result[0], (2, 0, 5, 20));
