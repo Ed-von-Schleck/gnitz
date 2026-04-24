@@ -3,9 +3,15 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_joins.py -v --tb=short
 """
+import os
 import random
 import pytest
 import gnitz
+
+_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
+_NEEDS_MULTI = pytest.mark.skipif(
+    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
+)
 
 
 def _uid():
@@ -305,3 +311,51 @@ class TestJoins:
             assert len(rows) == 6, f"expected 6 cross-product rows, got {len(rows)}"
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
+
+    @_NEEDS_MULTI
+    def test_inner_join_wide_u64_pks_multiworker(self, client):
+        """Inner join on BIGINT PK columns distributed across multiple workers.
+
+        Both tables use U64 PKs (narrow physical representation). Rows are
+        spread across workers by hash-partitioning. Verifies that exchange
+        routing, narrow PK encode/decode, and join produce the correct
+        cross-matched result with no duplicates or missing rows.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE left_t "
+                "(id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, lval BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE right_t "
+                "(id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, rval BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS "
+                "SELECT left_t.id AS lid, right_t.id AS rid, left_t.lval, right_t.rval "
+                "FROM left_t JOIN right_t ON left_t.fk = right_t.fk",
+                schema_name=sn,
+            )
+            # Use a range of PKs that span multiple hash buckets / workers.
+            n = 20
+            left_vals = ", ".join(f"({i}, {i % 5}, {i * 10})" for i in range(1, n + 1))
+            right_vals = ", ".join(f"({i + 100}, {i % 5}, {i * 100})" for i in range(1, n + 1))
+            client.execute_sql(f"INSERT INTO left_t VALUES {left_vals}", schema_name=sn)
+            client.execute_sql(f"INSERT INTO right_t VALUES {right_vals}", schema_name=sn)
+
+            vid = client.resolve_table(sn, "v")[0]
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            # Each fk value (0..4) appears 4 times on each side → 16 join pairs per group.
+            # fk=0: left ids where i%5==0: {5,10,15,20} (4), right same fk: 4 → 16 pairs
+            # total = 5 groups × 16 = 80? No: n=20 gives fk values 1,2,3,4,0 (each 4 times)
+            # so 5 fk groups × (4 left × 4 right) = 80 rows.
+            assert len(rows) == 80, f"expected 80 join rows, got {len(rows)}"
+            # All output PKs (lid field) must be in range [1, n]
+            lids = {r[1] for r in rows}
+            assert lids == set(range(1, n + 1)), f"unexpected lids: {lids}"
+        finally:
+            _cleanup(client, sn, tables=["left_t", "right_t"], views=["v"])

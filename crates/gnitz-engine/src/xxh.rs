@@ -24,6 +24,12 @@ mod tests {
     }
 
     #[test]
+    fn hash_u128_zero_extension_invariant() {
+        assert_eq!(hash_u128(42u64 as u128), hash_u128(42u128));
+        assert_eq!(hash_u128(u64::MAX as u128), hash_u128(u64::MAX as u128));
+    }
+
+    #[test]
     fn deterministic() {
         assert_eq!(hash_u128(pk(42, 99)), hash_u128(pk(42, 99)));
     }

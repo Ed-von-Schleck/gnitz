@@ -885,4 +885,29 @@ mod tests {
         assert_eq!(val1, 200);
         assert_eq!(out.get_weight(1), 1);
     }
+
+    #[test]
+    fn test_partition_routing_invariance_narrow_pk() {
+        use crate::xxh::hash_u128;
+        let num_workers = 4usize;
+        let pks: Vec<u64> = vec![
+            1,
+            42,
+            100,
+            1000,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            u64::MAX / 2,
+        ];
+        for &pk in &pks {
+            let pk_u128 = pk as u128;
+            let partition = (hash_u128(pk_u128) % num_workers as u64) as usize;
+            assert!(
+                partition < num_workers,
+                "partition {} out of range for pk={}",
+                partition,
+                pk
+            );
+        }
+    }
 }

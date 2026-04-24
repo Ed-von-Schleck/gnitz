@@ -951,6 +951,48 @@ def _push_then_insert_child(server_path, sn, tid, n_bulk):
 
 
 @_NEEDS_MULTI
+def test_partition_balance_wide_u64_range(client):
+    """Push U64 PKs spanning a wide range; verify all rows are present on scan.
+
+    Uses PKs drawn from low, mid, and high regions of the U64 space to
+    exercise the XXH3-based hash partitioning with narrow (8-byte) PK storage.
+    The scan result must contain every inserted PK exactly once.
+    """
+    sn = "pb" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        # PKs from low, mid, and high ranges of u64 (cast to signed BIGINT for SQL)
+        import ctypes
+        def _to_signed(v):
+            return ctypes.c_int64(v).value
+
+        low_pks = list(range(1, 33))
+        mid_val = (1 << 32)
+        mid_pks = [mid_val + i for i in range(32)]
+        high_val = (1 << 62)
+        high_pks = [high_val + i for i in range(32)]
+        all_pks = low_pks + mid_pks + high_pks
+
+        vals = ", ".join(f"({_to_signed(pk)}, {pk & 0xFFFF})" for pk in all_pks)
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        tid, _ = client.resolve_table(sn, "t")
+        result = client.scan(tid)
+        returned_pks = sorted(
+            ctypes.c_uint64(r.pk).value for r in result if r.weight > 0
+        )
+        assert returned_pks == sorted(all_pks), (
+            f"expected {len(all_pks)} distinct PKs, got {len(returned_pks)}"
+        )
+    finally:
+        _drop_all(client, sn, tables=["t"])
+
+
+@_NEEDS_MULTI
 def test_push_then_insert_sql_with_view_no_deadlock(client, server):
     """Bulk push (kicks off async tick) immediately followed by INSERT VALUES.
 
