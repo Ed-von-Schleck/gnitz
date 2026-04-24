@@ -12,7 +12,7 @@ mod helpers;
 use std::os::unix::io::RawFd;
 
 use gnitz_core::{GnitzClient, SCHEMA_TAB};
-use gnitz_protocol::{
+use gnitz_core::{
     Header,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     STATUS_OK, STATUS_ERROR,

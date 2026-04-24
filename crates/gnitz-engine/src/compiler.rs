@@ -81,7 +81,7 @@ struct CircuitGraph {
     opcode_of: HashMap<i32, i32>,
     ordered: Vec<i32>,
     outgoing: HashMap<i32, Vec<(i32, i32)>>, // node_id → [(dst, port)]
-    incoming: HashMap<i32, Vec<i32>>,        // node_id → [src_ids]
+    incoming: HashMap<i32, Vec<(i32, i32)>>, // node_id → [(src, port)]
     consumers: HashMap<i32, Vec<i32>>,       // node_id → [consumer_ids]
 }
 
@@ -141,8 +141,8 @@ pub fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescr
     }
     match col_size {
         8 => i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) }),
-        4 => (unsafe { *(ptr as *const i32) }) as i64,
-        2 => (unsafe { *(ptr as *const i16) }) as i64,
+        4 => i32::from_le_bytes(unsafe { *(ptr as *const [u8; 4]) }) as i64,
+        2 => i16::from_le_bytes(unsafe { *(ptr as *const [u8; 2]) }) as i64,
         1 => (unsafe { *ptr }) as i8 as i64,
         _ => 0,
     }
@@ -159,8 +159,8 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
 
     // German string layout: [length:u32][prefix:4bytes][payload:8bytes]
     // If length <= 12: inline (prefix + first 8 bytes of payload)
-    // If length > 12: prefix + offset(u32) into blob arena
-    let length = unsafe { *(ptr as *const u32) } as usize;
+    // If length > 12: prefix + offset(u64) into blob arena
+    let length = u32::from_le_bytes(unsafe { *(ptr as *const [u8; 4]) }) as usize;
     if length == 0 {
         return Vec::new();
     }
@@ -173,10 +173,10 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
         buf
     } else {
         // Long string: 4 bytes prefix at ptr+4, then blob offset (u64) at ptr+8
-        let blob_offset = unsafe { *(ptr.add(8) as *const u64) } as usize;
+        let blob_offset = u64::from_le_bytes(unsafe { *(ptr.add(8) as *const [u8; 8]) }) as usize;
         let blob_ptr = cursor.blob_ptr();
         let blob_len = cursor.blob_len();
-        if blob_ptr.is_null() || blob_offset + length > blob_len {
+        if blob_ptr.is_null() || blob_offset.checked_add(length).map_or(true, |end| end > blob_len) {
             return Vec::new();
         }
         let mut buf = vec![0u8; length];
@@ -360,7 +360,7 @@ fn topo_sort(graph: &mut CircuitGraph) -> Result<(), i32> {
 
     for e in &graph.edges {
         graph.outgoing.entry(e.src).or_default().push((e.dst, e.port));
-        graph.incoming.entry(e.dst).or_default().push(e.src);
+        graph.incoming.entry(e.dst).or_default().push((e.src, e.port));
         graph.consumers.entry(e.src).or_default().push(e.dst);
         *in_degree.entry(e.dst).or_insert(0) += 1;
     }
@@ -509,7 +509,7 @@ fn propagate_distinct(graph: &CircuitGraph, ann: &mut Annotation) {
             ann.is_distinct_at.insert(nid);
         } else if op == OPCODE_FILTER {
             let in_nids = graph.incoming.get(&nid).cloned().unwrap_or_default();
-            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0]) {
+            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
                 ann.is_distinct_at.insert(nid);
             }
         } else if op == OPCODE_MAP {
@@ -517,7 +517,7 @@ fn propagate_distinct(graph: &CircuitGraph, ann: &mut Annotation) {
             let reindex = node_params.and_then(|p| p.get(&PARAM_REINDEX_COL)).copied().unwrap_or(-1);
             if reindex < 0 {
                 let in_nids = graph.incoming.get(&nid).cloned().unwrap_or_default();
-                if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0]) {
+                if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
                     ann.is_distinct_at.insert(nid);
                 }
             }
@@ -630,7 +630,7 @@ fn opt_distinct(graph: &CircuitGraph, ann: &Annotation, rw: &mut Rewrites) {
     for n in &graph.nodes {
         if n.opcode == OPCODE_DISTINCT {
             let in_nids = graph.incoming.get(&n.id).cloned().unwrap_or_default();
-            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0]) {
+            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
                 rw.skip_nodes.insert(n.id);
             }
         }
@@ -652,7 +652,7 @@ fn opt_fold_reduce_map(
         if in_nids.len() != 1 {
             continue;
         }
-        let reduce_nid = in_nids[0];
+        let reduce_nid = in_nids[0].0;
         if graph.opcode_of.get(&reduce_nid) != Some(&OPCODE_REDUCE) {
             continue;
         }
@@ -702,6 +702,10 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
 
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    let total = left.num_columns as usize + right.num_columns as usize - 1;
+    assert!(total <= 64,
+        "join output schema exceeds 64-column limit: {} + {} - 1 = {}",
+        left.num_columns, right.num_columns, total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
     // PK from left
@@ -727,6 +731,10 @@ fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> 
 }
 
 fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    let total = left.num_columns as usize + right.num_columns as usize - 1;
+    assert!(total <= 64,
+        "join output schema exceeds 64-column limit: {} + {} - 1 = {}",
+        left.num_columns, right.num_columns, total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
     out.columns[ci] = left.columns[left.pk_index as usize];
@@ -950,6 +958,7 @@ struct EmitState {
     next_extra_reg: i32,
     sink_reg_id: i32,
     input_delta_reg_id: i32,
+    emit_failed: bool,
 }
 
 /// Emit instructions for a single circuit node.
@@ -1159,6 +1168,8 @@ fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_schema = reg_schemas[in_reg as usize];
             let n_cols = node_params.get(&PARAM_NULL_EXTEND_COUNT).copied().unwrap_or(0) as usize;
+            assert!(n_cols < 64,
+                "NULL_EXTEND n_cols={} would overflow schema array (max 63)", n_cols);
             // Build right schema from type codes stored in params
             let mut right = empty_schema();
             right.columns[0] = col(type_code::U128, 16, false); // dummy PK
@@ -1200,7 +1211,7 @@ fn emit_node(
             let child_name = format!("_hist_{}_{}", view_id, nid);
             let hist_table = match create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => { state.emit_failed = true; return; }
             };
             let table_idx = owned_tables.len();
             owned_tables.push(Box::new(hist_table));
@@ -1326,10 +1337,10 @@ fn emit_node(
 
 fn compute_in_regs(graph: &CircuitGraph, nid: i32, out_reg_of: &HashMap<i32, i32>) -> HashMap<i32, i32> {
     let mut in_regs = HashMap::new();
-    for e in &graph.edges {
-        if e.dst == nid {
-            if let Some(&reg) = out_reg_of.get(&e.src) {
-                in_regs.insert(e.port, reg);
+    if let Some(in_edges) = graph.incoming.get(&nid) {
+        for &(src, port) in in_edges {
+            if let Some(&reg) = out_reg_of.get(&src) {
+                in_regs.insert(port, reg);
             }
         }
     }
@@ -1412,7 +1423,7 @@ fn emit_reduce(
     // Create trace table (output history)
     let trace_table = match create_child_table(view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id) {
         Ok(t) => t,
-        Err(_) => return,
+        Err(_) => { state.emit_failed = true; return; }
     };
     let trace_table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
@@ -1457,7 +1468,7 @@ fn emit_reduce(
             view_dir, &format!("_reduce_in_{}_{}", view_id, nid), in_reg_schema, view_table_id,
         ) {
             Ok(t) => t,
-            Err(_) => return,
+            Err(_) => { state.emit_failed = true; return; }
         };
         let idx = owned_tables.len();
         owned_tables.push(Box::new(tr_in));
@@ -1636,7 +1647,7 @@ fn emit_gather_reduce(
         view_dir, &format!("_gather_{}_{}", view_id, nid), partial_schema, view_table_id,
     ) {
         Ok(t) => t,
-        Err(_) => return,
+        Err(_) => { state.emit_failed = true; return; }
     };
     let table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
@@ -1750,6 +1761,7 @@ fn build_plan(
         next_extra_reg: next_reg,
         sink_reg_id: -1,
         input_delta_reg_id: if exchange_input_reg_id >= 0 { exchange_input_reg_id } else { -1 },
+        emit_failed: false,
     };
 
     for &nid in ordered {
@@ -1767,6 +1779,10 @@ fn build_plan(
             ext_tables, &mut ext_trace_regs, &mut source_reg_map,
             view_dir, view_table_id, view_id,
         );
+    }
+
+    if state.emit_failed {
+        return None;
     }
 
     builder.add_halt();
@@ -2226,5 +2242,83 @@ mod tests {
         // folded_maps and skip_nodes are cloned to both halves
         assert!(rw_pre.folded_maps.contains_key(&2));
         assert!(rw_post.folded_maps.contains_key(&2));
+    }
+
+    // Issue #3: build_plan must return None when create_child_table fails (e.g. disk full,
+    // missing dir), not silently produce a corrupted plan with empty-schema registers and no
+    // instructions emitted for the failed node.
+    #[test]
+    fn test_build_plan_returns_none_when_child_table_fails() {
+        // Circuit: SCAN(0) → DISTINCT(1) → INTEGRATE(2)
+        // An invalid view_dir forces create_child_table to fail inside emit_node.
+        let mut graph = CircuitGraph {
+            view_id: 99,
+            nodes: vec![
+                Node { id: 0, opcode: OPCODE_SCAN_TRACE },
+                Node { id: 1, opcode: OPCODE_DISTINCT },
+                Node { id: 2, opcode: OPCODE_INTEGRATE },
+            ],
+            edges: vec![
+                Edge { _id: 0, src: 0, dst: 1, port: PORT_IN_DISTINCT },
+                Edge { _id: 1, src: 1, dst: 2, port: PORT_IN },
+            ],
+            sources: { let mut m = HashMap::new(); m.insert(0, 0i64); m },
+            params:      HashMap::new(),
+            str_params:  HashMap::new(),
+            group_cols:  HashMap::new(),
+            out_schema:  empty_schema(),
+            opcode_of:   HashMap::new(),
+            ordered:     Vec::new(),
+            outgoing:    HashMap::new(),
+            incoming:    HashMap::new(),
+            consumers:   HashMap::new(),
+        };
+        topo_sort(&mut graph).unwrap();
+
+        let in_schema = {
+            let mut s = empty_schema();
+            s.columns[0] = col(type_code::U64, 8, false);
+            s.num_columns = 1;
+            s
+        };
+        let ann = Annotation {
+            trace_side_sources: HashSet::new(),
+            in_schema,
+            co_partitioned: HashSet::new(),
+            is_distinct_at: HashSet::new(),
+        };
+        let rw = Rewrites {
+            skip_nodes:   HashSet::new(),
+            fold_finalize: HashMap::new(),
+            folded_maps:  HashMap::new(),
+        };
+
+        let ordered = graph.ordered.clone();
+        let result = build_plan(
+            &graph, &ann, &rw, &ordered, &[],
+            "/nonexistent_gnitz_test_path_xyz_abc",
+            0, 99, &empty_schema(),
+            None, None, vec![],
+        );
+        assert!(result.is_none(), "build_plan must return None when child table creation fails");
+    }
+
+    // Issue #4: merge_schemas_for_join must panic with a clear message (not a cryptic
+    // index-out-of-bounds) when the combined column count exceeds 64.
+    #[test]
+    #[should_panic(expected = "join output schema exceeds")]
+    fn test_merge_schemas_for_join_column_overflow() {
+        let make = |n: usize| {
+            let mut s = empty_schema();
+            s.columns[0] = col(type_code::U128, 16, false);
+            for i in 1..n {
+                s.columns[i] = col(type_code::I64, 8, false);
+            }
+            s.num_columns = n as u32;
+            s.pk_index = 0;
+            s
+        };
+        // 33 + 33 − 1 (right PK excluded) = 65 > 64 → must panic
+        merge_schemas_for_join(&make(33), &make(33));
     }
 }
