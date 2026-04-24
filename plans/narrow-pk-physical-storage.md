@@ -49,7 +49,7 @@ Downstream: `wal_block.rs`, `codec.rs`, `message.rs`, `client.rs`, `dml.rs`, `gn
 - `test_workers.py`: `test_partition_balance_wide_u64_range` (96 rows, three U64 regions)
 - `test_fk.py`: not yet added (low priority; FK tests already cover W=4)
 
-### Phase 6 — Documentation cleanup
+### Phase 6 ✓ DONE — Documentation cleanup
 
 - `foundations.md` §1: physical stride narrowing, zero-extension invariant.
 - `foundations.md` §6: update region convention table with `pk_stride`.

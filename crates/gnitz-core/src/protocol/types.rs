@@ -117,7 +117,10 @@ impl PkColumn {
 impl PartialEq<Vec<u128>> for PkColumn {
     fn eq(&self, other: &Vec<u128>) -> bool {
         if self.len() != other.len() { return false; }
-        (0..self.len()).all(|i| self.get(i) == other[i])
+        match self {
+            PkColumn::U64s(v) => v.iter().zip(other).all(|(&a, &b)| a as u128 == b),
+            PkColumn::U128s(v) => v.as_slice() == other.as_slice(),
+        }
     }
 }
 

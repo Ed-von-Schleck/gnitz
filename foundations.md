@@ -32,8 +32,20 @@ weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 4.5/4.6 (distinct-elimination) require positive inputs.
 
 **Single-column PKs only.** Each table has exactly one PK column
-(enforced by schema validation). The 128-bit slot holds one column
+(enforced by schema validation). The 128-bit API surface holds one column
 value: `(lo, hi)` for U128, `(value, 0)` for narrower types.
+
+**Physical stride narrowing.** Shard files, WAL blocks, and wire batches
+store only `pk_stride` bytes per PK row: 8 bytes for U64, 16 bytes for U128.
+The in-engine `ArenaZSetBatch` uses a 128-bit PK slot (pk_lo + pk_hi u64s)
+regardless of schema type. All boundary code zero-extends when crossing
+between the narrow physical representation and the 128-bit in-engine slot.
+
+**Zero-extension invariant.** `get_pk()` always returns u128; sort order,
+comparison, and partition routing all zero-extend narrow PK values before
+operating. A U64 value `v` stored as 8 bytes compares and hashes identically
+to `v as u128`: `hash_u128(v as u128) == hash_u128(v)`. XOR8 filter probes
+and exchange routing both depend on this invariant.
 
 **Physical representation.** `ArenaZSetBatch`: columnar buffers where each
 row is (pk_lo, pk_hi, weight, null_word, col_0, col_1, ...). Multiple
@@ -253,16 +265,22 @@ inputs, including NaN.
 
 ## 6. The Region Convention
 
-Column buffers are stored as flat (pointer, size) pairs in canonical order:
+Column buffers are stored as flat (pointer, size) pairs in canonical order.
+This layout applies to WAL blocks (WAL_FORMAT_VERSION ≥ 4) and shard files
+(SHARD_VERSION ≥ 6). `pk_stride = 8` for U64 PKs, `pk_stride = 16` for U128 PKs.
 
 ```
-region[0] = pk_lo      (count × 8 bytes, u64 LE)
-region[1] = pk_hi      (count × 8 bytes, u64 LE)
-region[2] = weight     (count × 8 bytes, i64 LE)
-region[3] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
-region[4..4+P-1] = payload columns (non-PK, schema order)
-region[4+P] = blob     (variable-length string heap)
+region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {8, 16})
+region[1] = weight     (count × 8 bytes, i64 LE)
+region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
+region[3..3+P-1] = payload columns (non-PK, schema order)
+region[3+P] = blob     (variable-length string heap)
 ```
+
+The in-engine `ArenaZSetBatch` uses separate pk_lo (u64) and pk_hi (u64)
+fields in its columnar layout regardless of schema type. Boundary code
+(WAL encode/decode, shard read/write) zero-extends or truncates when
+converting between the narrow on-disk layout and the in-engine 128-bit slot.
 
 PK columns are not included in the payload region pointers.
 

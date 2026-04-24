@@ -39,6 +39,15 @@ When adding a new constraint, validation rule, or invariant:
       tables where the same logical value may have different column types
       (e.g., PK = U64 vs join column = I64)? The hash must produce
       identical partitions regardless of type.
+- [ ] **Narrow-PK hash invariance**: if the code touches exchange routing or
+      XOR8 filter construction for U64-PK tables, confirm it zero-extends the
+      stored value to u128 before hashing (`hash_u128(pk as u128)`). The
+      physical storage uses 8 bytes/row for U64 PKs, but partition assignment
+      must be identical to a U128 table holding the same value.
+- [ ] **Schema-dependent PK stride**: IPC fast paths (WAL encode/decode, shard
+      read/write, wire batch serialization) derive `pk_stride` from the schema
+      (`pk_stride = 8` for U64, `pk_stride = 16` for U128). Hard-coding 16 is
+      wrong for U64-PK tables. See `foundations.md` §6 for the region layout.
 
 ## Debug logging
 

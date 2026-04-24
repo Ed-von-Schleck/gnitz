@@ -34,22 +34,22 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// Serialize a `PkColumn` into `buf` at 8-byte alignment.
+/// Serialize a `PkColumn` into `buf` at 8-byte alignment via bulk memcpy.
 /// U64 variant writes 8 bytes/row; U128 variant writes 16 bytes/row.
+/// Correct on little-endian (x86_64) — native layout matches to_le_bytes() output.
 fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn) -> (u32, u32) {
-    let aligned = align8(buf.len());
-    buf.resize(aligned, 0);
-    let off = aligned as u32;
     match pks {
         PkColumn::U64s(v) => {
-            for &x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+            // SAFETY: u64 is 8 bytes; native LE layout matches to_le_bytes() on x86_64.
+            let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
+            append_region(buf, src)
         }
         PkColumn::U128s(v) => {
-            for &x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+            // SAFETY: u128 is 16 bytes; native LE layout matches to_le_bytes() on x86_64.
+            let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 16) };
+            append_region(buf, src)
         }
     }
-    let stride = match pks { PkColumn::U64s(_) => 8, PkColumn::U128s(_) => 16 };
-    (off, (pks.len() * stride) as u32)
 }
 
 fn xxh3_64(data: &[u8]) -> u64 {
