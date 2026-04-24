@@ -37,7 +37,7 @@ impl CatalogEngine {
 
     // -- FK inline validation (single-worker) ------------------------------
 
-    pub fn validate_fk_inline(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn validate_fk_inline(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let constraints = match self.caches.fk_by_child.get(&table_id) {
             Some(c) if !c.is_empty() => c,
             _ => return Ok(()),
@@ -86,7 +86,7 @@ impl CatalogEngine {
     /// Validate FK RESTRICT on parent DELETE (single-worker path).
     /// For each retraction row, checks whether any child table still references
     /// the PK being deleted via the child's FK index. Returns an error if so.
-    pub fn validate_fk_parent_restrict(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn validate_fk_parent_restrict(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let children = self.fk_children_of(table_id);
         if children.is_empty() { return Ok(()); }
 
@@ -133,7 +133,7 @@ impl CatalogEngine {
     /// For unique_pk tables, UPSERT rows (PK already exists) get special
     /// handling: the old index entry will be retracted by enforce_unique_pk,
     /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
-    pub fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
@@ -152,7 +152,7 @@ impl CatalogEngine {
             let idx_table = ic.table_mut();
 
             // Track seen keys for batch-internal duplicate detection
-            let mut seen: HashSet<(u64, u64)> = HashSet::new();
+            let mut seen: HashSet<(u64, u64)> = HashSet::with_capacity(batch.count);
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
@@ -187,32 +187,23 @@ impl CatalogEngine {
                         // Index schema: PK = index_key, payload[0] = source_pk.
                         let (_net_w, found) = idx_table.retract_pk(key_u128);
                         if found {
-                            // Read the source PK from the index entry's payload
+                            // Read the source PK from the index entry's payload.
+                            // Index schema: PK = index_key (col 0), payload[0] = source_pk.
                             let idx_schema = &ic.index_schema;
-                            let pk_payload_col = 0usize; // first (only) payload column
+                            let pk_payload_col = 0usize;
                             let pk_size = idx_schema.columns[if idx_schema.pk_index == 0 { 1 } else { 0 }].size as usize;
-                            let ptr = idx_table.found_col_ptr(pk_payload_col, pk_size);
-                            if !ptr.is_null() {
-                                let (src_pk_lo, src_pk_hi) = if pk_size == 16 {
-                                    let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
-                                    let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
-                                    (lo, hi)
-                                } else {
-                                    let mut buf = [0u8; 8];
-                                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), pk_size.min(8)) };
-                                    (u64::from_le_bytes(buf), 0u64)
-                                };
-                                // If the index entry belongs to a DIFFERENT PK, it's a violation
-                                let src_pk = crate::util::make_pk(src_pk_lo, src_pk_hi);
-                                if src_pk != row_pk {
-                                    let col_names = self.get_column_names(table_id);
-                                    let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
-                                    return Err(format!(
-                                        "Unique index violation on column '{}'", cname
-                                    ));
-                                }
-                                // Same PK — this is fine, enforce_unique_pk will handle it
+                            // None means the found_source cursor is in an unexpected state;
+                            // treat as a conflict (fail-safe) rather than silently permitting.
+                            let src_pk = idx_table.read_found_u128(pk_payload_col, pk_size)
+                                .unwrap_or(u128::MAX);
+                            if src_pk != row_pk {
+                                let col_names = self.get_column_names(table_id);
+                                let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
+                                return Err(format!(
+                                    "Unique index violation on column '{}'", cname
+                                ));
                             }
+                            // Same PK — this is fine, enforce_unique_pk will handle it
                         }
                     } else {
                         let col_names = self.get_column_names(table_id);
@@ -254,7 +245,7 @@ impl CatalogEngine {
                 let data = batch.get_col_ptr(row, payload_col, 1);
                 (data[0] as u64, 0)
             }
-            _ => (0, 0),
+            _ => unreachable!("promote_to_pk_key: unsupported type_code {col_type}"),
         }
     }
 }

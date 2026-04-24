@@ -427,6 +427,23 @@ impl Table {
         }
     }
 
+    /// Read the found row's payload column as a u128 (little-endian, zero-padded for col_size < 16).
+    /// Returns None if no row was found.
+    pub fn read_found_u128(&self, payload_col: usize, col_size: usize) -> Option<u128> {
+        let ptr = self.found_col_ptr(payload_col, col_size);
+        if ptr.is_null() { return None; }
+        let val = if col_size == 16 {
+            let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
+            let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
+            ((hi as u128) << 64) | lo as u128
+        } else {
+            let mut buf = [0u8; 8];
+            unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), col_size.min(8)) };
+            u64::from_le_bytes(buf) as u128
+        };
+        Some(val)
+    }
+
     // ------------------------------------------------------------------
     // Compaction
     // ------------------------------------------------------------------
