@@ -670,6 +670,21 @@ fn execute_create_join_view(
                     cols.push(out_cols[1 + idx].clone());
                     proj.push(idx + 1);
                 }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let idx = match expr {
+                        Expr::Identifier(ident) =>
+                            resolve_unqualified_column(&ident.value, &alias_map)?,
+                        Expr::CompoundIdentifier(parts) if parts.len() == 2 =>
+                            resolve_qualified_column(&parts[0].value, &parts[1].value, &alias_map)?,
+                        _ => return Err(GnitzSqlError::Unsupported(
+                            "JOIN view: only column references supported in AS clause".to_string()
+                        )),
+                    };
+                    let mut col = out_cols[1 + idx].clone();
+                    col.name = alias.value.clone();
+                    cols.push(col);
+                    proj.push(idx + 1);
+                }
                 SelectItem::Wildcard(_) => {
                     for i in 1..out_cols.len() {
                         cols.push(out_cols[i].clone());

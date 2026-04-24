@@ -348,14 +348,11 @@ class TestJoins:
             client.execute_sql(f"INSERT INTO right_t VALUES {right_vals}", schema_name=sn)
 
             vid = client.resolve_table(sn, "v")[0]
-            rows = [r for r in client.scan(vid) if r.weight > 0]
-            # Each fk value (0..4) appears 4 times on each side → 16 join pairs per group.
-            # fk=0: left ids where i%5==0: {5,10,15,20} (4), right same fk: 4 → 16 pairs
-            # total = 5 groups × 16 = 80? No: n=20 gives fk values 1,2,3,4,0 (each 4 times)
-            # so 5 fk groups × (4 left × 4 right) = 80 rows.
+            rows = _scan_dicts(client, vid)
+            # 5 fk groups × (4 left × 4 right matches) = 80 rows.
             assert len(rows) == 80, f"expected 80 join rows, got {len(rows)}"
-            # All output PKs (lid field) must be in range [1, n]
-            lids = {r[1] for r in rows}
+            # Every left row (lid 1..n) must appear in the output.
+            lids = {r["lid"] for r in rows}
             assert lids == set(range(1, n + 1)), f"unexpected lids: {lids}"
         finally:
             _cleanup(client, sn, tables=["left_t", "right_t"], views=["v"])

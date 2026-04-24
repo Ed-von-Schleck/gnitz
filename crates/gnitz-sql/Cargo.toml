@@ -3,6 +3,9 @@ name    = "gnitz-sql"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+integration = []
+
 [dependencies]
 sqlparser  = "0.56"
 gnitz-core = { path = "../gnitz-core" }
