@@ -15,10 +15,9 @@ pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of columns per table or view schema.
-/// All `[SchemaColumn; N]` temporary arrays and column-count validation guards
-/// must agree with this value. Changing it requires updating every array
-/// initializer in ops/, storage/, catalog/, compiler.rs, and runtime/,
-/// plus the Python wrapper's `len > MAX_COLUMNS + 1` guard.
+/// All `[SchemaColumn; N]` arrays and column-count validation guards use this constant
+/// as the single source of truth. The Python wrapper has a separate `len > MAX_COLUMNS + 1`
+/// guard that must be updated manually if this value changes (gnitz-py does not depend on gnitz-engine).
 pub const MAX_COLUMNS: usize = 64;
 
 #[repr(C)]

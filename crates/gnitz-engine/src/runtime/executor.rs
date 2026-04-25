@@ -951,24 +951,24 @@ mod tests {
         assert!(validate_schema_match(&wire, &expected).is_err());
     }
 
-    /// Demonstrates that the name_refs_arr slice is bounded by .min(64).
+    /// Demonstrates that the name_refs_arr slice is bounded by .min(MAX_COLUMNS).
     /// Before the fix, `&name_refs_arr[..col_names.len()]` panicked when
-    /// col_names.len() > 64; after the fix it is always safe.
+    /// col_names.len() > MAX_COLUMNS; after the fix it is always safe.
     #[test]
-    fn col_names_slice_is_bounded_at_64() {
-        let mut arr = [&[] as &[u8]; 64];
-        // Build exactly 64 names (the maximum schema width).
-        let names: Vec<Vec<u8>> = (0..64u8).map(|i| vec![i]).collect();
-        for (i, n) in names.iter().enumerate().take(64) {
+    fn col_names_slice_is_bounded_at_max_columns() {
+        use crate::schema::MAX_COLUMNS;
+        let mut arr = [&[] as &[u8]; MAX_COLUMNS];
+        let names: Vec<Vec<u8>> = (0..MAX_COLUMNS).map(|i| vec![i as u8]).collect();
+        for (i, n) in names.iter().enumerate() {
             arr[i] = n.as_slice();
         }
-        // .min(64) must not change the result for len == 64 ...
-        let slice = &arr[..names.len().min(64)];
-        assert_eq!(slice.len(), 64);
+        // .min(MAX_COLUMNS) must not change the result for len == MAX_COLUMNS ...
+        let slice = &arr[..names.len().min(MAX_COLUMNS)];
+        assert_eq!(slice.len(), MAX_COLUMNS);
         assert_eq!(slice[0], &[0u8][..]);
-        assert_eq!(slice[63], &[63u8][..]);
-        // ... and must cap at 64 rather than panic for len > 64.
-        let capped = names.len().min(64);
-        assert_eq!(capped, 64, "min(64) is identity when len == 64");
+        assert_eq!(slice[MAX_COLUMNS - 1], &[(MAX_COLUMNS - 1) as u8][..]);
+        // ... and must cap at MAX_COLUMNS rather than panic for len > MAX_COLUMNS.
+        let capped = names.len().min(MAX_COLUMNS);
+        assert_eq!(capped, MAX_COLUMNS, "min(MAX_COLUMNS) is identity when len == MAX_COLUMNS");
     }
 }

@@ -124,11 +124,11 @@ pub fn build_schema_wire_block(
     block
 }
 
-/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; crate::schema::MAX_COLUMNS]`, capped
-/// at 64 (the wire protocol maximum). Returns the filled array and the fill count.
+/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; MAX_COLUMNS]`,
+/// capped at MAX_COLUMNS. Returns the filled array and the fill count.
 pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MAX_COLUMNS], usize) {
     let mut refs = [&[][..]; crate::schema::MAX_COLUMNS];
-    let n = names.len().min(64);
+    let n = names.len().min(crate::schema::MAX_COLUMNS);
     for (i, name) in names.iter().take(n).enumerate() {
         refs[i] = name;
     }

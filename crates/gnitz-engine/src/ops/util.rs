@@ -88,7 +88,7 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                         b_bytes,
                         batch.blob,
                     )
-                } else if col.type_code == type_code::U128 {
+                } else if col.type_code == type_code::U128 || col.type_code == type_code::UUID {
                     let c_lo = u64::from_le_bytes(c_bytes[0..8].try_into().unwrap());
                     let c_hi = u64::from_le_bytes(c_bytes[8..16].try_into().unwrap());
                     let b_lo = u64::from_le_bytes(b_bytes[0..8].try_into().unwrap());
@@ -167,7 +167,7 @@ pub(super) fn extract_group_key(
             let v = u64::from_le_bytes(ptr.try_into().unwrap());
             return v as u128;
         }
-        if tc == type_code::U128 {
+        if tc == type_code::U128 || tc == type_code::UUID {
             let pi = payload_idx(c_idx, pki);
             let ptr = mb.get_col_ptr(row, pi, 16);
             return u128::from_le_bytes(ptr[0..16].try_into().unwrap());

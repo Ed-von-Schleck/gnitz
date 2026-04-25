@@ -877,12 +877,22 @@ impl PyScanResult {
         // Specialize by column kind to avoid per-row dispatch through read_row_value.
         let pk_idx = data.schema.pk_index;
         if col_idx == pk_idx {
-            if data.schema.columns[col_idx].type_code == TypeCode::U128 {
-                let vals: Vec<u128> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i)).collect();
-                return Ok(PyList::new(py, &vals)?.unbind());
+            match data.schema.columns[col_idx].type_code {
+                TypeCode::UUID => {
+                    let items: Vec<String> = (0..data.batch.pks.len())
+                        .map(|i| format_uuid(data.batch.pks.get(i)))
+                        .collect();
+                    return Ok(PyList::new(py, items)?.unbind());
+                }
+                TypeCode::U128 => {
+                    let vals: Vec<u128> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i)).collect();
+                    return Ok(PyList::new(py, &vals)?.unbind());
+                }
+                _ => {
+                    let items: Vec<u64> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i) as u64).collect();
+                    return Ok(PyList::new(py, items)?.unbind());
+                }
             }
-            let items: Vec<u64> = (0..data.batch.pks.len()).map(|i| data.batch.pks.get(i) as u64).collect();
-            return Ok(PyList::new(py, items)?.unbind());
         }
 
         let payload_idx = if col_idx < pk_idx { col_idx } else { col_idx - 1 };

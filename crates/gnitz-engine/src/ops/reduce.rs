@@ -284,7 +284,7 @@ pub(super) fn extract_gc_u64(
     if group_by_cols.len() == 1 {
         let c_idx = group_by_cols[0] as usize;
         let tc = schema.columns[c_idx].type_code;
-        if tc != type_code::U128 && tc != TYPE_STRING
+        if tc != type_code::U128 && tc != type_code::UUID && tc != TYPE_STRING
             && tc != type_code::F32 && tc != type_code::F64
         {
             let pi = payload_idx(c_idx, pki);
@@ -565,7 +565,7 @@ pub fn op_reduce(
     // Determine output mapping: use_natural_pk
     let use_natural_pk = if group_by_cols.len() == 1 {
         let grp_tc = input_schema.columns[group_by_cols[0] as usize].type_code;
-        grp_tc == type_code::U64 || grp_tc == type_code::U128
+        grp_tc == type_code::U64 || grp_tc == type_code::U128 || grp_tc == type_code::UUID
     } else {
         false
     };

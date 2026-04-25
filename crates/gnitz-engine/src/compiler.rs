@@ -2306,10 +2306,12 @@ mod tests {
     }
 
     // Issue #4: merge_schemas_for_join must panic with a clear message (not a cryptic
-    // index-out-of-bounds) when the combined column count exceeds 64.
+    // index-out-of-bounds) when the combined column count exceeds MAX_COLUMNS.
     #[test]
     #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
+        use crate::schema::MAX_COLUMNS;
+        let half = MAX_COLUMNS / 2 + 1; // half + half - 1 (right PK excluded) = MAX_COLUMNS + 1
         let make = |n: usize| {
             let mut s = empty_schema();
             s.columns[0] = col(type_code::U128, 16, false);
@@ -2320,7 +2322,6 @@ mod tests {
             s.pk_index = 0;
             s
         };
-        // 33 + 33 − 1 (right PK excluded) = 65 > 64 → must panic
-        merge_schemas_for_join(&make(33), &make(33));
+        merge_schemas_for_join(&make(half), &make(half));
     }
 }
