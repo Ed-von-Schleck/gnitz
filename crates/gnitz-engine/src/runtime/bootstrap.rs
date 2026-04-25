@@ -397,6 +397,15 @@ pub fn server_main(
         }
         if pid == 0 {
             // --- Child process ---
+            // Die immediately if the master exits for any reason.  The
+            // getppid() check in sal_reader.wait() is a belt-and-suspenders
+            // fallback; this closes the ~30s polling gap.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+            // Re-check: parent may have died in the fork→prctl window.
+            if unsafe { libc::getppid() } != master_pid {
+                unsafe { libc::_exit(0) };
+            }
+
             // Redirect stdout/stderr to worker log file
             let log_path = format!("{}/worker_{}.log\0", data_dir, w);
             unsafe {
