@@ -319,11 +319,24 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             return;
         }
 
-        // Close the zone with the commit sentinel before fsync.
-        unsafe {
-            if let Err(e) = (*shared.disp_ptr).commit_zone(zone_lsn) {
-                crate::gnitz_warn!("commit_zone failed: {}", e);
-            }
+        // Crash-injection seam: abort after push groups but BEFORE the
+        // commit sentinel (GNITZ_INJECT_PUSH_ABORT=after_groups). SAL
+        // recovery skips any zone whose sentinel is absent; workers that
+        // already flushed their shard files before the crash retain the
+        // data via the shard path, so this seam is useful for targeted
+        // debugging rather than asserting invisibility after restart.
+        #[cfg(debug_assertions)]
+        if std::env::var("GNITZ_INJECT_PUSH_ABORT").as_deref() == Ok("after_groups") {
+            unsafe { libc::abort(); }
+        }
+
+        // Close the zone with the commit sentinel before fsync.  If this
+        // fails the zone has no FLAG_TXN_COMMIT and recovery would silently
+        // drop all groups in the zone — that is unrecoverable data loss
+        // after a restart while the client already received Ok.  Abort.
+        let commit_zone_err = unsafe { (*shared.disp_ptr).commit_zone(zone_lsn).err() };
+        if let Some(e) = commit_zone_err {
+            crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
         }
         unsafe { (*shared.disp_ptr).signal_all(); }
 

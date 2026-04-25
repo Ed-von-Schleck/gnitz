@@ -378,6 +378,10 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 /// with worker DAG eval.
 async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     if tids.is_empty() { return Ok(()); }
+    // Snapshot before any .await: a concurrent push can bump ingest_lsn
+    // while we wait for tick ACKs, and setting last_tick_lsn to that
+    // higher value would report an LSN that this tick never processed.
+    let snapshot_lsn = shared.ingest_lsn.get();
     let nw = unsafe { (*shared.dispatcher.0).num_workers() };
 
     // Allocate every (tid, worker) req_id up front so the SAL emission
@@ -409,7 +413,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     if let Some(e) = first_worker_error("tick", &replies) {
         return Err(e);
     }
-    shared.last_tick_lsn.set(shared.ingest_lsn.get());
+    shared.last_tick_lsn.set(snapshot_lsn);
     Ok(())
 }
 
@@ -772,6 +776,12 @@ async fn handle_system_dml(
         // All broadcasts in the zone share `zone_lsn`. The trailing
         // commit sentinel marks the zone durably closed; recovery
         // applies the zone's groups only when the sentinel is on disk.
+        //
+        // Failure here is unrecoverable: ingest_to_family already mutated
+        // the master catalog, and FLAG_DDL_SYNC groups that were written
+        // are processed by workers in real-time before any sentinel
+        // arrives.  A partial failure leaves master/worker schemas
+        // permanently diverged.  DDL rollback is not implemented; abort.
         if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
             for (tid, bat) in &drained {
                 (*disp_ptr_raw).broadcast_ddl(*tid, bat, zone_lsn)?;
@@ -786,8 +796,7 @@ async fn handle_system_dml(
             (*disp_ptr_raw).commit_zone(zone_lsn)?;
             Ok::<(), String>(())
         }) {
-            send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
-            return;
+            gnitz_fatal_abort!("DDL broadcast failed after in-memory catalog mutation: {}", e);
         }
         shared.reactor.fsync(shared.sal_fd)
     };
