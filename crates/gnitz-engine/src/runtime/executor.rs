@@ -178,10 +178,9 @@ impl ServerExecutor {
         reactor.attach_server_fd(server_fd);
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
-        // Phase 5: seed ingest_lsn from the catalog's known max so each
-        // newly allocated zone LSN is strictly greater than every
-        // table's `current_lsn`. This keeps the direct assignment in
-        // `ingest_to_family` monotonic across upgrades and restarts.
+        // Seed ingest_lsn above every table's current_lsn so each new zone
+        // LSN is strictly greater, keeping `ingest_to_family`'s direct
+        // current_lsn assignment monotonic across restarts.
         let initial_ingest_lsn = unsafe { &*catalog }.max_table_current_lsn();
         let ingest_lsn = Rc::new(Cell::new(initial_ingest_lsn));
         let last_tick_lsn = Rc::new(Cell::new(initial_ingest_lsn));
@@ -744,11 +743,7 @@ async fn handle_system_dml(
     // closes the pre-fsync window where clients could see an LSN whose
     // backing data is not yet on disk.
     let zone_lsn = shared.ingest_lsn.get() + 1;
-    // Phase 5: pin every system-table write in this zone to `zone_lsn`
-    // so recovery's flushed_lsn dedup matches the SAL's group LSN. Set
-    // BEFORE the mutate phase so cascading hooks inside `evaluate_dag`
-    // see the same value, then cleared after fsync (or on error).
-    unsafe { (*cat_ptr_raw).ddl_zone_lsn = zone_lsn; }
+    unsafe { (*cat_ptr_raw).set_ddl_zone_lsn(zone_lsn); }
 
     if let Err(e) = guard_panic("DDL", || {
         let cat = unsafe { &mut *cat_ptr_raw };
@@ -760,7 +755,7 @@ async fn handle_system_dml(
         // A partial cascade may have pushed entries before the failing hook;
         // clear them so the next DDL doesn't inherit half-applied broadcasts.
         let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
-        unsafe { (*cat_ptr_raw).ddl_zone_lsn = 0; }
+        unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
     }
@@ -807,10 +802,7 @@ async fn handle_system_dml(
     // during the DDL window now see the *old* LSN; tick-derived state
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
-    // Phase 5: zone is durably committed; release the LSN so subsequent
-    // non-DDL ingest paths (recovery test fixtures, raw_store_ingest)
-    // can use the auto-bump again.
-    unsafe { (*cat_ptr_raw).ddl_zone_lsn = 0; }
+    unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
     send_ok_response(shared, fd, target_id, None, client_id, &schema, zone_lsn as u128).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);

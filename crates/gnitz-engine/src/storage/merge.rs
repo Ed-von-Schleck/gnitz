@@ -558,7 +558,7 @@ pub unsafe fn parse_single_batch_from_regions<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
     fn make_schema_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -566,7 +566,7 @@ mod tests {
             size: 0,
             nullable: 0,
             _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         // col 0 = PK (U128, size 16)
         columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
         // col 1 = I64 value column

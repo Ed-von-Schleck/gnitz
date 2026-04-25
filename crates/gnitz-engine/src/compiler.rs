@@ -2311,7 +2311,7 @@ mod tests {
     #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
         use crate::schema::MAX_COLUMNS;
-        let half = MAX_COLUMNS / 2 + 1; // half + half - 1 (right PK excluded) = MAX_COLUMNS + 1
+        let half = MAX_COLUMNS / 2 + 2; // 2*half - 1 (right PK excluded) > MAX_COLUMNS for any parity
         let make = |n: usize| {
             let mut s = empty_schema();
             s.columns[0] = col(type_code::U128, 16, false);

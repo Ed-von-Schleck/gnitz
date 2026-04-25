@@ -544,7 +544,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
 mod tests {
     use super::*;
     use super::super::shard_reader::MappedShard;
-    use crate::schema::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut sd = SchemaDescriptor {
@@ -555,7 +555,7 @@ mod tests {
                 size: 0,
                 nullable: 0,
                 _pad: 0,
-            }; 64],
+            }; MAX_COLUMNS],
         };
         sd.columns[0] = SchemaColumn {
             type_code: 8,

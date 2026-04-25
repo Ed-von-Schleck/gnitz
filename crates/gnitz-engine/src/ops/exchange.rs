@@ -410,7 +410,7 @@ pub fn op_multi_scatter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code, MAX_COLUMNS};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -418,7 +418,7 @@ mod tests {
             size: 0,
             nullable: 0,
             _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64,
             size: 8,
@@ -444,7 +444,7 @@ mod tests {
             size: 0,
             nullable: 0,
             _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U128,
             size: 16,
@@ -470,7 +470,7 @@ mod tests {
             size: 0,
             nullable: 0,
             _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64,
             size: 8,

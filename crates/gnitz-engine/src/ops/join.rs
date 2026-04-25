@@ -845,13 +845,13 @@ fn write_join_row_from_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD, MAX_COLUMNS};
     use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };
@@ -864,7 +864,7 @@ mod tests {
     fn make_schema_u64_string() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };

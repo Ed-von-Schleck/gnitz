@@ -132,8 +132,8 @@ fn test_edge_cases() {
         &[ColumnDef { name: "id".into(), type_code: type_code::STRING, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }],
         0, true).is_err());
 
-    // 10. Too many columns (> 64)
-    let many: Vec<ColumnDef> = (0..65).map(|i| u64_col_def(&format!("c{}", i))).collect();
+    // 10. Too many columns (> MAX_COLUMNS = 65)
+    let many: Vec<ColumnDef> = (0..66).map(|i| u64_col_def(&format!("c{}", i))).collect();
     assert!(engine.create_table("public.too_many", &many, 0, true).is_err());
 
     // 11. Drop system schema

@@ -1,5 +1,5 @@
 use super::super::program::*;
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
 fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
@@ -8,7 +8,7 @@ fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDe
         size: 0,
         nullable: 0,
         _pad: 0,
-    }; 64];
+    }; MAX_COLUMNS];
     for (i, &(tc, sz)) in col_types.iter().enumerate() {
         columns[i] = SchemaColumn {
             type_code: tc,

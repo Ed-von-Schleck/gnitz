@@ -288,10 +288,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // Lock dropped immediately after; ACKs and fsync CQE are awaited
     // outside so tick/relay/DDL tasks can make progress.
     //
-    // Phase 6: every group in this batched commit shares one zone LSN.
-    // After all writes, emit `commit_zone(zone_lsn)` so recovery's
-    // two-pass walker treats them atomically. `shared.ingest_lsn` is
-    // bumped exactly once for the batch, after fsync (Phase D below).
+    // All groups in this batch share one zone_lsn. The commit sentinel
+    // written after all groups lets recovery treat the batch atomically:
+    // either every group applies or none do. ingest_lsn is bumped once,
+    // after fsync (Phase D), so clients only see durable LSNs.
     // ------------------------------------------------------------------
     let zone_lsn = shared.ingest_lsn.get() + 1;
     let (fsync_fut, reply_futs) = {
@@ -343,8 +343,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // ------------------------------------------------------------------
     // Phase C (no lock): await push ACKs, fire tick.
     // fsync is awaited separately in Phase D so DAG evaluation overlaps
-    // with fdatasync (~5 ms gap eliminated). LSN publish (Phase 6) is
-    // deferred to after fsync so clients only see a durable LSN.
+    // with fdatasync (~5 ms gap eliminated). LSN publish is deferred to
+    // after fsync so clients only see a durable LSN.
     // unique_filter_ingest_batch is NOT called here — per the invariant in
     // async-invariants.md it must run only after fsync confirms durability.
     // ------------------------------------------------------------------
@@ -361,7 +361,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
         }
 
         // Invalidate filters for groups whose worker ACK reported an error.
-        // ingest_lsn publish + filter ingest happen in Phase D after fsync.
+        // ingest_lsn publish + filter ingest are deferred to Phase D after fsync.
         let disp_ptr = shared.disp_ptr;
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
@@ -406,10 +406,9 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
         }
     }
 
-    // Phase 6: publish the zone LSN exactly once, after fsync confirms
-    // durability. Every group in this batch carries `zone_lsn` — clients
-    // pipelining N pushes into the same batch see the same LSN N times,
-    // not N distinct LSNs.
+    // Publish the zone LSN exactly once, after fsync confirms durability.
+    // Pipelined pushes batched together share one zone_lsn, so clients
+    // may see duplicate LSNs — only non-decreasing monotonicity is guaranteed.
     if groups.iter().any(|g| g.write_err.is_none()) {
         shared.ingest_lsn.set(zone_lsn);
     }

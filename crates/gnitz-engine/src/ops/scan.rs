@@ -55,13 +55,13 @@ pub fn op_scan_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, MAX_COLUMNS};
     use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };

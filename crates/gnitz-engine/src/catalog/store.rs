@@ -1,5 +1,13 @@
 use super::*;
 
+const SYS_TABLE_IDS: &[i64] = &[
+    SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
+    DEP_TAB_ID, SEQ_TAB_ID,
+    CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
+    CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
+    CIRCUIT_GROUP_COLS_TAB_ID,
+];
+
 impl CatalogEngine {
     // -- System table accessor -----------------------------------------------
 
@@ -38,13 +46,10 @@ impl CatalogEngine {
             let table = self.sys_table_mut(table_id)
                 .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
             ingest_batch_into(table, batch);
-            // Phase 5: pin current_lsn to the active zone LSN so recovery
-            // dedup (`msg.lsn <= flushed`) matches the SAL group's zone
-            // LSN. The auto-bump inside `ingest_batch_from_regions` is
-            // overwritten here; cascading hooks within the same zone all
-            // converge on the same value. The bootstrap initialises
-            // `shared.ingest_lsn` to be ≥ every table's `current_lsn`, so
-            // direct assignment never regresses the per-table counter.
+            // Pin every cascading write in the same zone to the same LSN so
+            // recovery's dedup check (`msg.lsn <= flushed`) matches the SAL
+            // group LSN. ingest_lsn is seeded above every table's current_lsn
+            // at boot, so direct assignment never regresses the counter.
             if zone_lsn > 0 {
                 table.current_lsn = zone_lsn;
             }
@@ -118,6 +123,19 @@ impl CatalogEngine {
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub fn drain_pending_broadcasts(&mut self) -> Vec<(i64, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
+    }
+
+    /// Pin all system-table writes in the current DDL to `lsn`. Must be
+    /// called before the mutate phase so every cascading hook sees the same
+    /// value; cleared by `clear_ddl_zone_lsn` after fsync (or on error).
+    pub(crate) fn set_ddl_zone_lsn(&mut self, lsn: u64) {
+        self.ddl_zone_lsn = lsn;
+    }
+
+    /// Release the DDL zone LSN after the zone is durably committed (or
+    /// rolled back). Subsequent non-DDL ingest paths use the auto-bump.
+    pub(crate) fn clear_ddl_zone_lsn(&mut self) {
+        self.ddl_zone_lsn = 0;
     }
 
     /// Ingest a user-table batch and return the effective delta (after unique_pk
@@ -540,8 +558,6 @@ impl CatalogEngine {
 
     /// Get max flushed LSN for a table (for SAL recovery). Handles both
     /// user tables (via the DAG) and system tables (via direct lookup).
-    /// Phase 5: system tables now track zone LSNs via `ingest_to_family`,
-    /// so recovery dedups them the same way user tables do.
     pub fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
         if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
             return self.sys_table_current_lsn(table_id);
@@ -584,13 +600,7 @@ impl CatalogEngine {
     /// dedup filter for the unified two-pass walk.
     pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
         let mut map = std::collections::HashMap::new();
-        for &tid in &[
-            SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
-            DEP_TAB_ID, SEQ_TAB_ID,
-            CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
-            CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
-            CIRCUIT_GROUP_COLS_TAB_ID,
-        ] {
+        for &tid in SYS_TABLE_IDS {
             map.insert(tid, self.sys_table_current_lsn(tid));
         }
         for &tid in self.dag.tables.keys() {
@@ -608,13 +618,7 @@ impl CatalogEngine {
     /// monotonic across upgrades and restarts.
     pub fn max_table_current_lsn(&self) -> u64 {
         let mut max_lsn = 0u64;
-        for &tid in &[
-            SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
-            DEP_TAB_ID, SEQ_TAB_ID,
-            CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
-            CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
-            CIRCUIT_GROUP_COLS_TAB_ID,
-        ] {
+        for &tid in SYS_TABLE_IDS {
             max_lsn = max_lsn.max(self.sys_table_current_lsn(tid));
         }
         for entry in self.dag.tables.values() {
