@@ -101,6 +101,34 @@ commands on the same mmap'd fd. Workers see all SAL entries immediately
 via Acquire/Release atomics on the size prefix — fdatasync is irrelevant
 for cross-process visibility. It exists solely for crash recovery.
 
+### Atomicity = LSN (Design 2)
+
+Every durable operation — DDL or push — runs as an **atomic zone**:
+all SAL groups in the zone share one LSN, and a trailing empty group
+with `FLAG_TXN_COMMIT` marks the zone closed. Recovery applies an LSN
+only when its commit sentinel is on disk; an LSN whose sentinel is
+missing was crashed mid-zone and is silently skipped. Orphan COL_TAB
+rows on crash are therefore impossible.
+
+A client pipelining N pushes into one committer batch sees the *same*
+LSN on every ACK, not N distinct LSNs. Pushes inside a single batched
+commit are not orderable relative to each other — they share durability
+and share an LSN. Sequential clients see one push per batch and observe
+strictly monotonic LSNs as before.
+
+### Upgrading from pre-Design-2 servers
+
+The Design 2 SAL is gated by a marker file `wal.sal.v2` next to
+`wal.sal`. On first boot under V2, if the marker is absent the SAL
+mmap is wiped (memset 0) and shard files become authoritative — any
+unflushed pre-V2 SAL contents are discarded. The marker is then
+written so subsequent boots skip the wipe.
+
+**Upgrading requires a clean shutdown.** Before installing a V2 server,
+checkpoint the running server (graceful flush) so all data is in shard
+files. Otherwise the V2 boot will discard whatever was sitting in the
+SAL.
+
 **Requires fdatasync before ACK** (upserts table data):
 - `flush_pending_pushes` — batched user-table DML (already batched: one
   fdatasync per batch).

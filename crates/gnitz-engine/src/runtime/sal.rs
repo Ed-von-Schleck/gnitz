@@ -34,6 +34,12 @@ pub const FLAG_BACKFILL: u32            = 2048;
 pub const FLAG_TICK: u32                = 4096;
 pub const FLAG_CHECKPOINT: u32          = 8192;
 pub const FLAG_FLUSH: u32               = 16384;
+/// Marks an empty broadcast group as the closing "commit sentinel" of an
+/// atomic zone. All preceding groups at the same LSN belong to the zone;
+/// recovery applies them only when this sentinel is on disk. The flag
+/// rides on top of FLAG_DDL_SYNC for the worker's dispatch loop, which
+/// already no-ops on a DDL_SYNC group with `count == 0`.
+pub const FLAG_TXN_COMMIT: u32          = 32768;
 
 // ---------------------------------------------------------------------------
 // Atomics (acquire/release for cross-process shared memory)
@@ -290,7 +296,6 @@ pub struct SalWriter {
     fd: i32,
     mmap_size: u64,
     write_cursor: u64,
-    lsn: u64,
     epoch: u32,
     checkpoint_threshold: u64,
     m2w_efds: Vec<i32>,
@@ -312,7 +317,6 @@ impl SalWriter {
             fd,
             mmap_size,
             write_cursor: 0,
-            lsn: 0,
             epoch: 0,
             checkpoint_threshold,
             m2w_efds,
@@ -339,10 +343,13 @@ impl SalWriter {
     }
 
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
+    /// `lsn` is supplied by the caller; the SAL writer no longer owns the
+    /// counter (Design 2: caller controls zone-LSN allocation).
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn write_group_direct(
         &mut self,
         target_id: u32,
+        lsn: u64,
         flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
@@ -357,8 +364,6 @@ impl SalWriter {
         assert_eq!(req_ids.len(), nw,
             "write_group_direct: req_ids.len()={} != num_workers={}",
             req_ids.len(), nw);
-        let lsn = self.lsn;
-        self.lsn += 1;
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
@@ -399,11 +404,12 @@ impl SalWriter {
     }
 
     /// Encode once into worker 0's slot, memcpy to workers 1..N-1.
-    /// Does NOT sync/signal.
+    /// Does NOT sync/signal. `lsn` is supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     pub fn write_broadcast_direct(
         &mut self,
         target_id: u32,
+        lsn: u64,
         flags: u32,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
@@ -414,8 +420,6 @@ impl SalWriter {
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
-        let lsn = self.lsn;
-        self.lsn += 1;
 
         let wsz = wire_size(
             STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
@@ -454,6 +458,30 @@ impl SalWriter {
             }
         }
 
+        self.write_cursor = unsafe { group.commit() };
+        Ok(())
+    }
+
+    /// Write an empty commit sentinel for an atomic zone.
+    ///
+    /// Header-only group (zero-byte payload for every worker) carrying
+    /// `FLAG_DDL_SYNC | FLAG_TXN_COMMIT`. Recovery uses the sentinel as
+    /// the "this LSN is closed" mark — without it, all groups at this
+    /// LSN are skipped. The sentinel is inert under the worker's hot
+    /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
+    pub fn write_commit_sentinel(&mut self, lsn: u64) -> Result<(), String> {
+        self.prefault_ahead();
+        let nw = self.num_workers;
+        let worker_sizes = [0u32; MAX_WORKERS];
+        let group = unsafe {
+            sal_begin_group(
+                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
+                nw, 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, self.epoch,
+                &worker_sizes[..nw],
+            )
+        }.ok_or_else(|| format!(
+            "SAL write_commit_sentinel failed (cursor={})", self.write_cursor
+        ))?;
         self.write_cursor = unsafe { group.commit() };
         Ok(())
     }

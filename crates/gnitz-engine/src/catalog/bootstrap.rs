@@ -65,6 +65,7 @@ impl CatalogEngine {
             sys_circuit_params,
             sys_circuit_group_cols,
             pending_broadcasts: Vec::new(),
+            ddl_zone_lsn: 0,
         };
 
         if is_new {

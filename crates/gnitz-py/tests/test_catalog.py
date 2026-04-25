@@ -146,11 +146,11 @@ class TestTableDDL:
             client.drop_schema(sn)
 
     def test_create_table_too_many_columns(self, client):
-        """65 columns exceeds the server limit and raises GnitzError."""
+        """66 columns exceeds the server limit (65) and raises GnitzError."""
         sn = "s" + _uid()
         client.create_schema(sn)
         cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-        for i in range(64):
+        for i in range(65):
             cols.append(gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64))
         try:
             with pytest.raises(gnitz.GnitzError):

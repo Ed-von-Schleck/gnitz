@@ -276,6 +276,11 @@ pub const STATUS_ERROR: u32 = 1;
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK:    u64 = 2;
 
+/// Maximum number of columns (PK + payload) in any table or view schema.
+/// Capped at 65 by the row-major null bitmap: each row stores one u64 word
+/// with one bit per nullable payload column, so payload columns ≤ 64.
+pub const MAX_COLUMNS: usize = 65;
+
 // ---------------------------------------------------------------------------
 // WAL header constants
 // ---------------------------------------------------------------------------

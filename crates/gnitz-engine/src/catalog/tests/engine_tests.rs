@@ -256,6 +256,53 @@ fn test_ddl_sync() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── test_ddl_sync_zone_lsn_tracking (Phase 5) ────────────────────────
+
+#[test]
+fn test_ddl_sync_zone_lsn_tracking() {
+    // Phase 5 invariant: while `ddl_zone_lsn` is set, `ingest_to_family`
+    // pins each touched system table's `current_lsn` to that zone LSN.
+    // After successive DDL zones, `get_max_flushed_lsn` reports the most
+    // recent zone LSN, and recovery can skip already-applied groups.
+    use crate::catalog::sys_tables::{SCHEMA_TAB_ID, TABLE_TAB_ID, COL_TAB_ID};
+
+    let dir = temp_dir("catalog_zone_lsn");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
+    engine.ddl_zone_lsn = 5;
+    engine.create_schema("z").unwrap();
+    assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5);
+
+    // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
+    // SCHEMA_TAB stays at 5 (untouched in this zone).
+    engine.ddl_zone_lsn = 7;
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let _tid = engine.create_table("z.t", &cols, 0, false).unwrap();
+    assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
+    assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
+    assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5,
+        "SCHEMA_TAB stays at the most recent zone that touched it");
+
+    // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
+    engine.ddl_zone_lsn = 9;
+    let _tid2 = engine.create_table("z.t2", &cols, 0, false).unwrap();
+    assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 9);
+    assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 9);
+
+    // collect_all_flushed_lsns covers every system table.
+    let map = engine.collect_all_flushed_lsns();
+    assert_eq!(map.get(&SCHEMA_TAB_ID), Some(&5));
+    assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
+    assert_eq!(map.get(&COL_TAB_ID), Some(&9));
+
+    // max_table_current_lsn is at least the highest zone LSN observed.
+    assert!(engine.max_table_current_lsn() >= 9);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_raw_store_ingest ─────────────────────────────────────────────
 
 #[test]

@@ -178,8 +178,13 @@ impl ServerExecutor {
         reactor.attach_server_fd(server_fd);
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
-        let ingest_lsn = Rc::new(Cell::new(0u64));
-        let last_tick_lsn = Rc::new(Cell::new(0u64));
+        // Phase 5: seed ingest_lsn from the catalog's known max so each
+        // newly allocated zone LSN is strictly greater than every
+        // table's `current_lsn`. This keeps the direct assignment in
+        // `ingest_to_family` monotonic across upgrades and restarts.
+        let initial_ingest_lsn = unsafe { &*catalog }.max_table_current_lsn();
+        let ingest_lsn = Rc::new(Cell::new(initial_ingest_lsn));
+        let last_tick_lsn = Rc::new(Cell::new(initial_ingest_lsn));
         let tick_rows: Rc<RefCell<HashMap<i64, usize>>> = Rc::new(RefCell::new(HashMap::new()));
         let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let t_last_push = Rc::new(Cell::new(None));
@@ -388,7 +393,8 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     let emit_err = guard_panic("tick", || unsafe {
         let disp = &mut *shared.dispatcher.0;
         for (i, &tid) in tids.iter().enumerate() {
-            disp.write_tick_group(tid, &req_ids[i])?;
+            let lsn = disp.next_lsn();
+            disp.write_tick_group(tid, lsn, &req_ids[i])?;
         }
         disp.signal_all();
         Ok(())
@@ -733,6 +739,17 @@ async fn handle_system_dml(
     // piggyback on this one.
     let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
 
+    // Reserve the zone LSN but do NOT publish it yet. ingest_lsn becomes
+    // visible to readers only after fsync confirms durability — Cleanup D
+    // closes the pre-fsync window where clients could see an LSN whose
+    // backing data is not yet on disk.
+    let zone_lsn = shared.ingest_lsn.get() + 1;
+    // Phase 5: pin every system-table write in this zone to `zone_lsn`
+    // so recovery's flushed_lsn dedup matches the SAL's group LSN. Set
+    // BEFORE the mutate phase so cascading hooks inside `evaluate_dag`
+    // see the same value, then cleared after fsync (or on error).
+    unsafe { (*cat_ptr_raw).ddl_zone_lsn = zone_lsn; }
+
     if let Err(e) = guard_panic("DDL", || {
         let cat = unsafe { &mut *cat_ptr_raw };
         cat.ingest_to_family(target_id, &batch)?;
@@ -743,12 +760,11 @@ async fn handle_system_dml(
         // A partial cascade may have pushed entries before the failing hook;
         // clear them so the next DDL doesn't inherit half-applied broadcasts.
         let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
+        unsafe { (*cat_ptr_raw).ddl_zone_lsn = 0; }
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
     }
     let t_mut_done = Instant::now();
-    let lsn = shared.ingest_lsn.get() + 1;
-    shared.ingest_lsn.set(lsn);
 
     // SAL emission window: acquire III.3b mutex to serialize the
     // broadcast write against committer + tick + relay. Lock held ONLY
@@ -758,10 +774,21 @@ async fn handle_system_dml(
     let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
         let disp_ptr_raw = shared.dispatcher.0;
-        if let Err(e) = guard_panic("broadcast_ddl", || {
+        // All broadcasts in the zone share `zone_lsn`. The trailing
+        // commit sentinel marks the zone durably closed; recovery
+        // applies the zone's groups only when the sentinel is on disk.
+        if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
             for (tid, bat) in &drained {
-                unsafe { (*disp_ptr_raw).broadcast_ddl(*tid, bat)?; }
+                (*disp_ptr_raw).broadcast_ddl(*tid, bat, zone_lsn)?;
             }
+            // Crash-injection seam: abort after broadcasts but BEFORE
+            // the commit sentinel — exercises the recovery path where a
+            // half-written zone must be skipped.
+            #[cfg(debug_assertions)]
+            if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
+                libc::abort();
+            }
+            (*disp_ptr_raw).commit_zone(zone_lsn)?;
             Ok::<(), String>(())
         }) {
             send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
@@ -776,7 +803,15 @@ async fn handle_system_dml(
         gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
     }
 
-    send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn as u128).await;
+    // Publish only after fsync. Tick handlers reading shared.ingest_lsn
+    // during the DDL window now see the *old* LSN; tick-derived state
+    // therefore reflects only durable work.
+    shared.ingest_lsn.set(zone_lsn);
+    // Phase 5: zone is durably committed; release the LSN so subsequent
+    // non-DDL ingest paths (recovery test fixtures, raw_store_ingest)
+    // can use the auto-bump again.
+    unsafe { (*cat_ptr_raw).ddl_zone_lsn = 0; }
+    send_ok_response(shared, fd, target_id, None, client_id, &schema, zone_lsn as u128).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {

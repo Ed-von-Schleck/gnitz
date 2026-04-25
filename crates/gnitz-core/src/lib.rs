@@ -22,7 +22,7 @@ pub use protocol::{
     FLAG_SEEK_BY_INDEX, FLAG_ALLOCATE_INDEX_ID,
     FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
-    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK, MAX_COLUMNS,
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
     encode_wal_block, decode_wal_block, recompute_block_checksum, get_region_offset_size,
     schema_to_batch, batch_to_schema,

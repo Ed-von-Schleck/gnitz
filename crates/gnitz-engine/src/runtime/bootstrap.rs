@@ -3,12 +3,14 @@
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
 //! runs SAL recovery, and enters the executor event loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::wire as ipc;
-use crate::runtime::sal::{FLAG_PUSH, FLAG_DDL_SYNC, SAL_MMAP_SIZE, SalWriter, SalReader};
+use crate::runtime::sal::{
+    FLAG_PUSH, FLAG_DDL_SYNC, FLAG_TXN_COMMIT, SAL_MMAP_SIZE, SalWriter, SalReader,
+};
 use crate::runtime::w2m::{W2mWriter, W2mReceiver};
 use crate::runtime::sys as ipc_sys;
 use crate::sys;
@@ -34,139 +36,154 @@ fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
-// SAL recovery
+// SAL recovery (Design 2: LSN as the atomic unit)
 // ---------------------------------------------------------------------------
+//
+// Two-pass walk over the SAL:
+//
+//   Pass 1 — collect every LSN that has its commit sentinel on disk
+//            (FLAG_TXN_COMMIT). Any LSN without one is "uncommitted" and
+//            its groups are skipped at apply time. Half-completed DDL
+//            (orphan COL_TAB) is therefore impossible: if the sentinel
+//            never made it to disk, none of the zone's groups apply.
+//
+//   Pass 2 — walk again. For each group whose LSN is committed and
+//            > family_lsns[tid] (table not already flushed past this
+//            LSN), hand the decoded batch to the apply closure.
+//
+// The same walker handles both system-table replay (master pre-fork) and
+// user-table replay (per-worker post-fork): callers vary only the
+// family_lsns scope and the apply closure.
 
-/// Replay unflushed SAL push blocks for this worker's partitions.
-///
-/// Walks the SAL from offset 0, reading group headers. For FLAG_PUSH messages
-/// with LSN > flushed LSN, decodes the wire data and ingests the batch.
-fn recover_from_sal(
-    sal_reader: &SalReader,
-    catalog: &mut CatalogEngine,
-) {
-    // Build per-table max_flushed_lsn map
-    let table_ids = catalog.iter_user_table_ids();
-    let mut family_lsns: HashMap<i64, u64> = HashMap::new();
-    for &tid in &table_ids {
-        let lsn = catalog.get_max_flushed_lsn(tid);
-        family_lsns.insert(tid, lsn);
-    }
-
+/// Pass 1: walk the SAL collecting committed LSNs. Honours the epoch
+/// fence (decreasing epoch terminates the walk).
+fn collect_committed_lsns(sal_reader: &SalReader) -> HashSet<u64> {
+    let mut committed: HashSet<u64> = HashSet::new();
     let mut offset: u64 = 0;
-    let mut replayed: u32 = 0;
     let mut last_epoch: u32 = 0;
-
     while (offset as usize) + 8 < SAL_MMAP_SIZE {
         let (msg, new_offset) = match sal_reader.try_read(offset) {
             Some(v) => v,
             None => break,
         };
-
-        // Epoch fence: decreasing epoch = stale data from before checkpoint
-        if last_epoch > 0 && msg.epoch < last_epoch {
-            break;
-        }
+        if last_epoch > 0 && msg.epoch < last_epoch { break; }
         last_epoch = msg.epoch;
+        offset = new_offset;
+        if msg.flags & FLAG_TXN_COMMIT != 0 {
+            committed.insert(msg.lsn);
+        }
+    }
+    committed
+}
 
+/// Pass 2: walk the SAL applying every committed group whose LSN is
+/// in `family_lsns` and exceeds the recorded flushed LSN. The closure
+/// receives the decoded batch and may filter by flag (e.g. master
+/// applies only FLAG_DDL_SYNC, worker only FLAG_PUSH).
+fn recover_sal<F>(
+    sal_reader: &SalReader,
+    catalog: &mut CatalogEngine,
+    family_lsns: &HashMap<i64, u64>,
+    mut apply: F,
+) -> u32
+where
+    F: FnMut(&mut CatalogEngine, &crate::runtime::sal::SalMessage, ipc::DecodedWire) -> bool,
+{
+    let committed = collect_committed_lsns(sal_reader);
+
+    let mut offset: u64 = 0;
+    let mut applied: u32 = 0;
+    let mut last_epoch: u32 = 0;
+    while (offset as usize) + 8 < SAL_MMAP_SIZE {
+        let (msg, new_offset) = match sal_reader.try_read(offset) {
+            Some(v) => v,
+            None => break,
+        };
+        if last_epoch > 0 && msg.epoch < last_epoch { break; }
+        last_epoch = msg.epoch;
         offset = new_offset;
 
-        // Only process FLAG_PUSH with data for this worker
-        if msg.flags & FLAG_PUSH == 0 {
-            continue;
-        }
-        let data = match msg.wire_data {
-            Some(d) => d,
-            None => continue,
-        };
+        if !committed.contains(&msg.lsn) { continue; }
 
         let tid = msg.target_id as i64;
         let flushed = match family_lsns.get(&tid) {
             Some(&lsn) => lsn,
             None => continue,
         };
-        if msg.lsn <= flushed {
-            continue;
-        }
+        if msg.lsn <= flushed { continue; }
 
-        // Decode wire data and extract batch
-        if let Ok(decoded) = ipc::decode_wire(data) {
-            if let Some(owned) = decoded.data_batch {
-                if owned.count > 0 {
-                    // Use the unique_pk-aware replay path so retractions
-                    // correctly cancel existing rows instead of being
-                    // added as orphaned (pk, zero-payload, -1) entries.
-                    let _ = catalog.replay_ingest(tid, owned);
-                    replayed += 1;
-                }
-            }
+        let data = match msg.wire_data { Some(d) => d, None => continue };
+        let decoded = match ipc::decode_wire(data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if apply(catalog, &msg, decoded) {
+            applied += 1;
         }
     }
-
-    if replayed > 0 {
-        let msg = format!("SAL recovery: replayed {} blocks\n", replayed);
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
-    }
+    applied
 }
 
-// ---------------------------------------------------------------------------
-// System table SAL recovery (master-side, before forking workers)
-// ---------------------------------------------------------------------------
-
-/// Replay unflushed DDL_SYNC SAL entries into system tables.
-///
-/// Called on the master before forking workers. The DDL_SYNC broadcast
-/// already carries the system table batch data, so no extra SAL entries
-/// are needed — we just replay the same entries workers would see.
+/// Master pre-fork system-table replay. Builds the system-table family
+/// map (Phase 5 will populate non-zero values), then walks the SAL via
+/// `recover_sal`. The closure ingests every committed FLAG_DDL_SYNC
+/// batch addressed to a system table — orphan COL_TAB rows from a
+/// crashed DDL are skipped because their zone never closed.
 fn recover_system_tables_from_sal(
     sal_ptr: *const u8,
     catalog: &mut CatalogEngine,
 ) {
     let sal_reader = SalReader::new(sal_ptr, 0, SAL_MMAP_SIZE, -1);
+    let all_lsns = catalog.collect_all_flushed_lsns();
+    let family_lsns: HashMap<i64, u64> = all_lsns.into_iter()
+        .filter(|&(tid, _)| tid > 0 && tid < FIRST_USER_TABLE_ID)
+        .collect();
 
-    let mut offset: u64 = 0;
-    let mut replayed: u32 = 0;
-    let mut last_epoch: u32 = 0;
-
-    while (offset as usize) + 8 < SAL_MMAP_SIZE {
-        let (msg, new_offset) = match sal_reader.try_read(offset) {
-            Some(v) => v,
-            None => break,
-        };
-
-        // Epoch fence: decreasing epoch = stale data from before checkpoint
-        if last_epoch > 0 && msg.epoch < last_epoch {
-            break;
-        }
-        last_epoch = msg.epoch;
-        offset = new_offset;
-
-        if msg.flags & FLAG_DDL_SYNC == 0 {
-            continue;
-        }
-
-        let tid = msg.target_id as i64;
-        if tid >= FIRST_USER_TABLE_ID {
-            continue;
-        }
-
-        let data = match msg.wire_data {
-            Some(d) => d,
-            None => continue,
-        };
-
-        if let Ok(decoded) = ipc::decode_wire(data) {
-            if let Some(batch) = decoded.data_batch {
-                if batch.count > 0 {
-                    let _ = catalog.ingest_to_family(tid, &batch);
-                    replayed += 1;
-                }
-            }
-        }
-    }
+    let replayed = recover_sal(
+        &sal_reader, catalog, &family_lsns,
+        |cat, msg, decoded| {
+            if msg.flags & FLAG_DDL_SYNC == 0 { return false; }
+            let batch = match decoded.data_batch {
+                Some(b) if b.count > 0 => b,
+                _ => return false,
+            };
+            cat.ingest_to_family(msg.target_id as i64, &batch).is_ok()
+        },
+    );
 
     if replayed > 0 {
         let msg = format!("SAL system table recovery: replayed {} entries\n", replayed);
+        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+    }
+}
+
+/// Per-worker post-fork user-table replay. The worker's `sal_reader`
+/// already has the worker's per-cursor view; the apply closure decodes
+/// each FLAG_PUSH group's batch and replays it through the unique-pk
+/// path so retractions cancel correctly.
+fn recover_from_sal(
+    sal_reader: &SalReader,
+    catalog: &mut CatalogEngine,
+) {
+    let all_lsns = catalog.collect_all_flushed_lsns();
+    let family_lsns: HashMap<i64, u64> = all_lsns.into_iter()
+        .filter(|&(tid, _)| tid >= FIRST_USER_TABLE_ID)
+        .collect();
+
+    let replayed = recover_sal(
+        sal_reader, catalog, &family_lsns,
+        |cat, msg, decoded| {
+            if msg.flags & FLAG_PUSH == 0 { return false; }
+            let batch = match decoded.data_batch {
+                Some(b) if b.count > 0 => b,
+                _ => return false,
+            };
+            cat.replay_ingest(msg.target_id as i64, batch).is_ok()
+        },
+    );
+
+    if replayed > 0 {
+        let msg = format!("SAL recovery: replayed {} blocks\n", replayed);
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
     }
 }
@@ -276,6 +293,31 @@ pub fn server_main(
     // MADV_POPULATE_WRITE (Linux 5.14+) installs dirty PTEs and triggers
     // the filesystem mkwrite callback upfront, without dirtying page contents.
     sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+
+    // --- V2 migration: clean break, sentinel marker file ---
+    //
+    // Design 2 changes the SAL semantics (LSN as the atomic unit, commit
+    // sentinels mark zone closure). A pre-V2 SAL has no sentinels, so
+    // every uncommitted-by-the-new-rules group would be skipped at
+    // recovery — which would silently drop unflushed work.
+    //
+    // Contract: upgrading to V2 requires a clean shutdown. On first boot
+    // under V2, any pre-V2 SAL contents are discarded and shard files
+    // (durable up to the last checkpoint) are authoritative. The marker
+    // is touched once so subsequent boots skip the wipe.
+    {
+        let v2_marker_path = format!("{}/wal.sal.v2", data_dir);
+        if !std::path::Path::new(&v2_marker_path).exists() {
+            unsafe { libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE); }
+            sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+            if let Err(e) = std::fs::File::create(&v2_marker_path) {
+                let msg = format!("Error: failed to create wal.sal.v2 marker: {}\n", e);
+                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+                return 1;
+            }
+            gnitz_info!("First boot under V2: pre-V2 SAL discarded, shards are authoritative");
+        }
+    }
 
     // --- System table SAL recovery (before forking workers) ---
     {
@@ -477,4 +519,167 @@ pub fn server_main(
     unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
 
     ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd)
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the two-pass recovery primitives. The full end-to-end crash
+// path is covered in `crates/gnitz-py/tests/test_crash_recovery.py`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::runtime::sal::{
+        sal_write_group, SalWriter, SalReader, MAX_WORKERS,
+    };
+
+    unsafe fn alloc_mmap(size: usize) -> *mut u8 {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+            -1,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        std::ptr::write_bytes(ptr as *mut u8, 0, size);
+        ptr as *mut u8
+    }
+
+    unsafe fn free_mmap(ptr: *mut u8, size: usize) {
+        libc::munmap(ptr as *mut libc::c_void, size);
+    }
+
+    /// Write one DDL_SYNC-flagged group with a 1-byte payload per worker.
+    /// Returns the new cursor.
+    unsafe fn write_ddl_group(
+        ptr: *mut u8, cursor: u64, nw: u32, target_id: u32, lsn: u64,
+        epoch: u32, size: u64,
+    ) -> u64 {
+        let payload = vec![0u8; 64];
+        let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
+        let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
+        let res = sal_write_group(
+            ptr, cursor, nw, target_id, lsn, FLAG_DDL_SYNC, epoch, size,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(res.status, 0);
+        res.new_cursor
+    }
+
+    #[test]
+    fn test_recover_skips_uncommitted() {
+        // Two groups at lsn=K are written without a sentinel — their
+        // zone never closed (simulated crash). One group at lsn=K+1 is
+        // closed with a sentinel. The committed set must contain only
+        // K+1 (plus any FLAG_PUSH auto-commits, of which there are none
+        // here).
+        unsafe {
+            let size = 1 << 20;
+            let ptr = alloc_mmap(size);
+            let nw = 2u32;
+
+            let mut cur = write_ddl_group(ptr, 0, nw, 100, 5, 1, size as u64);
+            cur = write_ddl_group(ptr, cur, nw, 101, 5, 1, size as u64);
+            // No sentinel for lsn=5 — zone never closed.
+
+            cur = write_ddl_group(ptr, cur, nw, 102, 6, 1, size as u64);
+            // Sentinel for lsn=6.
+            let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+            let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+            writer.reset(cur, 1);
+            writer.write_commit_sentinel(6).unwrap();
+
+            let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
+            let committed = collect_committed_lsns(&reader);
+            assert!(!committed.contains(&5),
+                "lsn=5 has no sentinel and must be uncommitted");
+            assert!(committed.contains(&6),
+                "lsn=6 has a sentinel and must be committed");
+
+            for &e in &efds { libc::close(e); }
+            free_mmap(ptr, size);
+        }
+    }
+
+    #[test]
+    fn test_recover_applies_all_committed() {
+        // Three DDL groups at lsn=K plus a sentinel at lsn=K. Recovery's
+        // committed set must contain K. Pass 2 (simulated by hand here)
+        // would then apply each of the three groups.
+        unsafe {
+            let size = 1 << 20;
+            let ptr = alloc_mmap(size);
+            let nw = 3u32;
+
+            let mut cur = write_ddl_group(ptr, 0, nw, 200, 9, 1, size as u64);
+            cur = write_ddl_group(ptr, cur, nw, 201, 9, 1, size as u64);
+            cur = write_ddl_group(ptr, cur, nw, 202, 9, 1, size as u64);
+
+            let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+            let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+            writer.reset(cur, 1);
+            writer.write_commit_sentinel(9).unwrap();
+
+            let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
+            let committed = collect_committed_lsns(&reader);
+            assert!(committed.contains(&9),
+                "committed sentinel at lsn=9 must mark the zone closed");
+
+            // Walk the SAL by hand to count groups at lsn=9 with
+            // FLAG_DDL_SYNC and no sentinel — these are the three apply
+            // candidates.
+            let mut applied = 0u32;
+            let mut offset = 0u64;
+            while (offset as usize) + 8 < size {
+                let (msg, next) = match reader.try_read(offset) {
+                    Some(v) => v, None => break,
+                };
+                offset = next;
+                if msg.lsn != 9 { continue; }
+                if msg.flags & FLAG_TXN_COMMIT != 0 { continue; }
+                if msg.flags & FLAG_DDL_SYNC != 0 && msg.wire_data.is_some() {
+                    applied += 1;
+                }
+            }
+            assert_eq!(applied, 3, "all three committed DDL groups apply");
+
+            for &e in &efds { libc::close(e); }
+            free_mmap(ptr, size);
+        }
+    }
+
+    #[test]
+    fn test_push_without_sentinel_skipped() {
+        // Phase 6 invariant: a FLAG_PUSH group with no closing
+        // FLAG_TXN_COMMIT sentinel is uncommitted and must be skipped.
+        // Earlier transitional code auto-committed every FLAG_PUSH group;
+        // that branch is gone now that the committer emits sentinels.
+        unsafe {
+            let size = 1 << 20;
+            let ptr = alloc_mmap(size);
+            let nw = 1u32;
+
+            let payload = vec![0u8; 32];
+            let ptrs = [payload.as_ptr()];
+            let sizes = [payload.len() as u32];
+            let res = sal_write_group(
+                ptr, 0, nw, 50, 11, FLAG_PUSH, 1, size as u64,
+                ptrs.as_ptr(), sizes.as_ptr(),
+            );
+            assert_eq!(res.status, 0);
+            // No sentinel — zone unclosed.
+
+            let efd = ipc_sys::eventfd_create();
+            let reader = SalReader::new(ptr as *const u8, 0, size, efd);
+            let committed = collect_committed_lsns(&reader);
+            assert!(!committed.contains(&11),
+                "uncommitted push must NOT appear in committed set");
+
+            let _ = MAX_WORKERS;
+            libc::close(efd);
+            free_mmap(ptr, size);
+        }
+    }
 }

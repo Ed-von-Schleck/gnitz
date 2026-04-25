@@ -34,9 +34,20 @@ impl CatalogEngine {
             self.precheck_sys_ingest(table_id, batch)?;
 
             let schema = sys_tab_schema(table_id);
+            let zone_lsn = self.ddl_zone_lsn;
             let table = self.sys_table_mut(table_id)
                 .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
             ingest_batch_into(table, batch);
+            // Phase 5: pin current_lsn to the active zone LSN so recovery
+            // dedup (`msg.lsn <= flushed`) matches the SAL group's zone
+            // LSN. The auto-bump inside `ingest_batch_from_regions` is
+            // overwritten here; cascading hooks within the same zone all
+            // converge on the same value. The bootstrap initialises
+            // `shared.ingest_lsn` to be ≥ every table's `current_lsn`, so
+            // direct assignment never regresses the per-table counter.
+            if zone_lsn > 0 {
+                table.current_lsn = zone_lsn;
+            }
             let mut batch_for_hooks = batch.clone();
             batch_for_hooks.set_schema(schema);
             self.fire_hooks(table_id, &batch_for_hooks)?;
@@ -527,8 +538,14 @@ impl CatalogEngine {
             .collect()
     }
 
-    /// Get max flushed LSN for a table (for SAL recovery).
+    /// Get max flushed LSN for a table (for SAL recovery). Handles both
+    /// user tables (via the DAG) and system tables (via direct lookup).
+    /// Phase 5: system tables now track zone LSNs via `ingest_to_family`,
+    /// so recovery dedups them the same way user tables do.
     pub fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
+        if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
+            return self.sys_table_current_lsn(table_id);
+        }
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
             None => return 0,
@@ -538,6 +555,77 @@ impl CatalogEngine {
             StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
             StoreHandle::Partitioned(ref pt) => pt.current_lsn(),
         }
+    }
+
+    /// Read `current_lsn` from a system table by id. Returns 0 for unknown
+    /// ids. Implemented without `&mut self` so recovery callers can hold
+    /// other shared state.
+    fn sys_table_current_lsn(&self, table_id: i64) -> u64 {
+        let table: &Table = match table_id {
+            SCHEMA_TAB_ID => &self.sys_schemas,
+            TABLE_TAB_ID => &self.sys_tables,
+            VIEW_TAB_ID => &self.sys_views,
+            COL_TAB_ID => &self.sys_columns,
+            IDX_TAB_ID => &self.sys_indices,
+            DEP_TAB_ID => &self.sys_view_deps,
+            SEQ_TAB_ID => &self.sys_sequences,
+            CIRCUIT_NODES_TAB_ID => &self.sys_circuit_nodes,
+            CIRCUIT_EDGES_TAB_ID => &self.sys_circuit_edges,
+            CIRCUIT_SOURCES_TAB_ID => &self.sys_circuit_sources,
+            CIRCUIT_PARAMS_TAB_ID => &self.sys_circuit_params,
+            CIRCUIT_GROUP_COLS_TAB_ID => &self.sys_circuit_group_cols,
+            _ => return 0,
+        };
+        table.current_lsn
+    }
+
+    /// Build a map of every known table id → max flushed LSN, covering
+    /// both system tables and user tables. Recovery uses this as the
+    /// dedup filter for the unified two-pass walk.
+    pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        let mut map = std::collections::HashMap::new();
+        for &tid in &[
+            SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
+            DEP_TAB_ID, SEQ_TAB_ID,
+            CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
+            CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
+            CIRCUIT_GROUP_COLS_TAB_ID,
+        ] {
+            map.insert(tid, self.sys_table_current_lsn(tid));
+        }
+        for &tid in self.dag.tables.keys() {
+            if tid >= FIRST_USER_TABLE_ID {
+                map.insert(tid, self.get_max_flushed_lsn(tid));
+            }
+        }
+        map
+    }
+
+    /// Maximum `current_lsn` across all tables — system and user. The
+    /// executor seeds `shared.ingest_lsn` from this at boot so the next
+    /// allocated zone LSN is strictly greater than every table's current
+    /// counter, keeping the direct assignment in `ingest_to_family`
+    /// monotonic across upgrades and restarts.
+    pub fn max_table_current_lsn(&self) -> u64 {
+        let mut max_lsn = 0u64;
+        for &tid in &[
+            SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
+            DEP_TAB_ID, SEQ_TAB_ID,
+            CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
+            CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
+            CIRCUIT_GROUP_COLS_TAB_ID,
+        ] {
+            max_lsn = max_lsn.max(self.sys_table_current_lsn(tid));
+        }
+        for entry in self.dag.tables.values() {
+            let l = match &entry.handle {
+                StoreHandle::Single(t) => t.current_lsn,
+                StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+                StoreHandle::Partitioned(pt) => pt.current_lsn(),
+            };
+            max_lsn = max_lsn.max(l);
+        }
+        max_lsn
     }
 
     // -- Read column definitions from sys_columns --------------------------

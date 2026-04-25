@@ -197,6 +197,11 @@ pub struct MasterDispatcher {
     /// unique-index broadcasts. See the UniqueFilter comment block above.
     unique_filters: HashMap<(i64, u32), UniqueFilter>,
 
+    /// Monotonic LSN allocator. The SAL writer no longer owns a counter;
+    /// the dispatcher hands out LSNs (one per zone) via `next_lsn`.
+    /// Reset on checkpoint via `reset_sal`.
+    next_lsn: u64,
+
     // Cache: table_id → (schema, col_name_bytes).
     // Shared via Rc so cache hits cost a refcount bump, not a deep clone of
     // the name bytes. Populated lazily; table schemas are immutable.
@@ -223,12 +228,22 @@ impl MasterDispatcher {
             catalog,
             router: PartitionRouter::new(),
             unique_filters: HashMap::new(),
+            next_lsn: 0,
             schema_names_cache: HashMap::new(),
         }
     }
 
     pub fn reset_sal(&mut self, write_cursor: u64, epoch: u32) {
         self.sal.reset(write_cursor, epoch);
+    }
+
+    /// Allocate the next monotonic LSN. Single allocator seam — after Phase 1,
+    /// every SAL group LSN flows from here. Phases 3 and 6 will replace this
+    /// with caller-supplied zone LSNs for DDL and push paths.
+    pub fn next_lsn(&mut self) -> u64 {
+        let v = self.next_lsn;
+        self.next_lsn += 1;
+        v
     }
 
     fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<[Vec<u8>]>) {
@@ -251,7 +266,7 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Encode per-worker data directly into SAL mmap.
-    /// Does NOT fdatasync or signal.
+    /// Does NOT fdatasync or signal. `lsn` is supplied by the caller.
     ///
     /// Sync callers pass `request_id=0` (or some single id) which is
     /// replicated across all workers. Async callers use
@@ -260,6 +275,7 @@ impl MasterDispatcher {
     fn write_group(
         &mut self,
         target_id: i64,
+        lsn: u64,
         flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
@@ -273,17 +289,19 @@ impl MasterDispatcher {
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
-            target_id, flags, worker_batches, schema, col_names,
+            target_id, lsn, flags, worker_batches, schema, col_names,
             seek_pk, seek_col_idx, &ids[..nw], unicast_worker,
         )
     }
 
     /// Encode per-worker data with per-worker request ids. Used by async
     /// fan-outs that need distinct ids per worker for reply routing.
+    /// `lsn` is supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     fn write_group_with_req_ids(
         &mut self,
         target_id: i64,
+        lsn: u64,
         flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
@@ -297,17 +315,19 @@ impl MasterDispatcher {
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_group_direct(
-            target_id as u32, flags, worker_batches,
+            target_id as u32, lsn, flags, worker_batches,
             schema, col_names_opt,
             seek_pk, seek_col_idx, req_ids, unicast_worker,
         )
     }
 
     /// Encode batch once directly into SAL mmap, replicate to all workers.
+    /// `lsn` is supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     fn write_broadcast(
         &mut self,
         target_id: i64,
+        lsn: u64,
         flags: u32,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
@@ -320,16 +340,18 @@ impl MasterDispatcher {
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_broadcast_direct(
-            target_id as u32, flags, batch, schema, col_names_opt,
+            target_id as u32, lsn, flags, batch, schema, col_names_opt,
             seek_pk, seek_col_idx, request_id,
         )
     }
 
     /// Encode once, write to all workers, signal (no fdatasync).
+    /// `lsn` is supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     fn send_broadcast(
         &mut self,
         target_id: i64,
+        lsn: u64,
         flags: u32,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
@@ -338,7 +360,7 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
-        self.write_broadcast(target_id, flags, batch, schema, col_names,
+        self.write_broadcast(target_id, lsn, flags, batch, schema, col_names,
                             seek_pk, seek_col_idx, request_id)?;
         self.signal_all();
         Ok(())
@@ -351,10 +373,12 @@ impl MasterDispatcher {
 
 
     /// Write per-worker message group + signal all workers (no fdatasync).
+    /// `lsn` is supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     fn send_to_workers(
         &mut self,
         target_id: i64,
+        lsn: u64,
         flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
@@ -363,7 +387,7 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
-        self.write_group(target_id, flags, worker_batches, schema, col_names,
+        self.write_group(target_id, lsn, flags, worker_batches, schema, col_names,
                          seek_pk, seek_col_idx, request_id, -1)?;
         self.signal_all();
         Ok(())
@@ -477,7 +501,8 @@ impl MasterDispatcher {
 
     fn do_checkpoint(&mut self) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
-        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
+        let lsn = self.next_lsn();
+        self.send_broadcast(0, lsn, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
         self.collect_acks()?;
         self.checkpoint_post_ack();
         Ok(())
@@ -539,12 +564,13 @@ impl MasterDispatcher {
         let refs: Vec<Option<&Batch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
+        let lsn = self.next_lsn();
         // Echo `source_id` back via `seek_pk_lo` so the worker's
         // `do_exchange_wait` can match on (view_id, source_id). Without
         // this, a multi-source view (join over 2+ tables) can deliver
         // the wrong source's relay to a waiting exchange and the worker
         // demuxes against the wrong sharding columns.
-        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
+        self.send_to_workers(view_id, lsn, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
                               source_id as u128, 0, 0)
     }
 
@@ -576,7 +602,8 @@ impl MasterDispatcher {
     pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
-        self.send_broadcast(source_id, FLAG_BACKFILL, None, &schema, &col_names,
+        let lsn = self.next_lsn();
+        self.send_broadcast(source_id, lsn, FLAG_BACKFILL, None, &schema, &col_names,
                            view_id as u128, 0, 0)?;
         self.collect_acks_and_relay(source_id)
     }
@@ -622,8 +649,9 @@ impl MasterDispatcher {
         let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
         let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
+            let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                target_id, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
+                target_id, lsn, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
                 key, col_idx as u64, req_ids, -1,
             )
         }).await?;
@@ -649,8 +677,9 @@ impl MasterDispatcher {
         let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
         let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
+            let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                target_id, 0, &[], &schema, &col_names,
+                target_id, lsn, 0, &[], &schema, &col_names,
                 0, 0, req_ids, -1,
             )
         }).await?;
@@ -704,8 +733,9 @@ impl MasterDispatcher {
                             .map(|b| if b.count > 0 { Some(b) } else { None })
                             .collect(),
                     };
+                    let lsn = disp.next_lsn();
                     disp.write_group_with_req_ids(
-                        check.target_id, check.flags, &refs,
+                        check.target_id, lsn, check.flags, &refs,
                         &check.schema, &[], 0, check.col_hint,
                         &rids[idx], -1,
                     )?;
@@ -750,12 +780,25 @@ impl MasterDispatcher {
         Ok(results)
     }
 
-    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch) -> Result<(), String> {
+    /// Broadcast a DDL batch to every worker. `lsn` is supplied by the
+    /// caller — Phase 3 uses one zone-LSN across all broadcasts in a DDL
+    /// so recovery can group them as an atomic zone.
+    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
+        self.write_broadcast(target_id, lsn, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
                             0, 0, 0)?;
         self.signal_all();
-        gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.count);
+        gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
+        Ok(())
+    }
+
+    /// Close an atomic zone at `lsn`: write the empty commit sentinel
+    /// and signal workers. All preceding groups at this LSN belong to
+    /// the zone; recovery applies them only when this sentinel reaches
+    /// disk before the crash.
+    pub fn commit_zone(&mut self, lsn: u64) -> Result<(), String> {
+        self.sal.write_commit_sentinel(lsn)?;
+        self.signal_all();
         Ok(())
     }
 
@@ -767,13 +810,14 @@ impl MasterDispatcher {
     /// NOT signal — the caller batches multiple `write_tick_group` calls
     /// followed by a single `signal_all` (IV.6). The underlying SAL
     /// encoder reuses `write_group_with_req_ids`; per-worker slots all
-    /// carry the corresponding req_id from `req_ids[w]`.
+    /// carry the corresponding req_id from `req_ids[w]`. `lsn` is
+    /// supplied by the caller.
     pub(crate) fn write_tick_group(
-        &mut self, tid: i64, req_ids: &[u64],
+        &mut self, tid: i64, lsn: u64, req_ids: &[u64],
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(tid);
         self.write_group_with_req_ids(
-            tid, FLAG_TICK, &[], &schema, &col_names,
+            tid, lsn, FLAG_TICK, &[], &schema, &col_names,
             0, 0, req_ids, -1,
         )
     }
@@ -797,7 +841,8 @@ impl MasterDispatcher {
 
     pub fn shutdown_workers(&mut self) {
         let schema = SchemaDescriptor::minimal_u64();
-        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
+        let lsn = self.next_lsn();
+        let _ = self.send_broadcast(0, lsn, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid > 0 {
@@ -1360,8 +1405,9 @@ impl MasterDispatcher {
 
         let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
+            let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                table_id, 0, &[], &schema, &col_names,
+                table_id, lsn, 0, &[], &schema, &col_names,
                 0, 0, req_ids, -1,
             )
         }).await?;
@@ -1392,10 +1438,10 @@ impl MasterDispatcher {
     /// Commit N push batches as a single SAL group write. Called from
     /// the committer task. Returns (groups, req_ids, fsync_id) — the
     /// caller awaits fsync + per-worker req_ids separately so they can
-    /// `join!` them.
+    /// `join!` them. `lsn` is supplied by the caller.
     pub(crate) fn write_commit_group(
         &mut self,
-        target_id: i64, batch: &Batch, mode: WireConflictMode,
+        target_id: i64, lsn: u64, batch: &Batch, mode: WireConflictMode,
         req_ids: &[u64],
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
@@ -1406,22 +1452,23 @@ impl MasterDispatcher {
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
         self.write_group_with_req_ids(
-            target_id, FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT, &refs,
+            target_id, lsn, FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT, &refs,
             &schema, &col_names, 0, mode.as_u8() as u64, req_ids, -1,
         )
     }
 
     /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.
-    /// Does NOT sync/signal. Caller signals + awaits replies.
+    /// Does NOT sync/signal. Caller signals + awaits replies. `lsn` is
+    /// supplied by the caller.
     pub(crate) fn write_checkpoint_group(
-        &mut self, req_ids: &[u64],
+        &mut self, lsn: u64, req_ids: &[u64],
     ) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
         // One "slot" per worker with empty batch — each worker replies
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1,
+            0, lsn, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1,
         )
     }
 
@@ -1540,7 +1587,8 @@ async fn single_worker_async(
             let disp = &mut *disp_ptr;
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let req_id = reactor.alloc_request_id();
-            disp.write_group(target_id, flags, &[], &schema, &col_names,
+            let lsn = disp.next_lsn();
+            disp.write_group(target_id, lsn, flags, &[], &schema, &col_names,
                              seek_pk, seek_col_idx, req_id, worker as i32)?;
             disp.signal_one(worker);
             (schema, req_id)

@@ -402,6 +402,37 @@ async def test_lsn_monotonic(aconn, table):
         assert lsns[i] >= lsns[i - 1], f"LSN not monotonic: {lsns}"
 
 
+@pytest.mark.asyncio
+async def test_pipelined_pushes_lsn_non_strict(aconn, table):
+    """Phase 6 (Design 2): pushes that the committer batches together
+    share one zone LSN, so pipelined returns may carry duplicate LSNs.
+    The strict per-group LSN guarantee is gone — only non-decreasing
+    monotonicity is preserved. Whether *this* run actually batches
+    depends on scheduling (committer.try_recv timing); we therefore
+    only assert LSN monotonicity, not the batching itself. The
+    SAL-level invariant is unit-tested in
+    `runtime::tests::sal::test_batched_push_shares_zone_lsn`.
+    """
+    tid, cols, _ = table
+    schema = gnitz.Schema(cols)
+    n = 50
+
+    async with aconn.pipeline() as pipe:
+        for i in range(n):
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(pk=6000 + i, val=i)
+            pipe.push(tid, batch)
+
+    lsns = pipe.results
+    assert len(lsns) == n
+    assert min(lsns) > 0
+    for i in range(1, n):
+        assert lsns[i] >= lsns[i - 1], (
+            f"Phase 6 must preserve non-decreasing LSN monotonicity; "
+            f"saw lsns[{i-1}]={lsns[i-1]} > lsns[{i}]={lsns[i]}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # ScanResult integration
 # ---------------------------------------------------------------------------

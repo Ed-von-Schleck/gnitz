@@ -17,6 +17,7 @@ pub use header::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
+    MAX_COLUMNS,
 };
 pub use wal_block::{
     encode_wal_block, decode_wal_block,

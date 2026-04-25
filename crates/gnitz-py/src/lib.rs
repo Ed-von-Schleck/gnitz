@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, MAX_COLUMNS};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
 // ---------------------------------------------------------------------------
@@ -97,11 +97,10 @@ impl PySchema {
     #[pyo3(signature = (columns, pk_index = None))]
     pub fn new(columns: Bound<'_, PyList>, pk_index: Option<usize>) -> PyResult<Self> {
         let len = columns.len();
-        // 65 = gnitz_engine::schema::MAX_COLUMNS (64) + 1 PK slot.
-        // If MAX_COLUMNS changes, update this guard and its error message.
-        if len == 0 || len > 65 {
+        if len == 0 || len > MAX_COLUMNS {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "Schema must have 1 to 65 columns (1 PK + up to 64 payload columns)",
+                format!("Schema must have 1 to {MAX_COLUMNS} columns (1 PK + up to {} payload columns)",
+                    MAX_COLUMNS - 1),
             ));
         }
         let idx = match pk_index {

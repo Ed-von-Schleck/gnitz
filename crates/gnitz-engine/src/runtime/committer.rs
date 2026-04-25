@@ -191,7 +191,8 @@ async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
 
     let reply_futs = unsafe {
         let disp = &mut *disp_ptr;
-        disp.write_checkpoint_group(&req_ids)?;
+        let lsn = disp.next_lsn();
+        disp.write_checkpoint_group(lsn, &req_ids)?;
         disp.signal_all();
         req_ids.iter().map(|&id| shared.reactor.await_reply(id)).collect::<Vec<_>>()
     };
@@ -286,7 +287,13 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // Phase B (under lock): emit SAL groups, signal, submit fsync SQE.
     // Lock dropped immediately after; ACKs and fsync CQE are awaited
     // outside so tick/relay/DDL tasks can make progress.
+    //
+    // Phase 6: every group in this batched commit shares one zone LSN.
+    // After all writes, emit `commit_zone(zone_lsn)` so recovery's
+    // two-pass walker treats them atomically. `shared.ingest_lsn` is
+    // bumped exactly once for the batch, after fsync (Phase D below).
     // ------------------------------------------------------------------
+    let zone_lsn = shared.ingest_lsn.get() + 1;
     let (fsync_fut, reply_futs) = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
 
@@ -295,9 +302,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             let disp_ptr = shared.disp_ptr;
             let mode = pushes[g.start].mode;
             let err = guard_panic("commit_write", || Ok(unsafe {
-                (*disp_ptr).write_commit_group(g.tid, &g.merged, mode, &g.req_ids).err()
+                (*disp_ptr).write_commit_group(g.tid, zone_lsn, &g.merged, mode, &g.req_ids).err()
             })).unwrap_or_else(Some);
             g.write_err = err;
+            g.lsn = zone_lsn;
         }
 
         let any_written = groups.iter().any(|g| g.write_err.is_none());
@@ -311,6 +319,12 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             return;
         }
 
+        // Close the zone with the commit sentinel before fsync.
+        unsafe {
+            if let Err(e) = (*shared.disp_ptr).commit_zone(zone_lsn) {
+                crate::gnitz_warn!("commit_zone failed: {}", e);
+            }
+        }
         unsafe { (*shared.disp_ptr).signal_all(); }
 
         // Submit fsync SQE (synchronous — returns a future). Return the
@@ -327,9 +341,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     };
 
     // ------------------------------------------------------------------
-    // Phase C (no lock): await push ACKs, assign LSNs, fire tick.
+    // Phase C (no lock): await push ACKs, fire tick.
     // fsync is awaited separately in Phase D so DAG evaluation overlaps
-    // with fdatasync (~5 ms gap eliminated).
+    // with fdatasync (~5 ms gap eliminated). LSN publish (Phase 6) is
+    // deferred to after fsync so clients only see a durable LSN.
     // unique_filter_ingest_batch is NOT called here — per the invariant in
     // async-invariants.md it must run only after fsync confirms durability.
     // ------------------------------------------------------------------
@@ -345,8 +360,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             cursor += nw;
         }
 
-        // Successful groups: bump ingest_lsn. Filter update is deferred to
-        // Phase D (after fsync) per the unique-filter ordering invariant.
+        // Invalidate filters for groups whose worker ACK reported an error.
+        // ingest_lsn publish + filter ingest happen in Phase D after fsync.
         let disp_ptr = shared.disp_ptr;
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
@@ -354,18 +369,13 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
                     unsafe { (*disp_ptr).unique_filter_invalidate_table(g.tid); }
                     Ok(())
                 });
-                continue;
             }
-            let new_lsn = shared.ingest_lsn.get() + 1;
-            shared.ingest_lsn.set(new_lsn);
-            g.lsn = new_lsn;
         }
 
         // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
-        // the fsync CQE so DAG evaluation overlaps with fdatasync.
-        // ingest_lsn is already updated above; run_tick reads the correct
-        // value when it fires (single-threaded: tick only runs after the
-        // fsync yield below).
+        // the fsync CQE so DAG evaluation overlaps with fdatasync. We
+        // bump tick_rows on writes that succeeded at the worker level —
+        // ingest_lsn publish is deferred but tick batching can proceed.
         {
             let mut tr = shared.tick_rows.borrow_mut();
             let mut tids = shared.tick_tids.borrow_mut();
@@ -394,6 +404,14 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
                 "SAL fdatasync (committer) failed rc={}", fsync_rc
             );
         }
+    }
+
+    // Phase 6: publish the zone LSN exactly once, after fsync confirms
+    // durability. Every group in this batch carries `zone_lsn` — clients
+    // pipelining N pushes into the same batch see the same LSN N times,
+    // not N distinct LSNs.
+    if groups.iter().any(|g| g.write_err.is_none()) {
+        shared.ingest_lsn.set(zone_lsn);
     }
 
     // Update unique-index filters now that fsync confirms durability.

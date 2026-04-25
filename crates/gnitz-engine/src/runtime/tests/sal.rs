@@ -1,6 +1,6 @@
 use crate::runtime::sal::{
-    sal_write_group, sal_read_group_header, sal_begin_group,
-    MAX_WORKERS,
+    sal_write_group, sal_read_group_header, sal_begin_group, SalReader, SalWriter,
+    MAX_WORKERS, FLAG_DDL_SYNC, FLAG_TXN_COMMIT,
     SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
 };
 use crate::runtime::sys as ipc_sys;
@@ -326,6 +326,271 @@ fn test_sal_epoch_fence() {
         assert_eq!(rr1.epoch, 5);
         let rr2 = sal_read_group_header(ptr, rr1.advance, 0);
         assert_eq!(rr2.epoch, 6);
+
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_commit_sentinel_round_trip() {
+    // Zone shape: two normal groups at lsn=K, one sentinel at lsn=K,
+    // then an unrelated group at lsn=K+1. After read-back the third
+    // group must be the only one with FLAG_TXN_COMMIT set.
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+        let nw = 2u32;
+
+        // Two normal groups at the same LSN.
+        let buf = make_test_data(0xAA, 32);
+        let ptrs = [buf.as_ptr(), buf.as_ptr()];
+        let sizes = [buf.len() as u32, buf.len() as u32];
+        let r1 = sal_write_group(
+            ptr, 0, nw, 100, 7, 0, 1, size as u64,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(r1.status, 0);
+        let r2 = sal_write_group(
+            ptr, r1.new_cursor, nw, 101, 7, 0, 1, size as u64,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(r2.status, 0);
+
+        // Sentinel via SalWriter at the same LSN. m2w_efds empty so
+        // signal_all is a no-op (we never call it here anyway, but its
+        // presence in SalWriter::new requires the vec).
+        let efd1 = ipc_sys::eventfd_create();
+        let efd2 = ipc_sys::eventfd_create();
+        assert!(efd1 >= 0 && efd2 >= 0);
+        let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
+        writer.reset(r2.new_cursor, 1);
+        writer.write_commit_sentinel(7).unwrap();
+
+        // Trailing group at the next LSN.
+        let r4 = sal_write_group(
+            ptr, writer.cursor(), nw, 102, 8, 0, 1, size as u64,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(r4.status, 0);
+
+        // Walk the SAL via SalReader (worker 0 perspective).
+        let reader = SalReader::new(ptr as *const u8, 0, size, efd1);
+        let (m1, c1) = reader.try_read(0).unwrap();
+        let (m2, c2) = reader.try_read(c1).unwrap();
+        let (m3, c3) = reader.try_read(c2).unwrap();
+        let (m4, _)  = reader.try_read(c3).unwrap();
+
+        assert_eq!(m1.lsn, 7);
+        assert_eq!(m2.lsn, 7);
+        assert_eq!(m3.lsn, 7);
+        assert_eq!(m4.lsn, 8);
+        assert_eq!(m1.flags & FLAG_TXN_COMMIT, 0);
+        assert_eq!(m2.flags & FLAG_TXN_COMMIT, 0);
+        assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
+        assert_eq!(m3.flags & FLAG_DDL_SYNC, FLAG_DDL_SYNC);
+        assert_eq!(m4.flags & FLAG_TXN_COMMIT, 0);
+
+        libc::close(efd1);
+        libc::close(efd2);
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_commit_sentinel_zero_payload() {
+    // The sentinel must produce wire_data=None for every worker — it is
+    // a header-only group and must not be misread as a DDL_SYNC batch.
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+
+        let efd1 = ipc_sys::eventfd_create();
+        let efd2 = ipc_sys::eventfd_create();
+        let efd3 = ipc_sys::eventfd_create();
+        let efd4 = ipc_sys::eventfd_create();
+        assert!(efd1 >= 0 && efd2 >= 0 && efd3 >= 0 && efd4 >= 0);
+        let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2, efd3, efd4]);
+        writer.reset(0, 1);
+        writer.write_commit_sentinel(123).unwrap();
+
+        for w in 0..4 {
+            let reader = SalReader::new(ptr as *const u8, w, size, efd1);
+            let (msg, _) = reader.try_read(0).unwrap();
+            assert_eq!(msg.lsn, 123);
+            assert!(msg.wire_data.is_none(),
+                "sentinel must carry no per-worker payload for worker {}", w);
+        }
+
+        libc::close(efd1);
+        libc::close(efd2);
+        libc::close(efd3);
+        libc::close(efd4);
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_batched_push_shares_zone_lsn() {
+    // Phase 6 invariant: every push group in a batched commit carries
+    // the same zone LSN, followed by exactly one commit sentinel. Two
+    // pipelined pushes thus produce three SAL groups: push, push, sentinel.
+    use crate::runtime::sal::FLAG_PUSH;
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+        let nw = 2u32;
+        let zone_lsn = 42u64;
+
+        let payload = make_test_data(0xDD, 64);
+        let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
+        let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
+        // Two push groups at the same LSN.
+        let r1 = sal_write_group(
+            ptr, 0, nw, 1000, zone_lsn, FLAG_PUSH, 1, size as u64,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(r1.status, 0);
+        let r2 = sal_write_group(
+            ptr, r1.new_cursor, nw, 1001, zone_lsn, FLAG_PUSH, 1, size as u64,
+            ptrs.as_ptr(), sizes.as_ptr(),
+        );
+        assert_eq!(r2.status, 0);
+
+        // Closing sentinel.
+        let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+        let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        writer.reset(r2.new_cursor, 1);
+        writer.write_commit_sentinel(zone_lsn).unwrap();
+
+        let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
+        let (m1, c1) = reader.try_read(0).unwrap();
+        let (m2, c2) = reader.try_read(c1).unwrap();
+        let (m3, _)  = reader.try_read(c2).unwrap();
+        assert_eq!(m1.lsn, zone_lsn);
+        assert_eq!(m2.lsn, zone_lsn);
+        assert_eq!(m3.lsn, zone_lsn);
+        assert_eq!(m1.flags & FLAG_PUSH, FLAG_PUSH);
+        assert_eq!(m2.flags & FLAG_PUSH, FLAG_PUSH);
+        assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
+        // Recovery's collect_committed_lsns must see this LSN as committed.
+        let committed = {
+            // Inline scan of the SAL: same logic as bootstrap's pass 1.
+            let mut set = std::collections::HashSet::new();
+            let mut off = 0u64;
+            while (off as usize) + 8 < size {
+                let (msg, next) = match reader.try_read(off) {
+                    Some(v) => v, None => break,
+                };
+                off = next;
+                if msg.flags & FLAG_TXN_COMMIT != 0 { set.insert(msg.lsn); }
+            }
+            set
+        };
+        assert!(committed.contains(&zone_lsn),
+            "sentinel must commit the push zone");
+
+        for &e in &efds { libc::close(e); }
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_zone_two_groups_one_sentinel() {
+    // Phase 3 shape: a CREATE TABLE emits two broadcasts (e.g. COL_TAB
+    // then TABLE_TAB) at one zone-LSN, then a sentinel at the same LSN.
+    // Recovery must see all three groups carry the same LSN, and only
+    // the sentinel must carry FLAG_TXN_COMMIT.
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+        let nw = 4u32;
+
+        let buf_col = make_test_data(0xC0, 64);
+        let buf_tab = make_test_data(0x7A, 96);
+        let zone_lsn = 17u64;
+
+        // Group 1: COL_TAB rows.
+        let ptrs_col: Vec<*const u8> = (0..nw).map(|_| buf_col.as_ptr()).collect();
+        let sizes_col: Vec<u32> = (0..nw).map(|_| buf_col.len() as u32).collect();
+        let r1 = sal_write_group(
+            ptr, 0, nw, 200, zone_lsn, 0, 1, size as u64,
+            ptrs_col.as_ptr(), sizes_col.as_ptr(),
+        );
+        assert_eq!(r1.status, 0);
+
+        // Group 2: TABLE_TAB row, same LSN.
+        let ptrs_tab: Vec<*const u8> = (0..nw).map(|_| buf_tab.as_ptr()).collect();
+        let sizes_tab: Vec<u32> = (0..nw).map(|_| buf_tab.len() as u32).collect();
+        let r2 = sal_write_group(
+            ptr, r1.new_cursor, nw, 201, zone_lsn, 0, 1, size as u64,
+            ptrs_tab.as_ptr(), sizes_tab.as_ptr(),
+        );
+        assert_eq!(r2.status, 0);
+
+        // Sentinel.
+        let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+        for &e in &efds { assert!(e >= 0); }
+        let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        writer.reset(r2.new_cursor, 1);
+        writer.write_commit_sentinel(zone_lsn).unwrap();
+
+        // Walk on every worker's perspective; assert zone shape.
+        for w in 0..nw {
+            let reader = SalReader::new(ptr as *const u8, w, size, efds[w as usize]);
+            let (m1, c1) = reader.try_read(0).unwrap();
+            let (m2, c2) = reader.try_read(c1).unwrap();
+            let (m3, _)  = reader.try_read(c2).unwrap();
+            assert_eq!(m1.lsn, zone_lsn);
+            assert_eq!(m2.lsn, zone_lsn);
+            assert_eq!(m3.lsn, zone_lsn);
+            assert_eq!(m1.flags & FLAG_TXN_COMMIT, 0);
+            assert_eq!(m2.flags & FLAG_TXN_COMMIT, 0);
+            assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
+            assert!(m1.wire_data.is_some(), "first DDL group has data");
+            assert!(m2.wire_data.is_some(), "second DDL group has data");
+            assert!(m3.wire_data.is_none(), "sentinel carries no data");
+        }
+
+        for &e in &efds { libc::close(e); }
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_two_groups_same_lsn() {
+    // Phase 1 invariant: the SAL writer accepts whatever LSN the caller
+    // supplies — it no longer owns a counter. Two groups written at the
+    // same LSN must both carry it on read-back. Phase 3 builds a zone on
+    // top of this: multiple groups + a sentinel, all sharing one LSN.
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+        let nw = 1u32;
+
+        let buf1 = make_test_data(0x10, 32);
+        let ptrs1 = [buf1.as_ptr()];
+        let sizes1 = [buf1.len() as u32];
+        let res1 = sal_write_group(
+            ptr, 0, nw, 7, 42, 0, 1, size as u64,
+            ptrs1.as_ptr(), sizes1.as_ptr(),
+        );
+        assert_eq!(res1.status, 0);
+
+        let buf2 = make_test_data(0x20, 32);
+        let ptrs2 = [buf2.as_ptr()];
+        let sizes2 = [buf2.len() as u32];
+        let res2 = sal_write_group(
+            ptr, res1.new_cursor, nw, 8, 42, 0, 1, size as u64,
+            ptrs2.as_ptr(), sizes2.as_ptr(),
+        );
+        assert_eq!(res2.status, 0);
+
+        let rr1 = sal_read_group_header(ptr, 0, 0);
+        let rr2 = sal_read_group_header(ptr, rr1.advance, 0);
+        assert_eq!(rr1.lsn, 42);
+        assert_eq!(rr2.lsn, 42);
+        assert_eq!(rr1.target_id, 7);
+        assert_eq!(rr2.target_id, 8);
 
         free_mmap(ptr, size);
     }

@@ -114,6 +114,14 @@ pub struct CatalogEngine {
     // once per top-level DDL and relays each entry to workers. Workers never
     // drain this (no broadcast channel), so it stays empty there.
     pub(crate) pending_broadcasts: Vec<(i64, Batch)>,
+
+    // --- Active DDL zone LSN (Phase 5 / Design 2) ---
+    //
+    // 0 means "no zone active". Set by the executor before a DDL mutate
+    // phase, cleared after fsync. `ingest_to_family` reads this for
+    // system tables and pins `table.current_lsn` to the zone LSN so
+    // recovery's flushed_lsn dedup matches the SAL's zone LSN.
+    pub(crate) ddl_zone_lsn: u64,
 }
 
 // SAFETY: CatalogEngine is only accessed from a single thread.

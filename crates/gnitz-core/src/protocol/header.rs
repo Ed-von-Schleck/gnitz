@@ -8,6 +8,7 @@ pub use gnitz_wire::{
     IPC_CONTROL_TID,
     WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
     WireConflictMode,
+    MAX_COLUMNS,
 };
 
 pub const FLAG_ALLOCATE_TABLE_ID:  u64 = 1;
