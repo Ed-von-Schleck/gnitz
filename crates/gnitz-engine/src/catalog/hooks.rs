@@ -129,9 +129,18 @@ impl CatalogEngine {
 
                 if (pk_col_idx as usize) < col_defs.len() {
                     let pk_type = col_defs[pk_col_idx as usize].type_code;
-                    if pk_type != type_code::U64 && pk_type != type_code::U128 {
-                        return Err(format!("Primary Key must be TYPE_U64 or TYPE_U128, got type_code={}", pk_type));
+                    if pk_type != type_code::U64 && pk_type != type_code::U128 && pk_type != type_code::UUID {
+                        return Err(format!("Primary Key must be TYPE_U64, TYPE_U128, or UUID, got type_code={}", pk_type));
                     }
+                }
+
+                if col_defs.len() > crate::schema::MAX_COLUMNS {
+                    return Err(format!(
+                        "catalog invariant violated: table '{}' (tid={}) has {} column defs (max {}); \
+                         type_codes={:?}",
+                        name, tid, col_defs.len(), crate::schema::MAX_COLUMNS,
+                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
+                    ));
                 }
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();

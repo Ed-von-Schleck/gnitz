@@ -220,7 +220,7 @@ impl CatalogEngine {
 
     pub(crate) fn promote_to_pk_key(&self, batch: &Batch, row: usize, payload_col: usize, col_type: u8) -> (u64, u64) {
         match col_type {
-            type_code::U128 => {
+            type_code::U128 | type_code::UUID => {
                 let data = batch.get_col_ptr(row, payload_col, 16);
                 let lo = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let hi = u64::from_le_bytes(data[8..16].try_into().unwrap());

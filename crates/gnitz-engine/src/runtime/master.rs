@@ -1606,14 +1606,14 @@ mod unique_filter_tests {
 
     fn u64_schema() -> SchemaDescriptor {
         // Single U64 PK column.
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
     }
 
     fn two_col_schema() -> SchemaDescriptor {
         // PK U64 at index 0, payload U64 at index 1.
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn::new(type_code::U64, 1);
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }

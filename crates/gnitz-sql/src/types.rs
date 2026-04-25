@@ -15,6 +15,7 @@ pub fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
         DataType::Float(_)                                                            => Ok(TypeCode::F32),
         DataType::Double(_) | DataType::DoublePrecision | DataType::Real              => Ok(TypeCode::F64),
         DataType::Varchar(_) | DataType::Text | DataType::Char(_)     => Ok(TypeCode::String),
+        DataType::Uuid                                                => Ok(TypeCode::UUID),
         // DECIMAL(p,0) with p in {38,39} maps to U128.
         // DECIMAL(38,0) is the common idiom for 128-bit integers (used by Spark, etc.).
         // DECIMAL(39,0) covers the full u128 range (u128::MAX has 39 decimal digits).
@@ -159,6 +160,21 @@ mod tests {
     #[test]
     fn decimal_bare_is_unsupported() {
         assert!(sql_type_to_typecode(&DataType::Decimal(ExactNumberInfo::None)).is_err());
+    }
+
+    // --- UUID ---
+
+    #[test]
+    fn uuid_keyword_maps_to_typecode_uuid() {
+        assert_eq!(ok(DataType::Uuid), TypeCode::UUID);
+    }
+
+    #[test]
+    fn decimal_38_0_still_maps_to_u128() {
+        assert_eq!(
+            ok(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(38, 0))),
+            TypeCode::U128,
+        );
     }
 
     // --- error cases ---

@@ -18,6 +18,7 @@ pub enum TypeCode {
     F64    = tc::F64,
     String = tc::STRING,
     U128   = tc::U128,
+    UUID   = tc::UUID,
 }
 
 impl TypeCode {
@@ -40,6 +41,7 @@ impl TypeCode {
             _ if v == tc::F64    as u64 => Ok(TypeCode::F64),
             _ if v == tc::STRING as u64 => Ok(TypeCode::String),
             _ if v == tc::U128   as u64 => Ok(TypeCode::U128),
+            _ if v == tc::UUID   as u64 => Ok(TypeCode::UUID),
             _ => Err(ProtocolError::UnknownTypeCode(v)),
         }
     }
@@ -82,7 +84,7 @@ pub enum PkColumn {
 
 impl PkColumn {
     pub fn for_type(tc: TypeCode) -> Self {
-        if tc == TypeCode::U128 { PkColumn::U128s(vec![]) } else { PkColumn::U64s(vec![]) }
+        if tc == TypeCode::U128 || tc == TypeCode::UUID { PkColumn::U128s(vec![]) } else { PkColumn::U64s(vec![]) }
     }
     pub fn len(&self) -> usize {
         match self { PkColumn::U64s(v) => v.len(), PkColumn::U128s(v) => v.len() }
@@ -150,7 +152,7 @@ impl ZSetBatch {
             } else {
                 match col.type_code {
                     TypeCode::String => ColData::Strings(vec![]),
-                    TypeCode::U128   => ColData::U128s(vec![]),
+                    TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![]),
                     _                => ColData::Fixed(vec![]),
                 }
             }

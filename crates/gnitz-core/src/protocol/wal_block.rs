@@ -153,10 +153,10 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 }
                 col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
-            TypeCode::U128 => {
+            TypeCode::U128 | TypeCode::UUID => {
                 let vals = match &batch.columns[ci] {
                     ColData::U128s(v) => v,
-                    _ => panic!("encode_wal_block: expected U128s for U128 column {}", ci),
+                    _ => panic!("encode_wal_block: expected U128s for U128/UUID column {}", ci),
                 };
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for &v in vals {
@@ -400,18 +400,18 @@ pub fn decode_wal_block(
                 }
                 columns.push(ColData::Strings(vals));
             }
-            TypeCode::U128 => {
+            TypeCode::U128 | TypeCode::UUID => {
                 let expected_sz = count * 16;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "U128 column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
+                        "U128/UUID column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
                     )));
                 }
                 let mut vals: Vec<u128> = Vec::with_capacity(count);
                 for row in 0..count {
                     let base = reg_off + row * 16;
                     if base + 16 > data.len() {
-                        return Err(ProtocolError::DecodeError("U128 out of bounds".into()));
+                        return Err(ProtocolError::DecodeError("U128/UUID out of bounds".into()));
                     }
                     let lo = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
                     let hi = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());

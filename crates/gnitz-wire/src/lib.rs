@@ -41,6 +41,7 @@ pub mod type_code {
     pub const F64:    u8 = 10;
     pub const STRING: u8 = 11;
     pub const U128:   u8 = 12;
+    pub const UUID:   u8 = 13;
 }
 
 /// Wire stride (byte width) for a column type code.
@@ -51,7 +52,7 @@ pub const fn wire_stride(tc: u8) -> usize {
         3 | 4           => 2,   // U16, I16
         5..=7           => 4,   // U32, I32, F32
         8..=10          => 8,   // U64, I64, F64
-        11 | 12          => 16,  // STRING, U128
+        11 | 12 | 13    => 16,  // STRING, U128, UUID
         _                => 8,
     }
 }

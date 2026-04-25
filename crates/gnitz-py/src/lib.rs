@@ -35,6 +35,7 @@ impl PyTypeCode {
     #[classattr] pub const F64:    u32 = 10;
     #[classattr] pub const STRING: u32 = 11;
     #[classattr] pub const U128:   u32 = 12;
+    #[classattr] pub const UUID:   u32 = 13;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,8 @@ impl PySchema {
     #[pyo3(signature = (columns, pk_index = None))]
     pub fn new(columns: Bound<'_, PyList>, pk_index: Option<usize>) -> PyResult<Self> {
         let len = columns.len();
+        // 65 = gnitz_engine::schema::MAX_COLUMNS (64) + 1 PK slot.
+        // If MAX_COLUMNS changes, update this guard and its error message.
         if len == 0 || len > 65 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Schema must have 1 to 65 columns (1 PK + up to 64 payload columns)",
@@ -282,7 +285,7 @@ impl PyZSetBatch {
                 "Missing primary key column {:?}", self.schema.columns[pk_idx].name,
             )));
         }
-        if self.schema.columns[pk_idx].type_code == TypeCode::U128 {
+        if matches!(self.schema.columns[pk_idx].type_code, TypeCode::U128 | TypeCode::UUID) {
             let pk = pk_val.extract::<u128>()?;
             self.batch.pks.push_u128(pk);
         } else {
@@ -304,7 +307,7 @@ impl PyZSetBatch {
                         v.push(Some(val.extract::<String>()?));
                     }
                 }
-                TypeCode::U128 => {
+                TypeCode::U128 | TypeCode::UUID => {
                     if let ColData::U128s(v) = &mut self.batch.columns[ci] {
                         v.push(val.extract::<u128>()?);
                     }
@@ -472,6 +475,15 @@ impl PyZSetBatch {
 // Batch conversion helpers
 // ---------------------------------------------------------------------------
 
+fn format_uuid(v: u128) -> String {
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (v >> 96) as u32,
+        (v >> 80) as u16,
+        (v >> 64) as u16,
+        (v >> 48) as u16,
+        v & 0x0000_ffff_ffff_ffff)
+}
+
 /// Write one fixed-width value as little-endian bytes into buf.
 fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
     match tc {
@@ -485,7 +497,7 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
         TypeCode::U64  => buf.extend_from_slice(&item.extract::<u64>()?.to_le_bytes()),
         TypeCode::I64  => buf.extend_from_slice(&item.extract::<i64>()?.to_le_bytes()),
         TypeCode::F64  => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::String | TypeCode::U128 => unreachable!("handled before write_fixed_le"),
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID => unreachable!("handled before write_fixed_le"),
     }
     Ok(())
 }
@@ -503,7 +515,7 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
         TypeCode::U64  => u64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::I64  => i64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::F64  => f64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::String | TypeCode::U128 => unreachable!(),
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID => unreachable!(),
     }
 }
 
@@ -552,10 +564,16 @@ fn build_row_values_into(
     for ci in 0..schema.columns.len() {
         if ci == pk_idx {
             let pk = batch.pks.get(row);
-            if schema.columns[ci].type_code == TypeCode::U128 {
-                out.push(pk.into_pyobject(py)?.into_any().unbind());
-            } else {
-                out.push((pk as u64).into_pyobject(py)?.into_any().unbind());
+            match schema.columns[ci].type_code {
+                TypeCode::UUID => {
+                    out.push(format_uuid(pk).into_pyobject(py)?.into_any().unbind());
+                }
+                TypeCode::U128 => {
+                    out.push(pk.into_pyobject(py)?.into_any().unbind());
+                }
+                _ => {
+                    out.push((pk as u64).into_pyobject(py)?.into_any().unbind());
+                }
             }
         } else {
             if null_word & (1u64 << payload_idx) != 0 {
@@ -574,7 +592,11 @@ fn build_row_values_into(
                         None    => out.push(py.None().into()),
                     },
                     ColData::U128s(v) => {
-                        out.push(v[row].into_pyobject(py)?.into_any().unbind());
+                        if schema.columns[ci].type_code == TypeCode::UUID {
+                            out.push(format_uuid(v[row]).into_pyobject(py)?.into_any().unbind());
+                        } else {
+                            out.push(v[row].into_pyobject(py)?.into_any().unbind());
+                        }
                     }
                 }
             }
@@ -680,8 +702,15 @@ fn rust_batch_columns_to_py(
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
             ColData::U128s(v) => {
+                let is_uuid = col_def.type_code == TypeCode::UUID;
                 let items: Vec<PyObject> = v.iter()
-                    .map(|&x| Ok(x.into_pyobject(py)?.into_any().unbind()))
+                    .map(|&x| {
+                        if is_uuid {
+                            Ok(format_uuid(x).into_pyobject(py)?.into_any().unbind())
+                        } else {
+                            Ok(x.into_pyobject(py)?.into_any().unbind())
+                        }
+                    })
                     .collect::<PyResult<_>>()?;
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }

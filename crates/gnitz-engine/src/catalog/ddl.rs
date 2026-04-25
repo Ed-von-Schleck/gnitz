@@ -134,17 +134,17 @@ impl CatalogEngine {
         if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("Table already exists".into());
         }
-        if col_defs.len() > 64 {
-            return Err("Maximum 64 columns supported".into());
+        if col_defs.len() > crate::schema::MAX_COLUMNS {
+            return Err(format!("Maximum {} columns supported", crate::schema::MAX_COLUMNS));
         }
         if pk_col_idx as usize >= col_defs.len() {
             return Err("Primary Key index out of bounds".into());
         }
 
-        // Validate PK type (must be U64 or U128)
+        // Validate PK type (must be U64, U128, or UUID)
         let pk_type = col_defs[pk_col_idx as usize].type_code;
-        if pk_type != type_code::U64 && pk_type != type_code::U128 {
-            return Err("Primary Key must be TYPE_U64 or TYPE_U128".into());
+        if pk_type != type_code::U64 && pk_type != type_code::U128 && pk_type != type_code::UUID {
+            return Err("Primary Key must be TYPE_U64, TYPE_U128, or UUID".into());
         }
 
         let tid = self.allocate_table_id();
@@ -217,8 +217,8 @@ impl CatalogEngine {
         if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("View/Table already exists".into());
         }
-        if graph.output_col_defs.len() > 64 {
-            return Err("Maximum 64 columns supported".into());
+        if graph.output_col_defs.len() > crate::schema::MAX_COLUMNS {
+            return Err(format!("Maximum {} columns supported", crate::schema::MAX_COLUMNS));
         }
 
         // Validate graph structure via DagEngine

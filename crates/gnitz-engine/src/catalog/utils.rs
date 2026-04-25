@@ -146,6 +146,7 @@ pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -
 pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
     match field_type_code {
         type_code::U128 => Ok(type_code::U128),
+        type_code::UUID => Ok(type_code::UUID),
         type_code::U64 => Ok(type_code::U64),
         type_code::I64 | type_code::U32 | type_code::I32 |
         type_code::U16 | type_code::I16 | type_code::U8 | type_code::I8 => Ok(type_code::U64),

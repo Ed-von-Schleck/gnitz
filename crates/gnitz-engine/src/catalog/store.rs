@@ -575,10 +575,16 @@ impl CatalogEngine {
     }
 
     pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_index: u32) -> SchemaDescriptor {
+        assert!(
+            col_defs.len() <= crate::schema::MAX_COLUMNS,
+            "build_schema_from_col_defs: too many columns ({}) for entity (type_codes: {:?})",
+            col_defs.len(),
+            col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
+        );
         let mut sd = SchemaDescriptor {
             num_columns: col_defs.len() as u32,
             pk_index,
-            columns: [zero_col(); 64],
+            columns: [zero_col(); crate::schema::MAX_COLUMNS],
         };
         for (i, cd) in col_defs.iter().enumerate() {
             sd.columns[i] = SchemaColumn {

@@ -975,6 +975,296 @@ class TestU128:
 
 
 # ---------------------------------------------------------------------------
+# TestUUID — UUID type end-to-end
+# ---------------------------------------------------------------------------
+
+class TestUUID:
+    """Test UUID type (TypeCode 13) end-to-end."""
+
+    _CREATE_PK = "CREATE TABLE t (pk UUID NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
+    _CREATE_COL = (
+        "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, uid UUID NOT NULL)"
+    )
+
+    UUID_A = '550e8400-e29b-41d4-a716-446655440000'
+    UUID_B = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
+    UUID_V7_EARLY = '01935000-0000-7000-8000-000000000001'
+    UUID_V7_LATE  = '01935001-0000-7000-8000-000000000001'
+
+    # --- TypeCode constant ---
+
+    def test_typecode_uuid_constant(self, client):
+        assert gnitz.TypeCode.UUID == 13
+
+    # --- DDL ---
+
+    def test_uuid_type_creates_typecode_uuid(self, client):
+        """CREATE TABLE with UUID PK stores TypeCode.UUID."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.UUID
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_non_pk_column_type(self, client):
+        """UUID as a non-PK payload column stores TypeCode.UUID."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_COL, schema_name=sn)
+            _, schema = client.resolve_table(sn, "t")
+            col_names = [c.name for c in schema.columns]
+            idx = col_names.index("uid")
+            assert schema.columns[idx].type_code == gnitz.TypeCode.UUID
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_decimal_38_0_unaffected(self, client):
+        """DECIMAL(38,0) still maps to TypeCode.U128 (not UUID), returns Python int."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U128
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (42, 1)", schema_name=sn)
+            rows = _scan_map(client, tid)
+            assert 42 in rows
+            assert isinstance(42, int)
+        finally:
+            _cleanup(client, sn, "t")
+
+    # --- INSERT ---
+
+    def test_uuid_pk_insert_string_literal(self, client):
+        """INSERT with a UUID string literal PK succeeds."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql(
+                f"INSERT INTO t VALUES ('{self.UUID_A}', 1)", schema_name=sn
+            )
+            rows = _scan_map(client, tid)
+            assert self.UUID_A in rows
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_non_pk_insert_string_literal(self, client):
+        """UUID non-PK column accepts a UUID string literal."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_COL, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql(
+                f"INSERT INTO t VALUES (1, '{self.UUID_A}')", schema_name=sn
+            )
+            rows = _scan_map(client, tid)
+            assert rows[1].uid == self.UUID_A
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_decimal_literal_still_valid(self, client):
+        """Decimal integer literal is also accepted for a UUID non-PK column."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_COL, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            rows = _scan_map(client, tid)
+            # 42 = 0x2a → UUID format: 00000000-0000-0000-0000-00000000002a
+            assert rows[1].uid == '00000000-0000-0000-0000-00000000002a'
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_invalid_string_rejected(self, client):
+        """INSERT with an invalid UUID string raises GnitzError."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "INSERT INTO t VALUES ('not-a-uuid', 1)", schema_name=sn
+                )
+        finally:
+            _cleanup(client, sn, "t")
+
+    # --- Output format ---
+
+    def test_uuid_output_is_string(self, client):
+        """Scanning a UUID PK table returns pk as a Python str, not int."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            client.execute_sql(
+                f"INSERT INTO t VALUES ('{self.UUID_A}', 1)", schema_name=sn
+            )
+            tid, _ = client.resolve_table(sn, "t")
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(rows) == 1
+            assert isinstance(rows[0].pk, str)
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_roundtrip(self, client):
+        """UUID PK INSERT + scan returns the same UUID string."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql(
+                f"INSERT INTO t VALUES ('{self.UUID_A}', 10)", schema_name=sn
+            )
+            rows = _scan_map(client, tid)
+            assert self.UUID_A in rows
+            assert rows[self.UUID_A].v == 10
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_uuid_v7_ordering(self, client):
+        """Two UUIDv7 values inserted in reverse order scan in ascending numeric order."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_PK, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            # Insert later UUID first
+            client.execute_sql(
+                f"INSERT INTO t VALUES ('{self.UUID_V7_LATE}', 2)", schema_name=sn
+            )
+            client.execute_sql(
+                f"INSERT INTO t VALUES ('{self.UUID_V7_EARLY}', 1)", schema_name=sn
+            )
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            pks = [r.pk for r in rows]
+            assert pks == [self.UUID_V7_EARLY, self.UUID_V7_LATE]
+        finally:
+            _cleanup(client, sn, "t")
+
+    # --- FK ---
+
+    def test_uuid_fk_valid(self, client):
+        """UUID FK column → UUID PK parent: valid UUID value accepted."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id UUID NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"INSERT INTO parent VALUES ('{self.UUID_A}')", schema_name=sn
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT UNSIGNED NOT NULL PRIMARY KEY,"
+                f"  uid UUID NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"INSERT INTO child VALUES (1, '{self.UUID_A}')", schema_name=sn
+            )
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_uuid_fk_invalid(self, client):
+        """UUID FK column → non-existent parent UUID raises GnitzError."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id UUID NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT UNSIGNED NOT NULL PRIMARY KEY,"
+                "  uid UUID NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql(
+                    f"INSERT INTO child VALUES (1, '{self.UUID_B}')", schema_name=sn
+                )
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_uuid_fk_null_nullable(self, client):
+        """Nullable UUID FK column: NULL value accepted without a matching parent."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id UUID NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT UNSIGNED NOT NULL PRIMARY KEY,"
+                "  uid UUID REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO child VALUES (1, NULL)", schema_name=sn
+            )
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_uuid_fk_type_mismatch_rejected(self, client):
+        """UUID FK column referencing a U64 PK parent fails at DDL time."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT UNSIGNED NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE TABLE child ("
+                    "  cid BIGINT UNSIGNED NOT NULL PRIMARY KEY,"
+                    "  uid UUID NOT NULL REFERENCES parent(id)"
+                    ")",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    # --- Views ---
+
+    def test_uuid_view_expression_error(self, client):
+        """UUID column used in a view WHERE expression gives a meaningful error."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE_COL, schema_name=sn)
+            with pytest.raises(gnitz.GnitzError) as exc_info:
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT * FROM t WHERE uid = 1",
+                    schema_name=sn,
+                )
+            assert "UUID" in str(exc_info.value) or "U128" in str(exc_info.value)
+        finally:
+            _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
 # TestTypeErrors — unsupported types and invalid values give clear errors
 # ---------------------------------------------------------------------------
 

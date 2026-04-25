@@ -321,7 +321,7 @@ mod tests {
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         // Col 0: PK (U64)
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         // Col 1: payload (I64)
@@ -646,7 +646,7 @@ mod tests {
         let mut sd = SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [SchemaColumn::new(0, 0); 64],
+            columns: [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS],
         };
         sd.columns[0] = SchemaColumn::new(type_code::U128, 0); // U128 PK
         sd.columns[1] = SchemaColumn::new(type_code::I64, 0);  // I64 group_val
@@ -715,7 +715,7 @@ mod tests {
     // ── append_row_simple tests ──────────────────────────────────────────
 
     fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         for (i, &(tc, nullable)) in cols.iter().enumerate() {
             columns[i] = SchemaColumn::new(tc, nullable);
         }
@@ -1165,7 +1165,7 @@ mod tests {
         use std::collections::HashMap;
 
         // Schema: col0 = PK (U64), col1 = STRING
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };

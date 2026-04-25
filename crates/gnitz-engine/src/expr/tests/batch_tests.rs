@@ -4,7 +4,7 @@ use crate::storage::Batch;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
 fn make_schema_2col() -> SchemaDescriptor {
-    let mut cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+    let mut cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
     cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
     cols[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
     SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols }

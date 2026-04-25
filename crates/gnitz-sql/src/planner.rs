@@ -52,12 +52,25 @@ pub fn execute_statement(
     }
 }
 
+/// Map a TypeCode to its unsigned key equivalent for FK compatibility.
+fn fk_key_type(tc: TypeCode) -> TypeCode {
+    match tc {
+        TypeCode::I8  => TypeCode::U8,
+        TypeCode::I16 => TypeCode::U16,
+        TypeCode::I32 => TypeCode::U32,
+        TypeCode::I64 => TypeCode::U64,
+        other => other,
+    }
+}
+
 /// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx).
+/// Validates that fk_col_type is compatible with the parent PK type.
 fn resolve_fk_target(
     client:           &GnitzClient,
     schema_name:      &str,
     foreign_table:    &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
+    fk_col_type:      TypeCode,
 ) -> Result<(u64, u64), GnitzSqlError> {
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
@@ -71,6 +84,13 @@ fn resolve_fk_target(
                 pk_col_name, ref_col_name,
             )));
         }
+    }
+    let parent_pk_type = ref_schema.columns[ref_schema.pk_index].type_code;
+    if fk_key_type(fk_col_type) != fk_key_type(parent_pk_type) {
+        return Err(GnitzSqlError::Bind(format!(
+            "FK type mismatch: column type {:?} is not compatible with parent PK type {:?}",
+            fk_col_type, parent_pk_type,
+        )));
     }
     Ok((ref_tid, ref_schema.pk_index as u64))
 }
@@ -110,7 +130,7 @@ fn execute_create_table(
         // Detect inline REFERENCES (foreign key)
         for opt in &col.options {
             if let ColumnOption::ForeignKey { foreign_table, referred_columns, .. } = &opt.option {
-                let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns)?;
+                let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns, cols[i].type_code)?;
                 cols[i].fk_table_id = tid;
                 cols[i].fk_col_idx  = idx;
             }
@@ -141,7 +161,7 @@ fn execute_create_table(
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
                     "FOREIGN KEY column '{}' not found in table definition", local_col_name
                 )))?;
-            let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns)?;
+            let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns, cols[col_idx].type_code)?;
             cols[col_idx].fk_table_id = tid;
             cols[col_idx].fk_col_idx  = idx;
         }

@@ -14,6 +14,13 @@ pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 // Schema descriptor
 // ---------------------------------------------------------------------------
 
+/// Maximum number of columns per table or view schema.
+/// All `[SchemaColumn; N]` temporary arrays and column-count validation guards
+/// must agree with this value. Changing it requires updating every array
+/// initializer in ops/, storage/, catalog/, compiler.rs, and runtime/,
+/// plus the Python wrapper's `len > MAX_COLUMNS + 1` guard.
+pub const MAX_COLUMNS: usize = 64;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SchemaColumn {
@@ -34,12 +41,12 @@ impl SchemaColumn {
 pub struct SchemaDescriptor {
     pub num_columns: u32,
     pub pk_index: u32,
-    pub columns: [SchemaColumn; 64],
+    pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
 impl SchemaDescriptor {
     pub const fn minimal_u64() -> Self {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
     }
@@ -107,7 +114,7 @@ pub(crate) fn promote_to_index_key(
         col_data.len(), offset + col_size,
     );
     match type_code_val {
-        type_code::U128 => {
+        type_code::U128 | type_code::UUID => {
             let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
             let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
             (lo, hi)

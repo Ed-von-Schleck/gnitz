@@ -1241,7 +1241,7 @@ mod tests {
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };
@@ -1273,7 +1273,7 @@ mod tests {
     fn make_schema_u64_f32() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };
@@ -1304,7 +1304,7 @@ mod tests {
         let mut s = SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
         s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
@@ -1319,7 +1319,7 @@ mod tests {
         let mut s = SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         s.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
         s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
@@ -1359,7 +1359,7 @@ mod tests {
         let mut s = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         s.columns[0] = SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1405,7 +1405,7 @@ mod tests {
         let mut out_schema = crate::schema::SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         out_schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1491,7 +1491,7 @@ mod tests {
         let mut out_schema = crate::schema::SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         out_schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1614,7 +1614,7 @@ mod tests {
         let mut schema = crate::schema::SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1752,7 +1752,7 @@ mod tests {
         let cs = crate::schema::type_size(tc);
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };
@@ -1805,7 +1805,7 @@ mod tests {
         let mut out_schema = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         out_schema.columns[0] = SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1852,7 +1852,7 @@ mod tests {
         let mut out_schema = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         out_schema.columns[0] = SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1896,7 +1896,7 @@ mod tests {
         let mut out_schema = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         out_schema.columns[0] = SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -1940,7 +1940,7 @@ mod tests {
         let mut schema = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         };
         schema.columns[0] = SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,

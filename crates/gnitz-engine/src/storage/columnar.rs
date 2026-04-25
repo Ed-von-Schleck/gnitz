@@ -129,7 +129,7 @@ mod tests {
 
     /// Build a 3-column schema: [PK:U64, nullable I64, F64].
     fn make_schema_nullable_float() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn::new(type_code::I64, 1);
         columns[2] = SchemaColumn::new(type_code::F64, 0);
@@ -222,7 +222,7 @@ mod tests {
     /// Test signed integer comparison: negative < positive via sign extension.
     #[test]
     fn test_compare_rows_signed_int() {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn::new(type_code::I64, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
@@ -238,7 +238,7 @@ mod tests {
     /// Test U128 column comparison.
     #[test]
     fn test_compare_rows_u128() {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn::new(type_code::U128, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
@@ -345,7 +345,7 @@ mod tests {
     /// Test STRING column comparison via compare_rows (short strings).
     #[test]
     fn test_compare_rows_string() {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         columns[1] = SchemaColumn::new(type_code::STRING, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };

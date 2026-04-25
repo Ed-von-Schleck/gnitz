@@ -105,7 +105,7 @@ pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaD
     let mut sd = SchemaDescriptor {
         num_columns: cols.len() as u32,
         pk_index,
-        columns: [zero_col(); 64],
+        columns: [zero_col(); crate::schema::MAX_COLUMNS],
     };
     let mut i = 0;
     while i < cols.len() {

@@ -679,7 +679,7 @@ mod tests {
         let mut sd = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn::new(0, 0); 64],
+            columns: [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS],
         };
         // col 0 = PK (U64, size 8)
         sd.columns[0] = SchemaColumn::new(type_code::U64, 0);

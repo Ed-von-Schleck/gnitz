@@ -421,15 +421,34 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
     }
 }
 
+fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
+    let s = s.trim();
+    let hex: String = if s.len() == 36
+        && s.as_bytes()[8]  == b'-'
+        && s.as_bytes()[13] == b'-'
+        && s.as_bytes()[18] == b'-'
+        && s.as_bytes()[23] == b'-'
+    {
+        format!("{}{}{}{}{}", &s[..8], &s[9..13], &s[14..18], &s[19..23], &s[24..])
+    } else if s.len() == 32 {
+        s.to_string()
+    } else {
+        return Err(GnitzSqlError::Bind(format!("invalid UUID literal: {:?}", s)));
+    };
+    u128::from_str_radix(&hex, 16)
+        .map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {:?}", s)))
+}
+
 /// Extract the primary key from a VALUES row, returning a u128.
 fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError> {
     let pk_expr = row.get(schema.pk_index).ok_or_else(|| {
         GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
     })?;
+    let pk_tc = schema.columns[schema.pk_index].type_code;
     match pk_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Number(n, _) => {
-                if schema.columns[schema.pk_index].type_code == TypeCode::U128 {
+                if pk_tc == TypeCode::U128 || pk_tc == TypeCode::UUID {
                     n.parse::<u128>().map_err(|_| {
                         GnitzSqlError::Bind(format!("PK value is not a valid u128: {}", n))
                     })
@@ -440,6 +459,7 @@ fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError
                     Ok(val as u128)
                 }
             }
+            Value::SingleQuotedString(s) if pk_tc == TypeCode::UUID => parse_uuid_str(s),
             _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
         },
         _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
@@ -514,6 +534,10 @@ fn append_value_to_col(
             Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
                 match col {
                     ColData::Strings(v) => { v.push(Some(s.clone())); Ok(()) }
+                    ColData::U128s(v) if tc == TypeCode::UUID => {
+                        v.push(parse_uuid_str(s)?);
+                        Ok(())
+                    }
                     _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
                 }
             }
@@ -616,7 +640,7 @@ fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<u128> {
     if col_idx == schema.pk_index { Some(key) } else { None }
 }
 
-/// Extracts (col_idx, key) from `col = integer_literal`. Does NOT check index existence.
+/// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
 fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
@@ -627,12 +651,30 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
                     matches!(expr.as_ref(), Expr::Value(vws) if matches!(vws.value, Value::Number(_, _))),
                 _ => false,
             };
+            let is_str = |e: &Expr| matches!(e, Expr::Value(vws) if matches!(vws.value, Value::SingleQuotedString(_)));
+
             let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(_), r) if is_num_or_neg(r) => (left.as_ref(), right.as_ref()),
-                (l, Expr::Identifier(_)) if is_num_or_neg(l) => (right.as_ref(), left.as_ref()),
+                (Expr::Identifier(_), r) if is_num_or_neg(r) || is_str(r) => (left.as_ref(), right.as_ref()),
+                (l, Expr::Identifier(_)) if is_num_or_neg(l) || is_str(l) => (right.as_ref(), left.as_ref()),
                 _ => return None,
             };
             let col_name = if let Expr::Identifier(id) = col_expr { &id.value } else { return None; };
+            let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            let col_tc = schema.columns[col_idx].type_code;
+
+            // UUID: accept single-quoted string literals
+            if col_tc == TypeCode::UUID {
+                if let Expr::Value(vws) = lit_expr {
+                    if let Value::SingleQuotedString(s) = &vws.value {
+                        return parse_uuid_str(s).ok().map(|v| (col_idx, v));
+                    }
+                    if let Value::Number(n, _) = &vws.value {
+                        return n.parse::<u128>().ok().map(|v| (col_idx, v));
+                    }
+                }
+                return None;
+            }
+
             // Extract (negated, numeric_string) from the literal side.
             let (negated, n_str): (bool, &str) = match lit_expr {
                 Expr::Value(vws) => {
@@ -645,8 +687,7 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
                 }
                 _ => return None,
             };
-            let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
-            if schema.columns[col_idx].type_code == TypeCode::U128 {
+            if col_tc == TypeCode::U128 {
                 if negated { return None; }
                 let val = n_str.parse::<u128>().ok()?;
                 Some((col_idx, val))
@@ -654,11 +695,11 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
                 // Secondary indexes store column values as zero-extended LE bytes cast to u64.
                 // For signed types, we must produce the same bit pattern by casting through
                 // the type's unsigned equivalent (not sign-extending to 64 bits).
-                let key = match schema.columns[col_idx].type_code {
+                let key = match col_tc {
                     TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
                         let v = n_str.parse::<i64>().ok()?;
                         let v = if negated { v.checked_neg()? } else { v };
-                        match schema.columns[col_idx].type_code {
+                        match col_tc {
                             TypeCode::I8  => (v as i8  as u8)  as u128,
                             TypeCode::I16 => (v as i16 as u16) as u128,
                             TypeCode::I32 => (v as i32 as u32) as u128,
@@ -797,10 +838,14 @@ fn eval_expr(
                 ColData::Strings(_) => Err(GnitzSqlError::Unsupported(
                     "residual filter on string column not supported".to_string()
                 )),
-                ColData::U128s(_) => Err(GnitzSqlError::Unsupported(
-                    "residual filter on U128 column not supported; \
-                     use a primary-key seek or CREATE INDEX for equality lookups".to_string()
-                )),
+                ColData::U128s(_) => {
+                    let type_name = if schema.columns[*c].type_code == TypeCode::UUID { "UUID" } else { "U128" };
+                    Err(GnitzSqlError::Unsupported(format!(
+                        "residual filter on {} column not supported; \
+                         use a primary-key seek or CREATE INDEX for equality lookups",
+                        type_name
+                    )))
+                }
             }
         }
         BoundExpr::LitInt(v) => Ok(Some(*v)),
@@ -1549,6 +1594,117 @@ mod tests {
 
         assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
+    }
+
+    // ------------------------------------------------------------------
+    // UUID parse_uuid_str
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_uuid_str_standard_format() {
+        let v = super::parse_uuid_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(v, 0x550e8400_e29b_41d4_a716_446655440000_u128);
+    }
+
+    #[test]
+    fn test_parse_uuid_str_no_hyphens() {
+        let v = super::parse_uuid_str("550e8400e29b41d4a716446655440000").unwrap();
+        assert_eq!(v, 0x550e8400_e29b_41d4_a716_446655440000_u128);
+    }
+
+    #[test]
+    fn test_parse_uuid_str_invalid_rejected() {
+        assert!(super::parse_uuid_str("not-a-uuid").is_err());
+        assert!(super::parse_uuid_str("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz").is_err());
+        assert!(super::parse_uuid_str("").is_err());
+    }
+
+    fn uuid_schema_pk() -> Schema {
+        Schema {
+            columns: vec![col_def("id", TypeCode::UUID, false)],
+            pk_index: 0,
+        }
+    }
+
+    fn uuid_schema_payload() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("uid", TypeCode::UUID, true),
+            ],
+            pk_index: 0,
+        }
+    }
+
+    fn uuid_str_expr(s: &str) -> Expr {
+        Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::SingleQuotedString(s.into()),
+            span:  sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    fn num_expr(n: &str) -> Expr {
+        Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::Number(n.into(), false),
+            span:  sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    #[test]
+    fn test_uuid_pk_string_literal_accepted() {
+        let schema = uuid_schema_pk();
+        let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
+        let pk = super::extract_pk_value(&row, &schema).unwrap();
+        assert_eq!(pk, 0x550e8400_e29b_41d4_a716_446655440000_u128);
+    }
+
+    #[test]
+    fn test_uuid_non_pk_string_literal_accepted() {
+        let schema = uuid_schema_payload();
+        let mut batch = ZSetBatch::new(&schema);
+        // col 1 is UUID
+        append_value_to_col(
+            &mut batch.columns[1],
+            TypeCode::UUID,
+            &uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
+        ).unwrap();
+        if let ColData::U128s(v) = &batch.columns[1] {
+            assert_eq!(v[0], 0x550e8400_e29b_41d4_a716_446655440000_u128);
+        } else { panic!("expected U128s"); }
+    }
+
+    #[test]
+    fn test_uuid_decimal_literal_still_accepted() {
+        let schema = uuid_schema_payload();
+        let mut batch = ZSetBatch::new(&schema);
+        let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
+        append_value_to_col(
+            &mut batch.columns[1],
+            TypeCode::UUID,
+            &num_expr(&big_val.to_string()),
+        ).unwrap();
+        if let ColData::U128s(v) = &batch.columns[1] {
+            assert_eq!(v[0], big_val);
+        } else { panic!("expected U128s"); }
+    }
+
+    #[test]
+    fn test_uuid_index_seek_string_literal() {
+        let schema = uuid_schema_payload();
+        let expr = eq_expr("uid", uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"));
+        let result = super::try_col_eq_literal(&expr, &schema);
+        assert_eq!(result, Some((1, 0x550e8400_e29b_41d4_a716_446655440000_u128)));
+    }
+
+    #[test]
+    fn test_uuid_residual_filter_error_names_uuid() {
+        let schema = uuid_schema_payload();
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1); batch.weights.push(1); batch.nulls.push(0);
+        if let ColData::U128s(v) = &mut batch.columns[1] { v.push(0); }
+        let pred = BoundExpr::ColRef(1);
+        let err = super::eval_expr(&pred, &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().contains("UUID"), "error should mention UUID: {}", err);
     }
 
     // ------------------------------------------------------------------

@@ -1121,7 +1121,7 @@ mod tests {
     // ── Test helpers ─────────────────────────────────────────────────────
 
     fn make_schema(col_types: &[(u8, u8)]) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
         // Column 0 is always the U128 PK
         columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
         for (i, &(tc, sz)) in col_types.iter().enumerate() {

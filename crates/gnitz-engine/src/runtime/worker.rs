@@ -933,7 +933,7 @@ impl Default for SchemaDescriptor {
         SchemaDescriptor {
             num_columns: 0,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
         }
     }
 }

@@ -78,11 +78,12 @@ pub fn compile_bound_expr(
         BoundExpr::ColRef(idx) => {
             let tc = schema.columns[*idx].type_code;
             match tc {
-                TypeCode::U128 => Err(GnitzSqlError::Unsupported(
+                TypeCode::U128 | TypeCode::UUID => Err(GnitzSqlError::Unsupported(
                     format!(
-                        "column {:?} is U128; U128 columns cannot be used in view \
+                        "column {:?} is {}; U128/UUID columns cannot be used in view \
                          expressions (use a primary-key seek or CREATE INDEX instead)",
                         schema.columns[*idx].name,
+                        if tc == TypeCode::UUID { "UUID" } else { "U128" },
                     )
                 )),
                 TypeCode::F32 | TypeCode::F64 => Ok((eb.load_col_float(*idx), true)),

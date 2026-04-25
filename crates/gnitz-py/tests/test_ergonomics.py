@@ -44,7 +44,10 @@ class TestTypeCode:
         assert TypeCode.STRING in TypeCode
 
     def test_all_values_present(self):
-        assert {tc.value for tc in TypeCode} == set(range(1, 13))
+        assert {tc.name for tc in TypeCode} == {
+            "U8", "I8", "U16", "I16", "U32", "I32", "F32",
+            "U64", "I64", "F64", "STRING", "U128", "UUID",
+        }
 
 
 class TestColumnDef:

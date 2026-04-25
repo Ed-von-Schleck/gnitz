@@ -691,7 +691,7 @@ pub fn empty_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         num_columns: 0,
         pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     }
 }
 
@@ -703,9 +703,9 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
     let total = left.num_columns as usize + right.num_columns as usize - 1;
-    assert!(total <= 64,
-        "join output schema exceeds 64-column limit: {} + {} - 1 = {}",
-        left.num_columns, right.num_columns, total);
+    assert!(total <= crate::schema::MAX_COLUMNS,
+        "join output schema exceeds {}-column limit: {} + {} - 1 = {}",
+        crate::schema::MAX_COLUMNS, left.num_columns, right.num_columns, total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
     // PK from left
@@ -732,9 +732,9 @@ fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> 
 
 fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
     let total = left.num_columns as usize + right.num_columns as usize - 1;
-    assert!(total <= 64,
-        "join output schema exceeds 64-column limit: {} + {} - 1 = {}",
-        left.num_columns, right.num_columns, total);
+    assert!(total <= crate::schema::MAX_COLUMNS,
+        "join output schema exceeds {}-column limit: {} + {} - 1 = {}",
+        crate::schema::MAX_COLUMNS, left.num_columns, right.num_columns, total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
     out.columns[ci] = left.columns[left.pk_index as usize];
@@ -805,7 +805,7 @@ fn build_reduce_output_schema(
 
     let use_natural_pk = if group_cols.len() == 1 {
         let gc_type = input.columns[group_cols[0] as usize].type_code;
-        gc_type == type_code::U64 || gc_type == type_code::U128
+        gc_type == type_code::U64 || gc_type == type_code::U128 || gc_type == type_code::UUID
     } else {
         false
     };
@@ -863,7 +863,7 @@ fn is_linear_agg(agg_op: u8) -> bool {
 }
 
 fn agg_value_idx_eligible(col_type_code: u8) -> bool {
-    col_type_code != type_code::U128 && col_type_code != type_code::STRING
+    col_type_code != type_code::U128 && col_type_code != type_code::UUID && col_type_code != type_code::STRING
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,8 +1168,9 @@ fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_schema = reg_schemas[in_reg as usize];
             let n_cols = node_params.get(&PARAM_NULL_EXTEND_COUNT).copied().unwrap_or(0) as usize;
-            assert!(n_cols < 64,
-                "NULL_EXTEND n_cols={} would overflow schema array (max 63)", n_cols);
+            assert!(n_cols < crate::schema::MAX_COLUMNS,
+                "NULL_EXTEND n_cols={} would overflow schema array (max {})",
+                n_cols, crate::schema::MAX_COLUMNS - 1);
             // Build right schema from type codes stored in params
             let mut right = empty_schema();
             right.columns[0] = col(type_code::U128, 16, false); // dummy PK
@@ -1491,6 +1492,7 @@ fn emit_reduce(
         let gc_col_idx = gcols[0] as usize;
         let gc_type = in_reg_schema.columns[gc_col_idx].type_code;
         if gc_type != type_code::U128
+            && gc_type != type_code::UUID
             && gc_type != type_code::STRING
             && gc_type != type_code::F32
             && gc_type != type_code::F64

@@ -41,7 +41,7 @@ const STR_COL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size:
 const STR_COL_NULL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0 };
 
 pub(crate) const META_SCHEMA_DESC: SchemaDescriptor = {
-    let mut sd = SchemaDescriptor { num_columns: 4, pk_index: 0, columns: [ZERO_COL; 64] };
+    let mut sd = SchemaDescriptor { num_columns: 4, pk_index: 0, columns: [ZERO_COL; crate::schema::MAX_COLUMNS] };
     sd.columns[0] = U64_COL;
     sd.columns[1] = U64_COL;
     sd.columns[2] = U64_COL;
@@ -61,7 +61,7 @@ pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
     let mut sd = SchemaDescriptor {
         num_columns: gnitz_wire::control::NUM_COLUMNS as u32,
         pk_index: 0,
-        columns: [ZERO_COL; 64],
+        columns: [ZERO_COL; crate::schema::MAX_COLUMNS],
     };
     sd.columns[0] = U64_COL; sd.columns[1] = U64_COL; sd.columns[2] = U64_COL;
     sd.columns[3] = U64_COL; sd.columns[4] = U64_COL; sd.columns[5] = U128_COL;
@@ -124,10 +124,10 @@ pub fn build_schema_wire_block(
     block
 }
 
-/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; 64]`, capped
+/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; crate::schema::MAX_COLUMNS]`, capped
 /// at 64 (the wire protocol maximum). Returns the filled array and the fill count.
-pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; 64], usize) {
-    let mut refs = [&[][..]; 64];
+pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MAX_COLUMNS], usize) {
+    let mut refs = [&[][..]; crate::schema::MAX_COLUMNS];
     let n = names.len().min(64);
     for (i, name) in names.iter().take(n).enumerate() {
         refs[i] = name;
@@ -164,11 +164,11 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
 #[cfg(test)]
 pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
     if batch.count == 0 { return Err("empty schema batch"); }
-    if batch.count > 64 { return Err("schema exceeds 64-column limit"); }
+    if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
     let mut sd = SchemaDescriptor {
         num_columns: batch.count as u32,
         pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
     let mut names = Vec::with_capacity(batch.count);
     let mut pk_found = false;
@@ -491,7 +491,7 @@ fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
     let (batch, _) = Batch::decode_from_wal_block(data, &META_SCHEMA_DESC)
         .map_err(|_| "schema block invalid")?;
     if batch.count == 0 { return Err("empty schema block"); }
-    if batch.count > 64 { return Err("schema exceeds 64-column limit"); }
+    if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
 
     let n = batch.count;
     let type_data  = batch.col_data(0);
@@ -500,7 +500,7 @@ fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
     let mut sd = SchemaDescriptor {
         num_columns: n as u32,
         pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
     let mut pk_found = false;
 

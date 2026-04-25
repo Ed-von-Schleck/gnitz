@@ -336,7 +336,7 @@ pub fn op_null_extend(
     }
 
     // Build a merged schema for the output batch.
-    let mut out_columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+    let mut out_columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
     let mut ci_out = 0;
     for ci in 0..in_schema.num_columns as usize {
         out_columns[ci_out] = in_schema.columns[ci];
@@ -485,7 +485,7 @@ mod tests {
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
+        }; crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn {
             type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
         };

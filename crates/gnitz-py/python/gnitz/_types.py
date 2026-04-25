@@ -14,3 +14,4 @@ class TypeCode(IntEnum):
     F64    = 10
     STRING = 11
     U128   = 12
+    UUID   = 13

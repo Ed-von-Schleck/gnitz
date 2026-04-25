@@ -1,5 +1,6 @@
 mod ddl_tests;
 mod fk_tests;
+mod uuid_tests;
 mod view_tests;
 mod index_tests;
 mod engine_tests;

@@ -116,7 +116,7 @@ fn make_gi_schema() -> SchemaDescriptor {
     let mut s = SchemaDescriptor {
         num_columns: 2,
         pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
     s.columns[0] = SchemaColumn {
         type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
@@ -132,7 +132,7 @@ fn make_avi_schema() -> SchemaDescriptor {
     let mut s = SchemaDescriptor {
         num_columns: 1,
         pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
     s.columns[0] = SchemaColumn {
         type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
