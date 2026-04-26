@@ -80,6 +80,11 @@ pub struct Shared {
     pub t_last_push: Rc<Cell<Option<Instant>>>,
 }
 
+impl Shared {
+    #[allow(clippy::mut_from_ref)]
+    fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.disp_ptr } }
+}
+
 /// The committer task loop. Returns when all senders drop (shutdown).
 ///
 /// For normal commit groups `sal_writer_excl` is held only for the
@@ -119,7 +124,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // groups go out: workers bump their expected_epoch on FLAG_FLUSH,
         // so commit groups written AFTER FLAG_FLUSH in the same epoch
         // would be silently skipped by workers.
-        if unsafe { (*shared.disp_ptr).sal_needs_checkpoint() } {
+        if shared.disp().sal_needs_checkpoint() {
             if let Err(e) = run_checkpoint_phase(&shared).await {
                 for p in pushes { let _ = p.done.send(Err(e.clone())); }
                 for b in barrier_senders { let _ = b.send(()); }
@@ -183,14 +188,13 @@ fn debounce_drain(
 /// resets `write_cursor` to 0, permanently orphaning the groups and
 /// leaving the writers waiting for ACKs that never arrive.
 async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
-    let disp_ptr = shared.disp_ptr;
     let nw = shared.num_workers;
     let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
 
     let _sal_excl = shared.sal_writer_excl.lock().await;
 
-    let reply_futs = unsafe {
-        let disp = &mut *disp_ptr;
+    let reply_futs = {
+        let disp = shared.disp();
         let lsn = disp.next_lsn();
         disp.write_checkpoint_group(lsn, &req_ids)?;
         disp.signal_all();
@@ -202,7 +206,7 @@ async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
         return Err(e);
     }
     guard_panic("checkpoint_post_ack", || {
-        unsafe { (*disp_ptr).checkpoint_post_ack(); }
+        shared.disp().checkpoint_post_ack();
         Ok(())
     })
 }
@@ -249,9 +253,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
                 .sum();
             let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
 
-            let disp_ptr = shared.disp_ptr;
-            let merged = match guard_panic("commit_merge", || Ok(unsafe {
-                let schema = (*disp_ptr).schema_desc_for(tid);
+            let merged = match guard_panic("commit_merge", || Ok({
+                let schema = shared.disp().schema_desc_for(tid);
                 let mut m = Batch::with_schema(schema, total_rows.max(1));
                 for p in pushes[run_start..run_end].iter() {
                     m.append_batch(&p.batch, 0, p.batch.count);
@@ -260,9 +263,9 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
             })) {
                 Ok(m) => m,
                 Err(panic_msg) => {
-                    let placeholder = guard_panic("commit_fallback_schema", || Ok(unsafe {
-                        Batch::with_schema((*disp_ptr).schema_desc_for(tid), 1)
-                    }))
+                    let placeholder = guard_panic("commit_fallback_schema", || Ok(
+                        Batch::with_schema(shared.disp().schema_desc_for(tid), 1)
+                    ))
                     .unwrap_or_else(|_| Batch::with_schema(
                         crate::schema::SchemaDescriptor::minimal_u64(), 1));
                     groups.push(GroupInfo {
@@ -299,11 +302,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
 
         for g in groups.iter_mut() {
             if g.write_err.is_some() { continue; }
-            let disp_ptr = shared.disp_ptr;
             let mode = pushes[g.start].mode;
-            let err = guard_panic("commit_write", || Ok(unsafe {
-                (*disp_ptr).write_commit_group(g.tid, zone_lsn, &g.merged, mode, &g.req_ids).err()
-            })).unwrap_or_else(Some);
+            let err = guard_panic("commit_write", || Ok(
+                shared.disp().write_commit_group(g.tid, zone_lsn, &g.merged, mode, &g.req_ids).err()
+            )).unwrap_or_else(Some);
             g.write_err = err;
             g.lsn = zone_lsn;
         }
@@ -334,11 +336,11 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
         // fails the zone has no FLAG_TXN_COMMIT and recovery would silently
         // drop all groups in the zone — that is unrecoverable data loss
         // after a restart while the client already received Ok.  Abort.
-        let commit_zone_err = unsafe { (*shared.disp_ptr).commit_zone(zone_lsn).err() };
+        let commit_zone_err = shared.disp().commit_zone(zone_lsn).err();
         if let Some(e) = commit_zone_err {
             crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
         }
-        unsafe { (*shared.disp_ptr).signal_all(); }
+        shared.disp().signal_all();
 
         // Submit fsync SQE (synchronous — returns a future). Return the
         // awaitables; the .await happens after the lock is dropped.
@@ -375,11 +377,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
 
         // Invalidate filters for groups whose worker ACK reported an error.
         // ingest_lsn publish + filter ingest are deferred to Phase D after fsync.
-        let disp_ptr = shared.disp_ptr;
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
                 let _ = guard_panic("unique_filter_invalidate", || {
-                    unsafe { (*disp_ptr).unique_filter_invalidate_table(g.tid); }
+                    shared.disp().unique_filter_invalidate_table(g.tid);
                     Ok(())
                 });
             }
@@ -431,15 +432,14 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // the data is already durable. Invalidate on panic so the next
     // constrained INSERT re-validates from scratch.
     {
-        let disp_ptr = shared.disp_ptr;
         for g in groups.iter_mut() {
             if g.write_err.is_some() { continue; }
             if let Err(e) = guard_panic("unique_filter_ingest", || {
-                unsafe { (*disp_ptr).unique_filter_ingest_batch(g.tid, &g.merged); }
+                shared.disp().unique_filter_ingest_batch(g.tid, &g.merged);
                 Ok(())
             }) {
                 let _ = guard_panic("unique_filter_invalidate", || {
-                    unsafe { (*disp_ptr).unique_filter_invalidate_table(g.tid); }
+                    shared.disp().unique_filter_invalidate_table(g.tid);
                     Ok(())
                 });
                 crate::gnitz_warn!("{}", e);
