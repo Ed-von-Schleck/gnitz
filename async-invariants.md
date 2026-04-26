@@ -150,7 +150,11 @@ Not yet wrapped: `seek_family`, `seek_by_index`, `scan_family`,
 
 **Table-lock scope** — constrained tables (FK parent/child, unique index,
 Error-mode PK) hold per-table `AsyncMutex` across validate + commit + ack.
-Unconstrained tables skip it.
+Unconstrained tables skip it. For FK constraints, `fk_lock_set` returns the
+full neighborhood (target + all FK parents + all FK children); all are
+acquired in ascending tid order before validation begins. Sorted acquisition
+prevents deadlock between concurrent child INSERT and parent DELETE, which
+otherwise pass their respective FK/RESTRICT validations against a stale view.
 
 **Task liveness** — dead committer → `committer_tx` backs up → every
 `done.rx.await` hangs → catalog read guards accumulate → DDL stalls (full

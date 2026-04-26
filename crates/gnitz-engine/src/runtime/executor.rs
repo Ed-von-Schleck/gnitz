@@ -131,10 +131,6 @@ impl Shared {
         l
     }
 
-    fn needs_table_lock(&self, tid: i64) -> bool {
-        self.cat().needs_table_lock(tid)
-    }
-
     /// True iff some pending tid has crossed the row coalesce threshold.
     /// Used by the tick task to skip the deadline coalesce window.
     fn any_threshold_crossed(&self) -> bool {
@@ -553,13 +549,14 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
             send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
             return;
         }
-        let needs_lock = shared.needs_table_lock(target_id);
-        let _tlock = if needs_lock {
-            let l = shared.table_lock(target_id).lock().await;
-            Some(l)
-        } else {
-            None
-        };
+        // Acquire all FK-related table locks in ascending tid order.
+        // Sorted acquisition prevents deadlock between concurrent child
+        // INSERT and parent DELETE: both attempt the same ordered set.
+        let lock_set = shared.cat().fk_lock_set(target_id);
+        let mut _tlocks = Vec::with_capacity(lock_set.len());
+        for &tid in &lock_set {
+            _tlocks.push(shared.table_lock(tid).lock().await);
+        }
 
         // Local (catalog-resident) unique-index validation. Wrapped per V.4
         // so a malformed batch can't crash the server.

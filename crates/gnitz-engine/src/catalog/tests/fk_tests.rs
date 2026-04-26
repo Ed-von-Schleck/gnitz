@@ -1,5 +1,55 @@
 use super::*;
 
+// ── test_fk_lock_set ─────────────────────────────────────────────────
+
+#[test]
+fn test_fk_lock_set() {
+    let dir = temp_dir("fk_lock_set");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Table with no constraints (unique_pk=false): no lock needed, empty set.
+    let plain_tid = engine.create_table("public.plain", &[u64_col_def("id")], 0, false).unwrap();
+    assert!(engine.fk_lock_set(plain_tid).is_empty());
+
+    // unique_pk=true table, no FK yet: needs a lock for itself, but no peers.
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    assert_eq!(engine.fk_lock_set(parent_tid), vec![parent_tid]);
+
+    // Add a child with FK to parent. Now both tables share a lock neighborhood,
+    // returned sorted ascending so both use the same acquisition order.
+    let child_cols = vec![
+        u64_col_def("cid"),
+        ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
+                    fk_table_id: parent_tid, fk_col_idx: 0 },
+    ];
+    let child_tid = engine.create_table("public.child", &child_cols, 0, true).unwrap();
+    let mut expected = vec![parent_tid, child_tid];
+    expected.sort_unstable();
+    assert_eq!(engine.fk_lock_set(child_tid), expected, "child sees parent in its lock set");
+    assert_eq!(engine.fk_lock_set(parent_tid), expected, "parent sees child in its lock set");
+
+    // Second child: parent's neighborhood grows; each child only sees itself + parent.
+    let child2_cols = vec![
+        u64_col_def("cid"),
+        ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
+                    fk_table_id: parent_tid, fk_col_idx: 0 },
+    ];
+    let child2_tid = engine.create_table("public.child2", &child2_cols, 0, true).unwrap();
+    let mut expected3 = vec![parent_tid, child_tid, child2_tid];
+    expected3.sort_unstable();
+    assert_eq!(engine.fk_lock_set(parent_tid), expected3);
+    let mut expected_c2 = vec![parent_tid, child2_tid];
+    expected_c2.sort_unstable();
+    assert_eq!(engine.fk_lock_set(child2_tid), expected_c2);
+
+    // Drop child: parent's neighborhood shrinks back to itself + child2 only.
+    engine.drop_table("public.child").unwrap();
+    assert_eq!(engine.fk_lock_set(parent_tid), expected_c2);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_fk_referential_integrity ────────────────────────────────────
 
 #[test]

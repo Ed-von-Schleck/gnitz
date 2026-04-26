@@ -520,6 +520,32 @@ impl CatalogEngine {
         self.caches.needs_lock.contains(&table_id)
     }
 
+    /// Return the full set of table IDs that must be locked together for a
+    /// write to `table_id`, sorted ascending to guarantee deadlock-free
+    /// acquisition. Includes `table_id` itself plus all FK parents (to
+    /// guard concurrent parent DELETE) and FK children (to guard concurrent
+    /// child INSERT during a parent DELETE). Returns an empty vec if this
+    /// table requires no lock at all.
+    pub fn fk_lock_set(&self, table_id: i64) -> Vec<i64> {
+        if !self.caches.needs_lock.contains(&table_id) {
+            return Vec::new();
+        }
+        let mut tids = vec![table_id];
+        if let Some(constraints) = self.caches.fk_by_child.get(&table_id) {
+            for c in constraints {
+                tids.push(c.target_table_id);
+            }
+        }
+        if let Some(children) = self.caches.fk_by_parent.get(&table_id) {
+            for &(child_tid, _) in children {
+                tids.push(child_tid);
+            }
+        }
+        tids.sort_unstable();
+        tids.dedup();
+        tids
+    }
+
     // -- Store handle accessors -----------------------------------------------
 
     /// Get raw PartitionedTable handle for a user table.
