@@ -207,6 +207,49 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
 // Encode
 // ---------------------------------------------------------------------------
 
+/// Encode only the ctrl WAL block (no schema, no data) into `out[offset..]`
+/// with checksums skipped. Caller pre-computes `wire_flags` (including
+/// `FLAG_HAS_SCHEMA`, `FLAG_HAS_DATA`, sorted/consolidated bits, etc.) so
+/// this helper can be called after the data block is already written.
+/// Returns bytes written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ctrl_block_ipc(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    wire_flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    request_id: u64,
+    status: u32,
+    error_msg: &[u8],
+) -> usize {
+    use gnitz_wire::control as ctrl;
+    let cs = CONTROL_SCHEMA_DESC;
+    let mut b = Batch::with_schema(cs, 1);
+    let has_error = !error_msg.is_empty();
+    let null_word: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
+    b.extend_pk(0u128);
+    b.extend_weight(&1i64.to_le_bytes());
+    b.extend_null_bmp(&null_word.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_STATUS,       &(status as u64).to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_CLIENT_ID,    &client_id.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_TARGET_ID,    &target_id.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_FLAGS,        &wire_flags.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_SEEK_PK,      &seek_pk.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_SEEK_COL_IDX, &seek_col_idx.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_REQUEST_ID,   &request_id.to_le_bytes());
+    let error_st = if has_error {
+        encode_german_string(error_msg, &mut b.blob)
+    } else {
+        [0u8; 16]
+    };
+    b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
+    b.count = 1;
+    b.encode_to_wire(IPC_CONTROL_TID, out, offset, false)
+}
+
 /// Compute total encoded wire size without allocating.
 ///
 /// `prebuilt_schema_block`: when `Some`, use its length as the schema block

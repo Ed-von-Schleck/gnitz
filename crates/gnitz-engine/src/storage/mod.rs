@@ -34,4 +34,5 @@ pub use error::StorageError;
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use read_cursor::ReadCursor;
 pub(crate) use columnar::compare_rows;
+pub(crate) use merge::DirectWriter;
 

@@ -17,6 +17,38 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Extract the routing key for `col_idx` from row `row` of `mb`.
+/// STRING columns are hashed to u64 (stored as u128); all others use the full value.
+fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
+    let pki = schema.pk_index as usize;
+    if col_idx == pki {
+        return mb.get_pk(row);
+    }
+    let pi = payload_idx(col_idx, pki);
+    let col = &schema.columns[col_idx];
+    let col_size = col.size as usize;
+    if col.type_code == crate::schema::type_code::STRING {
+        let struct_bytes = mb.get_col_ptr(row, pi, 16);
+        let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+        if length == 0 {
+            0u128
+        } else if length <= crate::schema::SHORT_STRING_THRESHOLD {
+            crate::xxh::checksum(&struct_bytes[4..4 + length]) as u128
+        } else {
+            let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+            crate::xxh::checksum(&mb.blob[heap_offset..heap_offset + length]) as u128
+        }
+    } else if col.type_code == crate::schema::type_code::U128 {
+        let bytes = mb.get_col_ptr(row, pi, 16);
+        u128::from_le_bytes(bytes[0..16].try_into().unwrap())
+    } else {
+        let bytes = mb.get_col_ptr(row, pi, col_size);
+        let mut buf = [0u8; 8];
+        buf[..col_size].copy_from_slice(bytes);
+        u64::from_le_bytes(buf) as u128
+    }
+}
+
 /// Build a 256-entry partition→worker lookup table, hoisting the division out
 /// of the per-row loop. `partition_for_key` always returns values in 0..=255.
 #[inline]
@@ -39,12 +71,12 @@ pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
 // Partition routing cache
 // ---------------------------------------------------------------------------
 
-/// Master-side routing cache: maps (table_id, col_idx, key_lo) → worker.
+/// Master-side routing cache: maps (table_id, col_idx, key) → worker.
 ///
 /// Populated by `record_routing` after repartitioning unique-indexed columns.
 /// Lets the master unicast index seeks instead of broadcasting on cache hit.
 pub struct PartitionRouter {
-    index_routing: std::collections::HashMap<(u32, u32, u64), u32>,
+    index_routing: std::collections::HashMap<(u32, u32, u128), u32>,
 }
 
 impl PartitionRouter {
@@ -55,15 +87,42 @@ impl PartitionRouter {
     }
 
     /// Returns the worker for a given index key, or -1 on cache miss.
-    pub fn worker_for_index_key(&self, tid: u32, col_idx: u32, key_lo: u64) -> i32 {
-        match self.index_routing.get(&(tid, col_idx, key_lo)) {
+    pub fn worker_for_index_key(&self, tid: u32, col_idx: u32, key: u128) -> i32 {
+        match self.index_routing.get(&(tid, col_idx, key)) {
             Some(&w) => w as i32,
             None => -1,
         }
     }
 
+    /// Like `record_routing` but iterates over `indices` into `source` rather
+    /// than every row of a pre-partitioned sub-batch. Used by the scatter-to-wire
+    /// path which never materialises per-worker Batch objects.
+    pub fn record_routing_from_source(
+        &mut self,
+        source: &Batch,
+        indices: &[u32],
+        schema: &SchemaDescriptor,
+        tid: u32,
+        col_idx: u32,
+        worker: u32,
+    ) {
+        let mb = source.as_mem_batch();
+        for &idx in indices {
+            let row = idx as usize;
+            let weight = source.get_weight(row);
+            let key = extract_col_key(&mb, row, col_idx as usize, schema);
+            let map_key = (tid, col_idx, key);
+            if weight < 0 {
+                self.index_routing.remove(&map_key);
+            } else {
+                self.index_routing.insert(map_key, worker);
+            }
+        }
+    }
+
     /// Scan every row in `batch` and record or retract its index key → worker mapping.
     /// Rows with negative weight retract; non-negative weight records.
+    #[allow(dead_code)]
     pub fn record_routing(
         &mut self,
         batch: &Batch,
@@ -73,41 +132,10 @@ impl PartitionRouter {
         worker: u32,
     ) {
         let mb = batch.as_mem_batch();
-        let pki = schema.pk_index as usize;
         for row in 0..batch.count {
             let weight = batch.get_weight(row);
-            let key_lo = if col_idx as usize == pki {
-                mb.get_pk(row) as u64
-            } else {
-                let pi = payload_idx(col_idx as usize, pki);
-                let col = &schema.columns[col_idx as usize];
-                let col_size = col.size as usize;
-                if col.type_code == crate::schema::type_code::STRING {
-                    // Hash string content to u64 (same approach as extract_group_key)
-                    let struct_bytes = mb.get_col_ptr(row, pi, 16);
-                    let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-                    if length == 0 {
-                        0u64
-                    } else if length <= crate::schema::SHORT_STRING_THRESHOLD {
-                        crate::xxh::checksum(&struct_bytes[4..4 + length])
-                    } else {
-                        let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                        crate::xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
-                    }
-                } else if col.type_code == crate::schema::type_code::U128 {
-                    // XOR the two u64 halves
-                    let bytes = mb.get_col_ptr(row, pi, 16);
-                    let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                    lo ^ hi
-                } else {
-                    let bytes = mb.get_col_ptr(row, pi, col_size);
-                    let mut buf = [0u8; 8];
-                    buf[..col_size].copy_from_slice(bytes);
-                    u64::from_le_bytes(buf)
-                }
-            };
-            let map_key = (tid, col_idx, key_lo);
+            let key = extract_col_key(&mb, row, col_idx as usize, schema);
+            let map_key = (tid, col_idx, key);
             if weight < 0 {
                 self.index_routing.remove(&map_key);
             } else {
@@ -131,6 +159,32 @@ fn hash_row_for_partition(
     partition_for_key(pk)
 }
 
+/// Compute per-worker row-index lists for `batch` without building sub-batches.
+/// Returns `worker_indices[w]` = sorted row indices from `batch` destined for
+/// worker `w`. Clones from the SCATTER_INDICES thread-local pool so the result
+/// is owned and the pool remains free for the next call.
+pub fn compute_worker_indices(
+    batch: &Batch,
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Vec<u32>> {
+    let mb = batch.as_mem_batch();
+    let w_map = build_w_map(num_workers);
+    SCATTER_INDICES.with(|pool| {
+        let mut worker_indices = pool.borrow_mut();
+        if worker_indices.len() < num_workers {
+            worker_indices.resize_with(num_workers, Vec::new);
+        }
+        for w in 0..num_workers { worker_indices[w].clear(); }
+        for i in 0..batch.count {
+            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+            worker_indices[w_map[partition]].push(i as u32);
+        }
+        worker_indices[..num_workers].to_vec()
+    })
+}
+
 pub fn op_repartition_batch(
     batch: &Batch,
     col_indices: &[u32],
@@ -139,33 +193,17 @@ pub fn op_repartition_batch(
 ) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batch: count={} num_workers={}", batch.count, num_workers);
     let npc = schema.num_columns as usize - 1;
-    let n = batch.count;
+    let worker_indices = compute_worker_indices(batch, col_indices, schema, num_workers);
     let mb = batch.as_mem_batch();
-    let w_map = build_w_map(num_workers);
-
-    SCATTER_INDICES.with(|pool| {
-        let mut worker_indices = pool.borrow_mut();
-        if worker_indices.len() < num_workers {
-            worker_indices.resize_with(num_workers, Vec::new);
-        }
-        for w in 0..num_workers { worker_indices[w].clear(); }
-
-        for i in 0..n {
-            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-            worker_indices[w_map[partition]].push(i as u32);
-        }
-
-        let mut result: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
-        for w in 0..num_workers {
-            if !worker_indices[w].is_empty() {
-                result[w] = Some(Batch::from_indexed_rows(&mb, &worker_indices[w], schema));
+    worker_indices.into_iter()
+        .map(|indices| {
+            if !indices.is_empty() {
+                Batch::from_indexed_rows(&mb, &indices, schema)
+            } else {
+                Batch::empty(npc, 16)
             }
-        }
-        result
-            .into_iter()
-            .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc, 16)))
-            .collect()
-    })
+        })
+        .collect()
 }
 
 pub fn op_repartition_batches(
@@ -822,7 +860,7 @@ mod tests {
         let struct_bytes = mb.get_col_ptr(0, 0, 16); // payload_idx(1, 0) = 0
         let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
         let hashed_key = crate::xxh::checksum(&struct_bytes[4..4 + length]);
-        assert_eq!(router.worker_for_index_key(1, 1, hashed_key), 2);
+        assert_eq!(router.worker_for_index_key(1, 1, hashed_key as u128), 2);
 
         // Long string (> 12 bytes)
         let b2 = make_batch_str(&schema, &[(2, 1, "a_long_string_value")]);

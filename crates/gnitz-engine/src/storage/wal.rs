@@ -75,19 +75,48 @@ pub fn encode(
     let block = &mut out_buf[out_offset..out_offset + total_size];
     block[..HEADER_SIZE].fill(0);
 
+    // Phase 1: compute per-region start positions and write directory.
+    // 72 slots — larger than the maximum 69 (68 payload columns + pk/weight/null_bmp + blob).
+    debug_assert!(num_regions <= 72, "num_regions={num_regions} exceeds positions array capacity");
+    let mut positions = [0usize; 72];
     let mut pos = HEADER_SIZE + dir_size;
     for i in 0..num_regions {
         pos = align8(pos);
-        let sz = region_sizes[i] as usize;
-        if sz > 0 && !region_ptrs[i].is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(region_ptrs[i], block[pos..].as_mut_ptr(), sz);
-            }
-        }
+        positions[i] = pos;
         let dir_off = HEADER_SIZE + i * 8;
         write_u32_le(block, dir_off, pos as u32);
-        write_u32_le(block, dir_off + 4, sz as u32);
-        pos += sz;
+        write_u32_le(block, dir_off + 4, region_sizes[i]);
+        pos += region_sizes[i] as usize;
+    }
+
+    // Phase 2: coalesce adjacent runs into single copies.
+    // A run extends while consecutive regions are both source-adjacent (no gap
+    // in the source buffer) and dest-adjacent (no align8 padding between them).
+    let mut i = 0;
+    while i < num_regions {
+        let sz = region_sizes[i] as usize;
+        if sz == 0 || region_ptrs[i].is_null() {
+            i += 1;
+            continue;
+        }
+        let run_src = region_ptrs[i];
+        let run_dst = positions[i];
+        let mut run_len = sz;
+        let mut j = i + 1;
+        while j < num_regions {
+            let sz_j = region_sizes[j] as usize;
+            if sz_j == 0 || region_ptrs[j].is_null() { break; }
+            // Source must be adjacent to previous region's end.
+            if unsafe { region_ptrs[j] != region_ptrs[j - 1].add(region_sizes[j - 1] as usize) } { break; }
+            // Destination must be gap-free (only holds when previous size is 8-aligned).
+            if positions[j] != positions[j - 1] + region_sizes[j - 1] as usize { break; }
+            run_len += sz_j;
+            j += 1;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(run_src, block[run_dst..].as_mut_ptr(), run_len);
+        }
+        i = j;
     }
 
     write_u64_le(block, OFF_LSN, lsn);

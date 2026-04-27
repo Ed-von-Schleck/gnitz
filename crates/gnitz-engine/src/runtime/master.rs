@@ -20,7 +20,7 @@ use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_relay_scatter_consolidated,
-    worker_for_partition,
+    worker_for_partition, compute_worker_indices,
 };
 
 const FLAGS_PUSH_CONFLICT_MODE: u32 = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
@@ -576,9 +576,12 @@ impl MasterDispatcher {
                               source_id as u128, 0, 0)
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn record_index_routing(
-        &mut self, target_id: i64, schema: &SchemaDescriptor, per_worker_batches: &[Batch],
+        &mut self,
+        target_id: i64,
+        schema: &SchemaDescriptor,
+        source_batch: &Batch,
+        worker_indices: &[Vec<u32>],
     ) {
         let cat = unsafe { &mut *self.catalog };
         let n_idx = cat.get_index_circuit_count(target_id);
@@ -588,9 +591,11 @@ impl MasterDispatcher {
             if let Some((col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
                 if !is_unique { continue; }
                 for w in 0..self.num_workers {
-                    let sb = &per_worker_batches[w];
-                    if sb.count > 0 {
-                        self.router.record_routing(sb, schema, target_id as u32, col_idx, w as u32);
+                    if !worker_indices[w].is_empty() {
+                        self.router.record_routing_from_source(
+                            source_batch, &worker_indices[w], schema,
+                            target_id as u32, col_idx, w as u32,
+                        );
                     }
                 }
             }
@@ -636,7 +641,7 @@ impl MasterDispatcher {
     ) -> Result<Option<Batch>, String> {
         let cached = unsafe {
             (*disp_ptr).router.worker_for_index_key(
-                target_id as u32, col_idx, key as u64,
+                target_id as u32, col_idx, key,
             )
         };
         if cached >= 0 {
@@ -1448,14 +1453,14 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         let pk_col = &[schema.pk_index];
-        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
-        self.record_index_routing(target_id, &schema, &sub_batches);
-        let refs: Vec<Option<&Batch>> = sub_batches.iter()
-            .map(|b| if b.count > 0 { Some(b) } else { None })
-            .collect();
-        self.write_group_with_req_ids(
-            target_id, lsn, FLAGS_PUSH_CONFLICT_MODE, &refs,
-            &schema, &col_names, 0, mode.as_u8() as u64, req_ids, -1,
+        let worker_indices = compute_worker_indices(batch, pk_col, &schema, self.num_workers);
+        self.record_index_routing(target_id, &schema, batch, &worker_indices);
+        let (name_refs, n) = col_names_as_refs(&col_names);
+        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
+        self.sal.scatter_wire_group(
+            batch, &worker_indices, &schema, col_names_opt,
+            target_id as u32, lsn, FLAGS_PUSH_CONFLICT_MODE,
+            0, mode.as_u8() as u64, req_ids, -1,
         )
     }
 
