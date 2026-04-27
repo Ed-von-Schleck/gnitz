@@ -1092,49 +1092,6 @@ impl Batch {
         self.consolidated = false;
     }
 
-    /// Scatter-copy selected rows from a MemBatch directly into this batch.
-    pub fn append_indexed_rows(
-        &mut self,
-        src: &merge::MemBatch,
-        indices: &[u32],
-        schema: &crate::schema::SchemaDescriptor,
-    ) {
-        if indices.is_empty() { return; }
-        let col_meta: Vec<(usize, bool)> = schema
-            .payload_columns()
-            .map(|(_pi, _ci, col)| {
-                let is_string = col.type_code == crate::schema::type_code::STRING && col.size == 16;
-                (col.size as usize, is_string)
-            })
-            .collect();
-
-        self.reserve_rows(indices.len());
-        for &idx in indices {
-            let row = idx as usize;
-            let pk = src.get_pk(row);
-            self.extend_pk(pk);
-            self.extend_weight(&src.get_weight(row).to_le_bytes());
-            let null_word = src.get_null_word(row);
-            self.extend_null_bmp(&null_word.to_le_bytes());
-
-            for (pi, &(cs, is_string)) in col_meta.iter().enumerate() {
-                let is_null = (null_word >> pi) & 1 != 0;
-                if is_null {
-                    self.fill_col_zero(pi, cs);
-                } else if is_string {
-                    let src_struct = src.get_col_ptr(row, pi, 16);
-                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize + self.count * 16;
-                    relocate_string_cell(src_struct, src.blob, &mut self.data[dst_off..dst_off + 16], &mut self.blob);
-                } else if cs > 0 {
-                    self.extend_col(pi, src.get_col_ptr(row, pi, cs));
-                }
-            }
-            self.count += 1;
-        }
-        self.sorted = false;
-        self.consolidated = false;
-    }
-
     /// Reset to empty without freeing buffer allocations.
     pub fn clear(&mut self) {
         self.count = 0;

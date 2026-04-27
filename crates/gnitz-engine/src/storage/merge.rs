@@ -567,6 +567,82 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
     }
 }
 
+/// Column-first scatter from multiple sources in a pre-determined (src_idx, row_idx) order.
+///
+/// `sources[i]` holds the MemBatch for source `i`; entries in `rows` are `(src_idx, row_idx)`
+/// in emission order. Destination writes are sequential per column; source reads are scattered.
+/// No zero-weight check — callers must filter before calling.
+pub fn scatter_multi_source(
+    sources: &[Option<MemBatch<'_>>],
+    rows: &[(u8, u32)],
+    writer: &mut DirectWriter<'_>,
+) {
+    if rows.is_empty() { return; }
+    #[cfg(debug_assertions)]
+    for &(si, ri) in rows {
+        let src = sources[si as usize].as_ref().unwrap();
+        debug_assert_ne!(
+            src.get_weight(ri as usize), 0,
+            "scatter_multi_source: zero-weight row at source={si} index={ri}",
+        );
+    }
+    let n = rows.len();
+    let base = writer.count;
+
+    let stride = writer.pk_stride as usize;
+    for (out, &(si, ri)) in rows.iter().enumerate() {
+        let src = sources[si as usize].as_ref().unwrap();
+        let row = ri as usize;
+        writer.pk[(base + out) * stride..][..stride]
+            .copy_from_slice(&src.pk[row * stride..][..stride]);
+    }
+
+    for (out, &(si, ri)) in rows.iter().enumerate() {
+        let src = sources[si as usize].as_ref().unwrap();
+        let row = ri as usize;
+        writer.weight[(base + out) * 8..][..8]
+            .copy_from_slice(&src.weight[row * 8..][..8]);
+    }
+
+    for (out, &(si, ri)) in rows.iter().enumerate() {
+        let src = sources[si as usize].as_ref().unwrap();
+        let row = ri as usize;
+        writer.null_bmp[(base + out) * 8..][..8]
+            .copy_from_slice(&src.null_bmp[row * 8..][..8]);
+    }
+
+    // One pass per column keeps destination writes sequential.
+    let schema = writer.schema;
+    for (pi, _ci, col) in schema.payload_columns() {
+        let cs = col.size as usize;
+        if col.type_code == TYPE_STRING {
+            for (out, &(si, ri)) in rows.iter().enumerate() {
+                let src = sources[si as usize].as_ref().unwrap();
+                writer.write_string(pi, src, ri as usize, base + out);
+            }
+        } else if col.nullable != 0 {
+            // Destination is pre-zeroed by write_to_batch; skip null cells.
+            for (out, &(si, ri)) in rows.iter().enumerate() {
+                let src = sources[si as usize].as_ref().unwrap();
+                let row = ri as usize;
+                if (src.get_null_word(row) >> pi) & 1 == 0 {
+                    let dst = &mut writer.col_bufs[pi][(base + out) * cs..][..cs];
+                    dst.copy_from_slice(&src.col_data[pi][row * cs..][..cs]);
+                }
+            }
+        } else {
+            for (out, &(si, ri)) in rows.iter().enumerate() {
+                let src = sources[si as usize].as_ref().unwrap();
+                let row = ri as usize;
+                let dst = &mut writer.col_bufs[pi][(base + out) * cs..][..cs];
+                dst.copy_from_slice(&src.col_data[pi][row * cs..][..cs]);
+            }
+        }
+    }
+
+    writer.count += n;
+}
+
 /// Sort a single batch by (PK, payload) WITHOUT consolidation.
 /// All N input rows produce N output rows — no weight merging, no ghost elimination.
 /// Duplicate (PK, payload) entries are preserved as separate rows.

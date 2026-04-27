@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key, write_to_batch, scatter_multi_source};
 
 use super::util::{extract_group_key, payload_idx};
 
@@ -15,6 +15,15 @@ use super::util::{extract_group_key, payload_idx};
 // steady-state repartition/scatter ops allocate nothing for routing tables.
 thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
+    static WORKER_ROWS: RefCell<Vec<Vec<(u8, u32)>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
+    mem_batches.iter()
+        .filter_map(|o| o.as_ref())
+        .map(|mb| mb.blob.len())
+        .sum::<usize>()
+        .max(1)
 }
 
 /// Extract the routing key for `col_idx` from row `row` of `mb`.
@@ -192,7 +201,6 @@ pub fn op_repartition_batch(
     num_workers: usize,
 ) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batch: count={} num_workers={}", batch.count, num_workers);
-    let npc = schema.num_columns as usize - 1;
     let worker_indices = compute_worker_indices(batch, col_indices, schema, num_workers);
     let mb = batch.as_mem_batch();
     worker_indices.into_iter()
@@ -200,7 +208,7 @@ pub fn op_repartition_batch(
             if !indices.is_empty() {
                 Batch::from_indexed_rows(&mb, &indices, schema)
             } else {
-                Batch::empty(npc, 16)
+                Batch::empty_with_schema(schema)
             }
         })
         .collect()
@@ -213,41 +221,47 @@ pub fn op_repartition_batches(
     num_workers: usize,
 ) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
-    let npc = schema.num_columns as usize - 1;
+    debug_assert!(sources.len() <= 256, "source index must fit in u8");
     let w_map = build_w_map(num_workers);
-    let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
-    SCATTER_INDICES.with(|pool| {
-        let mut worker_indices = pool.borrow_mut();
-        if worker_indices.len() < num_workers {
-            worker_indices.resize_with(num_workers, Vec::new);
+    let mem_batches: Vec<Option<MemBatch>> = sources
+        .iter()
+        .map(|opt| match opt {
+            Some(s) if s.count > 0 => Some(s.as_mem_batch()),
+            _ => None,
+        })
+        .collect();
+
+    let total_blob = mem_batch_blob_cap(&mem_batches);
+
+    WORKER_ROWS.with(|pool| {
+        let mut worker_rows = pool.borrow_mut();
+        if worker_rows.len() < num_workers {
+            worker_rows.resize_with(num_workers, Vec::new);
+        }
+        for w in 0..num_workers { worker_rows[w].clear(); }
+
+        for (si, mb_opt) in mem_batches.iter().enumerate() {
+            let mb = match mb_opt { Some(m) => m, None => continue };
+            for i in 0..mb.count {
+                let partition = hash_row_for_partition(mb, i, col_indices, schema);
+                worker_rows[w_map[partition]].push((si as u8, i as u32));
+            }
         }
 
-        for src_opt in sources {
-            let src = match src_opt {
-                Some(s) if s.count > 0 => *s,
-                _ => continue,
-            };
-            let mb = src.as_mem_batch();
-            for w in 0..num_workers { worker_indices[w].clear(); }
-            for i in 0..src.count {
-                let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-                worker_indices[w_map[partition]].push(i as u32);
-            }
-            for w in 0..num_workers {
-                if !worker_indices[w].is_empty() {
-                    let d = dest[w].get_or_insert_with(|| {
-                        Batch::with_schema(*schema, worker_indices[w].len())
-                    });
-                    d.append_indexed_rows(&mb, &worker_indices[w], schema);
+        let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
+        (0..num_workers)
+            .map(|w| {
+                if worker_rows[w].is_empty() {
+                    return Batch::empty_with_schema(schema);
                 }
-            }
-        }
-    });
-
-    dest.into_iter()
-        .map(|opt| opt.unwrap_or_else(|| Batch::empty(npc, 16)))
-        .collect()
+                let blob_cap = (total_blob * worker_rows[w].len() / total_rows).max(1);
+                write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
+                    scatter_multi_source(&mem_batches, &worker_rows[w], writer);
+                })
+            })
+            .collect()
+    })
 }
 
 pub fn op_repartition_batches_merged(
@@ -261,13 +275,11 @@ pub fn op_repartition_batches_merged(
         sources.len(),
         num_workers
     );
-    let npc = schema.num_columns as usize - 1;
+    debug_assert!(sources.len() <= 256, "source index must fit in u8");
     let n = sources.len();
     let w_map = build_w_map(num_workers);
     let mut cursors: Vec<usize> = vec![0; n];
-    let mut dest: Vec<Option<Batch>> = (0..num_workers).map(|_| None).collect();
 
-    // Pre-compute MemBatch views to avoid per-row allocation in as_mem_batch()
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
         .map(|src_opt| match src_opt {
@@ -276,57 +288,57 @@ pub fn op_repartition_batches_merged(
         })
         .collect();
 
-    loop {
-        let mut min_w: Option<usize> = None;
-        for w in 0..n {
-            if mem_batches[w].is_none() {
-                continue;
-            }
-            let src = sources[w].as_ref().unwrap();
-            let idx = cursors[w];
-            if idx >= src.count {
-                continue;
-            }
-            match min_w {
-                None => {
-                    min_w = Some(w);
-                }
-                Some(mw) => {
-                    let min_src = sources[mw].as_ref().unwrap();
-                    let min_idx = cursors[mw];
-                    if src.get_pk(idx) < min_src.get_pk(min_idx) {
-                        min_w = Some(w);
+    let total_blob = mem_batch_blob_cap(&mem_batches);
+
+    WORKER_ROWS.with(|pool| {
+        let mut worker_rows = pool.borrow_mut();
+        if worker_rows.len() < num_workers {
+            worker_rows.resize_with(num_workers, Vec::new);
+        }
+        for w in 0..num_workers { worker_rows[w].clear(); }
+
+        loop {
+            let mut min_w: Option<usize> = None;
+            for w in 0..n {
+                let mb = match &mem_batches[w] { Some(m) => m, None => continue };
+                let idx = cursors[w];
+                if idx >= mb.count { continue; }
+                match min_w {
+                    None => { min_w = Some(w); }
+                    Some(mw) => {
+                        if mb.get_pk(idx) < mem_batches[mw].as_ref().unwrap().get_pk(cursors[mw]) {
+                            min_w = Some(w);
+                        }
                     }
                 }
             }
+            let min_w = match min_w { None => break, Some(w) => w };
+
+            let src_idx = cursors[min_w];
+            let mb = mem_batches[min_w].as_ref().unwrap();
+            let partition = hash_row_for_partition(mb, src_idx, col_indices, schema);
+            let dw = w_map[partition];
+
+            worker_rows[dw].push((min_w as u8, src_idx as u32));
+            cursors[min_w] += 1;
         }
-        let min_w = match min_w {
-            None => break,
-            Some(w) => w,
-        };
 
-        let src = sources[min_w].as_ref().unwrap();
-        let src_idx = cursors[min_w];
-        let mb = mem_batches[min_w].as_ref().unwrap();
-        let partition = hash_row_for_partition(mb, src_idx, col_indices, schema);
-        let dw = w_map[partition];
-
-        let d = dest[dw].get_or_insert_with(|| Batch::with_schema(*schema, 16));
-        d.append_batch(src, src_idx, src_idx + 1);
-        cursors[min_w] += 1;
-    }
-
-    dest.into_iter()
-        .map(|opt| match opt {
-            Some(mut d) => {
-                d.sorted = true;
-                d.consolidated = false;
-                d.set_schema(*schema);
-                d
-            }
-            None => Batch::empty(npc, 16),
-        })
-        .collect()
+        let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
+        (0..num_workers)
+            .map(|w| {
+                if worker_rows[w].is_empty() {
+                    return Batch::empty_with_schema(schema);
+                }
+                let blob_cap = (total_blob * worker_rows[w].len() / total_rows).max(1);
+                let mut b = write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
+                    scatter_multi_source(&mem_batches, &worker_rows[w], writer);
+                });
+                b.sorted = true;
+                b.set_schema(*schema);
+                b
+            })
+            .collect()
+    })
 }
 
 /// Scatter pre-consolidated batches across workers using a merge-walk.
@@ -344,8 +356,7 @@ pub fn op_relay_scatter_consolidated(
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
     );
     if !has_any {
-        let npc = schema.num_columns as usize - 1;
-        return (0..num_workers).map(|_| Batch::empty(npc, 16)).collect();
+        return (0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect();
     }
     let plain: Vec<Option<&Batch>> = sources
         .iter()
@@ -383,7 +394,6 @@ pub fn op_multi_scatter(
 ) -> Vec<Vec<Batch>> {
     let n = batch.count;
     let n_specs = col_specs.len();
-    let npc = schema.num_columns as usize - 1;
     let pki = schema.pk_index as usize;
     let mb = batch.as_mem_batch();
     let w_map = build_w_map(num_workers);
@@ -404,7 +414,7 @@ pub fn op_multi_scatter(
         }
 
         let mut results: Vec<Vec<Batch>> = (0..n_specs)
-            .map(|_| (0..num_workers).map(|_| Batch::empty(npc, 16)).collect())
+            .map(|_| (0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect())
             .collect();
 
         for si in 0..n_specs {
