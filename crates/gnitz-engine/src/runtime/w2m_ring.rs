@@ -111,7 +111,8 @@ pub const SKIP_MARKER: u64 = u64::MAX;
 /// 72      4     reader_seq             AtomicU32  (M parks via FUTEX_WAITV)
 /// 76      4     _pad_a
 /// 80      8     capacity               u64        (immutable)
-/// 88     40     _pad_consumer
+/// 88      8     consume_cursor         AtomicU64  (M owns; free-space sentinel)
+/// 96     32     _pad_consumer
 /// ---------------------------------------------
 /// 128+          data region
 /// ```
@@ -138,7 +139,8 @@ pub struct W2mRingHeader {
     reader_seq: AtomicU32,
     _pad_a: u32,
     capacity: u64,
-    _pad_consumer: [u8; 40],
+    consume_cursor: AtomicU64,
+    _pad_consumer: [u8; 32],
 }
 
 const _: () = assert!(std::mem::size_of::<W2mRingHeader>() == W2M_HEADER_SIZE);
@@ -163,6 +165,13 @@ impl W2mRingHeader {
     pub fn write_cursor(&self) -> &AtomicU64 { &self.write_cursor }
     #[inline]
     pub fn read_cursor(&self) -> &AtomicU64 { &self.read_cursor }
+    #[inline]
+    pub fn consume_cursor(&self) -> &AtomicU64 { &self.consume_cursor }
+    #[inline]
+    pub fn advance_read_cursors(&self, new_rc: u64) {
+        self.read_cursor().store(new_rc, Ordering::Release);
+        self.consume_cursor().store(new_rc, Ordering::Release);
+    }
     #[inline]
     pub fn writer_seq(&self) -> &AtomicU32 { &self.writer_seq }
     #[inline]
@@ -208,6 +217,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     hdr.read_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
+    hdr.consume_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     // capacity is a plain u64 — not atomic — so write it through the
     // raw pointer to avoid forming a &mut reference to the shared
     // struct (which would violate the `&'static Self` aliasing model
@@ -362,9 +372,9 @@ pub(crate) unsafe fn try_reserve(
     let total = (8 + align8(sz)) as u64;
     let cap = hdr.capacity;
     let vwc = hdr.write_cursor.load(Ordering::Acquire);
-    let vrc = hdr.read_cursor.load(Ordering::Acquire);
+    let vcc = hdr.consume_cursor().load(Ordering::Acquire);
 
-    if !room_for(vwc, vrc, total, cap) {
+    if !room_for(vwc, vcc, total, cap) {
         return TryReserve::Full;
     }
 
@@ -413,6 +423,7 @@ pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     hdr.read_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
+    hdr.consume_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     write_u64_raw(ptr, 80, capacity);
 }
 
@@ -430,8 +441,8 @@ pub(crate) unsafe fn has_room(hdr: &W2mRingHeader, sz: usize) -> bool {
     let total = (8 + align8(sz)) as u64;
     let cap = hdr.capacity;
     let vwc = hdr.write_cursor.load(Ordering::Acquire);
-    let vrc = hdr.read_cursor.load(Ordering::Acquire);
-    room_for(vwc, vrc, total, cap)
+    let vcc = hdr.consume_cursor().load(Ordering::Acquire);
+    room_for(vwc, vcc, total, cap)
 }
 
 /// Commit a previously-returned `Reservation`: Release-store the new
@@ -564,7 +575,7 @@ mod tests {
     ) -> Option<(*const u8, u32)> {
         let rc = hdr.read_cursor().load(Ordering::Acquire);
         let (p, sz, new_rc) = try_consume(hdr, ptr, rc)?;
-        hdr.read_cursor().store(new_rc, Ordering::Release);
+        hdr.advance_read_cursors(new_rc);
         Some((p, sz))
     }
 
@@ -673,7 +684,7 @@ mod tests {
                 let (_data_ptr, sz, new_rc) = try_consume(hdr, ptr, rc)
                     .expect("tag consume");
                 assert_eq!(sz, msg_sz as u32);
-                hdr.read_cursor().store(new_rc, Ordering::Release);
+                hdr.advance_read_cursors(new_rc);
                 rc = new_rc;
             }
             // After two publish+consume, wc == rc. Third publish
@@ -725,7 +736,7 @@ mod tests {
             let mut rc = W2M_HEADER_SIZE as u64;
             for _ in 0..2 {
                 let (_, _, new_rc) = try_consume(hdr, ptr, rc).expect("consume");
-                hdr.read_cursor().store(new_rc, Ordering::Release);
+                hdr.advance_read_cursors(new_rc);
                 rc = new_rc;
             }
 
@@ -747,7 +758,7 @@ mod tests {
             let (_, sz_a, new_rc) = try_consume(hdr, ptr, rc)
                 .expect("pre-SKIP big");
             assert_eq!(sz_a, big_sz as u32);
-            hdr.read_cursor().store(new_rc, Ordering::Release);
+            hdr.advance_read_cursors(new_rc);
 
             let (_, sz_b, _) = try_consume(hdr, ptr, new_rc)
                 .expect("wrapped big via SKIP");
@@ -873,7 +884,7 @@ mod tests {
                 // Consume, then publish, keeping rc 1-behind.
                 let (_, _sz, new_rc) = try_consume(hdr, ptr, rc)
                     .expect("cycle consume");
-                hdr.read_cursor().store(new_rc, Ordering::Release);
+                hdr.advance_read_cursors(new_rc);
                 rc = new_rc;
                 match try_publish(hdr, ptr, msg_sz, |_| {}) {
                     TryPublish::Ok(_) => {}
@@ -884,7 +895,7 @@ mod tests {
             loop {
                 match try_consume(hdr, ptr, rc) {
                     Some((_, _, new_rc)) => {
-                        hdr.read_cursor().store(new_rc, Ordering::Release);
+                        hdr.advance_read_cursors(new_rc);
                         rc = new_rc;
                     }
                     None => break,
@@ -947,7 +958,7 @@ mod tests {
                     .expect("consume");
                 assert_eq!(sz as usize, msg_sz);
                 received.push(*data_ptr);
-                hdr.read_cursor().store(new_rc, Ordering::Release);
+                hdr.advance_read_cursors(new_rc);
                 rc = new_rc;
             }
             assert_eq!(received, vec![1, 2, 3]);
@@ -963,7 +974,7 @@ mod tests {
                         .expect("drain to make room");
                     assert_eq!(sz as usize, msg_sz);
                     received.push(*data_ptr);
-                    hdr.read_cursor().store(new_rc, Ordering::Release);
+                    hdr.advance_read_cursors(new_rc);
                     rc = new_rc;
                     assert!(publish(tag),
                         "publish #{} after drain", tag);
@@ -976,7 +987,7 @@ mod tests {
                     Some((data_ptr, sz, new_rc)) => {
                         assert_eq!(sz as usize, msg_sz);
                         received.push(*data_ptr);
-                        hdr.read_cursor().store(new_rc, Ordering::Release);
+                        hdr.advance_read_cursors(new_rc);
                         rc = new_rc;
                     }
                     None => break,
@@ -1036,6 +1047,48 @@ mod tests {
             assert_eq!(sz, 32);
             let data = std::slice::from_raw_parts(p, 32);
             assert!(data.iter().all(|&b| b == 0x77));
+            free_region(ptr, size);
+        }
+    }
+
+    /// Verifies that advancing `consume_cursor` unblocks `try_reserve` backpressure.
+    #[test]
+    fn test_consume_cursor_tracks_read_cursor() {
+        unsafe {
+            let msg_sz = 1 << 16; // 64 KiB
+            let msg_total = (8 + align8(msg_sz)) as u64;
+            let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
+            let size = capacity as usize;
+            let ptr = alloc_region(size);
+            init_region_raw(ptr, capacity);
+            let hdr = W2mRingHeader::from_raw(ptr);
+
+            for _ in 0..2 {
+                match try_publish(hdr, ptr, msg_sz, |_| {}) {
+                    TryPublish::Ok(_) => {}
+                    TryPublish::Full => panic!("fill publish"),
+                }
+            }
+            match try_publish(hdr, ptr, msg_sz, |_| {}) {
+                TryPublish::Full => {}
+                TryPublish::Ok(_) => panic!("ring must be Full"),
+            }
+
+            assert_eq!(hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64);
+            assert_eq!(hdr.read_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64);
+
+            let cursor = hdr.read_cursor().load(Ordering::Acquire);
+            let (_, _, new_rc) = try_consume(hdr, ptr, cursor).expect("must have message");
+            hdr.advance_read_cursors(new_rc);
+
+            assert_eq!(hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64 + msg_total);
+            assert_eq!(hdr.read_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64 + msg_total);
+
+            match try_publish(hdr, ptr, msg_sz, |_| {}) {
+                TryPublish::Ok(_) => {}
+                TryPublish::Full => panic!("must have room after consume_cursor advance"),
+            }
+
             free_region(ptr, size);
         }
     }

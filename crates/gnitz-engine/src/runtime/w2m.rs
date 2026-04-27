@@ -107,7 +107,7 @@ impl W2mReceiver {
             f(slot)
         };
 
-        hdr.read_cursor().store(new_rc, Ordering::Release);
+        hdr.advance_read_cursors(new_rc);
         hdr.writer_seq().fetch_add(1, Ordering::Release);
         if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
             let _ = ipc_sys::futex_wake_u32(
