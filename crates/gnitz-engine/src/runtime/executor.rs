@@ -40,18 +40,6 @@ const FLAG_SEEK: u64               = 128;
 const FLAG_SEEK_BY_INDEX: u64      = 256;
 const FLAG_ALLOCATE_INDEX_ID: u64  = 512;
 
-/// Send+Sync wrapper so raw pointers can cross the `Waker` boundary.
-/// The master process is single-threaded; this is a compile-time
-/// shim, not runtime sharing.
-#[derive(Clone, Copy)]
-struct DispPtr(*mut MasterDispatcher);
-unsafe impl Send for DispPtr {}
-unsafe impl Sync for DispPtr {}
-#[derive(Clone, Copy)]
-struct CatPtr(*mut CatalogEngine);
-unsafe impl Send for CatPtr {}
-unsafe impl Sync for CatPtr {}
-
 /// One tick request to `tick_loop_async`.
 pub enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
@@ -68,8 +56,8 @@ pub enum TickTrigger {
 /// Shared executor state held by every task.
 pub struct Shared {
     pub reactor: Rc<Reactor>,
-    catalog: CatPtr,
-    dispatcher: DispPtr,
+    catalog: *mut CatalogEngine,
+    dispatcher: *mut MasterDispatcher,
     sal_fd: i32,
     committer_tx: mpsc::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
@@ -94,9 +82,9 @@ pub struct Shared {
 
 impl Shared {
     #[allow(clippy::mut_from_ref)]
-    fn cat(&self) -> &mut CatalogEngine { unsafe { &mut *self.catalog.0 } }
+    fn cat(&self) -> &mut CatalogEngine { unsafe { &mut *self.catalog } }
     #[allow(clippy::mut_from_ref)]
-    fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.dispatcher.0 } }
+    fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.dispatcher } }
 
     fn get_schema_desc(&self, target_id: i64) -> SchemaDescriptor {
         self.cat().get_schema_desc(target_id)
@@ -206,8 +194,8 @@ impl ServerExecutor {
         });
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
-            catalog: CatPtr(catalog),
-            dispatcher: DispPtr(dispatcher),
+            catalog,
+            dispatcher,
             sal_fd,
             committer_tx,
             catalog_rwlock: Rc::new(AsyncRwLock::new()),
@@ -378,7 +366,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
     let snapshot_lsn = shared.ingest_lsn.get();
-    let nw = unsafe { (*shared.dispatcher.0).num_workers() };
+    let nw = unsafe { (*shared.dispatcher).num_workers() };
 
     // Allocate every (tid, worker) req_id up front so the SAL emission
     // sequence is fully prepared before we take any locks.
@@ -390,7 +378,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     let _sal_excl = shared.sal_writer_excl.lock().await;
 
     let emit_err = guard_panic("tick", || unsafe {
-        let disp = &mut *shared.dispatcher.0;
+        let disp = &mut *shared.dispatcher;
         for (i, &tid) in tids.iter().enumerate() {
             let lsn = disp.next_lsn();
             disp.write_tick_group(tid, lsn, &req_ids[i])?;
@@ -437,7 +425,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         let prep = {
             let _cat = shared.catalog_rwlock.read().await;
             match guard_panic("prepare_relay", || unsafe {
-                (*shared.dispatcher.0).prepare_relay(relay)
+                (*shared.dispatcher).prepare_relay(relay)
             }) {
                 Ok(p) => p,
                 Err(e) => { gnitz_warn!("prepare_relay: {}", e); continue; }
@@ -447,7 +435,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         {
             let _sal = shared.sal_writer_excl.lock().await;
             if let Err(e) = guard_panic("emit_relay", || unsafe {
-                (*shared.dispatcher.0).emit_relay(prep)
+                (*shared.dispatcher).emit_relay(prep)
             }) {
                 gnitz_warn!("emit_relay failed: {}", e);
             }
@@ -560,7 +548,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
 
         // Local (catalog-resident) unique-index validation. Wrapped per V.4
         // so a malformed batch can't crash the server.
-        let cat_ptr_raw = shared.catalog.0;
+        let cat_ptr_raw = shared.catalog;
         if let Err(e) = guard_panic("validate", || unsafe {
             (*cat_ptr_raw).validate_unique_indices(target_id, &batch)
         }) {
@@ -569,7 +557,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         }
         // Distributed validation (FK / unique indices + UPSERT).
         if let Err(e) = MasterDispatcher::validate_all_distributed_async(
-            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, &batch, mode,
         ).await {
             send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
@@ -617,11 +605,11 @@ async fn handle_seek(
     let schema = shared.get_schema_desc(target_id);
     let result = if target_id >= FIRST_USER_TABLE_ID {
         MasterDispatcher::fan_out_seek_async(
-            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, pk,
         ).await
     } else {
-        let cat_ptr = shared.catalog.0;
+        let cat_ptr = shared.catalog;
         unsafe { (*cat_ptr).seek_family(target_id, pk) }
     };
     match result {
@@ -642,12 +630,12 @@ async fn handle_seek_by_index(
     let schema = shared.get_schema_desc(target_id);
     let result = if target_id >= FIRST_USER_TABLE_ID {
         let r = MasterDispatcher::fan_out_seek_by_index_async(
-            shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl,
+            shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, col_idx, key,
         ).await;
         r
     } else {
-        let cat_ptr = shared.catalog.0;
+        let cat_ptr = shared.catalog;
         unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key) }
     };
     match result {
@@ -686,7 +674,7 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher.0, &shared.reactor, &shared.sal_writer_excl, target_id,
+        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id,
     ).await;
     match result {
         Ok(batch) => {
@@ -710,7 +698,7 @@ async fn handle_system_dml(
     // Empty SCAN for system tables — no DDL, no lock needed.
     if !non_empty {
         let _g = shared.catalog_rwlock.read().await;
-        let cat_ptr = shared.catalog.0;
+        let cat_ptr = shared.catalog;
         match guard_panic("scan", || unsafe { (*cat_ptr).scan_family(target_id) }) {
             Ok(b) => {
                 let batch_ref = if b.count > 0 { Some(b) } else { None };
@@ -734,7 +722,7 @@ async fn handle_system_dml(
     let batch = batch.unwrap();
     let t_mut_start = Instant::now();
 
-    let cat_ptr_raw = shared.catalog.0;
+    let cat_ptr_raw = shared.catalog;
     // Discard any stale queue entries from a prior failed DDL so they don't
     // piggyback on this one.
     let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
@@ -769,7 +757,7 @@ async fn handle_system_dml(
     let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
     let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
-        let disp_ptr_raw = shared.dispatcher.0;
+        let disp_ptr_raw = shared.dispatcher;
         // All broadcasts in the zone share `zone_lsn`. The trailing
         // commit sentinel marks the zone durably closed; recovery
         // applies the zone's groups only when the sentinel is on disk.
