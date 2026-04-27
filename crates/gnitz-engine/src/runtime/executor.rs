@@ -16,7 +16,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
@@ -677,9 +676,8 @@ async fn handle_scan(
         shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id,
     ).await;
     match result {
-        Ok(batch) => {
-            let arc = batch.map(Arc::new);
-            send_ok_response(shared, fd, target_id, arc.as_deref(), client_id, &schema, lsn as u128).await;
+        Ok(batches) => {
+            send_ok_response_multi(shared, fd, target_id, &batches, client_id, &schema, lsn as u128).await;
         }
         Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }
@@ -849,6 +847,38 @@ async fn send_ok_response(
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
         schema, Some(schema_block.as_slice()), seek_pk,
+    );
+    let rc = shared.reactor.send_buffer(fd, buf).await;
+    if rc < 0 { shared.reactor.close_fd(fd); }
+}
+
+fn encode_response_buffer_multi(
+    target_id: i64, client_id: u64,
+    batches: &[Batch], schema: &SchemaDescriptor,
+    prebuilt_schema: Option<&[u8]>, seek_pk: u128,
+) -> Vec<u8> {
+    let sz = ipc::wire_size_multi(STATUS_OK, b"", Some(schema), batches, prebuilt_schema);
+    let total = 4 + sz;
+    let mut buf: Vec<u8> = vec![0; total];
+    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
+    let written = ipc::encode_wire_into_multi(
+        &mut buf[4..total], 0,
+        target_id as u64, client_id, 0, seek_pk, 0, 0,
+        STATUS_OK, b"", Some(schema), batches, prebuilt_schema,
+    );
+    debug_assert_eq!(written, sz);
+    buf
+}
+
+async fn send_ok_response_multi(
+    shared: &Rc<Shared>, fd: i32, target_id: i64,
+    batches: &[Batch], client_id: u64,
+    schema: &SchemaDescriptor, seek_pk: u128,
+) {
+    let schema_block = shared.get_schema_wire_block(target_id);
+    let buf = encode_response_buffer_multi(
+        target_id, client_id, batches, schema,
+        Some(schema_block.as_slice()), seek_pk,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }

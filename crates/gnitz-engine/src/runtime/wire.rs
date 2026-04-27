@@ -224,6 +224,7 @@ pub(crate) fn encode_ctrl_block_ipc(
     request_id: u64,
     status: u32,
     error_msg: &[u8],
+    checksum: bool,
 ) -> usize {
     use gnitz_wire::control as ctrl;
     let cs = CONTROL_SCHEMA_DESC;
@@ -247,7 +248,7 @@ pub(crate) fn encode_ctrl_block_ipc(
     };
     b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
     b.count = 1;
-    b.encode_to_wire(IPC_CONTROL_TID, out, offset, false)
+    b.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum)
 }
 
 /// Compute total encoded wire size without allocating.
@@ -376,6 +377,94 @@ pub fn encode_wire_into_ipc(
     )
 }
 
+/// Like `wire_size` but for multi-batch scan responses. No `col_names` parameter;
+/// always pass `prebuilt_schema_block` for the hot SCAN path.
+pub fn wire_size_multi(
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    batches: &[Batch],
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    let has_data = batches.iter().any(|b| b.count > 0);
+    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+
+    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+        error_msg.len()
+    } else { 0 };
+    let mut total = schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob);
+
+    if has_schema {
+        if let Some(prebuilt) = prebuilt_schema_block {
+            total += prebuilt.len();
+        } else {
+            let s = schema.unwrap();
+            let ncols = s.num_columns as usize;
+            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, 0);
+        }
+    }
+
+    if has_data {
+        total += crate::storage::wire_byte_size_multi(batches);
+    }
+    total
+}
+
+/// Encode a full wire response carrying multiple scan batches as one data block.
+/// Returns bytes written.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_wire_into_multi(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    request_id: u64,
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    batches: &[Batch],
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    let has_data = batches.iter().any(|b| b.count > 0);
+    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+
+    let mut wire_flags = flags;
+    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
+    if has_data {
+        wire_flags |= FLAG_HAS_DATA;
+        let (all_sorted, all_consolidated) = batches.iter()
+            .fold((true, true), |(s, c), b| (s && b.sorted, c && b.consolidated));
+        if all_sorted { wire_flags |= FLAG_BATCH_SORTED; }
+        if all_consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
+    }
+
+    let written = encode_ctrl_block_ipc(out, offset, target_id, client_id, wire_flags,
+                                        seek_pk, seek_col_idx, request_id, status, error_msg, true);
+    let mut pos = offset + written;
+
+    if has_schema {
+        if let Some(prebuilt) = prebuilt_schema_block {
+            let end = pos + prebuilt.len();
+            out[pos..end].copy_from_slice(prebuilt);
+            pos = end;
+        } else {
+            let schema_batch = schema_to_batch(schema.unwrap(), &[]);
+            let written = schema_batch.encode_to_wire(target_id as u32, out, pos, true);
+            pos += written;
+        }
+    }
+
+    if has_data {
+        let written = crate::storage::encode_multi_to_wire(batches, target_id as u32, out, pos, true);
+        pos += written;
+    }
+
+    pos - offset
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_wire_into_impl(
     out: &mut [u8],
@@ -406,32 +495,8 @@ fn encode_wire_into_impl(
         if b.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
     }
 
-    let ctrl_batch = {
-        use gnitz_wire::control as ctrl;
-        let cs = CONTROL_SCHEMA_DESC;
-        let mut b = Batch::with_schema(cs, 1);
-        let has_error = !error_msg.is_empty();
-        let null_word: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
-        b.extend_pk(0u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&null_word.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_STATUS,       &(status as u64).to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_CLIENT_ID,    &client_id.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_TARGET_ID,    &target_id.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_FLAGS,        &wire_flags.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_SEEK_PK,      &seek_pk.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_SEEK_COL_IDX, &seek_col_idx.to_le_bytes());
-        b.extend_col(ctrl::PAYLOAD_REQUEST_ID,   &request_id.to_le_bytes());
-        let error_st = if has_error {
-            encode_german_string(error_msg, &mut b.blob)
-        } else {
-            [0u8; 16]
-        };
-        b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
-        b.count = 1;
-        b
-    };
-    let written = ctrl_batch.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum);
+    let written = encode_ctrl_block_ipc(out, offset, target_id, client_id, wire_flags,
+                                        seek_pk, seek_col_idx, request_id, status, error_msg, checksum);
     let mut pos = offset + written;
 
     if has_schema {

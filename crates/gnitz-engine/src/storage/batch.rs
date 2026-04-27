@@ -1501,6 +1501,175 @@ pub fn write_to_batch(
     }
 }
 
+/// Byte count of the WAL block needed to encode `batches` as one combined data block.
+pub fn wire_byte_size_multi(batches: &[Batch]) -> usize {
+    let first = match batches.iter().find(|b| b.count > 0) {
+        Some(b) => b,
+        None => {
+            if batches.is_empty() { return 0; }
+            let b = &batches[0];
+            let nr = b.num_regions_total();
+            return super::wal::block_size(nr, &[0u32; MAX_BATCH_REGIONS + 1][..nr]);
+        }
+    };
+    let nr = first.num_regions_total();
+    let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+    for batch in batches {
+        for i in 0..nr {
+            sizes[i] += batch.region_size(i) as u32;
+        }
+    }
+    super::wal::block_size(nr, &sizes[..nr])
+}
+
+/// Encode `batches` into one WAL-format data block at `out[offset..]`.
+///
+/// STRING payload columns have their long-string blob offsets adjusted per
+/// batch so offsets are correct in the concatenated output blob.
+/// Short strings (≤ SHORT_STRING_THRESHOLD bytes) are copied verbatim.
+/// Returns bytes written.
+pub fn encode_multi_to_wire(
+    batches: &[Batch],
+    table_id: u32,
+    out: &mut [u8],
+    offset: usize,
+    checksum: bool,
+) -> usize {
+    use crate::util::{align8, write_u32_le, write_u64_le};
+    use crate::schema::SHORT_STRING_THRESHOLD;
+
+    let first = match batches.iter().find(|b| b.count > 0) {
+        Some(b) => b,
+        None => {
+            if batches.is_empty() { return 0; }
+            let b = &batches[0];
+            let nr = b.num_regions_total();
+            let ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
+            let sizes = [0u32; MAX_BATCH_REGIONS + 1];
+            return super::wal::encode(out, offset, 0, table_id, 0,
+                &ptrs[..nr], &sizes[..nr], 0, checksum)
+                .expect("WAL encode failed") - offset;
+        }
+    };
+
+    let nr = first.num_regions_total();
+    let npc = first.num_payload_cols();
+    let blob_idx = REG_PAYLOAD_START + npc;
+
+    let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+    let mut total_count: u32 = 0;
+    for batch in batches {
+        total_count += batch.count as u32;
+        for i in 0..nr {
+            sizes[i] += batch.region_size(i) as u32;
+        }
+    }
+    let total_blob: u64 = sizes[blob_idx] as u64;
+
+    let total_block_size = super::wal::block_size(nr, &sizes[..nr]);
+    assert!(
+        offset + total_block_size <= out.len(),
+        "encode_multi_to_wire: buffer too small ({} + {} > {})",
+        offset, total_block_size, out.len()
+    );
+
+    let block = &mut out[offset..offset + total_block_size];
+    block[..super::wal::HEADER_SIZE].fill(0);
+
+    let dir_size = nr * 8;
+    let mut positions = [0usize; MAX_BATCH_REGIONS + 1];
+    let mut pos = super::wal::HEADER_SIZE + dir_size;
+    for i in 0..nr {
+        pos = align8(pos);
+        positions[i] = pos;
+        let dir_off = super::wal::HEADER_SIZE + i * 8;
+        write_u32_le(block, dir_off, pos as u32);
+        write_u32_le(block, dir_off + 4, sizes[i]);
+        pos += sizes[i] as usize;
+    }
+
+    let mut is_string = [false; MAX_BATCH_REGIONS + 1];
+    if let Some(ref schema) = first.schema {
+        for (pi, _ci, col) in schema.payload_columns() {
+            if col.type_code == crate::schema::type_code::STRING && col.size == 16 {
+                is_string[REG_PAYLOAD_START + pi] = true;
+            }
+        }
+    }
+
+    for i in 0..nr {
+        let mut dst_pos = positions[i];
+
+        if i == blob_idx {
+            for batch in batches {
+                let len = batch.blob.len();
+                if len > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            batch.blob.as_ptr(),
+                            block[dst_pos..].as_mut_ptr(),
+                            len,
+                        );
+                    }
+                    dst_pos += len;
+                }
+            }
+        } else if is_string[i] {
+            let mut cum_blob: u64 = 0;
+            for batch in batches {
+                let n = batch.count;
+                if n > 0 {
+                    let base = batch.offsets[i] as usize;
+                    for row in 0..n {
+                        let src_off = base + row * 16;
+                        let src = &batch.data[src_off..src_off + 16];
+                        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+                        block[dst_pos..dst_pos + 8].copy_from_slice(&src[0..8]);
+                        if length > SHORT_STRING_THRESHOLD {
+                            let old_off = u64::from_le_bytes(src[8..16].try_into().unwrap());
+                            block[dst_pos + 8..dst_pos + 16]
+                                .copy_from_slice(&(old_off + cum_blob).to_le_bytes());
+                        } else {
+                            block[dst_pos + 8..dst_pos + 16].copy_from_slice(&src[8..16]);
+                        }
+                        dst_pos += 16;
+                    }
+                }
+                cum_blob += batch.blob.len() as u64;
+            }
+        } else {
+            for batch in batches {
+                let sz = batch.region_size(i);
+                if sz > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            batch.region_ptr(i),
+                            block[dst_pos..].as_mut_ptr(),
+                            sz,
+                        );
+                    }
+                    dst_pos += sz;
+                }
+            }
+        }
+    }
+
+    write_u64_le(block, 0, 0u64); // lsn placeholder; not meaningful on wire
+    write_u32_le(block, 8, table_id);
+    write_u32_le(block, 12, total_count);
+    write_u32_le(block, 16, total_block_size as u32);
+    write_u32_le(block, 20, super::wal::FORMAT_VERSION);
+    write_u32_le(block, 32, nr as u32);
+    write_u64_le(block, 40, total_blob);
+
+    if checksum && total_block_size > super::wal::HEADER_SIZE {
+        let cs = crate::xxh::checksum(&block[super::wal::HEADER_SIZE..total_block_size]);
+        write_u64_le(block, 24, cs);
+    }
+
+    total_block_size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

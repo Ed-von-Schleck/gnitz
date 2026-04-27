@@ -718,7 +718,7 @@ impl SalWriter {
                 slot, 0,
                 target_id as u64, 0, wire_flags,
                 seek_pk, seek_col_idx, req_ids[w],
-                STATUS_OK, b"",
+                STATUS_OK, b"", false,
             );
 
             off += align8(wsz);

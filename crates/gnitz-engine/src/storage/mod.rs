@@ -27,7 +27,7 @@ mod error;
 pub use table::Table;
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_arena_size};
 pub use read_cursor::CursorHandle;
-pub use batch::{Batch, ConsolidatedBatch, write_to_batch};
+pub use batch::{Batch, ConsolidatedBatch, write_to_batch, encode_multi_to_wire, wire_byte_size_multi};
 pub use merge::{MemBatch, scatter_copy};
 pub use error::StorageError;
 

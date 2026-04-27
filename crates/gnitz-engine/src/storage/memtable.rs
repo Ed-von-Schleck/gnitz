@@ -526,13 +526,11 @@ mod tests {
         mt.upsert_sorted_batch(b1).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
+        let dir_cstr = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
         let dirfd = unsafe {
-            libc::open(
-                dir.path().as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-            )
+            libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
         };
-        assert!(dirfd >= 0);
+        assert!(dirfd >= 0, "open({:?}) failed: {}", dir.path(), std::io::Error::last_os_error());
 
         let name = std::ffi::CString::new("test_shard.db").unwrap();
         let wrote = mt.flush(dirfd, &name, 42, false).unwrap();
@@ -551,13 +549,11 @@ mod tests {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
         let dir = tempfile::tempdir().unwrap();
+        let dir_cstr = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
         let dirfd = unsafe {
-            libc::open(
-                dir.path().as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-            )
+            libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
         };
-        assert!(dirfd >= 0);
+        assert!(dirfd >= 0, "open({:?}) failed: {}", dir.path(), std::io::Error::last_os_error());
 
         let name = std::ffi::CString::new("empty.db").unwrap();
         let wrote = mt.flush(dirfd, &name, 42, false).unwrap();

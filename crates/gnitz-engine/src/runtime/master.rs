@@ -680,8 +680,7 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
-    ) -> Result<Option<Batch>, String> {
-        let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
+    ) -> Result<Vec<Batch>, String> {
         let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
@@ -693,19 +692,10 @@ impl MasterDispatcher {
         if let Some(e) = first_worker_error("scan", &decoded_vec) {
             return Err(e);
         }
-        let total_rows: usize = decoded_vec.iter()
-            .filter_map(|d| d.data_batch.as_ref())
-            .map(|b| b.count)
-            .sum();
-        let mut out = Batch::with_schema(schema, total_rows.max(1));
-        for decoded in &decoded_vec {
-            if let Some(ref batch) = decoded.data_batch {
-                if batch.count > 0 {
-                    out.append_batch(batch, 0, batch.count);
-                }
-            }
-        }
-        if out.count == 0 { Ok(None) } else { Ok(Some(out)) }
+        Ok(decoded_vec.into_iter()
+            .filter_map(|d| d.data_batch)
+            .filter(|b| b.count > 0)
+            .collect())
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
