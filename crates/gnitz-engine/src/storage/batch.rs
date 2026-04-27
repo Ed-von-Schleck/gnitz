@@ -724,24 +724,6 @@ impl Batch {
         })
     }
 
-    /// Produce region pointer/size arrays for `Table::ingest_batch_from_regions`.
-    pub fn to_region_ptrs(&self) -> (Vec<*const u8>, Vec<u32>) {
-        let npc = self.num_payload_cols();
-        // 3 fixed regions + npc payload regions + 1 blob region.
-        let cap = REG_PAYLOAD_START + npc + 1;
-        let mut ptrs = Vec::with_capacity(cap);
-        let mut sizes = Vec::with_capacity(cap);
-        for i in 0..REG_PAYLOAD_START + npc {
-            let off = self.offsets[i] as usize;
-            let len = self.count * self.strides[i] as usize;
-            ptrs.push(self.data[off..].as_ptr());
-            sizes.push(len as u32);
-        }
-        ptrs.push(self.blob.as_ptr());
-        sizes.push(self.blob.len() as u32);
-        (ptrs, sizes)
-    }
-
     /// Clone all buffers into a new independent Batch.
     /// 2 allocations (data + blob) instead of N+7.
     #[allow(clippy::uninit_vec, clippy::needless_range_loop)]

@@ -187,9 +187,7 @@ pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 
 pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
     if batch.count == 0 { return; }
-    let npc = batch.num_payload_cols();
-    let (ptrs, sizes) = batch.to_region_ptrs();
-    let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+    let _ = table.ingest_owned_batch(batch.clone_batch());
 }
 
 /// Flush a system table, surfacing the error with a contextual message.

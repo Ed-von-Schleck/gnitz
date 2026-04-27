@@ -159,13 +159,13 @@ pub fn op_integrate_with_indexes(
         return Ok(());
     }
 
-    // Phase 1: ingest into target table
+    // `reduce` for non-group-by-PK aggregates may emit retract+insert pairs
+    // that are physically unsorted while claiming `consolidated = true`.
     if let Some(table) = target_table {
-        let regions = batch.regions();
-        let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
-        let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
-        let npc = input_schema.num_columns as usize - 1;
-        table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc)?;
+        let mut cloned = batch.clone_batch();
+        cloned.sorted = false;
+        cloned.consolidated = false;
+        table.ingest_owned_batch_memonly(cloned)?;
     }
 
     let mb = batch.as_mem_batch();
@@ -205,14 +205,7 @@ pub fn op_integrate_with_indexes(
 
         if gi_batch.count > 0 {
             let gi_table = unsafe { &mut *gi_desc.table };
-            let gi_schema = gi_table.schema();
-            let regions = gi_batch.regions();
-            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
-            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
-            let _ = gi_table.ingest_batch_memonly_from_regions(
-                &ptrs, &sizes, gi_batch.count as u32,
-                gi_schema.num_columns as usize - 1,
-            );
+            let _ = gi_table.ingest_owned_batch_memonly(gi_batch);
         }
     }
 
@@ -257,14 +250,7 @@ pub fn op_integrate_with_indexes(
                 gnitz_debug!("  avi[{}]: pk={:#034x} w={}", i, pk, w);
             }
             let avi_table = unsafe { &mut *avi_desc.table };
-            let avi_schema = avi_table.schema();
-            let regions = avi_batch.regions();
-            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
-            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
-            let _ = avi_table.ingest_batch_memonly_from_regions(
-                &ptrs, &sizes, avi_batch.count as u32,
-                avi_schema.num_columns as usize - 1,
-            );
+            let _ = avi_table.ingest_owned_batch_memonly(avi_batch);
         }
     }
 

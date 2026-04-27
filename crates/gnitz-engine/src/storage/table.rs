@@ -107,10 +107,6 @@ impl Table {
         Ok(table)
     }
 
-    pub fn schema(&self) -> &SchemaDescriptor {
-        &self.schema
-    }
-
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
@@ -118,95 +114,42 @@ impl Table {
     /// Ingest an already-constructed Batch into the memtable.
     /// Used by PartitionedTable after hash-routing.
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+        self.upsert_owned_and_maybe_flush(batch, false)
+    }
+
+    /// Ingest an already-constructed Batch without WAL (worker DDL sync /
+    /// memonly index population). Forces ephemeral flushes on overflow.
+    pub fn ingest_owned_batch_memonly(&mut self, batch: Batch) -> Result<(), StorageError> {
+        self.upsert_owned_and_maybe_flush(batch, true)
+    }
+
+    fn upsert_owned_and_maybe_flush(
+        &mut self,
+        batch: Batch,
+        force_ephemeral: bool,
+    ) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
-        let consolidated = batch.into_consolidated(&self.schema);
         self.found_source = FoundSource::None;
 
-        if self.durable {
+        let durable = !force_ephemeral && self.durable;
+        if durable {
             self.current_lsn += 1;
         }
 
+        let consolidated = batch.into_consolidated(&self.schema);
         if self.memtable.should_flush() {
-            self.flush()?;
+            self.flush_inner(durable)?;
         }
         // The should_flush() pre-check above ensures runs_bytes is either 0
         // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
         // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
         self.memtable.upsert_sorted_batch(consolidated)?;
         if self.memtable.should_flush() {
-            self.flush()?;
+            self.flush_inner(durable)?;
         }
         Ok(())
-    }
-
-    /// Ingest a pre-sorted batch into the memtable.
-    pub fn ingest_batch_from_regions(
-        &mut self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-    ) -> Result<(), StorageError> {
-        if count == 0 {
-            return Ok(());
-        }
-        self.found_source = FoundSource::None;
-
-        if self.durable {
-            self.current_lsn += 1;
-        }
-
-        self.upsert_and_maybe_flush(ptrs, sizes, count, num_payload_cols, false)
-    }
-
-    /// Ingest without WAL (worker DDL sync path).  Uses ephemeral flush on overflow.
-    pub fn ingest_batch_memonly_from_regions(
-        &mut self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-    ) -> Result<(), StorageError> {
-        if count == 0 {
-            return Ok(());
-        }
-        self.found_source = FoundSource::None;
-        self.upsert_and_maybe_flush(ptrs, sizes, count, num_payload_cols, true)
-    }
-
-    fn upsert_and_maybe_flush(
-        &mut self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-        force_ephemeral: bool,
-    ) -> Result<(), StorageError> {
-        let batch = unsafe {
-            Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
-        };
-        let consolidated = batch.into_consolidated(&self.schema);
-        let durable = !force_ephemeral && self.durable;
-        match self.memtable.upsert_sorted_batch(consolidated) {
-            Ok(()) => {
-                if self.memtable.should_flush() {
-                    self.flush_inner(durable)?;
-                }
-                Ok(())
-            }
-            Err(StorageError::Capacity) => {
-                self.flush_inner(durable)?;
-                let batch2 = unsafe {
-                    Batch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
-                };
-                let consolidated2 = batch2.into_consolidated(&self.schema);
-                self.memtable.upsert_sorted_batch(consolidated2)?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     }
 
     // ------------------------------------------------------------------
@@ -579,27 +522,25 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_regions(rows: &[(u64, i64, i64)]) -> (Vec<*const u8>, Vec<u32>, u32) {
-        let n = rows.len();
-        let pk: Vec<u8> = rows.iter().flat_map(|r| r.0.to_le_bytes()).collect();
-        let weight: Vec<u8> = rows.iter().flat_map(|r| r.1.to_le_bytes()).collect();
-        let null_bmp: Vec<u8> = vec![0u8; n * 8];
-        let col0: Vec<u8> = rows.iter().flat_map(|r| r.2.to_le_bytes()).collect();
-        let blob: Vec<u8> = Vec::new();
-
-        // Leak the vecs so pointers remain valid for the test
-        let pk = pk.into_boxed_slice(); let pk_ptr = pk.as_ptr(); std::mem::forget(pk);
-        let weight = weight.into_boxed_slice(); let weight_ptr = weight.as_ptr(); std::mem::forget(weight);
-        let null_bmp = null_bmp.into_boxed_slice(); let null_bmp_ptr = null_bmp.as_ptr(); std::mem::forget(null_bmp);
-        let col0 = col0.into_boxed_slice(); let col0_ptr = col0.as_ptr(); std::mem::forget(col0);
-        let blob = blob.into_boxed_slice(); let blob_ptr = blob.as_ptr(); std::mem::forget(blob);
-
-        let ptrs = vec![pk_ptr, weight_ptr, null_bmp_ptr, col0_ptr, blob_ptr];
-        let sizes = vec![
-            (n * 8) as u32, (n * 8) as u32, (n * 8) as u32,
-            (n * 8) as u32, 0u32,
-        ];
-        (ptrs, sizes, n as u32)
+    /// Build an unsorted owned `Batch` of (pk, weight, val_i64) rows for the
+    /// 2-column `make_u64_i64_schema` (U64 PK + I64 payload). Rows land in
+    /// the order given; `sorted` and `consolidated` are cleared so the
+    /// ingest path runs the canonical sort+fold.
+    fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
+        let schema = make_u64_i64_schema();
+        let mut batch = Batch::with_schema(schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            batch.extend_pk(pk as u128);
+            batch.extend_weight(&w.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &val.to_le_bytes());
+            batch.count += 1;
+        }
+        if !rows.is_empty() {
+            batch.sorted = false;
+            batch.consolidated = false;
+        }
+        batch
     }
 
     #[test]
@@ -614,8 +555,7 @@ mod tests {
 
         assert!(t.memtable_is_empty());
 
-        let (ptrs, sizes, count) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
         assert!(t.has_pk(10));
         assert!(t.has_pk(20));
@@ -640,8 +580,7 @@ mod tests {
             tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, true,
         ).unwrap();
 
-        let (ptrs, sizes, count) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         t.flush().unwrap();
 
         assert!(t.has_pk(10));
@@ -668,8 +607,7 @@ mod tests {
             tdir.to_str().unwrap(), "test", schema, 300, 1 << 20, false,
         ).unwrap();
 
-        let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)])).unwrap();
 
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
@@ -687,8 +625,7 @@ mod tests {
             tdir.to_str().unwrap(), "test", schema, 400, 1 << 20, false,
         ).unwrap();
 
-        let (ptrs, sizes, count) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
         let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
@@ -713,8 +650,7 @@ mod tests {
 
         // Create enough flushes to trigger compaction
         for i in 0..6u64 {
-            let (ptrs, sizes, count) = make_regions(&[(i * 10, 1, (i * 100) as i64)]);
-            t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+            t.ingest_owned_batch(make_batch(&[(i * 10, 1, (i * 100) as i64)])).unwrap();
             t.flush().unwrap();
         }
 
@@ -740,13 +676,11 @@ mod tests {
         ).unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
-        let (ptrs1, sizes1, count1) = make_regions(&[(10, 1, 100)]);
-        t.ingest_batch_from_regions(&ptrs1, &sizes1, count1, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
 
         // Batch 2: UPDATE delta — retract val=100, insert val=200
         // Rows sorted by (PK, payload): (-1 for val=100) before (+1 for val=200)
-        let (ptrs2, sizes2, count2) = make_regions(&[(10, -1, 100), (10, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs2, &sizes2, count2, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)])).unwrap();
 
         // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
         let (w, found) = t.retract_pk(10);
@@ -762,8 +696,8 @@ mod tests {
         assert_eq!(val, 200, "retract_pk must return the live (val=200) row, not the retracted val=100");
     }
 
-    /// `ingest_owned_batch` must sort the batch before WAL write and memtable
-    /// insert, even when the incoming Batch has sorted=false (reverse order).
+    /// `ingest_owned_batch` must sort the batch before memtable insert, even
+    /// when the incoming Batch has `sorted=false` (reverse order).
     #[test]
     fn test_ingest_owned_batch_unsorted() {
         let dir = tempfile::tempdir().unwrap();
@@ -774,10 +708,9 @@ mod tests {
             tdir.to_str().unwrap(), "test", schema, 700, 1 << 20, false,
         ).unwrap();
 
-        // Build a reverse-sorted batch (PK order: 30, 20, 10)
-        let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
-        let batch = unsafe { Batch::from_regions(&ptrs, &sizes, count as usize, 1) };
-        // from_regions sets sorted=false
+        // Build a reverse-sorted batch (PK order: 30, 20, 10).
+        let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
+        // make_batch produces an unsorted batch (sorted=false default).
         assert!(!batch.sorted);
 
         t.ingest_owned_batch(batch).unwrap();
@@ -788,34 +721,34 @@ mod tests {
         assert_eq!(cursor.cursor.current_key_lo(), 10, "cursor should start at PK=10 (smallest)");
     }
 
-    /// When upsert_and_maybe_flush hits ERR_CAPACITY and rebuilds batch2 from
-    /// raw regions, it must sort batch2 before the retry upsert.
+    /// `ingest_owned_batch` must pre-flush when the memtable is already
+    /// over its size budget, then accept the new batch (which itself may be
+    /// unsorted). Pre-fill the memtable past `max_bytes` directly, then
+    /// ingest a reverse-sorted batch and verify rows from both batches are
+    /// retrievable in ascending PK order.
     #[test]
-    fn test_upsert_capacity_retry_sorted() {
+    fn test_ingest_owned_batch_pre_flushes_when_overflowing() {
         let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("cap_retry_test");
+        let tdir = dir.path().join("pre_flush_test");
         let schema = make_u64_i64_schema();
 
-        // Very small arena: 40 bytes.  A 3-row batch (~120 bytes) will exceed it.
+        // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
         let mut t = Table::new(
             tdir.to_str().unwrap(), "test", schema, 900, 40, false,
         ).unwrap();
 
         // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
         // (bypasses auto-flush so runs_bytes exceeds max_bytes).
-        let (fill_ptrs, fill_sizes, fill_count) =
-            make_regions(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let fill_batch = unsafe {
-            Batch::from_regions(&fill_ptrs, &fill_sizes, fill_count as usize, 1)
-        };
+        let fill_batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let fill_batch = fill_batch.into_consolidated(&schema);
         t.memtable_upsert_sorted_batch(fill_batch).unwrap();
-        // runs_bytes (~120) > max_bytes (40) — next upsert will hit ERR_CAPACITY.
+        // runs_bytes (~120) > max_bytes (40) — next ingest must pre-flush
+        // before upsert. The new owned-batch path checks should_flush()
+        // before upserting, so the pre-fill goes to a shard cleanly.
 
-        // Ingest a REVERSE-sorted batch.  This hits ERR_CAPACITY → flush → retry.
-        // Fix 1d: the retry batch (batch2 from raw regions) must be sorted.
-        let (ptrs, sizes, count) = make_regions(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)]);
-        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+        // Ingest a REVERSE-sorted batch. ingest_owned_batch must sort it
+        // (via into_consolidated) before insert.
+        t.ingest_owned_batch(make_batch(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)])).unwrap();
 
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
         let cursor = t.create_cursor().unwrap();
@@ -836,13 +769,11 @@ mod tests {
         ).unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
-        let (ptrs1, sizes1, count1) = make_regions(&[(10, 1, 100)]);
-        t.ingest_batch_from_regions(&ptrs1, &sizes1, count1, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
         t.flush().unwrap();
 
         // Batch 2: UPDATE delta — retract val=100, insert val=200
-        let (ptrs2, sizes2, count2) = make_regions(&[(10, -1, 100), (10, 1, 200)]);
-        t.ingest_batch_from_regions(&ptrs2, &sizes2, count2, 1).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)])).unwrap();
         t.flush().unwrap();
 
         // Both batches are now in shards, memtable is empty.

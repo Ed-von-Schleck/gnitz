@@ -8,7 +8,6 @@ use std::sync::Arc;
 use crate::schema::SchemaDescriptor;
 use super::batch::Batch;
 use super::error::StorageError;
-use super::merge;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, Table};
@@ -65,34 +64,27 @@ impl PartitionedTable {
     // Ingest
     // ------------------------------------------------------------------
 
+    /// Ingest an already-constructed Batch (owned). Moves into tables[0]
+    /// directly for the single-partition case, scatters via a borrowed
+    /// `MemBatch` view otherwise.
     #[allow(clippy::needless_range_loop)]
-    pub fn ingest_batch_from_regions(
-        &mut self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-    ) -> Result<(), StorageError> {
-        if count == 0 || self.tables.is_empty() {
+    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+        if batch.count == 0 || self.tables.is_empty() {
             return Ok(());
         }
 
         if self.num_partitions == 1 {
-            return self.tables[0].ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols);
+            return self.tables[0].ingest_owned_batch(batch);
         }
 
-        let batch = unsafe {
-            merge::parse_single_batch_from_regions(ptrs, sizes, count as usize, num_payload_cols)
-        };
-
+        let mb = batch.as_mem_batch();
         let np = self.num_partitions as usize;
         let mut part_indices: Vec<Vec<u32>> = Vec::with_capacity(np);
         for _ in 0..np {
             part_indices.push(Vec::new());
         }
-
-        for i in 0..batch.count {
-            let p = partition_for_key(batch.get_pk(i));
+        for i in 0..mb.count {
+            let p = partition_for_key(mb.get_pk(i));
             part_indices[p].push(i as u32);
         }
 
@@ -108,11 +100,12 @@ impl PartitionedTable {
                 continue;
             }
             let sub_batch = Batch::from_indexed_rows(
-                &batch, &part_indices[p], &self.schema,
+                &mb, &part_indices[p], &self.schema,
             );
             self.tables[local].ingest_owned_batch(sub_batch)?;
         }
 
+        // `batch` drops here; its buffers return to batch_pool.
         Ok(())
     }
 
@@ -306,22 +299,23 @@ mod tests {
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
-    fn make_regions(rows: &[(u64, i64, i64)]) -> (Vec<*const u8>, Vec<u32>) {
-        let n = rows.len();
-        let pk: Vec<u8> = rows.iter()
-            .flat_map(|r| r.0.to_le_bytes())
-            .collect();
-        let weight: Vec<u8> = rows.iter().flat_map(|r| r.1.to_le_bytes()).collect();
-        let null_bmp: Vec<u8> = vec![0u8; n * 8];
-        let col0: Vec<u8> = rows.iter().flat_map(|r| r.2.to_le_bytes()).collect();
-        let blob: Vec<u8> = Vec::new();
-        let pk = pk.leak();
-        let weight = weight.leak(); let null_bmp = null_bmp.leak();
-        let col0 = col0.leak(); let blob = blob.leak();
-        (vec![pk.as_ptr(), weight.as_ptr(),
-              null_bmp.as_ptr(), col0.as_ptr(), blob.as_ptr()],
-         vec![(n*8) as u32, (n*8) as u32,
-              (n*8) as u32, (n*8) as u32, 0])
+    /// Build an unsorted owned `Batch` of (pk, weight, val_i64) rows
+    /// matching `make_schema` (U64 PK + I64 payload).
+    fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
+        let schema = make_schema();
+        let mut batch = Batch::with_schema(schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            batch.extend_pk(pk as u128);
+            batch.extend_weight(&w.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &val.to_le_bytes());
+            batch.count += 1;
+        }
+        if !rows.is_empty() {
+            batch.sorted = false;
+            batch.consolidated = false;
+        }
+        batch
     }
 
     #[test]
@@ -335,8 +329,7 @@ mod tests {
             partition_arena_size(1),
         ).unwrap();
 
-        let (ptrs, sizes) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
-        pt.ingest_batch_from_regions(&ptrs, &sizes, 2, 1).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         assert!(pt.has_pk(10));
         assert!(pt.has_pk(20));
         assert!(!pt.has_pk(99));
@@ -356,8 +349,7 @@ mod tests {
         ).unwrap();
 
         let rows: Vec<(u64, i64, i64)> = (0..100).map(|i| (i * 7 + 13, 1, (i * 100) as i64)).collect();
-        let (ptrs, sizes) = make_regions(&rows);
-        pt.ingest_batch_from_regions(&ptrs, &sizes, rows.len() as u32, 1).unwrap();
+        pt.ingest_owned_batch(make_batch(&rows)).unwrap();
 
         for &(pk, _, _) in &rows {
             assert!(pt.has_pk(pk as u128), "PK {} not found", pk);
@@ -376,8 +368,7 @@ mod tests {
             partition_arena_size(256),
         ).unwrap();
 
-        let (ptrs, sizes) = make_regions(&[(30, 1, 300), (10, 1, 100), (20, 1, 200), (40, 1, 400)]);
-        pt.ingest_batch_from_regions(&ptrs, &sizes, 4, 1).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200), (40, 1, 400)])).unwrap();
 
         let cursor = pt.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
@@ -395,8 +386,7 @@ mod tests {
             partition_arena_size(256),
         ).unwrap();
 
-        let (ptrs, sizes) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
-        pt.ingest_batch_from_regions(&ptrs, &sizes, 2, 1).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
         let (w, found) = pt.retract_pk(10);
         assert_eq!(w, 1);

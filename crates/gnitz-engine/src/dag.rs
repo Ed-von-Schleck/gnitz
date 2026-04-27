@@ -121,23 +121,20 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched durable ingest.
-    pub fn ingest_batch_from_regions(
-        &self,
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: u32,
-        num_payload_cols: usize,
-    ) -> Result<(), StorageError> {
+    /// Dispatched durable ingest of an already-owned `Batch`. Skips the
+    /// regions memcpy round-trip; moves the batch directly into the
+    /// storage layer (zero-copy for single-partition stores; one
+    /// MemBatch-borrowed scatter for multi-partition).
+    pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
         unsafe {
             match self {
-                StoreHandle::Single(t) => (*(std::ptr::addr_of!(**t) as *mut Table))
-                    .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols),
-                StoreHandle::Borrowed(ptr) => (**ptr)
-                    .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols),
+                StoreHandle::Single(t) => {
+                    (*(std::ptr::addr_of!(**t) as *mut Table)).ingest_owned_batch(batch)
+                }
+                StoreHandle::Borrowed(ptr) => (**ptr).ingest_owned_batch(batch),
                 StoreHandle::Partitioned(pt) => {
                     (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable))
-                        .ingest_batch_from_regions(ptrs, sizes, count, num_payload_cols)
+                        .ingest_owned_batch(batch)
                 }
             }
         }
@@ -909,36 +906,8 @@ impl DagEngine {
 
         let schema = entry.schema;
 
-        // Stage 2: ingest into store
-        let npc = batch.num_payload_cols();
-        let (ptrs, sizes) = batch.to_region_ptrs();
         let entry = self.tables.get_mut(&table_id).unwrap();
-        match &mut entry.handle {
-            StoreHandle::Single(t) => {
-                let _ = t.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-            StoreHandle::Borrowed(ptr) => {
-                let table = unsafe { &mut **ptr };
-                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-            StoreHandle::Partitioned(pt) => {
-                let _ = pt.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-            }
-        }
-
-        // Stage 3: index projection
-        for ic in &mut entry.index_circuits {
-            let idx_batch = Self::batch_project_index(
-                batch, ic.col_idx, &schema, &ic.index_schema,
-            );
-            if idx_batch.count > 0 {
-                let idx_npc = idx_batch.num_payload_cols();
-                let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
-                let _ = ic.index_table.ingest_batch_from_regions(
-                    &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
-                );
-            }
-        }
+        Self::ingest_store_and_indices(entry, &schema, batch);
 
         0
     }
@@ -980,37 +949,28 @@ impl DagEngine {
 
         let entry = self.tables.get_mut(&table_id).unwrap();
 
-        // Stage 2: ingest into store
-        let npc = effective_batch.num_payload_cols();
-        let (ptrs, sizes) = effective_batch.to_region_ptrs();
-        match &mut entry.handle {
-            StoreHandle::Single(t) => {
-                let _ = t.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-            StoreHandle::Borrowed(ptr) => {
-                let table = unsafe { &mut **ptr };
-                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-            StoreHandle::Partitioned(pt) => {
-                let _ = pt.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-        }
-
-        // Stage 3: index projection
-        for ic in &mut entry.index_circuits {
-            let idx_batch = Self::batch_project_index(
-                &effective_batch, ic.col_idx, &schema, &ic.index_schema,
-            );
-            if idx_batch.count > 0 {
-                let idx_npc = idx_batch.num_payload_cols();
-                let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
-                let _ = ic.index_table.ingest_batch_from_regions(
-                    &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
-                );
-            }
-        }
+        Self::ingest_store_and_indices(entry, &schema, &effective_batch);
 
         (0, Some(effective_batch))
+    }
+
+    /// Project all index batches from `source`, ingest a clone into the store,
+    /// then drain the projected index batches into their respective index tables.
+    /// Shared by `ingest_by_ref` and `ingest_returning_effective`.
+    fn ingest_store_and_indices(
+        entry: &mut TableEntry,
+        schema: &SchemaDescriptor,
+        source: &Batch,
+    ) {
+        let index_batches: Vec<Batch> = entry.index_circuits.iter()
+            .map(|ic| Self::batch_project_index(source, ic.col_idx, schema, &ic.index_schema))
+            .collect();
+        let _ = entry.handle.ingest_owned_batch(source.clone_batch());
+        for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
+            if idx_batch.count > 0 {
+                let _ = ic.index_table.ingest_owned_batch(idx_batch);
+            }
+        }
     }
 
     /// Flush a table's WAL.  Returns 0 on success, -1 on missing table or

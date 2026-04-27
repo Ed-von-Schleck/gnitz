@@ -312,14 +312,12 @@ impl CatalogEngine {
         if table_id >= FIRST_USER_TABLE_ID {
             return Err("ddl_sync only for system tables".into());
         }
+        // Fire hooks first (borrow only); the ingest below moves `batch`.
+        // Hooks have no observable ordering dependency on the storage write.
+        self.fire_hooks(table_id, &batch)?;
         let table = self.sys_table_mut(table_id)
             .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
-        // Memonly ingest (no WAL)
-        let npc = batch.num_payload_cols();
-        let (ptrs, sizes) = batch.to_region_ptrs();
-        let _ = table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc);
-        // Fire hooks to update registry
-        self.fire_hooks(table_id, &batch)?;
+        let _ = table.ingest_owned_batch_memonly(batch);
         Ok(())
     }
 
@@ -327,9 +325,7 @@ impl CatalogEngine {
     pub fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
-        let npc = batch.num_payload_cols();
-        let (ptrs, sizes) = batch.to_region_ptrs();
-        let _ = entry.handle.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+        let _ = entry.handle.ingest_owned_batch(batch);
         Ok(())
     }
 

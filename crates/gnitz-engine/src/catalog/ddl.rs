@@ -478,10 +478,8 @@ impl CatalogEngine {
             }
         }
 
-        let npc = projected.num_payload_cols();
-        let (ptrs, sizes) = projected.to_region_ptrs();
         let table = unsafe { &mut *idx_table };
-        let _ = table.ingest_batch_from_regions(&ptrs, &sizes, projected.count as u32, npc);
+        let _ = table.ingest_owned_batch(projected);
         Ok(())
     }
 

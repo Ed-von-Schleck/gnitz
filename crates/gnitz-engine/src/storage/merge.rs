@@ -672,41 +672,6 @@ pub fn sort_only(
     }
 }
 
-/// Parse a single batch from flat region arrays.
-///
-/// Region layout: pk, weight, null_bmp,
-/// payload_col_0 .. payload_col_{N-1}, blob.
-pub unsafe fn parse_single_batch_from_regions<'a>(
-    in_ptrs: &[*const u8],
-    in_sizes: &[u32],
-    count: usize,
-    num_payload_cols: usize,
-) -> MemBatch<'a> {
-    let pk = std::slice::from_raw_parts(in_ptrs[0], in_sizes[0] as usize);
-    let pk_stride = if count > 0 { (in_sizes[0] as usize / count) as u8 } else { 16 };
-    let weight = std::slice::from_raw_parts(in_ptrs[1], in_sizes[1] as usize);
-    let null_bmp = std::slice::from_raw_parts(in_ptrs[2], in_sizes[2] as usize);
-
-    let mut col_data = Vec::with_capacity(num_payload_cols);
-    for ci in 0..num_payload_cols {
-        let ri = 3 + ci;
-        col_data.push(std::slice::from_raw_parts(in_ptrs[ri], in_sizes[ri] as usize));
-    }
-
-    let blob_ri = 3 + num_payload_cols;
-    let blob = std::slice::from_raw_parts(in_ptrs[blob_ri], in_sizes[blob_ri] as usize);
-
-    MemBatch {
-        pk,
-        pk_stride,
-        weight,
-        null_bmp,
-        col_data,
-        blob,
-        count,
-    }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
