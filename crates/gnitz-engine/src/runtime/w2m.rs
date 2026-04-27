@@ -61,7 +61,7 @@ impl W2mWriter {
                 );
                 encode_fn(slice);
             }
-            w2m_ring::commit(hdr, &reservation);
+            w2m_ring::commit(hdr, reservation);
         }
 
         hdr.reader_seq().fetch_add(1, Ordering::Release);

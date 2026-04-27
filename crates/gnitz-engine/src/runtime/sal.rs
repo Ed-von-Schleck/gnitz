@@ -178,6 +178,7 @@ pub(crate) struct SalWriteResult {
 
 /// Handle returned by `sal_begin_group`. Header and per-worker directory
 /// are already written; caller fills per-worker data, then calls `commit()`.
+#[must_use = "SalGroup must be passed to commit(); dropping it leaves the SAL sentinel unwritten"]
 pub(crate) struct SalGroup {
     sal_ptr: *mut u8,
     hdr_off: usize,
@@ -185,6 +186,13 @@ pub(crate) struct SalGroup {
     total: usize,
     payload_size: usize,
     mmap_size: usize,
+    committed: bool,
+}
+
+impl Drop for SalGroup {
+    fn drop(&mut self) {
+        debug_assert!(self.committed, "SalGroup dropped without commit — SAL sentinel never written");
+    }
 }
 
 impl SalGroup {
@@ -193,10 +201,12 @@ impl SalGroup {
         self.sal_ptr.add(self.hdr_off + offset)
     }
 
-    pub(crate) unsafe fn commit(self) -> u64 {
+    pub(crate) unsafe fn commit(mut self) -> u64 {
         sal_write_sentinel(self.sal_ptr, self.base + self.total, self.mmap_size);
         atomic_store_u64(self.sal_ptr.add(self.base), self.payload_size as u64);
-        (self.base + self.total) as u64
+        let cursor = (self.base + self.total) as u64;
+        self.committed = true;
+        cursor
     }
 }
 
@@ -251,7 +261,7 @@ pub(crate) unsafe fn sal_begin_group(
         }
     }
 
-    Some(SalGroup { sal_ptr, hdr_off, base, total, payload_size, mmap_size })
+    Some(SalGroup { sal_ptr, hdr_off, base, total, payload_size, mmap_size, committed: false })
 }
 
 /// Write a message group into the SAL for N workers (test helper).

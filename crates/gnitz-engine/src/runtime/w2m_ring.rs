@@ -263,22 +263,30 @@ pub enum TryPublish {
 /// cursor value to commit via `commit`. `reserve` does NOT update
 /// `write_cursor` — the producer must call `commit` after filling the
 /// slot so the consumer's Acquire pairing sees the populated payload.
+#[must_use = "Reservation must be passed to commit(); dropping it silently corrupts the ring"]
 pub struct Reservation {
     /// Raw mutable pointer to where the caller encodes the message
     /// payload (past the 8-byte size prefix that `reserve` has
     /// already stamped).
-    pub slot_ptr: *mut u8,
+    pub(crate) slot_ptr: *mut u8,
     /// Slice length in bytes (exactly `sz` from the original call).
-    pub slot_len: usize,
+    pub(crate) slot_len: usize,
     /// New (virtual) `write_cursor` value to store on commit.
-    pub new_wc: u64,
+    pub(crate) new_wc: u64,
     /// True if a SKIP wrap occurred; commit increments
     /// `writer_wrap_count`.
-    pub wrapped: bool,
+    pub(crate) wrapped: bool,
+    committed: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        debug_assert!(self.committed, "Reservation dropped without commit — ring corruption");
+    }
 }
 
 /// Outcome of `reserve`.
-pub enum TryReserve {
+pub(crate) enum TryReserve {
     Ok(Reservation),
     Full,
 }
@@ -318,8 +326,9 @@ pub unsafe fn try_publish(
                 let slice = std::slice::from_raw_parts_mut(r.slot_ptr, r.slot_len);
                 encode(slice);
             }
-            commit(hdr, &r);
-            TryPublish::Ok(r.new_wc)
+            let new_wc = r.new_wc;
+            commit(hdr, r);
+            TryPublish::Ok(new_wc)
         }
         TryReserve::Full => TryPublish::Full,
     }
@@ -340,7 +349,7 @@ pub unsafe fn try_publish(
 /// # Safety
 /// Same preconditions as `try_publish`. The caller must not interleave
 /// reserves; each `reserve` must pair with exactly one `commit`.
-pub unsafe fn try_reserve(
+pub(crate) unsafe fn try_reserve(
     hdr: &W2mRingHeader,
     data_base: *mut u8,
     sz: usize,
@@ -371,6 +380,7 @@ pub unsafe fn try_reserve(
             slot_len: sz,
             new_wc: vwc + total,
             wrapped: false,
+            committed: false,
         })
     } else {
         // SKIP-wrap: pad with a SKIP marker, publish at HEADER.
@@ -383,6 +393,7 @@ pub unsafe fn try_reserve(
             slot_len: sz,
             new_wc: vwc + pad + total,
             wrapped: true,
+            committed: false,
         })
     }
 }
@@ -412,7 +423,7 @@ pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
 ///
 /// # Safety
 /// `hdr` must be a valid, initialized W2M ring header.
-pub unsafe fn has_room(hdr: &W2mRingHeader, sz: usize) -> bool {
+pub(crate) unsafe fn has_room(hdr: &W2mRingHeader, sz: usize) -> bool {
     if (sz as u64) > MAX_W2M_MSG {
         return false;
     }
@@ -425,14 +436,14 @@ pub unsafe fn has_room(hdr: &W2mRingHeader, sz: usize) -> bool {
 
 /// Commit a previously-returned `Reservation`: Release-store the new
 /// `write_cursor` and bump `writer_wrap_count` if the reservation
-/// wrapped.
+/// wrapped. Consumes the reservation to enforce single-commit.
 ///
 /// # Safety
 /// `r` must be the result of a `try_reserve` call against the same
 /// `hdr`, with the caller having fully written into the returned slot
-/// since. Calling `commit` twice or skipping the encode step leaves
-/// the ring in an inconsistent state.
-pub unsafe fn commit(hdr: &W2mRingHeader, r: &Reservation) {
+/// since. Skipping the encode step leaves the ring in an inconsistent
+/// state.
+pub(crate) unsafe fn commit(hdr: &W2mRingHeader, mut r: Reservation) {
     debug_assert!(
         r.new_wc > hdr.write_cursor.load(Ordering::Relaxed),
         "commit must monotonically advance write_cursor: new_wc={} cur={}",
@@ -442,6 +453,7 @@ pub unsafe fn commit(hdr: &W2mRingHeader, r: &Reservation) {
     if r.wrapped {
         hdr.writer_wrap_count.fetch_add(1, Ordering::Relaxed);
     }
+    r.committed = true;
 }
 
 /// Try to read the next message from the ring.
