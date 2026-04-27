@@ -284,7 +284,7 @@ impl WorkerProcess {
         }
         self.read_cursor = new_cursor;
         Some((
-            SalMessageKind::classify(msg.flags),
+            msg.kind,
             msg.target_id as i64,
             msg.wire_data,
         ))

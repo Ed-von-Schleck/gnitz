@@ -619,6 +619,7 @@ impl SalWriter {
 
 pub struct SalMessage<'a> {
     pub lsn: u64,
+    pub kind: SalMessageKind,
     pub flags: u32,
     pub target_id: u32,
     pub epoch: u32,
@@ -657,6 +658,7 @@ impl SalReader {
         Some((
             SalMessage {
                 lsn: result.lsn,
+                kind: SalMessageKind::classify(result.flags),
                 flags: result.flags,
                 target_id: result.target_id,
                 epoch: result.epoch,

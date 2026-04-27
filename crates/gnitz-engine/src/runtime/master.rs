@@ -23,6 +23,8 @@ use crate::ops::{
     worker_for_partition,
 };
 
+const FLAGS_PUSH_CONFLICT_MODE: u32 = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
+
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
 // ---------------------------------------------------------------------------
@@ -1452,7 +1454,7 @@ impl MasterDispatcher {
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
         self.write_group_with_req_ids(
-            target_id, lsn, FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT, &refs,
+            target_id, lsn, FLAGS_PUSH_CONFLICT_MODE, &refs,
             &schema, &col_names, 0, mode.as_u8() as u64, req_ids, -1,
         )
     }
