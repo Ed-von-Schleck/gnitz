@@ -42,6 +42,101 @@ pub const FLAG_FLUSH: u32               = 16384;
 pub const FLAG_TXN_COMMIT: u32          = 32768;
 
 // ---------------------------------------------------------------------------
+// SalMessageKind — receive-side classification of a SAL group's flag bits.
+//
+// Master-side encoding still uses raw FLAG_* writes (master.rs) and the
+// reactor only reads one bit (reactor/mod.rs). This enum is consumed by
+// the worker dispatch loop to give the compiler an exhaustiveness check
+// over every kind of message the worker can observe. Add a new variant
+// here whenever a new dispatch arm is added on the worker side.
+// ---------------------------------------------------------------------------
+
+/// Classification of a SAL group's flag bits, used by the worker to
+/// dispatch. Mutually exclusive: every well-formed SAL group classifies
+/// into exactly one variant.
+///
+/// `Scan` is the default when no kind-specific flag is set; the worker
+/// answers with a full table scan. `FLAG_CHECKPOINT` is intentionally
+/// absent — it is an ACK-only echo flag, never appears on a SAL group
+/// inbound to the worker. `FLAG_TXN_COMMIT` rides on top of
+/// `FLAG_DDL_SYNC` (zero-count sentinel); classification stops at
+/// `DdlSync` and the worker handles it as a no-op DDL_SYNC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SalMessageKind {
+    Shutdown,
+    Flush,
+    DdlSync,
+    ExchangeRelay,
+    PreloadedExchange,
+    Backfill,
+    HasPk,
+    Push,
+    Tick,
+    SeekByIndex,
+    Seek,
+    Scan,
+}
+
+impl SalMessageKind {
+    /// Classify a SAL group by its flag word.
+    ///
+    /// Priority order matches the worker's existing if-chain (see
+    /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
+    /// EXCHANGE_RELAY > PRELOADED_EXCHANGE > BACKFILL > HAS_PK >
+    /// PUSH > TICK > SEEK_BY_INDEX > SEEK > Scan. The first match wins.
+    pub fn classify(flags: u32) -> SalMessageKind {
+        if flags & FLAG_SHUTDOWN != 0           { return SalMessageKind::Shutdown; }
+        if flags & FLAG_FLUSH != 0              { return SalMessageKind::Flush; }
+        if flags & FLAG_DDL_SYNC != 0           { return SalMessageKind::DdlSync; }
+        if flags & FLAG_EXCHANGE_RELAY != 0     { return SalMessageKind::ExchangeRelay; }
+        if flags & FLAG_PRELOADED_EXCHANGE != 0 { return SalMessageKind::PreloadedExchange; }
+        if flags & FLAG_BACKFILL != 0           { return SalMessageKind::Backfill; }
+        if flags & FLAG_HAS_PK != 0             { return SalMessageKind::HasPk; }
+        if flags & FLAG_PUSH != 0               { return SalMessageKind::Push; }
+        if flags & FLAG_TICK != 0               { return SalMessageKind::Tick; }
+        if flags & FLAG_SEEK_BY_INDEX != 0      { return SalMessageKind::SeekByIndex; }
+        if flags & FLAG_SEEK != 0               { return SalMessageKind::Seek; }
+        SalMessageKind::Scan
+    }
+
+    /// True when the worker must act on the group even if its per-worker
+    /// data slot is empty (broadcast / control / data-rebroadcast kinds).
+    /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, ExchangeRelay) return
+    /// false: a missing slot means the message wasn't for us.
+    pub fn is_broadcast(self) -> bool {
+        matches!(
+            self,
+            SalMessageKind::Shutdown
+                | SalMessageKind::Flush
+                | SalMessageKind::DdlSync
+                | SalMessageKind::PreloadedExchange
+                | SalMessageKind::Backfill
+                | SalMessageKind::HasPk
+                | SalMessageKind::Push
+                | SalMessageKind::Tick
+        )
+    }
+
+    /// All variants in classification priority order. Used by tests that
+    /// walk every kind to exercise the dispatcher's full match.
+    #[allow(dead_code)]
+    pub const ALL: [SalMessageKind; 12] = [
+        SalMessageKind::Shutdown,
+        SalMessageKind::Flush,
+        SalMessageKind::DdlSync,
+        SalMessageKind::ExchangeRelay,
+        SalMessageKind::PreloadedExchange,
+        SalMessageKind::Backfill,
+        SalMessageKind::HasPk,
+        SalMessageKind::Push,
+        SalMessageKind::Tick,
+        SalMessageKind::SeekByIndex,
+        SalMessageKind::Seek,
+        SalMessageKind::Scan,
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Atomics (acquire/release for cross-process shared memory)
 // ---------------------------------------------------------------------------
 
