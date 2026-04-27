@@ -852,9 +852,11 @@ impl WorkerProcess {
                 let mut result = Batch::with_schema(schema, n);
                 if let Some(ref b) = batch {
                     let table = unsafe { &mut *index_handle };
+                    let mut blob_cache = HashMap::new();
                     for i in 0..n {
-                        let exists = table.has_pk(b.get_pk(i));
-                        result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+                        if table.has_pk(b.get_pk(i)) {
+                            result.append_row_from_source(b.get_pk(i), 1, b, i, &mut blob_cache);
+                        }
                     }
                 }
                 self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
@@ -865,13 +867,13 @@ impl WorkerProcess {
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
                 let mut result = Batch::with_schema(schema, n);
                 if let Some(ref b) = batch {
+                    let mut blob_cache = HashMap::new();
                     for i in 0..n {
-                        let exists = if let Some(pt_ptr) = ptable_handle {
-                            unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i))
-                        } else {
-                            false
-                        };
-                        result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
+                        let exists = ptable_handle
+                            .is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i)));
+                        if exists {
+                            result.append_row_from_source(b.get_pk(i), 1, b, i, &mut blob_cache);
+                        }
                     }
                 }
                 self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
@@ -1014,66 +1016,6 @@ enum DispatchResult {
     Error(String),
 }
 
-// ---------------------------------------------------------------------------
-// Batch helper: append_row_from_batch with specified weight
-// ---------------------------------------------------------------------------
-
-impl Batch {
-    /// Append a single row from another batch, with a caller-specified weight.
-    fn append_row_from_batch(&mut self, src: &Batch, row: usize, weight: i64) {
-        if row >= src.count { return; }
-        let pk = src.get_pk(row);
-        self.extend_pk(pk);
-        self.extend_weight(&weight.to_le_bytes());
-        let null_word = src.get_null_word(row);
-        self.extend_null_bmp(&null_word.to_le_bytes());
-
-        let schema = self.schema.unwrap_or_else(|| src.schema.unwrap());
-        for (pi, _ci, col_desc) in schema.payload_columns() {
-            let cs = col_desc.size as usize;
-            let is_null = (null_word >> pi) & 1 != 0;
-            if is_null {
-                self.fill_col_zero(pi, cs);
-            } else if col_desc.type_code == crate::schema::type_code::STRING {
-                let off = row * cs;
-                let src_slice = &src.col_data(pi)[off..off + cs];
-                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_slice);
-                if is_long {
-                    let length = u32::from_le_bytes(src_slice[0..4].try_into().unwrap()) as usize;
-                    let src_blob_ptr = if src.blob.is_empty() { std::ptr::null() } else { src.blob.as_ptr() };
-                    assert!(!src_blob_ptr.is_null(), "append_row_from_batch: long string but src blob is empty");
-                    let old_offset = u64::from_le_bytes(src_slice[8..16].try_into().unwrap()) as usize;
-                    let src_data = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(old_offset), length) };
-                    let new_offset = self.blob.len();
-                    self.blob.extend_from_slice(src_data);
-                    dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-                }
-                self.extend_col(pi, &dest);
-            } else {
-                let off = row * cs;
-                self.extend_col(pi, &src.col_data(pi)[off..off + cs]);
-            }
-        }
-        self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SchemaDescriptor Default impl (for empty schema fallback)
-// ---------------------------------------------------------------------------
-
-impl Default for SchemaDescriptor {
-    fn default() -> Self {
-        use crate::schema::SchemaColumn;
-        SchemaDescriptor {
-            num_columns: 0,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1379,47 +1321,6 @@ mod tests {
         unsafe {
             libc::munmap(region_ptr as *mut libc::c_void, region_size);
         }
-    }
-
-    #[test]
-    fn append_row_from_batch_copies_long_string_blob() {
-        use crate::schema::{SchemaColumn, type_code, encode_german_string, decode_german_string};
-        // Schema: pk (U64) + name (STRING, size=16).
-        let mut sd = SchemaDescriptor::default();
-        sd.num_columns = 2;
-        sd.pk_index = 0;
-        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
-        sd.columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
-
-        let long_name = b"this name is definitely longer than twelve bytes";
-
-        // Build source batch with a long string stored in src.blob.
-        let mut src = Batch::with_schema(sd, 1);
-        src.extend_pk(7u128);
-        src.extend_weight(&1i64.to_le_bytes());
-        src.extend_null_bmp(&0u64.to_le_bytes());
-        // payload column 0 = name (pi=0 in payload order)
-        let german = encode_german_string(long_name, &mut src.blob);
-        src.extend_col(0, &german);
-        src.count = 1;
-
-        // Destination batch: starts with an existing blob entry so the offset
-        // written into dest.blob is non-zero (verifies the offset is updated,
-        // not hard-coded to 0).
-        let mut dst = Batch::with_schema(sd, 1);
-        dst.blob.extend_from_slice(b"prefixdata"); // 10 bytes already in blob
-        dst.schema = Some(sd);
-
-        dst.append_row_from_batch(&src, 0, 2);
-
-        assert_eq!(dst.count, 1);
-        // The long string cell lives in col(0) of the payload (pi=0).
-        let cell = &dst.col_data(0)[0..16];
-        let decoded = decode_german_string(cell.try_into().unwrap(), &dst.blob);
-        assert_eq!(decoded, long_name, "blob content must round-trip through append_row_from_batch");
-        // The new blob offset must be >= 10 (after the prefix).
-        let new_offset = u64::from_le_bytes(cell[8..16].try_into().unwrap()) as usize;
-        assert!(new_offset >= 10, "blob offset should be past the pre-existing prefix data");
     }
 
     #[test]

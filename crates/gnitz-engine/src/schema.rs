@@ -74,6 +74,16 @@ impl SchemaDescriptor {
     }
 }
 
+impl Default for SchemaDescriptor {
+    fn default() -> Self {
+        SchemaDescriptor {
+            num_columns: 0,
+            pk_index: 0,
+            columns: [SchemaColumn::new(0, 0); MAX_COLUMNS],
+        }
+    }
+}
+
 pub(crate) const fn type_size(tc: u8) -> u8 {
     gnitz_wire::wire_stride(tc) as u8
 }

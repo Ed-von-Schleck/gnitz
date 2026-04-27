@@ -119,26 +119,8 @@ impl W2mReceiver {
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
-        #[allow(clippy::large_enum_variant)]
-        enum Outcome {
-            NoData(DecodedWire),
-            HasData(Vec<u8>),
-            BadWire,
-        }
-        let outcome = self.try_read_with(worker, |slot| match decode_wire(slot) {
-            Err(_) => Outcome::BadWire,
-            Ok(d) if d.data_batch.is_none() => Outcome::NoData(d),
-            Ok(_) => Outcome::HasData(slot.to_vec()),
-        })?;
-        match outcome {
-            Outcome::NoData(d) => Some(d),
-            Outcome::HasData(owned) => {
-                let mut d = decode_wire(&owned).ok()?;
-                d.batch_backing = Some(owned);
-                Some(d)
-            }
-            Outcome::BadWire => None,
-        }
+        self.try_read_with(worker, |slot| decode_wire(slot).ok())
+            .flatten()
     }
 
     pub fn wait_for(&self, worker: usize, timeout_ms: i32) -> i32 {

@@ -342,10 +342,8 @@ pub fn op_null_extend(
         out_columns[ci_out] = in_schema.columns[ci];
         ci_out += 1;
     }
-    let right_pk_index = right_schema.pk_index as usize;
-    for ci in 0..right_schema.num_columns as usize {
-        if ci == right_pk_index { continue; }
-        out_columns[ci_out] = right_schema.columns[ci];
+    for (_rpi, _ci, col) in right_schema.payload_columns() {
+        out_columns[ci_out] = *col;
         ci_out += 1;
     }
     let out_schema = SchemaDescriptor {

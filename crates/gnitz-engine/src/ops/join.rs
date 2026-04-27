@@ -410,13 +410,7 @@ fn write_left_payload(
     left_null: u64,
     left_schema: &SchemaDescriptor,
 ) {
-    let left_pk_index = left_schema.pk_index as usize;
-    let mut pi = 0;
-    for ci in 0..left_schema.num_columns as usize {
-        if ci == left_pk_index {
-            continue;
-        }
-        let col = &left_schema.columns[ci];
+    for (pi, _ci, col) in left_schema.payload_columns() {
         let cs = col.size as usize;
         let is_null = (left_null >> pi) & 1 != 0;
         if is_null {
@@ -424,10 +418,8 @@ fn write_left_payload(
         } else if col.type_code == TYPE_STRING {
             write_string_from_batch(output, pi, left_batch, left_row, pi);
         } else {
-            let src = left_batch.get_col_ptr(left_row, pi, cs);
-            output.extend_col(pi, src);
+            output.extend_col(pi, left_batch.get_col_ptr(left_row, pi, cs));
         }
-        pi += 1;
     }
 }
 
@@ -458,14 +450,8 @@ fn write_join_row(
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns (from cursor public API)
-    let right_pk_index = right_schema.pk_index as usize;
     let right_blob = right_cursor.blob_ptr();
-    let mut rpi = 0;
-    for ci in 0..right_schema.num_columns as usize {
-        if ci == right_pk_index {
-            continue;
-        }
-        let col = &right_schema.columns[ci];
+    for (rpi, ci, col) in right_schema.payload_columns() {
         let cs = col.size as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
@@ -493,7 +479,6 @@ fn write_join_row(
                 output.extend_col(out_pi, src);
             }
         }
-        rpi += 1;
     }
 
     output.count += 1;
@@ -527,17 +512,8 @@ fn write_join_row_null_right(
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns: all zeros (null)
-    let right_pk_index = right_schema.pk_index as usize;
-    let mut rpi = 0;
-    for ci in 0..right_schema.num_columns as usize {
-        if ci == right_pk_index {
-            continue;
-        }
-        let col = &right_schema.columns[ci];
-        let cs = col.size as usize;
-        let out_pi = left_npc + rpi;
-        output.fill_col_zero(out_pi, cs);
-        rpi += 1;
+    for (rpi, _ci, col) in right_schema.payload_columns() {
+        output.fill_col_zero(left_npc + rpi, col.size as usize);
     }
 
     output.count += 1;
@@ -811,28 +787,17 @@ fn write_join_row_from_batches(
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns (from right MemBatch)
-    let right_pk_index = right_schema.pk_index as usize;
-    let mut rpi = 0;
-    for ci in 0..right_schema.num_columns as usize {
-        if ci == right_pk_index {
-            continue;
-        }
-        let col = &right_schema.columns[ci];
+    for (rpi, _ci, col) in right_schema.payload_columns() {
         let cs = col.size as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
             output.fill_col_zero(out_pi, cs);
         } else if col.type_code == TYPE_STRING {
-            write_string_from_batch(
-                output, out_pi,
-                right_batch, right_row, rpi,
-            );
+            write_string_from_batch(output, out_pi, right_batch, right_row, rpi);
         } else {
-            let src = right_batch.get_col_ptr(right_row, rpi, cs);
-            output.extend_col(out_pi, src);
+            output.extend_col(out_pi, right_batch.get_col_ptr(right_row, rpi, cs));
         }
-        rpi += 1;
     }
 
     output.count += 1;

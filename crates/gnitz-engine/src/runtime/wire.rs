@@ -386,8 +386,6 @@ pub struct DecodedWire {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<Batch>,
-    /// Backing buffer keeping `data_batch`'s region pointers live (W2M path).
-    pub batch_backing: Option<Vec<u8>>,
 }
 
 /// Decode all control fields directly from the WAL block's directory without
@@ -619,5 +617,5 @@ fn decode_wire_impl(
         None
     };
 
-    Ok(DecodedWire { control, schema: wire_schema, data_batch, batch_backing: None })
+    Ok(DecodedWire { control, schema: wire_schema, data_batch })
 }

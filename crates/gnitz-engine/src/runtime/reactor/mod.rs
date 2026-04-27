@@ -2020,7 +2020,6 @@ mod tests {
             },
             schema: None,
             data_batch: None,
-            batch_backing: None,
         }
     }
 
@@ -2413,7 +2412,6 @@ mod tests {
             },
             schema: Some(SchemaDescriptor::minimal_u64()),
             data_batch: None,
-            batch_backing: None,
         }
     }
 

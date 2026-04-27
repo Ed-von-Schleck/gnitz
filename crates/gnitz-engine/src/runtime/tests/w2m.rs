@@ -210,8 +210,6 @@ fn test_w2m_control_only_reply_has_no_backing() {
     assert_eq!(decoded.control.request_id, 42);
     assert!(decoded.data_batch.is_none(),
         "control-only ACK must have no data_batch");
-    assert!(decoded.batch_backing.is_none(),
-        "control-only ACK must skip the heap-copy path");
 
     unsafe { libc::munmap(region as *mut libc::c_void, CAP); }
 }

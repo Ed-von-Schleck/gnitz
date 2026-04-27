@@ -475,15 +475,95 @@ pub fn scatter_copy(
     weights: &[i64],
     writer: &mut DirectWriter,
 ) {
-    let use_explicit_weights = !weights.is_empty();
-    for (i, &idx) in indices.iter().enumerate() {
-        let row = idx as usize;
-        let w = if use_explicit_weights {
-            weights[i]
+    if indices.is_empty() { return; }
+
+    if !weights.is_empty() {
+        // Explicit-weight path (consolidation merge): row-by-row with zero-weight skip.
+        for (i, &idx) in indices.iter().enumerate() {
+            let w = weights[i];
+            if w != 0 {
+                writer.write_row(batch, idx as usize, w);
+            }
+        }
+        return;
+    }
+
+    // Column-first scatter (repartition / join hot path).
+    // Input must not contain zero-weight rows — callers guarantee this.
+    #[cfg(debug_assertions)]
+    for &idx in indices {
+        debug_assert_ne!(
+            batch.get_weight(idx as usize), 0,
+            "scatter_copy: zero-weight row at index {idx} (filter before scatter)",
+        );
+    }
+    scatter_col_first(batch, indices, writer);
+}
+
+fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectWriter<'_>) {
+    let n = indices.len();
+    let base = writer.count; // first output row for this scatter
+
+    {
+        let stride = writer.pk_stride as usize;
+        let src = batch.pk;
+        let dst = &mut writer.pk[base * stride..];
+        match stride {
+            8  => gather_col::<8>(src, dst, indices),
+            _  => gather_col::<16>(src, dst, indices),
+        }
+    }
+
+    gather_col::<8>(batch.weight, &mut writer.weight[base * 8..], indices);
+    gather_col::<8>(batch.null_bmp, &mut writer.null_bmp[base * 8..], indices);
+
+    let schema = writer.schema;
+    for (pi, _ci, col) in schema.payload_columns() {
+        let cs = col.size as usize;
+        if col.type_code == TYPE_STRING {
+            // Blob relocation is sequential per-row; no way to batch.
+            for (out, &idx) in indices.iter().enumerate() {
+                writer.write_string(pi, batch, idx as usize, base + out);
+            }
+        } else if col.nullable != 0 {
+            // Nullable: skip null cells; destination is pre-zeroed by write_to_batch.
+            let src_col = batch.col_data[pi];
+            let dst_col = &mut writer.col_bufs[pi][base * cs..];
+            for (out, &idx) in indices.iter().enumerate() {
+                let row = idx as usize;
+                if (batch.get_null_word(row) >> pi) & 1 == 0 {
+                    dst_col[out * cs..][..cs].copy_from_slice(&src_col[row * cs..][..cs]);
+                }
+            }
         } else {
-            batch.get_weight(row)
-        };
-        writer.write_row(batch, row, w);
+            // Dispatch on cs so LLVM monomorphizes a tight loop for each stride.
+            let src_col = batch.col_data[pi];
+            let dst_col = &mut writer.col_bufs[pi][base * cs..];
+            match cs {
+                1  => gather_col::<1>(src_col, dst_col, indices),
+                2  => gather_col::<2>(src_col, dst_col, indices),
+                4  => gather_col::<4>(src_col, dst_col, indices),
+                8  => gather_col::<8>(src_col, dst_col, indices),
+                16 => gather_col::<16>(src_col, dst_col, indices),
+                _  => {
+                    for (out, &idx) in indices.iter().enumerate() {
+                        let i = idx as usize;
+                        dst_col[out * cs..][..cs].copy_from_slice(&src_col[i * cs..][..cs]);
+                    }
+                }
+            }
+        }
+    }
+
+    writer.count += n;
+}
+
+// `N` is a const so LLVM sees a fixed-width copy and emits optimal load/store code.
+#[inline(always)]
+fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
+    for (out, &idx) in indices.iter().enumerate() {
+        let i = idx as usize;
+        dst[out * N..][..N].copy_from_slice(&src[i * N..][..N]);
     }
 }
 

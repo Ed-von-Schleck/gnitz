@@ -106,7 +106,6 @@ mod tests {
             },
             schema: if with_schema { Some(SchemaDescriptor::minimal_u64()) } else { None },
             data_batch: None,
-            batch_backing: None,
         }
     }
 
