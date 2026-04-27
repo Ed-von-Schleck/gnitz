@@ -1714,6 +1714,58 @@ mod tests {
             "committer must complete after its ACK is delivered");
     }
 
+    /// Structural regression: the relay loop acquires `sal_writer_excl` for a
+    /// synchronous SAL write, then releases it at scope exit before awaiting
+    /// the next item from its channel.  If the guard leaked across that await,
+    /// a concurrent committer could never acquire the mutex and would deadlock.
+    #[test]
+    fn sal_writer_excl_not_held_across_relay_recv() {
+        let r = make_reactor();
+        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        // `next_rx` stands in for the relay's `rx.recv()` — the await that
+        // follows the SAL write scope.  `commit_tx` stands in for a concurrent
+        // committer that must be able to acquire the SAL lock while the relay
+        // task is parked on `next_rx.await`.
+        let (next_tx, next_rx) = oneshot::channel::<()>();
+        let (commit_tx, commit_rx) = oneshot::channel::<()>();
+        let relay_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        let commit_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        let m1 = Rc::clone(&mutex);
+        let rd = Rc::clone(&relay_done);
+        r.spawn(async move {
+            // Phase 2 of relay_loop: acquire lock, sync write, release.
+            {
+                let _sal = m1.lock().await;
+                // ...emit_relay would go here...
+            }
+            // Lock dropped. Now await the next relay item (rx.recv()).
+            let _ = next_rx.await;
+            rd.set(true);
+        });
+
+        let m2 = Rc::clone(&mutex);
+        let cd = Rc::clone(&commit_done);
+        r.spawn(async move {
+            // Committer: must be able to acquire the SAL lock while the relay
+            // task is parked waiting for its next item.  Once it can, it
+            // unblocks the relay by sending on `next_tx`.
+            let _sal = m2.lock().await;
+            cd.set(true);
+            let _ = commit_tx.send(());
+            let _ = next_tx.send(());
+        });
+
+        // commit_rx is unused — its role is to confirm the committer ran.
+        drop(commit_rx);
+
+        r.block_until_idle();
+        assert!(commit_done.get(),
+            "committer must have acquired the mutex while relay was parked");
+        assert!(relay_done.get(),
+            "relay must complete after being unblocked");
+    }
+
     #[test]
     fn async_rwlock_multiple_readers() {
         let r = make_reactor();
