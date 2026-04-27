@@ -120,7 +120,7 @@ pub fn build_schema_wire_block(
     let schema_batch = schema_to_batch(schema, col_names);
     let sz = schema_batch.wire_byte_size(target_tid);
     let mut block = vec![0u8; sz];
-    schema_batch.encode_to_wire(target_tid, &mut block, 0);
+    schema_batch.encode_to_wire(target_tid, &mut block, 0, true);
     block
 }
 
@@ -299,6 +299,58 @@ pub fn encode_wire_into(
     data_batch: Option<&Batch>,
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
+    encode_wire_into_impl(
+        out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
+        request_id, status, error_msg, schema, col_names, data_batch,
+        prebuilt_schema_block, true,
+    )
+}
+
+/// Like `encode_wire_into` but skips WAL block checksums.  Use for trusted
+/// intra-process IPC (W2M ring) where integrity is guaranteed by the OS
+/// shared-memory mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_wire_into_ipc(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    request_id: u64,
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    data_batch: Option<&Batch>,
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    encode_wire_into_impl(
+        out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
+        request_id, status, error_msg, schema, col_names, data_batch,
+        prebuilt_schema_block, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_wire_into_impl(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    request_id: u64,
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    data_batch: Option<&Batch>,
+    prebuilt_schema_block: Option<&[u8]>,
+    checksum: bool,
+) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
 
@@ -336,7 +388,7 @@ pub fn encode_wire_into(
         b.count = 1;
         b
     };
-    let written = ctrl_batch.encode_to_wire(IPC_CONTROL_TID, out, offset);
+    let written = ctrl_batch.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum);
     let mut pos = offset + written;
 
     if has_schema {
@@ -352,13 +404,13 @@ pub fn encode_wire_into(
             };
             let names = col_names.unwrap_or(&[]);
             let schema_batch = schema_to_batch(eff_schema, names);
-            let written = schema_batch.encode_to_wire(target_id as u32, out, pos);
+            let written = schema_batch.encode_to_wire(target_id as u32, out, pos, checksum);
             pos += written;
         }
     }
 
     if has_data {
-        let written = data_batch.unwrap().encode_to_wire(target_id as u32, out, pos);
+        let written = data_batch.unwrap().encode_to_wire(target_id as u32, out, pos, checksum);
         pos += written;
     }
 
@@ -485,8 +537,8 @@ fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
     true
 }
 
-fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
-    let (batch, _) = Batch::decode_from_wal_block(data, &META_SCHEMA_DESC)
+fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
+    let (batch, _) = Batch::decode_from_wal_block(data, &META_SCHEMA_DESC, verify_checksum)
         .map_err(|_| "schema block invalid")?;
     if batch.count == 0 { return Err("empty schema block"); }
     if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
@@ -541,17 +593,24 @@ pub fn peek_target_id(data: &[u8]) -> Result<i64, &'static str> {
 
 /// Decode a wire message using a caller-provided schema.
 pub fn decode_wire_with_schema(data: &[u8], schema: &SchemaDescriptor) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, Some(schema))
+    decode_wire_impl(data, Some(schema), true)
 }
 
 /// Decode a full IPC wire message from raw bytes.
 pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, None)
+    decode_wire_impl(data, None, true)
+}
+
+/// Like `decode_wire` but skips WAL block checksum verification.  Use for
+/// trusted intra-process IPC (W2M ring).
+pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
+    decode_wire_impl(data, None, false)
 }
 
 fn decode_wire_impl(
     data: &[u8],
     schema_hint: Option<&SchemaDescriptor>,
+    verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
     if data.len() < gnitz_wire::WAL_HEADER_SIZE {
         return Err("IPC payload too small");
@@ -586,7 +645,7 @@ fn decode_wire_impl(
         if off + schema_size > data.len() {
             return Err("schema block truncated");
         }
-        let parsed = decode_schema_block(&data[off..off + schema_size])?;
+        let parsed = decode_schema_block(&data[off..off + schema_size], verify_checksum)?;
         if let Some(hint) = schema_hint {
             if !schemas_layout_equal(&parsed, hint) {
                 return Err("schema mismatch: client schema differs from server schema");
@@ -609,7 +668,7 @@ fn decode_wire_impl(
         if off + data_size > data.len() {
             return Err("data block truncated");
         }
-        let (mut batch, _) = Batch::decode_from_wal_block(&data[off..off + data_size], eff_schema)?;
+        let (mut batch, _) = Batch::decode_from_wal_block(&data[off..off + data_size], eff_schema, verify_checksum)?;
         if (flags & FLAG_BATCH_SORTED) != 0 { batch.mark_sorted(); }
         if (flags & FLAG_BATCH_CONSOLIDATED) != 0 { batch.mark_consolidated(); }
         Some(batch)

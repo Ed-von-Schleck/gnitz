@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::runtime::sys as ipc_sys;
 use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED, TryReserve};
-use crate::runtime::wire::{decode_wire, DecodedWire};
+use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 
 /// Worker's write side of a single W2M ring.
 pub struct W2mWriter {
@@ -119,7 +119,7 @@ impl W2mReceiver {
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
-        self.try_read_with(worker, |slot| decode_wire(slot).ok())
+        self.try_read_with(worker, |slot| decode_wire_ipc(slot).ok())
             .flatten()
     }
 

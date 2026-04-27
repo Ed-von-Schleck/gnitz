@@ -1303,7 +1303,7 @@ impl Batch {
     }
 
     /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
-    pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
+    pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let nr_wire = self.num_regions_total();
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
         let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
@@ -1314,16 +1314,18 @@ impl Batch {
         let blob_size = self.blob.len() as u64;
         let new_offset = super::wal::encode(
             out, offset, 0, table_id, self.count as u32,
-            &ptrs[..nr_wire], &sizes[..nr_wire], blob_size,
+            &ptrs[..nr_wire], &sizes[..nr_wire], blob_size, checksum,
         ).expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
     /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
     /// Does not set sorted/consolidated — caller derives those from wire header flags.
+    /// Set `verify_checksum = false` for trusted IPC paths (W2M ring).
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
+        verify_checksum: bool,
     ) -> Result<(Self, usize), &'static str> {
         let npc = schema.num_columns as usize - 1;
         // V4: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + npc payload + blob
@@ -1339,7 +1341,7 @@ impl Batch {
 
         if super::wal::validate_and_parse(
             data, &mut lsn, &mut tid, &mut count, &mut num_regions,
-            &mut blob_size, &mut offsets, &mut sizes, 128,
+            &mut blob_size, &mut offsets, &mut sizes, 128, verify_checksum,
         ).is_err() {
             return Err("WAL block validation failed");
         }

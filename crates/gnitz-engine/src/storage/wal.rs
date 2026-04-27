@@ -49,6 +49,9 @@ pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 ///   [48B header][directory: num_regions * 8B][data regions, 8B-aligned]
 ///
 /// Directory entries store offsets relative to block start (not buffer start).
+///
+/// Set `checksum = false` for trusted IPC paths (W2M ring) to skip the XXH3
+/// computation.  Always use `true` for durable WAL writes and network responses.
 #[allow(clippy::too_many_arguments)]
 pub fn encode(
     out_buf: &mut [u8],
@@ -59,6 +62,7 @@ pub fn encode(
     region_ptrs: &[*const u8],
     region_sizes: &[u32],
     blob_size: u64,
+    checksum: bool,
 ) -> Result<usize, StorageError> {
     let num_regions = region_ptrs.len().min(region_sizes.len());
     let dir_size = num_regions * 8;
@@ -94,7 +98,7 @@ pub fn encode(
     write_u32_le(block, OFF_NUM_REGIONS, num_regions as u32);
     write_u64_le(block, OFF_BLOB_SIZE, blob_size);
 
-    if total_size > HEADER_SIZE {
+    if checksum && total_size > HEADER_SIZE {
         let cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
         write_u64_le(block, OFF_CHECKSUM, cs);
     }
@@ -108,6 +112,9 @@ pub fn encode(
 ///
 /// `out_region_offsets` and `out_region_sizes` must have at least `max_regions`
 /// entries. Only `min(num_regions, max_regions)` entries are written.
+///
+/// Set `verify_checksum = false` for trusted IPC paths (W2M ring) to skip the
+/// XXH3 verification.  Always use `true` for WAL recovery and network decoding.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_and_parse(
     block: &[u8],
@@ -119,6 +126,7 @@ pub fn validate_and_parse(
     out_region_offsets: &mut [u64],
     out_region_sizes: &mut [u32],
     max_regions: u32,
+    verify_checksum: bool,
 ) -> Result<(), StorageError> {
     if block.len() < HEADER_SIZE {
         return Err(StorageError::Truncated);
@@ -134,8 +142,8 @@ pub fn validate_and_parse(
         return Err(StorageError::Truncated);
     }
 
-    let expected_cs = read_u64_le(block, OFF_CHECKSUM);
-    if total_size > HEADER_SIZE {
+    if verify_checksum && total_size > HEADER_SIZE {
+        let expected_cs = read_u64_le(block, OFF_CHECKSUM);
         let actual_cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
         if actual_cs != expected_cs {
             return Err(StorageError::ChecksumMismatch);
@@ -181,7 +189,7 @@ mod tests {
         let (_regions, ptrs, sizes) = make_test_regions();
         let mut buf = vec![0u8; 4096];
 
-        let block_len = encode(&mut buf, 0, 42, 7, 2, &ptrs, &sizes, 0).unwrap();
+        let block_len = encode(&mut buf, 0, 42, 7, 2, &ptrs, &sizes, 0, true).unwrap();
 
         let mut lsn = 0u64;
         let mut tid = 0u32;
@@ -194,7 +202,7 @@ mod tests {
         validate_and_parse(
             &buf[..block_len],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16,
+            &mut offsets, &mut rsizes, 16, true,
         ).unwrap();
         assert_eq!(lsn, 42);
         assert_eq!(tid, 7);
@@ -217,8 +225,8 @@ mod tests {
         let mut buf = vec![0u8; 8192];
 
         // Encode two blocks sequentially (like IPC does)
-        let off1 = encode(&mut buf, 0, 1, 10, 2, &ptrs, &sizes, 0).unwrap();
-        let off2 = encode(&mut buf, off1, 2, 20, 2, &ptrs, &sizes, 0).unwrap();
+        let off1 = encode(&mut buf, 0, 1, 10, 2, &ptrs, &sizes, 0, true).unwrap();
+        let off2 = encode(&mut buf, off1, 2, 20, 2, &ptrs, &sizes, 0, true).unwrap();
         assert!(off2 > off1);
 
         // Decode both blocks
@@ -233,7 +241,7 @@ mod tests {
         validate_and_parse(
             &buf[..off1],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16,
+            &mut offsets, &mut rsizes, 16, true,
         ).unwrap();
         assert_eq!(lsn, 1);
         assert_eq!(tid, 10);
@@ -241,7 +249,7 @@ mod tests {
         validate_and_parse(
             &buf[off1..off2],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16,
+            &mut offsets, &mut rsizes, 16, true,
         ).unwrap();
         assert_eq!(lsn, 2);
         assert_eq!(tid, 20);
@@ -256,7 +264,7 @@ mod tests {
         let sizes = vec![5u32, 4];
         let mut buf = vec![0u8; 4096];
 
-        let new_offset = encode(&mut buf, 0, 0, 0, 2, &ptrs, &sizes, 0).unwrap();
+        let new_offset = encode(&mut buf, 0, 0, 0, 2, &ptrs, &sizes, 0, true).unwrap();
 
         let mut lsn = 0u64;
         let mut tid = 0u32;
@@ -269,7 +277,7 @@ mod tests {
         validate_and_parse(
             &buf[..new_offset],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16,
+            &mut offsets, &mut rsizes, 16, true,
         ).unwrap();
 
         // Second region offset must be 8-byte aligned
@@ -290,7 +298,7 @@ mod tests {
 
         let rc = validate_and_parse(
             &buf, &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0,
+            &mut [], &mut [], 0, true,
         );
         assert_eq!(rc, Err(StorageError::InvalidVersion));
     }
@@ -299,7 +307,7 @@ mod tests {
     fn bad_checksum() {
         let (_regions, ptrs, sizes) = make_test_regions();
         let mut buf = vec![0u8; 4096];
-        let new_offset = encode(&mut buf, 0, 1, 1, 2, &ptrs, &sizes, 0).unwrap();
+        let new_offset = encode(&mut buf, 0, 1, 1, 2, &ptrs, &sizes, 0, true).unwrap();
 
         // Corrupt one byte in the body
         buf[HEADER_SIZE + 1] ^= 0xFF;
@@ -313,7 +321,7 @@ mod tests {
         let rc = validate_and_parse(
             &buf[..new_offset],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0,
+            &mut [], &mut [], 0, true,
         );
         assert_eq!(rc, Err(StorageError::ChecksumMismatch));
     }
@@ -330,7 +338,7 @@ mod tests {
         let rc = validate_and_parse(
             &[0u8; 10],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0,
+            &mut [], &mut [], 0, true,
         );
         assert_eq!(rc, Err(StorageError::Truncated));
     }
@@ -338,7 +346,7 @@ mod tests {
     #[test]
     fn empty_regions() {
         let mut buf = vec![0u8; 4096];
-        let new_offset = encode(&mut buf, 0, 1, 1, 0, &[], &[], 0).unwrap();
+        let new_offset = encode(&mut buf, 0, 1, 1, 0, &[], &[], 0, true).unwrap();
         assert_eq!(new_offset, HEADER_SIZE); // just a header, no directory, no data
 
         let mut lsn = 0u64;
@@ -350,7 +358,7 @@ mod tests {
         validate_and_parse(
             &buf[..new_offset],
             &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0,
+            &mut [], &mut [], 0, true,
         ).unwrap();
         assert_eq!(num_regions, 0);
     }
@@ -362,7 +370,7 @@ mod tests {
         let sizes = [100u32];
         let mut buf = vec![0u8; 64]; // too small
 
-        let rc = encode(&mut buf, 0, 0, 0, 0, &ptrs, &sizes, 0);
+        let rc = encode(&mut buf, 0, 0, 0, 0, &ptrs, &sizes, 0, true);
         assert_eq!(rc, Err(StorageError::BufferTooSmall));
     }
 }
