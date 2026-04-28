@@ -673,7 +673,7 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id,
+        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id, client_id,
     ).await;
     match result {
         Ok(batches) => {

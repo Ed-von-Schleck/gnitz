@@ -555,6 +555,7 @@ impl WorkerProcess {
         // Extract control fields before consuming decoded
         let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
+        let client_id = decoded.as_ref().map(|d| d.control.client_id).unwrap_or(0);
 
         // Extract batch (consumes decoded)
         let batch = decoded.and_then(|d| d.data_batch);
@@ -650,7 +651,7 @@ impl WorkerProcess {
                 match self.cat().scan_family(target_id) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, Some(&*result), schema.as_ref(), request_id);
+                        self.send_scan_response(target_id as u64, Some(&*result), schema.as_ref(), request_id, client_id);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -715,6 +716,39 @@ impl WorkerProcess {
             ipc::encode_wire_into_ipc(
                 buf, 0, target_id, 0, 0,
                 0u128, 0, request_id, STATUS_OK, &[],
+                schema, None, result, prebuilt,
+            );
+        });
+    }
+
+    // Unlike send_response, uses encode_wire_into (checksummed, client-shape) and
+    // the catalog-level cache that includes col_names.
+    fn send_scan_response(
+        &mut self,
+        target_id: u64,
+        result: Option<&Batch>,
+        schema: Option<&SchemaDescriptor>,
+        request_id: u64,
+        client_id: u64,
+    ) {
+        let tid_key = target_id as i64;
+        let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
+            if let Some(block) = self.cat().get_cached_schema_wire_block(tid_key) {
+                return block;
+            }
+            let col_names = self.cat().get_col_names_bytes(tid_key);
+            let (name_refs, n) = ipc::col_names_as_refs(&col_names);
+            let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
+            self.cat().set_schema_wire_block(tid_key, block.clone());
+            block
+        });
+        let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
+        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
+        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
+            ipc::encode_wire_into(
+                buf, 0, target_id, client_id, 0,
+                0u128, 0, request_id, // TODO: switch to request_id=0 once internal_req_id routing is in place
+                STATUS_OK, &[],
                 schema, None, result, prebuilt,
             );
         });

@@ -568,6 +568,7 @@ impl SalWriter {
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
+        client_id: u64,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
@@ -600,7 +601,7 @@ impl SalWriter {
                 let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
-                    slot, 0, target_id as u64, 0, flags as u64,
+                    slot, 0, target_id as u64, client_id, flags as u64,
                     seek_pk, seek_col_idx, req_ids[w],
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
                 );
@@ -659,7 +660,7 @@ impl SalWriter {
                 .collect();
             return self.write_group_direct(
                 target_id, lsn, flags, &refs, schema, col_names_opt,
-                seek_pk, seek_col_idx, req_ids, unicast_worker,
+                seek_pk, seek_col_idx, req_ids, unicast_worker, 0,
             );
         }
 

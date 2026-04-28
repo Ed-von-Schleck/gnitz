@@ -292,7 +292,7 @@ impl MasterDispatcher {
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
             target_id, lsn, flags, worker_batches, schema, col_names,
-            seek_pk, seek_col_idx, &ids[..nw], unicast_worker,
+            seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0,
         )
     }
 
@@ -312,6 +312,7 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
+        client_id: u64,
     ) -> Result<(), String> {
         let (name_refs, n) = col_names_as_refs(col_names);
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
@@ -319,7 +320,7 @@ impl MasterDispatcher {
         self.sal.write_group_direct(
             target_id as u32, lsn, flags, worker_batches,
             schema, col_names_opt,
-            seek_pk, seek_col_idx, req_ids, unicast_worker,
+            seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
         )
     }
 
@@ -663,7 +664,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 target_id, lsn, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
-                key, col_idx as u64, req_ids, -1,
+                key, col_idx as u64, req_ids, -1, 0,
             )
         }).await?;
         if let Some(e) = first_worker_error("seek_by_index", &decoded_vec) {
@@ -684,13 +685,14 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
+        client_id: u64,
     ) -> Result<Vec<Batch>, String> {
         let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 target_id, lsn, 0, &[], &schema, &col_names,
-                0, 0, req_ids, -1,
+                0, 0, req_ids, -1, client_id,
             )
         }).await?;
         if let Some(e) = first_worker_error("scan", &decoded_vec) {
@@ -738,7 +740,7 @@ impl MasterDispatcher {
                     disp.write_group_with_req_ids(
                         check.target_id, lsn, check.flags, &refs,
                         &check.schema, &[], 0, check.col_hint,
-                        &rids[idx], -1,
+                        &rids[idx], -1, 0,
                     )?;
                 }
                 disp.signal_all();
@@ -819,7 +821,7 @@ impl MasterDispatcher {
         let (schema, col_names) = self.get_schema_and_names(tid);
         self.write_group_with_req_ids(
             tid, lsn, FLAG_TICK, &[], &schema, &col_names,
-            0, 0, req_ids, -1,
+            0, 0, req_ids, -1, 0,
         )
     }
 
@@ -1409,7 +1411,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 table_id, lsn, 0, &[], &schema, &col_names,
-                0, 0, req_ids, -1,
+                0, 0, req_ids, -1, 0,
             )
         }).await?;
 
@@ -1469,7 +1471,7 @@ impl MasterDispatcher {
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, lsn, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1,
+            0, lsn, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1, 0,
         )
     }
 
