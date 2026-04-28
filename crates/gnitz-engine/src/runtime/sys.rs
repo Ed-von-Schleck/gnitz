@@ -118,6 +118,12 @@ pub fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
     }
 }
 
+/// Return the errno of the most recent failed syscall.
+#[inline]
+pub fn errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
 /// mmap a shared, read-write region of `size` bytes backed by `fd`.
 /// Returns the mapped pointer, or null on error.
 pub fn mmap_shared(fd: i32, size: usize) -> *mut u8 {

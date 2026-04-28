@@ -167,10 +167,18 @@ impl W2mRingHeader {
     pub fn read_cursor(&self) -> &AtomicU64 { &self.read_cursor }
     #[inline]
     pub fn consume_cursor(&self) -> &AtomicU64 { &self.consume_cursor }
-    #[inline]
+    #[cfg(test)]
     pub fn advance_read_cursors(&self, new_rc: u64) {
         self.read_cursor().store(new_rc, Ordering::Release);
         self.consume_cursor().store(new_rc, Ordering::Release);
+    }
+    #[inline]
+    pub fn advance_read_cursor(&self, new_rc: u64) {
+        self.read_cursor().store(new_rc, Ordering::Release);
+    }
+    #[inline]
+    pub fn advance_consume_cursor(&self, new_cc: u64) {
+        self.consume_cursor().store(new_cc, Ordering::Release);
     }
     #[inline]
     pub fn writer_seq(&self) -> &AtomicU32 { &self.writer_seq }
@@ -291,7 +299,12 @@ pub struct Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        debug_assert!(self.committed, "Reservation dropped without commit — ring corruption");
+        if !self.committed {
+            crate::gnitz_fatal_abort!(
+                "w2m_ring: Reservation dropped without commit — \
+                 size prefix published but write_cursor not advanced; ring is now corrupt"
+            );
+        }
     }
 }
 
@@ -521,11 +534,10 @@ pub unsafe fn try_consume(
         return None;
     }
     if size > MAX_W2M_MSG {
-        crate::gnitz_error!(
-            "w2m_ring::try_consume: size={} exceeds MAX_W2M_MSG at phys={}",
-            size, phys_rc,
+        crate::gnitz_fatal_abort!(
+            "w2m_ring::try_consume: size={} at phys={} exceeds MAX_W2M_MSG={} — ring corrupt",
+            size, phys_rc, MAX_W2M_MSG,
         );
-        return None;
     }
     let total = 8 + align8(size as usize);
     let new_vrc = vrc + total as u64;
@@ -800,10 +812,9 @@ mod tests {
         }
     }
 
-    /// Publishing with `sz > MAX_W2M_MSG` is rejected. Models a buggy
-    /// caller — the ring must not UB.
+    /// Publishing with `sz > MAX_W2M_MSG` is rejected. Models a buggy caller.
     #[test]
-    fn test_w2m_corrupt_size_prefix_rejected() {
+    fn test_w2m_oversized_publish_rejected() {
         unsafe {
             let size = region_size_for_tests();
             let ptr = alloc_region(size);
@@ -814,12 +825,6 @@ mod tests {
                 TryPublish::Full => {}
                 TryPublish::Ok(_) => panic!("oversized publish must be rejected"),
             }
-
-            // Simulate corruption: stamp a bogus size prefix directly.
-            write_u64_raw(ptr, W2M_HEADER_SIZE, MAX_W2M_MSG + 1);
-            hdr.write_cursor.store(W2M_HEADER_SIZE as u64 + 16, Ordering::Release);
-            assert!(try_consume(hdr, ptr, W2M_HEADER_SIZE as u64).is_none(),
-                "consume must reject size > MAX_W2M_MSG and return None");
 
             free_region(ptr, size);
         }

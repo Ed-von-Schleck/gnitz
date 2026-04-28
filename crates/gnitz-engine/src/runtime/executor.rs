@@ -157,7 +157,7 @@ impl ServerExecutor {
         let sal_fd = unsafe { &*dispatcher }.sal_fd();
         let num_workers = unsafe { &*dispatcher }.num_workers();
 
-        reactor.attach_w2m(unsafe { &*dispatcher }.w2m_handle());
+        reactor.attach_w2m(unsafe { &mut *dispatcher }.take_w2m());
         reactor.attach_server_fd(server_fd);
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));

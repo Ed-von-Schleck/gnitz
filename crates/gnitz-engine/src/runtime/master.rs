@@ -191,7 +191,7 @@ pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: Vec<i32>,
     sal: SalWriter,
-    w2m: Rc<W2mReceiver>,
+    w2m: Option<W2mReceiver>,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
@@ -226,7 +226,7 @@ impl MasterDispatcher {
             num_workers,
             worker_pids,
             sal,
-            w2m: Rc::new(w2m),
+            w2m: Some(w2m),
             catalog,
             router: PartitionRouter::new(),
             unique_filters: HashMap::new(),
@@ -395,10 +395,14 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Expose the shared W2M handle so the executor can attach it to the
-    /// reactor for async fan-out reply routing.
-    pub fn w2m_handle(&self) -> Rc<W2mReceiver> {
-        Rc::clone(&self.w2m)
+    /// Transfer ownership of the W2M receiver to the reactor.
+    /// Called once by the executor after bootstrap; panics if called twice.
+    pub fn take_w2m(&mut self) -> W2mReceiver {
+        self.w2m.take().expect("take_w2m called twice")
+    }
+
+    fn w2m(&self) -> &W2mReceiver {
+        self.w2m.as_ref().expect("W2mReceiver already handed off to reactor")
     }
 
     /// Wait for one response from each worker. Bootstrap-only: runs
@@ -411,7 +415,7 @@ impl MasterDispatcher {
         let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
         for w in 0..nw {
             loop {
-                match self.w2m.try_read(w) {
+                match self.w2m().try_read(w) {
                     Some(decoded) => {
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
@@ -421,7 +425,7 @@ impl MasterDispatcher {
                         break;
                     }
                     None => {
-                        let _ = self.w2m.wait_for(w, 1000);
+                        let _ = self.w2m().wait_for(w, 1000);
                     }
                 }
             }
@@ -456,7 +460,7 @@ impl MasterDispatcher {
             let mut progressed = false;
             for w in 0..nw {
                 if collected[w] { continue; }
-                let Some(decoded) = self.w2m.try_read(w) else {
+                let Some(decoded) = self.w2m().try_read(w) else {
                     continue;
                 };
                 progressed = true;
@@ -477,7 +481,7 @@ impl MasterDispatcher {
             if !progressed {
                 // Wait for the first still-active worker to publish.
                 if let Some(next) = (0..nw).find(|&w| !collected[w]) {
-                    let _ = self.w2m.wait_for(next, 1000);
+                    let _ = self.w2m().wait_for(next, 1000);
                 }
             }
         }

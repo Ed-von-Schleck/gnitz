@@ -19,7 +19,7 @@
 //!   56-bit id in the low bits, where id is a request/timer/send id (not
 //!   an fd). Safe from collisions because the reactor owns its own ring.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -111,7 +111,7 @@ struct ReactorShared {
     /// fires.
     fsync_wakers: RefCell<HashMap<u64, Waker>>,
     parked_fsync_results: RefCell<HashMap<u64, i32>>,
-    w2m: RefCell<Option<Rc<W2mReceiver>>>,
+    w2m: OnceCell<W2mReceiver>,
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
     /// asynchronously, so it must outlive the SQE. A single SQE covers
@@ -268,7 +268,7 @@ impl Reactor {
             parked_replies: RefCell::new(HashMap::new()),
             fsync_wakers: RefCell::new(HashMap::new()),
             parked_fsync_results: RefCell::new(HashMap::new()),
-            w2m: RefCell::new(None),
+            w2m: OnceCell::new(),
             futex_waitv_storage: RefCell::new(None),
             futex_waitv_armed: Cell::new(false),
             futex_waitv_cancelled: Cell::new(false),
@@ -445,28 +445,27 @@ impl Reactor {
     /// reactor drains all rings (the wake index is not authoritative
     /// for FutexWaitV), rebuilds the expected-values array, and
     /// re-arms.
-    pub fn attach_w2m(&self, w2m: Rc<W2mReceiver>) {
+    pub fn attach_w2m(&self, w2m: W2mReceiver) {
         let nw = w2m.num_workers();
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(nw);
         // Allocate a zeroed boxed slice — `refresh_futex_waitv_vals`
         // fills the entries after MASTER_PARKED is published.
         let futexv: Vec<FutexWaitV> = (0..nw).map(|_| FutexWaitV::new()).collect();
         let boxed: Box<[FutexWaitV]> = futexv.into_boxed_slice();
-        *self.inner.w2m.borrow_mut() = Some(w2m);
+        if self.inner.w2m.set(w2m).is_err() {
+            panic!("attach_w2m called twice");
+        }
         *self.inner.futex_waitv_storage.borrow_mut() = Some(boxed);
         // Drain-then-refresh loop: the same protocol used by the
         // CQE dispatch path. Drain catches any messages published
         // between init and attach; refresh snapshots expected values
         // with MASTER_PARKED already set.
-        let w2m_handle = self.inner.w2m.borrow().as_ref().cloned();
-        if let Some(_w2m) = w2m_handle {
-            loop {
-                for w in 0..nw {
-                    self.drain_w2m_for_worker(w);
-                }
-                if !self.refresh_futex_waitv_vals() {
-                    break;
-                }
+        loop {
+            for w in 0..nw {
+                self.drain_w2m_for_worker(w);
+            }
+            if !self.refresh_futex_waitv_vals() {
+                break;
             }
         }
         self.arm_futex_waitv();
@@ -487,7 +486,13 @@ impl Reactor {
         {
             let mut ring = self.inner.ring.borrow_mut();
             unsafe { ring.prep_futex_waitv(ptr, nr, udata_val); }
-            let _ = ring.submit_and_wait_timeout(0, 0);
+            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+                crate::gnitz_error!(
+                    "reactor: FUTEX_WAITV SQE flush failed (errno={}); \
+                     SQE queued in SQ ring — will submit on next tick",
+                    e,
+                );
+            }
         }
         self.inner.futex_waitv_armed.set(true);
     }
@@ -509,8 +514,7 @@ impl Reactor {
     fn refresh_futex_waitv_vals(&self) -> bool {
         let mut storage = self.inner.futex_waitv_storage.borrow_mut();
         let Some(boxed) = storage.as_mut() else { return false; };
-        let w2m_opt = self.inner.w2m.borrow();
-        let Some(w2m) = w2m_opt.as_ref() else { return false; };
+        let Some(w2m) = self.inner.w2m.get() else { return false; };
         let mut pending = false;
         for (w, entry) in boxed.iter_mut().enumerate() {
             let hdr = unsafe { w2m.header(w) };
@@ -565,7 +569,13 @@ impl Reactor {
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_fsync(fd, udata(KIND_FSYNC, id));
-            let _ = ring.submit_and_wait_timeout(0, 0);
+            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+                crate::gnitz_error!(
+                    "reactor: fsync SQE flush failed (errno={}); \
+                     SQE queued — will submit on next tick",
+                    e,
+                );
+            }
         }
         id
     }
@@ -604,7 +614,12 @@ impl Reactor {
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_accept(server_fd, udata(KIND_ACCEPT, 0));
-            let _ = ring.submit_and_wait_timeout(0, 0);
+            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+                crate::gnitz_fatal_abort!(
+                    "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
+                    e,
+                );
+            }
         }
     }
 
@@ -625,14 +640,13 @@ impl Reactor {
         // release, free the buffers so we don't leak.
         let stale = self.inner.pending_recv.borrow_mut().remove(&fd);
         if let Some(stale) = stale {
-            debug_assert!(stale.is_empty(),
-                "register_conn: stale pending_recv queue ({} entries) for fd={}; \
-                 reap_closing_conns did not free the previous incarnation's buffers",
-                stale.len(), fd);
-            for (ptr, _) in stale {
-                if !ptr.is_null() {
-                    unsafe { libc::free(ptr as *mut libc::c_void); }
-                }
+            if !stale.is_empty() {
+                crate::gnitz_fatal_abort!(
+                    "reactor: register_conn: {} stale pending_recv entries for fd={} — \
+                     reap_closing_conns did not run before fd was reused; \
+                     freeing would be a use-after-free if any SQEs are still in flight",
+                    stale.len(), fd,
+                );
             }
         }
         let mut conns = self.inner.conns.borrow_mut();
@@ -642,7 +656,13 @@ impl Reactor {
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_recv(fd, hdr_ptr, 4, udata(KIND_RECV, fd as u32 as u64));
-            let _ = ring.submit_and_wait_timeout(0, 0);
+            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+                crate::gnitz_error!(
+                    "reactor: recv SQE flush failed for fd={} (errno={}); \
+                     SQE queued — will submit on next tick",
+                    fd, e,
+                );
+            }
         }
         conn.recv_armed = true;
     }
@@ -677,7 +697,13 @@ impl Reactor {
             {
                 let mut ring = self.inner.ring.borrow_mut();
                 ring.prep_send(fd, ptr, remaining, udata(KIND_SEND, send_id));
-                let _ = ring.submit_and_wait_timeout(0, 0);
+                if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+                    crate::gnitz_error!(
+                        "reactor: send SQE flush failed for send_id={} (errno={}); \
+                         SQE queued — will submit on next tick",
+                        send_id, e,
+                    );
+                }
             }
             let rc = SendFuture {
                 send_id,
@@ -737,11 +763,35 @@ impl Reactor {
     }
 
     /// Single iteration of the event loop:
+    ///   0. proactive W2M drain (lost-wake safety net)
     ///   1. drain CQEs (waking reply / timeout / fsync wakers)
     ///   2. poll all tasks in the run queue (each polled at most once)
     ///   3. submit pending SQEs; if `block` and the run queue is now
     ///      empty, sleep until the next CQE.
     fn tick(&self, block: bool) {
+        // 0. Proactive W2M drain — safety net for lost FUTEX_WAITV wakes.
+        //
+        // A narrow race exists between refresh_futex_waitv_vals (which sets
+        // FLAG_MASTER_PARKED and snapshots reader_seq) and arm_futex_waitv
+        // (which registers the FUTEX_WAITV SQE with the kernel): a worker
+        // that publishes in that window calls FUTEX_WAKE against a waiter
+        // that does not exist yet. The kernel's mismatch-detection (it
+        // immediately completes a FUTEX_WAITV whose expected value is stale)
+        // covers the case where the arm precedes the publish; this drain
+        // covers the opposite case (publish beats the arm) in both the
+        // spinning path (no blocking) and the blocking path (before we sleep).
+        //
+        // Cost: one try_consume call per worker per tick — just two Acquire
+        // loads that return None when the ring is empty.
+        if self.inner.futex_waitv_armed.get() {
+            let nw = self.inner.w2m.get()
+                .expect("futex_waitv_armed=true but w2m not attached")
+                .num_workers();
+            for w in 0..nw {
+                self.drain_w2m_for_worker(w);
+            }
+        }
+
         // 1. CQEs (no syscall — reads memory-mapped CQ).
         self.drain_cqes_into_wakers();
         #[cfg(test)]
@@ -768,11 +818,11 @@ impl Reactor {
         if should_block {
             // Block indefinitely — outstanding timer SQEs guarantee a CQE
             // will arrive when the soonest timer fires.
-            let _ = self.inner.ring.borrow_mut()
-                .submit_and_wait_timeout(1, -1);
-        } else {
-            let _ = self.inner.ring.borrow_mut()
-                .submit_and_wait_timeout(0, 0);
+            if let Err(e) = self.inner.ring.borrow_mut().submit_and_wait_timeout(1, -1) {
+                crate::gnitz_error!("reactor: tick blocking submit failed (errno={})", e);
+            }
+        } else if let Err(e) = self.inner.ring.borrow_mut().submit_and_wait_timeout(0, 0) {
+            crate::gnitz_error!("reactor: tick non-blocking submit failed (errno={})", e);
         }
     }
 
@@ -838,9 +888,9 @@ impl Reactor {
                 // already-stale expected value.
                 self.inner.futex_waitv_armed.set(false);
                 if !self.inner.shutdown.get() {
-                    let nw = self.inner.w2m.borrow().as_ref()
-                        .map(|w2m| w2m.num_workers())
-                        .unwrap_or(0);
+                    let nw = self.inner.w2m.get()
+                        .expect("KIND_FUTEX_WAITV fired but w2m not attached")
+                        .num_workers();
                     loop {
                         for w in 0..nw {
                             self.drain_w2m_for_worker(w);
@@ -1019,10 +1069,8 @@ impl Reactor {
     /// `try_read` advances the ring's shared `read_cursor` and may
     /// wake a parked producer.
     fn drain_w2m_for_worker(&self, w: usize) {
-        let w2m = Rc::clone(
-            self.inner.w2m.borrow().as_ref()
-                .expect("drain_w2m_for_worker called before attach_w2m"),
-        );
+        let w2m = self.inner.w2m.get()
+            .expect("drain_w2m_for_worker called before attach_w2m");
         while let Some(decoded) = w2m.try_read(w) {
             self.route_reply(w, decoded);
         }
@@ -2672,8 +2720,7 @@ mod tests {
         // registers every ReplyFuture's waker before attach drains.
         reactor.poll_nonblocking();
 
-        let w2m = Rc::new(W2mReceiver::new(vec![ptr]));
-        reactor.attach_w2m(Rc::clone(&w2m));
+        reactor.attach_w2m(W2mReceiver::new(vec![ptr]));
 
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
@@ -2774,8 +2821,7 @@ mod tests {
         }
         reactor.poll_nonblocking();
 
-        let w2m = Rc::new(W2mReceiver::new(vec![ptr]));
-        reactor.attach_w2m(Rc::clone(&w2m));
+        reactor.attach_w2m(W2mReceiver::new(vec![ptr]));
 
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
