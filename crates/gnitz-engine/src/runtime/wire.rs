@@ -1,7 +1,7 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
-use crate::storage::Batch;
+use crate::storage::{Batch, MemBatch};
 use crate::util::align8;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +29,14 @@ pub fn decode_conflict_mode(flags: u64, seek_col_idx: u64) -> WireConflictMode {
 
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
+
+// WAL block header field offsets (matches storage/wal.rs; duplicated here to
+// avoid cross-module coupling between runtime and storage internals).
+const WAL_OFF_COUNT:       usize = 12;
+pub(crate) const WAL_OFF_SIZE: usize = 16;
+const WAL_OFF_VERSION:     usize = 20;
+const WAL_OFF_CHECKSUM:    usize = 24;
+const WAL_OFF_NUM_REGIONS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Internal schema descriptors for the wire control and schema blocks
@@ -548,42 +556,51 @@ pub struct DecodedWire {
     pub data_batch: Option<Batch>,
 }
 
+/// Zero-copy decoded wire message: data borrows directly from the source buffer.
+pub struct DecodedWireZeroCopy<'a> {
+    pub control: DecodedControl,
+    pub schema: Option<SchemaDescriptor>,
+    pub data_batch: Option<MemBatch<'a>>,
+}
+
+/// Read the (data_offset, data_size) directory entry for region `r` from a
+/// WAL block.  Panics on slice errors — callers must validate `data.len()`
+/// covers the full directory before calling.
+#[inline(always)]
+fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
+    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
+    const DIR_ENTRY: usize = 8;
+    let base = HEADER + r * DIR_ENTRY;
+    let off = u32::from_le_bytes(data[base    ..base + 4].try_into().unwrap()) as usize;
+    let sz  = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+    (off, sz)
+}
+
 /// Decode all control fields directly from the WAL block's directory without
 /// allocating a `Batch`. Each directory entry stores (data_offset: u32,
 /// data_size: u32) at `HEADER_SIZE + region * 8`. For a 1-row control block
 /// every u64 region is exactly 8 bytes, so we can index the fields directly.
-fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
+pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     use gnitz_wire::control as ctrl;
 
-    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE; // 48
-    const DIR_ENTRY: usize = 8;                         // (offset u32, size u32)
-
-    let dir_end = HEADER + ctrl::NUM_REGIONS * DIR_ENTRY;
+    let dir_end = gnitz_wire::WAL_HEADER_SIZE + ctrl::NUM_REGIONS * 8;
     if data.len() < dir_end {
         return Err("control block too small");
     }
 
     // Validate WAL version and region count without computing the checksum.
-    let version = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let version = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
     if version != gnitz_wire::WAL_FORMAT_VERSION {
         return Err("control block wrong version");
     }
-    let num_regions = u32::from_le_bytes(data[32..36].try_into().unwrap());
+    let num_regions = u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap());
     if num_regions as usize != ctrl::NUM_REGIONS {
         return Err("control block wrong region count");
     }
 
-    // Read the (data_offset, data_size) pair for region `r`.
-    let dir = |r: usize| -> (usize, usize) {
-        let base = HEADER + r * DIR_ENTRY;
-        let off  = u32::from_le_bytes(data[base    ..base + 4].try_into().unwrap()) as usize;
-        let sz   = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
-        (off, sz)
-    };
-
     // Read a u64 from a fixed-width u64 region (exactly 8 bytes for 1 row).
     let read_u64 = |r: usize| -> Result<u64, &'static str> {
-        let (off, sz) = dir(r);
+        let (off, sz) = wal_dir_entry(data, r);
         if sz < 8 || off + 8 > data.len() {
             return Err("control block region out of bounds");
         }
@@ -592,7 +609,7 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 
     // Read a u128 from a fixed-width u128 region (exactly 16 bytes for 1 row).
     let read_u128 = |r: usize| -> Result<u128, &'static str> {
-        let (off, sz) = dir(r);
+        let (off, sz) = wal_dir_entry(data, r);
         if sz < 16 || off + 16 > data.len() {
             return Err("control block u128 region out of bounds");
         }
@@ -612,13 +629,13 @@ fn decode_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     let error_msg = if error_is_null {
         Vec::new()
     } else {
-        let (err_off, err_sz) = dir(ctrl::REGION_ERROR_MSG);
+        let (err_off, err_sz) = wal_dir_entry(data, ctrl::REGION_ERROR_MSG);
         if err_sz < 16 || err_off + 16 > data.len() {
             return Err("error_msg region out of bounds");
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[err_off..err_off + 16]);
-        let (blob_off, blob_sz) = dir(ctrl::REGION_BLOB);
+        let (blob_off, blob_sz) = wal_dir_entry(data, ctrl::REGION_BLOB);
         let blob = if blob_sz > 0 && blob_off + blob_sz <= data.len() {
             &data[blob_off..blob_off + blob_sz]
         } else {
@@ -646,23 +663,50 @@ fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
 }
 
 fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
-    let (batch, _) = Batch::decode_from_wal_block(data, &META_SCHEMA_DESC, verify_checksum)
-        .map_err(|_| "schema block invalid")?;
-    if batch.count == 0 { return Err("empty schema block"); }
-    if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
+    // Parse directly from WAL block bytes; no Batch allocation needed.
+    // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
+    //   type_code/U64(3), flags/U64(4), name/STR(5), blob(6).
+    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
 
-    let n = batch.count;
-    let type_data  = batch.col_data(0);
-    let flags_data = batch.col_data(1);
+    if data.len() < HEADER { return Err("schema block too small"); }
+
+    let version = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
+    if version != gnitz_wire::WAL_FORMAT_VERSION {
+        return Err("schema block wrong version");
+    }
+    let total_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    if total_size > data.len() { return Err("schema block truncated"); }
+
+    if verify_checksum && total_size > HEADER {
+        let expected = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
+        let actual = crate::xxh::checksum(&data[HEADER..total_size]);
+        if actual != expected { return Err("schema block checksum mismatch"); }
+    }
+
+    let count = u32::from_le_bytes(data[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()) as usize;
+    let num_regions = u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
+
+    if count == 0 { return Err("empty schema block"); }
+    if count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
+    if num_regions < 5 { return Err("schema block region count mismatch"); }
+
+    let (tc_off, tc_sz) = wal_dir_entry(data, 3);
+    let (fl_off, fl_sz) = wal_dir_entry(data, 4);
+
+    if tc_sz < count * 8 || tc_off + tc_sz > data.len() { return Err("schema type_code region OOB"); }
+    if fl_sz < count * 8 || fl_off + fl_sz > data.len() { return Err("schema flags region OOB"); }
+
+    let type_data  = &data[tc_off..tc_off + count * 8];
+    let flags_data = &data[fl_off..fl_off + count * 8];
 
     let mut sd = SchemaDescriptor {
-        num_columns: n as u32,
+        num_columns: count as u32,
         pk_index: 0,
         columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
     let mut pk_found = false;
 
-    for i in 0..n {
+    for i in 0..count {
         let off8 = i * 8;
         let tc = u64::from_le_bytes(type_data[off8..off8+8].try_into().unwrap()) as u8;
         let fl = u64::from_le_bytes(flags_data[off8..off8+8].try_into().unwrap());
@@ -690,12 +734,12 @@ pub fn peek_target_id(data: &[u8]) -> Result<i64, &'static str> {
         return Err("IPC payload too small");
     }
     let ctrl_size = u32::from_le_bytes(
-        data[16..20].try_into().map_err(|_| "bad control size")?
+        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad control size")?
     ) as usize;
     if ctrl_size > data.len() {
         return Err("control block truncated");
     }
-    let ctrl = decode_control_block(&data[..ctrl_size])?;
+    let ctrl = peek_control_block(&data[..ctrl_size])?;
     Ok(ctrl.target_id as i64)
 }
 
@@ -723,15 +767,33 @@ fn decode_wire_impl(
     if data.len() < gnitz_wire::WAL_HEADER_SIZE {
         return Err("IPC payload too small");
     }
-
     let ctrl_size = u32::from_le_bytes(
-        data[16..20].try_into().map_err(|_| "bad control size")?
+        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad control size")?
     ) as usize;
     if ctrl_size > data.len() {
         return Err("control block truncated");
     }
+    let control = peek_control_block(&data[..ctrl_size])?;
+    decode_wire_body(data, ctrl_size, control, schema_hint, verify_checksum)
+}
 
-    let control = decode_control_block(&data[..ctrl_size])?;
+/// Like `decode_wire_ipc` but reuses a pre-parsed control block, avoiding a
+/// redundant parse of the control WAL block.
+pub(crate) fn decode_wire_ipc_with_ctrl(
+    data: &[u8],
+    ctrl_size: usize,
+    control: DecodedControl,
+) -> Result<DecodedWire, &'static str> {
+    decode_wire_body(data, ctrl_size, control, None, false)
+}
+
+fn decode_wire_body(
+    data: &[u8],
+    ctrl_size: usize,
+    control: DecodedControl,
+    schema_hint: Option<&SchemaDescriptor>,
+    verify_checksum: bool,
+) -> Result<DecodedWire, &'static str> {
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data   = (flags & FLAG_HAS_DATA)   != 0;
@@ -748,7 +810,7 @@ fn decode_wire_impl(
             return Err("schema block truncated");
         }
         let schema_size = u32::from_le_bytes(
-            data[off + 16..off + 20].try_into().map_err(|_| "bad schema size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad schema size")?
         ) as usize;
         if off + schema_size > data.len() {
             return Err("schema block truncated");
@@ -771,7 +833,7 @@ fn decode_wire_impl(
             return Err("data block truncated");
         }
         let data_size = u32::from_le_bytes(
-            data[off + 16..off + 20].try_into().map_err(|_| "bad data size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad data size")?
         ) as usize;
         if off + data_size > data.len() {
             return Err("data block truncated");
@@ -785,4 +847,64 @@ fn decode_wire_impl(
     };
 
     Ok(DecodedWire { control, schema: wire_schema, data_batch })
+}
+
+/// Decode a W2M IPC message without copying data: schema is parsed from the
+/// wire bytes directly and the data block is returned as a `MemBatch<'a>`
+/// that borrows slices from `data`.  The caller must keep `data` live (i.e.
+/// hold the `W2mSlot`) until it is done reading from the `MemBatch`.
+///
+/// Takes a pre-parsed `control` block (from `peek_control_block`) and its byte
+/// size so the caller can inspect flags before choosing a decode path without
+/// triggering a redundant parse.
+pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
+    data: &'a [u8],
+    ctrl_size: usize,
+    control: DecodedControl,
+) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
+    let flags = control.flags;
+    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
+    let has_data   = (flags & FLAG_HAS_DATA)   != 0;
+
+    if has_data && !has_schema {
+        return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
+    }
+
+    let mut off = ctrl_size;
+    let mut wire_schema: Option<SchemaDescriptor> = None;
+
+    if has_schema {
+        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
+            return Err("schema block truncated");
+        }
+        let schema_size = u32::from_le_bytes(
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad schema size")?
+        ) as usize;
+        if off + schema_size > data.len() {
+            return Err("schema block truncated");
+        }
+        wire_schema = Some(decode_schema_block(&data[off..off + schema_size], false)?);
+        off += schema_size;
+    }
+
+    let data_batch = if has_data {
+        let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
+        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
+            return Err("data block truncated");
+        }
+        let data_size = u32::from_le_bytes(
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad data size")?
+        ) as usize;
+        if off + data_size > data.len() {
+            return Err("data block truncated");
+        }
+        let mb = crate::storage::decode_mem_batch_from_wal_block(
+            &data[off..off + data_size], eff_schema,
+        )?;
+        Some(mb)
+    } else {
+        None
+    };
+
+    Ok(DecodedWireZeroCopy { control, schema: wire_schema, data_batch })
 }

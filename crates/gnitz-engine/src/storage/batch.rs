@@ -614,8 +614,11 @@ impl Batch {
             .copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
     }
 
-    /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`, writing
-    /// `weight_override` into the weight column instead of the source weights.
+    /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`.
+    ///
+    /// `weight_override`:
+    /// - `Some(w)`: broadcast `w` into every copied row's weight column.
+    /// - `None`: copy per-row weights verbatim from `src`.
     ///
     /// Non-STRING payload columns: one `copy_from_slice` per region.
     /// STRING payload columns: per-row blob relocation via `relocate_string_cell`.
@@ -628,19 +631,24 @@ impl Batch {
         src: &MemBatch<'_>,
         start: usize,
         end: usize,
-        weight_override: i64,
+        weight_override: Option<i64>,
     ) {
         let n = end - start;
         if n == 0 { return; }
         self.reserve_rows(n);
         if !src.blob.is_empty() { self.blob.reserve(src.blob.len()); }
         self.bulk_copy_region(REG_PK, src.pk, start, end);
-        {
-            let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
-            let w_bytes = weight_override.to_le_bytes();
-            let dest = &mut self.data[dst_off..dst_off + n * 8];
-            for chunk in dest.chunks_exact_mut(8) {
-                chunk.copy_from_slice(&w_bytes);
+        match weight_override {
+            Some(w) => {
+                let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
+                let w_bytes = w.to_le_bytes();
+                let dest = &mut self.data[dst_off..dst_off + n * 8];
+                for chunk in dest.chunks_exact_mut(8) {
+                    chunk.copy_from_slice(&w_bytes);
+                }
+            }
+            None => {
+                self.bulk_copy_region(REG_WEIGHT, src.weight, start, end);
             }
         }
         self.bulk_copy_region(REG_NULL_BMP, src.null_bmp, start, end);
@@ -1364,6 +1372,76 @@ impl ConsolidatedBatch {
 impl std::ops::Deref for ConsolidatedBatch {
     type Target = Batch;
     fn deref(&self) -> &Batch { &self.0 }
+}
+
+/// Decode a WAL data block into a `MemBatch<'a>` that borrows slices directly
+/// from `data`.  No allocation; caller must keep `data` live for as long as
+/// the returned `MemBatch` is used.  Checksum verification is skipped (IPC
+/// trusted path).
+pub fn decode_mem_batch_from_wal_block<'a>(
+    data: &'a [u8],
+    schema: &SchemaDescriptor,
+) -> Result<MemBatch<'a>, &'static str> {
+    let npc = schema.num_columns as usize - 1;
+    let expected_regions = 3 + npc + 1; // pk, weight, null_bmp, payload…, blob
+
+    let mut _lsn = 0u64; let mut _tid = 0u32; let mut count = 0u32;
+    let mut num_regions = 0u32; let mut _blob_size = 0u64;
+    let mut offsets = [0u64; MAX_BATCH_REGIONS];
+    let mut sizes   = [0u32; MAX_BATCH_REGIONS];
+
+    super::wal::validate_and_parse(
+        data, &mut _lsn, &mut _tid, &mut count, &mut num_regions,
+        &mut _blob_size, &mut offsets, &mut sizes, MAX_BATCH_REGIONS as u32, false,
+    ).map_err(|_| "data WAL block invalid")?;
+
+    if num_regions as usize != expected_regions {
+        return Err("data WAL block region count mismatch");
+    }
+
+    let n = count as usize;
+    let pk_stride_val = pk_stride(schema);
+
+    if n == 0 {
+        return Ok(MemBatch {
+            pk: &[], pk_stride: pk_stride_val,
+            weight: &[], null_bmp: &[],
+            col_data: Vec::new(), blob: &[], count: 0,
+        });
+    }
+
+    let region_slice = |r: usize, row_stride: usize| -> Result<&'a [u8], &'static str> {
+        let off = offsets[r] as usize;
+        let sz  = sizes[r] as usize;
+        let needed = n * row_stride;
+        if sz < needed || off + sz > data.len() {
+            return Err("data WAL region OOB");
+        }
+        Ok(&data[off..off + needed])
+    };
+
+    let pk       = region_slice(REG_PK,       pk_stride_val as usize)?;
+    let weight   = region_slice(REG_WEIGHT,   8)?;
+    let null_bmp = region_slice(REG_NULL_BMP, 8)?;
+
+    let mut col_data = Vec::with_capacity(npc);
+    let pk_idx = schema.pk_index as usize;
+    let mut pi = 0usize;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pk_idx { continue; }
+        let stride = schema.columns[ci].size as usize;
+        col_data.push(region_slice(REG_PAYLOAD_START + pi, stride)?);
+        pi += 1;
+    }
+
+    let blob_r = REG_PAYLOAD_START + npc;
+    let blob = {
+        let off = offsets[blob_r] as usize;
+        let sz  = sizes[blob_r] as usize;
+        if sz > 0 && off + sz <= data.len() { &data[off..off + sz] } else { &[] }
+    };
+
+    Ok(MemBatch { pk, pk_stride: pk_stride_val, weight, null_bmp, col_data, blob, count: n })
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via

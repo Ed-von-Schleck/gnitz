@@ -336,7 +336,7 @@ pub(crate) fn retract_rows_by_pk_lo_range(
         {
             end += 1;
         }
-        batch.append_mem_batch_range(&src, start, end, -1);
+        batch.append_mem_batch_range(&src, start, end, Some(-1));
         return batch;
     }
 
@@ -372,7 +372,7 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
         {
             end += 1;
         }
-        batch.append_mem_batch_range(&src, start, end, -1);
+        batch.append_mem_batch_range(&src, start, end, Some(-1));
         return batch;
     }
 

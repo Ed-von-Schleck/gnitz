@@ -31,9 +31,9 @@ use std::time::Instant;
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::runtime::wire::DecodedWire;
+use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
 use crate::runtime::sal::FLAG_EXCHANGE;
-use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sys::FUTEX2_SIZE_U32;
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 
@@ -1063,17 +1063,62 @@ impl Reactor {
         }
     }
 
-    /// Decode every unread W2M message for worker `w` and route each
-    /// through `route_reply`. The tail-chasing ring self-maintains —
-    /// no reset gate, no `in_flight` accounting. Each successful
-    /// `try_read` advances the ring's shared `read_cursor` and may
-    /// wake a parked producer.
+    /// Drain every unread W2M slot for worker `w` and route each reply.
+    ///
+    /// Peeks the control block first to choose the decode path:
+    /// - `FLAG_HAS_DATA`: zero-copy decode into an owned `Batch`, then route.
+    /// - everything else (exchange, control-only): full decode via `park_owned`.
+    ///
+    /// The RAII `W2mSlot` advances `consume_cursor` on drop so the worker
+    /// can reuse the ring space immediately after decoding completes.
     fn drain_w2m_for_worker(&self, w: usize) {
         let w2m = self.inner.w2m.get()
             .expect("drain_w2m_for_worker called before attach_w2m");
-        while let Some(decoded) = w2m.try_read(w) {
-            self.route_reply(w, decoded);
+        while let Some(slot) = w2m.try_read_slot(w) {
+            let ctrl = wire::peek_control_block(slot.bytes())
+                .expect("W2M control block corrupt — ring corrupt");
+            let ctrl_size = u32::from_le_bytes(
+                slot.bytes()[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()
+            ) as usize;
+            if ctrl.flags & FLAG_HAS_DATA != 0 && ctrl.flags as u32 & FLAG_EXCHANGE == 0 {
+                self.ingest_from_slot(w, slot, ctrl, ctrl_size);
+            } else {
+                self.park_owned(w, slot, ctrl, ctrl_size);
+            }
         }
+    }
+
+    /// Zero-copy decode path for W2M slots with `FLAG_HAS_DATA`.
+    ///
+    /// Borrows ring bytes via `MemBatch`, allocates exactly one owned `Batch`
+    /// (ring → run, single `copy_from_slice`), then drops the slot so
+    /// `consume_cursor` advances before the awaiter wakes.
+    fn ingest_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
+        let bytes = slot.bytes();
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl)
+            .expect("W2M zero-copy decode failed — ring corrupt");
+        let flags = zc.control.flags;
+        let schema = zc.schema;
+        let mb = zc.data_batch.expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
+        let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
+        let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
+        owned.append_mem_batch_range(&mb, 0, mb.count, None);
+        if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
+        if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
+        let control = zc.control;
+        drop(mb); // release borrows from slot before dropping the slot
+        drop(slot); // RAII: advance consume_cursor before waking awaiter
+        self.route_reply(w, DecodedWire { control, schema, data_batch: Some(owned) });
+    }
+
+    /// Full-decode fallback: decode a W2M slot via the owned-batch path and
+    /// route the reply.  Drops the slot (advancing `consume_cursor`) before
+    /// waking any awaiter.
+    fn park_owned(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
+        let decoded = wire::decode_wire_ipc_with_ctrl(slot.bytes(), ctrl_size, ctrl)
+            .expect("W2M decode failed — ring corrupt");
+        drop(slot);
+        self.route_reply(w, decoded);
     }
 
     /// Park `decoded` for its awaiter. FLAG_EXCHANGE replies are
