@@ -9,7 +9,7 @@ use crate::util::align8;
 // ---------------------------------------------------------------------------
 
 pub use gnitz_wire::{
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     FLAG_CONFLICT_MODE_PRESENT as FLAG_CONFLICT_MODE_PRESENT_U64,
     WireConflictMode,

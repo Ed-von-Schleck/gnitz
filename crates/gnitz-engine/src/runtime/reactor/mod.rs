@@ -31,8 +31,7 @@ use std::time::Instant;
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
-use crate::runtime::sal::FLAG_EXCHANGE;
+use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sys::FUTEX2_SIZE_U32;
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
@@ -1066,8 +1065,9 @@ impl Reactor {
     /// Drain every unread W2M slot for worker `w` and route each reply.
     ///
     /// Peeks the control block first to choose the decode path:
-    /// - `FLAG_HAS_DATA`: zero-copy decode into an owned `Batch`, then route.
-    /// - everything else (exchange, control-only): full decode via `park_owned`.
+    /// - `FLAG_HAS_DATA` (non-exchange): zero-copy ingest into owned `Batch`.
+    /// - `FLAG_EXCHANGE`: decode from slot bytes, process synchronously.
+    /// - everything else (control-only): full decode via `park_owned`.
     ///
     /// The RAII `W2mSlot` advances `consume_cursor` on drop so the worker
     /// can reuse the ring space immediately after decoding completes.
@@ -1080,8 +1080,11 @@ impl Reactor {
             let ctrl_size = u32::from_le_bytes(
                 slot.bytes()[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()
             ) as usize;
-            if ctrl.flags & FLAG_HAS_DATA != 0 && ctrl.flags as u32 & FLAG_EXCHANGE == 0 {
+            let flags = ctrl.flags;
+            if flags & FLAG_HAS_DATA != 0 && flags & FLAG_EXCHANGE == 0 {
                 self.ingest_from_slot(w, slot, ctrl, ctrl_size);
+            } else if flags & FLAG_EXCHANGE != 0 {
+                self.process_exchange_from_slot(w, slot, ctrl, ctrl_size);
             } else {
                 self.park_owned(w, slot, ctrl, ctrl_size);
             }
@@ -1111,6 +1114,47 @@ impl Reactor {
         self.route_reply(w, DecodedWire { control, schema, data_batch: Some(owned) });
     }
 
+    /// Zero-copy decode path for FLAG_EXCHANGE slots: mirrors `ingest_from_slot`
+    /// but feeds the result into `exchange_acc` instead of routing to an awaiter.
+    fn process_exchange_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
+        let bytes = slot.bytes();
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl)
+            .expect("W2M exchange decode failed — ring corrupt");
+        let flags = zc.control.flags;
+        let control = zc.control;
+        let schema = zc.schema;
+        let data_batch = if let Some(mb) = zc.data_batch {
+            let sch = schema.as_ref()
+                .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
+            let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
+            owned.append_mem_batch_range(&mb, 0, mb.count, None);
+            if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
+            if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
+            drop(mb); // release borrow from slot bytes before dropping slot
+            Some(owned)
+        } else {
+            None
+        };
+        drop(slot); // advance consume_cursor before processing relay
+        let pending = self.inner.exchange_acc.borrow_mut().process(
+            w, DecodedWire { control, schema, data_batch },
+        );
+        self.dispatch_relay(pending);
+    }
+
+    fn dispatch_relay(&self, pending: Option<PendingRelay>) {
+        if let Some(relay) = pending {
+            if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
+                tx.send(relay);
+            } else {
+                crate::gnitz_warn!(
+                    "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
+                    relay.view_id,
+                );
+            }
+        }
+    }
+
     /// Full-decode fallback: decode a W2M slot via the owned-batch path and
     /// route the reply.  Drops the slot (advancing `consume_cursor`) before
     /// waking any awaiter.
@@ -1129,19 +1173,9 @@ impl Reactor {
     ///
     /// Unrouted replies are logged and dropped.
     fn route_reply(&self, w: usize, decoded: DecodedWire) {
-        let flags = decoded.control.flags as u32;
-        if flags & FLAG_EXCHANGE != 0 {
+        if decoded.control.flags & FLAG_EXCHANGE != 0 {
             let pending = self.inner.exchange_acc.borrow_mut().process(w, decoded);
-            if let Some(relay) = pending {
-                if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
-                    tx.send(relay);
-                } else {
-                    crate::gnitz_warn!(
-                        "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
-                        relay.view_id,
-                    );
-                }
-            }
+            self.dispatch_relay(pending);
             return;
         }
 
@@ -2491,13 +2525,12 @@ mod tests {
 
     fn synthetic_exchange_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
         use crate::runtime::wire::DecodedControl;
-        use crate::runtime::sal::FLAG_EXCHANGE;
         DecodedWire {
             control: DecodedControl {
                 status: 0,
                 client_id: 0,
                 target_id: view_id as u64,
-                flags: FLAG_EXCHANGE as u64,
+                flags: FLAG_EXCHANGE,
                 seek_pk: source_id as u128,
                 seek_col_idx: 0,
                 request_id: req_id,
