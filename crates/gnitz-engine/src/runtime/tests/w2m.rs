@@ -29,7 +29,7 @@ fn test_w2m_concurrent_publish_consume_ordered() {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
         let sz = wire_size(STATUS_OK, b"", None, None, None, None);
         for req_id in 1..=N {
-            writer.send_encoded(sz, |buf| {
+            writer.send_encoded(sz, req_id as u32, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
                      0u128, 0, req_id, STATUS_OK, b"", None, None, None, None,
@@ -101,7 +101,7 @@ fn test_w2m_concurrent_large_messages_ordered() {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
         let sz = wire_size(STATUS_OK, &pad_w, None, None, None, None);
         for req_id in 1..=N {
-            writer.send_encoded(sz, |buf| {
+            writer.send_encoded(sz, req_id as u32, |buf| {
                 encode_wire_into(
                     buf, 0, 0, 0, 0,
                      0u128, 0, req_id, STATUS_OK, &pad_w, None, None, None, None,
@@ -161,6 +161,7 @@ fn test_w2m_writer_rejects_oversized() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             writer.send_encoded(
                 (w2m_ring::MAX_W2M_MSG + 1) as usize,
+                0,
                 |_| {},
             );
         }));
@@ -198,7 +199,7 @@ fn test_w2m_control_only_reply_has_no_backing() {
 
     let writer = W2mWriter::new(region, CAP as u64);
     let sz = wire_size(STATUS_OK, b"", None, None, None, None);
-    writer.send_encoded(sz, |buf| {
+    writer.send_encoded(sz, 42, |buf| {
         encode_wire_into(
             buf, 0, 0, 0, 0,
              0u128, 0, 42, STATUS_OK, b"", None, None, None, None,

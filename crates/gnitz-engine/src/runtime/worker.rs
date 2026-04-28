@@ -676,7 +676,7 @@ impl WorkerProcess {
 
     fn send_ack(&self, target_id: u64, flags: u32, request_id: u64) {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
-        self.w2m_writer.send_encoded(sz, |buf| {
+        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, target_id, 0, flags as u64,
                 0u128, 0, request_id, STATUS_OK, &[], None, None, None, None,
@@ -711,7 +711,7 @@ impl WorkerProcess {
         });
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
-        self.w2m_writer.send_encoded(sz, |buf| {
+        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, target_id, 0, 0,
                 0u128, 0, request_id, STATUS_OK, &[],
@@ -723,7 +723,7 @@ impl WorkerProcess {
     fn send_error(&self, error_msg: &str, request_id: u64) {
         let msg = error_msg.as_bytes();
         let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None);
-        self.w2m_writer.send_encoded(sz, |buf| {
+        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, 0, 0, 0,
                 0u128, 0, request_id, STATUS_ERROR, msg, None, None, None, None,
@@ -935,7 +935,7 @@ impl WorkerProcess {
 
         let schema = batch.schema;
         let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None);
-        self.w2m_writer.send_encoded(sz, |buf| {
+        self.w2m_writer.send_encoded(sz, tick_request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
                 source_id as u128, 0, tick_request_id, STATUS_OK, &[],
@@ -1307,7 +1307,7 @@ mod tests {
         let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
         let mut decoded_ids = Vec::new();
         for _ in 0..3 {
-            let (data_ptr, sz, new_rc) = unsafe {
+            let (data_ptr, sz, new_rc, _req_id) = unsafe {
                 w2m_ring::try_consume(hdr, region_ptr as *const u8, rc)
                     .expect("expected a message")
             };

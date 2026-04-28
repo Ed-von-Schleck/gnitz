@@ -25,7 +25,9 @@ impl W2mWriter {
     }
 
     /// Encode wire data into the W2M ring. Blocks on `writer_seq` if full.
-    pub fn send_encoded(&self, sz: usize, encode_fn: impl FnOnce(&mut [u8])) {
+    /// `internal_req_id` is stored in the slot prefix so the master can route
+    /// scan responses without decoding the wire frame.
+    pub fn send_encoded(&self, sz: usize, internal_req_id: u32, encode_fn: impl FnOnce(&mut [u8])) {
         assert!(
             (sz as u64) <= w2m_ring::MAX_W2M_MSG,
             "W2mWriter::send_encoded: sz={} exceeds MAX_W2M_MSG={}",
@@ -34,7 +36,7 @@ impl W2mWriter {
         let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
 
         let reservation = loop {
-            let r = unsafe { w2m_ring::try_reserve(hdr, self.region_ptr, sz) };
+            let r = unsafe { w2m_ring::try_reserve(hdr, self.region_ptr, sz, internal_req_id) };
             match r {
                 TryReserve::Ok(r) => break r,
                 TryReserve::Full => {
@@ -174,6 +176,11 @@ impl InFlightState {
 pub struct W2mSlot {
     bytes:    &'static [u8],
     push_idx: u64,
+    /// `internal_req_id` from the slot prefix, set by the worker via
+    /// `try_reserve`. Used by the master to route scan responses without
+    /// decoding the wire frame. Read in Step 3 (scan egress routing).
+    #[allow(dead_code)]
+    pub(crate) internal_req_id: u32,
     /// Raw pointer into `W2mReceiver::in_flight[worker]`.
     /// Valid for the slot's lifetime: W2mReceiver outlives all slots
     /// (slots borrow from its mmaps), and the master thread is the
@@ -227,7 +234,7 @@ impl W2mReceiver {
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
         let hdr = unsafe { self.header(worker) };
         let cursor = hdr.read_cursor().load(Ordering::Acquire);
-        let (ptr, sz, new_vrc) = unsafe {
+        let (ptr, sz, new_vrc, req_id) = unsafe {
             w2m_ring::try_consume(hdr, self.region_ptrs[worker] as *const u8, cursor)?
         };
 
@@ -237,7 +244,7 @@ impl W2mReceiver {
         let state = self.in_flight[worker].get();
         let push_idx = unsafe { (*state).take(new_vrc) };
 
-        Some(W2mSlot { bytes, push_idx, state })
+        Some(W2mSlot { bytes, push_idx, internal_req_id: req_id, state })
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
@@ -321,8 +328,8 @@ mod tests {
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
-            writer.send_encoded(64, |s| { s[0] = 1; });
-            writer.send_encoded(64, |s| { s[0] = 2; });
+            writer.send_encoded(64, 0, |s| { s[0] = 1; });
+            writer.send_encoded(64, 0, |s| { s[0] = 2; });
 
             let slot_a = receiver.try_read_slot(0).expect("slot A");
             let new_vrc_a = hdr.read_cursor().load(Ordering::Acquire);
@@ -361,8 +368,8 @@ mod tests {
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
-            writer.send_encoded(64, |s| { s[0] = 1; });
-            writer.send_encoded(64, |s| { s[0] = 2; });
+            writer.send_encoded(64, 0, |s| { s[0] = 1; });
+            writer.send_encoded(64, 0, |s| { s[0] = 2; });
 
             let slot_a = receiver.try_read_slot(0).expect("slot A");
             let slot_b = receiver.try_read_slot(0).expect("slot B");
@@ -415,7 +422,7 @@ mod tests {
             // Spawn a thread that tries to publish a second message.
             // It will block until consume_cursor advances.
             let handle = std::thread::spawn(move || {
-                writer.send_encoded(msg_sz, |s| { s[0] = 2; });
+                writer.send_encoded(msg_sz, 0, |s| { s[0] = 2; });
                 let _ = done_tx.send(());
             });
 

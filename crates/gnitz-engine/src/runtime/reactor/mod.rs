@@ -34,7 +34,7 @@ use self::uring::IoUringRing;
 use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sys::FUTEX2_SIZE_U32;
-use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
+use crate::runtime::w2m_ring::{FLAG_MASTER_PARKED, MAX_W2M_REQUEST_ID};
 
 use io_uring::types::FutexWaitV;
 
@@ -368,12 +368,12 @@ impl Reactor {
     }
 
     /// Allocate a new master-side request_id. Strictly monotonic; values
-    /// 0 and `u64::MAX` are reserved (untagged, broadcast).
+    /// 0 and `u64::MAX` are reserved (untagged, broadcast). Bounded at
+    /// `MAX_W2M_REQUEST_ID` so the value always fits in the W2M ring prefix.
     pub fn alloc_request_id(&self) -> u64 {
         let id = self.inner.next_request_id.get();
-        // Skip the reserved sentinels on overflow / wrap.
         let next = match id.checked_add(1) {
-            Some(n) if n != u64::MAX => n,
+            Some(n) if n <= MAX_W2M_REQUEST_ID => n,
             _ => 1,
         };
         self.inner.next_request_id.set(next);
@@ -2768,7 +2768,7 @@ mod tests {
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
             let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
             for req_id in 1..=N_MESSAGES {
-                writer.send_encoded(sz, |buf| {
+                writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
                          0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
@@ -2873,7 +2873,7 @@ mod tests {
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
             let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
             for req_id in 1..=N_MESSAGES {
-                writer.send_encoded(sz, |buf| {
+                writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
                          0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
@@ -3223,20 +3223,22 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // alloc_request_id wrap: u64::MAX is reserved; the counter must
-    // skip it and wrap to 1.
+    // alloc_request_id wrap: must stay at or below MAX_W2M_REQUEST_ID
+    // so the value always fits in the W2M ring prefix.
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn alloc_request_id_skips_max_and_wraps_to_one() {
         let r = make_reactor();
-        // Position counter so the next allocation returns u64::MAX - 1
-        // and the one after would naturally hit u64::MAX (reserved).
-        r.inner.next_request_id.set(u64::MAX - 1);
+        // Position counter one below the last valid id so the next two
+        // allocations return the last two valid values, then wrap to 1.
+        r.inner.next_request_id.set(MAX_W2M_REQUEST_ID - 1);
         let id1 = r.alloc_request_id();
-        assert_eq!(id1, u64::MAX - 1);
+        assert_eq!(id1, MAX_W2M_REQUEST_ID - 1);
         let id2 = r.alloc_request_id();
-        assert_eq!(id2, 1, "counter must skip u64::MAX and wrap to 1");
-        assert_ne!(id2, u64::MAX, "u64::MAX is reserved and must never be returned");
+        assert_eq!(id2, MAX_W2M_REQUEST_ID);
+        let id3 = r.alloc_request_id();
+        assert_eq!(id3, 1, "counter must wrap after MAX_W2M_REQUEST_ID to 1");
+        assert!(id3 <= MAX_W2M_REQUEST_ID, "request_id must always fit in u32");
     }
 }
