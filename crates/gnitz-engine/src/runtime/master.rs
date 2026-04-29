@@ -14,8 +14,8 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire, col_names_as_refs};
-use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
@@ -686,8 +686,8 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
         client_id: u64,
-    ) -> Result<Vec<Batch>, String> {
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+    ) -> Result<Vec<W2mSlot>, String> {
+        let slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -695,13 +695,15 @@ impl MasterDispatcher {
                 0, 0, req_ids, -1, client_id,
             )
         }).await?;
-        if let Some(e) = first_worker_error("scan", &decoded_vec) {
-            return Err(e);
+        for (w, slot) in slots.iter().enumerate() {
+            let ctrl = peek_control_block(slot.bytes())
+                .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+            if ctrl.status != 0 {
+                let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
+                return Err(format!("worker {}: scan: {}", w, msg));
+            }
         }
-        Ok(decoded_vec.into_iter()
-            .filter_map(|d| d.data_batch)
-            .filter(|b| b.count > 0)
-            .collect())
+        Ok(slots)
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
@@ -1406,7 +1408,7 @@ impl MasterDispatcher {
             missing
         };
 
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        let slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -1414,6 +1416,14 @@ impl MasterDispatcher {
                 0, 0, req_ids, -1, 0,
             )
         }).await?;
+
+        let decoded_vec: Vec<DecodedWire> = slots.iter().enumerate()
+            .map(|(w, slot)| {
+                decode_wire_ipc(slot.bytes())
+                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(slots);
 
         if let Some(e) = first_worker_error("scan", &decoded_vec) {
             return Err(e);
@@ -1562,6 +1572,31 @@ where
         }
     }
     let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
+    Ok(crate::runtime::reactor::join_all(futs).await)
+}
+
+/// Like `dispatch_fanout` but uses scan request ids and returns raw `W2mSlot`s
+/// for zero-copy forwarding. `sal_excl` semantics are identical.
+pub(crate) async fn dispatch_scan_fanout<F>(
+    disp_ptr: *mut MasterDispatcher,
+    reactor: &crate::runtime::reactor::Reactor,
+    sal_excl: &Rc<AsyncMutex<()>>,
+    submit: F,
+) -> Result<Vec<W2mSlot>, String>
+where
+    F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
+{
+    let nw = unsafe { (*disp_ptr).num_workers };
+    let req_ids: Vec<u64> = (0..nw).map(|_| reactor.alloc_scan_request_id()).collect();
+    {
+        let _guard = sal_excl.lock().await;
+        unsafe {
+            let disp = &mut *disp_ptr;
+            submit(disp, &req_ids)?;
+            disp.signal_all();
+        }
+    }
+    let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_scan_slot(id as u32)).collect();
     Ok(crate::runtime::reactor::join_all(futs).await)
 }
 

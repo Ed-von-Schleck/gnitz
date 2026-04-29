@@ -1519,6 +1519,7 @@ pub fn write_to_batch(
 }
 
 /// Byte count of the WAL block needed to encode `batches` as one combined data block.
+#[allow(dead_code)]
 pub fn wire_byte_size_multi(batches: &[Batch]) -> usize {
     let first = match batches.iter().find(|b| b.count > 0) {
         Some(b) => b,
@@ -1545,6 +1546,7 @@ pub fn wire_byte_size_multi(batches: &[Batch]) -> usize {
 /// batch so offsets are correct in the concatenated output blob.
 /// Short strings (≤ SHORT_STRING_THRESHOLD bytes) are copied verbatim.
 /// Returns bytes written.
+#[allow(dead_code)]
 pub fn encode_multi_to_wire(
     batches: &[Batch],
     table_id: u32,

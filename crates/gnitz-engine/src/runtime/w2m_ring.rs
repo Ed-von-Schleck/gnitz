@@ -91,10 +91,6 @@ pub const FLAG_MASTER_PARKED: u32 = 1 << 1;
 /// `u64::MAX` is safe because legitimate sizes are capped at `MAX_W2M_MSG`.
 pub const SKIP_MARKER: u64 = u64::MAX;
 
-/// Largest valid request_id (inclusive). The ring prefix stores req_id in the
-/// low 32 bits of an 8-byte word, so ids must fit in a u32.
-pub const MAX_W2M_REQUEST_ID: u64 = u32::MAX as u64 - 1;
-
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, 2 cache lines)
 // ---------------------------------------------------------------------------

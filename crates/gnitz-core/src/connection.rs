@@ -4,7 +4,7 @@ use crate::protocol::{
     Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
-    FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
+    FLAG_CONFLICT_MODE_PRESENT, FLAG_CONTINUATION, WireConflictMode,
     send_message, recv_message,
     connect as proto_connect,
 };
@@ -94,8 +94,26 @@ impl Connection {
         &self,
         target_id: u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        let msg = self.roundtrip(target_id, 0, None, None)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
+        // Send the scan request then collect streaming worker frames
+        // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, 0, 0u128, 0, None, None)?;
+        let mut schema: Option<Schema> = None;
+        let mut data:   Option<ZSetBatch> = None;
+        let lsn: u64 = loop {
+            let msg = check_response(recv_message(self.sock.as_raw_fd(), None)?)?;
+            let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
+            schema = schema.or(msg.schema);
+            if let Some(batch) = msg.data_batch {
+                match data.as_mut() {
+                    Some(acc) => acc.extend_from(&batch),
+                    None => data = Some(batch),
+                }
+            }
+            if !is_continuation {
+                break msg.seek_pk as u64;
+            }
+        };
+        Ok((schema, data, lsn))
     }
 
     pub fn seek(

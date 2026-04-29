@@ -233,6 +233,10 @@ pub const FLAG_SEEK_BY_INDEX:  u64 = 256;
 pub const FLAG_CONFLICT_MODE_PRESENT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA:     u64 = 1 << 48;
 pub const FLAG_HAS_DATA:       u64 = 1 << 49;
+/// Set on every per-worker scan response frame. Absent on the terminal
+/// frame sent by the master after all worker frames. Clients loop on
+/// `recv_message` until they see a frame without this bit.
+pub const FLAG_CONTINUATION:   u64 = 1 << 52;
 
 // ---------------------------------------------------------------------------
 // Wire-level conflict mode for INSERT / UPSERT semantics

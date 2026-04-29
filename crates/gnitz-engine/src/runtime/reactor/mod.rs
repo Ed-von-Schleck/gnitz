@@ -34,7 +34,16 @@ use self::uring::IoUringRing;
 use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sys::FUTEX2_SIZE_U32;
-use crate::runtime::w2m_ring::{FLAG_MASTER_PARKED, MAX_W2M_REQUEST_ID};
+use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
+
+/// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
+/// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
+/// Scan IDs stay in [SCAN_REQ_ID_BASE, 0xFFFFFFFE] (bit 31 set).
+/// Detection in `drain_w2m_for_worker` is a single bitwise AND — zero
+/// HashMap overhead on the push/seek hot path.
+pub(crate) const SCAN_REQ_ID_FLAG: u32 = 1 << 31;
+const MAX_REGULAR_REQ_ID: u64 = (SCAN_REQ_ID_FLAG - 1) as u64; // 0x7FFFFFFF
+const SCAN_REQ_ID_BASE: u32 = SCAN_REQ_ID_FLAG | 1;             // 0x80000001
 
 use io_uring::types::FutexWaitV;
 
@@ -136,6 +145,7 @@ struct ReactorShared {
     #[cfg(test)]
     injected_cqes: RefCell<VecDeque<Cqe>>,
     next_request_id: Cell<u64>,
+    next_scan_req_id: Cell<u32>,
     next_send_id: Cell<u64>,
     /// Per-fd connection state (recv decoder + send queue). Boxed so the
     /// inline hdr buffer address survives HashMap resizes — io_uring SQEs
@@ -182,6 +192,12 @@ struct ReactorShared {
     /// dispatches it to the relay task via `relay_tx`.
     exchange_acc: RefCell<ExchangeAccumulator>,
     relay_tx: RefCell<Option<mpsc::Sender<PendingRelay>>>,
+    /// Scan-slot wakers keyed by `internal_req_id` (u32). Populated by
+    /// `await_scan_slot` futures; drained by `route_scan_slot`.
+    scan_wakers: RefCell<HashMap<u32, Waker>>,
+    /// Scan slots parked between `route_scan_slot` and the awaiting
+    /// `ScanSlotFuture::poll`.
+    scan_parked: RefCell<HashMap<u32, W2mSlot>>,
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<std::collections::HashSet<i32>>,
@@ -276,6 +292,7 @@ impl Reactor {
             #[cfg(test)]
             injected_cqes: RefCell::new(VecDeque::new()),
             next_request_id: Cell::new(1),
+            next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
             next_send_id: Cell::new(1),
             conns: RefCell::new(HashMap::new()),
             server_fd: Cell::new(-1),
@@ -292,6 +309,8 @@ impl Reactor {
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
             closing_fds: RefCell::new(std::collections::HashSet::new()),
+            scan_wakers: RefCell::new(HashMap::new()),
+            scan_parked: RefCell::new(HashMap::new()),
         });
         Ok(Reactor { inner })
     }
@@ -367,17 +386,30 @@ impl Reactor {
         *self.inner.futex_waitv_storage.borrow_mut() = None;
     }
 
-    /// Allocate a new master-side request_id. Strictly monotonic; values
-    /// 0 and `u64::MAX` are reserved (untagged, broadcast). Bounded at
-    /// `MAX_W2M_REQUEST_ID` so the value always fits in the W2M ring prefix.
+    /// Allocate a regular (non-scan) request_id. Bit 31 is always clear,
+    /// so `drain_w2m_for_worker` can distinguish these from scan IDs by
+    /// a single bitwise AND without a HashMap lookup.
     pub fn alloc_request_id(&self) -> u64 {
         let id = self.inner.next_request_id.get();
         let next = match id.checked_add(1) {
-            Some(n) if n <= MAX_W2M_REQUEST_ID => n,
+            Some(n) if n <= MAX_REGULAR_REQ_ID => n,
             _ => 1,
         };
         self.inner.next_request_id.set(next);
         id
+    }
+
+    /// Allocate a scan request_id (bit 31 set). The hot-path check in
+    /// `drain_w2m_for_worker` is `internal_req_id & SCAN_REQ_ID_FLAG != 0`
+    /// — a single AND with no HashMap borrow on every push/seek ack.
+    pub fn alloc_scan_request_id(&self) -> u64 {
+        let id = self.inner.next_scan_req_id.get();
+        let next = match id.checked_add(1) {
+            Some(n) if n != 0 => n, // wraps only at u32 overflow
+            _ => SCAN_REQ_ID_BASE,
+        };
+        self.inner.next_scan_req_id.set(next);
+        id as u64
     }
 
     /// Spawn a task that runs detached. Returns the task key (useful for
@@ -434,6 +466,17 @@ impl Reactor {
     /// Future that resolves to the decoded W2M reply for `req_id`.
     pub fn await_reply(&self, req_id: u64) -> impl Future<Output = DecodedWire> {
         ReplyFuture {
+            req_id,
+            inner: Rc::clone(&self.inner),
+        }
+    }
+
+    /// Return a future that resolves to the raw `W2mSlot` routed to
+    /// `internal_req_id`. The scan-intercept path in `drain_w2m_for_worker`
+    /// fires it ahead of flag-based routing so scan response frames are
+    /// never decoded into `Batch` on the master side.
+    pub fn await_scan_slot(&self, req_id: u32) -> impl Future<Output = W2mSlot> {
+        ScanSlotFuture {
             req_id,
             inner: Rc::clone(&self.inner),
         }
@@ -1075,6 +1118,13 @@ impl Reactor {
         let w2m = self.inner.w2m.get()
             .expect("drain_w2m_for_worker called before attach_w2m");
         while let Some(slot) = w2m.try_read_slot(w) {
+            // Scan-slot intercept: bit 31 of internal_req_id is set for
+            // scan-allocated IDs (alloc_scan_request_id). Single AND, no
+            // HashMap borrow — keeps the push/seek hot path overhead zero.
+            if slot.internal_req_id & SCAN_REQ_ID_FLAG != 0 {
+                self.route_scan_slot(slot);
+                continue;
+            }
             let ctrl = wire::peek_control_block(slot.bytes())
                 .expect("W2M control block corrupt — ring corrupt");
             let ctrl_size = u32::from_le_bytes(
@@ -1088,6 +1138,14 @@ impl Reactor {
             } else {
                 self.park_owned(w, slot, ctrl, ctrl_size);
             }
+        }
+    }
+
+    fn route_scan_slot(&self, slot: W2mSlot) {
+        let req_id = slot.internal_req_id;
+        self.inner.scan_parked.borrow_mut().insert(req_id, slot);
+        if let Some(waker) = self.inner.scan_wakers.borrow_mut().remove(&req_id) {
+            waker.wake();
         }
     }
 
@@ -1241,6 +1299,12 @@ impl Reactor {
         self.route_reply(w, decoded)
     }
 
+    /// Test-only: drive `route_scan_slot` with a real slot.
+    #[cfg(test)]
+    pub fn test_route_scan_slot(&self, slot: W2mSlot) {
+        self.route_scan_slot(slot);
+    }
+
     #[cfg(test)]
     pub fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
@@ -1369,6 +1433,23 @@ impl Future for ReplyFuture {
             return Poll::Ready(decoded);
         }
         self.inner.reply_wakers.borrow_mut()
+            .insert(self.req_id, cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct ScanSlotFuture {
+    req_id: u32,
+    inner: Rc<ReactorShared>,
+}
+
+impl Future for ScanSlotFuture {
+    type Output = W2mSlot;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<W2mSlot> {
+        if let Some(slot) = self.inner.scan_parked.borrow_mut().remove(&self.req_id) {
+            return Poll::Ready(slot);
+        }
+        self.inner.scan_wakers.borrow_mut()
             .insert(self.req_id, cx.waker().clone());
         Poll::Pending
     }
@@ -3223,22 +3304,146 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // alloc_request_id wrap: must stay at or below MAX_W2M_REQUEST_ID
-    // so the value always fits in the W2M ring prefix.
+    // alloc_request_id: bit 31 always clear; wraps at MAX_REGULAR_REQ_ID.
+    // alloc_scan_request_id: bit 31 always set; wraps at u32::MAX.
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn alloc_request_id_skips_max_and_wraps_to_one() {
+    fn alloc_request_id_wraps_within_regular_range() {
         let r = make_reactor();
-        // Position counter one below the last valid id so the next two
-        // allocations return the last two valid values, then wrap to 1.
-        r.inner.next_request_id.set(MAX_W2M_REQUEST_ID - 1);
+        r.inner.next_request_id.set(MAX_REGULAR_REQ_ID - 1);
         let id1 = r.alloc_request_id();
-        assert_eq!(id1, MAX_W2M_REQUEST_ID - 1);
+        assert_eq!(id1, MAX_REGULAR_REQ_ID - 1);
         let id2 = r.alloc_request_id();
-        assert_eq!(id2, MAX_W2M_REQUEST_ID);
+        assert_eq!(id2, MAX_REGULAR_REQ_ID);
         let id3 = r.alloc_request_id();
-        assert_eq!(id3, 1, "counter must wrap after MAX_W2M_REQUEST_ID to 1");
-        assert!(id3 <= MAX_W2M_REQUEST_ID, "request_id must always fit in u32");
+        assert_eq!(id3, 1, "must wrap to 1 after MAX_REGULAR_REQ_ID");
+        assert!(id3 & SCAN_REQ_ID_FLAG as u64 == 0, "bit 31 must be clear");
+    }
+
+    #[test]
+    fn alloc_scan_request_id_bit31_always_set() {
+        let r = make_reactor();
+        for _ in 0..1000 {
+            let id = r.alloc_scan_request_id();
+            assert!(id & SCAN_REQ_ID_FLAG as u64 != 0, "bit 31 must be set");
+        }
+    }
+
+    #[test]
+    fn regular_and_scan_ids_never_collide() {
+        let r = make_reactor();
+        let regular_ids: std::collections::HashSet<u64> =
+            (0..10000).map(|_| r.alloc_request_id()).collect();
+        let scan_ids: std::collections::HashSet<u64> =
+            (0..10000).map(|_| r.alloc_scan_request_id()).collect();
+        assert!(regular_ids.is_disjoint(&scan_ids), "regular and scan IDs must not overlap");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // route_scan_slot: park-before-wake ordering.
+    //
+    // The bug: the old impl woke the waker before parking the slot.
+    // If a slot arrived before the future was first polled (no waker
+    // yet registered), the slot was silently dropped and join_all
+    // would hang forever.  The fix parks unconditionally, then wakes
+    // if a waker is present — matching the behaviour of route_reply.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a minimal W2M ring and write one scan slot with `req_id`.
+    /// The returned `W2mReceiver` owns the `InFlightState` that the slot's Drop
+    /// references — it must be kept alive until after the slot is dropped.
+    /// Caller must munmap the returned pointer after both receiver and slot drop.
+    unsafe fn make_scan_slot(req_id: u32)
+        -> (crate::runtime::w2m::W2mSlot, crate::runtime::w2m::W2mReceiver, *mut u8, usize)
+    {
+        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::wire::{self as ipc, STATUS_OK};
+
+        const CAPACITY: usize = 4096;
+        let ptr = libc::mmap(
+            std::ptr::null_mut(), CAPACITY,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+        ) as *mut u8;
+        assert!(!ptr.is_null());
+        std::ptr::write_bytes(ptr, 0, CAPACITY);
+        w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+
+        let writer   = W2mWriter::new(ptr, CAPACITY as u64);
+        let receiver = W2mReceiver::new(vec![ptr]);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
+        writer.send_encoded(sz, req_id, |buf| {
+            ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None);
+        });
+        let slot = receiver.try_read_slot(0).expect("scan slot");
+        (slot, receiver, ptr, CAPACITY)
+    }
+
+    #[test]
+    fn route_scan_slot_parks_when_no_waker_registered() {
+        // Slot arrives before any future is polled: must be parked, not dropped.
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+
+        r.test_route_scan_slot(slot);
+
+        assert!(r.inner.scan_parked.borrow().contains_key(&req_id),
+            "slot must be parked when no waker is registered");
+        assert!(r.inner.scan_wakers.borrow().is_empty(),
+            "no waker should have been inserted");
+
+        r.inner.scan_parked.borrow_mut().remove(&req_id); // drop slot, advance consume_cursor
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    #[test]
+    fn await_scan_slot_resolves_immediately_when_slot_preloaded() {
+        // The bug scenario: slot arrives and is parked BEFORE the future is
+        // first polled. The first poll must return Poll::Ready, not Poll::Pending.
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+
+        r.test_route_scan_slot(slot); // park before any poll
+
+        let fut = r.await_scan_slot(req_id);
+        let result = r.block_on(async move { fut.await });
+        assert_eq!(result.internal_req_id, req_id,
+            "first poll must return the pre-parked slot");
+
+        drop(result); // advance consume_cursor before munmap
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    #[test]
+    fn await_scan_slot_resolves_after_route_fires_waker() {
+        // Normal path: future polled first (registers waker), then slot arrives.
+        use std::cell::Cell;
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+
+        let delivered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let delivered2 = Rc::clone(&delivered);
+        let fut = r.await_scan_slot(req_id);
+        r.spawn(async move {
+            let s = fut.await;
+            assert_eq!(s.internal_req_id, req_id);
+            delivered2.set(true);
+        });
+
+        r.poll_nonblocking(); // poll task → Poll::Pending, waker registered
+        assert!(r.inner.scan_wakers.borrow().contains_key(&req_id),
+            "waker must be registered after first poll");
+        assert!(!delivered.get(), "must not be delivered yet");
+
+        r.test_route_scan_slot(slot); // park + wake
+        r.poll_nonblocking();         // task woken → Poll::Ready
+
+        assert!(delivered.get(), "slot must be delivered after route_scan_slot");
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
     }
 }

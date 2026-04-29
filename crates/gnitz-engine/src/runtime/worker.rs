@@ -13,7 +13,7 @@ use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::storage::partition_for_key;
 use crate::ops::worker_for_partition;
-use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION};
 use crate::runtime::sal::{
     SAL_MMAP_SIZE, FLAG_EXCHANGE, FLAG_CHECKPOINT,
     SalReader, SalMessageKind,
@@ -746,8 +746,8 @@ impl WorkerProcess {
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into(
-                buf, 0, target_id, client_id, 0,
-                0u128, 0, request_id, // TODO: switch to request_id=0 once internal_req_id routing is in place
+                buf, 0, target_id, client_id, FLAG_CONTINUATION,
+                0u128, 0, 0, // request_id=0: routing uses internal_req_id from ring prefix
                 STATUS_OK, &[],
                 schema, None, result, prebuilt,
             );

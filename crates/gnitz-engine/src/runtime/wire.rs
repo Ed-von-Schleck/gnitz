@@ -9,7 +9,7 @@ use crate::util::align8;
 // ---------------------------------------------------------------------------
 
 pub use gnitz_wire::{
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, IPC_CONTROL_TID,
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_CONTINUATION, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     FLAG_CONFLICT_MODE_PRESENT as FLAG_CONFLICT_MODE_PRESENT_U64,
     WireConflictMode,
@@ -385,93 +385,6 @@ pub fn encode_wire_into_ipc(
     )
 }
 
-/// Like `wire_size` but for multi-batch scan responses. No `col_names` parameter;
-/// always pass `prebuilt_schema_block` for the hot SCAN path.
-pub fn wire_size_multi(
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    batches: &[Batch],
-    prebuilt_schema_block: Option<&[u8]>,
-) -> usize {
-    let has_data = batches.iter().any(|b| b.count > 0);
-    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
-
-    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-        error_msg.len()
-    } else { 0 };
-    let mut total = schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob);
-
-    if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            total += prebuilt.len();
-        } else {
-            let s = schema.unwrap();
-            let ncols = s.num_columns as usize;
-            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, 0);
-        }
-    }
-
-    if has_data {
-        total += crate::storage::wire_byte_size_multi(batches);
-    }
-    total
-}
-
-/// Encode a full wire response carrying multiple scan batches as one data block.
-/// Returns bytes written.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_wire_into_multi(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    batches: &[Batch],
-    prebuilt_schema_block: Option<&[u8]>,
-) -> usize {
-    let has_data = batches.iter().any(|b| b.count > 0);
-    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
-
-    let mut wire_flags = flags;
-    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
-    if has_data {
-        wire_flags |= FLAG_HAS_DATA;
-        let (all_sorted, all_consolidated) = batches.iter()
-            .fold((true, true), |(s, c), b| (s && b.sorted, c && b.consolidated));
-        if all_sorted { wire_flags |= FLAG_BATCH_SORTED; }
-        if all_consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
-    }
-
-    let written = encode_ctrl_block_ipc(out, offset, target_id, client_id, wire_flags,
-                                        seek_pk, seek_col_idx, request_id, status, error_msg, true);
-    let mut pos = offset + written;
-
-    if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            let end = pos + prebuilt.len();
-            out[pos..end].copy_from_slice(prebuilt);
-            pos = end;
-        } else {
-            let schema_batch = schema_to_batch(schema.unwrap(), &[]);
-            let written = schema_batch.encode_to_wire(target_id as u32, out, pos, true);
-            pos += written;
-        }
-    }
-
-    if has_data {
-        let written = crate::storage::encode_multi_to_wire(batches, target_id as u32, out, pos, true);
-        pos += written;
-    }
-
-    pos - offset
-}
 
 #[allow(clippy::too_many_arguments)]
 fn encode_wire_into_impl(

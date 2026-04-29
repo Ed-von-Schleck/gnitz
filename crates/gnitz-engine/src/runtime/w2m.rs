@@ -175,11 +175,12 @@ impl InFlightState {
 /// out-of-order slots complete a contiguous prefix) and wakes a parked writer.
 pub struct W2mSlot {
     bytes:    &'static [u8],
+    /// Borrowed directly from the ring prefix to forward to `send_buffer` without re-encoding.
+    frame:    &'static [u8],
     push_idx: u64,
     /// `internal_req_id` from the slot prefix, set by the worker via
     /// `try_reserve`. Used by the master to route scan responses without
-    /// decoding the wire frame. Read in Step 3 (scan egress routing).
-    #[allow(dead_code)]
+    /// decoding the wire frame.
     pub(crate) internal_req_id: u32,
     /// Raw pointer into `W2mReceiver::in_flight[worker]`.
     /// Valid for the slot's lifetime: W2mReceiver outlives all slots
@@ -190,6 +191,8 @@ pub struct W2mSlot {
 
 impl W2mSlot {
     pub fn bytes(&self) -> &[u8] { self.bytes }
+    /// The framed bytes ready for `send_buffer`: `[sz_as_u32_le | payload]`.
+    pub(crate) fn frame_bytes(&self) -> &[u8] { self.frame }
 }
 
 impl Drop for W2mSlot {
@@ -241,10 +244,14 @@ impl W2mReceiver {
         hdr.advance_read_cursor(new_vrc);
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, sz as usize) };
+        // The 4 bytes at ptr-4 hold `sz as u32 LE` (the client length prefix).
+        // Together with the payload they form the exact framed buffer that
+        // `send_buffer` expects, avoiding a re-encode on the scan egress path.
+        let frame = unsafe { std::slice::from_raw_parts(ptr.sub(4), sz as usize + 4) };
         let state = self.in_flight[worker].get();
         let push_idx = unsafe { (*state).take(new_vrc) };
 
-        Some(W2mSlot { bytes, push_idx, internal_req_id: req_id, state })
+        Some(W2mSlot { bytes, frame, push_idx, internal_req_id: req_id, state })
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {

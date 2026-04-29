@@ -173,6 +173,25 @@ impl ZSetBatch {
         self.pks.is_empty()
     }
 
+    /// Append all rows from `other` into `self`. Panics if column layouts differ.
+    pub fn extend_from(&mut self, other: &ZSetBatch) {
+        match (&mut self.pks, &other.pks) {
+            (PkColumn::U64s(a), PkColumn::U64s(b)) => a.extend_from_slice(b),
+            (PkColumn::U128s(a), PkColumn::U128s(b)) => a.extend_from_slice(b),
+            _ => panic!("extend_from: pk column type mismatch"),
+        }
+        self.weights.extend_from_slice(&other.weights);
+        self.nulls.extend_from_slice(&other.nulls);
+        for (a, b) in self.columns.iter_mut().zip(other.columns.iter()) {
+            match (a, b) {
+                (ColData::Fixed(a), ColData::Fixed(b)) => a.extend_from_slice(b),
+                (ColData::Strings(a), ColData::Strings(b)) => a.extend(b.iter().cloned()),
+                (ColData::U128s(a), ColData::U128s(b)) => a.extend_from_slice(b),
+                _ => panic!("extend_from: column type mismatch"),
+            }
+        }
+    }
+
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
         let n = self.pks.len();

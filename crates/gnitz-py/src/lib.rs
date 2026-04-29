@@ -1579,6 +1579,38 @@ impl Drop for PyAsyncTransport {
     }
 }
 
+/// Receive a streaming scan response: loop on `recv_framed` + `parse_response`
+/// until a frame without `FLAG_CONTINUATION` arrives, accumulating schema and
+/// data from each worker frame.  The terminal frame carries the LSN in seek_pk.
+fn recv_scan_response(sock_fd: std::os::unix::io::RawFd) -> Result<gnitz_core::Message, String> {
+    let mut schema: Option<Schema> = None;
+    let mut data:   Option<ZSetBatch> = None;
+    let lsn: u128 = loop {
+        let buf = gnitz_core::recv_framed(sock_fd).map_err(|e| e.to_string())?;
+        let msg = gnitz_core::parse_response(&buf).map_err(|e| e.to_string())?;
+        if msg.status != 0 {
+            return Err(msg.error_text.unwrap_or_default());
+        }
+        let is_continuation = (msg.flags & gnitz_core::FLAG_CONTINUATION) != 0;
+        schema = schema.or(msg.schema);
+        if let Some(batch) = msg.data_batch {
+            match data.as_mut() {
+                Some(acc) => acc.extend_from(&batch),
+                None => data = Some(batch),
+            }
+        }
+        if !is_continuation {
+            break msg.seek_pk;
+        }
+    };
+    Ok(gnitz_core::Message {
+        status: 0,
+        target_id: 0, client_id: 0, flags: 0,
+        seek_pk: lsn, seek_col_idx: 0, request_id: 0,
+        schema, schema_batch: None, data_batch: data, error_text: None,
+    })
+}
+
 fn async_io_loop(
     sock_fd:  std::os::unix::io::RawFd,
     rx:       std::sync::mpsc::Receiver<IoRequest>,
@@ -1627,27 +1659,26 @@ fn async_io_loop(
             }
         }
 
-        // Recv all responses for this batch (pure Rust, no GIL)
-        let n = batch.len();
-        let mut results: Vec<Result<gnitz_core::Message, String>> = Vec::with_capacity(n);
+        // Recv all responses for this batch (pure Rust, no GIL).
+        // Scan requests use recv_scan_response to collect streaming frames.
+        let mut results: Vec<Result<gnitz_core::Message, String>> = Vec::with_capacity(batch.len());
         let mut recv_failed = false;
-        for _ in 0..n {
+        for req in &batch {
             if recv_failed {
                 results.push(Err("connection lost".to_string()));
                 continue;
             }
-            match gnitz_core::recv_framed(sock_fd) {
-                Ok(buf) => match gnitz_core::parse_response(&buf) {
-                    Ok(msg) => results.push(Ok(msg)),
-                    Err(e)  => {
-                        results.push(Err(e.to_string()));
-                        recv_failed = true;
-                    }
-                },
-                Err(e) => {
-                    results.push(Err(e.to_string()));
-                    recv_failed = true;
+            let recv_result = match req.kind {
+                ResponseKind::Scan => recv_scan_response(sock_fd),
+                ResponseKind::Push => {
+                    gnitz_core::recv_framed(sock_fd)
+                        .map_err(|e| e.to_string())
+                        .and_then(|buf| gnitz_core::parse_response(&buf).map_err(|e| e.to_string()))
                 }
+            };
+            match recv_result {
+                Ok(msg)  => results.push(Ok(msg)),
+                Err(e)   => { results.push(Err(e)); recv_failed = true; }
             }
         }
 

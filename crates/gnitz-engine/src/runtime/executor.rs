@@ -653,7 +653,6 @@ async fn handle_scan(
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
-    let schema = shared.get_schema_desc(target_id);
     // Drain pending ticks before reading: views derive from source-table
     // pushes through the DAG (IV.2). Loop until `tick_rows` is empty —
     // a push landing during the tick may add more rows; the outer
@@ -676,11 +675,36 @@ async fn handle_scan(
         shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id, client_id,
     ).await;
     match result {
-        Ok(batches) => {
-            send_ok_response_multi(shared, fd, target_id, &batches, client_id, &schema, lsn as u128).await;
+        Ok(worker_slots) => {
+            let frames: Vec<Vec<u8>> = worker_slots.into_iter()
+                .map(|slot| slot.frame_bytes().to_vec())
+                .collect();
+            // All W2mSlots dropped above; consume_cursors advance before I/O.
+            for frame in frames {
+                let rc = shared.reactor.send_buffer(fd, frame).await;
+                if rc < 0 { shared.reactor.close_fd(fd); return; }
+            }
+            let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
+            let rc = shared.reactor.send_buffer(fd, terminal).await;
+            if rc < 0 { shared.reactor.close_fd(fd); }
         }
         Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }
+}
+
+fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> Vec<u8> {
+    let sz = ipc::wire_size(STATUS_OK, b"", None, None, None, None);
+    let total = 4 + sz;
+    let mut buf = vec![0u8; total];
+    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
+    ipc::encode_wire_into(
+        &mut buf[4..total], 0,
+        target_id as u64, client_id, 0,
+        lsn as u128, 0, 0,
+        STATUS_OK, b"",
+        None, None, None, None,
+    );
+    buf
 }
 
 /// System-table path: catalog ingest + (optionally) DDL broadcast.
@@ -847,38 +871,6 @@ async fn send_ok_response(
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
         schema, Some(schema_block.as_slice()), seek_pk,
-    );
-    let rc = shared.reactor.send_buffer(fd, buf).await;
-    if rc < 0 { shared.reactor.close_fd(fd); }
-}
-
-fn encode_response_buffer_multi(
-    target_id: i64, client_id: u64,
-    batches: &[Batch], schema: &SchemaDescriptor,
-    prebuilt_schema: Option<&[u8]>, seek_pk: u128,
-) -> Vec<u8> {
-    let sz = ipc::wire_size_multi(STATUS_OK, b"", Some(schema), batches, prebuilt_schema);
-    let total = 4 + sz;
-    let mut buf: Vec<u8> = vec![0; total];
-    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = ipc::encode_wire_into_multi(
-        &mut buf[4..total], 0,
-        target_id as u64, client_id, 0, seek_pk, 0, 0,
-        STATUS_OK, b"", Some(schema), batches, prebuilt_schema,
-    );
-    debug_assert_eq!(written, sz);
-    buf
-}
-
-async fn send_ok_response_multi(
-    shared: &Rc<Shared>, fd: i32, target_id: i64,
-    batches: &[Batch], client_id: u64,
-    schema: &SchemaDescriptor, seek_pk: u128,
-) {
-    let schema_block = shared.get_schema_wire_block(target_id);
-    let buf = encode_response_buffer_multi(
-        target_id, client_id, batches, schema,
-        Some(schema_block.as_slice()), seek_pk,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
