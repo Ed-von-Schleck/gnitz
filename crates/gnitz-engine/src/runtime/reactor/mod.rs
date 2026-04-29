@@ -178,9 +178,9 @@ struct ReactorShared {
     /// no waker has been installed yet.
     send_wakers: RefCell<HashMap<u64, Waker>>,
     send_fd_for_id: RefCell<HashMap<u64, i32>>,
-    /// Buffers stashed here outlive their owning `SendFuture` when it is
+    /// Keep-alives stashed here outlive their owning `SendFuture` when it is
     /// dropped before the CQE arrives. The CQE handler removes the entry.
-    send_buffers_in_flight: RefCell<HashMap<u64, Rc<Vec<u8>>>>,
+    send_buffers_in_flight: RefCell<HashMap<u64, SendAlive>>,
     /// Send results parked before their waker was installed (same pattern
     /// as parked_replies / parked_fsync_results).
     parked_send_results: RefCell<HashMap<u64, i32>>,
@@ -722,10 +722,27 @@ impl Reactor {
     /// when the kernel's socket buffer fills up.
     pub async fn send_buffer(&self, fd: i32, buf: Vec<u8>) -> i32 {
         let len = buf.len();
-        // Rc so a dropped outer future hands the allocation to the
-        // in-flight SendFuture, which parks it until the CQE fires
-        // (the kernel still dereferences the pointer).
-        let buf_rc: Rc<Vec<u8>> = Rc::new(buf);
+        let ptr = buf.as_ptr();
+        self.send_buf_inner(fd, ptr, len, SendAlive::Heap(Rc::new(buf))).await
+    }
+
+    /// Send the frame bytes of a W2M ring slot directly, without copying.
+    ///
+    /// The slot is kept alive (consume_cursor stays fixed) until the io_uring
+    /// OP_SEND CQE fires, at which point the kernel has consumed the data and
+    /// the slot is dropped, advancing the cursor.
+    pub async fn send_slot(&self, fd: i32, slot: W2mSlot) -> i32 {
+        let frame = slot.frame_bytes();
+        let (ptr, len) = (frame.as_ptr(), frame.len());
+        self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))).await
+    }
+
+    /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
+    async fn send_buf_inner(
+        &self, fd: i32,
+        ptr: *const u8, len: usize,
+        alive: SendAlive,
+    ) -> i32 {
         let mut sent: usize = 0;
         let mut final_rc: i32 = 0;
         while sent < len {
@@ -734,11 +751,11 @@ impl Reactor {
                 conn.send_inflight += 1;
             }
             self.inner.send_fd_for_id.borrow_mut().insert(send_id, fd);
-            let ptr = unsafe { buf_rc.as_ptr().add(sent) };
+            let cur_ptr = unsafe { ptr.add(sent) };
             let remaining = (len - sent) as u32;
             {
                 let mut ring = self.inner.ring.borrow_mut();
-                ring.prep_send(fd, ptr, remaining, udata(KIND_SEND, send_id));
+                ring.prep_send(fd, cur_ptr, remaining, udata(KIND_SEND, send_id));
                 if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
                     crate::gnitz_error!(
                         "reactor: send SQE flush failed for send_id={} (errno={}); \
@@ -749,7 +766,7 @@ impl Reactor {
             }
             let rc = SendFuture {
                 send_id,
-                _buf: Some(Rc::clone(&buf_rc)),
+                _alive: Some(alive.clone()),
                 inner: Rc::clone(&self.inner),
             }.await;
             if rc < 0 { final_rc = rc; break; }
@@ -1514,9 +1531,23 @@ impl Future for RecvFuture {
     }
 }
 
+enum SendAlive {
+    Heap(Rc<Vec<u8>>),
+    Slot(Rc<W2mSlot>),
+}
+
+impl Clone for SendAlive {
+    fn clone(&self) -> Self {
+        match self {
+            SendAlive::Heap(rc) => SendAlive::Heap(Rc::clone(rc)),
+            SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
+        }
+    }
+}
+
 pub struct SendFuture {
     send_id: u64,
-    _buf: Option<Rc<Vec<u8>>>,
+    _alive: Option<SendAlive>,
     inner: Rc<ReactorShared>,
 }
 
@@ -1525,7 +1556,7 @@ impl Future for SendFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
         let parked = self.inner.parked_send_results.borrow_mut().remove(&self.send_id);
         if let Some(rc) = parked {
-            self._buf.take();
+            self._alive.take();
             return Poll::Ready(rc);
         }
         let send_id = self.send_id;
@@ -1537,11 +1568,11 @@ impl Future for SendFuture {
 
 impl Drop for SendFuture {
     fn drop(&mut self) {
-        // CQE hasn't arrived — park the buffer in the reactor so the
+        // CQE hasn't arrived — park the keep-alive in the reactor so the
         // kernel's pointer stays valid until KIND_SEND fires.
-        if let Some(buf) = self._buf.take() {
+        if let Some(alive) = self._alive.take() {
             self.inner.send_buffers_in_flight.borrow_mut()
-                .insert(self.send_id, buf);
+                .insert(self.send_id, alive);
         }
     }
 }
@@ -2413,7 +2444,7 @@ mod tests {
         let r = make_reactor();
         // Pre-populate an in-flight buffer and a conn with send_inflight=1.
         r.inner.send_buffers_in_flight.borrow_mut()
-            .insert(77, Rc::new(vec![0u8; 16]));
+            .insert(77, SendAlive::Heap(Rc::new(vec![0u8; 16])));
         r.inner.send_fd_for_id.borrow_mut().insert(77, 42);
         r.inner.conns.borrow_mut().insert(42, Box::new(io::Conn::new()));
         if let Some(c) = r.inner.conns.borrow_mut().get_mut(&42) {
@@ -2441,18 +2472,19 @@ mod tests {
     #[test]
     fn send_future_drop_parks_buffer_rc() {
         let r = make_reactor();
-        let buf: Rc<Vec<u8>> = Rc::new(vec![0xAB; 64]);
+        let buf = vec![0xAB_u8; 64];
         {
             // Build and drop a SendFuture without it ever becoming Ready.
             let _fut = SendFuture {
                 send_id: 88,
-                _buf: Some(Rc::clone(&buf)),
+                _alive: Some(SendAlive::Heap(Rc::new(buf.clone()))),
                 inner: Rc::clone(&r.inner),
             };
         }
         let parked = r.inner.send_buffers_in_flight.borrow();
-        let stored = parked.get(&88).expect("drop must park buffer");
-        assert_eq!(stored.as_slice(), buf.as_slice());
+        let stored = parked.get(&88).expect("drop must park keep-alive");
+        let SendAlive::Heap(stored_rc) = stored else { panic!("expected Heap variant") };
+        assert_eq!(stored_rc.as_slice(), &buf[..]);
     }
 
     // ─────────────────────────────────────────────────────────────────

@@ -676,12 +676,8 @@ async fn handle_scan(
     ).await;
     match result {
         Ok(worker_slots) => {
-            let frames: Vec<Vec<u8>> = worker_slots.into_iter()
-                .map(|slot| slot.frame_bytes().to_vec())
-                .collect();
-            // All W2mSlots dropped above; consume_cursors advance before I/O.
-            for frame in frames {
-                let rc = shared.reactor.send_buffer(fd, frame).await;
+            for slot in worker_slots {
+                let rc = shared.reactor.send_slot(fd, slot).await;
                 if rc < 0 { shared.reactor.close_fd(fd); return; }
             }
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
