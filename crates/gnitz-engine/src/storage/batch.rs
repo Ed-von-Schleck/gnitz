@@ -459,7 +459,7 @@ impl Batch {
         let schema = self.schema.expect("capacity_writer requires schema");
         let (pk, weight, null_bmp, col_slices) =
             carve_writer_slices(&mut self.data, &self.strides, nr, cap);
-        merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema)
+        merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
     }
 
     // ── Row accessors ───────────────────────────────────────────────────
@@ -1533,7 +1533,7 @@ pub fn write_to_batch(
             carve_writer_slices(&mut data, &strides, nr, max_rows);
         let mut writer = merge::DirectWriter::new(
             pk, weight, null_bmp,
-            col_slices, &mut blob, *schema,
+            col_slices, &mut blob, *schema, max_rows,
         );
         write_fn(&mut writer);
         actual_rows = writer.row_count();

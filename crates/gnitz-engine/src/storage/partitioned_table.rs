@@ -11,7 +11,6 @@ use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, Table};
-use crate::xxh;
 
 // ---------------------------------------------------------------------------
 // PartitionedTable
@@ -271,8 +270,15 @@ impl Drop for PartitionedTable {
 
 #[inline]
 pub fn partition_for_key(pk: u128) -> usize {
-    let h = xxh::hash_u128(pk);
-    (h & 0xFF) as usize
+    // Multiplicative hash: two Fibonacci multipliers XOR'd together.
+    // ~4 instructions vs ~20 for XXH3-64; distribution across 256 buckets
+    // is sufficient for worker routing. XXH3 is reserved for filters
+    // (xor8, bloom) where collision quality matters.
+    let lo = pk as u64;
+    let hi = (pk >> 64) as u64;
+    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64)
+             ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
+    (h >> 56) as usize
 }
 
 pub fn partition_arena_size(num_partitions: u32) -> u64 {

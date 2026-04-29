@@ -164,6 +164,7 @@ impl<'a> DirectWriter<'a> {
         col_bufs: Vec<&'a mut [u8]>,
         blob: &'a mut Vec<u8>,
         schema: SchemaDescriptor,
+        blob_cache_capacity: usize,
     ) -> Self {
         let pk_stride = super::batch::pk_stride(&schema);
         DirectWriter {
@@ -173,7 +174,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: HashMap::new(),
+            blob_cache: HashMap::with_capacity(blob_cache_capacity),
             count: 0,
             schema,
         }
