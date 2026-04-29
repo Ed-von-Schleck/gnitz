@@ -223,9 +223,16 @@ impl MappedShard {
         let weight = build_region_view(&entries[1])?;
         let null_bmp = build_region_view(&entries[2])?;
 
-        // has_ghosts: true if any row could have weight == 0.
+        // has_ghosts: true only if at least one row actually has weight == 0.
+        // For Raw regions we scan the weight data once at open rather than
+        // assuming any Raw-encoded shard has ghosts. The drain-then-scatter
+        // path writes Raw weights that are all non-zero (drain filters w=0
+        // before scatter), so the conservative `Raw => true` caused skip_ghosts
+        // to do a full linear scan on every advance for ghost-free shards.
         let has_ghosts = match &weight {
-            RegionView::Raw { .. } => true,
+            RegionView::Raw { offset, .. } => {
+                (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0)
+            }
             RegionView::Constant { value, .. } => {
                 i64::from_le_bytes(value[..8].try_into().unwrap()) == 0
             }
@@ -769,7 +776,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert!(shard.has_ghosts); // Raw encoding
+        assert!(!shard.has_ghosts); // Raw encoding but no zero weights → no ghosts
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_weight(1), -1);
         assert_eq!(shard.get_weight(2), 2);
