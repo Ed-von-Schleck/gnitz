@@ -214,13 +214,14 @@ pub fn op_repartition_batch(
         .collect()
 }
 
-pub fn op_repartition_batches(
+#[inline]
+fn op_repartition_batches_impl(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
+    sort_output: bool,
 ) -> Vec<Batch> {
-    gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
     debug_assert!(sources.len() <= 256, "source index must fit in u8");
     let w_map = build_w_map(num_workers);
 
@@ -249,78 +250,15 @@ pub fn op_repartition_batches(
             }
         }
 
-        let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
-        (0..num_workers)
-            .map(|w| {
-                if worker_rows[w].is_empty() {
-                    return Batch::empty_with_schema(schema);
-                }
-                let blob_cap = (total_blob * worker_rows[w].len() / total_rows).max(1);
-                write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
-                    scatter_multi_source(&mem_batches, &worker_rows[w], writer);
-                })
-            })
-            .collect()
-    })
-}
-
-pub fn op_repartition_batches_merged(
-    sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
-    gnitz_debug!(
-        "op_repartition_batches_merged: sources={} num_workers={}",
-        sources.len(),
-        num_workers
-    );
-    debug_assert!(sources.len() <= 256, "source index must fit in u8");
-    let n = sources.len();
-    let w_map = build_w_map(num_workers);
-    let mut cursors: Vec<usize> = vec![0; n];
-
-    let mem_batches: Vec<Option<MemBatch>> = sources
-        .iter()
-        .map(|src_opt| match src_opt {
-            Some(s) if s.count > 0 => Some(s.as_mem_batch()),
-            _ => None,
-        })
-        .collect();
-
-    let total_blob = mem_batch_blob_cap(&mem_batches);
-
-    WORKER_ROWS.with(|pool| {
-        let mut worker_rows = pool.borrow_mut();
-        if worker_rows.len() < num_workers {
-            worker_rows.resize_with(num_workers, Vec::new);
-        }
-        for w in 0..num_workers { worker_rows[w].clear(); }
-
-        loop {
-            let mut min_w: Option<usize> = None;
-            for w in 0..n {
-                let mb = match &mem_batches[w] { Some(m) => m, None => continue };
-                let idx = cursors[w];
-                if idx >= mb.count { continue; }
-                match min_w {
-                    None => { min_w = Some(w); }
-                    Some(mw) => {
-                        if mb.get_pk(idx) < mem_batches[mw].as_ref().unwrap().get_pk(cursors[mw]) {
-                            min_w = Some(w);
-                        }
-                    }
+        if sort_output {
+            // Sources are consolidated (sorted by PK); timsort detects the K pre-sorted runs.
+            for w in 0..num_workers {
+                if worker_rows[w].len() > 1 {
+                    worker_rows[w].sort_by_cached_key(|&(si, row)| {
+                        mem_batches[si as usize].as_ref().unwrap().get_pk(row as usize)
+                    });
                 }
             }
-            let min_w = match min_w { None => break, Some(w) => w };
-
-            let src_idx = cursors[min_w];
-            let mb = mem_batches[min_w].as_ref().unwrap();
-            let partition = hash_row_for_partition(mb, src_idx, col_indices, schema);
-            let dw = w_map[partition];
-
-            worker_rows[dw].push((min_w as u8, src_idx as u32));
-            cursors[min_w] += 1;
         }
 
         let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
@@ -333,12 +271,24 @@ pub fn op_repartition_batches_merged(
                 let mut b = write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
                     scatter_multi_source(&mem_batches, &worker_rows[w], writer);
                 });
-                b.sorted = true;
-                b.set_schema(*schema);
+                if sort_output {
+                    b.sorted = true;
+                    b.set_schema(*schema);
+                }
                 b
             })
             .collect()
     })
+}
+
+pub fn op_repartition_batches(
+    sources: &[Option<&Batch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Batch> {
+    gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
+    op_repartition_batches_impl(sources, col_indices, schema, num_workers, false)
 }
 
 /// Scatter pre-consolidated batches across workers using a merge-walk.
@@ -363,7 +313,7 @@ pub fn op_relay_scatter_consolidated(
         .copied()
         .map(|opt| opt.map(|cb| -> &Batch { cb }))
         .collect();
-    op_repartition_batches_merged(&plain, col_indices, schema, num_workers)
+    op_repartition_batches_impl(&plain, col_indices, schema, num_workers, true)
 }
 
 /// Scatter non-consolidated batches across workers by hashing each row.
