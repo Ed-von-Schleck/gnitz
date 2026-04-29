@@ -2,7 +2,37 @@
 
 use crate::schema::{SchemaDescriptor, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, ReadCursor, write_to_batch, scatter_copy};
+use crate::storage::{
+    Batch, ConsolidatedBatch, DRAIN_BUFFER, MemBatch, ReadCursor,
+    scatter_copy, write_to_batch,
+};
+
+/// `clear()` does not re-zero the data buffer, so the scatter variants used
+/// here must be the unconditional-copy ones — a nullable-skip would leak stale
+/// bytes through.
+fn fill_cleared_batch(
+    batch: &mut Batch,
+    trace_cursor: Option<&ReadCursor>,
+    trace_rows: &[(u32, u32, i64)],
+    delta_mb: &MemBatch,
+    delta_indices: &[u32],
+) {
+    let needed = trace_rows.len() + delta_indices.len();
+    if needed == 0 {
+        return;
+    }
+    batch.reserve_rows(needed);
+    {
+        let mut writer = batch.capacity_writer();
+        if let Some(cursor) = trace_cursor {
+            cursor.scatter_drained_into(trace_rows, &mut writer);
+        }
+        // Delta rows arrive already filtered to non-zero weights, so the
+        // empty `weights` arg routes through `scatter_col_first`.
+        scatter_copy(delta_mb, delta_indices, &[], &mut writer);
+    }
+    batch.count = needed;
+}
 
 use super::util::{
     write_string_from_batch, payload_idx,
@@ -682,75 +712,75 @@ pub fn op_reduce(
                 );
                 gnitz_debug!("reduce: AVI lookup gc={:#x} found={}", gc_u64, found);
             } else {
-                // Full replay path: build replay batch from trace_in + delta
                 let replay = replay.as_mut().unwrap();
                 replay.clear();
 
-                if let Some(ref mut ti_cursor) = trace_in {
-                    if group_by_pk {
-                        ti_cursor.seek(group_key);
-                        while ti_cursor.valid
-                            && ti_cursor.current_key == group_key
-                        {
-                            ti_cursor.copy_current_row_into(replay, ti_cursor.current_weight);
-                            ti_cursor.advance();
-                        }
-                    } else if let Some(ref mut gi_c) = gi {
-                        // GI path
-                        let pki = input_schema.pk_index as usize;
-                        let gi_ci = gi_col_idx as usize;
-                        let pi = payload_idx(gi_ci, pki);
-                        let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
-                        let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
-                        gi_c.seek(crate::util::make_pk(0, gc_u64_val));
-                        while gi_c.valid {
-                            let gk_hi = (gi_c.current_key >> 64) as u64;
-                            if gk_hi != gc_u64_val {
-                                break;
+                let delta_indices: &[u32] = &sorted_indices[group_start_pos..idx];
+
+                DRAIN_BUFFER.with(|tb| {
+                    let mut trace_rows = tb.borrow_mut();
+                    trace_rows.clear();
+
+                    if let Some(ti_cursor) = trace_in.as_deref_mut() {
+                        if group_by_pk {
+                            ti_cursor.seek(group_key);
+                            while ti_cursor.valid
+                                && ti_cursor.current_key == group_key
+                            {
+                                ti_cursor.push_current_row(&mut trace_rows);
+                                ti_cursor.advance();
                             }
-                            if gi_c.current_weight > 0 {
-                                let spk_lo = gi_c.current_key as u64;
-                                // spk_hi is in payload col 1 (first payload col = col index 1)
-                                let spk_hi_ptr = gi_c.col_ptr(1, 8);
-                                let spk_hi = if !spk_hi_ptr.is_null() {
-                                    let bytes = unsafe { std::slice::from_raw_parts(spk_hi_ptr, 8) };
-                                    u64::from_le_bytes(bytes.try_into().unwrap())
-                                } else {
-                                    0
-                                };
-                                let trace_key = crate::util::make_pk(spk_lo, spk_hi);
-                                if let Some(ref mut ti) = trace_in {
-                                    ti.seek(trace_key);
-                                    while ti.valid && ti.current_key == trace_key {
-                                        ti.copy_current_row_into(replay, ti.current_weight);
-                                        ti.advance();
+                        } else if let Some(gi_c) = gi.as_deref_mut() {
+                            let pki = input_schema.pk_index as usize;
+                            let gi_ci = gi_col_idx as usize;
+                            let pi = payload_idx(gi_ci, pki);
+                            let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
+                            let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
+                            gi_c.seek(crate::util::make_pk(0, gc_u64_val));
+                            while gi_c.valid {
+                                let gk_hi = (gi_c.current_key >> 64) as u64;
+                                if gk_hi != gc_u64_val {
+                                    break;
+                                }
+                                if gi_c.current_weight > 0 {
+                                    let spk_lo = gi_c.current_key as u64;
+                                    // spk_hi is in payload col 1 (first payload col = col index 1)
+                                    let spk_hi_ptr = gi_c.col_ptr(1, 8);
+                                    let spk_hi = if !spk_hi_ptr.is_null() {
+                                        let bytes = unsafe { std::slice::from_raw_parts(spk_hi_ptr, 8) };
+                                        u64::from_le_bytes(bytes.try_into().unwrap())
+                                    } else {
+                                        0
+                                    };
+                                    let trace_key = crate::util::make_pk(spk_lo, spk_hi);
+                                    ti_cursor.seek(trace_key);
+                                    while ti_cursor.valid && ti_cursor.current_key == trace_key {
+                                        ti_cursor.push_current_row(&mut trace_rows);
+                                        ti_cursor.advance();
                                     }
                                 }
+                                gi_c.advance();
                             }
-                            gi_c.advance();
-                        }
-                    } else {
-                        // Fallback: full trace scan
-                        ti_cursor.seek(0u128);
-                        let ti_mb_exemplar_row = group_start_idx;
-                        while ti_cursor.valid {
-                            // Compare group columns between cursor row and exemplar
-                            if cursor_matches_group(
-                                ti_cursor, &mb, ti_mb_exemplar_row,
-                                input_schema, group_by_cols,
-                            ) {
-                                ti_cursor.copy_current_row_into(replay, ti_cursor.current_weight);
+                        } else {
+                            // Fallback: full trace scan, predicate-filtered.
+                            ti_cursor.seek(0u128);
+                            let ti_mb_exemplar_row = group_start_idx;
+                            while ti_cursor.valid {
+                                if cursor_matches_group(
+                                    ti_cursor, &mb, ti_mb_exemplar_row,
+                                    input_schema, group_by_cols,
+                                ) {
+                                    ti_cursor.push_current_row(&mut trace_rows);
+                                }
+                                ti_cursor.advance();
                             }
-                            ti_cursor.advance();
                         }
                     }
-                }
 
-                // Append delta rows to replay
-                for &d_idx_u32 in sorted_indices[group_start_pos..idx].iter() {
-                    let d_idx = d_idx_u32 as usize;
-                    append_membatch_row_to_batch(replay, &mb, d_idx, input_schema);
-                }
+                    fill_cleared_batch(
+                        replay, trace_in.as_deref(), &trace_rows, &mb, delta_indices,
+                    );
+                });
 
                 // Consolidate replay and step all accumulators (borrow replay; don't consume it)
                 let merged_cs = Batch::consolidate_if_needed(replay, input_schema);
@@ -986,36 +1016,6 @@ fn emit_finalized_row(
     fin_output.count += 1;
 }
 
-/// Append a row from a MemBatch to an Batch.
-fn append_membatch_row_to_batch(
-    output: &mut Batch,
-    mb: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-) {
-    let pk = mb.get_pk(row);
-    output.extend_pk(pk);
-    output.extend_weight(&mb.get_weight(row).to_le_bytes());
-    let null_word = mb.get_null_word(row);
-    output.extend_null_bmp(&null_word.to_le_bytes());
-
-    for (pi, _ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
-        let is_null = (null_word >> pi) & 1 != 0;
-        if is_null {
-            output.fill_col_zero(pi, cs);
-        } else if col.type_code == TYPE_STRING {
-            write_string_from_batch(
-                output, pi,
-                mb, row, pi,
-            );
-        } else {
-            let src = mb.get_col_ptr(row, pi, cs);
-            output.extend_col(pi, src);
-        }
-    }
-    output.count += 1;
-}
 
 /// Check if a cursor's current row matches the group columns of an exemplar row.
 fn cursor_matches_group(

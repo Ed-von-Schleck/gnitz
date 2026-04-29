@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
+use crate::storage::{Batch, ConsolidatedBatch, ReadCursor, DRAIN_BUFFER, write_to_batch};
 
 
 // ---------------------------------------------------------------------------
@@ -20,32 +20,28 @@ pub fn op_scan_trace(
     schema: &SchemaDescriptor,
     chunk_limit: i32,
 ) -> ConsolidatedBatch {
-    // Fast path: bulk drain for single-source cursors without ghosts
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
     if let Some(batch) = cursor.drain_single_source(limit) {
         return ConsolidatedBatch::new_unchecked(batch);
     }
 
-    // Fallback: row-at-a-time scan
-    let cap = if chunk_limit > 0 { chunk_limit as usize } else { cursor.estimated_length().max(64) };
-    let mut output = Batch::with_schema(*schema, cap);
-    output.sorted = true;
-    output.consolidated = true;
-
-    let mut scanned: i32 = 0;
-    while cursor.valid {
-        if chunk_limit > 0 && scanned >= chunk_limit {
-            break;
+    DRAIN_BUFFER.with(|buf| {
+        let mut rows = buf.borrow_mut();
+        cursor.drain_sorted_into(limit, &mut rows);
+        if rows.is_empty() {
+            return ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema));
         }
-        // Skip zero-weight rows
-        if cursor.current_weight != 0 {
-            cursor.copy_current_row_into(&mut output, cursor.current_weight);
-            scanned += 1;
-        }
-        cursor.advance();
-    }
-
-    ConsolidatedBatch::new_unchecked(output)
+        // For full drains the entry sum is a tight upper bound; for chunked
+        // drains it can be orders of magnitude too large. Pass 0 there and
+        // let `extend_from_slice` grow the blob on demand.
+        let blob_cap = if limit > 0 { 0 } else { cursor.total_blob_len() };
+        let mut b = write_to_batch(schema, rows.len(), blob_cap, |writer| {
+            cursor.scatter_drained_into(&rows, writer);
+        });
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code};
 use super::heap::MergeHeap;
-use crate::util::{read_u32_le, read_u64_le};
+use crate::util::read_u64_le;
 
 use type_code::STRING as TYPE_STRING;
 
@@ -148,8 +148,9 @@ pub struct DirectWriter<'a> {
     weight: &'a mut [u8],
     null_bmp: &'a mut [u8],
     col_bufs: Vec<&'a mut [u8]>,
-    blob: &'a mut [u8],
-    blob_offset: usize,
+    /// Growable blob arena; capacity is reserved up-front by `write_to_batch`,
+    /// and `blob.len()` doubles as the next-write offset.
+    blob: &'a mut Vec<u8>,
     blob_cache: HashMap<(u64, usize), usize>,
     count: usize,
     schema: SchemaDescriptor,
@@ -161,7 +162,7 @@ impl<'a> DirectWriter<'a> {
         weight: &'a mut [u8],
         null_bmp: &'a mut [u8],
         col_bufs: Vec<&'a mut [u8]>,
-        blob: &'a mut [u8],
+        blob: &'a mut Vec<u8>,
         schema: SchemaDescriptor,
     ) -> Self {
         let pk_stride = super::batch::pk_stride(&schema);
@@ -172,7 +173,6 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_offset: 0,
             blob_cache: HashMap::new(),
             count: 0,
             schema,
@@ -210,7 +210,8 @@ impl<'a> DirectWriter<'a> {
                 let off = out_row * col_size;
                 self.col_bufs[payload_idx][off..off + col_size].fill(0);
             } else if col.type_code == TYPE_STRING {
-                self.write_string(payload_idx, batch, row, out_row);
+                let src_struct = batch.get_col_ptr(row, payload_idx, 16);
+                self.write_string_cell(payload_idx, src_struct, batch.blob, out_row);
             } else {
                 let src = batch.get_col_ptr(row, payload_idx, col_size);
                 let off = out_row * col_size;
@@ -219,44 +220,60 @@ impl<'a> DirectWriter<'a> {
         }
     }
 
-    fn write_string(
+    /// Write one 16-byte German string struct from raw source slices.
+    pub(super) fn write_string_cell(
         &mut self,
         payload_col: usize,
-        batch: &MemBatch,
-        src_row: usize,
+        src_struct: &[u8],
+        src_blob: &[u8],
         out_row: usize,
     ) {
-        let src = batch.get_col_ptr(src_row, payload_col, 16);
-        let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
-        if is_long {
-            let length = read_u32_le(src, 0) as usize;
-            let old_offset = read_u64_le(src, 8) as usize;
-            let src_data = &batch.blob[old_offset..old_offset + length];
-            let new_offset = self.get_or_append_blob(src_data);
-            dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-        }
+        let dest = crate::schema::relocate_german_string_vec(
+            src_struct, src_blob, self.blob, Some(&mut self.blob_cache),
+        );
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
 
-    fn get_or_append_blob(&mut self, data: &[u8]) -> usize {
-        let new_offset = self.blob_offset;
-        match crate::schema::blob_cache_lookup(data, &mut self.blob_cache, &self.blob[..self.blob_offset], new_offset) {
-            Some(off) => off,
-            None => {
-                self.blob[self.blob_offset..self.blob_offset + data.len()].copy_from_slice(data);
-                self.blob_offset += data.len();
-                new_offset
+    /// Write one row by reading from a `ColumnarSource`. Used by the cursor
+    /// scatter path (`ReadCursor::scatter_drained_into`) so the writer's
+    /// internal field layout stays private to this module.
+    pub(super) fn scatter_row<S: ColumnarSource>(
+        &mut self,
+        source: &S,
+        pk: u128,
+        weight: i64,
+        row: usize,
+    ) {
+        let dst_row = self.count;
+        let stride = self.pk_stride as usize;
+        debug_assert!(stride == 16 || pk >> 64 == 0,
+            "scatter_row: U64 batch requires high bits == 0");
+        self.pk[dst_row * stride..][..stride]
+            .copy_from_slice(&pk.to_le_bytes()[..stride]);
+        self.weight[dst_row * 8..][..8]
+            .copy_from_slice(&weight.to_le_bytes());
+        let null_word = source.get_null_word(row);
+        self.null_bmp[dst_row * 8..][..8]
+            .copy_from_slice(&null_word.to_le_bytes());
+
+        let src_blob = source.blob_slice();
+        let schema = self.schema;
+        for (pi, _ci, col) in schema.payload_columns() {
+            let cs = col.size as usize;
+            if col.type_code == TYPE_STRING {
+                let src_struct = source.get_col_ptr(row, pi, 16);
+                self.write_string_cell(pi, src_struct, src_blob, dst_row);
+            } else {
+                let src = source.get_col_ptr(row, pi, cs);
+                self.col_bufs[pi][dst_row * cs..][..cs].copy_from_slice(src);
             }
         }
+        self.count += 1;
     }
 
     pub fn row_count(&self) -> usize {
         self.count
-    }
-
-    pub fn blob_written(&self) -> usize {
-        self.blob_offset
     }
 }
 
@@ -523,20 +540,13 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
         if col.type_code == TYPE_STRING {
             // Blob relocation is sequential per-row; no way to batch.
             for (out, &idx) in indices.iter().enumerate() {
-                writer.write_string(pi, batch, idx as usize, base + out);
-            }
-        } else if col.nullable != 0 {
-            // Nullable: skip null cells; destination is pre-zeroed by write_to_batch.
-            let src_col = batch.col_data[pi];
-            let dst_col = &mut writer.col_bufs[pi][base * cs..];
-            for (out, &idx) in indices.iter().enumerate() {
                 let row = idx as usize;
-                if (batch.get_null_word(row) >> pi) & 1 == 0 {
-                    dst_col[out * cs..][..cs].copy_from_slice(&src_col[row * cs..][..cs]);
-                }
+                let src_struct = batch.get_col_ptr(row, pi, 16);
+                writer.write_string_cell(pi, src_struct, batch.blob, base + out);
             }
         } else {
-            // Dispatch on cs so LLVM monomorphizes a tight loop for each stride.
+            // Source null cells are zero by Batch invariant, so we copy
+            // unconditionally and let `gather_col` vectorize.
             let src_col = batch.col_data[pi];
             let dst_col = &mut writer.col_bufs[pi][base * cs..];
             match cs {
@@ -588,26 +598,18 @@ pub fn scatter_multi_source(
     }
     let n = rows.len();
     let base = writer.count;
-
     let stride = writer.pk_stride as usize;
+
+    // PK + weight + null-bmp fused: one source-table lookup per row.
     for (out, &(si, ri)) in rows.iter().enumerate() {
         let src = sources[si as usize].as_ref().unwrap();
         let row = ri as usize;
-        writer.pk[(base + out) * stride..][..stride]
+        let dst_row = base + out;
+        writer.pk[dst_row * stride..][..stride]
             .copy_from_slice(&src.pk[row * stride..][..stride]);
-    }
-
-    for (out, &(si, ri)) in rows.iter().enumerate() {
-        let src = sources[si as usize].as_ref().unwrap();
-        let row = ri as usize;
-        writer.weight[(base + out) * 8..][..8]
+        writer.weight[dst_row * 8..][..8]
             .copy_from_slice(&src.weight[row * 8..][..8]);
-    }
-
-    for (out, &(si, ri)) in rows.iter().enumerate() {
-        let src = sources[si as usize].as_ref().unwrap();
-        let row = ri as usize;
-        writer.null_bmp[(base + out) * 8..][..8]
+        writer.null_bmp[dst_row * 8..][..8]
             .copy_from_slice(&src.null_bmp[row * 8..][..8]);
     }
 
@@ -618,21 +620,78 @@ pub fn scatter_multi_source(
         if col.type_code == TYPE_STRING {
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = sources[si as usize].as_ref().unwrap();
-                writer.write_string(pi, src, ri as usize, base + out);
-            }
-        } else if col.nullable != 0 {
-            // Destination is pre-zeroed by write_to_batch; skip null cells.
-            for (out, &(si, ri)) in rows.iter().enumerate() {
-                let src = sources[si as usize].as_ref().unwrap();
                 let row = ri as usize;
-                if (src.get_null_word(row) >> pi) & 1 == 0 {
-                    let dst = &mut writer.col_bufs[pi][(base + out) * cs..][..cs];
-                    dst.copy_from_slice(&src.col_data[pi][row * cs..][..cs]);
-                }
+                let src_struct = src.get_col_ptr(row, pi, 16);
+                writer.write_string_cell(pi, src_struct, src.blob, base + out);
             }
         } else {
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = sources[si as usize].as_ref().unwrap();
+                let row = ri as usize;
+                let dst = &mut writer.col_bufs[pi][(base + out) * cs..][..cs];
+                dst.copy_from_slice(&src.col_data[pi][row * cs..][..cs]);
+            }
+        }
+    }
+
+    writer.count += n;
+}
+
+/// Like `scatter_multi_source` but reads each output row's weight from
+/// `rows[i].2` instead of from the source batch.
+///
+/// Used by the merge-walk drain path (`ReadCursor::scatter_drained_into`):
+/// the merge produces a *net* consolidated weight per (PK, payload) group,
+/// which may differ from any single source's stored weight when multiple
+/// inputs contribute to the same group.  Callers are also expected to filter
+/// out zero-weight groups before invoking — `drain_sorted_into` does so.
+///
+/// `sources` carries one `MemBatch` per source slot; entries in `rows` are
+/// `(src_idx, row_idx, net_weight)` in emission order.
+pub fn scatter_multi_source_with_weights(
+    sources: &[MemBatch<'_>],
+    rows: &[(u32, u32, i64)],
+    writer: &mut DirectWriter<'_>,
+) {
+    if rows.is_empty() { return; }
+    #[cfg(debug_assertions)]
+    for &(_si, _ri, w) in rows {
+        debug_assert_ne!(
+            w, 0,
+            "scatter_multi_source_with_weights: zero-weight row in drain buffer",
+        );
+    }
+    let n = rows.len();
+    let base = writer.count;
+    let stride = writer.pk_stride as usize;
+
+    // PK + weight + null-bmp fused: one source-table lookup per row, and
+    // weight comes from the tuple, not from the source's stored weight.
+    for (out, &(si, ri, w)) in rows.iter().enumerate() {
+        let src = &sources[si as usize];
+        let row = ri as usize;
+        let dst_row = base + out;
+        writer.pk[dst_row * stride..][..stride]
+            .copy_from_slice(&src.pk[row * stride..][..stride]);
+        writer.weight[dst_row * 8..][..8]
+            .copy_from_slice(&w.to_le_bytes());
+        writer.null_bmp[dst_row * 8..][..8]
+            .copy_from_slice(&src.null_bmp[row * 8..][..8]);
+    }
+
+    let schema = writer.schema;
+    for (pi, _ci, col) in schema.payload_columns() {
+        let cs = col.size as usize;
+        if col.type_code == TYPE_STRING {
+            for (out, &(si, ri, _)) in rows.iter().enumerate() {
+                let src = &sources[si as usize];
+                let row = ri as usize;
+                let src_struct = src.get_col_ptr(row, pi, 16);
+                writer.write_string_cell(pi, src_struct, src.blob, base + out);
+            }
+        } else {
+            for (out, &(si, ri, _)) in rows.iter().enumerate() {
+                let src = &sources[si as usize];
                 let row = ri as usize;
                 let dst = &mut writer.col_bufs[pi][(base + out) * cs..][..cs];
                 dst.copy_from_slice(&src.col_data[pi][row * cs..][..cs]);
@@ -755,7 +814,7 @@ mod tests {
         let mut out_null = vec![0u8; total_rows * 8];
         let mut out_col0 = vec![0u8; total_rows * 8];
         let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob = vec![0u8; blob_cap];
+        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
 
         {
             let mut writer = DirectWriter {
@@ -765,7 +824,6 @@ mod tests {
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
                 blob: &mut out_blob,
-                blob_offset: 0,
                 blob_cache: HashMap::new(),
                 count: 0,
                 schema: *schema,
@@ -1083,7 +1141,7 @@ mod tests {
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
         let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob = vec![0u8; blob_cap];
+        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
 
         let count;
         {
@@ -1094,7 +1152,6 @@ mod tests {
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
                 blob: &mut out_blob,
-                blob_offset: 0,
                 blob_cache: HashMap::new(),
                 count: 0,
                 schema: *schema,
@@ -1257,7 +1314,7 @@ mod tests {
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
         let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob = vec![0u8; blob_cap];
+        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
 
         let count;
         {
@@ -1268,7 +1325,6 @@ mod tests {
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
                 blob: &mut out_blob,
-                blob_offset: 0,
                 blob_cache: HashMap::new(),
                 count: 0,
                 schema: *schema,
@@ -1351,7 +1407,7 @@ mod tests {
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
         let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob = vec![0u8; blob_cap];
+        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
 
         let count;
         {
@@ -1362,7 +1418,6 @@ mod tests {
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
                 blob: &mut out_blob,
-                blob_offset: 0,
                 blob_cache: HashMap::new(),
                 count: 0,
                 schema: *schema,

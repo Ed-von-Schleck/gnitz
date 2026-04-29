@@ -444,6 +444,24 @@ impl Batch {
         &mut self.data[off..end]
     }
 
+    /// Return a `DirectWriter` carving slices bounded by `capacity * stride`
+    /// **not** by `count * stride`. Used to re-fill a batch whose allocation
+    /// is already live but whose row count has been reset (`clear()`, then
+    /// `reserve_rows`).
+    ///
+    /// The recycled data buffer is **not** re-zeroed by `clear()`, so writers
+    /// must use the unconditional-copy `scatter_*` variants — a nullable-skip
+    /// would leak stale bytes through. Caller must update `self.count` after
+    /// the writer is dropped.
+    pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
+        let cap = self.capacity as usize;
+        let nr = self.num_regions as usize;
+        let schema = self.schema.expect("capacity_writer requires schema");
+        let (pk, weight, null_bmp, col_slices) =
+            carve_writer_slices(&mut self.data, &self.strides, nr, cap);
+        merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema)
+    }
+
     // ── Row accessors ───────────────────────────────────────────────────
 
     #[inline(always)]
@@ -1200,7 +1218,6 @@ impl Batch {
         });
         result.sorted = true;
         result.consolidated = true;
-        result.set_schema(*schema);
         ConsolidatedBatch(result)
     }
 
@@ -1224,7 +1241,6 @@ impl Batch {
         });
         result.sorted = true;
         result.consolidated = true;
-        result.set_schema(*schema);
         Some(ConsolidatedBatch::new_unchecked(result))
     }
 
@@ -1444,6 +1460,30 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     Ok(MemBatch { pk, pk_stride: pk_stride_val, weight, null_bmp, col_data, blob, count: n })
 }
 
+/// Carve `data` into the four DirectWriter regions: PK, weight, null bitmap,
+/// then one slice per payload column. Slices are sized for `rows * stride`.
+fn carve_writer_slices<'a>(
+    data: &'a mut [u8],
+    strides: &[u8; MAX_BATCH_REGIONS],
+    nr: usize,
+    rows: usize,
+) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
+    let pk_sz = rows * strides[REG_PK] as usize;
+    let fixed = rows * 8;
+    let (pk, rest) = data.split_at_mut(pk_sz);
+    let (weight, rest) = rest.split_at_mut(fixed);
+    let (null_bmp, mut rest) = rest.split_at_mut(fixed);
+
+    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - REG_PAYLOAD_START);
+    for &stride in &strides[REG_PAYLOAD_START..nr] {
+        let col_sz = rows * stride as usize;
+        let (col, new_rest) = rest.split_at_mut(col_sz);
+        col_slices.push(col);
+        rest = new_rest;
+    }
+    (pk, weight, null_bmp, col_slices)
+}
+
 /// Allocate a single contiguous arena, run a merge/copy operation via
 /// DirectWriter, and return the arena as a Batch — zero copy-out.
 ///
@@ -1462,46 +1502,42 @@ pub fn write_to_batch(
     // Sized for max_rows; blob is separate.
     let (offsets, arena_size) = compute_offsets(&strides, nr, max_rows);
 
+    // Match `with_schema`: a too-small pooled buffer is recycled rather than
+    // grown in place — `Vec::reserve` would copy old bytes forward before the
+    // tail is zeroed, slower than a fresh zeroed allocation.
     let mut data = {
         let mut buf = super::batch_pool::acquire_buf();
-        if buf.capacity() > 0 { buf.resize(arena_size, 0); buf } else { alloc_large_zeroed(arena_size) }
+        if buf.capacity() >= arena_size {
+            buf.resize(arena_size, 0);
+            buf
+        } else {
+            super::batch_pool::recycle_buf(buf);
+            alloc_large_zeroed(arena_size)
+        }
     };
+    // DirectWriter grows blob length via `extend_from_slice`; reserve capacity
+    // up front but do not zero-fill.
     let mut blob = {
         let mut buf = super::batch_pool::acquire_buf();
-        if buf.capacity() > 0 { buf.resize(max_blob, 0); buf } else { alloc_large_zeroed(max_blob) }
+        buf.clear();
+        buf.reserve(max_blob);
+        if max_blob >= HUGEPAGE_THRESHOLD {
+            crate::sys::madvise_hugepage(buf.as_mut_ptr(), buf.capacity());
+        }
+        buf
     };
 
     let actual_rows;
-    let actual_blob;
     {
-        // Carve non-overlapping mutable slices via split_at_mut.
-        let pk_sz = max_rows * strides[REG_PK] as usize;
-        let (pk, rest) = data.split_at_mut(pk_sz);
-        let fixed = max_rows * 8;
-        let (weight, rest) = rest.split_at_mut(fixed);
-        let (null_bmp, mut rest) = rest.split_at_mut(fixed);
-
-        let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - 3);
-        for &stride in strides[3..nr].iter() {
-            let col_sz = max_rows * stride as usize;
-            let (col, new_rest) = rest.split_at_mut(col_sz);
-            col_slices.push(col);
-            rest = new_rest;
-        }
-
+        let (pk, weight, null_bmp, col_slices) =
+            carve_writer_slices(&mut data, &strides, nr, max_rows);
         let mut writer = merge::DirectWriter::new(
             pk, weight, null_bmp,
             col_slices, &mut blob, *schema,
         );
         write_fn(&mut writer);
         actual_rows = writer.row_count();
-        actual_blob = writer.blob_written();
     }
-
-    // The arena IS the batch's data buffer — no copy-out needed.
-    // Just record the actual row count; offsets stay max_rows-based
-    // (extra capacity is harmless and enables future appends).
-    blob.truncate(actual_blob);
 
     Batch {
         data,
@@ -1514,7 +1550,7 @@ pub fn write_to_batch(
         count: actual_rows,
         sorted: false,
         consolidated: false,
-        schema: None,
+        schema: Some(*schema),
     }
 }
 

@@ -3,6 +3,7 @@
 //! Produces rows in (PK, payload) order with inline ghost elimination
 //! (net weight=0 rows are skipped).
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ptr;
 use std::sync::Arc;
@@ -13,6 +14,15 @@ use crate::schema::{SchemaDescriptor, type_code};
 use super::heap::MergeHeap;
 use super::merge::MemBatch;
 use super::shard_reader::MappedShard;
+
+thread_local! {
+    /// Reusable per-thread scratch buffer for `drain_sorted_into`. Each
+    /// 16-byte tuple is much smaller than the corresponding output row, so
+    /// keeping peak capacity for the thread's lifetime is cheap relative to
+    /// the batches it feeds.
+    pub(crate) static DRAIN_BUFFER: RefCell<Vec<(u32, u32, i64)>> =
+        const { RefCell::new(Vec::new()) };
+}
 
 // ---------------------------------------------------------------------------
 // CursorSource — unified access to in-memory batches or shard mmaps
@@ -134,7 +144,7 @@ fn entry_cmp(
 // ReadCursorEntry — per-source position tracker
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ReadCursorEntry {
+struct ReadCursorEntry {
     source: CursorSource,
     position: usize,
     count: usize,
@@ -207,6 +217,11 @@ impl ReadCursorEntry {
             0
         }
     }
+
+    #[inline]
+    fn source_blob_len(&self) -> usize {
+        self.source.blob_slice().len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +261,7 @@ impl ReadCursor {
         )
     }
 
-    pub(crate) fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
+    fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
         let tree = if n > 1 {
             Some(Self::build_tree(&entries, &schema))
@@ -466,7 +481,8 @@ impl ReadCursor {
         batch.count += 1;
     }
 
-    /// Materialize all positive-weight rows into an owned `Arc<Batch>`.
+    /// Materialize all non-zero-weight rows in merge order into an owned
+    /// `Arc<Batch>`.
     pub(crate) fn materialize(mut self) -> Arc<Batch> {
         if self.entries.len() == 1 && self.entries[0].position == 0 {
             match &self.entries[0].source {
@@ -480,18 +496,26 @@ impl ReadCursor {
         if !self.valid {
             return Arc::new(Batch::empty_with_schema(&self.schema));
         }
-        let estimated = self.estimated_length().max(8);
-        let mut batch = Batch::with_schema(self.schema, estimated);
-        let total_blob: usize = self.entries.iter().map(|e| e.source.blob_slice().len()).sum();
-        if total_blob > 0 { batch.blob.reserve(total_blob); }
-        while self.valid {
-            if self.current_weight > 0 {
-                let w = self.current_weight;
-                self.copy_current_row_into(&mut batch, w);
+
+        DRAIN_BUFFER.with(|buf| {
+            let mut merge_order = buf.borrow_mut();
+            self.drain_sorted_into(0, &mut merge_order);
+            if merge_order.is_empty() {
+                return Arc::new(Batch::empty_with_schema(&self.schema));
             }
-            self.advance();
-        }
-        Arc::new(batch)
+            let blob_cap: usize = self.entries.iter().map(|e| e.source_blob_len()).sum();
+            let mut batch = super::batch::write_to_batch(
+                &self.schema,
+                merge_order.len(),
+                blob_cap,
+                |writer| self.scatter_drained_into(&merge_order, writer),
+            );
+            // The merge walk emits in (PK, payload) order with consolidated
+            // weights; `write_to_batch` doesn't know that, so restore the flags.
+            batch.sorted = true;
+            batch.consolidated = true;
+            Arc::new(batch)
+        })
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
@@ -552,6 +576,106 @@ impl ReadCursor {
         match &entry.source {
             CursorSource::Batch(b) => Some((b.as_mem_batch(), entry.position)),
             CursorSource::Shard(_) => None,
+        }
+    }
+
+    /// Sum of blob arena sizes across every source. Tight upper bound on the
+    /// blob bytes a full drain can produce; callers use this to size the
+    /// output blob arena.
+    pub(crate) fn total_blob_len(&self) -> usize {
+        self.entries.iter().map(|e| e.source_blob_len()).sum()
+    }
+
+    /// Append the cursor's current `(entry_idx, row, weight)` to `buf` if the
+    /// row is valid and has non-zero weight. Companion to `drain_sorted_into`
+    /// for callers whose termination condition is custom (group-bounded or
+    /// predicate-filtered).
+    pub(crate) fn push_current_row(&self, buf: &mut Vec<(u32, u32, i64)>) {
+        if !self.valid {
+            return;
+        }
+        let w = self.current_weight;
+        if w == 0 {
+            return;
+        }
+        buf.push((
+            self.current_entry_idx as u32,
+            self.current_row as u32,
+            w,
+        ));
+    }
+
+    /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
+    /// for every row whose net consolidated weight is non-zero.  Drains up to
+    /// `limit` rows (`limit == 0` means unlimited).  Clears `out` first.
+    ///
+    /// The buffered weight is the **net** weight produced by the merge —
+    /// callers must not read it back from the exemplar source's stored weight,
+    /// which is the per-source contribution and may not equal the net.
+    /// Callers needing custom termination (group-bounded iteration, predicate
+    /// filters) collect into a local `Vec` instead — this helper only supports
+    /// row-count and full-cursor termination.
+    pub(crate) fn drain_sorted_into(
+        &mut self,
+        limit: usize,
+        out: &mut Vec<(u32, u32, i64)>,
+    ) {
+        out.clear();
+        let mut count = 0usize;
+        while self.valid {
+            if limit > 0 && count >= limit {
+                break;
+            }
+            let w = self.current_weight;
+            if w != 0 {
+                // src_idx is u32 because partitioned-table cursors can exceed
+                // 256 entries; a u8 cast would wrap silently.
+                out.push((
+                    self.current_entry_idx as u32,
+                    self.current_row as u32,
+                    w,
+                ));
+                count += 1;
+            }
+            self.advance();
+        }
+    }
+
+    /// `MemBatch` views for every entry iff every source is an in-memory
+    /// `Batch`. Returning `None` for any shard source steers
+    /// `scatter_drained_into` to its row-major shard fallback.
+    fn all_batch_sources(&self) -> Option<Vec<MemBatch<'_>>> {
+        let mut batches = Vec::with_capacity(self.entries.len());
+        for e in &self.entries {
+            match &e.source {
+                CursorSource::Batch(b) => batches.push(b.as_mem_batch()),
+                CursorSource::Shard(_) => return None,
+            }
+        }
+        Some(batches)
+    }
+
+    /// Scatter `rows` (collected via `drain_sorted_into`) into `writer`. Fast
+    /// path uses column-major scatter when every source is in-memory; the
+    /// shard fallback is row-major because shard reads are IO-bound and the
+    /// per-row enum dispatch is in the noise next to the page-cache miss.
+    pub(crate) fn scatter_drained_into(
+        &self,
+        rows: &[(u32, u32, i64)],
+        writer: &mut super::merge::DirectWriter<'_>,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(mem_batches) = self.all_batch_sources() {
+            super::merge::scatter_multi_source_with_weights(&mem_batches, rows, writer);
+            return;
+        }
+        for &(si, ri, w) in rows {
+            let entry = &self.entries[si as usize];
+            let row = ri as usize;
+            let pk = entry.source.get_pk(row);
+            writer.scatter_row(&entry.source, pk, w, row);
         }
     }
 }

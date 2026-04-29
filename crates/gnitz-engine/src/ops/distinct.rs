@@ -81,7 +81,6 @@ pub fn op_distinct(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.set_schema(*schema);
 
     (ConsolidatedBatch::new_unchecked(output), consolidated)
 }

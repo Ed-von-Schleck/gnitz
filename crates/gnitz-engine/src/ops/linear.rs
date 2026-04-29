@@ -272,24 +272,53 @@ fn op_union_merge(
                 j_end += 1;
             }
 
-            // Merge the two sub-ranges by payload order.
+            // Merge the two equal-PK sub-ranges by payload order. Coalesces
+            // contiguous single-source runs into one `append_batch` per run
+            // because the row count per group is often single-digit and
+            // `append_batch` has fixed per-call overhead from offset math.
             let (mut ia, mut jb) = (i, j);
-            while ia < i_end && jb < j_end {
-                if crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
-                    != std::cmp::Ordering::Greater
-                {
-                    output.append_batch(batch_a, ia, ia + 1);
-                    ia += 1;
-                } else {
-                    output.append_batch(batch_b, jb, jb + 1);
-                    jb += 1;
+            if ia < i_end && jb < j_end {
+                let mut prev_a = crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
+                    != std::cmp::Ordering::Greater;
+                let mut run_start = if prev_a { ia } else { jb };
+                if prev_a { ia += 1; } else { jb += 1; }
+                while ia < i_end && jb < j_end {
+                    let pick_a = crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
+                        != std::cmp::Ordering::Greater;
+                    if pick_a != prev_a {
+                        if prev_a {
+                            output.append_batch(batch_a, run_start, ia);
+                            run_start = jb;
+                        } else {
+                            output.append_batch(batch_b, run_start, jb);
+                            run_start = ia;
+                        }
+                        prev_a = pick_a;
+                    }
+                    if pick_a { ia += 1; } else { jb += 1; }
                 }
-            }
-            if ia < i_end {
-                output.append_batch(batch_a, ia, i_end);
-            }
-            if jb < j_end {
-                output.append_batch(batch_b, jb, j_end);
+                // Flush the in-progress run, folding its side's still-unpicked
+                // tail (rows the loop never reached because the *other* side
+                // exhausted first) into the same append. The opposite side
+                // then drains as a separate run.
+                if prev_a {
+                    output.append_batch(batch_a, run_start, i_end);
+                    if jb < j_end {
+                        output.append_batch(batch_b, jb, j_end);
+                    }
+                } else {
+                    output.append_batch(batch_b, run_start, j_end);
+                    if ia < i_end {
+                        output.append_batch(batch_a, ia, i_end);
+                    }
+                }
+            } else {
+                if ia < i_end {
+                    output.append_batch(batch_a, ia, i_end);
+                }
+                if jb < j_end {
+                    output.append_batch(batch_b, jb, j_end);
+                }
             }
 
             i = i_end;

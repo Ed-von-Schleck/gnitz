@@ -489,8 +489,13 @@ fn write_scattered_data_block(
         col_slices.push(col_slice);
         rest = new_rest;
     }
-    let mut writer = DirectWriter::new(pk_slice, weight_slice, null_slice, col_slices, rest, *schema);
+    // No STRING columns on this fast path; DirectWriter still wants a blob
+    // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
+    debug_assert!(rest.is_empty(), "non-string SAL fast path should not reserve blob bytes");
+    let mut empty_blob: Vec<u8> = Vec::new();
+    let mut writer = DirectWriter::new(pk_slice, weight_slice, null_slice, col_slices, &mut empty_blob, *schema);
     scatter_copy(batch, indices, &[], &mut writer);
+    debug_assert!(empty_blob.is_empty(), "non-string SAL fast path must not write blob bytes");
 
     // Compute and write the XXH3 checksum over the body (same as wal::encode).
     let cs = xxh::checksum(&data_slot[gnitz_wire::WAL_HEADER_SIZE..total_size]);

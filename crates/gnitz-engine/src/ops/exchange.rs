@@ -273,7 +273,6 @@ fn op_repartition_batches_impl(
                 });
                 if sort_output {
                     b.sorted = true;
-                    b.set_schema(*schema);
                 }
                 b
             })

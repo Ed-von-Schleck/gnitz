@@ -65,7 +65,6 @@ pub fn op_anti_join_delta_trace(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.set_schema(*schema);
     ConsolidatedBatch::new_unchecked(output)
 }
 
@@ -139,7 +138,6 @@ pub fn op_semi_join_delta_trace(
         });
     output.sorted = true;
     output.consolidated = true;
-    output.set_schema(*schema);
     ConsolidatedBatch::new_unchecked(output)
 }
 
@@ -195,7 +193,6 @@ fn semi_join_dt_swapped(
     // Rows come from the consolidated delta so (PK, payload) pairs are unique.
     output.sorted = true;
     output.consolidated = true;
-    output.set_schema(*schema);
     output
 }
 
@@ -586,7 +583,7 @@ fn filter_join_dd_with_payload(
             }
         }
 
-        // Process each A row individually — check payload match
+        let mut unmatched_start: Option<usize> = None;
         while idx_a < n_a && pks_a[idx_a] == key_a {
             let mut matched = false;
             for scan_b in b_group_start..b_group_end {
@@ -599,9 +596,16 @@ fn filter_join_dd_with_payload(
                 }
             }
             if !matched {
-                output.append_batch(ca, idx_a, idx_a + 1);
+                if unmatched_start.is_none() {
+                    unmatched_start = Some(idx_a);
+                }
+            } else if let Some(rs) = unmatched_start.take() {
+                output.append_batch(ca, rs, idx_a);
             }
             idx_a += 1;
+        }
+        if let Some(rs) = unmatched_start.take() {
+            output.append_batch(ca, rs, idx_a);
         }
     }
 
