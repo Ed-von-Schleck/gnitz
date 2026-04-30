@@ -641,24 +641,12 @@ impl ReadCursor {
         }
     }
 
-    /// `MemBatch` views for every entry iff every source is an in-memory
-    /// `Batch`. Returning `None` for any shard source steers
-    /// `scatter_drained_into` to its row-major shard fallback.
-    fn all_batch_sources(&self) -> Option<Vec<MemBatch<'_>>> {
-        let mut batches = Vec::with_capacity(self.entries.len());
-        for e in &self.entries {
-            match &e.source {
-                CursorSource::Batch(b) => batches.push(b.as_mem_batch()),
-                CursorSource::Shard(_) => return None,
-            }
-        }
-        Some(batches)
-    }
-
     /// Scatter `rows` (collected via `drain_sorted_into`) into `writer`. Fast
-    /// path uses column-major scatter when every source is in-memory; the
-    /// shard fallback is row-major because shard reads are IO-bound and the
-    /// per-row enum dispatch is in the noise next to the page-cache miss.
+    /// path uses column-major scatter when every source is an in-memory
+    /// `Batch` and the entry count fits in `MAX_INLINE_BATCH_SOURCES`; the
+    /// shard fallback (or >16-entry case) is row-major because shard reads
+    /// are IO-bound and the per-row enum dispatch is in the noise next to
+    /// the page-cache miss.
     pub(crate) fn scatter_drained_into(
         &self,
         rows: &[(u32, u32, i64)],
@@ -667,8 +655,19 @@ impl ReadCursor {
         if rows.is_empty() {
             return;
         }
-        if let Some(mem_batches) = self.all_batch_sources() {
-            super::merge::scatter_multi_source_with_weights(&mem_batches, rows, writer);
+        let all_batches = self.entries.len() <= MAX_INLINE_BATCH_SOURCES
+            && self.entries.iter().all(|e| matches!(e.source, CursorSource::Batch(_)));
+        if all_batches {
+            // Stack-materialize the MemBatch views once outside the row loop.
+            // ~313 bytes per slot × 16 slots = ~5 KB, comfortably on stack.
+            let mut sources: [Option<MemBatch<'_>>; MAX_INLINE_BATCH_SOURCES] =
+                [const { None }; MAX_INLINE_BATCH_SOURCES];
+            for (i, e) in self.entries.iter().enumerate() {
+                if let CursorSource::Batch(b) = &e.source {
+                    sources[i] = Some(b.as_mem_batch());
+                }
+            }
+            super::merge::scatter_multi_source_with_weights(&sources, rows, writer);
             return;
         }
         for &(si, ri, w) in rows {
@@ -679,6 +678,11 @@ impl ReadCursor {
         }
     }
 }
+
+/// Upper bound for the column-major scatter fast path in
+/// `scatter_drained_into`. Above this we degrade to the row-major loop —
+/// not a correctness limit, just a stack-size cap on the inline source array.
+const MAX_INLINE_BATCH_SOURCES: usize = 16;
 
 /// Build a ReadCursor from in-memory batches + shard Arcs.
 ///

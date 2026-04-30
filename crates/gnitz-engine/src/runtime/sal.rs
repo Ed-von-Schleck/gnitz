@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sys as ipc_sys;
 use crate::sys;
 use crate::schema::{SchemaDescriptor, type_code};
-use crate::storage::{Batch, DirectWriter, scatter_copy};
+use crate::storage::{Batch, DirectWriter, carve_writer_slices, scatter_copy};
 use crate::util::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
 use crate::runtime::wire::{
     encode_wire_into, wire_size, STATUS_OK,
@@ -477,23 +477,14 @@ fn write_scattered_data_block(
     write_u32_le(data_slot, blob_dir_off,     pos as u32);
     write_u32_le(data_slot, blob_dir_off + 4, 0u32);
 
+    // The writer carves `rest` (body after header+directory) into per-region
+    // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
     let (_, rest) = data_slot.split_at_mut(header_dir_size);
-    let pk_sz = pk_stride * count;
-    let (pk_slice, rest) = rest.split_at_mut(pk_sz);
-    let (weight_slice, rest) = rest.split_at_mut(8 * count);
-    let (null_slice, mut rest) = rest.split_at_mut(8 * count);
-    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(npc);
-    for (_pi, _ci, col) in schema.payload_columns() {
-        let col_sz = col.size as usize * count;
-        let (col_slice, new_rest) = rest.split_at_mut(col_sz);
-        col_slices.push(col_slice);
-        rest = new_rest;
-    }
+    let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
     // No STRING columns on this fast path; DirectWriter still wants a blob
     // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
-    debug_assert!(rest.is_empty(), "non-string SAL fast path should not reserve blob bytes");
     let mut empty_blob: Vec<u8> = Vec::new();
-    let mut writer = DirectWriter::new(pk_slice, weight_slice, null_slice, col_slices, &mut empty_blob, *schema, 0);
+    let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, *schema, 0);
     scatter_copy(batch, indices, &[], &mut writer);
     debug_assert!(empty_blob.is_empty(), "non-string SAL fast path must not write blob bytes");
 

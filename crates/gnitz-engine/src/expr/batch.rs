@@ -218,8 +218,8 @@ fn eval_str_col_vs_const(
     pred: impl Fn(Ordering) -> bool,
 ) {
     let pi = if ci < pki { ci } else { ci - 1 };
-    fill_null_bits_ci(scratch, dst, mb.null_bmp, morsel_start, m, ci, pki);
-    let col_data = mb.col_data[pi];
+    fill_null_bits_ci(scratch, dst, mb.null_bmp(), morsel_start, m, ci, pki);
+    let col_data = mb.col_data(pi, 16);
     let blob = mb.blob;
     let const_bytes = &prog.const_strings[const_idx];
     let const_prefix = prog.const_prefixes[const_idx];
@@ -263,7 +263,7 @@ fn eval_str_col_vs_col(
     pki: usize,
     pred: impl Fn(Ordering) -> bool,
 ) {
-    fill_null_bits_ci(scratch, dst, mb.null_bmp, morsel_start, m, ci_a, pki);
+    fill_null_bits_ci(scratch, dst, mb.null_bmp(), morsel_start, m, ci_a, pki);
     if !scratch.no_nulls {
         let words = m.div_ceil(64);
         let pi_b = if ci_b < pki { ci_b } else { ci_b - 1 };
@@ -272,7 +272,7 @@ fn eval_str_col_vs_col(
             let hi = (lo + 64).min(m);
             let mut extra: u64 = 0;
             for i in lo..hi {
-                let row_null = read_u64_le(mb.null_bmp, (morsel_start + i) * 8);
+                let row_null = read_u64_le(mb.null_bmp(), (morsel_start + i) * 8);
                 let is_null_b = ci_b != pki && (row_null >> pi_b) & 1 != 0;
                 if is_null_b { extra |= 1u64 << (i - lo); }
             }
@@ -281,8 +281,8 @@ fn eval_str_col_vs_col(
     }
     let pi_a = if ci_a < pki { ci_a } else { ci_a - 1 };
     let pi_b = if ci_b < pki { ci_b } else { ci_b - 1 };
-    let col_a = mb.col_data[pi_a];
-    let col_b = mb.col_data[pi_b];
+    let col_a = mb.col_data(pi_a, 16);
+    let col_b = mb.col_data(pi_b, 16);
     let blob = mb.blob;
     let base_d = dst * MORSEL;
     // Compute results unconditionally; null rows produce a valid but irrelevant value.
@@ -354,7 +354,7 @@ pub(in crate::expr) fn eval_batch(
                     crate::schema::type_code::I16 |
                     crate::schema::type_code::I32 |
                     crate::schema::type_code::I64);
-                let col_data = mb.col_data[pi];
+                let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 match col_size {
                     8 => {
@@ -401,7 +401,7 @@ pub(in crate::expr) fn eval_batch(
                     }
                     _ => {}
                 }
-                fill_null_bits_pi(scratch, dst, mb.null_bmp, morsel_start, m, pi);
+                fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
             }
 
             EXPR_LOAD_PAYLOAD_FLOAT => {
@@ -411,7 +411,7 @@ pub(in crate::expr) fn eval_batch(
                 } else {
                     prog.payload_col_sizes[pi] as usize
                 };
-                let col_data = mb.col_data[pi];
+                let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 if col_size == 4 {
                     let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
@@ -425,7 +425,7 @@ pub(in crate::expr) fn eval_batch(
                         dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                     }
                 }
-                fill_null_bits_pi(scratch, dst, mb.null_bmp, morsel_start, m, pi);
+                fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
             }
 
             EXPR_LOAD_PK_INT => {
@@ -446,7 +446,7 @@ pub(in crate::expr) fn eval_batch(
             // Legacy: LOAD_COL_INT/FLOAT — only appear in unresolved programs (tests).
             EXPR_LOAD_COL_INT => {
                 let ci = a1 as usize;
-                fill_null_bits_ci(scratch, dst, mb.null_bmp, morsel_start, m, ci, pki);
+                fill_null_bits_ci(scratch, dst, mb.null_bmp(), morsel_start, m, ci, pki);
                 let base_d = dst * MORSEL;
                 if ci == pki {
                     for i in 0..m {
@@ -454,7 +454,7 @@ pub(in crate::expr) fn eval_batch(
                     }
                 } else {
                     let pi = if ci < pki { ci } else { ci - 1 };
-                    let col_data = mb.col_data[pi];
+                    let col_data = mb.col_data(pi, 8);
                     for i in 0..m {
                         let off = (morsel_start + i) * 8;
                         scratch.regs[base_d + i] =
@@ -465,9 +465,9 @@ pub(in crate::expr) fn eval_batch(
 
             EXPR_LOAD_COL_FLOAT => {
                 let ci = a1 as usize;
-                fill_null_bits_ci(scratch, dst, mb.null_bmp, morsel_start, m, ci, pki);
+                fill_null_bits_ci(scratch, dst, mb.null_bmp(), morsel_start, m, ci, pki);
                 let pi = if ci < pki { ci } else { ci - 1 };
-                let col_data = mb.col_data[pi];
+                let col_data = mb.col_data(pi, 8);
                 let base_d = dst * MORSEL;
                 for i in 0..m {
                     let off = (morsel_start + i) * 8;
@@ -849,7 +849,7 @@ pub(in crate::expr) fn eval_batch(
                     for i in 0..m { scratch.regs[base_d + i] = 0; }
                 } else {
                     let pi = if ci < pki { ci } else { ci - 1 };
-                    let null_bmp = mb.null_bmp;
+                    let null_bmp = mb.null_bmp();
                     for i in 0..m {
                         let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
                         scratch.regs[base_d + i] = ((row_null >> pi) & 1) as i64;
@@ -864,7 +864,7 @@ pub(in crate::expr) fn eval_batch(
                     for i in 0..m { scratch.regs[base_d + i] = 1; }
                 } else {
                     let pi = if ci < pki { ci } else { ci - 1 };
-                    let null_bmp = mb.null_bmp;
+                    let null_bmp = mb.null_bmp();
                     for i in 0..m {
                         let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
                         scratch.regs[base_d + i] = (((row_null >> pi) & 1) ^ 1) as i64;

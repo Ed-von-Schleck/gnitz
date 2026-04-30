@@ -35,4 +35,5 @@ pub use error::StorageError;
 pub(crate) use read_cursor::{DRAIN_BUFFER, ReadCursor};
 pub(crate) use columnar::compare_rows;
 pub(crate) use merge::DirectWriter;
+pub(crate) use batch::carve_writer_slices;
 

@@ -26,17 +26,17 @@ const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 /// (schema max is 64 total columns, 1 is the PK).  The blob is not in this
 /// array; it lives in `self.blob` and is accounted for separately.
 /// 3 + 63 = 66, rounded up to 68 to keep the array size as a multiple of 4.
-pub(super) const MAX_BATCH_REGIONS: usize = 68;
+pub(crate) const MAX_BATCH_REGIONS: usize = 68;
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
 // Three fixed regions (PK is 16 bytes/row; weight and null_bmp are 8 bytes/row);
 // payload columns start at index 3 and continue for `num_payload_cols()` slots.
 // Use these constants instead of bare numeric literals.
-const REG_PK: usize = 0;
-const REG_WEIGHT: usize = 1;
-const REG_NULL_BMP: usize = 2;
-const REG_PAYLOAD_START: usize = 3;
+pub(super) const REG_PK: usize = 0;
+pub(super) const REG_WEIGHT: usize = 1;
+pub(super) const REG_NULL_BMP: usize = 2;
+pub(super) const REG_PAYLOAD_START: usize = 3;
 /// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
 
@@ -110,6 +110,32 @@ pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_
     strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
     let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
     (strides, nr as u8)
+}
+
+/// Carve a contiguous arena into the four `DirectWriter` regions: PK, weight,
+/// null bitmap, then one slice per payload column. Each region is sized for
+/// `rows * stride`. The caller is responsible for ensuring `data` has at least
+/// that many bytes; any tail is left untouched and discarded.
+pub(crate) fn carve_writer_slices<'a>(
+    data: &'a mut [u8],
+    schema: &SchemaDescriptor,
+    rows: usize,
+) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
+    let pk_sz = rows * pk_stride(schema) as usize;
+    let fixed = rows * 8;
+    let (pk, rest) = data.split_at_mut(pk_sz);
+    let (weight, rest) = rest.split_at_mut(fixed);
+    let (null_bmp, mut rest) = rest.split_at_mut(fixed);
+
+    let npc = schema.num_columns as usize - 1;
+    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(npc);
+    for (_pi, _ci, col) in schema.payload_columns() {
+        let col_sz = rows * col.size as usize;
+        let (c, new_rest) = rest.split_at_mut(col_sz);
+        col_slices.push(c);
+        rest = new_rest;
+    }
+    (pk, weight, null_bmp, col_slices)
 }
 
 /// Owned columnar batch.  All fixed-stride column data lives in a single
@@ -444,8 +470,8 @@ impl Batch {
         &mut self.data[off..end]
     }
 
-    /// Return a `DirectWriter` carving slices bounded by `capacity * stride`
-    /// **not** by `count * stride`. Used to re-fill a batch whose allocation
+    /// Return a `DirectWriter` over this batch's data buffer, sized for
+    /// `capacity` rows (not `count`). Used to re-fill a batch whose allocation
     /// is already live but whose row count has been reset (`clear()`, then
     /// `reserve_rows`).
     ///
@@ -455,10 +481,9 @@ impl Batch {
     /// the writer is dropped.
     pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
         let cap = self.capacity as usize;
-        let nr = self.num_regions as usize;
         let schema = self.schema.expect("capacity_writer requires schema");
         let (pk, weight, null_bmp, col_slices) =
-            carve_writer_slices(&mut self.data, &self.strides, nr, cap);
+            carve_writer_slices(&mut self.data, &schema, cap);
         merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
     }
 
@@ -655,7 +680,7 @@ impl Batch {
         if n == 0 { return; }
         self.reserve_rows(n);
         if !src.blob.is_empty() { self.blob.reserve(src.blob.len()); }
-        self.bulk_copy_region(REG_PK, src.pk, start, end);
+        self.bulk_copy_region(REG_PK, src.pk(), start, end);
         match weight_override {
             Some(w) => {
                 let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
@@ -666,11 +691,11 @@ impl Batch {
                 }
             }
             None => {
-                self.bulk_copy_region(REG_WEIGHT, src.weight, start, end);
+                self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
             }
         }
-        self.bulk_copy_region(REG_NULL_BMP, src.null_bmp, start, end);
-        let npc = src.col_data.len();
+        self.bulk_copy_region(REG_NULL_BMP, src.null_bmp(), start, end);
+        let npc = self.num_payload_cols();
         let mut is_string_at = [false; MAX_BATCH_REGIONS];
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
@@ -682,15 +707,14 @@ impl Batch {
             let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
             if is_string_at[pi] && cs == 16 {
                 for row in start..end {
-                    let src_off = row * 16;
-                    let src_struct = &src.col_data[pi][src_off..src_off + 16];
+                    let src_struct = src.get_col_ptr(row, pi, 16);
                     let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize
                         + (self.count + row - start) * 16;
                     relocate_string_cell(src_struct, src.blob,
                         &mut self.data[dst_off..dst_off + 16], &mut self.blob);
                 }
             } else if cs > 0 {
-                self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data[pi], start, end);
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data(pi, cs), start, end);
             }
         }
         self.count += n;
@@ -699,18 +723,14 @@ impl Batch {
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     /// Create a borrowed `MemBatch` view over this batch's data.
+    ///
+    /// Zero-allocation: copies the by-value `offsets` array and forwards
+    /// references to `data` and `blob`.
     pub fn as_mem_batch(&self) -> MemBatch<'_> {
-        let npc = self.num_payload_cols();
-        let mut col_slices = Vec::with_capacity(npc);
-        for pi in 0..npc {
-            col_slices.push(self.col_data(pi));
-        }
         MemBatch {
-            pk: self.pk_data(),
+            data: &self.data,
+            offsets: self.offsets,
             pk_stride: self.strides[REG_PK],
-            weight: self.weight_data(),
-            null_bmp: self.null_bmp_data(),
-            col_data: col_slices,
             blob: &self.blob,
             count: self.count,
         }
@@ -1390,10 +1410,14 @@ impl std::ops::Deref for ConsolidatedBatch {
     fn deref(&self) -> &Batch { &self.0 }
 }
 
-/// Decode a WAL data block into a `MemBatch<'a>` that borrows slices directly
-/// from `data`.  No allocation; caller must keep `data` live for as long as
-/// the returned `MemBatch` is used.  Checksum verification is skipped (IPC
-/// trusted path).
+/// Decode a WAL data block into a `MemBatch<'a>` that borrows the buffer
+/// directly. No allocation; caller must keep `data` live for as long as the
+/// returned `MemBatch` is used. Checksum verification is skipped (IPC trusted
+/// path).
+///
+/// The returned `MemBatch` carries the parsed region offsets by value. We
+/// validate every region's `offset + count*stride <= data.len()` here so that
+/// the hot-path `get_*` accessors never panic on a corrupted WAL block.
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
@@ -1403,12 +1427,12 @@ pub fn decode_mem_batch_from_wal_block<'a>(
 
     let mut _lsn = 0u64; let mut _tid = 0u32; let mut count = 0u32;
     let mut num_regions = 0u32; let mut _blob_size = 0u64;
-    let mut offsets = [0u64; MAX_BATCH_REGIONS];
-    let mut sizes   = [0u32; MAX_BATCH_REGIONS];
+    let mut wal_offsets = [0u64; MAX_BATCH_REGIONS];
+    let mut sizes       = [0u32; MAX_BATCH_REGIONS];
 
     super::wal::validate_and_parse(
         data, &mut _lsn, &mut _tid, &mut count, &mut num_regions,
-        &mut _blob_size, &mut offsets, &mut sizes, MAX_BATCH_REGIONS as u32, false,
+        &mut _blob_size, &mut wal_offsets, &mut sizes, MAX_BATCH_REGIONS as u32, false,
     ).map_err(|_| "data WAL block invalid")?;
 
     if num_regions as usize != expected_regions {
@@ -1418,70 +1442,41 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     let n = count as usize;
     let pk_stride_val = pk_stride(schema);
 
-    if n == 0 {
-        return Ok(MemBatch {
-            pk: &[], pk_stride: pk_stride_val,
-            weight: &[], null_bmp: &[],
-            col_data: Vec::new(), blob: &[], count: 0,
-        });
-    }
+    let mut offsets = [0u32; MAX_BATCH_REGIONS];
 
-    let region_slice = |r: usize, row_stride: usize| -> Result<&'a [u8], &'static str> {
-        let off = offsets[r] as usize;
-        let sz  = sizes[r] as usize;
+    // Validate every fixed region: data covers [off, off + n*stride).
+    let validate = |r: usize, row_stride: usize| -> Result<u32, &'static str> {
+        if n == 0 { return Ok(0); }
+        let off = wal_offsets[r] as usize;
+        let sz  = sizes[r]  as usize;
         let needed = n * row_stride;
-        if sz < needed || off + sz > data.len() {
+        if sz < needed || off + sz > data.len() || off > u32::MAX as usize {
             return Err("data WAL region OOB");
         }
-        Ok(&data[off..off + needed])
+        Ok(off as u32)
     };
 
-    let pk       = region_slice(REG_PK,       pk_stride_val as usize)?;
-    let weight   = region_slice(REG_WEIGHT,   8)?;
-    let null_bmp = region_slice(REG_NULL_BMP, 8)?;
+    offsets[REG_PK]       = validate(REG_PK,       pk_stride_val as usize)?;
+    offsets[REG_WEIGHT]   = validate(REG_WEIGHT,   8)?;
+    offsets[REG_NULL_BMP] = validate(REG_NULL_BMP, 8)?;
 
-    let mut col_data = Vec::with_capacity(npc);
     let pk_idx = schema.pk_index as usize;
     let mut pi = 0usize;
     for ci in 0..schema.num_columns as usize {
         if ci == pk_idx { continue; }
         let stride = schema.columns[ci].size as usize;
-        col_data.push(region_slice(REG_PAYLOAD_START + pi, stride)?);
+        offsets[REG_PAYLOAD_START + pi] = validate(REG_PAYLOAD_START + pi, stride)?;
         pi += 1;
     }
 
     let blob_r = REG_PAYLOAD_START + npc;
     let blob = {
-        let off = offsets[blob_r] as usize;
+        let off = wal_offsets[blob_r] as usize;
         let sz  = sizes[blob_r] as usize;
         if sz > 0 && off + sz <= data.len() { &data[off..off + sz] } else { &[] }
     };
 
-    Ok(MemBatch { pk, pk_stride: pk_stride_val, weight, null_bmp, col_data, blob, count: n })
-}
-
-/// Carve `data` into the four DirectWriter regions: PK, weight, null bitmap,
-/// then one slice per payload column. Slices are sized for `rows * stride`.
-fn carve_writer_slices<'a>(
-    data: &'a mut [u8],
-    strides: &[u8; MAX_BATCH_REGIONS],
-    nr: usize,
-    rows: usize,
-) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
-    let pk_sz = rows * strides[REG_PK] as usize;
-    let fixed = rows * 8;
-    let (pk, rest) = data.split_at_mut(pk_sz);
-    let (weight, rest) = rest.split_at_mut(fixed);
-    let (null_bmp, mut rest) = rest.split_at_mut(fixed);
-
-    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr - REG_PAYLOAD_START);
-    for &stride in &strides[REG_PAYLOAD_START..nr] {
-        let col_sz = rows * stride as usize;
-        let (col, new_rest) = rest.split_at_mut(col_sz);
-        col_slices.push(col);
-        rest = new_rest;
-    }
-    (pk, weight, null_bmp, col_slices)
+    Ok(MemBatch { data, offsets, pk_stride: pk_stride_val, blob, count: n })
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via
@@ -1530,10 +1525,9 @@ pub fn write_to_batch(
     let actual_rows;
     {
         let (pk, weight, null_bmp, col_slices) =
-            carve_writer_slices(&mut data, &strides, nr, max_rows);
+            carve_writer_slices(&mut data, schema, max_rows);
         let mut writer = merge::DirectWriter::new(
-            pk, weight, null_bmp,
-            col_slices, &mut blob, *schema, max_rows,
+            pk, weight, null_bmp, col_slices, &mut blob, *schema, max_rows,
         );
         write_fn(&mut writer);
         actual_rows = writer.row_count();
