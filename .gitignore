@@ -134,6 +134,7 @@ cython_debug/
 *.so
 *.dylib
 *.dll
+*.ll
 
 # Server binaries (built by Makefile)
 /gnitz-server

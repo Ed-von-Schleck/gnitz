@@ -39,6 +39,7 @@ pub(super) const REG_NULL_BMP: usize = 2;
 pub(super) const REG_PAYLOAD_START: usize = 3;
 /// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
+pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
