@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
-use crate::storage::partition_for_key;
+use crate::storage::{BlobCacheGuard, partition_for_key};
 use crate::ops::worker_for_partition;
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION};
 use crate::runtime::sal::{
@@ -177,6 +177,25 @@ pub struct WorkerProcess {
     // schema for the same target_id (FLAG_HAS_PK UniqueIndex path). On
     // fingerprint mismatch the block is built inline without evicting the cache.
     schema_wire_block_cache: HashMap<i64, (u32, u32, Rc<Vec<u8>>)>,
+}
+
+fn filter_by_pk(
+    batch: &Option<Batch>,
+    schema: SchemaDescriptor,
+    n: usize,
+    mut has_pk: impl FnMut(u128) -> bool,
+) -> Batch {
+    let mut result = Batch::with_schema(schema, n);
+    if let Some(ref b) = batch {
+        let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
+        for i in 0..n {
+            let pk = b.get_pk(i);
+            if has_pk(pk) {
+                result.append_row_from_source(pk, 1, b, i, blob_cache.get_mut());
+            }
+        }
+    }
+    result
 }
 
 impl WorkerProcess {
@@ -871,7 +890,7 @@ impl WorkerProcess {
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
-        match lookup {
+        let (schema, result) = match lookup {
             HasPkLookup::UniqueIndex(col_idx) => {
                 let index_handle = self.cat().get_index_store_handle(target_id, col_idx);
                 if index_handle.is_null() {
@@ -883,36 +902,20 @@ impl WorkerProcess {
                     .and_then(|b| b.schema)
                     .or_else(|| self.cat().get_schema_desc(target_id))
                     .ok_or_else(|| format!("no schema for tid={}", target_id))?;
-                let mut result = Batch::with_schema(schema, n);
-                if let Some(ref b) = batch {
-                    let table = unsafe { &mut *index_handle };
-                    let mut blob_cache = HashMap::new();
-                    for i in 0..n {
-                        if table.has_pk(b.get_pk(i)) {
-                            result.append_row_from_source(b.get_pk(i), 1, b, i, &mut blob_cache);
-                        }
-                    }
-                }
-                self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
+                let table = unsafe { &mut *index_handle };
+                (schema, filter_by_pk(&batch, schema, n, |pk| table.has_pk(pk)))
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self.cat().get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={}", target_id))?;
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
-                let mut result = Batch::with_schema(schema, n);
-                if let Some(ref b) = batch {
-                    let mut blob_cache = HashMap::new();
-                    for i in 0..n {
-                        let exists = ptable_handle
-                            .is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i)));
-                        if exists {
-                            result.append_row_from_source(b.get_pk(i), 1, b, i, &mut blob_cache);
-                        }
-                    }
-                }
-                self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
+                let result = filter_by_pk(&batch, schema, n, |pk| {
+                    ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(pk))
+                });
+                (schema, result)
             }
-        }
+        };
+        self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
         Ok(())
     }
 

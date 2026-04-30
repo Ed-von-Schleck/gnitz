@@ -8,11 +8,10 @@
 
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 use super::columnar::{self, ColumnarSource};
 use super::batch::FIXED_REGION_BYTES;
-use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
+use crate::schema::{BlobCache, SchemaDescriptor, type_code, MAX_COLUMNS};
 use super::heap::MergeHeap;
 use crate::util::read_u64_le;
 
@@ -48,12 +47,17 @@ pub(crate) struct UnifiedSource<'a> {
 // only acquire one when the schema actually contains a STRING column.
 // ---------------------------------------------------------------------------
 
+/// Don't recycle caches that grew beyond this many buckets — keeps idle pool
+/// memory bounded. Sized for typical merge fan-in of a few thousand unique
+/// long-string spans; oversized caches are dropped instead of pooled.
+const BLOB_CACHE_RECYCLE_CAP: usize = 65_536;
+
 thread_local! {
-    static BLOB_CACHE_POOL: Cell<Vec<HashMap<(u64, usize), usize>>> =
+    static BLOB_CACHE_POOL: Cell<Vec<BlobCache>> =
         const { Cell::new(Vec::new()) };
 }
 
-fn acquire_blob_cache() -> HashMap<(u64, usize), usize> {
+fn acquire_blob_cache() -> BlobCache {
     BLOB_CACHE_POOL.try_with(|p| {
         let mut pool = p.take();
         let cache = pool.pop().unwrap_or_default();
@@ -62,8 +66,8 @@ fn acquire_blob_cache() -> HashMap<(u64, usize), usize> {
     }).unwrap_or_default()
 }
 
-fn recycle_blob_cache(mut cache: HashMap<(u64, usize), usize>) {
-    if cache.capacity() > 65_536 { return; }
+fn recycle_blob_cache(mut cache: BlobCache) {
+    if cache.capacity() > BLOB_CACHE_RECYCLE_CAP { return; }
     cache.clear();
     let _ = BLOB_CACHE_POOL.try_with(|p| {
         let mut pool = p.take();
@@ -74,7 +78,7 @@ fn recycle_blob_cache(mut cache: HashMap<(u64, usize), usize>) {
 
 /// RAII wrapper that returns a pooled blob cache only when the schema has at
 /// least one STRING column, and recycles it on drop.
-pub(crate) struct BlobCacheGuard(Option<HashMap<(u64, usize), usize>>);
+pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
@@ -89,7 +93,7 @@ impl BlobCacheGuard {
         }
     }
 
-    pub(crate) fn get_mut(&mut self) -> Option<&mut HashMap<(u64, usize), usize>> {
+    pub(crate) fn get_mut(&mut self) -> Option<&mut BlobCache> {
         self.0.as_mut()
     }
 }

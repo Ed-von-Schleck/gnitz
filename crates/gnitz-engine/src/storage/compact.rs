@@ -1,12 +1,12 @@
 //! Self-contained shard compaction: N-way merge of sorted shard files.
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 
 use super::columnar;
 use super::error::StorageError;
 use super::heap::MergeHeap;
 use super::batch::Batch;
+use super::merge::BlobCacheGuard;
 use crate::schema::SchemaDescriptor;
 use super::shard_reader::MappedShard;
 #[cfg(test)]
@@ -252,9 +252,9 @@ pub fn compact_shards(
     table_id: u32,
 ) -> Result<(), StorageError> {
     let mut batch = Batch::with_schema(*schema, 1024);
-    let mut blob_cache: HashMap<(u64, usize), usize> = HashMap::new();
+    let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
     open_and_merge(input_files, schema, |key, weight, shard, row| {
-        batch.append_row_from_source(key, weight, shard, row, &mut blob_cache);
+        batch.append_row_from_source(key, weight, shard, row, blob_cache.get_mut());
     })?;
     batch.write_as_shard(output_file, table_id)
 }
@@ -276,8 +276,8 @@ pub fn merge_and_route(
     let mut batches: Vec<Batch> = (0..num_guards)
         .map(|_| Batch::with_schema(*schema, 256))
         .collect();
-    let mut blob_caches: Vec<HashMap<(u64, usize), usize>> = (0..num_guards)
-        .map(|_| HashMap::new())
+    let mut blob_caches: Vec<BlobCacheGuard> = (0..num_guards)
+        .map(|_| BlobCacheGuard::acquire(schema, 256))
         .collect();
     let out_filenames: Vec<String> = (0..num_guards)
         .map(|i| format!(
@@ -288,7 +288,7 @@ pub fn merge_and_route(
 
     open_and_merge(input_files, schema, |key, weight, shard, row| {
         let gi = find_guard_for_key(guard_keys, key);
-        batches[gi].append_row_from_source(key, weight, shard, row, &mut blob_caches[gi]);
+        batches[gi].append_row_from_source(key, weight, shard, row, blob_caches[gi].get_mut());
     })?;
 
     // Validate all output paths fit in GuardResult.filename before writing anything.

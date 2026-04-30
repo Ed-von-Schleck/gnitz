@@ -1157,8 +1157,7 @@ mod tests {
     /// Bug 5: append_row_from_source must not panic when blob offset is invalid.
     #[test]
     fn test_append_row_from_source_corrupted_blob() {
-        use crate::schema::{SchemaColumn, type_code};
-        use std::collections::HashMap;
+        use crate::schema::{BlobCache, SchemaColumn, type_code};
 
         // Schema: col0 = PK (U64), col1 = STRING
         let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
@@ -1188,10 +1187,10 @@ mod tests {
 
         // Build destination batch and call append_row_from_source
         let mut dst = Batch::with_schema(schema, 1);
-        let mut blob_cache: HashMap<(u64, usize), usize> = HashMap::new();
+        let mut blob_cache: BlobCache = BlobCache::default();
 
         // Must not panic
-        dst.append_row_from_source(42u128, 1, &src, 0, &mut blob_cache);
+        dst.append_row_from_source(42u128, 1, &src, 0, Some(&mut blob_cache));
 
         assert_eq!(dst.count, 1);
         // The corrupted string should have length 0

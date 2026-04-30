@@ -3,14 +3,13 @@
 //! `Batch` owns its memory (two `Vec<u8>` buffers — data + blob).
 //! `MemBatch<'a>` in the merge module is the borrowed slice-view counterpart.
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use super::shard_file;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{BlobCache, SchemaDescriptor};
 use crate::util::{read_i64_le, read_u64_le};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
@@ -1178,13 +1177,17 @@ impl Batch {
     }
 
     /// Append a single row from any ColumnarSource with blob deduplication.
+    ///
+    /// Pass `None` for `blob_cache` when the schema has no STRING columns or
+    /// when cross-row dedup isn't worth the bookkeeping. Pass `Some(...)` to
+    /// dedup repeated source long-string spans into a single destination copy.
     pub fn append_row_from_source<S: ColumnarSource>(
         &mut self,
         key: u128,
         weight: i64,
         source: &S,
         row: usize,
-        blob_cache: &mut HashMap<(u64, usize), usize>,
+        mut blob_cache: Option<&mut BlobCache>,
     ) {
         if weight == 0 { return; }
         self.ensure_row_capacity();
@@ -1205,7 +1208,7 @@ impl Batch {
             } else if col.type_code == crate::schema::type_code::STRING {
                 let src_struct = source.get_col_ptr(row, pi, cs);
                 let dest = crate::schema::relocate_german_string_vec(
-                    src_struct, src_blob, &mut self.blob, Some(blob_cache),
+                    src_struct, src_blob, &mut self.blob, blob_cache.as_deref_mut(),
                 );
                 self.extend_col(pi, &dest);
             } else {

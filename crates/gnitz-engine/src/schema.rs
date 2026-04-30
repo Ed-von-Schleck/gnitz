@@ -2,10 +2,9 @@
 //!
 //! These are shared across the storage, IPC, and query layers.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::util::{read_u32_le, read_u64_le};
-use crate::xxh;
 
 pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
@@ -155,26 +154,12 @@ pub(crate) fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
     }
 }
 
-/// Check the blob dedup cache. Returns `Some(offset)` if `data` is already
-/// present in `existing_blob`. Otherwise inserts `new_offset` into the cache
-/// and returns `None` — the caller must actually append `data` at `new_offset`.
-pub(crate) fn blob_cache_lookup(
-    data: &[u8],
-    cache: &mut HashMap<(u64, usize), usize>,
-    existing_blob: &[u8],
-    new_offset: usize,
-) -> Option<usize> {
-    if data.is_empty() { return Some(0); }
-    let h = xxh::checksum(data);
-    let key = (h, data.len());
-    if let Some(&off) = cache.get(&key) {
-        if existing_blob.get(off..off + data.len()) == Some(data) {
-            return Some(off);
-        }
-    }
-    cache.insert(key, new_offset);
-    None
-}
+/// Identity-keyed dedup cache for `relocate_german_string_vec`.
+///
+/// Key: `(src_blob.as_ptr() as usize, old_offset, length)`. The same source
+/// span is copied at most once per merge — the cached value is the offset
+/// inside the destination blob where the bytes were appended.
+pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
 
 /// Copy a 16-byte German string cell and (for long strings) migrate the
 /// out-of-line payload from `src_blob` into `dst_blob`.
@@ -183,8 +168,9 @@ pub(crate) fn blob_cache_lookup(
 /// Short strings (≤ SHORT_STRING_THRESHOLD) are copied inline — `src_blob` is
 /// unused for them.
 ///
-/// When `cache` is `Some`, the appended blob data is deduplicated via
-/// `blob_cache_lookup`; the returned offset may point to an existing copy.
+/// When `cache` is `Some`, the appended blob data is deduplicated by
+/// `(src_blob.as_ptr(), old_offset, length)` — i.e. the same source span is
+/// only copied once per merge.
 ///
 /// **Malformed-input fallback:** if the long-string header declares a region
 /// `[old_offset, old_offset + length)` that overruns `src_blob.len()`, the
@@ -195,7 +181,7 @@ pub(crate) fn relocate_german_string_vec(
     src_cell: &[u8],
     src_blob: &[u8],
     dst_blob: &mut Vec<u8>,
-    cache: Option<&mut HashMap<(u64, usize), usize>>,
+    cache: Option<&mut BlobCache>,
 ) -> [u8; 16] {
     let (mut dest, is_long) = prep_german_string_copy(src_cell);
     if !is_long {
@@ -210,12 +196,19 @@ pub(crate) fn relocate_german_string_vec(
         dest[0..8].copy_from_slice(&0u64.to_le_bytes());
         return dest;
     }
-    let src_data = &src_blob[old_offset..old_offset + length];
     let new_offset = dst_blob.len();
     let off = match cache {
-        Some(cache) => blob_cache_lookup(src_data, cache, dst_blob, new_offset)
-            .unwrap_or_else(|| { dst_blob.extend_from_slice(src_data); new_offset }),
-        None => { dst_blob.extend_from_slice(src_data); new_offset },
+        Some(cache) => {
+            let key = (src_blob.as_ptr() as usize, old_offset, length);
+            *cache.entry(key).or_insert_with(|| {
+                dst_blob.extend_from_slice(&src_blob[old_offset..old_offset + length]);
+                new_offset
+            })
+        }
+        None => {
+            dst_blob.extend_from_slice(&src_blob[old_offset..old_offset + length]);
+            new_offset
+        }
     };
     dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
     dest
@@ -333,21 +326,27 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_cache_lookup_hit_and_miss() {
-        let data = b"hello world test data";
-        let mut cache: HashMap<(u64, usize), usize> = HashMap::new();
-        // First lookup on empty blob: miss, populates cache at offset 0.
-        assert_eq!(blob_cache_lookup(data, &mut cache, &[], 0), None);
-        // Second lookup with the data in the blob: hit.
-        let blob: Vec<u8> = data.to_vec();
-        assert_eq!(blob_cache_lookup(data, &mut cache, &blob, 99), Some(0));
-    }
+    fn test_relocate_german_string_vec_cache_hit_dedups() {
+        // Long-string source: length=20, payload at offset 0 in src_blob.
+        let payload: &[u8] = b"hello world test dat";
+        assert_eq!(payload.len(), 20);
+        let src_blob: Vec<u8> = payload.to_vec();
 
-    #[test]
-    fn test_blob_cache_lookup_empty_always_zero() {
-        let mut cache: HashMap<(u64, usize), usize> = HashMap::new();
-        assert_eq!(blob_cache_lookup(b"", &mut cache, &[], 42), Some(0));
-        assert!(cache.is_empty(), "empty string must not pollute the cache");
+        let mut src_cell = [0u8; 16];
+        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
+        src_cell[4..8].copy_from_slice(&payload[0..4]);
+        src_cell[8..16].copy_from_slice(&0u64.to_le_bytes());
+
+        let mut dst_blob: Vec<u8> = Vec::new();
+        let mut cache: BlobCache = BlobCache::default();
+
+        let r1 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
+        let after_first = dst_blob.len();
+        assert_eq!(after_first, 20, "first call must append payload exactly once");
+
+        let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
+        assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
+        assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
     }
 
     #[test]
