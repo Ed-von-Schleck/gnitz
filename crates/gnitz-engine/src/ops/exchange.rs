@@ -194,6 +194,7 @@ pub fn compute_worker_indices(
     })
 }
 
+#[cfg(test)]
 pub fn op_repartition_batch(
     batch: &Batch,
     col_indices: &[u32],

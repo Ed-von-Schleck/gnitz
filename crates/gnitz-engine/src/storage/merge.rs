@@ -649,18 +649,13 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     let n = indices.len();
     let base = writer.count; // first output row for this scatter
 
-    {
-        let stride = writer.pk_stride as usize;
-        let src = batch.pk();
-        let dst = &mut writer.pk[base * stride..];
-        match stride {
-            8  => gather_col::<8>(src, dst, indices),
-            _  => gather_col::<16>(src, dst, indices),
-        }
+    // Fused PK + weight + null_bmp gather: one pass over `indices` instead of three.
+    // PK stride dispatches to a const-N helper so the inner loop sees a literal width.
+    if writer.pk_stride == 8 {
+        scatter_col_first_fixed::<8>(batch, indices, base, writer);
+    } else {
+        scatter_col_first_fixed::<16>(batch, indices, base, writer);
     }
-
-    gather_col::<8>(batch.weight(), &mut writer.weight[base * 8..], indices);
-    gather_col::<8>(batch.null_bmp(), &mut writer.null_bmp[base * 8..], indices);
 
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
@@ -696,12 +691,92 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     writer.count += n;
 }
 
-// `N` is a const so LLVM sees a fixed-width copy and emits optimal load/store code.
+// Fused PK + weight + null_bmp gather in one pass over `indices`, replacing three
+// separate gather_col calls. Caller invariant: every index < batch.count; writer
+// slices sized for at least (base + indices.len()) rows.
 #[inline(always)]
-fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
+fn scatter_col_first_fixed<const PKS: usize>(
+    batch: &MemBatch<'_>,
+    indices: &[u32],
+    base: usize,
+    writer: &mut DirectWriter<'_>,
+) {
+    const FB: usize = FIXED_REGION_BYTES;
+    let pk_src = batch.pk();
+    let wt_src = batch.weight();
+    let nb_src = batch.null_bmp();
+    let pk_dst = &mut writer.pk[base * PKS..];
+    let wt_dst = &mut writer.weight[base * FB..];
+    let nb_dst = &mut writer.null_bmp[base * FB..];
+    debug_assert!(pk_dst.len() >= indices.len() * PKS);
+    debug_assert!(wt_dst.len() >= indices.len() * FB);
+    debug_assert!(nb_dst.len() >= indices.len() * FB);
     for (out, &idx) in indices.iter().enumerate() {
         let i = idx as usize;
-        dst[out * N..][..N].copy_from_slice(&src[i * N..][..N]);
+        debug_assert!((i + 1) * PKS <= pk_src.len());
+        debug_assert!((i + 1) * FB <= wt_src.len());
+        debug_assert!((i + 1) * FB <= nb_src.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pk_src.as_ptr().add(i * PKS),
+                pk_dst.as_mut_ptr().add(out * PKS),
+                PKS,
+            );
+            std::ptr::copy_nonoverlapping(
+                wt_src.as_ptr().add(i * FB),
+                wt_dst.as_mut_ptr().add(out * FB),
+                FB,
+            );
+            std::ptr::copy_nonoverlapping(
+                nb_src.as_ptr().add(i * FB),
+                nb_dst.as_mut_ptr().add(out * FB),
+                FB,
+            );
+        }
+    }
+}
+
+// `N` is a const so LLVM sees a fixed-width copy and emits optimal load/store code.
+// Caller invariant: every `idx` in `indices` is `< src.len() / N`; `dst.len() >= indices.len() * N`.
+#[inline(always)]
+unsafe fn copy_row<const N: usize>(src: &[u8], dst: &mut [u8], idx: usize, out: usize) {
+    std::ptr::copy_nonoverlapping(src.as_ptr().add(idx * N), dst.as_mut_ptr().add(out * N), N);
+}
+
+#[inline(always)]
+fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
+    debug_assert!(dst.len() >= indices.len() * N);
+    // On x86_64, prefetch source rows ahead when src exceeds half of L1d and would stall on DRAM.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const AHEAD: usize = 64;
+        if src.len() > 16 * 1024 && indices.len() > AHEAD * 2 {
+            let end = indices.len() - AHEAD;
+            for out in 0..end {
+                unsafe {
+                    let idx = *indices.get_unchecked(out) as usize;
+                    let pi = *indices.get_unchecked(out + AHEAD) as usize;
+                    debug_assert!((idx + 1) * N <= src.len());
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        src.as_ptr().add(pi * N) as *const i8,
+                    );
+                    copy_row::<N>(src, dst, idx, out);
+                }
+            }
+            for out in end..indices.len() {
+                unsafe {
+                    let idx = *indices.get_unchecked(out) as usize;
+                    debug_assert!((idx + 1) * N <= src.len());
+                    copy_row::<N>(src, dst, idx, out);
+                }
+            }
+            return;
+        }
+    }
+    for (out, &idx) in indices.iter().enumerate() {
+        let i = idx as usize;
+        debug_assert!((i + 1) * N <= src.len());
+        unsafe { copy_row::<N>(src, dst, i, out); }
     }
 }
 

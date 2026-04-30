@@ -2,9 +2,20 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
+
+use rustc_hash::FxHashMap;
+
+thread_local! {
+    /// Pooled aggregation map for PK net-weight + positive-count tracking,
+    /// reused across `validate_all_distributed_async` calls. Cleared (capacity
+    /// retained) on entry; never held across `.await`.
+    static PK_AGG_POOL: RefCell<FxHashMap<u128, (i64, u32)>> =
+        RefCell::new(FxHashMap::default());
+}
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
@@ -19,7 +30,7 @@ use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
-    PartitionRouter, op_repartition_batch, op_relay_scatter, op_relay_scatter_consolidated,
+    PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
     worker_for_partition, compute_worker_indices,
 };
 
@@ -35,8 +46,9 @@ enum CheckPayload {
     /// Replicate the same batch to every worker; each worker filters
     /// its local partition.
     Broadcast(Batch),
-    /// Per-worker sub-batches (caller has already routed by key).
-    Partitioned(Vec<Batch>),
+    /// Pre-partitioned: source batch + per-worker row indices, delivered via
+    /// `scatter_wire_group` without materializing intermediate per-worker `Batch`es.
+    ScatterSource { source: Batch, worker_indices: Vec<Vec<u32>> },
 }
 
 /// A single distributed has-pk check queued for pipelined execution.
@@ -732,18 +744,24 @@ impl MasterDispatcher {
                     rids.push((0..nw).map(|_| reactor.alloc_request_id()).collect());
                 }
                 for (idx, check) in checks.iter().enumerate() {
-                    let refs: Vec<Option<&Batch>> = match &check.payload {
-                        CheckPayload::Broadcast(batch) => (0..nw).map(|_| Some(batch)).collect(),
-                        CheckPayload::Partitioned(batches) => batches.iter()
-                            .map(|b| if b.count > 0 { Some(b) } else { None })
-                            .collect(),
-                    };
                     let lsn = disp.next_lsn();
-                    disp.write_group_with_req_ids(
-                        check.target_id, lsn, check.flags, &refs,
-                        &check.schema, &[], 0, check.col_hint,
-                        &rids[idx], -1, 0,
-                    )?;
+                    match &check.payload {
+                        CheckPayload::Broadcast(batch) => {
+                            let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
+                            disp.write_group_with_req_ids(
+                                check.target_id, lsn, check.flags, &refs,
+                                &check.schema, &[], 0, check.col_hint,
+                                &rids[idx], -1, 0,
+                            )?;
+                        }
+                        CheckPayload::ScatterSource { source, worker_indices } => {
+                            disp.sal.scatter_wire_group(
+                                source, worker_indices, &check.schema, None,
+                                check.target_id as u32, lsn, check.flags,
+                                0, check.col_hint, &rids[idx], -1,
+                            )?;
+                        }
+                    }
                 }
                 disp.signal_all();
                 (nw, rids)
@@ -762,7 +780,7 @@ impl MasterDispatcher {
         let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
             let cap = match &check.payload {
                 CheckPayload::Broadcast(b) => b.count,
-                CheckPayload::Partitioned(bs) => bs.iter().map(|b| b.count).sum(),
+                CheckPayload::ScatterSource { source, .. } => source.count,
             };
             HashSet::with_capacity(cap)
         }).collect();
@@ -988,8 +1006,14 @@ impl MasterDispatcher {
 
         let pki = source_schema.pk_index as usize;
 
-        let pk_agg: HashMap<u128, (i64, u32)> = if has_unique || needs_pk_rejection {
-            let mut m: HashMap<u128, (i64, u32)> = HashMap::with_capacity(batch.count);
+        // Build PK aggregation using pooled map; release borrow before any `.await`.
+        let pk_lo_hi: Option<(Vec<u64>, Vec<u64>)> = PK_AGG_POOL.with(|cell| -> Result<Option<(Vec<u64>, Vec<u64>)>, String> {
+            let mut m = cell.borrow_mut();
+            m.clear();
+            if !(has_unique || needs_pk_rejection) {
+                return Ok(None);
+            }
+            m.reserve(batch.count);
             for i in 0..batch.count {
                 let w = batch.get_weight(i);
                 if w == 0 { continue; }
@@ -997,28 +1021,32 @@ impl MasterDispatcher {
                 entry.0 += w;
                 if w > 0 { entry.1 += 1; }
             }
-            m
-        } else {
-            HashMap::new()
-        };
-
-        if needs_pk_rejection {
-            for (&pk, &(_, pos_count)) in &pk_agg {
-                if pos_count > 1 {
-                    let (pk_name, sn, tn) = unsafe {
-                        let disp = &mut *disp_ptr;
-                        (disp.get_col_name(target_id, pki),
-                         disp.get_qualified_name_owned(target_id).0,
-                         disp.get_qualified_name_owned(target_id).1)
-                    };
-                    let key_str = format_pk_value(pk, &source_schema);
-                    return Err(format!(
-                        "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
-                        sn, tn, pk_name, key_str,
-                    ));
+            if needs_pk_rejection {
+                for (&pk, &(_, pos_count)) in m.iter() {
+                    if pos_count > 1 {
+                        let (pk_name, (sn, tn)) = unsafe {
+                            let disp = &mut *disp_ptr;
+                            (disp.get_col_name(target_id, pki),
+                             disp.get_qualified_name_owned(target_id))
+                        };
+                        let key_str = format_pk_value(pk, &source_schema);
+                        return Err(format!(
+                            "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
+                            sn, tn, pk_name, key_str,
+                        ));
+                    }
                 }
             }
-        }
+            let mut lo_list: Vec<u64> = Vec::with_capacity(m.len());
+            let mut hi_list: Vec<u64> = Vec::with_capacity(m.len());
+            for (&pk, &(net_weight, _)) in m.iter() {
+                if net_weight <= 0 { continue; }
+                let (lo, hi) = crate::util::split_pk(pk);
+                lo_list.push(lo);
+                hi_list.push(hi);
+            }
+            Ok(Some((lo_list, hi_list)))
+        })?;
 
         // ----- Phase 1 plan -----------------------------------------------
         let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
@@ -1066,7 +1094,7 @@ impl MasterDispatcher {
             let expected_count = lo_list.len();
             let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
             let pk_col = &[parent_schema.pk_index];
-            let sub_batches = op_repartition_batch(
+            let worker_indices = compute_worker_indices(
                 &check_batch, pk_col, &parent_schema, num_workers);
 
             p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
@@ -1074,7 +1102,7 @@ impl MasterDispatcher {
                 target_id: parent_table_id,
                 flags: FLAG_HAS_PK,
                 col_hint: 0,
-                payload: CheckPayload::Partitioned(sub_batches),
+                payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
                 schema: parent_schema,
             });
         }
@@ -1130,27 +1158,18 @@ impl MasterDispatcher {
             }
         }
 
-        if has_unique || needs_pk_rejection {
-            let mut lo_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
-            let mut hi_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
-            for (&pk, &(net_weight, _)) in &pk_agg {
-                if net_weight <= 0 { continue; }
-                let (lo, hi) = crate::util::split_pk(pk);
-                lo_list.push(lo);
-                hi_list.push(hi);
-            }
-
+        if let Some((lo_list, hi_list)) = pk_lo_hi {
             if !lo_list.is_empty() {
                 let check_batch = build_check_batch(&source_schema, &lo_list, &hi_list);
                 let pk_col = &[source_schema.pk_index];
-                let sub_batches = op_repartition_batch(
+                let worker_indices = compute_worker_indices(
                     &check_batch, pk_col, &source_schema, num_workers);
                 p1_labels.push(P1Label::UpsertPkId);
                 p1_checks.push(PipelinedCheck {
                     target_id,
                     flags: FLAG_HAS_PK,
                     col_hint: 0,
-                    payload: CheckPayload::Partitioned(sub_batches),
+                    payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
                     schema: source_schema,
                 });
             }
