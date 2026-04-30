@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use super::columnar;
 use super::error::StorageError;
@@ -25,7 +25,7 @@ use super::shard_reader::MappedShard;
 enum FoundSource {
     None,
     MemTable,
-    Shard(Arc<MappedShard>, usize),
+    Shard(Rc<MappedShard>, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,8 @@ pub struct Table {
     pub current_lsn: u64,
 
     found_source: FoundSource,
+
+    cached_full_scan: Option<Rc<Batch>>,
 }
 
 impl Table {
@@ -92,6 +94,7 @@ impl Table {
             flush_seq: 0,
             current_lsn: 1,
             found_source: FoundSource::None,
+            cached_full_scan: None,
         };
 
         if durable {
@@ -132,6 +135,7 @@ impl Table {
             return Ok(());
         }
         self.found_source = FoundSource::None;
+        self.cached_full_scan = None;
 
         let durable = !force_ephemeral && self.durable;
         if durable {
@@ -229,13 +233,26 @@ impl Table {
         Ok(handle)
     }
 
+    /// Return the fully consolidated batch of all live rows, caching the result.
+    /// The cache is invalidated on any logical write (upsert or test-helper upsert).
+    /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
+    pub fn full_scan(&mut self) -> Result<Rc<Batch>, StorageError> {
+        if let Some(ref rc) = self.cached_full_scan {
+            return Ok(Rc::clone(rc));
+        }
+        let handle = self.create_cursor()?;
+        let rc = handle.cursor.materialize();
+        self.cached_full_scan = Some(Rc::clone(&rc));
+        Ok(rc)
+    }
+
     /// Get a memtable snapshot handle (for PartitionedTable cursor gathering).
-    pub fn get_snapshot(&mut self) -> Arc<Batch> {
+    pub fn get_snapshot(&mut self) -> Rc<Batch> {
         self.memtable.get_snapshot()
     }
 
-    /// Get all shard Arcs (for PartitionedTable cursor gathering).
-    pub fn all_shard_arcs(&self) -> Vec<Arc<MappedShard>> {
+    /// Get all shard Rcs (for PartitionedTable cursor gathering).
+    pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
     }
 
@@ -248,6 +265,7 @@ impl Table {
     /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
     #[cfg(test)]
     pub fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
+        self.cached_full_scan = None;
         self.memtable.upsert_sorted_batch(batch)
     }
 
@@ -296,10 +314,10 @@ impl Table {
             self.found_source = FoundSource::MemTable;
         } else {
             // Payload-aware shard fallback: check net weight per (PK, payload)
-            for (arc, idx) in &shard_candidates {
-                let net_w = self.get_weight_for_row(key, arc.as_ref(), *idx);
+            for (rc, idx) in &shard_candidates {
+                let net_w = self.get_weight_for_row(key, rc.as_ref(), *idx);
                 if net_w > 0 {
-                    self.found_source = FoundSource::Shard(Arc::clone(arc), *idx);
+                    self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
                     break;
                 }
             }
@@ -323,17 +341,17 @@ impl Table {
         }
 
         // Shards
-        self.shard_index.find_pk(key, &mut |shard_arc, start_idx| {
+        self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_arc.count {
-                if shard_arc.get_pk(idx) != key {
+            while idx < shard_rc.count {
+                if shard_rc.get_pk(idx) != key {
                     break;
                 }
                 let ord = columnar::compare_rows(
-                    &self.schema, shard_arc.as_ref(), idx, ref_source, ref_row,
+                    &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
-                    total_w += shard_arc.get_weight(idx);
+                    total_w += shard_rc.get_weight(idx);
                 }
                 idx += 1;
             }
@@ -426,18 +444,18 @@ impl Table {
     fn scan_shards_for_pk(
         &self,
         key: u128,
-    ) -> (i64, Vec<(Arc<MappedShard>, usize)>) {
+    ) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
         let mut total_w: i64 = 0;
-        let mut candidates: Vec<(Arc<MappedShard>, usize)> = Vec::new();
+        let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
 
-        self.shard_index.find_pk(key, &mut |shard_arc, start_idx| {
+        self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_arc.count {
-                if shard_arc.get_pk(idx) != key {
+            while idx < shard_rc.count {
+                if shard_rc.get_pk(idx) != key {
                     break;
                 }
-                total_w += shard_arc.get_weight(idx);
-                candidates.push((Arc::clone(&shard_arc), idx));
+                total_w += shard_rc.get_weight(idx);
+                candidates.push((Rc::clone(&shard_rc), idx));
                 idx += 1;
             }
         });

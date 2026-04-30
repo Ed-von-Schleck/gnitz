@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
@@ -876,7 +875,7 @@ impl WorkerProcess {
             return Ok(());
         }
         let local_batch = self.cat().scan_family(source_tid)?;
-        let owned = Arc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
+        let owned = Rc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
         self.evaluate_dag(source_tid, owned, request_id);
         Ok(())
     }

@@ -32,7 +32,7 @@ pub use merge::{MemBatch, scatter_copy, scatter_multi_source};
 pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use read_cursor::{DRAIN_BUFFER, ReadCursor};
+pub(crate) use read_cursor::{DRAIN_BUFFER, ReadCursor, create_cursor_from_snapshots};
 pub(crate) use columnar::compare_rows;
 pub(crate) use merge::{BlobCacheGuard, DirectWriter};
 pub(crate) use batch::carve_writer_slices;

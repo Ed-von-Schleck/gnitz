@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::create_cursor_from_snapshots;
 
 const SYS_TABLE_IDS: &[i64] = &[
     SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
@@ -186,7 +187,7 @@ impl CatalogEngine {
     }
 
     /// Scan all positive-weight rows from a table.
-    pub fn scan_family(&mut self, table_id: i64) -> Result<Arc<Batch>, String> {
+    pub fn scan_family(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
@@ -200,7 +201,15 @@ impl CatalogEngine {
             CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_SOURCES_TAB_ID |
             CIRCUIT_PARAMS_TAB_ID | CIRCUIT_GROUP_COLS_TAB_ID)
         {
-            return Ok(Arc::new(Batch::empty_with_schema(&schema)));
+            return Ok(Rc::new(Batch::empty_with_schema(&schema)));
+        }
+        if matches!(table_id, SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID
+            | COL_TAB_ID | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID)
+        {
+            let table = self.sys_table_mut(table_id).unwrap();
+            return Ok(table.full_scan().unwrap_or_else(|_| {
+                Rc::new(Batch::empty_with_schema(&schema))
+            }));
         }
         Ok(self.scan_store(table_id, &schema))
     }
@@ -222,7 +231,11 @@ impl CatalogEngine {
             match table_id {
                 SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID
                 | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID => {
-                    self.sys_table_mut(table_id).unwrap().create_cursor()
+                    let arc = match self.sys_table_mut(table_id).unwrap().full_scan() {
+                        Ok(a) => a,
+                        Err(_) => return Ok(None),
+                    };
+                    Ok(create_cursor_from_snapshots(&[arc], &[], schema))
                 }
                 _ => return Ok(None),
             }
@@ -659,10 +672,8 @@ impl CatalogEngine {
     pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Result<Vec<ColumnDef>, String> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
-        let mut cursor = match self.sys_columns.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let arc = self.sys_columns.full_scan().map_err(|e| e.to_string())?;
+        let mut cursor = create_cursor_from_snapshots(&[arc], &[], sys_tab_schema(COL_TAB_ID));
         cursor.cursor.seek(start_pk as u128);
 
         let mut defs = Vec::new();
@@ -822,14 +833,14 @@ impl CatalogEngine {
 
     // -- Scan store -------------------------------------------------------
 
-    pub(crate) fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Arc<Batch> {
+    pub(crate) fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Rc<Batch> {
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
-            None => return Arc::new(Batch::empty_with_schema(schema)),
+            None => return Rc::new(Batch::empty_with_schema(schema)),
         };
         match entry.handle.create_cursor() {
             Ok(c) => c.cursor.materialize(),
-            Err(_) => Arc::new(Batch::empty_with_schema(schema)),
+            Err(_) => Rc::new(Batch::empty_with_schema(schema)),
         }
     }
 }

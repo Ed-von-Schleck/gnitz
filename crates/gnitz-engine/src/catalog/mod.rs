@@ -43,7 +43,6 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, StoreHandle};
@@ -122,5 +121,3 @@ pub struct CatalogEngine {
     ddl_zone_lsn: u64,
 }
 
-// SAFETY: CatalogEngine is only accessed from a single thread.
-unsafe impl Send for CatalogEngine {}

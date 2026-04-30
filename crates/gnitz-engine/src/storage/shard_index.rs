@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use super::compact;
 use super::error::StorageError;
@@ -25,7 +25,7 @@ fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
 }
 
 struct ShardEntry {
-    shard: Arc<MappedShard>,
+    shard: Rc<MappedShard>,
     filename: String,
     min_lsn: u64,
     max_lsn: u64,
@@ -34,7 +34,6 @@ struct ShardEntry {
 }
 
 impl ShardEntry {
-    #[allow(clippy::arc_with_non_send_sync)]
     fn open(
         path: &str,
         schema: &SchemaDescriptor,
@@ -42,7 +41,7 @@ impl ShardEntry {
         max_lsn: u64,
     ) -> Result<Self, StorageError> {
         let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
-        let shard = Arc::new(MappedShard::open(&cpath, schema, false)?);
+        let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
         // Empty shard: pk_min > pk_max so range checks always fail
         let (pk_min, pk_max) = if shard.count > 0 {
             (shard.get_pk(0), shard.get_pk(shard.count - 1))
@@ -59,13 +58,13 @@ impl ShardEntry {
         })
     }
 
-    fn probe_pk(&self, key: u128) -> Option<(Arc<MappedShard>, usize)> {
+    fn probe_pk(&self, key: u128) -> Option<(Rc<MappedShard>, usize)> {
         if self.pk_min <= key && key <= self.pk_max {
             if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
             if let Some(row) = self.shard.find_row_index(key) {
-                return Some((Arc::clone(&self.shard), row));
+                return Some((Rc::clone(&self.shard), row));
             }
         }
         None
@@ -213,13 +212,13 @@ impl ShardIndex {
         self.needs_compaction
     }
 
-    pub fn all_shard_arcs(&self) -> Vec<Arc<MappedShard>> {
+    pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.all_entries()
-            .map(|e| Arc::clone(&e.shard))
+            .map(|e| Rc::clone(&e.shard))
             .collect()
     }
 
-    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Arc<MappedShard>, usize)) {
+    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         for e in &self.l0 {
             if let Some((arc, idx)) = e.probe_pk(key) {
                 visitor(arc, idx);

@@ -87,12 +87,12 @@ mod tests {
 
     #[test]
     fn test_op_scan_trace_chunked() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
         // 5 rows in trace
-        let trace = Arc::new(make_batch(&schema, &[
+        let trace = Rc::new(make_batch(&schema, &[
             (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50),
         ]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
@@ -114,11 +114,11 @@ mod tests {
 
     #[test]
     fn test_op_scan_trace_empty() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let out = op_scan_trace(ch.cursor_mut(), &schema, 10);

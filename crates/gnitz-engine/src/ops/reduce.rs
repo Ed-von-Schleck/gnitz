@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_retraction() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
@@ -1418,7 +1418,7 @@ mod tests {
         };
 
         // Empty trace_out
-        let empty_out = Arc::new(Batch::empty(2, 16));
+        let empty_out = Rc::new(Batch::empty(2, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
@@ -1453,7 +1453,7 @@ mod tests {
 
         // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
         // Need trace_out with previous aggregate
-        let prev_out = Arc::new(out1);
+        let prev_out = Rc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
         let delta2 = {
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn test_reduce_count() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
@@ -1500,7 +1500,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
@@ -1527,7 +1527,7 @@ mod tests {
     /// GI path bug: same PK, two different string payloads — the `if` must be `while`.
     #[test]
     fn test_reduce_gi_same_pk_multiple_payloads() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let input_schema = make_schema_3col_grp_str();
@@ -1535,16 +1535,16 @@ mod tests {
         let gi_schema = make_gi_schema();
 
         // trace_in: apple and zebra both at PK=1 (apple sorts first by payload)
-        let ti_batch = Arc::new(make_batch_3col_grp_str(
+        let ti_batch = Rc::new(make_batch_3col_grp_str(
             &input_schema,
             &[(1, 1, 1, "apple"), (1, 1, 1, "zebra")],
         ).into_inner());
 
         // GI: only PK=1 → group gc_u64=1
-        let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
+        let gi_batch = Rc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
 
         // trace_out: empty (no previous aggregate, no retraction emitted)
-        let to_batch = Arc::new(Batch::empty(output_schema.num_columns as usize - 1, 16));
+        let to_batch = Rc::new(Batch::empty(output_schema.num_columns as usize - 1, 16));
 
         // delta: retract apple at PK=1
         let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);
@@ -1606,7 +1606,7 @@ mod tests {
 
     #[test]
     fn test_gather_reduce_retraction() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
@@ -1624,7 +1624,7 @@ mod tests {
         };
 
         // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = Batch::with_schema(schema, 2);
@@ -1648,7 +1648,7 @@ mod tests {
         assert_eq!(global_count, 4);
 
         // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
-        let prev_out = Arc::new(out1);
+        let prev_out = Rc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = Batch::with_schema(schema, 2);
@@ -1796,7 +1796,7 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_i32() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::I32);
@@ -1814,7 +1814,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I32 values, group by PK
@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_reduce_min_f32() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::F32);
@@ -1861,7 +1861,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_reduce_max_i16() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::I16);
@@ -1905,7 +1905,7 @@ mod tests {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I16 values, all same PK
@@ -1933,7 +1933,7 @@ mod tests {
 
     #[test]
     fn test_gather_reduce_min_retraction() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         // Schema: pk(U128), min_val(I64)
@@ -1950,7 +1950,7 @@ mod tests {
         };
 
         // Tick 1: partial MIN=5 from one worker → global MIN=5
-        let empty_out = Arc::new(Batch::empty(1, 16));
+        let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = Batch::with_schema(schema, 1);
@@ -1972,7 +1972,7 @@ mod tests {
 
         // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
         // via merge_accumulated with weight=1 → combine(5). New MIN should be min(3, 5) = 3.
-        let prev_out = Arc::new(out1);
+        let prev_out = Rc::new(out1);
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = Batch::with_schema(schema, 1);

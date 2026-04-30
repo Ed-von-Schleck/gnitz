@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 use std::ffi::CStr;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use super::batch::{Batch, write_to_batch, ConsolidatedBatch};
 use super::bloom::BloomFilter;
@@ -51,7 +51,7 @@ pub struct MemTable {
     max_bytes: usize,
     total_row_count: usize,
     runs_bytes: usize,
-    cached_consolidated: Option<Arc<Batch>>,
+    cached_consolidated: Option<Rc<Batch>>,
     // Last lookup result (set by lookup_pk, read by found_* accessors)
     found_run: usize,
     found_row: usize,
@@ -117,17 +117,17 @@ impl MemTable {
     }
 
     /// Get a consolidated snapshot.  Caches the merged result of all runs.
-    /// Returns an `Arc<Batch>` — cheap to clone for multiple consumers.
-    pub fn get_snapshot(&mut self) -> Arc<Batch> {
+    /// Returns an `Rc<Batch>` — cheap to clone for multiple consumers.
+    pub fn get_snapshot(&mut self) -> Rc<Batch> {
         if self.cached_consolidated.is_none() && !self.runs.is_empty() {
             let batches = self.runs_as_sorted();
             let consolidated = consolidate_batches(&batches, &self.schema);
-            self.cached_consolidated = Some(Arc::new(consolidated));
+            self.cached_consolidated = Some(Rc::new(consolidated));
         }
 
         match &self.cached_consolidated {
-            Some(arc) => Arc::clone(arc),
-            None => Arc::new(Batch::empty_with_schema(&self.schema)),
+            Some(rc) => Rc::clone(rc),
+            None => Rc::new(Batch::empty_with_schema(&self.schema)),
         }
     }
 
@@ -394,14 +394,14 @@ mod tests {
 
         let s1 = mt.get_snapshot();
         let s2 = mt.get_snapshot();
-        // Should be the same Arc (cached)
-        assert!(Arc::ptr_eq(&s1, &s2));
+        // Should be the same Rc (cached)
+        assert!(Rc::ptr_eq(&s1, &s2));
 
         // After new upsert, cache is invalidated
         let b2 = make_batch(&schema, &[(20, 1, 200)]);
         mt.upsert_sorted_batch(b2).unwrap();
         let s3 = mt.get_snapshot();
-        assert!(!Arc::ptr_eq(&s1, &s3));
+        assert!(!Rc::ptr_eq(&s1, &s3));
         assert_eq!(s3.count, 2);
     }
 

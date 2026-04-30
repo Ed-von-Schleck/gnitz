@@ -848,13 +848,13 @@ mod tests {
 
     #[test]
     fn test_distinct_update_same_pk() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
-        let trace_batch = Arc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
         let mut cursor_handle = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.

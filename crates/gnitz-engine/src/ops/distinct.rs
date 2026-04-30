@@ -128,13 +128,13 @@ mod tests {
 
     #[test]
     fn test_op_distinct_boundary() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
-        let empty = Arc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty.clone()], schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
@@ -147,7 +147,7 @@ mod tests {
 
         // Now trace has pk=1 w=3 and pk=2 w=1
         // Delta: pk=1 w=-2 (3→1, still positive, no output), pk=2 w=-1 (1→0, emit -1)
-        let trace_batch = Arc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
+        let trace_batch = Rc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
         let mut ch2 = CursorHandle::from_owned(&[trace_batch], schema);
         let delta2 = make_batch(&schema, &[(1, -2, 10), (2, -1, 20)]);
         let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
@@ -222,11 +222,11 @@ mod tests {
 
     #[test]
     fn test_distinct_i32_payload_no_panic() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i32();
-        let trace = Arc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
+        let trace = Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: same (PK=1, val=42) → stays +1 → no output
@@ -236,7 +236,7 @@ mod tests {
 
         // New (PK=1, val=99) → new element → +1 output
         let mut ch2 = CursorHandle::from_owned(
-            &[Arc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))],
+            &[Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))],
             schema,
         );
         let delta2 = make_batch_narrow::<4>(&schema, &[(1, 1, 99)]);
@@ -246,11 +246,11 @@ mod tests {
 
     #[test]
     fn test_distinct_i16_payload_no_panic() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i16();
-        let trace = Arc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
+        let trace = Rc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         let delta = make_batch_narrow::<2>(&schema, &[(5, 1, -100)]);
@@ -260,11 +260,11 @@ mod tests {
 
     #[test]
     fn test_distinct_i8_payload_no_panic() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i8();
-        let trace = Arc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
+        let trace = Rc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         let delta = make_batch_narrow::<1>(&schema, &[(7, 1, -1)]);
@@ -274,11 +274,11 @@ mod tests {
 
     #[test]
     fn test_op_distinct_consolidated_flag() {
-        use std::sync::Arc;
+        use std::rc::Rc;
         use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
-        let empty = Arc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty(1, 16));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);

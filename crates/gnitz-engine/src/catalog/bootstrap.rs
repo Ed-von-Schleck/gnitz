@@ -333,41 +333,18 @@ impl CatalogEngine {
     }
 
     fn replay_system_table(&mut self, sys_table_id: i64) -> Result<(), String> {
-        let schema = sys_tab_schema(sys_table_id);
         // Only the five catalog tables below need hook-driven replay. Circuit_*
         // and sys_sequences are loaded directly by other open-time paths.
         match sys_table_id {
             SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID | IDX_TAB_ID => {}
             _ => return Ok(()),
         }
-        let table_ptr: *mut Table = self.sys_table_mut(sys_table_id)
-            .expect("sys_table_mut covers the match arms above")
-            as *mut Table;
-
-        // Scan all live rows and process through hooks
-        let mut cursor = unsafe { (*table_ptr).create_cursor().map_err(|e| format!("cursor error: {}", e))? };
-        let mut batch = Batch::with_schema(schema, 512);
-        let mut count = 0;
-
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
-                // Copy row into batch
-                self.copy_cursor_row_to_batch(&cursor, &mut batch);
-                count += 1;
-
-                if count >= 512 {
-                    self.fire_hooks(sys_table_id, &batch)?;
-                    batch = Batch::with_schema(schema, 512);
-                    count = 0;
-                }
-            }
-            cursor.cursor.advance();
+        let table = self.sys_table_mut(sys_table_id)
+            .expect("sys_table_mut covers the match arms above");
+        let arc = table.full_scan().map_err(|e| format!("scan error: {}", e))?;
+        if arc.count > 0 {
+            self.fire_hooks(sys_table_id, &*arc)?;
         }
-
-        if count > 0 {
-            self.fire_hooks(sys_table_id, &batch)?;
-        }
-
         Ok(())
     }
 

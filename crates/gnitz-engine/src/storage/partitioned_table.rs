@@ -3,7 +3,7 @@
 //! User tables have 256 partitions; system tables have 1.  The partition
 //! index is `xxh3(pk_lo, pk_hi) & 0xFF`.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::schema::SchemaDescriptor;
 use super::batch::Batch;
@@ -121,8 +121,8 @@ impl PartitionedTable {
             return self.tables[0].create_cursor();
         }
 
-        let mut all_snapshots: Vec<Arc<Batch>> = Vec::new();
-        let mut all_shard_arcs: Vec<Arc<MappedShard>> = Vec::new();
+        let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
+        let mut all_shard_arcs: Vec<Rc<MappedShard>> = Vec::new();
 
         for table in &mut self.tables {
             table.compact_if_needed()?;

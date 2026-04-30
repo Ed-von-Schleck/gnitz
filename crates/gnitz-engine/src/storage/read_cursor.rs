@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ptr;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
@@ -28,17 +28,17 @@ thread_local! {
 // CursorSource — unified access to in-memory batches or shard mmaps
 // ---------------------------------------------------------------------------
 //
-// Both variants own their backing data via `Arc`, so a `CursorSource` (and
+// Both variants own their backing data via `Rc`, so a `CursorSource` (and
 // therefore the enclosing `ReadCursor`) is a self-contained owning value with
 // no borrow lifetime.  This is what lets us hand `CursorHandle` (and pointers
 // to it) across DAG/VM boundaries without needing a `'static` transmute.
 
 enum CursorSource {
-    /// Arc-owned in-memory batch.  The Arc keeps the data alive for the
+    /// Rc-owned in-memory batch.  The Rc keeps the data alive for the
     /// cursor's lifetime; multiple cursors can share a snapshot.
-    Batch(Arc<Batch>),
-    /// Arc-owned reference to a MappedShard.  The Arc keeps the mmap alive.
-    Shard(Arc<MappedShard>),
+    Batch(Rc<Batch>),
+    /// Rc-owned reference to a MappedShard.  The Rc keeps the mmap alive.
+    Shard(Rc<MappedShard>),
 }
 
 impl CursorSource {
@@ -250,7 +250,7 @@ struct ReadCursorEntry {
 }
 
 impl ReadCursorEntry {
-    fn new_batch(batch: Arc<Batch>) -> Self {
+    fn new_batch(batch: Rc<Batch>) -> Self {
         let count = batch.count;
         ReadCursorEntry {
             source: CursorSource::Batch(batch),
@@ -259,7 +259,7 @@ impl ReadCursorEntry {
         }
     }
 
-    fn new_shard(shard: Arc<MappedShard>) -> Self {
+    fn new_shard(shard: Rc<MappedShard>) -> Self {
         let count = shard.count;
         let mut entry = ReadCursorEntry {
             source: CursorSource::Shard(shard),
@@ -581,26 +581,26 @@ impl ReadCursor {
     }
 
     /// Materialize all non-zero-weight rows in merge order into an owned
-    /// `Arc<Batch>`.
-    pub(crate) fn materialize(mut self) -> Arc<Batch> {
+    /// `Rc<Batch>`.
+    pub(crate) fn materialize(mut self) -> Rc<Batch> {
         if self.entries.len() == 1 && self.entries[0].position == 0 {
             match &self.entries[0].source {
-                CursorSource::Batch(arc) if arc.consolidated => return Arc::clone(arc),
-                CursorSource::Shard(arc) if !arc.has_ghosts => {
-                    return Arc::new(arc.to_owned_batch(&self.schema));
+                CursorSource::Batch(rc) if rc.consolidated => return Rc::clone(rc),
+                CursorSource::Shard(rc) if !rc.has_ghosts => {
+                    return Rc::new(rc.to_owned_batch(&self.schema));
                 }
                 _ => {}
             }
         }
         if !self.valid {
-            return Arc::new(Batch::empty_with_schema(&self.schema));
+            return Rc::new(Batch::empty_with_schema(&self.schema));
         }
 
         DRAIN_BUFFER.with(|buf| {
             let mut merge_order = buf.borrow_mut();
             self.drain_sorted_into(0, &mut merge_order);
             if merge_order.is_empty() {
-                return Arc::new(Batch::empty_with_schema(&self.schema));
+                return Rc::new(Batch::empty_with_schema(&self.schema));
             }
             let blob_cap: usize = self.entries.iter().map(|e| e.source_blob_len()).sum();
             let mut batch = super::batch::write_to_batch(
@@ -613,7 +613,7 @@ impl ReadCursor {
             // weights; `write_to_batch` doesn't know that, so restore the flags.
             batch.sorted = true;
             batch.consolidated = true;
-            Arc::new(batch)
+            Rc::new(batch)
         })
     }
 
@@ -787,26 +787,26 @@ impl ReadCursor {
 /// not a correctness limit, just a stack-size cap on the inline source array.
 const MAX_INLINE_BATCH_SOURCES: usize = 16;
 
-/// Build a ReadCursor from in-memory batches + shard Arcs.
+/// Build a ReadCursor from in-memory batches + shard Rcs.
 ///
-/// Both inputs are passed by `Arc`, so the cursor owns its data and has no
+/// Both inputs are passed by `Rc`, so the cursor owns its data and has no
 /// borrow lifetime — see the `CursorSource` doc comment.
 pub fn create_read_cursor(
-    batches: &[Arc<Batch>],
-    shard_arcs: &[Arc<MappedShard>],
+    batches: &[Rc<Batch>],
+    shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> ReadCursor {
     let mut entries = Vec::with_capacity(batches.len() + shard_arcs.len());
 
     for batch in batches {
         if batch.count > 0 {
-            entries.push(ReadCursorEntry::new_batch(Arc::clone(batch)));
+            entries.push(ReadCursorEntry::new_batch(Rc::clone(batch)));
         }
     }
 
     for shard in shard_arcs {
         if shard.count > 0 {
-            entries.push(ReadCursorEntry::new_shard(Arc::clone(shard)));
+            entries.push(ReadCursorEntry::new_shard(Rc::clone(shard)));
         }
     }
 
@@ -831,7 +831,7 @@ impl CursorHandle {
     /// Convenience wrapper used by test code.
     #[cfg(test)]
     pub fn from_owned(
-        snapshots: &[Arc<Batch>],
+        snapshots: &[Rc<Batch>],
         schema: crate::schema::SchemaDescriptor,
     ) -> CursorHandle {
         create_cursor_from_snapshots(snapshots, &[], schema)
@@ -843,14 +843,14 @@ impl CursorHandle {
     }
 }
 
-/// Build a CursorHandle from Rust-owned snapshots + shard Arcs.
+/// Build a CursorHandle from Rust-owned snapshots + shard Rcs.
 ///
-/// Each snapshot's `Arc<Batch>` and shard's `Arc<MappedShard>` is cloned into
+/// Each snapshot's `Rc<Batch>` and shard's `Rc<MappedShard>` is cloned into
 /// the corresponding `CursorSource` entry, keeping the data alive for the
 /// cursor's entire lifetime without any unsafe lifetime extension.
 pub fn create_cursor_from_snapshots(
-    snapshots: &[Arc<Batch>],
-    shard_arcs: &[Arc<MappedShard>],
+    snapshots: &[Rc<Batch>],
+    shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> CursorHandle {
     let cursor = create_read_cursor(snapshots, shard_arcs, schema);
@@ -892,10 +892,10 @@ mod tests {
         }
     }
 
-    /// Build an `Arc<Batch>` with i64-payload rows.  Tests pre-sort their
+    /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
     /// inputs and have at most one row per (PK, payload), so we mark the
     /// batch as sorted+consolidated.
-    fn make_batch(rows: &[(u64, u64, i64, i64)]) -> Arc<Batch> {
+    fn make_batch(rows: &[(u64, u64, i64, i64)]) -> Rc<Batch> {
         let schema = make_schema_i64();
         let mut b = Batch::with_schema(schema, rows.len().max(1));
         for &(lo, hi, w, val) in rows {
@@ -907,7 +907,7 @@ mod tests {
         }
         b.sorted = true;
         b.consolidated = true;
-        Arc::new(b)
+        Rc::new(b)
     }
 
     fn scan_all(cursor: &mut ReadCursor) -> Vec<(u64, u64, i64)> {

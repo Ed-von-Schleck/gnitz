@@ -427,7 +427,7 @@ impl CatalogEngine {
             if scan_batch.count == 0 { continue; }
 
             // Execute view plan on the batch
-            let owned = Arc::try_unwrap(scan_batch).unwrap_or_else(|a| (*a).clone());
+            let owned = Rc::try_unwrap(scan_batch).unwrap_or_else(|a| (*a).clone());
             let out_handle = self.dag.execute_epoch(vid, owned, source_id);
             if let Some(result) = out_handle {
                 if result.count > 0 {
