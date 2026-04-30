@@ -14,6 +14,7 @@ pub struct MergeHeap {
     pub heap: Vec<HeapNode>,
     pub pos_map: Vec<i32>,
     pub min_indices: Vec<usize>,
+    scratch: Vec<usize>,
 }
 
 #[inline]
@@ -50,6 +51,7 @@ impl MergeHeap {
             heap,
             pos_map,
             min_indices: Vec::with_capacity(8),
+            scratch: Vec::with_capacity(64),
         };
         let size = h.heap.len();
         for i in (0..size / 2).rev() {
@@ -172,26 +174,18 @@ impl MergeHeap {
         if self.heap.is_empty() {
             return 0;
         }
-        let heap = &self.heap;
-        let mut stack = [0usize; 64];
-        let mut sp = 1;
-        stack[0] = 0;
-        while sp > 0 {
-            sp -= 1;
-            let idx = stack[sp];
-            if idx == 0 || eq_root(&heap[idx], &heap[0]) == Ordering::Equal {
-                self.min_indices.push(heap[idx].idx);
+        self.scratch.clear();
+        self.scratch.push(0usize);
+        while let Some(idx) = self.scratch.pop() {
+            if idx == 0 || eq_root(&self.heap[idx], &self.heap[0]) == Ordering::Equal {
+                self.min_indices.push(self.heap[idx].idx);
                 let right = 2 * idx + 2;
-                if right < heap.len() {
-                    debug_assert!(sp < stack.len(), "collect_min_indices stack overflow");
-                    stack[sp] = right;
-                    sp += 1;
+                if right < self.heap.len() {
+                    self.scratch.push(right);
                 }
                 let left = 2 * idx + 1;
-                if left < heap.len() {
-                    debug_assert!(sp < stack.len(), "collect_min_indices stack overflow");
-                    stack[sp] = left;
-                    sp += 1;
+                if left < self.heap.len() {
+                    self.scratch.push(left);
                 }
             }
         }
