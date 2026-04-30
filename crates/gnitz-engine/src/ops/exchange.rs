@@ -168,28 +168,65 @@ fn hash_row_for_partition(
     partition_for_key(pk)
 }
 
+/// Fill `out[..num_workers]` with per-worker row indices from `batch`.
+/// Grows `out` to `num_workers` if shorter; clears `out[0..num_workers]`
+/// while preserving inner-Vec capacity.
+fn fill_worker_indices(
+    batch: &Batch,
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+    out: &mut Vec<Vec<u32>>,
+) {
+    let mb = batch.as_mem_batch();
+    let w_map = build_w_map(num_workers);
+    if out.len() < num_workers {
+        out.resize_with(num_workers, Vec::new);
+    }
+    for w in 0..num_workers { out[w].clear(); }
+    for i in 0..batch.count {
+        let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+        out[w_map[partition]].push(i as u32);
+    }
+}
+
+/// Compute per-worker row indices into the TLS pool and call `f` with a
+/// borrowed view, avoiding the clone done by `compute_worker_indices`.
+///
+/// `f` must not re-enter `compute_worker_indices` / `with_worker_indices` on
+/// the same thread (the TLS `RefCell` would panic).
+pub fn with_worker_indices<F, R>(
+    batch: &Batch,
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+    f: F,
+) -> R
+where
+    F: FnOnce(&[Vec<u32>]) -> R,
+{
+    SCATTER_INDICES.with(|pool| {
+        let mut worker_indices = pool.borrow_mut();
+        fill_worker_indices(batch, col_indices, schema, num_workers, &mut worker_indices);
+        f(&worker_indices[..num_workers])
+    })
+}
+
 /// Compute per-worker row-index lists for `batch` without building sub-batches.
 /// Returns `worker_indices[w]` = sorted row indices from `batch` destined for
 /// worker `w`. Clones from the SCATTER_INDICES thread-local pool so the result
-/// is owned and the pool remains free for the next call.
+/// is owned and the pool remains free for the next call. Use
+/// `with_worker_indices` instead when the caller can borrow the routing table
+/// for the duration of the scatter.
 pub fn compute_worker_indices(
     batch: &Batch,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Vec<u32>> {
-    let mb = batch.as_mem_batch();
-    let w_map = build_w_map(num_workers);
     SCATTER_INDICES.with(|pool| {
         let mut worker_indices = pool.borrow_mut();
-        if worker_indices.len() < num_workers {
-            worker_indices.resize_with(num_workers, Vec::new);
-        }
-        for w in 0..num_workers { worker_indices[w].clear(); }
-        for i in 0..batch.count {
-            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-            worker_indices[w_map[partition]].push(i as u32);
-        }
+        fill_worker_indices(batch, col_indices, schema, num_workers, &mut worker_indices);
         worker_indices[..num_workers].to_vec()
     })
 }

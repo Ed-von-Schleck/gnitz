@@ -31,7 +31,7 @@ use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    worker_for_partition, compute_worker_indices,
+    worker_for_partition, compute_worker_indices, with_worker_indices,
 };
 
 const FLAGS_PUSH_CONFLICT_MODE: u32 = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
@@ -220,7 +220,7 @@ pub struct MasterDispatcher {
     // Shared via Rc so cache hits cost a refcount bump, not a deep clone of
     // the name bytes. Populated lazily; table schemas are immutable.
     #[allow(clippy::type_complexity)]
-    schema_names_cache: HashMap<i64, (SchemaDescriptor, Rc<[Vec<u8>]>)>,
+    schema_names_cache: FxHashMap<i64, (SchemaDescriptor, Rc<[Vec<u8>]>)>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -243,7 +243,7 @@ impl MasterDispatcher {
             router: PartitionRouter::new(),
             unique_filters: HashMap::new(),
             next_lsn: 0,
-            schema_names_cache: HashMap::new(),
+            schema_names_cache: FxHashMap::default(),
         }
     }
 
@@ -1478,15 +1478,16 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         let pk_col = &[schema.pk_index];
-        let worker_indices = compute_worker_indices(batch, pk_col, &schema, self.num_workers);
-        self.record_index_routing(target_id, &schema, batch, &worker_indices);
         let (name_refs, n) = col_names_as_refs(&col_names);
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
-        self.sal.scatter_wire_group(
-            batch, &worker_indices, &schema, col_names_opt,
-            target_id as u32, lsn, FLAGS_PUSH_CONFLICT_MODE,
-            0, mode.as_u8() as u64, req_ids, -1,
-        )
+        with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
+            self.record_index_routing(target_id, &schema, batch, worker_indices);
+            self.sal.scatter_wire_group(
+                batch, worker_indices, &schema, col_names_opt,
+                target_id as u32, lsn, FLAGS_PUSH_CONFLICT_MODE,
+                0, mode.as_u8() as u64, req_ids, -1,
+            )
+        })
     }
 
     /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.

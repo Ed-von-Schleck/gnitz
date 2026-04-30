@@ -10,7 +10,7 @@ mod util;
 pub use distinct::op_distinct;
 pub use exchange::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    compute_worker_indices,
+    compute_worker_indices, with_worker_indices,
     worker_for_partition,
 };
 pub use index::{AviDesc, GiDesc, op_integrate_with_indexes};
