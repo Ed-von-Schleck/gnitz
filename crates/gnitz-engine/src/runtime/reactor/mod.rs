@@ -6,9 +6,13 @@
 //!
 //! Design notes:
 //!
-//! - Run queue is `Arc<Mutex<VecDeque<usize>>>`. The `Waker` vtable
-//!   requires `Send + Sync`; the master process is single-threaded so
-//!   the mutex never contends, but its presence is API-forced.
+//! - Run queue is a thread-local-reachable `RefCell<RunQueue>`. The
+//!   `Waker` vtable requires `Send + Sync`, but the reactor is strictly
+//!   single-threaded, so the waker stores only the task key as its
+//!   `*const ()` data pointer and reaches the queue via a thread-local
+//!   raw pointer set in `Reactor::new`. This eliminates the per-wake
+//!   `Arc::fetch_add/sub` and `Mutex::lock` round-trips that an
+//!   `Arc<Mutex<VecDeque>>` design would impose.
 //! - Timers are `io_uring Timeout` SQEs. `TimerFuture::poll` submits a
 //!   `prep_timeout` SQE on first poll; the resulting CQE wakes the
 //!   registered waker. A cancelled timer's CQE is silently discarded by
@@ -23,8 +27,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::ptr;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
@@ -107,12 +111,11 @@ struct ReactorShared {
     tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
     /// Tasks whose wakers fired; the reactor's main loop polls them on
-    /// the next tick. Wrapped in `Arc<Mutex<…>>` because the waker vtable
-    /// requires `Send + Sync` even though we never cross threads.
-    run_queue: Arc<Mutex<VecDeque<usize>>>,
-    /// Per-task waker; stored so spawning code does not need to rebuild
-    /// it on each poll. Indexed by task key.
-    task_wakers: RefCell<FxHashMap<usize, Waker>>,
+    /// the next tick. The waker vtable reaches this through a
+    /// thread-local raw pointer (`REACTOR_RUN_QUEUE`) — see `waker_wake`.
+    /// Dedup in `RunQueue::push` collapses N wakes for the same task
+    /// into a single poll per tick.
+    run_queue: RefCell<RunQueue>,
     /// Reply wakers keyed by request_id; populated by `await_reply`.
     reply_wakers: RefCell<FxHashMap<u64, Waker>>,
     parked_replies: RefCell<FxHashMap<u64, DecodedWire>>,
@@ -279,8 +282,7 @@ impl Reactor {
             ring: RefCell::new(ring),
             tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
-            run_queue: Arc::new(Mutex::new(VecDeque::new())),
-            task_wakers: RefCell::new(FxHashMap::default()),
+            run_queue: RefCell::new(RunQueue::new()),
             reply_wakers: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
             parked_replies: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
             fsync_wakers: RefCell::new(FxHashMap::default()),
@@ -314,6 +316,12 @@ impl Reactor {
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
         });
+        // Publish the run-queue pointer for the waker vtable. ReactorShared
+        // lives behind Rc with a stable address, so the pointer is valid
+        // for the reactor's lifetime; `Drop for Reactor` clears it.
+        REACTOR_RUN_QUEUE.with(|p| {
+            p.set(&inner.run_queue as *const RefCell<RunQueue>);
+        });
         Ok(Reactor { inner })
     }
 
@@ -332,8 +340,11 @@ impl Reactor {
     pub fn request_shutdown(&self) {
         self.inner.shutdown.set(true);
         self.cancel_futex_waitv_and_wait();
-        if let Some(w) = self.inner.task_wakers.borrow().values().next().cloned() {
-            w.wake();
+        // Unblock a sleeping reactor by scheduling any live task directly.
+        // We're on the reactor thread, so a direct push is sound — no
+        // waker round-trip needed.
+        if let Some(&key) = self.inner.tasks.borrow().keys().next() {
+            self.inner.run_queue.borrow_mut().push(key);
         }
     }
 
@@ -421,10 +432,8 @@ impl Reactor {
         self.inner.next_task_key.set(key + 1);
         let task = Task { future: Box::pin(fut) };
         self.inner.tasks.borrow_mut().insert(key, task);
-        let waker = make_waker(key, Arc::clone(&self.inner.run_queue));
-        self.inner.task_wakers.borrow_mut().insert(key, waker);
         // Schedule immediate first poll.
-        self.inner.run_queue.lock().unwrap().push_back(key);
+        self.inner.run_queue.borrow_mut().push(key);
         key
     }
 
@@ -859,15 +868,16 @@ impl Reactor {
         self.drain_injected_cqes();
         self.reap_closing_conns();
 
-        // 2. Drain the run queue. Snapshot first so wakes during poll
-        // schedule for the *next* tick rather than re-entering this one.
-        let ready: Vec<usize> = {
-            let mut q = self.inner.run_queue.lock().unwrap();
-            q.drain(..).collect()
-        };
-        for key in ready {
+        // 2. Drain the run queue. Swap into a thread-local scratch buffer
+        // so wakes during poll schedule for the *next* tick rather than
+        // re-entering this one. `Cell::take` releases any borrow before
+        // poll_task runs so waker_wake can push freely.
+        let mut buf = TICK_SCRATCH.with(|c| c.take());
+        self.inner.run_queue.borrow_mut().swap_into(&mut buf);
+        for key in buf.drain(..) {
             self.poll_task(key);
         }
+        TICK_SCRATCH.with(|c| c.set(buf));
 
         // 3. Submit pending SQEs and optionally block until the next event.
         // Skip blocking when there is nothing to drive (slab empty) or when
@@ -875,7 +885,7 @@ impl Reactor {
         // would sleep past the natural completion of the loop.
         let should_block = block
             && !self.inner.tasks.borrow().is_empty()
-            && self.inner.run_queue.lock().unwrap().is_empty();
+            && self.inner.run_queue.borrow().is_empty();
         if should_block {
             // Block indefinitely — outstanding timer SQEs guarantee a CQE
             // will arrive when the soonest timer fires.
@@ -893,17 +903,14 @@ impl Reactor {
     /// HashMap removal + same-key reinsertion is stable regardless of
     /// what other keys are added/removed during poll.
     fn poll_task(&self, key: usize) {
-        let waker = match self.inner.task_wakers.borrow().get(&key).cloned() {
-            Some(w) => w,
-            None => return,
-        };
         let mut task = match self.inner.tasks.borrow_mut().remove(&key) {
             Some(t) => t,
             None => return,
         };
+        let waker = make_waker(key);
         let mut cx = Context::from_waker(&waker);
         match task.future.as_mut().poll(&mut cx) {
-            Poll::Ready(()) => { self.inner.task_wakers.borrow_mut().remove(&key); }
+            Poll::Ready(()) => {}
             Poll::Pending   => { self.inner.tasks.borrow_mut().insert(key, task); }
         }
     }
@@ -1099,8 +1106,8 @@ impl Reactor {
     /// Called once per tick. Iterates only `closing_fds` (O(closing)),
     /// not all connections.
     fn reap_closing_conns(&self) {
+        if self.inner.closing_fds.borrow().is_empty() { return; }
         let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
-        if closing.is_empty() { return; }
         for fd in closing {
             let ready = {
                 let conns = self.inner.conns.borrow();
@@ -1328,46 +1335,104 @@ impl Reactor {
 }
 
 // ---------------------------------------------------------------------------
-// Waker vtable
+// Run queue + waker vtable
 // ---------------------------------------------------------------------------
 
-/// Heap-allocated state captured by the waker. The vtable requires
-/// `Send + Sync` so we use `Arc`; in practice the reactor never crosses
-/// threads.
-struct WakerInner {
-    key: usize,
-    queue: Arc<Mutex<VecDeque<usize>>>,
+/// Single-threaded run queue with in-flight deduplication.
+///
+/// `push` is O(scan) over the current contents; in practice the queue
+/// holds ≤ 16 entries (peak in-flight wake count for normal workloads),
+/// so the scan fits in one or two cache lines and auto-vectorizes — much
+/// cheaper than maintaining a parallel `FxHashSet`.
+///
+/// `Vec` (not `VecDeque`) so `swap_into` can exchange backing storage in
+/// O(1) (three pointer-width words) instead of copying N elements.
+struct RunQueue {
+    queue: Vec<usize>,
+}
+
+impl RunQueue {
+    fn new() -> Self {
+        Self { queue: Vec::with_capacity(16) }
+    }
+
+    /// Enqueue `key` unless it is already pending. Idempotent: N wakes
+    /// for the same task before the next tick collapse to one poll.
+    fn push(&mut self, key: usize) {
+        if !self.queue.contains(&key) {
+            self.queue.push(key);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// O(1) swap of the backing allocation into `out`.
+    fn swap_into(&mut self, out: &mut Vec<usize>) {
+        std::mem::swap(out, &mut self.queue);
+    }
+}
+
+thread_local! {
+    /// Points to the `RefCell<RunQueue>` owned by the reactor running on
+    /// this thread. Set in `Reactor::new`, cleared in `Reactor::drop`.
+    /// The waker vtable reads this to schedule wakes without per-wake
+    /// `Arc` traffic. Invariant: at most one reactor exists per thread
+    /// at any time (so this pointer is never overwritten while live).
+    static REACTOR_RUN_QUEUE: Cell<*const RefCell<RunQueue>> =
+        const { Cell::new(ptr::null()) };
+
+    /// Reused scratch buffer for `tick`'s run-queue drain. Allocated once
+    /// (capacity 16, covers normal-concurrency cases) and swapped in/out
+    /// every tick to avoid per-tick `Vec::from_iter`.
+    static TICK_SCRATCH: Cell<Vec<usize>> = Cell::new(Vec::with_capacity(16));
+}
+
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        // Clear before `ReactorShared` (and any pending tasks/futures) is
+        // freed: drop chains in `sync.rs` may call `Waker::wake`, and
+        // those calls must observe a null pointer rather than a dangling
+        // one. Wakes after this point are silent no-ops.
+        REACTOR_RUN_QUEUE.with(|p| p.set(ptr::null()));
+    }
 }
 
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
-    let arc = unsafe { Arc::from_raw(data as *const WakerInner) };
-    let cloned = Arc::clone(&arc);
-    std::mem::forget(arc);
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &WAKER_VTABLE)
+    RawWaker::new(data, &WAKER_VTABLE)
 }
 
 unsafe fn waker_wake(data: *const ()) {
-    let arc = unsafe { Arc::from_raw(data as *const WakerInner) };
-    arc.queue.lock().unwrap().push_back(arc.key);
+    let key = data as usize;
+    REACTOR_RUN_QUEUE.with(|p| {
+        let ptr = p.get();
+        if ptr.is_null() {
+            // Reactor torn down; the wake has nowhere to land. This is
+            // reached when `sync.rs` Drop chains (oneshot / mpsc /
+            // AsyncMutexGuard / WriteGuard) fire `waker.wake()` while
+            // the reactor is being dropped. Silent no-op.
+            return;
+        }
+        // SAFETY: invariant: the reactor that published this pointer is
+        // still alive (cleared in `Drop for Reactor`). RefCell enforces
+        // borrow rules, so a double-borrow panics rather than UB.
+        unsafe { (*ptr).borrow_mut().push(key); }
+    });
 }
 
 unsafe fn waker_wake_by_ref(data: *const ()) {
-    let arc = unsafe { Arc::from_raw(data as *const WakerInner) };
-    arc.queue.lock().unwrap().push_back(arc.key);
-    std::mem::forget(arc);
+    unsafe { waker_wake(data); }
 }
 
-unsafe fn waker_drop(data: *const ()) {
-    let _ = unsafe { Arc::from_raw(data as *const WakerInner) };
-}
+unsafe fn waker_drop(_data: *const ()) {}
 
 const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     waker_clone, waker_wake, waker_wake_by_ref, waker_drop,
 );
 
-fn make_waker(key: usize, queue: Arc<Mutex<VecDeque<usize>>>) -> Waker {
-    let inner = Arc::new(WakerInner { key, queue });
-    let raw = RawWaker::new(Arc::into_raw(inner) as *const (), &WAKER_VTABLE);
+pub(super) fn make_waker(key: usize) -> Waker {
+    let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }
 }
 
@@ -1778,17 +1843,17 @@ mod tests {
     }
 
     /// Cloning a waker, dropping the original, then waking the clone
-    /// must still schedule the task. Exercises the Arc refcount in the
-    /// waker vtable.
+    /// must still schedule the task. With the key-as-pointer waker
+    /// design, clone is a bitwise copy and drop is a no-op — but the
+    /// behaviour must still be observable.
     #[test]
     fn waker_clone_outlives_original() {
         let r = make_reactor();
-        let queue = Arc::clone(&r.inner.run_queue);
-        let original = make_waker(123, queue);
+        let original = make_waker(123);
         let cloned = original.clone();
         drop(original);
         cloned.wake();
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
         assert!(q.contains(&123));
     }
 
@@ -2167,14 +2232,14 @@ mod tests {
     #[test]
     fn register_reply_waker_replaces() {
         let r = make_reactor();
-        let waker_q = Arc::clone(&r.inner.run_queue);
-        let w1 = make_waker(99, Arc::clone(&waker_q));
-        let w2 = make_waker(100, Arc::clone(&waker_q));
+        
+        let w1 = make_waker(99);
+        let w2 = make_waker(100);
         r.register_reply_waker(42, w1);
         r.register_reply_waker(42, w2);
         r.inject_cqe(KIND_REPLY, 42, 0);
         r.drain_injected_cqes();
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
         assert!(q.contains(&100), "second waker (key=100) must win");
         assert!(!q.contains(&99), "first waker (key=99) must have been replaced");
     }
@@ -2286,7 +2351,7 @@ mod tests {
         let r = make_reactor();
         r.test_init_state(2);
 
-        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(0);
         r.register_reply_waker(42, waker);
 
         r.test_route_reply(1, synthetic_decoded_wire(42));
@@ -2391,14 +2456,14 @@ mod tests {
         let r = make_reactor();
         // Register a reply waker so KIND_REPLY's dispatch path has
         // something to pop.
-        let waker = make_waker(7, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(7);
         r.register_reply_waker(42, waker);
 
         r.inject_cqe(KIND_REPLY, 42, 0);
         r.inject_cqe(KIND_FSYNC, 42, -11);
         r.drain_injected_cqes();
 
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap()
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue
             .iter().copied().collect();
         assert!(q.contains(&7),
             "KIND_REPLY dispatch must wake the reply waker for id=42");
@@ -2423,7 +2488,7 @@ mod tests {
     #[test]
     fn send_cqe_parks_rc_and_wakes_waker() {
         let r = make_reactor();
-        let waker = make_waker(11, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(11);
         r.inner.send_wakers.borrow_mut().insert(55, waker);
 
         r.inject_cqe(KIND_SEND, 55, 1234);
@@ -2434,7 +2499,7 @@ mod tests {
             "KIND_SEND must park the CQE rc verbatim so SendFuture sees it");
         assert!(!r.inner.send_wakers.borrow().contains_key(&55),
             "KIND_SEND must consume the waker entry");
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap()
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue
             .iter().copied().collect();
         assert!(q.contains(&11), "KIND_SEND must wake the send future");
     }
@@ -2662,7 +2727,7 @@ mod tests {
     fn route_reply_flag_exchange_does_not_wake() {
         let r = make_reactor();
         r.test_init_state(2);
-        let waker = make_waker(0, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(0);
         r.register_reply_waker(42, waker);
 
         let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
@@ -2684,8 +2749,8 @@ mod tests {
         r.attach_relay_tx(tx);
         r.test_init_state(2);
 
-        let w0 = make_waker(0, Arc::clone(&r.inner.run_queue));
-        let w1 = make_waker(1, Arc::clone(&r.inner.run_queue));
+        let w0 = make_waker(0);
+        let w1 = make_waker(1);
         r.register_reply_waker(10, w0);
         r.register_reply_waker(11, w1);
 
@@ -2723,7 +2788,7 @@ mod tests {
         // Register one reply waker per worker to satisfy route_reply's
         // parked-waker pre-flight check.
         for w in 0..4 {
-            let waker = make_waker(w, Arc::clone(&r.inner.run_queue));
+            let waker = make_waker(w);
             r.register_reply_waker(100 + w as u64, waker);
         }
 
@@ -2786,7 +2851,7 @@ mod tests {
     fn timer_future_drop_cancels_heap_entry() {
         let r = make_reactor();
         let inner = Rc::clone(&r.inner);
-        let waker = make_waker(999, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(999);
         // Build a TimerFuture, poll once to register, then drop it.
         let mut tf = TimerFuture::new(
             Instant::now() + Duration::from_millis(10),
@@ -2801,7 +2866,7 @@ mod tests {
         // discarded without waking key=999.
         std::thread::sleep(Duration::from_millis(20));
         for _ in 0..4 { r.tick(false); }
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap()
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue
             .iter().copied().collect();
         assert!(!q.contains(&999),
             "cancelled timer must not wake its original waker");
@@ -3277,13 +3342,13 @@ mod tests {
     #[test]
     fn dispatch_accept_wakes_waiter_when_present() {
         let r = make_reactor();
-        let waker = make_waker(42, Arc::clone(&r.inner.run_queue));
+        let waker = make_waker(42);
         *r.inner.accept_waker.borrow_mut() = Some(waker);
 
         r.inject_cqe(KIND_ACCEPT, 0, 5);
         r.drain_injected_cqes();
 
-        let q: Vec<usize> = r.inner.run_queue.lock().unwrap().iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
         assert!(q.contains(&42), "KIND_ACCEPT must wake the registered accept_waker");
         assert!(r.inner.accept_waker.borrow().is_none(),
             "KIND_ACCEPT must consume (take) the accept_waker");
