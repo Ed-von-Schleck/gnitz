@@ -3,7 +3,6 @@
 //! W2M regions. Eventfds provide cross-process signaling.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -209,7 +208,7 @@ pub struct MasterDispatcher {
     router: PartitionRouter,
     /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
     /// unique-index broadcasts. See the UniqueFilter comment block above.
-    unique_filters: HashMap<(i64, u32), UniqueFilter>,
+    unique_filters: FxHashMap<(i64, u32), UniqueFilter>,
 
     /// Monotonic LSN allocator. The SAL writer no longer owns a counter;
     /// the dispatcher hands out LSNs (one per zone) via `next_lsn`.
@@ -241,7 +240,7 @@ impl MasterDispatcher {
             w2m: Some(w2m),
             catalog,
             router: PartitionRouter::new(),
-            unique_filters: HashMap::new(),
+            unique_filters: FxHashMap::default(),
             next_lsn: 0,
             schema_names_cache: FxHashMap::default(),
         }

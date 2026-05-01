@@ -2,6 +2,8 @@
 
 use std::cell::RefCell;
 
+use rustc_hash::FxHashMap;
+
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key, write_to_batch, scatter_multi_source};
 
@@ -85,13 +87,13 @@ pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
 /// Populated by `record_routing` after repartitioning unique-indexed columns.
 /// Lets the master unicast index seeks instead of broadcasting on cache hit.
 pub struct PartitionRouter {
-    index_routing: std::collections::HashMap<(u32, u32, u128), u32>,
+    index_routing: FxHashMap<(u32, u32, u128), u32>,
 }
 
 impl PartitionRouter {
     pub fn new() -> Self {
         PartitionRouter {
-            index_routing: std::collections::HashMap::new(),
+            index_routing: FxHashMap::default(),
         }
     }
 
@@ -168,9 +170,6 @@ fn hash_row_for_partition(
     partition_for_key(pk)
 }
 
-/// Fill `out[..num_workers]` with per-worker row indices from `batch`.
-/// Grows `out` to `num_workers` if shorter; clears `out[0..num_workers]`
-/// while preserving inner-Vec capacity.
 fn fill_worker_indices(
     batch: &Batch,
     col_indices: &[u32],
@@ -193,8 +192,8 @@ fn fill_worker_indices(
 /// Compute per-worker row indices into the TLS pool and call `f` with a
 /// borrowed view, avoiding the clone done by `compute_worker_indices`.
 ///
-/// `f` must not re-enter `compute_worker_indices` / `with_worker_indices` on
-/// the same thread (the TLS `RefCell` would panic).
+/// `f` must not call `compute_worker_indices` or `with_worker_indices` —
+/// the `SCATTER_INDICES` `RefCell` is already mutably borrowed.
 pub fn with_worker_indices<F, R>(
     batch: &Batch,
     col_indices: &[u32],
@@ -213,10 +212,8 @@ where
 }
 
 /// Compute per-worker row-index lists for `batch` without building sub-batches.
-/// Returns `worker_indices[w]` = sorted row indices from `batch` destined for
-/// worker `w`. Clones from the SCATTER_INDICES thread-local pool so the result
-/// is owned and the pool remains free for the next call. Use
-/// `with_worker_indices` instead when the caller can borrow the routing table
+/// Returns `worker_indices[w]` = row indices from `batch` destined for worker `w`.
+/// Use `with_worker_indices` instead when the caller can borrow the routing table
 /// for the duration of the scatter.
 pub fn compute_worker_indices(
     batch: &Batch,
