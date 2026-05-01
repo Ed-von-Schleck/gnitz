@@ -191,7 +191,7 @@ pub(crate) struct RelayPrepared {
     source_id: i64,
     dest_batches: Vec<Batch>,
     schema: SchemaDescriptor,
-    name_bytes: Rc<[Vec<u8>]>,
+    name_bytes: Rc<Vec<Vec<u8>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +214,6 @@ pub struct MasterDispatcher {
     /// the dispatcher hands out LSNs (one per zone) via `next_lsn`.
     /// Reset on checkpoint via `reset_sal`.
     next_lsn: u64,
-
-    // Cache: table_id → (schema, col_name_bytes).
-    // Shared via Rc so cache hits cost a refcount bump, not a deep clone of
-    // the name bytes. Populated lazily; table schemas are immutable.
-    #[allow(clippy::type_complexity)]
-    schema_names_cache: FxHashMap<i64, (SchemaDescriptor, Rc<[Vec<u8>]>)>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -242,7 +236,6 @@ impl MasterDispatcher {
             router: PartitionRouter::new(),
             unique_filters: FxHashMap::default(),
             next_lsn: 0,
-            schema_names_cache: FxHashMap::default(),
         }
     }
 
@@ -259,19 +252,12 @@ impl MasterDispatcher {
         v
     }
 
-    fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<[Vec<u8>]>) {
-        let cat_ptr = self.catalog;
-        let entry = self.schema_names_cache.entry(target_id).or_insert_with(|| {
-            let cat = unsafe { &mut *cat_ptr };
-            let schema = cat.get_schema_desc(target_id)
-                .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
-            let names: Rc<[Vec<u8>]> = cat.get_column_names(target_id)
-                .into_iter()
-                .map(String::into_bytes)
-                .collect();
-            (schema, names)
-        });
-        (entry.0, Rc::clone(&entry.1))
+    fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<Vec<u8>>>) {
+        let cat = unsafe { &mut *self.catalog };
+        let schema = cat.get_schema_desc(target_id)
+            .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
+        let names = cat.get_col_names_bytes(target_id);
+        (schema, names)
     }
 
     // -----------------------------------------------------------------------
