@@ -24,7 +24,7 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
+use crate::runtime::wire::{self, FLAG_CONFLICT_MODE_PRESENT, FLAG_HAS_DATA, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
@@ -641,7 +641,7 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, pk: u128,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<W2mSlot, String> {
         let worker = unsafe {
             worker_for_partition(partition_for_key(pk), (*disp_ptr).num_workers)
         };
@@ -654,7 +654,7 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, col_idx: u32, key: u128,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<W2mSlot, String> {
         let cached = unsafe {
             (*disp_ptr).router.worker_for_index_key(
                 target_id as u32, col_idx, key,
@@ -668,9 +668,9 @@ impl MasterDispatcher {
             ).await;
         }
 
-        // Cache miss: broadcast to all workers with per-worker req_ids.
-        let schema = unsafe { (*disp_ptr).get_schema_and_names(target_id).0 };
-        let decoded_vec = dispatch_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // Cache miss: broadcast to all workers with per-worker req_ids and
+        // forward the slot whose worker found a row (or slot 0 if none).
+        let mut slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -678,17 +678,21 @@ impl MasterDispatcher {
                 key, col_idx as u64, req_ids, -1, 0,
             )
         }).await?;
-        if let Some(e) = first_worker_error("seek_by_index", &decoded_vec) {
-            return Err(e);
-        }
-        for decoded in decoded_vec {
-            if let Some(ref batch) = decoded.data_batch {
-                if batch.count > 0 {
-                    return Ok(extract_single_batch(&schema, decoded));
-                }
+
+        let mut data_idx = None;
+        for (w, slot) in slots.iter().enumerate() {
+            let ctrl = peek_control_block(slot.bytes())
+                .map_err(|e| format!("seek_by_index: worker {}: {}", w, e))?;
+            if ctrl.status != 0 {
+                return Err(format!(
+                    "worker {}: seek_by_index: {}",
+                    w, String::from_utf8_lossy(&ctrl.error_msg)));
+            }
+            if ctrl.flags & FLAG_HAS_DATA != 0 {
+                data_idx = Some(w);
             }
         }
-        Ok(None)
+        Ok(slots.swap_remove(data_idx.unwrap_or(0)))
     }
 
     pub async fn fan_out_scan_async(
@@ -721,7 +725,7 @@ impl MasterDispatcher {
     /// per-worker req_ids, signals once, and joins all replies.
     ///
     /// `sal_excl` is held only for the synchronous write + signal phase;
-    /// see `dispatch_fanout` for the rationale.
+    /// see `dispatch_scan_fanout` for the rationale.
     async fn execute_pipeline_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
@@ -1365,14 +1369,18 @@ impl MasterDispatcher {
                     for &(key_lo, key_hi, pk_i) in upsert_keys {
                         let key_pk = crate::util::make_pk(key_lo, key_hi);
                         if !occupied.contains(&key_pk) { continue; }
-                        match Self::fan_out_seek_by_index_async(
+                        let slot = Self::fan_out_seek_by_index_async(
                             disp_ptr, reactor, sal_excl, target_id, *col_idx,
                             crate::util::make_pk(key_lo, key_hi),
-                        ).await {
-                            Err(e) => return Err(e),
-                            Ok(None) => {}
-                            Ok(Some(ref found)) if found.count > 0 => {
-                                if found.get_pk(0) != pk_i {
+                        ).await?;
+                        let ctrl = peek_control_block(slot.bytes())
+                            .map_err(|e| e.to_string())?;
+                        if ctrl.flags & FLAG_HAS_DATA != 0 {
+                            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
+                                slot.bytes(), ctrl.block_size, ctrl,
+                            ).map_err(|e| e.to_string())?;
+                            if let Some(ref found) = zc.data_batch {
+                                if found.count > 0 && found.get_pk(0) != pk_i {
                                     let col_name = unsafe {
                                         (*disp_ptr).get_col_name(target_id, *source_col)
                                     };
@@ -1380,7 +1388,6 @@ impl MasterDispatcher {
                                         "Unique index violation on column '{}'", col_name));
                                 }
                             }
-                            Ok(Some(_)) => {}
                         }
                     }
                 }
@@ -1563,39 +1570,16 @@ pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
     None
 }
 
-/// Allocate `nw` per-worker request ids, run `submit`, signal all workers,
-/// then await every reply via `join_all`. Returns decoded replies in worker order.
+/// Allocate `nw` per-worker scan request ids, run `submit`, signal all
+/// workers, then await every slot via `join_all`. Returns the raw `W2mSlot`s
+/// in worker order so the caller can forward them to the client without an
+/// intermediate decode/copy.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
 /// concurrent checkpoint FLAG_FLUSH groups: without the lock a fan-out
 /// could write with the old epoch during the checkpoint window, workers
 /// would skip it, and the caller would hang waiting for an ACK.
-pub(crate) async fn dispatch_fanout<F>(
-    disp_ptr: *mut MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex<()>>,
-    submit: F,
-) -> Result<Vec<DecodedWire>, String>
-where
-    F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
-{
-    let nw = unsafe { (*disp_ptr).num_workers };
-    let req_ids: Vec<u64> = (0..nw).map(|_| reactor.alloc_request_id()).collect();
-    {
-        let _guard = sal_excl.lock().await;
-        unsafe {
-            let disp = &mut *disp_ptr;
-            submit(disp, &req_ids)?;
-            disp.signal_all();
-        }
-    }
-    let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_reply(id)).collect();
-    Ok(crate::runtime::reactor::join_all(futs).await)
-}
-
-/// Like `dispatch_fanout` but uses scan request ids and returns raw `W2mSlot`s
-/// for zero-copy forwarding. `sal_excl` semantics are identical.
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
@@ -1606,27 +1590,32 @@ where
     F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
 {
     let nw = unsafe { (*disp_ptr).num_workers };
-    let req_ids: Vec<u64> = (0..nw).map(|_| reactor.alloc_scan_request_id()).collect();
+    let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+    for id in req_ids[..nw].iter_mut() {
+        *id = reactor.alloc_scan_request_id();
+    }
     {
         let _guard = sal_excl.lock().await;
         unsafe {
             let disp = &mut *disp_ptr;
-            submit(disp, &req_ids)?;
+            submit(disp, &req_ids[..nw])?;
             disp.signal_all();
         }
     }
-    let futs: Vec<_> = req_ids.iter().map(|&id| reactor.await_scan_slot(id as u32)).collect();
-    Ok(crate::runtime::reactor::join_all(futs).await)
+    Ok(crate::runtime::reactor::join_all(
+        req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
+    ).await)
 }
 
 /// Common body for every single-worker async fan-out. Submits the SAL
-/// message, signals the worker, yields, and returns the decoded reply.
-/// The closures in the public wrappers compute the worker; everything
-/// else is here so there is a single place to maintain the unsafe
+/// message, signals the worker, yields, and returns the raw `W2mSlot` so the
+/// caller can forward it to the client without an intermediate decode/copy.
+/// The closures in the public wrappers compute the worker; everything else
+/// is here so there is a single place to maintain the unsafe
 /// borrow-and-release pattern.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase;
-/// see `dispatch_fanout` for the rationale.
+/// see `dispatch_scan_fanout` for the rationale.
 #[allow(clippy::too_many_arguments)]
 async fn single_worker_async(
     disp_ptr: *mut MasterDispatcher,
@@ -1637,38 +1626,28 @@ async fn single_worker_async(
     worker: usize,
     seek_pk: u128, seek_col_idx: u64,
     op_name: &'static str,
-) -> Result<Option<Batch>, String> {
-    let (schema, req_id) = {
+) -> Result<W2mSlot, String> {
+    let req_id = {
         let _guard = sal_excl.lock().await;
         unsafe {
             let disp = &mut *disp_ptr;
             let (schema, col_names) = disp.get_schema_and_names(target_id);
-            let req_id = reactor.alloc_request_id();
+            let req_id = reactor.alloc_scan_request_id();
             let lsn = disp.next_lsn();
             disp.write_group(target_id, lsn, flags, &[], &schema, &col_names,
                              seek_pk, seek_col_idx, req_id, worker as i32)?;
             disp.signal_one(worker);
-            (schema, req_id)
+            req_id
         }
     };
-    let decoded = reactor.await_reply(req_id).await;
-    if decoded.control.status != 0 {
-        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+    let slot = reactor.await_scan_slot(req_id as u32).await;
+    let ctrl = peek_control_block(slot.bytes())
+        .expect("W2M ctrl corrupt in single_worker_async");
+    if ctrl.status != 0 {
+        let msg = String::from_utf8_lossy(&ctrl.error_msg);
         return Err(format!("worker {}: {}: {}", worker, op_name, msg));
     }
-    Ok(extract_single_batch(&schema, decoded))
-}
-
-fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<Batch> {
-    decoded.data_batch.and_then(|b| {
-        if b.count > 0 {
-            let mut result = Batch::with_schema(*schema, b.count);
-            result.append_batch(&b, 0, b.count);
-            Some(result)
-        } else {
-            None
-        }
-    })
+    Ok(slot)
 }
 
 /// Render a PK u128 as a human-readable decimal for error messages.

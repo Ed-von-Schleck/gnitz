@@ -167,15 +167,6 @@ pub struct WorkerProcess {
     pending_deltas: HashMap<i64, Batch>,
     read_cursor: u64,
     expected_epoch: u32,
-    // Per-target schema cache: skip the 512-byte schema block parse on hot paths.
-    // Populated lazily from decoded.schema on first non-DDL message per target.
-    schema_cache: HashMap<i64, SchemaDescriptor>,
-    // Per-target encoded schema wire block (no col_names on the worker path).
-    // Keyed by target_id; value = (num_columns, pk_index, block) so a cached
-    // table block is not reused when send_response is called with an index
-    // schema for the same target_id (FLAG_HAS_PK UniqueIndex path). On
-    // fingerprint mismatch the block is built inline without evicting the cache.
-    schema_wire_block_cache: HashMap<i64, (u32, u32, Rc<Vec<u8>>)>,
 }
 
 fn filter_by_pk(
@@ -222,8 +213,7 @@ impl WorkerProcess {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         }
     }
 
@@ -344,40 +334,6 @@ impl WorkerProcess {
     /// Inside an exchange wait we always do a full decode — same reason
     /// as DDL_SYNC/HAS_PK — and the schema cache is intentionally
     /// untouched there.
-    fn decode_for_dispatch(
-        &mut self,
-        ctx: DispatchContext,
-        kind: SalMessageKind,
-        target_id: i64,
-        wire: Option<&[u8]>,
-    ) -> Option<ipc::DecodedWire> {
-        let data = wire?;
-        match ctx {
-            DispatchContext::TopLevel => {
-                let needs_full = matches!(kind,
-                    SalMessageKind::DdlSync | SalMessageKind::HasPk);
-                if !needs_full {
-                    if let Some(&schema) = self.schema_cache.get(&target_id) {
-                        return ipc::decode_wire_with_schema(data, &schema).ok();
-                    }
-                    let d = ipc::decode_wire(data).ok();
-                    if let Some(ref d) = d {
-                        if let Some(s) = d.schema {
-                            self.schema_cache.insert(target_id, s);
-                            // Invalidate the prebuilt wire block so the next
-                            // send_response rebuilds it from the new schema.
-                            self.schema_wire_block_cache.remove(&target_id);
-                        }
-                    }
-                    d
-                } else {
-                    ipc::decode_wire(data).ok()
-                }
-            }
-            DispatchContext::InsideExchangeWait { .. } => ipc::decode_wire(data).ok(),
-        }
-    }
-
     /// The single source of truth for the inline-vs-defer matrix.
     /// Match exhaustiveness (`match (ctx, kind)`) means a new
     /// `SalMessageKind` variant cannot be added without explicitly
@@ -450,7 +406,7 @@ impl WorkerProcess {
         match (ctx, kind) {
             // ── Tick: inline at top-level, defer inside exchange wait ──
             (DispatchContext::TopLevel, SalMessageKind::Tick) => {
-                self.run_via_dispatch_inner(ctx, kind, target_id, wire)
+                self.run_via_dispatch_inner(kind, target_id, wire)
             }
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::Tick) => {
                 let req_id = wire
@@ -463,7 +419,7 @@ impl WorkerProcess {
 
             // ── DdlSync: apply at top-level, defer inside ──────────────
             (DispatchContext::TopLevel, SalMessageKind::DdlSync) => {
-                self.run_via_dispatch_inner(ctx, kind, target_id, wire)
+                self.run_via_dispatch_inner(kind, target_id, wire)
             }
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::DdlSync) => {
                 if let Some(data) = wire {
@@ -534,7 +490,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
             | (_, SalMessageKind::Scan) => {
-                self.run_via_dispatch_inner(ctx, kind, target_id, wire)
+                self.run_via_dispatch_inner(kind, target_id, wire)
             }
         }
     }
@@ -546,12 +502,11 @@ impl WorkerProcess {
     /// failure back to the original caller.
     fn run_via_dispatch_inner(
         &mut self,
-        ctx: DispatchContext,
         kind: SalMessageKind,
         target_id: i64,
         wire: Option<&'static [u8]>,
     ) -> DispatchOutcome {
-        let decoded = self.decode_for_dispatch(ctx, kind, target_id, wire);
+        let decoded = wire.and_then(|data| ipc::decode_wire(data).ok());
         let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
         match self.dispatch_inner(kind, target_id, decoded, request_id) {
             DispatchResult::Continue => DispatchOutcome::Continue,
@@ -616,7 +571,7 @@ impl WorkerProcess {
 
             SalMessageKind::HasPk => {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
-                if let Err(msg) = self.handle_has_pk(target_id, batch, lookup, request_id) {
+                if let Err(msg) = self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk) {
                     return DispatchResult::Error(msg);
                 }
                 DispatchResult::Continue
@@ -647,7 +602,7 @@ impl WorkerProcess {
                 match self.cat().seek_by_index(target_id, col_idx, seek_pk) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
+                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -658,7 +613,7 @@ impl WorkerProcess {
                 match self.cat().seek_family(target_id, seek_pk) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id);
+                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -709,38 +664,40 @@ impl WorkerProcess {
         result: Option<&Batch>,
         schema: Option<&SchemaDescriptor>,
         request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
     ) {
         let tid_key = target_id as i64;
-        // Rc::clone releases the mutable borrow on schema_wire_block_cache
-        // before w2m_writer is accessed below. On fingerprint mismatch (index
-        // schema vs cached table schema for the same target_id) build inline
-        // without overwriting — the cached table block remains valid for SEEK/SCAN.
+        // HasPk UniqueIndex passes an index schema; reusing the catalog's
+        // table-schema wire block for it would corrupt the master decoder.
         let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
-            let nc = s.num_columns;
-            let pi = s.pk_index;
-            if let Some(entry) = self.schema_wire_block_cache.get(&tid_key) {
-                if entry.0 == nc && entry.1 == pi {
-                    return Rc::clone(&entry.2);
-                }
+            let table_schema_matches = self.cat()
+                .get_schema_desc(tid_key)
+                .map(|t| t.num_columns == s.num_columns && t.pk_index == s.pk_index)
+                .unwrap_or(false);
+            if !table_schema_matches {
                 return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
             }
-            let block = Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
-            self.schema_wire_block_cache.insert(tid_key, (nc, pi, block.clone()));
+            if let Some(block) = self.cat().get_cached_schema_wire_block(tid_key) {
+                return block;
+            }
+            let col_names = self.cat().get_col_names_bytes(tid_key);
+            let (name_refs, n) = ipc::col_names_as_refs(&col_names);
+            let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
+            self.cat().set_schema_wire_block(tid_key, block.clone());
             block
         });
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_ipc(
-                buf, 0, target_id, 0, 0,
-                0u128, 0, request_id, STATUS_OK, &[],
+            ipc::encode_wire_into(
+                buf, 0, target_id, client_id, 0,
+                seek_pk, 0, request_id, STATUS_OK, &[],
                 schema, None, result, prebuilt,
             );
         });
     }
 
-    // Unlike send_response, uses encode_wire_into (checksummed, client-shape) and
-    // the catalog-level cache that includes col_names.
     fn send_scan_response(
         &mut self,
         target_id: u64,
@@ -886,6 +843,8 @@ impl WorkerProcess {
         batch: Option<Batch>,
         lookup: HasPkLookup,
         request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
@@ -914,7 +873,7 @@ impl WorkerProcess {
                 (schema, result)
             }
         };
-        self.send_response(target_id as u64, Some(&result), Some(&schema), request_id);
+        self.send_response(target_id as u64, Some(&result), Some(&schema), request_id, client_id, seek_pk);
         Ok(())
     }
 
@@ -1169,8 +1128,7 @@ mod tests {
                 pending_deltas: HashMap::new(),
                 read_cursor: 0,
                 expected_epoch: 1,
-                schema_cache: HashMap::new(),
-                schema_wire_block_cache: HashMap::new(),
+    
             };
             let filtered = wp.filter_my_partition(batch.clone_batch());
             // Every row in the filtered batch must belong to this worker.
@@ -1199,8 +1157,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 0);
@@ -1228,8 +1185,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         };
         let result = wp.filter_my_partition(batch);
         assert_eq!(result.count, 1);
@@ -1326,16 +1282,17 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         };
 
         let req_ack: u64 = 42;
         let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
         let req_err: u64 = u64::MAX;
         wp.send_ack(7, 0, req_ack);
-        let schema = test_schema();
-        wp.send_response(8, None, Some(&schema), req_resp);
+        // Pass schema=None: send_response consults the catalog only when a
+        // schema is present, and this test uses a null catalog pointer.
+        // The id round-trip is the assertion of interest.
+        wp.send_response(8, None, None, req_resp, 0, 0u128);
         wp.send_error("boom", req_err);
 
         // Decode the three messages back from the ring via try_consume.
@@ -1402,8 +1359,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         }
     }
 
@@ -1618,8 +1574,7 @@ mod tests {
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
-            schema_cache: HashMap::new(),
-            schema_wire_block_cache: HashMap::new(),
+
         };
 
         // First call: epoch 1 group 1 — consumed.

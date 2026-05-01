@@ -20,7 +20,7 @@
 //!   an fd). Safe from collisions because the reactor owns its own ring.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -28,10 +28,12 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED, WAL_OFF_SIZE};
+use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sys::FUTEX2_SIZE_U32;
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
@@ -102,7 +104,7 @@ struct ReactorShared {
     /// task's future may spawn new tasks during its poll, and we must
     /// reinsert the running task at its original key so the waker hits
     /// the right entry on the next wake.
-    tasks: RefCell<HashMap<usize, Task>>,
+    tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
     /// Tasks whose wakers fired; the reactor's main loop polls them on
     /// the next tick. Wrapped in `Arc<Mutex<…>>` because the waker vtable
@@ -110,15 +112,15 @@ struct ReactorShared {
     run_queue: Arc<Mutex<VecDeque<usize>>>,
     /// Per-task waker; stored so spawning code does not need to rebuild
     /// it on each poll. Indexed by task key.
-    task_wakers: RefCell<HashMap<usize, Waker>>,
+    task_wakers: RefCell<FxHashMap<usize, Waker>>,
     /// Reply wakers keyed by request_id; populated by `await_reply`.
-    reply_wakers: RefCell<HashMap<u64, Waker>>,
-    parked_replies: RefCell<HashMap<u64, DecodedWire>>,
+    reply_wakers: RefCell<FxHashMap<u64, Waker>>,
+    parked_replies: RefCell<FxHashMap<u64, DecodedWire>>,
     /// Fsync wakers + parked results. An async fsync registers its waker
     /// here; when the CQE arrives the result is parked and the waker
     /// fires.
-    fsync_wakers: RefCell<HashMap<u64, Waker>>,
-    parked_fsync_results: RefCell<HashMap<u64, i32>>,
+    fsync_wakers: RefCell<FxHashMap<u64, Waker>>,
+    parked_fsync_results: RefCell<FxHashMap<u64, i32>>,
     w2m: OnceCell<W2mReceiver>,
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
@@ -140,7 +142,7 @@ struct ReactorShared {
     /// shared with the owning TimerFuture. If the future is dropped before
     /// the CQE, the flag is set and dispatch_cqe silently discards it.
     #[allow(clippy::type_complexity)]
-    timer_wakers: RefCell<HashMap<u64, (Waker, Rc<Cell<bool>>)>>,
+    timer_wakers: RefCell<FxHashMap<u64, (Waker, Rc<Cell<bool>>)>>,
     next_timer_id: Cell<u64>,
     #[cfg(test)]
     injected_cqes: RefCell<VecDeque<Cqe>>,
@@ -150,7 +152,7 @@ struct ReactorShared {
     /// Per-fd connection state (recv decoder + send queue). Boxed so the
     /// inline hdr buffer address survives HashMap resizes — io_uring SQEs
     /// capture the pointer.
-    conns: RefCell<HashMap<i32, Box<io::Conn>>>,
+    conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
     /// Listen socket fd; set by `attach_server_fd`. The reactor submits a
     /// single `AcceptMulti` SQE on attach and re-arms on cancellation.
     server_fd: Cell<i32>,
@@ -161,29 +163,29 @@ struct ReactorShared {
     /// Recv waiters per fd: set when a task has called `recv(fd)` and is
     /// awaiting a complete message. Only one waiter per fd — per-connection
     /// FIFO is a correctness requirement (I2).
-    recv_waiters: RefCell<HashMap<i32, Waker>>,
+    recv_waiters: RefCell<FxHashMap<i32, Waker>>,
     /// Completed recv messages awaiting pickup by a `recv().await` call.
     /// A VecDeque per fd — multiple messages can queue if the handler
     /// is slow. Load-bearing for TCP flow control: with a single slot,
     /// pipelined clients deadlock once the kernel socket buffer fills
     /// (we can only drain messages one-at-a-time from the handler,
     /// while the kernel blocks the client's send).
-    pending_recv: RefCell<HashMap<i32, std::collections::VecDeque<(*mut u8, usize)>>>,
+    pending_recv: RefCell<FxHashMap<i32, std::collections::VecDeque<(*mut u8, usize)>>>,
     /// Closed-fd sentinel: set to true when a recv CQE arrived with
     /// res<=0 or the connection was forcibly closed. A subsequent
     /// `recv()` returns `None`.
-    recv_closed: RefCell<HashMap<i32, bool>>,
+    recv_closed: RefCell<FxHashMap<i32, bool>>,
     /// Send wakers keyed by send_id. `(send_id → fd)` lives separately
     /// so the CQE handler can decrement `Conn::send_inflight` even when
     /// no waker has been installed yet.
-    send_wakers: RefCell<HashMap<u64, Waker>>,
-    send_fd_for_id: RefCell<HashMap<u64, i32>>,
+    send_wakers: RefCell<FxHashMap<u64, Waker>>,
+    send_fd_for_id: RefCell<FxHashMap<u64, i32>>,
     /// Keep-alives stashed here outlive their owning `SendFuture` when it is
     /// dropped before the CQE arrives. The CQE handler removes the entry.
-    send_buffers_in_flight: RefCell<HashMap<u64, SendAlive>>,
+    send_buffers_in_flight: RefCell<FxHashMap<u64, SendAlive>>,
     /// Send results parked before their waker was installed (same pattern
     /// as parked_replies / parked_fsync_results).
-    parked_send_results: RefCell<HashMap<u64, i32>>,
+    parked_send_results: RefCell<FxHashMap<u64, i32>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -194,13 +196,13 @@ struct ReactorShared {
     relay_tx: RefCell<Option<mpsc::Sender<PendingRelay>>>,
     /// Scan-slot wakers keyed by `internal_req_id` (u32). Populated by
     /// `await_scan_slot` futures; drained by `route_scan_slot`.
-    scan_wakers: RefCell<HashMap<u32, Waker>>,
+    scan_wakers: RefCell<FxHashMap<u32, Waker>>,
     /// Scan slots parked between `route_scan_slot` and the awaiting
     /// `ScanSlotFuture::poll`.
-    scan_parked: RefCell<HashMap<u32, W2mSlot>>,
+    scan_parked: RefCell<FxHashMap<u32, W2mSlot>>,
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
-    closing_fds: RefCell<std::collections::HashSet<i32>>,
+    closing_fds: RefCell<FxHashSet<i32>>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -275,42 +277,42 @@ impl Reactor {
         let ring = IoUringRing::new(ring_capacity)?;
         let inner = Rc::new(ReactorShared {
             ring: RefCell::new(ring),
-            tasks: RefCell::new(HashMap::new()),
+            tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
             run_queue: Arc::new(Mutex::new(VecDeque::new())),
-            task_wakers: RefCell::new(HashMap::new()),
-            reply_wakers: RefCell::new(HashMap::with_capacity(32)),
-            parked_replies: RefCell::new(HashMap::with_capacity(32)),
-            fsync_wakers: RefCell::new(HashMap::new()),
-            parked_fsync_results: RefCell::new(HashMap::new()),
+            task_wakers: RefCell::new(FxHashMap::default()),
+            reply_wakers: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
+            parked_replies: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
+            fsync_wakers: RefCell::new(FxHashMap::default()),
+            parked_fsync_results: RefCell::new(FxHashMap::default()),
             w2m: OnceCell::new(),
             futex_waitv_storage: RefCell::new(None),
             futex_waitv_armed: Cell::new(false),
             futex_waitv_cancelled: Cell::new(false),
-            timer_wakers: RefCell::new(HashMap::new()),
+            timer_wakers: RefCell::new(FxHashMap::default()),
             next_timer_id: Cell::new(0),
             #[cfg(test)]
             injected_cqes: RefCell::new(VecDeque::new()),
             next_request_id: Cell::new(1),
             next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
             next_send_id: Cell::new(1),
-            conns: RefCell::new(HashMap::new()),
+            conns: RefCell::new(FxHashMap::default()),
             server_fd: Cell::new(-1),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
-            recv_waiters: RefCell::new(HashMap::new()),
-            pending_recv: RefCell::new(HashMap::new()),
-            recv_closed: RefCell::new(HashMap::new()),
-            send_wakers: RefCell::new(HashMap::new()),
-            send_fd_for_id: RefCell::new(HashMap::new()),
-            send_buffers_in_flight: RefCell::new(HashMap::new()),
-            parked_send_results: RefCell::new(HashMap::new()),
+            recv_waiters: RefCell::new(FxHashMap::default()),
+            pending_recv: RefCell::new(FxHashMap::default()),
+            recv_closed: RefCell::new(FxHashMap::default()),
+            send_wakers: RefCell::new(FxHashMap::default()),
+            send_fd_for_id: RefCell::new(FxHashMap::default()),
+            send_buffers_in_flight: RefCell::new(FxHashMap::default()),
+            parked_send_results: RefCell::new(FxHashMap::default()),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
-            closing_fds: RefCell::new(std::collections::HashSet::new()),
-            scan_wakers: RefCell::new(HashMap::new()),
-            scan_parked: RefCell::new(HashMap::new()),
+            closing_fds: RefCell::new(FxHashSet::default()),
+            scan_wakers: RefCell::new(FxHashMap::default()),
+            scan_parked: RefCell::new(FxHashMap::default()),
         });
         Ok(Reactor { inner })
     }
@@ -1144,16 +1146,13 @@ impl Reactor {
             }
             let ctrl = wire::peek_control_block(slot.bytes())
                 .expect("W2M control block corrupt — ring corrupt");
-            let ctrl_size = u32::from_le_bytes(
-                slot.bytes()[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()
-            ) as usize;
             let flags = ctrl.flags;
             if flags & FLAG_HAS_DATA != 0 && flags & FLAG_EXCHANGE == 0 {
-                self.ingest_from_slot(w, slot, ctrl, ctrl_size);
+                self.ingest_from_slot(w, slot, ctrl);
             } else if flags & FLAG_EXCHANGE != 0 {
-                self.process_exchange_from_slot(w, slot, ctrl, ctrl_size);
+                self.process_exchange_from_slot(w, slot, ctrl);
             } else {
-                self.park_owned(w, slot, ctrl, ctrl_size);
+                self.park_owned(w, slot, ctrl);
             }
         }
     }
@@ -1171,9 +1170,9 @@ impl Reactor {
     /// Borrows ring bytes via `MemBatch`, allocates exactly one owned `Batch`
     /// (ring → run, single `copy_from_slice`), then drops the slot so
     /// `consume_cursor` advances before the awaiter wakes.
-    fn ingest_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
+    fn ingest_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl)
             .expect("W2M zero-copy decode failed — ring corrupt");
         let flags = zc.control.flags;
         let schema = zc.schema;
@@ -1191,9 +1190,9 @@ impl Reactor {
 
     /// Zero-copy decode path for FLAG_EXCHANGE slots: mirrors `ingest_from_slot`
     /// but feeds the result into `exchange_acc` instead of routing to an awaiter.
-    fn process_exchange_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
+    fn process_exchange_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl)
             .expect("W2M exchange decode failed — ring corrupt");
         let flags = zc.control.flags;
         let control = zc.control;
@@ -1233,8 +1232,8 @@ impl Reactor {
     /// Full-decode fallback: decode a W2M slot via the owned-batch path and
     /// route the reply.  Drops the slot (advancing `consume_cursor`) before
     /// waking any awaiter.
-    fn park_owned(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl, ctrl_size: usize) {
-        let decoded = wire::decode_wire_ipc_with_ctrl(slot.bytes(), ctrl_size, ctrl)
+    fn park_owned(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
+        let decoded = wire::decode_wire_ipc_with_ctrl(slot.bytes(), ctrl.block_size, ctrl)
             .expect("W2M decode failed — ring corrupt");
         drop(slot);
         self.route_reply(w, decoded);
@@ -2256,6 +2255,7 @@ mod tests {
                 seek_col_idx: 0,
                 request_id: req_id,
                 error_msg: Vec::new(),
+                block_size: 0,
             },
             schema: None,
             data_batch: None,
@@ -2648,6 +2648,7 @@ mod tests {
                 seek_col_idx: 0,
                 request_id: req_id,
                 error_msg: Vec::new(),
+                block_size: 0,
             },
             schema: Some(SchemaDescriptor::minimal_u64()),
             data_batch: None,

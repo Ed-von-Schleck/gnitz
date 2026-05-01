@@ -24,9 +24,9 @@
 //!   catalog mutation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
+use rustc_hash::FxHashMap;
 use crate::runtime::wire::WireConflictMode;
 use crate::runtime::master::{MasterDispatcher, first_worker_error};
 use crate::runtime::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
@@ -74,7 +74,7 @@ pub struct Shared {
     /// SCAN/SEEK responses report the same value.
     pub ingest_lsn: Rc<Cell<u64>>,
     pub num_workers: usize,
-    pub tick_rows: Rc<RefCell<HashMap<i64, usize>>>,
+    pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     pub tick_tids: Rc<RefCell<Vec<i64>>>,
     pub fire_auto_tick: Rc<dyn Fn()>,
     pub t_last_push: Rc<Cell<Option<Instant>>>,

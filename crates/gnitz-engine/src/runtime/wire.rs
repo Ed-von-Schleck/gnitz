@@ -567,6 +567,11 @@ pub struct DecodedControl {
     pub seek_col_idx: u64,
     pub request_id: u64,
     pub error_msg: Vec<u8>,
+    /// Total byte length of this control WAL block (read from the WAL size
+    /// field at offset WAL_OFF_SIZE). Callers that need to advance past the
+    /// ctrl block to find the schema/data blocks use this directly instead of
+    /// re-reading the WAL header.
+    pub block_size: usize,
 }
 
 /// Full decoded wire message.
@@ -664,9 +669,11 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         decode_german_string(&st, blob)
     };
 
+    let block_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
     Ok(DecodedControl {
         status, client_id, target_id, flags,
         seek_pk, seek_col_idx, request_id, error_msg,
+        block_size,
     })
 }
 

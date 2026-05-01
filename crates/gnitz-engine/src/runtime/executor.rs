@@ -14,9 +14,10 @@
 //! into an accumulator and hands completed views to the relay task.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::runtime::committer::{self, CommitRequest};
@@ -73,10 +74,10 @@ pub struct Shared {
     ingest_lsn: Rc<Cell<u64>>,
     last_tick_lsn: Rc<Cell<u64>>,
     /// Per-table row counter feeding the tick threshold.
-    tick_rows: Rc<RefCell<HashMap<i64, usize>>>,
+    tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     tick_tids: Rc<RefCell<Vec<i64>>>,
     t_last_push: Rc<Cell<Option<Instant>>>,
-    table_locks: RefCell<HashMap<i64, Rc<AsyncMutex<()>>>>,
+    table_locks: RefCell<FxHashMap<i64, Rc<AsyncMutex<()>>>>,
 }
 
 impl Shared {
@@ -167,7 +168,7 @@ impl ServerExecutor {
         let initial_ingest_lsn = unsafe { &*catalog }.max_table_current_lsn();
         let ingest_lsn = Rc::new(Cell::new(initial_ingest_lsn));
         let last_tick_lsn = Rc::new(Cell::new(initial_ingest_lsn));
-        let tick_rows: Rc<RefCell<HashMap<i64, usize>>> = Rc::new(RefCell::new(HashMap::new()));
+        let tick_rows: Rc<RefCell<FxHashMap<i64, usize>>> = Rc::new(RefCell::new(FxHashMap::default()));
         let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let t_last_push = Rc::new(Cell::new(None));
 
@@ -205,7 +206,7 @@ impl ServerExecutor {
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
             t_last_push: Rc::clone(&t_last_push),
-            table_locks: RefCell::new(HashMap::new()),
+            table_locks: RefCell::new(FxHashMap::default()),
         });
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
@@ -601,19 +602,25 @@ async fn handle_seek(
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
-    let schema = shared.get_schema_desc(target_id);
-    let result = if target_id >= FIRST_USER_TABLE_ID {
-        MasterDispatcher::fan_out_seek_async(
+    if target_id >= FIRST_USER_TABLE_ID {
+        match MasterDispatcher::fan_out_seek_async(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, pk,
-        ).await
+        ).await {
+            Ok(slot) => {
+                let rc = shared.reactor.send_slot(fd, slot).await;
+                if rc < 0 { shared.reactor.close_fd(fd); }
+            }
+            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        }
     } else {
-        let cat_ptr = shared.catalog;
-        unsafe { (*cat_ptr).seek_family(target_id, pk) }
-    };
-    match result {
-        Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await,
-        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        let schema = shared.get_schema_desc(target_id);
+        match unsafe { (*shared.catalog).seek_family(target_id, pk) } {
+            Ok(batch) => send_ok_response(
+                shared, fd, target_id, batch.as_ref(), client_id, &schema, pk,
+            ).await,
+            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        }
     }
 }
 
@@ -626,22 +633,25 @@ async fn handle_seek_by_index(
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
-    let schema = shared.get_schema_desc(target_id);
-    let result = if target_id >= FIRST_USER_TABLE_ID {
-        let r = MasterDispatcher::fan_out_seek_by_index_async(
+    if target_id >= FIRST_USER_TABLE_ID {
+        match MasterDispatcher::fan_out_seek_by_index_async(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, col_idx, key,
-        ).await;
-        r
-    } else {
-        let cat_ptr = shared.catalog;
-        unsafe { (*cat_ptr).seek_by_index(target_id, col_idx, key) }
-    };
-    match result {
-        Ok(batch) => {
-            send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, &schema, 0).await;
+        ).await {
+            Ok(slot) => {
+                let rc = shared.reactor.send_slot(fd, slot).await;
+                if rc < 0 { shared.reactor.close_fd(fd); }
+            }
+            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
-        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+    } else {
+        let schema = shared.get_schema_desc(target_id);
+        match unsafe { (*shared.catalog).seek_by_index(target_id, col_idx, key) } {
+            Ok(batch) => send_ok_response(
+                shared, fd, target_id, batch.as_ref(), client_id, &schema, 0,
+            ).await,
+            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        }
     }
 }
 
