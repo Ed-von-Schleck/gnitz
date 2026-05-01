@@ -2,6 +2,7 @@ use crate::runtime::wire::{
     encode_wire, encode_wire_into, decode_wire, decode_wire_with_schema,
     wire_size, schema_to_batch, batch_to_schema, peek_target_id,
     build_schema_wire_block,
+    encode_ctrl_block_ipc, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     STATUS_OK, STATUS_ERROR,
 };
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code, encode_german_string, decode_german_string};
@@ -546,4 +547,69 @@ fn decode_wire_truncated_data_block_returns_err() {
     let truncated = &wire[..data_start + gnitz_wire::WAL_HEADER_SIZE / 2];
     let result = decode_wire(truncated);
     assert!(result.is_err(), "decode_wire should reject truncated data block");
+}
+
+/// Encoding the same control fields with `encode_ctrl_block_direct` and
+/// `encode_ctrl_block_ipc` must produce byte-identical output. Uses distinct
+/// non-zero values for every variable field so a swapped offset would corrupt
+/// the bytes detectably; uses `offset = 64` so that writes accidentally
+/// indexing through `out[offset + OFF_X..]` rather than the sub-slice would
+/// also be caught.
+#[test]
+fn encode_ctrl_block_direct_matches_ipc() {
+    const OFFSET: usize = 64;
+    let target_id: u64    = 0x1111_2222_3333_4444;
+    let client_id: u64    = 0x5555_6666_7777_8888;
+    let wire_flags: u64   = 0x9999_AAAA_BBBB_CCCC;
+    let seek_pk: u128     = (0xDDDD_EEEE_FFFF_0011u128 << 64) | 0x2233_4455_6677_8899u128;
+    let seek_col_idx: u64 = 0xAA_BB_CC_DD_EE_FF_00_11;
+    let request_id: u64   = 0x1234_5678_9ABC_DEF0;
+    let status: u32       = 0xDEAD_BEEF;
+
+    for &checksum in &[false, true] {
+        let mut buf_direct = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
+        let mut buf_ipc    = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
+
+        let n_direct = encode_ctrl_block_direct(
+            &mut buf_direct, OFFSET,
+            target_id, client_id, wire_flags,
+            seek_pk, seek_col_idx, request_id,
+            status, b"", checksum,
+        );
+        let n_ipc = encode_ctrl_block_ipc(
+            &mut buf_ipc, OFFSET,
+            target_id, client_id, wire_flags,
+            seek_pk, seek_col_idx, request_id,
+            status, b"", checksum,
+        );
+
+        assert_eq!(n_direct, n_ipc,
+            "byte counts differ (checksum={checksum})");
+        assert_eq!(n_direct, CTRL_BLOCK_SIZE_NO_BLOB,
+            "direct encoder size mismatch (checksum={checksum})");
+        assert_eq!(buf_direct, buf_ipc,
+            "encoded ctrl blocks differ (checksum={checksum})");
+    }
+}
+
+/// `encode_ctrl_block_direct` falls back to `encode_ctrl_block_ipc` when an
+/// error message is present; verify byte-identical output on that path too.
+#[test]
+fn encode_ctrl_block_direct_error_path_matches_ipc() {
+    const OFFSET: usize = 32;
+    let err = b"something went wrong";
+    let total = OFFSET + 1024;
+    let mut buf_direct = vec![0u8; total];
+    let mut buf_ipc    = vec![0u8; total];
+
+    let n_direct = encode_ctrl_block_direct(
+        &mut buf_direct, OFFSET,
+        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, true,
+    );
+    let n_ipc = encode_ctrl_block_ipc(
+        &mut buf_ipc, OFFSET,
+        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, true,
+    );
+    assert_eq!(n_direct, n_ipc);
+    assert_eq!(buf_direct[..OFFSET + n_direct], buf_ipc[..OFFSET + n_ipc]);
 }

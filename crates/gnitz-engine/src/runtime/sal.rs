@@ -12,7 +12,7 @@ use crate::storage::{Batch, DirectWriter, carve_writer_slices, scatter_copy};
 use crate::util::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
 use crate::runtime::wire::{
     encode_wire_into, wire_size, STATUS_OK,
-    build_schema_wire_block, encode_ctrl_block_ipc,
+    build_schema_wire_block, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED,
 };
 use crate::xxh;
@@ -663,8 +663,8 @@ impl SalWriter {
         // Fast path: scatter directly into SAL slots.
         let col_names = col_names_opt.unwrap_or(&[]);
         let schema_block = build_schema_wire_block(schema, col_names, target_id);
-        // ctrl block size = wire_size with no schema/data (just the ctrl WAL block).
-        let ctrl_size = wire_size(STATUS_OK, b"", None, None, None, None);
+        // ctrl block size for the no-error fast path is a compile-time constant.
+        let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
@@ -711,7 +711,7 @@ impl SalWriter {
                 | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
                 | if input_batch.sorted { FLAG_BATCH_SORTED } else { 0 }
                 | if input_batch.consolidated { FLAG_BATCH_CONSOLIDATED } else { 0 };
-            encode_ctrl_block_ipc(
+            encode_ctrl_block_direct(
                 slot, 0,
                 target_id as u64, 0, wire_flags,
                 seek_pk, seek_col_idx, req_ids[w],

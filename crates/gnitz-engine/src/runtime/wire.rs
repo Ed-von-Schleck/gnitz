@@ -259,6 +259,109 @@ pub(crate) fn encode_ctrl_block_ipc(
     b.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum)
 }
 
+// ---------------------------------------------------------------------------
+// Direct ctrl-block encoder (no Batch allocation on the no-error fast path)
+// ---------------------------------------------------------------------------
+//
+// Walks `CONTROL_SCHEMA_DESC` once to derive each region's offset within the
+// ctrl WAL block. Mirrors `wal::encode`'s phase-1 directory walk: directory
+// immediately follows the WAL header, each region is `align8`-padded before
+// its data. The const-time assertion enforces that every region size is a
+// multiple of 8 (so the implicit `align8` is a no-op); a future schema change
+// that introduces an unaligned column fails at compile time.
+const fn ctrl_region_offset(target_region: usize) -> usize {
+    use gnitz_wire::control::NUM_REGIONS;
+    let schema = &CONTROL_SCHEMA_DESC;
+    let pk_idx = schema.pk_index as usize;
+
+    let mut sizes = [0usize; NUM_REGIONS];
+    sizes[0] = schema.columns[pk_idx].size as usize;          // pk
+    sizes[1] = 8;                                             // weight
+    sizes[2] = 8;                                             // null_bmp
+    let mut pi = 0usize;
+    let mut ci = 0usize;
+    while ci < schema.num_columns as usize {
+        if ci == pk_idx { ci += 1; continue; }
+        sizes[3 + pi] = schema.columns[ci].size as usize;
+        pi += 1;
+        ci += 1;
+    }
+    sizes[NUM_REGIONS - 1] = 0;                               // blob (no-blob path)
+
+    let mut pos = gnitz_wire::WAL_HEADER_SIZE + NUM_REGIONS * 8;
+    let mut r = 0;
+    while r < target_region {
+        assert!(sizes[r] % 8 == 0,
+            "ctrl_region_offset assumes every region size is 8-aligned");
+        pos += sizes[r];
+        r += 1;
+    }
+    pos
+}
+
+pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize =
+    ctrl_region_offset(gnitz_wire::control::NUM_REGIONS);
+
+const OFF_STATUS:       usize = ctrl_region_offset(gnitz_wire::control::REGION_STATUS);
+const OFF_CLIENT_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_CLIENT_ID);
+const OFF_TARGET_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_TARGET_ID);
+const OFF_FLAGS:        usize = ctrl_region_offset(gnitz_wire::control::REGION_FLAGS);
+const OFF_SEEK_PK:      usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_PK);
+const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_COL_IDX);
+const OFF_REQUEST_ID:   usize = ctrl_region_offset(gnitz_wire::control::REGION_REQUEST_ID);
+
+static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> =
+    std::sync::LazyLock::new(|| {
+        let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
+        let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", false);
+        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB,
+            "ctrl block template size mismatch");
+        arr
+    });
+
+/// Direct ctrl-block encoder. On the no-error fast path
+/// (`error_msg.is_empty()`), copies the pre-encoded template and patches the 7
+/// variable fields, avoiding the `Batch` pool allocation and `encode_to_wire`
+/// overhead. Falls back to `encode_ctrl_block_ipc` when an error message is
+/// present (the blob region is variable-size, so the template approach does
+/// not apply).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn encode_ctrl_block_direct(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    wire_flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    request_id: u64,
+    status: u32,
+    error_msg: &[u8],
+    checksum: bool,
+) -> usize {
+    if !error_msg.is_empty() {
+        return encode_ctrl_block_ipc(
+            out, offset, target_id, client_id, wire_flags,
+            seek_pk, seek_col_idx, request_id, status, error_msg, checksum,
+        );
+    }
+    let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
+    buf.copy_from_slice(&*CTRL_BLOCK_TEMPLATE);
+    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(status as u64).to_le_bytes());
+    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&client_id.to_le_bytes());
+    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&target_id.to_le_bytes());
+    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&wire_flags.to_le_bytes());
+    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&seek_pk.to_le_bytes());
+    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&seek_col_idx.to_le_bytes());
+    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&request_id.to_le_bytes());
+    if checksum {
+        let cs = crate::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..]);
+        buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
+    }
+    CTRL_BLOCK_SIZE_NO_BLOB
+}
+
 /// Compute total encoded wire size without allocating.
 ///
 /// `prebuilt_schema_block`: when `Some`, use its length as the schema block
@@ -279,7 +382,11 @@ pub fn wire_size(
     let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
     } else { 0 };
-    let mut total = schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob);
+    let mut total = if ctrl_blob == 0 {
+        CTRL_BLOCK_SIZE_NO_BLOB
+    } else {
+        schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob)
+    };
 
     if has_schema {
         if let Some(prebuilt) = prebuilt_schema_block {
@@ -416,8 +523,8 @@ fn encode_wire_into_impl(
         if b.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
     }
 
-    let written = encode_ctrl_block_ipc(out, offset, target_id, client_id, wire_flags,
-                                        seek_pk, seek_col_idx, request_id, status, error_msg, checksum);
+    let written = encode_ctrl_block_direct(out, offset, target_id, client_id, wire_flags,
+                                           seek_pk, seek_col_idx, request_id, status, error_msg, checksum);
     let mut pos = offset + written;
 
     if has_schema {

@@ -30,8 +30,9 @@ and may write a blob region when `error_msg` is non-empty. For the common path
 (`error_msg = b""`), the blob region is 0 bytes and the entire WAL block layout
 is a compile-time constant.
 
-In the 2026-04-30 profile this function contributes ~6% of the `memmove` bucket
-from the committer scatter path alone, roughly 0.8% of total CPU.
+In the 2026-04-30 profile, pool + encoding overhead attributed to this function
+accounts for ~6% of the `memmove` bucket from the committer scatter path alone,
+roughly 0.8% of total CPU.
 
 ---
 
@@ -80,41 +81,69 @@ col 8: error_msg     (16 bytes, offset 232) — all-zero null German string head
 blob region          (0 bytes,  offset 248)
 ```
 
-`CTRL_BLOCK_SIZE_NO_BLOB = 248` is a compile-time constant derived by walking
-the layout above (all region sizes are constant; `align8` arithmetic is
-deterministic). `wal_block_size` and `schema_wal_block_size` are not `const fn`,
-so this value is hard-coded as a named const and verified against
-`schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, 0)` in a `#[test]`.
+`CTRL_BLOCK_SIZE_NO_BLOB = 248` is computed at compile time by the same
+`ctrl_region_offset` const fn that produces the OFF_* constants below — see
+"Compile-time offset computation". No hardcoded literal, no runtime
+size-equality test required.
 
 **Null bitmap:** `null_bmp = ctrl::NULL_BIT_ERROR_MSG` when `error_msg.is_empty()`
 (col 8 is null). When `error_msg` is non-empty, `null_bmp = 0` (col 8 is
 non-null). This matches the existing implementation exactly; getting it wrong
 causes `peek_control_block` to misread the error_msg field.
 
-### Implementation approach: static template
+### Implementation approach: lazily-generated template
 
 All directory offsets, region offsets, and every WAL header field that does not
-depend on call arguments are compile-time constants. Pre-build a
-`static CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB]` with those bytes
-pre-filled. The template encodes: WAL header (including the constant WAL size
+depend on call arguments are compile-time constants. Use a
+`static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]>`
+initialized by calling `encode_ctrl_block_ipc` once with dummy zero values and
+`checksum=false`. The template encodes: WAL header (including the constant WAL size
 field), directory, pk=0, weight=1, null_bmp=`NULL_BIT_ERROR_MSG`, and the
-all-zero 16-byte German string header for error_msg. Each call:
+all-zero 16-byte German string header for error_msg. Because the template is
+derived directly from `encode_ctrl_block_ipc`, any future changes to the WAL
+header layout or schema are automatically reflected without manual sync.
 
-1. `out[offset..][..CTRL_BLOCK_SIZE_NO_BLOB].copy_from_slice(&CTRL_BLOCK_TEMPLATE)`
-2. Patch the **7 variable fields** at their known offsets (status at 168, client_id
-   at 176, target_id at 184, wire_flags at 192, seek_pk at 200, seek_col_idx at 216,
-   request_id at 224).
-3. If `checksum=true`, compute and write the WAL block checksum over the written bytes.
+```rust
+static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> =
+    std::sync::LazyLock::new(|| {
+        let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
+        let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", false);
+        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB,
+            "ctrl block template size mismatch");
+        arr
+    });
+```
 
-The WAL size field is constant (`CTRL_BLOCK_SIZE_NO_BLOB = 248`) and is baked into
-the template; it does not need to be patched per call.
+The buffer is sized by `CTRL_BLOCK_SIZE_NO_BLOB` directly: if `encode_ctrl_block_ipc`
+were to write more bytes (because the const fn drifted from `wal::encode`'s actual
+layout), the slice indexing inside `encode_ctrl_block_ipc` would panic with a clear
+out-of-bounds error during init rather than silently writing a malformed template.
+The byte-equality test (see below) is the primary correctness guard.
+
+Each call:
+
+1. Sub-slice once: `let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB]`.
+   This allows LLVM to prove all subsequent indexed writes are in-bounds and elide
+   those bounds checks entirely.
+2. `buf.copy_from_slice(&*CTRL_BLOCK_TEMPLATE)`.
+3. Patch the **7 variable fields** at their known offsets into `buf`:
+   - `status` at 168 (8 bytes — see casting note below)
+   - `client_id` at 176
+   - `target_id` at 184
+   - `wire_flags` at 192
+   - `seek_pk` at 200 (16 bytes)
+   - `seek_col_idx` at 216
+   - `request_id` at 224
+4. If `checksum=true`, compute `crate::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB])`
+   and write the result as 8 LE bytes at `buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8]`.
+   This mirrors `wal::encode` exactly: the hash covers the payload only (post-header),
+   and the stored value occupies the 8-byte checksum slot in the header.
+
+The WAL size field is constant and is baked into the template; it does not
+need to be patched per call.
 
 This eliminates all per-call offset arithmetic. The only work per call is 7 store
 operations into known byte offsets plus the optional checksum.
-
-`CTRL_BLOCK_SIZE_NO_BLOB = 248` must be confirmed equal to
-`schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, 0)` in a `#[test]`
-(not a `const assert` — `schema_wal_block_size` is not `const fn`).
 
 ### Checksum handling
 
@@ -123,6 +152,11 @@ operations into known byte offsets plus the optional checksum.
 through `encode_wire_into_impl`. The direct encoder must correctly implement both
 branches — `checksum=false` skips the hash, `checksum=true` computes and writes it.
 
+The hash input is the post-header payload: `buf[WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB]`
+= `buf[48..248]`. The result (8 bytes, LE) is written at `buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM+8]`
+= `buf[24..32]`. Hashing the entire 248-byte slice would include the checksum field
+itself in the input, causing decoder mismatch and block rejection.
+
 ### Error path fallback
 
 When `!error_msg.is_empty()`, fall back to the existing `Batch`-based path inside
@@ -130,9 +164,78 @@ the same function rather than branching to a separate function. This keeps the
 call sites unchanged and avoids any observable difference in encoded bytes.
 `encode_ctrl_block_ipc` is kept as the fallback and is not deleted.
 
+### Compile-time offset computation
+
+A single `const fn ctrl_region_offset` derives both the OFF_* constants and
+`CTRL_BLOCK_SIZE_NO_BLOB`. It walks `CONTROL_SCHEMA_DESC` once to build the
+per-region size table, then sums the first `target_region` sizes. Passing
+`NUM_REGIONS` returns the position after the last region — i.e., the total
+block size for the no-blob path.
+
+Mirroring `wal::encode`'s phase-1 directory walk: directory immediately follows
+the WAL header; each region is `align8`-padded before its data. This helper
+omits explicit `align8` calls because every region in `CONTROL_SCHEMA_DESC` has
+a size that is a multiple of 8 (PK is U64, payload is U64/U128/STRING-16, blob
+is 0). A const-time assertion enforces this precondition for **every** region
+(including the PK), so a future schema change that introduces an unaligned
+column fails at compile time rather than silently producing wrong offsets:
+
+```rust
+const fn ctrl_region_offset(target_region: usize) -> usize {
+    use gnitz_wire::control::NUM_REGIONS;
+    let schema = &CONTROL_SCHEMA_DESC;
+    let pk_idx = schema.pk_index as usize;
+
+    // Build the size table for all 12 regions. Asserts 8-alignment for each.
+    let mut sizes = [0usize; NUM_REGIONS];
+    sizes[0] = schema.columns[pk_idx].size as usize;          // pk
+    sizes[1] = 8;                                             // weight
+    sizes[2] = 8;                                             // null_bmp
+    let mut pi = 0usize;
+    let mut ci = 0usize;
+    while ci < schema.num_columns as usize {
+        if ci == pk_idx { ci += 1; continue; }
+        sizes[3 + pi] = schema.columns[ci].size as usize;
+        pi += 1;
+        ci += 1;
+    }
+    sizes[NUM_REGIONS - 1] = 0;                               // blob (no-blob path)
+
+    // Sum sizes[0..target_region] starting from the post-directory position.
+    // The 8-alignment assertion ensures the implicit `align8` between regions
+    // is a no-op (so we can omit it from the running sum).
+    let mut pos = gnitz_wire::WAL_HEADER_SIZE + NUM_REGIONS * 8;
+    let limit = if target_region < NUM_REGIONS { target_region } else { NUM_REGIONS };
+    let mut r = 0;
+    while r < limit {
+        assert!(sizes[r] % 8 == 0,
+            "ctrl_region_offset assumes every region size is 8-aligned");
+        pos += sizes[r];
+        r += 1;
+    }
+    pos
+}
+
+const CTRL_BLOCK_SIZE_NO_BLOB: usize = ctrl_region_offset(gnitz_wire::control::NUM_REGIONS);
+
+const OFF_STATUS:       usize = ctrl_region_offset(gnitz_wire::control::REGION_STATUS);
+const OFF_CLIENT_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_CLIENT_ID);
+const OFF_TARGET_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_TARGET_ID);
+const OFF_FLAGS:        usize = ctrl_region_offset(gnitz_wire::control::REGION_FLAGS);
+const OFF_SEEK_PK:      usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_PK);
+const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_COL_IDX);
+const OFF_REQUEST_ID:   usize = ctrl_region_offset(gnitz_wire::control::REGION_REQUEST_ID);
+```
+
+The byte-equality test against `encode_ctrl_block_ipc` (see "What to watch
+out for") is the primary correctness guard against this helper drifting from
+`wal::encode`'s layout — the const-fn alignment assertion only catches the
+narrower case of a non-8-aligned region.
+
 ### Proposed implementation
 
 ```rust
+#[inline]
 pub(crate) fn encode_ctrl_block_direct(
     out: &mut [u8],
     offset: usize,
@@ -147,14 +250,24 @@ pub(crate) fn encode_ctrl_block_direct(
     checksum: bool,
 ) -> usize {
     if !error_msg.is_empty() {
-        // Rare error path: fall back to the Batch-based encoder.
         return encode_ctrl_block_ipc(
             out, offset, target_id, client_id, wire_flags,
             seek_pk, seek_col_idx, request_id, status, error_msg, checksum,
         );
     }
-    // Fast path: direct write via static template.
-    // ... patch template copy, then patch variable fields at known offsets ...
+    let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
+    buf.copy_from_slice(&*CTRL_BLOCK_TEMPLATE);
+    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(status as u64).to_le_bytes());
+    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&client_id.to_le_bytes());
+    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&target_id.to_le_bytes());
+    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&wire_flags.to_le_bytes());
+    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&seek_pk.to_le_bytes());
+    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&seek_col_idx.to_le_bytes());
+    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&request_id.to_le_bytes());
+    if checksum {
+        let cs = crate::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB]);
+        buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
+    }
     CTRL_BLOCK_SIZE_NO_BLOB
 }
 ```
@@ -165,9 +278,10 @@ pub(crate) fn encode_ctrl_block_direct(
 
 | File | Change |
 |------|--------|
-| `runtime/wire.rs` | Add `encode_ctrl_block_direct` (with static template); keep `encode_ctrl_block_ipc` |
+| `runtime/wire.rs` | Add `ctrl_region_offset` const fn, derived `CTRL_BLOCK_SIZE_NO_BLOB` and `OFF_*` consts, `CTRL_BLOCK_TEMPLATE` LazyLock, `encode_ctrl_block_direct`; keep `encode_ctrl_block_ipc` |
 | `runtime/wire.rs` | Replace `encode_ctrl_block_ipc` call at line 419 with `encode_ctrl_block_direct` |
-| `runtime/sal.rs` | Replace `encode_ctrl_block_ipc` call at line 714 with `encode_ctrl_block_direct` |
+| `runtime/wire.rs` | In `wire_size`: replace `schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob)` with `if ctrl_blob == 0 { CTRL_BLOCK_SIZE_NO_BLOB } else { schema_wal_block_size(...) }` |
+| `runtime/sal.rs` | Replace `encode_ctrl_block_ipc` call at line 714 with `encode_ctrl_block_direct`; replace the `wire_size(STATUS_OK, b"", None, None, None, None)` call for `ctrl_size` with `CTRL_BLOCK_SIZE_NO_BLOB` directly |
 
 No behaviour change. The encoded bytes are identical for both paths.
 
@@ -175,10 +289,12 @@ No behaviour change. The encoded bytes are identical for both paths.
 
 ## What to watch out for
 
-- **Null bitmap**: must write `ctrl::NULL_BIT_ERROR_MSG` (not `0`) when `error_msg.is_empty()`. Zero means the error_msg column is non-null, which is wrong on the common path.
-- **Checksum**: `encode_wire_into` passes `checksum=true`; implement the hash branch correctly, do not silently drop it.
-- **Byte-count identity**: assert `CTRL_BLOCK_SIZE_NO_BLOB == schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, 0)` in a `#[test]`. A `const assert` cannot be used because `schema_wal_block_size` is not `const fn`.
-- **Template correctness**: validate by encoding the same message with both `encode_ctrl_block_direct` and `encode_ctrl_block_ipc` and asserting byte-for-byte equality. Round-tripping through `peek_control_block` catches decode errors but not subtle field-offset swaps; the direct comparison catches those.
+- **Null bitmap**: must write `ctrl::NULL_BIT_ERROR_MSG` (not `0`) when `error_msg.is_empty()`. Zero means the error_msg column is non-null, which is wrong on the common path. The `LazyLock` template is initialized with `error_msg=b""` so the null bit is already baked in — do not overwrite it.
+- **Checksum**: hash covers `buf[48..248]` only; result written at `buf[24..32]`. See checksum handling section.
+- **`status` u32→u64 cast**: `status` is `u32` but col 1 is `U64` (8 bytes). Write `(status as u64).to_le_bytes()` at `OFF_STATUS`. Writing only 4 bytes would corrupt `client_id`.
+- **Parameter order at call sites**: `encode_ctrl_block_ipc` and `encode_ctrl_block_direct` share the same signature. `target_id`, `client_id`, and `wire_flags` are all `u64` — a positional swap compiles silently. Verify each substitution against the parameter list mechanically, not visually. At `sal.rs:714`, `client_id=0` is a literal; confirm it stays in slot 4 (the `client_id` position) after renaming.
+- **Direct encoder correctness**: validate by encoding the same message with both `encode_ctrl_block_direct` and `encode_ctrl_block_ipc` and asserting byte-for-byte equality. Use **distinct non-zero values** for every variable field (`status`, `client_id`, `target_id`, `wire_flags`, `seek_pk`, `seek_col_idx`, `request_id`) — identical or shared values can pass even when two field offsets are swapped. Use **`offset = 64`** (not 0) — a test with `offset = 0` passes even if writes are accidentally `out[offset + OFF_X..]` rather than `buf[OFF_X..]`. Test both `checksum=false` and `checksum=true`. This test is the primary guard against `ctrl_region_offset` drifting from `wal::encode`'s actual layout.
+- **error_msg/blob directory entries need no patching**: for the fast path, `error_msg` is null (`null_bmp = NULL_BIT_ERROR_MSG`), the German string inline header is all-zeros, and the blob region has size 0. All three are constant across calls and are baked into the template. The directory entries for these regions (pointing to offsets 232 and 248, respectively) are therefore also constant. Do not add patching for them.
 
 ---
 
