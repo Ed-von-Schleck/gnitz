@@ -27,9 +27,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
 use rustc_hash::FxHashMap;
-use crate::runtime::wire::WireConflictMode;
-use crate::runtime::master::{MasterDispatcher, first_worker_error};
-use crate::runtime::reactor::{self, AsyncMutex, Reactor, mpsc, oneshot};
+use crate::runtime::wire::{DecodedWire, WireConflictMode};
+use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
+use crate::runtime::reactor::{
+    AsyncMutex, Reactor, ReplyFuture, join_into, mpsc, oneshot,
+};
 use crate::storage::Batch;
 use crate::util::guard_panic;
 
@@ -99,6 +101,12 @@ impl Shared {
 /// old epoch and is silently skipped. `checkpoint_post_ack` then resets
 /// `write_cursor` to 0, permanently orphaning those groups.
 pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
+    // Reused across every commit/checkpoint cycle to avoid the per-iteration
+    // Vec<ReplyFuture> + Vec<Option<DecodedWire>> allocations that the old
+    // join_all path implied. Sized for one group's ACKs; commit_pushes grows
+    // them on the first multi-group batch and reuses the capacity thereafter.
+    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(shared.num_workers);
+    let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(shared.num_workers);
     loop {
         // Block for the first request, exit if no senders remain.
         let first = match rx.recv().await {
@@ -125,7 +133,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // so commit groups written AFTER FLAG_FLUSH in the same epoch
         // would be silently skipped by workers.
         if shared.disp().sal_needs_checkpoint() {
-            if let Err(e) = run_checkpoint_phase(&shared).await {
+            if let Err(e) = run_checkpoint_phase(&shared, &mut fut_slots, &mut ack_slots).await {
                 for p in pushes { let _ = p.done.send(Err(e.clone())); }
                 for b in barrier_senders { let _ = b.send(()); }
                 continue;
@@ -133,7 +141,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         }
 
         // Phase 2 — commit the batched pushes.  Its own lock scope.
-        commit_pushes(&shared, pushes).await;
+        commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots).await;
 
         for b in barrier_senders { let _ = b.send(()); }
     }
@@ -187,22 +195,29 @@ fn debounce_drain(
 /// those groups would be silently skipped. `checkpoint_post_ack` then
 /// resets `write_cursor` to 0, permanently orphaning the groups and
 /// leaving the writers waiting for ACKs that never arrive.
-async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
+async fn run_checkpoint_phase(
+    shared: &Rc<Shared>,
+    fut_slots: &mut Vec<ReplyFuture>,
+    ack_slots: &mut Vec<Option<DecodedWire>>,
+) -> Result<(), String> {
     let nw = shared.num_workers;
     let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
 
     let _sal_excl = shared.sal_writer_excl.lock().await;
 
-    let reply_futs = {
+    {
         let disp = shared.disp();
         let lsn = disp.next_lsn();
         disp.write_checkpoint_group(lsn, &req_ids)?;
         disp.signal_all();
-        req_ids.iter().map(|&id| shared.reactor.await_reply(id)).collect::<Vec<_>>()
-    };
+    }
 
-    let decoded_vec = reactor::join_all(reply_futs).await;
-    if let Some(e) = first_worker_error("checkpoint", &decoded_vec) {
+    fut_slots.clear();
+    fut_slots.extend(req_ids.iter().map(|&id| shared.reactor.await_reply(id)));
+    join_into(fut_slots, ack_slots).await;
+    let err = first_worker_error_opt("checkpoint", ack_slots);
+    ack_slots.clear();
+    if let Some(e) = err {
         return Err(e);
     }
     guard_panic("checkpoint_post_ack", || {
@@ -216,7 +231,12 @@ async fn run_checkpoint_phase(shared: &Rc<Shared>) -> Result<(), String> {
 /// releases the lock, THEN awaits worker ACKs (Phase C) and the fsync
 /// CQE (Phase D). LSN assignment and `done.send` happen after worker
 /// ACKs; unique-index filter update happens after fsync.
-async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
+async fn commit_pushes(
+    shared: &Rc<Shared>,
+    mut pushes: Vec<PendingPush>,
+    fut_slots: &mut Vec<ReplyFuture>,
+    ack_slots: &mut Vec<Option<DecodedWire>>,
+) {
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
 
@@ -297,7 +317,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // after fsync (Phase D), so clients only see durable LSNs.
     // ------------------------------------------------------------------
     let zone_lsn = shared.ingest_lsn.get() + 1;
-    let (fsync_fut, reply_futs) = {
+    let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
 
         for g in groups.iter_mut() {
@@ -342,18 +362,22 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
         }
         shared.disp().signal_all();
 
-        // Submit fsync SQE (synchronous — returns a future). Return the
-        // awaitables; the .await happens after the lock is dropped.
-        let fsync_fut = shared.reactor.fsync(shared.sal_fd);
-        let all_req_ids: Vec<u64> = groups.iter()
-            .filter(|g| g.write_err.is_none())
-            .flat_map(|g| g.req_ids.iter().copied())
-            .collect();
-        let reply_futs: Vec<_> = all_req_ids.iter()
-            .map(|&id| shared.reactor.await_reply(id))
-            .collect();
-        (fsync_fut, reply_futs)
+        // Submit fsync SQE (synchronous — returns a future). The
+        // ReplyFutures are built into `fut_slots` outside the lock scope:
+        // await_reply only borrows reactor state, never the SAL writer,
+        // so populating the slots after dropping the lock is correct
+        // and lets concurrent tick/relay tasks make progress sooner.
+        shared.reactor.fsync(shared.sal_fd)
     };
+
+    // Build per-worker reply futures into the caller-supplied scratch
+    // buffer. Holds one block of `nw` entries for each group with
+    // `write_err.is_none()`, in iteration order — failed groups have no
+    // slot, so the cursor in Phase C must skip them without advancing.
+    fut_slots.clear();
+    for g in groups.iter().filter(|g| g.write_err.is_none()) {
+        fut_slots.extend(g.req_ids.iter().map(|&id| shared.reactor.await_reply(id)));
+    }
 
     // ------------------------------------------------------------------
     // Phase C (no lock): await push ACKs, fire tick.
@@ -364,16 +388,20 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>) {
     // async-invariants.md it must run only after fsync confirms durability.
     // ------------------------------------------------------------------
     {
-        let decoded_vec = reactor::join_all(reply_futs).await;
+        join_into(fut_slots, ack_slots).await;
 
         let mut cursor = 0usize;
         for g in groups.iter_mut() {
             if g.write_err.is_some() { continue; }
-            if let Some(e) = first_worker_error("commit", &decoded_vec[cursor..cursor + nw]) {
+            if let Some(e) = first_worker_error_opt("commit", &ack_slots[cursor..cursor + nw]) {
                 g.write_err = Some(e);
             }
             cursor += nw;
         }
+        // Drop DecodedWire heap fields (data_batch, error_msg) before the
+        // committer parks waiting for the next request. Capacity stays
+        // resident so the next commit reuses it.
+        ack_slots.clear();
 
         // Invalidate filters for groups whose worker ACK reported an error.
         // ingest_lsn publish + filter ingest are deferred to Phase D after fsync.

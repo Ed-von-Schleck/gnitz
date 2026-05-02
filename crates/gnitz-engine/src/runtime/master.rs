@@ -764,7 +764,7 @@ impl MasterDispatcher {
                 futs.push(reactor.await_reply(rid));
             }
         }
-        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all(futs).await;
+        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all_unpin(futs).await;
 
         let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
             let cap = match &check.payload {
@@ -1547,7 +1547,28 @@ impl MasterDispatcher {
 pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
     -> Option<String>
 {
-    for (w, d) in decoded.iter().enumerate() {
+    worker_error_scan(op, decoded.iter().enumerate())
+}
+
+/// Variant of `first_worker_error` for the `Vec<Option<DecodedWire>>` slot
+/// shape produced by `join_into`. Slots are guaranteed `Some` after the
+/// future resolves; an unfilled slot indicates a bug in the join driver.
+pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>])
+    -> Option<String>
+{
+    worker_error_scan(
+        op,
+        decoded.iter().enumerate().map(|(w, d)| {
+            (w, d.as_ref().expect("join_into left a None slot — logic bug"))
+        }),
+    )
+}
+
+fn worker_error_scan<'a>(
+    op: &str,
+    it: impl Iterator<Item = (usize, &'a DecodedWire)>,
+) -> Option<String> {
+    for (w, d) in it {
         if d.control.status != 0 {
             let msg = String::from_utf8_lossy(&d.control.error_msg);
             return Some(format!("worker {}: {}: {}", w, op, msg));
@@ -1588,7 +1609,7 @@ where
             disp.signal_all();
         }
     }
-    Ok(crate::runtime::reactor::join_all(
+    Ok(crate::runtime::reactor::join_all_unpin(
         req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
     ).await)
 }

@@ -22,9 +22,10 @@ use rustc_hash::FxHashMap;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
-use crate::runtime::master::{MasterDispatcher, first_worker_error};
+use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
 use crate::runtime::reactor::{
-    AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, mpsc, oneshot, select2,
+    AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture, join_into,
+    mpsc, oneshot, select2,
 };
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
@@ -286,6 +287,9 @@ async fn worker_watcher(shared: Rc<Shared>) {
 /// trigger only fails that trigger, not the loop. SAL emission is
 /// further guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
+    let nw = unsafe { (*shared.dispatcher).num_workers() };
+    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
+    let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
     loop {
         let first = match rx.recv().await {
             Some(t) => t,
@@ -342,7 +346,7 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 
         // Run the tick. Errors are reported in logs; every Drain trigger's
         // `done` is signalled regardless so callers don't hang.
-        if let Err(e) = run_tick(&shared, &tids).await {
+        if let Err(e) = run_tick(&shared, &tids, &mut fut_slots, &mut ack_slots).await {
             gnitz_warn!("tick error: {}", e);
         }
         for t in triggers {
@@ -360,7 +364,12 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 /// for the contiguous emission window (III.3b). Both are released
 /// before awaiting ACKs so other reactor work can proceed concurrently
 /// with worker DAG eval.
-async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
+async fn run_tick(
+    shared: &Rc<Shared>,
+    tids: &[i64],
+    fut_slots: &mut Vec<ReplyFuture>,
+    ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
+) -> Result<(), String> {
     if tids.is_empty() { return Ok(()); }
     // Snapshot before any .await: a concurrent push can bump ingest_lsn
     // while we wait for tick ACKs, and setting last_tick_lsn to that
@@ -390,11 +399,12 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), String> {
     drop(_cat_read);
     emit_err?;
 
-    let futs: Vec<_> = req_ids.iter().flatten()
-        .map(|&id| shared.reactor.await_reply(id))
-        .collect();
-    let replies = crate::runtime::reactor::join_all(futs).await;
-    if let Some(e) = first_worker_error("tick", &replies) {
+    fut_slots.clear();
+    fut_slots.extend(req_ids.iter().flatten().map(|&id| shared.reactor.await_reply(id)));
+    join_into(fut_slots, ack_slots).await;
+    let err = first_worker_error_opt("tick", ack_slots);
+    ack_slots.clear();
+    if let Some(e) = err {
         return Err(e);
     }
     shared.last_tick_lsn.set(snapshot_lsn);

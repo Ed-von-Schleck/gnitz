@@ -448,30 +448,65 @@ where
     }).await
 }
 
-/// Drive every future in `futs` to completion, return values in input order.
-pub async fn join_all<F, T, I>(futs: I) -> Vec<T>
-where
-    I: IntoIterator<Item = F>,
-    F: Future<Output = T>,
-{
-    let mut futs: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
-    let mut out: Vec<Option<T>> = (0..futs.len()).map(|_| None).collect();
-    std::future::poll_fn(move |cx| {
-        let mut all_done = true;
-        for i in 0..futs.len() {
-            if out[i].is_some() { continue; }
-            match futs[i].as_mut().poll(cx) {
-                Poll::Ready(v) => out[i] = Some(v),
-                Poll::Pending => all_done = false,
+/// Future driving `futs` to completion, writing values in input order
+/// into `out`. Both buffers are caller-supplied; no internal allocation
+/// happens once their capacity is large enough.
+///
+/// The caller-supplied scratch shape lets the committer/executor reuse
+/// the same `Vec<F>` and `Vec<Option<T>>` across every commit/tick,
+/// eliminating the three transient allocations that the old `join_all`
+/// performed on every call (boxed futures, option slots, result vec).
+pub struct JoinInto<'a, F, T> {
+    futs: &'a mut Vec<F>,
+    out: &'a mut Vec<Option<T>>,
+}
+
+impl<'a, F: Future<Output = T> + Unpin, T> Future for JoinInto<'a, F, T> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let n = this.futs.len();
+        let mut remaining = 0;
+        for i in 0..n {
+            if this.out[i].is_some() { continue; }
+            match Pin::new(&mut this.futs[i]).poll(cx) {
+                Poll::Ready(v) => { this.out[i] = Some(v); }
+                Poll::Pending => { remaining += 1; }
             }
         }
-        if all_done {
-            let result: Vec<T> = out.iter_mut().map(|o| o.take().unwrap()).collect();
-            Poll::Ready(result)
-        } else {
-            Poll::Pending
-        }
-    }).await
+        if remaining == 0 { Poll::Ready(()) } else { Poll::Pending }
+    }
+}
+
+/// Drive every future in `futs` to completion, writing each result into
+/// the same index in `out`. `out` is cleared and resized to `futs.len()`
+/// on entry; allocation only happens when its capacity is too small.
+pub fn join_into<'a, F, T>(
+    futs: &'a mut Vec<F>,
+    out: &'a mut Vec<Option<T>>,
+) -> JoinInto<'a, F, T>
+where
+    F: Future<Output = T> + Unpin,
+{
+    let n = futs.len();
+    out.clear();
+    out.resize_with(n, || None);
+    JoinInto { futs, out }
+}
+
+/// Drive every future in `futs` to completion, return values in input order.
+/// Requires `F: Unpin`. Every production caller passes `ReplyFuture` /
+/// `ScanSlotFuture` (both `Unpin`); non-`Unpin` callers must `Box::pin`
+/// at the call site.
+pub async fn join_all_unpin<F, T, I>(futs: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T> + Unpin,
+{
+    let mut futs: Vec<F> = futs.into_iter().collect();
+    let mut out: Vec<Option<T>> = Vec::new();
+    join_into(&mut futs, &mut out).await;
+    out.into_iter().map(|o| o.unwrap()).collect()
 }
 
 // ---------------------------------------------------------------------------

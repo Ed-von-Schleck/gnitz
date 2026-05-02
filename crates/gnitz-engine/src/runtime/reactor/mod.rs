@@ -61,7 +61,10 @@ mod exchange;
 pub mod sync;
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
-pub use sync::{AsyncMutex, AsyncRwLock, Either, join_all, oneshot, mpsc, select2};
+pub use sync::{
+    AsyncMutex, AsyncRwLock, Either, join_all_unpin, join_into,
+    oneshot, mpsc, select2,
+};
 #[cfg(test)]
 pub use sync::join2;
 
@@ -475,7 +478,9 @@ impl Reactor {
     }
 
     /// Future that resolves to the decoded W2M reply for `req_id`.
-    pub fn await_reply(&self, req_id: u64) -> impl Future<Output = DecodedWire> {
+    /// Returns the concrete `ReplyFuture` so callers can declare a
+    /// `Vec<ReplyFuture>` scratch buffer that lives across reactor calls.
+    pub fn await_reply(&self, req_id: u64) -> ReplyFuture {
         ReplyFuture {
             req_id,
             inner: Rc::clone(&self.inner),
@@ -1502,7 +1507,7 @@ impl Drop for TimerFuture {
     }
 }
 
-struct ReplyFuture {
+pub struct ReplyFuture {
     req_id: u64,
     inner: Rc<ReactorShared>,
 }
@@ -2924,7 +2929,7 @@ mod tests {
         use crate::runtime::wire::STATUS_OK;
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::reactor::{join_all, select2, Either};
+        use crate::runtime::reactor::{join_all_unpin, select2, Either};
 
         const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 500;
@@ -2967,13 +2972,13 @@ mod tests {
         {
             let received = Rc::clone(&received);
             reactor.spawn(async move {
-                let replies = join_all(reply_futs).await;
+                let replies = join_all_unpin(reply_futs).await;
                 *received.borrow_mut() = replies.into_iter()
                     .map(|r| r.control.request_id)
                     .collect();
             });
         }
-        // One tick polls the spawned task, which walks join_all and
+        // One tick polls the spawned task, which walks join_all_unpin and
         // registers every ReplyFuture's waker before attach drains.
         reactor.poll_nonblocking();
 
@@ -3033,7 +3038,7 @@ mod tests {
         use crate::runtime::wire::STATUS_OK;
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::reactor::{join_all, select2, Either};
+        use crate::runtime::reactor::{join_all_unpin, select2, Either};
 
         const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 5_000;
@@ -3070,7 +3075,7 @@ mod tests {
         {
             let received = Rc::clone(&received);
             reactor.spawn(async move {
-                let replies = join_all(reply_futs).await;
+                let replies = join_all_unpin(reply_futs).await;
                 *received.borrow_mut() = replies.into_iter()
                     .map(|r| r.control.request_id)
                     .collect();
@@ -3364,23 +3369,23 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // join_all edge cases.
+    // join_all_unpin edge cases.
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn join_all_empty_returns_empty_vec() {
+    fn join_all_unpin_empty_returns_empty_vec() {
         let r = make_reactor();
         let result = r.block_on(async {
-            join_all(std::iter::empty::<std::future::Ready<i32>>()).await
+            join_all_unpin(std::iter::empty::<std::future::Ready<i32>>()).await
         });
-        assert!(result.is_empty(), "join_all on empty iterator must return empty vec");
+        assert!(result.is_empty(), "join_all_unpin on empty iterator must return empty vec");
     }
 
     #[test]
-    fn join_all_single_future_completes() {
+    fn join_all_unpin_single_future_completes() {
         let r = make_reactor();
         let result = r.block_on(async {
-            join_all(std::iter::once(async { 99u32 })).await
+            join_all_unpin(std::iter::once(std::future::ready(99u32))).await
         });
         assert_eq!(result, vec![99u32]);
     }
