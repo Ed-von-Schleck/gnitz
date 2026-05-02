@@ -290,12 +290,14 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
     let nw = unsafe { (*shared.dispatcher).num_workers() };
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
+    let mut req_ids: Vec<u64> = Vec::with_capacity(nw);
+    let mut triggers: Vec<TickTrigger> = Vec::new();
     loop {
         let first = match rx.recv().await {
             Some(t) => t,
             None => return, // all senders dropped — clean shutdown
         };
-        let mut triggers = vec![first];
+        triggers.push(first);
 
         // Drain anything already queued.
         while let Some(more) = rx.try_recv() {
@@ -346,10 +348,10 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 
         // Run the tick. Errors are reported in logs; every Drain trigger's
         // `done` is signalled regardless so callers don't hang.
-        if let Err(e) = run_tick(&shared, &tids, &mut fut_slots, &mut ack_slots).await {
+        if let Err(e) = run_tick(&shared, &tids, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await {
             gnitz_warn!("tick error: {}", e);
         }
-        for t in triggers {
+        for t in triggers.drain(..) {
             if let TickTrigger::Drain { done, .. } = t {
                 let _ = done.send(());
             }
@@ -367,6 +369,8 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
 async fn run_tick(
     shared: &Rc<Shared>,
     tids: &[i64],
+    nw: usize,
+    req_ids: &mut Vec<u64>,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
 ) -> Result<(), String> {
@@ -375,13 +379,11 @@ async fn run_tick(
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
     let snapshot_lsn = shared.ingest_lsn.get();
-    let nw = unsafe { (*shared.dispatcher).num_workers() };
 
     // Allocate every (tid, worker) req_id up front so the SAL emission
     // sequence is fully prepared before we take any locks.
-    let req_ids: Vec<Vec<u64>> = tids.iter()
-        .map(|_| (0..nw).map(|_| shared.reactor.alloc_request_id()).collect())
-        .collect();
+    req_ids.clear();
+    req_ids.extend((0..tids.len() * nw).map(|_| shared.reactor.alloc_request_id()));
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let _sal_excl = shared.sal_writer_excl.lock().await;
@@ -390,7 +392,7 @@ async fn run_tick(
         let disp = &mut *shared.dispatcher;
         for (i, &tid) in tids.iter().enumerate() {
             let lsn = disp.next_lsn();
-            disp.write_tick_group(tid, lsn, &req_ids[i])?;
+            disp.write_tick_group(tid, lsn, &req_ids[i * nw..(i + 1) * nw])?;
         }
         disp.signal_all();
         Ok(())
@@ -400,7 +402,7 @@ async fn run_tick(
     emit_err?;
 
     fut_slots.clear();
-    fut_slots.extend(req_ids.iter().flatten().map(|&id| shared.reactor.await_reply(id)));
+    fut_slots.extend(req_ids.iter().copied().map(|id| shared.reactor.await_reply(id)));
     join_into(fut_slots, ack_slots).await;
     let err = first_worker_error_opt("tick", ack_slots);
     ack_slots.clear();

@@ -723,31 +723,32 @@ impl MasterDispatcher {
             return Ok(Vec::new());
         }
 
-        let (nw, mut all_req_ids): (usize, Vec<Vec<u64>>) = {
+        let (nw, all_req_ids): (usize, Vec<u64>) = {
             let _guard = sal_excl.lock().await;
             unsafe {
                 let disp = &mut *disp_ptr;
                 let nw = disp.num_workers;
-                let mut rids: Vec<Vec<u64>> = Vec::with_capacity(num_checks);
-                for _ in 0..num_checks {
-                    rids.push((0..nw).map(|_| reactor.alloc_request_id()).collect());
+                let mut rids: Vec<u64> = Vec::with_capacity(num_checks * nw);
+                for _ in 0..(num_checks * nw) {
+                    rids.push(reactor.alloc_request_id());
                 }
                 for (idx, check) in checks.iter().enumerate() {
                     let lsn = disp.next_lsn();
+                    let req_slice = &rids[idx * nw..(idx + 1) * nw];
                     match &check.payload {
                         CheckPayload::Broadcast(batch) => {
                             let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
                             disp.write_group_with_req_ids(
                                 check.target_id, lsn, check.flags, &refs,
                                 &check.schema, &[], 0, check.col_hint,
-                                &rids[idx], -1, 0,
+                                req_slice, -1, 0,
                             )?;
                         }
                         CheckPayload::ScatterSource { source, worker_indices } => {
                             disp.sal.scatter_wire_group(
                                 source, worker_indices, &check.schema, None,
                                 check.target_id as u32, lsn, check.flags,
-                                0, check.col_hint, &rids[idx], -1,
+                                0, check.col_hint, req_slice, -1,
                             )?;
                         }
                     }
@@ -757,14 +758,9 @@ impl MasterDispatcher {
             }
         };
 
-        // Flatten futures in (check_idx, worker) order.
-        let mut futs = Vec::with_capacity(num_checks * nw);
-        for rids in all_req_ids.drain(..) {
-            for rid in rids {
-                futs.push(reactor.await_reply(rid));
-            }
-        }
-        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all_unpin(futs).await;
+        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all_unpin(
+            all_req_ids.iter().map(|&id| reactor.await_reply(id))
+        ).await;
 
         let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
             let cap = match &check.payload {
