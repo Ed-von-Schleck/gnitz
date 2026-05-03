@@ -13,7 +13,7 @@ impl CatalogEngine {
         // Write schema record
         let schema = schema_tab_schema();
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(sid as u64, 0, 1);
+        bb.begin_row(sid as u128, 1);
         bb.put_string(name);
         bb.end_row();
         let batch = bb.finish();
@@ -50,7 +50,7 @@ impl CatalogEngine {
         //    delta exactly as before.
         let schema = schema_tab_schema();
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(sid as u64, 0, -1);
+        bb.begin_row(sid as u128, -1);
         bb.put_string(name);
         bb.end_row();
         let batch = bb.finish();
@@ -168,7 +168,7 @@ impl CatalogEngine {
         {
             let schema = table_tab_schema();
             let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(tid as u64, 0, 1);
+            bb.begin_row(tid as u128, 1);
             bb.put_u64(sid as u64);
             bb.put_string(table_name);
             bb.put_string(&directory);
@@ -194,7 +194,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
         let schema = table_tab_schema();
-        let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u64, 0);
+        let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u128);
         if batch.count == 0 {
             return Err(format!("Table does not exist: {}", qualified));
         }
@@ -264,7 +264,7 @@ impl CatalogEngine {
         {
             let schema = view_tab_schema();
             let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(vid as u64, 0, 1);
+            bb.begin_row(vid as u128, 1);
             bb.put_u64(sid as u64);
             bb.put_string(view_name);
             bb.put_string(sql_definition);
@@ -300,7 +300,7 @@ impl CatalogEngine {
         self.dag.invalidate(vid);
 
         let schema = view_tab_schema();
-        let batch = retract_single_row(&mut self.sys_views, &schema, vid as u64, 0);
+        let batch = retract_single_row(&mut self.sys_views, &schema, vid as u128);
         if batch.count == 0 {
             return Err(format!("View does not exist: {}", qualified));
         }
@@ -335,7 +335,7 @@ impl CatalogEngine {
         {
             let schema = idx_tab_schema();
             let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(index_id as u64, 0, 1);
+            bb.begin_row(index_id as u128, 1);
             bb.put_u64(owner_id as u64);
             bb.put_u64(OWNER_KIND_TABLE as u64);
             bb.put_u64(col_idx as u64);
@@ -351,7 +351,7 @@ impl CatalogEngine {
                 // Writing directly to storage would leave those caches poisoned
                 // with a ghost index that doesn't exist on disk.
                 let mut undo = BatchBuilder::new(schema);
-                undo.begin_row(index_id as u64, 0, -1);
+                undo.begin_row(index_id as u128, -1);
                 undo.put_u64(owner_id as u64);
                 undo.put_u64(OWNER_KIND_TABLE as u64);
                 undo.put_u64(col_idx as u64);
@@ -381,7 +381,7 @@ impl CatalogEngine {
             .map_err(|e| format!("cursor error: {}", e))?;
         cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
 
-        if !cursor.cursor.valid || cursor.cursor.current_key_lo() != idx_id as u64 {
+        if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
             return Err(format!("Index {} not found in catalog", index_name));
         }
 
@@ -394,7 +394,7 @@ impl CatalogEngine {
 
         let schema = idx_tab_schema();
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(idx_id as u64, 0, -1);
+        bb.begin_row(idx_id as u128, -1);
         bb.put_u64(owner_id as u64);
         bb.put_u64(owner_kind);
         bb.put_u64(source_col_idx);
@@ -502,7 +502,7 @@ impl CatalogEngine {
             // Write index record to sys_indices
             let idx_schema = idx_tab_schema();
             let mut bb = BatchBuilder::new(idx_schema);
-            bb.begin_row(index_id as u64, 0, 1);
+            bb.begin_row(index_id as u128, 1);
             bb.put_u64(table_id as u64);           // owner_id
             bb.put_u64(OWNER_KIND_TABLE as u64);   // owner_kind
             bb.put_u64(col_idx as u64);            // source_col_idx
@@ -530,7 +530,7 @@ impl CatalogEngine {
         let mut bb = BatchBuilder::new(schema);
         for (i, cd) in col_defs.iter().enumerate() {
             let pk = pack_column_id(owner_id, i as i64);
-            bb.begin_row(pk, 0, weight);
+            bb.begin_row(pk as u128, weight);
             bb.put_u64(owner_id as u64);
             bb.put_u64(kind as u64);
             bb.put_u64(i as u64);
@@ -554,7 +554,7 @@ impl CatalogEngine {
         let mut bb = BatchBuilder::new(schema);
         for &dep_tid in dep_ids {
             let (pk_lo, pk_hi) = pack_dep_pk(vid, dep_tid);
-            bb.begin_row(pk_lo, pk_hi, 1);
+            bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
             bb.put_u64(vid as u64);
             bb.put_u64(0); // dep_view_id
             bb.put_u64(dep_tid as u64);
@@ -571,7 +571,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for &(node_id, opcode) in &graph.nodes {
                 let (pk_lo, pk_hi) = pack_node_pk(vid, node_id as i64);
-                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
                 bb.put_u64(opcode as u64);
                 bb.end_row();
             }
@@ -585,7 +585,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for &(edge_id, src, dst, port) in &graph.edges {
                 let (pk_lo, pk_hi) = pack_edge_pk(vid, edge_id as i64);
-                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
                 bb.put_u64(src as u64);
                 bb.put_u64(dst as u64);
                 bb.put_u64(port as u64);
@@ -601,7 +601,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for &(node_id, table_id) in &graph.sources {
                 let (pk_lo, pk_hi) = pack_node_pk(vid, node_id as i64);
-                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
                 bb.put_u64(table_id as u64);
                 bb.end_row();
             }
@@ -615,7 +615,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for &(node_id, slot, value) in &graph.params {
                 let (pk_lo, pk_hi) = pack_param_pk(vid, node_id as i64, slot as i64);
-                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
                 bb.put_u64(value as u64);
                 bb.put_null(); // str_value (NULL)
                 bb.end_row();
@@ -630,7 +630,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for &(node_id, col_idx) in &graph.group_cols {
                 let (pk_lo, pk_hi) = pack_gcol_pk(vid, node_id as i64, col_idx as i64);
-                bb.begin_row(pk_lo, pk_hi, 1);
+                bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
                 bb.put_u64(col_idx as u64);
                 bb.end_row();
             }

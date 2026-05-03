@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::promote_to_index_key;
 
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
@@ -64,10 +65,11 @@ impl CatalogEngine {
 
                 // Promote column value to PK key
                 let col_type = schema.columns[col_idx].type_code;
-                let (fk_lo, fk_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);
+                let col_size = schema.columns[col_idx].size as usize;
+                let col_data = batch.col_data(payload_col);
+                let fk_key = promote_to_index_key(col_data, row * col_size, col_size, col_type);
 
                 // Check if target has this PK
-                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
                 if !target_entry.handle.has_pk(fk_key) {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
@@ -151,8 +153,10 @@ impl CatalogEngine {
 
             let idx_table = ic.table_mut();
 
+            let col_size = schema.columns[source_col_idx].size as usize;
+
             // Track seen keys for batch-internal duplicate detection
-            let mut seen: HashSet<(u64, u64)> = HashSet::with_capacity(batch.count);
+            let mut seen: HashSet<u128> = HashSet::with_capacity(batch.count);
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
@@ -167,10 +171,11 @@ impl CatalogEngine {
                 let is_upsert = entry.unique_pk && entry.handle.has_pk(row_pk);
 
                 // Promote column value to index key
-                let (key_lo, key_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);
+                let col_data = batch.col_data(payload_col);
+                let key_u128 = promote_to_index_key(col_data, row * col_size, col_size, col_type);
 
                 // Batch-internal duplicate check
-                if !seen.insert((key_lo, key_hi)) {
+                if !seen.insert(key_u128) {
                     let col_names = self.get_column_names(table_id);
                     let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
                     return Err(format!(
@@ -179,7 +184,6 @@ impl CatalogEngine {
                 }
 
                 // Check index store for existing key
-                let key_u128 = crate::util::make_pk(key_lo, key_hi);
                 if idx_table.has_pk(key_u128) {
                     if is_upsert {
                         // For UPSERT: the index entry might belong to this same row
@@ -218,34 +222,4 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn promote_to_pk_key(&self, batch: &Batch, row: usize, payload_col: usize, col_type: u8) -> (u64, u64) {
-        match col_type {
-            type_code::U128 | type_code::UUID => {
-                let data = batch.get_col_ptr(row, payload_col, 16);
-                let lo = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                let hi = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                (lo, hi)
-            }
-            type_code::U64 | type_code::I64 => {
-                let data = batch.get_col_ptr(row, payload_col, 8);
-                let lo = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                (lo, 0)
-            }
-            type_code::U32 | type_code::I32 => {
-                let data = batch.get_col_ptr(row, payload_col, 4);
-                let lo = u32::from_le_bytes(data[0..4].try_into().unwrap()) as u64;
-                (lo, 0)
-            }
-            type_code::U16 | type_code::I16 => {
-                let data = batch.get_col_ptr(row, payload_col, 2);
-                let lo = u16::from_le_bytes(data[0..2].try_into().unwrap()) as u64;
-                (lo, 0)
-            }
-            type_code::U8 | type_code::I8 => {
-                let data = batch.get_col_ptr(row, payload_col, 1);
-                (data[0] as u64, 0)
-            }
-            _ => unreachable!("promote_to_pk_key: unsupported type_code {col_type}"),
-        }
-    }
 }

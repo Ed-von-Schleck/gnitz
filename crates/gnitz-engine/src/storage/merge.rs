@@ -1099,11 +1099,11 @@ mod tests {
     /// view via `batch.as_mem_batch()`. Avoids the prior pattern of building
     /// disjoint pk/weight/null/col Vecs, which doesn't fit the new MemBatch
     /// layout (single `data` slice + offsets).
-    fn make_batch_i64(rows: &[(u64, u64, i64, i64)]) -> Batch {
+    fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
         let schema = make_schema_i64();
         let mut b = Batch::with_schema(schema, rows.len().max(1));
-        for &(lo, hi, w, val) in rows {
-            b.extend_pk(crate::util::make_pk(lo, hi));
+        for &(pk, w, val) in rows {
+            b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1170,9 +1170,9 @@ mod tests {
     fn test_single_batch_passthrough() {
         let schema = make_schema_i64();
         let batch = make_batch_i64(&[
-            (10, 0, 1, 100),
-            (20, 0, 1, 200),
-            (30, 0, 1, 300),
+            (10, 1, 100),
+            (20, 1, 200),
+            (30, 1, 300),
         ]);
 
         let result = run_merge(&[batch], &schema);
@@ -1186,12 +1186,12 @@ mod tests {
     fn test_two_batch_interleave() {
         let schema = make_schema_i64();
         let b1 = make_batch_i64(&[
-            (10, 0, 1, 100),
-            (30, 0, 1, 300),
+            (10, 1, 100),
+            (30, 1, 300),
         ]);
         let b2 = make_batch_i64(&[
-            (20, 0, 1, 200),
-            (40, 0, 1, 400),
+            (20, 1, 200),
+            (40, 1, 400),
         ]);
 
         let result = run_merge(&[b1, b2], &schema);
@@ -1205,8 +1205,8 @@ mod tests {
     #[test]
     fn test_consolidation_same_pk_same_payload() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[(10, 0, 1, 100)]);
-        let b2 = make_batch_i64(&[(10, 0, 2, 100)]);
+        let b1 = make_batch_i64(&[(10, 1, 100)]);
+        let b2 = make_batch_i64(&[(10, 2, 100)]);
 
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 1);
@@ -1216,8 +1216,8 @@ mod tests {
     #[test]
     fn test_consolidation_cancellation() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[(10, 0, 1, 100)]);
-        let b2 = make_batch_i64(&[(10, 0, -1, 100)]);
+        let b1 = make_batch_i64(&[(10, 1, 100)]);
+        let b2 = make_batch_i64(&[(10, -1, 100)]);
 
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 0);
@@ -1226,8 +1226,8 @@ mod tests {
     #[test]
     fn test_same_pk_different_payload() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[(10, 0, 1, 100)]);
-        let b2 = make_batch_i64(&[(10, 0, 1, 200)]);
+        let b1 = make_batch_i64(&[(10, 1, 100)]);
+        let b2 = make_batch_i64(&[(10, 1, 200)]);
 
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
@@ -1238,9 +1238,9 @@ mod tests {
     #[test]
     fn test_three_way_merge() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[(10, 0, 1, 100), (40, 0, 1, 400)]);
-        let b2 = make_batch_i64(&[(20, 0, 1, 200), (50, 0, 1, 500)]);
-        let b3 = make_batch_i64(&[(30, 0, 1, 300), (60, 0, 1, 600)]);
+        let b1 = make_batch_i64(&[(10, 1, 100), (40, 1, 400)]);
+        let b2 = make_batch_i64(&[(20, 1, 200), (50, 1, 500)]);
+        let b3 = make_batch_i64(&[(30, 1, 300), (60, 1, 600)]);
 
         let result = run_merge(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 6);
@@ -1259,7 +1259,7 @@ mod tests {
     fn test_one_empty_one_nonempty() {
         let schema = make_schema_i64();
         let empty = empty_batch_i64();
-        let b = make_batch_i64(&[(10, 0, 1, 100)]);
+        let b = make_batch_i64(&[(10, 1, 100)]);
 
         let result = run_merge(&[empty, b], &schema);
         assert_eq!(result.len(), 1);
@@ -1270,11 +1270,11 @@ mod tests {
     fn test_partial_cancellation_three_batches() {
         let schema = make_schema_i64();
         // Insert PK=10 w=+1, PK=20 w=+1
-        let b1 = make_batch_i64(&[(10, 0, 1, 100), (20, 0, 1, 200)]);
+        let b1 = make_batch_i64(&[(10, 1, 100), (20, 1, 200)]);
         // Delete PK=10 w=-1
-        let b2 = make_batch_i64(&[(10, 0, -1, 100)]);
+        let b2 = make_batch_i64(&[(10, -1, 100)]);
         // Insert PK=30 w=+1
-        let b3 = make_batch_i64(&[(30, 0, 1, 300)]);
+        let b3 = make_batch_i64(&[(30, 1, 300)]);
         let result = run_merge(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (20, 0, 1, 200));
@@ -1284,8 +1284,8 @@ mod tests {
     #[test]
     fn test_pk_hi_differentiation() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[(10, 0, 1, 100)]);
-        let b2 = make_batch_i64(&[(10, 1, 1, 200)]);
+        let b1 = make_batch_i64(&[(10, 1, 100)]);
+        let b2 = make_batch_i64(&[((1u128 << 64) | 10, 1, 200)]);
 
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
@@ -1298,7 +1298,7 @@ mod tests {
         let schema = make_schema_i64();
         // 5 separate single-row batches, same (PK, payload) → merged weight = 5
         let batches: Vec<Batch> = (0..5)
-            .map(|_| make_batch_i64(&[(42, 0, 1, 999)]))
+            .map(|_| make_batch_i64(&[(42, 1, 999)]))
             .collect();
         let result = run_merge(&batches, &schema);
         assert_eq!(result.len(), 1);
@@ -1309,8 +1309,8 @@ mod tests {
     fn test_weight_zero_skip() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (10, 0, 0, 100),
-            (20, 0, 1, 200),
+            (10, 0, 100),
+            (20, 1, 200),
         ]);
 
         let result = run_merge(&[b], &schema);
@@ -1331,8 +1331,8 @@ mod tests {
             let base = (9 - chunk) * 10;
             let mut rows = Vec::new();
             for i in 0..10 {
-                let pk = (base + i) as u64;
-                rows.push((pk, 0u64, 1i64, (pk * 100) as i64));
+                let pk = (base + i) as u128;
+                rows.push((pk, 1i64, (pk * 100) as i64));
             }
             // Sort within each batch (required: inputs are sorted runs)
             rows.sort_by_key(|r| r.0);
@@ -1350,9 +1350,9 @@ mod tests {
         // Two rows with the same PK within a single sorted batch
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (10, 0, 1, 100),
-            (10, 0, 1, 100),
-            (20, 0, 1, 200),
+            (10, 1, 100),
+            (10, 1, 100),
+            (20, 1, 200),
         ]);
 
         let result = run_merge(&[b], &schema);
@@ -1366,9 +1366,9 @@ mod tests {
         // Two rows with same PK but different payload within one batch
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (10, 0, 1, 100),
-            (10, 0, 1, 200),
-            (20, 0, 1, 300),
+            (10, 1, 100),
+            (10, 1, 200),
+            (20, 1, 300),
         ]);
 
         let result = run_merge(&[b], &schema);
@@ -1434,7 +1434,7 @@ mod tests {
     #[test]
     fn test_consolidate_single_row() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[(5, 0, 1, 42)]);
+        let b = make_batch_i64(&[(5, 1, 42)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 1);
@@ -1445,9 +1445,9 @@ mod tests {
     fn test_consolidate_already_sorted_no_dups() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
+            (1, 1, 10),
+            (2, 1, 20),
+            (3, 1, 30),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1461,9 +1461,9 @@ mod tests {
     fn test_consolidate_unsorted_no_dups() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (3, 0, 1, 30),
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
+            (3, 1, 30),
+            (1, 1, 10),
+            (2, 1, 20),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1479,8 +1479,8 @@ mod tests {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and +1 → merged to +2
         let b = make_batch_i64(&[
-            (5, 0, 1, 42),
-            (5, 0, 1, 42),
+            (5, 1, 42),
+            (5, 1, 42),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1493,8 +1493,8 @@ mod tests {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and -1 → ghost, eliminated
         let b = make_batch_i64(&[
-            (5, 0, 1, 42),
-            (5, 0, -1, 42),
+            (5, 1, 42),
+            (5, -1, 42),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1506,8 +1506,8 @@ mod tests {
         let schema = make_schema_i64();
         // Same PK but different payloads → both survive, sorted by payload
         let b = make_batch_i64(&[
-            (5, 0, 1, 200),
-            (5, 0, 1, 100),
+            (5, 1, 200),
+            (5, 1, 100),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1522,10 +1522,10 @@ mod tests {
         let schema = make_schema_i64();
         // Unsorted: insert + retract + different PKs
         let b = make_batch_i64(&[
-            (10, 0, 1, 100),   // insert pk=10 val=100
-            (5, 0, 1, 50),     // insert pk=5 val=50
-            (10, 0, -1, 100),  // retract pk=10 val=100
-            (5, 0, 1, 50),     // duplicate insert pk=5 val=50
+            (10, 1, 100),   // insert pk=10 val=100
+            (5, 1, 50),     // insert pk=5 val=50
+            (10, -1, 100),  // retract pk=10 val=100
+            (5, 1, 50),     // duplicate insert pk=5 val=50
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1539,10 +1539,10 @@ mod tests {
     fn test_consolidate_all_cancel() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (1, 0, 1, 10),
-            (1, 0, -1, 10),
-            (2, 0, 3, 20),
-            (2, 0, -3, 20),
+            (1, 1, 10),
+            (1, -1, 10),
+            (2, 3, 20),
+            (2, -3, 20),
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1598,9 +1598,9 @@ mod tests {
     fn test_sort_unsorted() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (3, 0, 1, 30),
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
+            (3, 1, 30),
+            (1, 1, 10),
+            (2, 1, 20),
         ]);
 
         let result = run_sort(&b, &schema);
@@ -1615,9 +1615,9 @@ mod tests {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and -1 — both MUST survive (no consolidation)
         let b = make_batch_i64(&[
-            (5, 0, -1, 42),
-            (5, 0, 1, 42),
-            (10, 0, 1, 100),
+            (5, -1, 42),
+            (5, 1, 42),
+            (10, 1, 100),
         ]);
 
         let result = run_sort(&b, &schema);
@@ -1631,8 +1631,8 @@ mod tests {
     fn test_sort_already_sorted() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
+            (1, 1, 10),
+            (2, 1, 20),
         ]);
 
         let result = run_sort(&b, &schema);
@@ -1692,9 +1692,9 @@ mod tests {
     fn test_scatter_basic() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
-            (3, 0, 1, 30),
+            (1, 1, 10),
+            (2, 1, 20),
+            (3, 1, 30),
         ]);
 
         // Pick rows 2 and 0 (out of order)
@@ -1707,7 +1707,7 @@ mod tests {
     #[test]
     fn test_scatter_empty_indices() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[(1, 0, 1, 10)]);
+        let b = make_batch_i64(&[(1, 1, 10)]);
 
         let result = run_scatter(&b, &[], &[], &schema);
         assert_eq!(result.len(), 0);
@@ -1717,8 +1717,8 @@ mod tests {
     fn test_scatter_with_explicit_weights() {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[
-            (1, 0, 1, 10),
-            (2, 0, 1, 20),
+            (1, 1, 10),
+            (2, 1, 20),
         ]);
 
         // Override weights: row 1 gets w=5, row 0 gets w=-1

@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::make_pk;
 
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
@@ -71,7 +72,7 @@ fn test_fk_referential_integrity() {
     // Insert valid parent
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(10, 0, 1);
+    pbb.begin_row(10u128, 1);
     pbb.end_row();
     let pbatch = pbb.finish();
     engine.dag.ingest_to_family(parent_tid, pbatch);
@@ -80,7 +81,7 @@ fn test_fk_referential_integrity() {
     // Insert valid child (FK=10 exists in parent)
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
-    cbb.begin_row(1, 0, 1);
+    cbb.begin_row(1u128, 1);
     cbb.put_u64(10); // valid FK
     cbb.end_row();
     let cbatch = cbb.finish();
@@ -88,7 +89,7 @@ fn test_fk_referential_integrity() {
 
     // Insert invalid child (FK=99, not in parent)
     let mut cbb2 = BatchBuilder::new(child_schema);
-    cbb2.begin_row(2, 0, 1);
+    cbb2.begin_row(2u128, 1);
     cbb2.put_u64(99); // invalid FK
     cbb2.end_row();
     let cbatch2 = cbb2.finish();
@@ -116,7 +117,7 @@ fn test_fk_nullability_and_retractions() {
     // NULL FK should be allowed even if parent is empty
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut bb = BatchBuilder::new(child_schema);
-    bb.begin_row(1, 0, 1);
+    bb.begin_row(1u128, 1);
     bb.put_null();
     bb.end_row();
     let batch = bb.finish();
@@ -124,7 +125,7 @@ fn test_fk_nullability_and_retractions() {
 
     // Retraction (weight -1) should not trigger FK check
     let mut bb2 = BatchBuilder::new(child_schema);
-    bb2.begin_row(2, 0, -1);
+    bb2.begin_row(2u128, -1);
     bb2.put_u64(999); // non-existent, but weight is negative
     bb2.end_row();
     let batch2 = bb2.finish();
@@ -225,7 +226,7 @@ fn test_fk_parent_restrict_blocks_delete() {
     // Insert parent PK=10
     let ps = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(ps);
-    pbb.begin_row(10, 0, 1);
+    pbb.begin_row(10u128, 1);
     pbb.end_row();
     engine.dag.ingest_to_family(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
@@ -233,7 +234,7 @@ fn test_fk_parent_restrict_blocks_delete() {
     // Insert child FK=10
     let cs = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(cs);
-    cbb.begin_row(1, 0, 1);
+    cbb.begin_row(1u128, 1);
     cbb.put_u64(10);
     cbb.end_row();
     let cbatch = cbb.finish();
@@ -243,7 +244,7 @@ fn test_fk_parent_restrict_blocks_delete() {
 
     // Retract parent PK=10 — should be blocked by RESTRICT
     let mut del = BatchBuilder::new(ps);
-    del.begin_row(10, 0, -1);
+    del.begin_row(10u128, -1);
     del.end_row();
     let del_batch = del.finish();
     let result = engine.validate_fk_parent_restrict(parent_tid, &del_batch);
@@ -252,13 +253,13 @@ fn test_fk_parent_restrict_blocks_delete() {
 
     // Retract parent PK=99 (no child references it) — should succeed
     let mut del2 = BatchBuilder::new(ps);
-    del2.begin_row(99, 0, -1);
+    del2.begin_row(99u128, -1);
     del2.end_row();
     assert!(engine.validate_fk_parent_restrict(parent_tid, &del2.finish()).is_ok());
 
     // Insert-only batch on parent table — RESTRICT should be a no-op
     let mut ins = BatchBuilder::new(ps);
-    ins.begin_row(20, 0, 1);
+    ins.begin_row(20u128, 1);
     ins.end_row();
     assert!(engine.validate_fk_parent_restrict(parent_tid, &ins.finish()).is_ok());
 
@@ -326,14 +327,14 @@ fn test_fk_multiple_children_same_parent() {
     // Insert parent + child1 row, verify RESTRICT
     let ps = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(ps);
-    pbb.begin_row(10, 0, 1);
+    pbb.begin_row(10u128, 1);
     pbb.end_row();
     engine.dag.ingest_to_family(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
 
     let cs = engine.get_schema(child1_tid).unwrap();
     let mut cbb = BatchBuilder::new(cs);
-    cbb.begin_row(1, 0, 1);
+    cbb.begin_row(1u128, 1);
     cbb.put_u64(10);
     cbb.end_row();
     engine.dag.ingest_to_family(child1_tid, cbb.finish());
@@ -341,7 +342,7 @@ fn test_fk_multiple_children_same_parent() {
 
     // DELETE parent blocked by child1
     let mut del = BatchBuilder::new(ps);
-    del.begin_row(10, 0, -1);
+    del.begin_row(10u128, -1);
     del.end_row();
     assert!(engine.validate_fk_parent_restrict(parent_tid, &del.finish()).is_err());
 
@@ -380,7 +381,7 @@ fn test_fk_u128() {
     // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(0xBBBB, 0xAAAA, 1);
+    pbb.begin_row(make_pk(0xBBBB, 0xAAAA), 1);
     pbb.end_row();
     engine.dag.ingest_to_family(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
@@ -388,15 +389,15 @@ fn test_fk_u128() {
     // Valid child FK (matches parent)
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
-    cbb.begin_row(1, 0, 1);
-    cbb.put_u128(0xBBBB, 0xAAAA);
+    cbb.begin_row(1u128, 1);
+    cbb.put_u128(make_pk(0xBBBB, 0xAAAA));
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_ok());
 
     // Invalid child FK (no such parent)
     let mut cbb2 = BatchBuilder::new(child_schema);
-    cbb2.begin_row(2, 0, 1);
-    cbb2.put_u128(0xDEAD, 0xBEEF);
+    cbb2.begin_row(2u128, 1);
+    cbb2.put_u128(make_pk(0xDEAD, 0xBEEF));
     cbb2.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb2.finish()).is_err());
 

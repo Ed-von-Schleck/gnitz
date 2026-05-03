@@ -100,11 +100,11 @@ impl CatalogEngine {
             let schema = schema_tab_schema();
             let mut bb = BatchBuilder::new(schema);
             // _system schema
-            bb.begin_row(SYSTEM_SCHEMA_ID as u64, 0, 1);
+            bb.begin_row(SYSTEM_SCHEMA_ID as u128, 1);
             bb.put_string("_system");
             bb.end_row();
             // public schema
-            bb.begin_row(PUBLIC_SCHEMA_ID as u64, 0, 1);
+            bb.begin_row(PUBLIC_SCHEMA_ID as u128, 1);
             bb.put_string("public");
             bb.end_row();
             let batch = bb.finish();
@@ -117,7 +117,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
             for info in SYS_TAB_INFOS {
                 let dir = format!("{}/{}", sys_dir, info.subdir);
-                bb.begin_row(info.id as u64, 0, 1);
+                bb.begin_row(info.id as u128, 1);
                 bb.put_u64(SYSTEM_SCHEMA_ID as u64);  // schema_id
                 bb.put_string(info.name);               // name
                 bb.put_string(&dir);                    // directory
@@ -178,7 +178,7 @@ impl CatalogEngine {
             for &(tid, cols) in system_cols {
                 for (i, &(name, tcode)) in cols.iter().enumerate() {
                     let pk = pack_column_id(tid, i as i64);
-                    bb.begin_row(pk, 0, 1);
+                    bb.begin_row(pk as u128, 1);
                     bb.put_u64(tid as u64);          // owner_id
                     bb.put_u64(OWNER_KIND_TABLE as u64); // owner_kind
                     bb.put_u64(i as u64);            // col_idx
@@ -198,16 +198,16 @@ impl CatalogEngine {
         {
             let schema = seq_tab_schema();
             let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(SEQ_ID_SCHEMAS as u64, 0, 1);
+            bb.begin_row(SEQ_ID_SCHEMAS as u128, 1);
             bb.put_u64((FIRST_USER_SCHEMA_ID - 1) as u64);
             bb.end_row();
-            bb.begin_row(SEQ_ID_TABLES as u64, 0, 1);
+            bb.begin_row(SEQ_ID_TABLES as u128, 1);
             bb.put_u64((FIRST_USER_TABLE_ID - 1) as u64);
             bb.end_row();
-            bb.begin_row(SEQ_ID_INDICES as u64, 0, 1);
+            bb.begin_row(SEQ_ID_INDICES as u128, 1);
             bb.put_u64((FIRST_USER_INDEX_ID - 1) as u64);
             bb.end_row();
-            bb.begin_row(SEQ_ID_PROGRAMS as u64, 0, 1);
+            bb.begin_row(SEQ_ID_PROGRAMS as u128, 1);
             bb.put_u64((FIRST_USER_TABLE_ID - 1) as u64);
             bb.end_row();
             let batch = bb.finish();
@@ -232,7 +232,7 @@ impl CatalogEngine {
         };
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
-                let seq_id = cursor.cursor.current_key_lo() as i64;
+                let seq_id = cursor.cursor.current_key as u64 as i64;
                 let val = cursor_read_u64(&cursor, SEQTAB_COL_VALUE) as i64;
                 match seq_id {
                     SEQ_ID_SCHEMAS => {

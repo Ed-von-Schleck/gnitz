@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::make_pk;
 
 // ── test_view_backfill_simple ────────────────────────────────────────
 
@@ -14,7 +15,7 @@ fn test_view_backfill_simple() {
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
-        bb.begin_row(i, 0, 1);
+        bb.begin_row(i as u128, 1);
         bb.put_u64((i * 10) as u64);
         bb.end_row();
     }
@@ -60,7 +61,7 @@ fn test_view_backfill_on_restart() {
         let schema = engine.get_schema(tid).unwrap();
         let mut bb = BatchBuilder::new(schema);
         for i in 0..5u64 {
-            bb.begin_row(i, 0, 1);
+            bb.begin_row(i as u128, 1);
             bb.put_u64((i * 10) as u64);
             bb.end_row();
         }
@@ -102,7 +103,7 @@ fn test_view_on_view_backfill() {
         let schema = engine.get_schema(tid).unwrap();
         let mut bb = BatchBuilder::new(schema);
         for v in &[5u64, 20, 50, 80, 100] {
-            bb.begin_row(*v, 0, 1);
+            bb.begin_row(*v as u128, 1);
             bb.put_u64(*v);
             bb.end_row();
         }
@@ -153,7 +154,7 @@ fn test_view_live_update() {
     // Ingest initial data
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
-        bb.begin_row(i, 0, 1);
+        bb.begin_row(i as u128, 1);
         bb.put_u64(i * 10);
         bb.end_row();
     }
@@ -174,7 +175,7 @@ fn test_view_live_update() {
 
     // Live update: ingest 1 more row + evaluate DAG
     let mut bb2 = BatchBuilder::new(schema);
-    bb2.begin_row(99, 0, 1);
+    bb2.begin_row(99u128, 1);
     bb2.put_u64(999);
     bb2.end_row();
     let delta = bb2.finish();
@@ -316,8 +317,8 @@ fn test_full_lifecycle() {
     // 3. FK enforcement: invalid order (no matching user)
     let orders_schema = engine.get_schema(orders_tid).unwrap();
     let mut bad = BatchBuilder::new(orders_schema);
-    bad.begin_row(1, 0, 1);
-    bad.put_u128(0xCAFEBABE, 0xDEADBEEF);
+    bad.begin_row(1u128, 1);
+    bad.put_u128(make_pk(0xCAFEBABE, 0xDEADBEEF));
     bad.put_u64(500);
     bad.end_row();
     assert!(engine.validate_fk_inline(orders_tid, &bad.finish()).is_err());
@@ -325,15 +326,15 @@ fn test_full_lifecycle() {
     // 4. Ingest valid user + order
     let users_schema = engine.get_schema(users_tid).unwrap();
     let mut ub = BatchBuilder::new(users_schema);
-    ub.begin_row(0xCAFEBABE, 0xDEADBEEF, 1);
+    ub.begin_row(make_pk(0xCAFEBABE, 0xDEADBEEF), 1);
     ub.put_string("alice");
     ub.end_row();
     engine.dag.ingest_to_family(users_tid, ub.finish());
     let _ = engine.dag.flush(users_tid);
 
     let mut ob = BatchBuilder::new(orders_schema);
-    ob.begin_row(101, 0, 1);
-    ob.put_u128(0xCAFEBABE, 0xDEADBEEF);
+    ob.begin_row(101u128, 1);
+    ob.put_u128(make_pk(0xCAFEBABE, 0xDEADBEEF));
     ob.put_u64(1000);
     ob.end_row();
     assert!(engine.validate_fk_inline(orders_tid, &ob.finish()).is_ok());
@@ -386,8 +387,8 @@ fn test_push_and_evaluate_cascades_to_view() {
 
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(10); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(20); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
 
     // View should reflect the push
@@ -396,7 +397,7 @@ fn test_push_and_evaluate_cascades_to_view() {
 
     // Push more
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(3, 0, 1); bb.put_u64(30); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(30); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
 
     let scan = engine.scan_family(vid).unwrap();
@@ -418,13 +419,13 @@ fn test_upsert_effective_batch_has_retractions() {
 
     // Insert PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
     // UPSERT PK=1, val=200 via ingest_returning_effective
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
     let (rc, effective_opt) = engine.dag.ingest_returning_effective(tid, bb.finish());
     assert_eq!(rc, 0);
     let effective = effective_opt.unwrap();
@@ -458,7 +459,7 @@ fn test_upsert_retraction_reaches_views() {
 
     // Insert PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
 
     // Check view: should have 1 row with val=100
@@ -467,7 +468,7 @@ fn test_upsert_retraction_reaches_views() {
 
     // UPSERT PK=1, val=200
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
 
     // View should have 1 row with val=200 (old val=100 retracted)
@@ -498,13 +499,13 @@ fn test_intra_batch_insert_then_delete_same_pk() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
-    bb.begin_row(1, 0, -1); bb.put_u64(0); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, -1); bb.put_u64(0); bb.end_row();
     let effective = engine.ingest_returning_effective(tid, bb.finish()).unwrap();
 
     // Count retractions of the stored (pk=1, val=100) row.  Must be
@@ -550,13 +551,13 @@ fn test_intra_batch_double_insert_same_pk() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(10); bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(20); bb.end_row();
-    bb.begin_row(1, 0, 1); bb.put_u64(30); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(30); bb.end_row();
     let effective = engine.ingest_returning_effective(tid, bb.finish()).unwrap();
 
     let col = effective.col_data(0);
@@ -607,14 +608,14 @@ fn test_intra_batch_same_pk_propagates_to_view() {
     let vid = engine.create_view("public.v", &graph, "").unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
     assert_eq!(engine.scan_family(vid).unwrap().count, 1);
 
     // Intra-batch: replace val 100 → 200 → 300.
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
-    bb.begin_row(1, 0, 1); bb.put_u64(300); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(300); bb.end_row();
     engine.push_and_evaluate(tid, bb.finish()).unwrap();
 
     let scan = engine.scan_family(vid).unwrap();

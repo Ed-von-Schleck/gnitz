@@ -14,7 +14,7 @@ fn test_index_creation_and_backfill() {
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
-        bb.begin_row(i, 0, 1);
+        bb.begin_row(i as u128, 1);
         bb.put_u64((i * 100) as u64);
         bb.end_row();
     }
@@ -48,7 +48,7 @@ fn test_index_live_fanout() {
     // Ingest 5 rows
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
-        bb.begin_row(i, 0, 1);
+        bb.begin_row(i as u128, 1);
         bb.put_u64(i * 100);
         bb.end_row();
     }
@@ -60,7 +60,7 @@ fn test_index_live_fanout() {
 
     // Live fan-out: ingest 1 more row via ingest_to_family (which does index projection)
     let mut bb2 = BatchBuilder::new(schema);
-    bb2.begin_row(99, 0, 1);
+    bb2.begin_row(99u128, 1);
     bb2.put_u64(777);
     bb2.end_row();
     engine.dag.ingest_to_family(tid, bb2.finish());
@@ -90,13 +90,13 @@ fn test_validate_unique_indices_duplicate_value() {
 
     // Insert first row
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // Insert second row with same val=42 → should violate unique index
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(2, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(42); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Unique index violation"));
@@ -116,8 +116,8 @@ fn test_validate_unique_indices_batch_internal_dup() {
 
     // Single batch with two rows sharing val=99 → duplicate in batch
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(99); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(99); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(99); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("duplicate in batch"));
@@ -137,13 +137,13 @@ fn test_validate_unique_indices_upsert_same_value_ok() {
 
     // Insert PK=1, val=42
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // UPSERT PK=1, val=42 (same value) → should succeed
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_ok());
 
@@ -162,14 +162,14 @@ fn test_validate_unique_indices_upsert_to_existing_value_fails() {
 
     // Insert PK=1, val=42 and PK=2, val=99
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(99); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // UPSERT PK=1, val=99 → conflicts with PK=2's val=99
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(99); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(99); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Unique index violation"));
@@ -189,13 +189,13 @@ fn test_validate_unique_indices_distinct_values_ok() {
 
     // Insert row with val=42
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // Insert row with different val=99 → should succeed
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(99); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_ok());
 
@@ -215,9 +215,9 @@ fn test_seek_by_index_found() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(10, 0, 1); bb.put_u64(100); bb.end_row();
-    bb.begin_row(20, 0, 1); bb.put_u64(200); bb.end_row();
-    bb.begin_row(30, 0, 1); bb.put_u64(300); bb.end_row();
+    bb.begin_row(10u128, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(20u128, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(30u128, 1); bb.put_u64(300); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -242,7 +242,7 @@ fn test_seek_by_index_not_found() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -266,10 +266,10 @@ fn test_seek_by_index_negative_i64() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64((-5i64) as u64); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64((-1i64) as u64); bb.end_row();
-    bb.begin_row(3, 0, 1); bb.put_u64(0); bb.end_row();
-    bb.begin_row(4, 0, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64((-5i64) as u64); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64((-1i64) as u64); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(0); bb.end_row();
+    bb.begin_row(4u128, 1); bb.put_u64(10); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -302,9 +302,9 @@ fn test_seek_by_index_negative_i32() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u32((-1i32) as u32); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u32((-100i32) as u32); bb.end_row();
-    bb.begin_row(3, 0, 1); bb.put_u32(42u32); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u32((-1i32) as u32); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u32((-100i32) as u32); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u32(42u32); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -333,8 +333,8 @@ fn test_seek_by_index_u8_column() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(10, 0, 1); bb.put_u8(42); bb.end_row();
-    bb.begin_row(20, 0, 1); bb.put_u8(99); bb.end_row();
+    bb.begin_row(10u128, 1); bb.put_u8(42); bb.end_row();
+    bb.begin_row(20u128, 1); bb.put_u8(99); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -360,8 +360,8 @@ fn test_seek_by_index_u16_column() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u16(8080); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u16(443); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u16(8080); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u16(443); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -383,23 +383,20 @@ fn test_promote_to_index_key_matches_batch_project_for_signed() {
 
     // I32 value -1 stored as little-endian 0xFFFFFFFF
     let data: [u8; 4] = (-1i32).to_le_bytes();
-    let (lo, hi) = promote_to_index_key(&data, 0, 4, type_code::I32);
+    let key = promote_to_index_key(&data, 0, 4, type_code::I32);
 
     // batch_project_index reads u32::from_le_bytes() as u64 → 0x00000000FFFFFFFF
-    assert_eq!(lo, 0xFFFFFFFFu64, "I32 -1 must zero-extend, not sign-extend");
-    assert_eq!(hi, 0);
+    assert_eq!(key, 0xFFFFFFFFu128, "I32 -1 must zero-extend, not sign-extend");
 
     // I16 value -1 stored as little-endian 0xFFFF
     let data16: [u8; 2] = (-1i16).to_le_bytes();
-    let (lo16, hi16) = promote_to_index_key(&data16, 0, 2, type_code::I16);
-    assert_eq!(lo16, 0xFFFFu64);
-    assert_eq!(hi16, 0);
+    let key16 = promote_to_index_key(&data16, 0, 2, type_code::I16);
+    assert_eq!(key16, 0xFFFFu128);
 
     // I8 value -1 stored as 0xFF
     let data8: [u8; 1] = [0xFF];
-    let (lo8, hi8) = promote_to_index_key(&data8, 0, 1, type_code::I8);
-    assert_eq!(lo8, 0xFFu64);
-    assert_eq!(hi8, 0);
+    let key8 = promote_to_index_key(&data8, 0, 1, type_code::I8);
+    assert_eq!(key8, 0xFFu128);
 }
 
 #[test]
@@ -413,8 +410,8 @@ fn test_seek_by_index_i32_negative_value() {
 
     // Insert a row with a negative I32 value
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u32((-5i32) as u32); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u32(10u32); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u32((-5i32) as u32); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u32(10u32); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -601,8 +598,8 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
 
     // Seed duplicate values on `val` so a unique index over it cannot be built.
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(42); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 

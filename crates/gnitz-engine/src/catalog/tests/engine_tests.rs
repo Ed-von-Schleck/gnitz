@@ -21,7 +21,7 @@ fn test_enforce_unique_pk() {
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(pk, 0, w);
+        bb.begin_row(pk as u128, w);
         bb.put_u64(val);
         bb.end_row();
         bb.finish()
@@ -49,15 +49,15 @@ fn test_enforce_unique_pk() {
     // ST3: intra-batch duplicate — last value wins (enforce_unique_pk
     // handles intra-batch dedup correctly)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(5, 0, 1); bb.put_u64(10); bb.end_row();
-    bb.begin_row(5, 0, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(5u128, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(5u128, 1); bb.put_u64(20); bb.end_row();
     dag.ingest_to_family(100, bb.finish());
     assert_eq!(scan(&mut table), 3, "Intra-batch dup: PK=5 has 1 net row");
 
     // ST4: intra-batch insert then delete cancel each other
     let mut bb2 = BatchBuilder::new(schema);
-    bb2.begin_row(6, 0, 1); bb2.put_u64(10); bb2.end_row();
-    bb2.begin_row(6, 0, -1); bb2.put_u64(10); bb2.end_row();
+    bb2.begin_row(6u128, 1); bb2.put_u64(10); bb2.end_row();
+    bb2.begin_row(6u128, -1); bb2.put_u64(10); bb2.end_row();
     dag.ingest_to_family(100, bb2.finish());
     // PK=6 cancelled, existing PKs (1,2,5) remain
     assert_eq!(scan(&mut table), 3, "Insert+delete cancel: PK=6 not added");
@@ -83,7 +83,7 @@ fn test_orphaned_metadata_recovery() {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let idx_schema = idx_tab_schema();
         let mut bb = BatchBuilder::new(idx_schema);
-        bb.begin_row(888, 0, 1);
+        bb.begin_row(888u128, 1);
         bb.put_u64(99999);   // owner_id (non-existent)
         bb.put_u64(OWNER_KIND_TABLE as u64);
         bb.put_u64(1);       // source_col_idx
@@ -119,7 +119,7 @@ fn test_sequence_gap_recovery() {
         // Inject table record for tid=250 directly into sys_tables
         let tbl_schema = table_tab_schema();
         let mut bb = BatchBuilder::new(tbl_schema);
-        bb.begin_row(250, 0, 1);
+        bb.begin_row(250u128, 1);
         bb.put_u64(PUBLIC_SCHEMA_ID as u64); // schema_id
         bb.put_string("gap_table");
         bb.put_string(&format!("{}/public/gap", dir));
@@ -133,7 +133,7 @@ fn test_sequence_gap_recovery() {
         let col_schema = col_tab_schema();
         let mut cbb = BatchBuilder::new(col_schema);
         let pk = pack_column_id(250, 0);
-        cbb.begin_row(pk, 0, 1);
+        cbb.begin_row(pk as u128, 1);
         cbb.put_u64(250);   // owner_id
         cbb.put_u64(OWNER_KIND_TABLE as u64);
         cbb.put_u64(0);     // col_idx
@@ -174,9 +174,9 @@ fn test_ingest_scan_seek_family() {
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
-    bb.begin_row(2, 0, 1); bb.put_u64(200); bb.end_row();
-    bb.begin_row(3, 0, 1); bb.put_u64(300); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(300); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -211,13 +211,13 @@ fn test_ingest_unique_pk_partitioned() {
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -244,7 +244,7 @@ fn test_ddl_sync() {
     // Simulate DDL sync: create batch mimicking a schema record
     let schema = schema_tab_schema();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(100, 0, 1); // sid=100
+    bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
     bb.end_row();
     engine.ddl_sync(SCHEMA_TAB_ID, bb.finish()).unwrap();
@@ -315,8 +315,8 @@ fn test_raw_store_ingest() {
 
     // Raw ingest (SAL recovery path — no hooks, no unique_pk, no index projection)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(10, 0, 1); bb.put_u64(1000); bb.end_row();
-    bb.begin_row(20, 0, 1); bb.put_u64(2000); bb.end_row();
+    bb.begin_row(10u128, 1); bb.put_u64(1000); bb.end_row();
+    bb.begin_row(20u128, 1); bb.put_u64(2000); bb.end_row();
     engine.raw_store_ingest(tid, bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -442,7 +442,7 @@ fn test_circuit_table_surface_restricted() {
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
     let schema = circuit_nodes_schema();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(42, 0, 1);
+    bb.begin_row(42u128, 1);
     bb.put_u64(11); // opcode
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();

@@ -84,7 +84,7 @@ enum P2Label {
     Upsert {
         col_idx: u32,
         source_col: usize,
-        upsert_keys: Vec<(u64, u64, u128)>,
+        upsert_keys: Vec<(u128, u128)>,
     },
 }
 
@@ -169,13 +169,13 @@ fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndex
             let null_word = batch.get_null_word(i);
             if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
         }
-        let (lo, hi) = if d.is_pk_col {
-            crate::util::split_pk(batch.get_pk(i))
+        let key = if d.is_pk_col {
+            batch.get_pk(i)
         } else {
             let col_data = batch.col_data(d.src_payload_idx);
             promote_to_index_key(col_data, i * d.col_size, d.col_size, d.type_code)
         };
-        filter.insert(crate::util::make_pk(lo, hi));
+        filter.insert(key);
     }
 }
 
@@ -992,7 +992,7 @@ impl MasterDispatcher {
         let pki = source_schema.pk_index as usize;
 
         // Build PK aggregation using pooled map; release borrow before any `.await`.
-        let pk_lo_hi: Option<(Vec<u64>, Vec<u64>)> = PK_AGG_POOL.with(|cell| -> Result<Option<(Vec<u64>, Vec<u64>)>, String> {
+        let pk_lo_hi: Option<Vec<u128>> = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
             let mut m = cell.borrow_mut();
             m.clear();
             if !(has_unique || needs_pk_rejection) {
@@ -1022,15 +1022,12 @@ impl MasterDispatcher {
                     }
                 }
             }
-            let mut lo_list: Vec<u64> = Vec::with_capacity(m.len());
-            let mut hi_list: Vec<u64> = Vec::with_capacity(m.len());
+            let mut keys: Vec<u128> = Vec::with_capacity(m.len());
             for (&pk, &(net_weight, _)) in m.iter() {
                 if net_weight <= 0 { continue; }
-                let (lo, hi) = crate::util::split_pk(pk);
-                lo_list.push(lo);
-                hi_list.push(hi);
+                keys.push(pk);
             }
-            Ok(Some((lo_list, hi_list)))
+            Ok(Some(keys))
         })?;
 
         // ----- Phase 1 plan -----------------------------------------------
@@ -1056,8 +1053,7 @@ impl MasterDispatcher {
             let col_size = source_schema.columns[fk_col_idx].size as usize;
 
             let mut seen: HashSet<u128> = HashSet::new();
-            let mut lo_list: Vec<u64> = Vec::new();
-            let mut hi_list: Vec<u64> = Vec::new();
+            let mut keys: Vec<u128> = Vec::new();
 
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
@@ -1065,19 +1061,16 @@ impl MasterDispatcher {
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
                 let col_data = batch.col_data(payload_col);
-                let (fk_lo, fk_hi) = promote_to_index_key(
-                    col_data, i * col_size, col_size, col_type);
-                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
+                let fk_key = promote_to_index_key(col_data, i * col_size, col_size, col_type);
                 if seen.insert(fk_key) {
-                    lo_list.push(fk_lo);
-                    hi_list.push(fk_hi);
+                    keys.push(fk_key);
                 }
             }
 
-            if lo_list.is_empty() { continue; }
+            if keys.is_empty() { continue; }
 
-            let expected_count = lo_list.len();
-            let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
+            let expected_count = keys.len();
+            let check_batch = build_check_batch(&parent_schema, &keys);
             let pk_col = &[parent_schema.pk_index];
             let worker_indices = compute_worker_indices(
                 &check_batch, pk_col, &parent_schema, num_workers);
@@ -1106,13 +1099,7 @@ impl MasterDispatcher {
             }
 
             if !neg_pks.is_empty() {
-                let mut lo_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
-                let mut hi_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
-                for &pk in &neg_pks {
-                    let (lo, hi) = crate::util::split_pk(pk);
-                    lo_list.push(lo);
-                    hi_list.push(hi);
-                }
+                let keys: Vec<u128> = neg_pks.iter().copied().collect();
 
                 for ci in 0..n_children {
                     let (child_tid, fk_col_idx, idx_schema) = unsafe {
@@ -1130,7 +1117,7 @@ impl MasterDispatcher {
                         (child_tid, fk_col_idx, idx_schema)
                     };
 
-                    let check_batch = build_check_batch(&idx_schema, &lo_list, &hi_list);
+                    let check_batch = build_check_batch(&idx_schema, &keys);
                     p1_labels.push(P1Label::FkRestrict { child_tid });
                     p1_checks.push(PipelinedCheck {
                         target_id: child_tid,
@@ -1143,9 +1130,9 @@ impl MasterDispatcher {
             }
         }
 
-        if let Some((lo_list, hi_list)) = pk_lo_hi {
-            if !lo_list.is_empty() {
-                let check_batch = build_check_batch(&source_schema, &lo_list, &hi_list);
+        if let Some(keys) = pk_lo_hi {
+            if !keys.is_empty() {
+                let check_batch = build_check_batch(&source_schema, &keys);
                 let pk_col = &[source_schema.pk_index];
                 let worker_indices = compute_worker_indices(
                     &check_batch, pk_col, &source_schema, num_workers);
@@ -1257,9 +1244,8 @@ impl MasterDispatcher {
             };
             let col_size = source_schema.columns[source_col].size as usize;
 
-            let mut upsert_keys: Vec<(u64, u64, u128)> = Vec::new();
-            let mut check_lo: Vec<u64> = Vec::new();
-            let mut check_hi: Vec<u64> = Vec::new();
+            let mut upsert_keys: Vec<(u128, u128)> = Vec::new();
+            let mut check_keys: Vec<u128> = Vec::new();
             let mut seen: HashSet<u128> = HashSet::new();
 
             for i in 0..batch.count {
@@ -1272,39 +1258,34 @@ impl MasterDispatcher {
 
                 let pk_i = batch.get_pk(i);
 
-                let (key_lo, key_hi) = if is_pk_col {
-                    crate::util::split_pk(pk_i)
+                let key = if is_pk_col {
+                    pk_i
                 } else {
                     let col_data = batch.col_data(src_payload_idx);
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
 
                 if existing_pks.contains(&pk_i) {
-                    upsert_keys.push((key_lo, key_hi, pk_i));
+                    upsert_keys.push((key, pk_i));
                     continue;
                 }
 
-                let key_pk = crate::util::make_pk(key_lo, key_hi);
-                if seen.contains(&key_pk) {
+                if seen.contains(&key) {
                     let col_name = unsafe { (*disp_ptr).get_col_name(target_id, source_col) };
                     return Err(format!(
                         "Unique index violation on column '{}': duplicate in batch", col_name));
                 }
-                seen.insert(key_pk);
-                check_lo.push(key_lo);
-                check_hi.push(key_hi);
+                seen.insert(key);
+                check_keys.push(key);
             }
 
-            if !check_lo.is_empty() {
-                let filter_keys: Vec<u128> = check_lo.iter().zip(check_hi.iter())
-                    .map(|(&lo, &hi)| crate::util::make_pk(lo, hi))
-                    .collect();
+            if !check_keys.is_empty() {
                 let skip_broadcast = unsafe {
-                    (*disp_ptr).unique_filter_all_absent(target_id, col_idx, &filter_keys)
+                    (*disp_ptr).unique_filter_all_absent(target_id, col_idx, &check_keys)
                 };
 
                 if !skip_broadcast {
-                    let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
+                    let chk_batch = build_check_batch(&idx_schema, &check_keys);
                     p2_labels.push(P2Label::NonUpsert { source_col });
                     p2_checks.push(PipelinedCheck {
                         target_id,
@@ -1317,9 +1298,8 @@ impl MasterDispatcher {
             }
 
             if !upsert_keys.is_empty() {
-                let u_lo: Vec<u64> = upsert_keys.iter().map(|&(lo, _, _)| lo).collect();
-                let u_hi: Vec<u64> = upsert_keys.iter().map(|&(_, hi, _)| hi).collect();
-                let u_batch = build_check_batch(&idx_schema, &u_lo, &u_hi);
+                let u_keys: Vec<u128> = upsert_keys.iter().map(|&(k, _)| k).collect();
+                let u_batch = build_check_batch(&idx_schema, &u_keys);
                 p2_labels.push(P2Label::Upsert { col_idx, source_col, upsert_keys });
                 p2_checks.push(PipelinedCheck {
                     target_id,
@@ -1348,12 +1328,11 @@ impl MasterDispatcher {
                 }
                 P2Label::Upsert { col_idx, source_col, upsert_keys } => {
                     let occupied = &p2_results[idx];
-                    for &(key_lo, key_hi, pk_i) in upsert_keys {
-                        let key_pk = crate::util::make_pk(key_lo, key_hi);
+                    for &(key_pk, pk_i) in upsert_keys {
                         if !occupied.contains(&key_pk) { continue; }
                         let slot = Self::fan_out_seek_by_index_async(
                             disp_ptr, reactor, sal_excl, target_id, *col_idx,
-                            crate::util::make_pk(key_lo, key_hi),
+                            key_pk,
                         ).await?;
                         let ctrl = peek_control_block(slot.bytes())
                             .map_err(|e| e.to_string())?;
@@ -1668,13 +1647,13 @@ fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
     }
 }
 
-fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]) -> Batch {
+fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128]) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let mut batch = Batch::with_schema(*schema, lo_list.len());
+    let mut batch = Batch::with_schema(*schema, keys.len());
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
-    for k in 0..lo_list.len() {
+    for &key in keys {
         batch.ensure_row_capacity();
-        batch.extend_pk(crate::util::make_pk(lo_list[k], hi_list[k]));
+        batch.extend_pk(key);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         for c in 0..npc {

@@ -699,18 +699,18 @@ mod tests {
     fn test_repartition_batch_u128_pk() {
         let schema = make_schema_u128_i64();
         let num_workers = 4;
-        let pk_pairs: &[(u64, u64)] = &[
-            (0, 1),
-            (0xDEAD_BEEF, 0xCAFE_BABE),
-            (u64::MAX, u64::MAX),
-            (42, 7),
+        let pks: &[u128] = &[
+            (1u128 << 64) | 0,
+            (0xCAFE_BABEu128 << 64) | 0xDEAD_BEEF,
+            u128::MAX,
+            (7u128 << 64) | 42,
         ];
 
-        let n = pk_pairs.len();
+        let n = pks.len();
         let mut b = Batch::with_schema(schema, n);
 
-        for &(lo, hi) in pk_pairs {
-            b.extend_pk(crate::util::make_pk(lo, hi));
+        for &pk in pks {
+            b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &0i64.to_le_bytes());
@@ -720,15 +720,15 @@ mod tests {
         let sub_batches = op_repartition_batch(&b, &[0u32], &schema, num_workers);
         assert_eq!(total_rows(&sub_batches), n);
 
-        for &(lo, hi) in pk_pairs {
+        for &pk in pks {
             let expected = worker_for_partition(
-                partition_for_key(crate::util::make_pk(lo, hi)),
+                partition_for_key(pk),
                 num_workers,
             );
             let found = (0..sub_batches[expected].count).any(|r| {
-                sub_batches[expected].get_pk(r) == crate::util::make_pk(lo, hi)
+                sub_batches[expected].get_pk(r) == pk
             });
-            assert!(found, "pk=({lo},{hi}) not in worker {expected}");
+            assert!(found, "pk={pk} not in worker {expected}");
         }
     }
 

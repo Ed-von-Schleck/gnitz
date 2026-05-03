@@ -407,7 +407,7 @@ mod tests {
 
         let cursor = pt.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo(), 10);
+        assert_eq!(cursor.cursor.current_key as u64, 10);
     }
 
     #[test]

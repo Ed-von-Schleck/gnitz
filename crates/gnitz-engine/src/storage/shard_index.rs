@@ -9,7 +9,6 @@ use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::manifest::{self, ManifestEntryRaw, PreparedManifest};
 use super::shard_reader::MappedShard;
-use crate::util::{make_pk, split_pk};
 
 /// A shard that has been written and mmap'd at its `.tmp` path but not yet
 /// inserted into the index. Held by `Table::flush_prepare` until the worker
@@ -264,18 +263,12 @@ impl ShardIndex {
     ) -> ManifestEntryRaw {
         let mut raw = ManifestEntryRaw::zeroed();
         raw.table_id = self.table_id as u64;
-        let (min_lo, min_hi) = split_pk(e.pk_min);
-        let (max_lo, max_hi) = split_pk(e.pk_max);
-        raw.pk_min_lo = min_lo;
-        raw.pk_min_hi = min_hi;
-        raw.pk_max_lo = max_lo;
-        raw.pk_max_hi = max_hi;
+        raw.pk_min = e.pk_min;
+        raw.pk_max = e.pk_max;
         raw.min_lsn = e.min_lsn;
         raw.max_lsn = e.max_lsn;
         raw.level = level;
-        let (gk_lo, gk_hi) = split_pk(gk);
-        raw.guard_key_lo = gk_lo;
-        raw.guard_key_hi = gk_hi;
+        raw.guard_key = gk;
         let name_bytes = e.filename.as_bytes();
         let len = name_bytes.len().min(127);
         raw.filename[..len].copy_from_slice(&name_bytes[..len]);
@@ -311,7 +304,7 @@ impl ShardIndex {
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
                 level
-                    .get_or_create_guard(make_pk(raw.guard_key_lo, raw.guard_key_hi))
+                    .get_or_create_guard(raw.guard_key)
                     .entries
                     .push(entry);
             }
@@ -963,28 +956,28 @@ mod tests {
         }
 
         // Range entirely within guard 0
-        let r = level.find_guards_for_range(make_pk(10, 0), make_pk(50, 0));
+        let r = level.find_guards_for_range(10, 50);
         assert_eq!(r, vec![0]);
 
         // Range spanning guards 1 and 2
-        let r = level.find_guards_for_range(make_pk(100, 0), make_pk(250, 0));
+        let r = level.find_guards_for_range(100, 250);
         assert_eq!(r, vec![1, 2]);
 
         // Range spanning all guards
-        let r = level.find_guards_for_range(make_pk(0, 0), make_pk(999, 0));
+        let r = level.find_guards_for_range(0, 999);
         assert_eq!(r, vec![0, 1, 2, 3]);
 
         // Point query at exact guard boundary
-        let r = level.find_guards_for_range(make_pk(200, 0), make_pk(200, 0));
+        let r = level.find_guards_for_range(200, 200);
         assert_eq!(r, vec![2]);
 
         // Range below all guards still hits guard 0 (partition_point - 1)
-        let r = level.find_guards_for_range(make_pk(0, 0), make_pk(0, 0));
+        let r = level.find_guards_for_range(0, 0);
         assert_eq!(r, vec![0]);
 
         // No guards at all
         let empty = FLSMLevel::new();
-        let r = empty.find_guards_for_range(make_pk(0, 0), make_pk(100, 0));
+        let r = empty.find_guards_for_range(0, 100);
         assert!(r.is_empty());
     }
 

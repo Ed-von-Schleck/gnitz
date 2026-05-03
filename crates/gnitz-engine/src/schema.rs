@@ -103,14 +103,14 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
-/// Promote raw column data at `offset` to (key_lo, key_hi) for index lookups.
+/// Promote raw column data at `offset` to a u128 key for index lookups.
 #[inline]
 pub(crate) fn promote_to_index_key(
     col_data: &[u8],
     offset: usize,
     col_size: usize,
     type_code_val: u8,
-) -> (u64, u64) {
+) -> u128 {
     debug_assert!(
         col_data.len() >= offset + col_size,
         "promote_to_index_key: buffer too short ({} < {})",
@@ -118,15 +118,13 @@ pub(crate) fn promote_to_index_key(
     );
     match type_code_val {
         type_code::U128 | type_code::UUID => {
-            let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
-            let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
-            (lo, hi)
+            u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
         }
         _ => {
             let mut bytes = [0u8; 8];
             let copy_len = col_size.min(8);
             bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
-            (u64::from_le_bytes(bytes), 0)
+            u64::from_le_bytes(bytes) as u128
         }
     }
 }

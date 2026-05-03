@@ -842,11 +842,11 @@ impl CatalogEngine {
         let schema = seq_tab_schema();
         let mut bb = BatchBuilder::new(schema);
         // Retract old
-        bb.begin_row(seq_id as u64, 0, -1);
+        bb.begin_row(seq_id as u128, -1);
         bb.put_u64(old_val as u64);
         bb.end_row();
         // Insert new
-        bb.begin_row(seq_id as u64, 0, 1);
+        bb.begin_row(seq_id as u128, 1);
         bb.put_u64(new_val as u64);
         bb.end_row();
         let batch = bb.finish();

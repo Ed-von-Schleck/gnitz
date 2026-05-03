@@ -502,11 +502,6 @@ impl ReadCursor {
         self.entries.iter().map(|e| e.count.saturating_sub(e.position)).sum()
     }
 
-    #[inline]
-    pub fn current_key_lo(&self) -> u64 { self.current_key as u64 }
-    #[inline]
-    pub fn current_key_hi(&self) -> u64 { (self.current_key >> 64) as u64 }
-
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     ///
     /// Returns null for the PK column — use `current_key` instead.
@@ -895,11 +890,11 @@ mod tests {
     /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
     /// inputs and have at most one row per (PK, payload), so we mark the
     /// batch as sorted+consolidated.
-    fn make_batch(rows: &[(u64, u64, i64, i64)]) -> Rc<Batch> {
+    fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
         let schema = make_schema_i64();
         let mut b = Batch::with_schema(schema, rows.len().max(1));
-        for &(lo, hi, w, val) in rows {
-            b.extend_pk(crate::util::make_pk(lo, hi));
+        for &(pk, w, val) in rows {
+            b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -934,7 +929,7 @@ mod tests {
     #[test]
     fn test_single_batch_scan() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
+        let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
         let rows = scan_all(&mut cursor);
@@ -947,8 +942,8 @@ mod tests {
     #[test]
     fn test_two_batch_merge() {
         let schema = make_schema_i64();
-        let b1 = make_batch(&[(1, 0, 1, 10), (3, 0, 1, 30)]);
-        let b2 = make_batch(&[(2, 0, 1, 20), (4, 0, 1, 40)]);
+        let b1 = make_batch(&[(1, 1, 10), (3, 1, 30)]);
+        let b2 = make_batch(&[(2, 1, 20), (4, 1, 40)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -966,9 +961,9 @@ mod tests {
     fn test_ghost_elimination_across_sources() {
         let schema = make_schema_i64();
         // Batch 1: pk=5 val=50 w=+1, pk=10 val=100 w=+1
-        let b1 = make_batch(&[(5, 0, 1, 50), (10, 0, 1, 100)]);
+        let b1 = make_batch(&[(5, 1, 50), (10, 1, 100)]);
         // Batch 2: pk=5 val=50 w=-1 (retraction)
-        let b2 = make_batch(&[(5, 0, -1, 50)]);
+        let b2 = make_batch(&[(5, -1, 50)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -983,7 +978,7 @@ mod tests {
     #[test]
     fn test_seek() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(1, 0, 1, 10), (5, 0, 1, 50), (10, 0, 1, 100)]);
+        let batch = make_batch(&[(1, 1, 10), (5, 1, 50), (10, 1, 100)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -1006,8 +1001,8 @@ mod tests {
     fn test_same_pk_different_payload_ordering() {
         let schema = make_schema_i64();
         // Two entries with same PK but different payloads
-        let b1 = make_batch(&[(5, 0, 1, 200)]);
-        let b2 = make_batch(&[(5, 0, 1, 100)]);
+        let b1 = make_batch(&[(5, 1, 200)]);
+        let b2 = make_batch(&[(5, 1, 100)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -1024,8 +1019,8 @@ mod tests {
     fn test_weight_accumulation_across_sources() {
         let schema = make_schema_i64();
         // Same (PK, payload) in two batches: weights should sum
-        let b1 = make_batch(&[(5, 0, 3, 50)]);
-        let b2 = make_batch(&[(5, 0, 7, 50)]);
+        let b1 = make_batch(&[(5, 3, 50)]);
+        let b2 = make_batch(&[(5, 7, 50)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -1039,7 +1034,7 @@ mod tests {
     #[test]
     fn test_drain_single_source_full() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
+        let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -1055,7 +1050,7 @@ mod tests {
     #[test]
     fn test_drain_single_source_with_limit() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30), (4, 0, 1, 40)]);
+        let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
 
@@ -1077,8 +1072,8 @@ mod tests {
     #[test]
     fn test_drain_multi_source_returns_none() {
         let schema = make_schema_i64();
-        let b1 = make_batch(&[(1, 0, 1, 10)]);
-        let b2 = make_batch(&[(2, 0, 1, 20)]);
+        let b1 = make_batch(&[(1, 1, 10)]);
+        let b2 = make_batch(&[(2, 1, 20)]);
         let entries = vec![
             ReadCursorEntry::new_batch(b1),
             ReadCursorEntry::new_batch(b2),
@@ -1090,9 +1085,9 @@ mod tests {
     #[test]
     fn test_col_ptr_pk_returns_null() {
         // PK (logical col 0, pk_index=0) must always return null — callers read
-        // the PK through current_key_lo / current_key_hi instead.
+        // the PK through current_key instead.
         let schema = make_schema_i64();
-        let batch = make_batch(&[(42, 0, 1, 99)]);
+        let batch = make_batch(&[(42, 1, 99)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let cursor = ReadCursor::new(entries, schema);
         assert!(cursor.valid);
@@ -1106,7 +1101,7 @@ mod tests {
         // Payload col at logical index 1 must return a non-null pointer with
         // the correct value.
         let schema = make_schema_i64();
-        let batch = make_batch(&[(7, 0, 1, 1234)]);
+        let batch = make_batch(&[(7, 1, 1234)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let cursor = ReadCursor::new(entries, schema);
         assert!(cursor.valid);
@@ -1128,7 +1123,7 @@ mod tests {
     #[test]
     fn test_estimated_length_reflects_remaining() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)]);
+        let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let mut cursor = ReadCursor::new(entries, schema);
         assert_eq!(cursor.estimated_length(), 3);
@@ -1141,15 +1136,13 @@ mod tests {
     }
 
     #[test]
-    fn test_current_key_helper() {
+    fn test_current_key() {
         let schema = make_schema_i64();
-        let batch = make_batch(&[(0xDEAD, 0xBEEF, 1, 0)]);
+        let expected = (0xBEEFu128 << 64) | 0xDEADu128;
+        let batch = make_batch(&[(expected, 1, 0)]);
         let entries = vec![ReadCursorEntry::new_batch(batch)];
         let cursor = ReadCursor::new(entries, schema);
         assert!(cursor.valid);
-        let expected = (0xBEEFu128 << 64) | 0xDEADu128;
         assert_eq!(cursor.current_key, expected);
-        assert_eq!(cursor.current_key_lo(), 0xDEAD);
-        assert_eq!(cursor.current_key_hi(), 0xBEEF);
     }
 }

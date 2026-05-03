@@ -224,14 +224,14 @@ fn load_nodes(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> Vec
         None => return result,
     };
     let end_hi = view_id + 1;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
-            let node_id = ch.cursor.current_key_lo() as i32;
+            let node_id = ch.cursor.current_key as u64 as i32;
             let opcode = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE, schema) as i32;
             result.push(Node { id: node_id, opcode });
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }
@@ -246,16 +246,16 @@ fn load_edges(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> Vec
         None => return result,
     };
     let end_hi = view_id + 1;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
-            let edge_id = ch.cursor.current_key_lo() as i32;
+            let edge_id = ch.cursor.current_key as u64 as i32;
             let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC, schema) as i32;
             let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST, schema) as i32;
             let port = cursor_read_i64(&ch.cursor, EDGES_COL_PORT, schema) as i32;
             result.push(Edge { _id: edge_id, src, dst, port });
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }
@@ -270,14 +270,14 @@ fn load_sources(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> H
         None => return result,
     };
     let end_hi = view_id + 1;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
-            let node_id = ch.cursor.current_key_lo() as i32;
+            let node_id = ch.cursor.current_key as u64 as i32;
             let table_id = cursor_read_i64(&ch.cursor, SOURCES_COL_TABLE_ID, schema);
             result.insert(node_id, table_id);
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }
@@ -298,9 +298,9 @@ fn load_params(
         None => return (int_params, str_params),
     };
     let end_hi = view_id + 1;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
-            let lo64 = ch.cursor.current_key_lo();
+            let lo64 = ch.cursor.current_key as u64;
             let node_id = (lo64 >> 8) as i32;
             let slot = (lo64 & 0xFF) as i32;
             let value = cursor_read_i64(&ch.cursor, PARAMS_COL_VALUE, schema);
@@ -314,7 +314,7 @@ fn load_params(
             }
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }
@@ -329,15 +329,15 @@ fn load_group_cols(table: *mut Table, view_id: u64, _schema: &SchemaDescriptor) 
         None => return result,
     };
     let end_hi = view_id + 1;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
-            let lo64 = ch.cursor.current_key_lo();
+            let lo64 = ch.cursor.current_key as u64;
             let node_id = (lo64 >> 16) as i32;
             let col_idx = (lo64 & 0xFFFF) as i32;
             result.entry(node_id).or_default().push(col_idx);
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }
@@ -441,7 +441,7 @@ fn resolve_primary_input_schema(
     };
     let end_hi = view_id + 1;
     let mut any_dep_schema: Option<SchemaDescriptor> = None;
-    while ch.cursor.valid && ch.cursor.current_key_hi() == view_id {
+    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
         if ch.cursor.current_weight > 0 {
             let dep_tid = cursor_read_i64(&ch.cursor, DEP_COL_DEP_TABLE_ID, dep_schema);
             if dep_tid > 0 {
@@ -456,7 +456,7 @@ fn resolve_primary_input_schema(
             }
         }
         ch.cursor.advance();
-        if ch.cursor.valid && ch.cursor.current_key_hi() >= end_hi {
+        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
             break;
         }
     }

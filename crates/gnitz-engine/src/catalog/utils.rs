@@ -26,9 +26,9 @@ impl BatchBuilder {
     }
 
     /// Begin a new row with the given PK and weight.
-    pub(crate) fn begin_row(&mut self, pk_lo: u64, pk_hi: u64, weight: i64) {
+    pub(crate) fn begin_row(&mut self, pk: u128, weight: i64) {
         self.batch.ensure_row_capacity();
-        self.batch.extend_pk(crate::util::make_pk(pk_lo, pk_hi));
+        self.batch.extend_pk(pk);
         self.batch.extend_weight(&weight.to_le_bytes());
         self.curr_null_word = 0;
         self.curr_col = 0;
@@ -47,12 +47,9 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
-    /// Put a u128 value (lo, hi) for the current payload column.
-    pub(crate) fn put_u128(&mut self, lo: u64, hi: u64) {
-        let mut buf = [0u8; 16];
-        buf[0..8].copy_from_slice(&lo.to_le_bytes());
-        buf[8..16].copy_from_slice(&hi.to_le_bytes());
-        self.batch.extend_col(self.curr_col, &buf);
+    /// Put a u128 value for the current payload column.
+    pub(crate) fn put_u128(&mut self, val: u128) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
@@ -243,7 +240,7 @@ pub(crate) fn collect_for_schema(
             if c.cursor.current_weight > 0 {
                 let row_sid = cursor_read_u64(&c, schema_col) as i64;
                 if row_sid == sid {
-                    let eid = c.cursor.current_key_lo() as i64;
+                    let eid = c.cursor.current_key as u64 as i64;
                     if let Some((sn, en)) = id_to_qualified.get(&eid) {
                         result.push(format!("{}.{}", sn, en));
                     }
@@ -294,16 +291,15 @@ pub(crate) fn copy_cursor_row_with_weight(
 
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
-pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> Batch {
+pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
         Err(_) => return batch,
     };
-    cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
+    cursor.cursor.seek(pk);
     if cursor.cursor.valid
-        && cursor.cursor.current_key_lo() == pk_lo
-        && cursor.cursor.current_key_hi() == pk_hi
+        && cursor.cursor.current_key == pk
         && cursor.cursor.current_weight > 0
     {
         copy_cursor_row_with_weight(&cursor, &mut batch, -1);
@@ -311,38 +307,36 @@ pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
     batch
 }
 
-/// Scan `[pk_lo_start, pk_lo_end)` on `pk_hi == 0` and emit a weight=-1 batch
-/// of every positive-weight row in the range. Used for U64-PK system tables
-/// where rows belonging to one owner share a packed PK prefix (e.g.
-/// `sys_columns` keyed by `pack_column_id(owner, col)`).
-pub(crate) fn retract_rows_by_pk_lo_range(
+/// Scan `[start, pk_end)` and emit a weight=-1 batch of every positive-weight
+/// row in the range. Used for U64-PK system tables where rows belonging to one
+/// owner share a packed PK prefix (e.g. `sys_columns` keyed by
+/// `pack_column_id(owner, col)`).
+pub(crate) fn retract_rows_in_pk_range(
     table: &mut Table,
     schema: &SchemaDescriptor,
-    pk_lo_start: u64,
-    pk_lo_end: u64,
+    start: u128,
+    pk_end: u128,
 ) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = match table.create_cursor() {
         Ok(c) => c,
         Err(_) => return batch,
     };
-    cursor.cursor.seek(crate::util::make_pk(pk_lo_start, 0));
+    cursor.cursor.seek(start);
 
     // Bulk path: single consolidated MemBatch source.
-    if let Some((src, start)) = cursor.cursor.single_mem_batch() {
-        let mut end = start;
-        while end < src.count
-            && (src.get_pk(end) as u64) < pk_lo_end
-        {
+    if let Some((src, start_idx)) = cursor.cursor.single_mem_batch() {
+        let mut end = start_idx;
+        while end < src.count && src.get_pk(end) < pk_end {
             end += 1;
         }
-        batch.append_mem_batch_range(&src, start, end, Some(-1));
+        batch.append_mem_batch_range(&src, start_idx, end, Some(-1));
         return batch;
     }
 
     // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid {
-        if cursor.cursor.current_key_lo() >= pk_lo_end { break; }
+        if cursor.cursor.current_key >= pk_end { break; }
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }
@@ -377,7 +371,7 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
     }
 
     // Row-at-a-time fallback for multi-source cursors.
-    while cursor.cursor.valid && cursor.cursor.current_key_hi() == pk_hi {
+    while cursor.cursor.valid && (cursor.cursor.current_key >> 64) as u64 == pk_hi {
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         }

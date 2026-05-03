@@ -809,7 +809,7 @@ mod tests {
 
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo(), 10);
+        assert_eq!(cursor.cursor.current_key as u64, 10);
         // Don't need to iterate further — cursor creation works
     }
 
@@ -916,7 +916,7 @@ mod tests {
         // Cursor must yield rows in ascending PK order
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo(), 10, "cursor should start at PK=10 (smallest)");
+        assert_eq!(cursor.cursor.current_key as u64, 10, "cursor should start at PK=10 (smallest)");
     }
 
     /// `ingest_owned_batch` must pre-flush when the memtable is already
@@ -951,7 +951,7 @@ mod tests {
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo(), 1, "cursor should start at PK=1 from flushed shard");
+        assert_eq!(cursor.cursor.current_key as u64, 1, "cursor should start at PK=1 from flushed shard");
     }
 
     /// Two ingest calls that cumulatively cross the 75% threshold must produce
