@@ -144,14 +144,14 @@ impl Table {
 
         let consolidated = batch.into_consolidated(&self.schema);
         if self.memtable.should_flush() {
-            self.flush_inner(durable)?;
+            self.flush_inner(durable, true)?;
         }
         // The should_flush() pre-check above ensures runs_bytes is either 0
         // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
         // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
         self.memtable.upsert_sorted_batch(consolidated)?;
         if self.memtable.should_flush() {
-            self.flush_inner(durable)?;
+            self.flush_inner(durable, true)?;
         }
         Ok(())
     }
@@ -162,7 +162,7 @@ impl Table {
 
     /// Flush memtable to shard.  Persistent tables also update manifest.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(self.durable)
+        self.flush_inner(self.durable, true)
     }
 
     /// Flush with durable shard naming and manifest update, regardless of
@@ -170,10 +170,26 @@ impl Table {
     /// provides durability) but still need manifest-tracked shards so
     /// the data survives restart.
     pub fn flush_durable(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(true)
+        self.flush_inner(true, true)
     }
 
-    fn flush_inner(&mut self, durable: bool) -> Result<bool, StorageError> {
+    /// Flush without issuing fsync(dirfd). Returns the dirfd to sync when Some.
+    /// Caller is responsible for fsync-ing the returned fd before acknowledging
+    /// durability (e.g. at the end of flush_all).
+    pub fn flush_deferred(&mut self) -> Result<Option<libc::c_int>, StorageError> {
+        // Capture before flush_inner because flush_inner resets the memtable.
+        // A non-empty durable flush always touches the directory (unlinkat + publish_manifest),
+        // even when wrote == false.
+        let needs_dir_sync = !self.memtable.is_empty() && self.durable;
+        self.flush_inner(self.durable, false)?;
+        if needs_dir_sync {
+            Ok(Some(self.dirfd))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn flush_inner(&mut self, durable: bool, sync_dir: bool) -> Result<bool, StorageError> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
             return Ok(false);
@@ -209,8 +225,10 @@ impl Table {
             if let Some(ref path) = self.manifest_path {
                 self.shard_index.publish_manifest(path)?;
             }
-            if unsafe { libc::fsync(self.dirfd) } < 0 {
-                return Err(StorageError::Io);
+            if sync_dir {
+                if unsafe { libc::fsync(self.dirfd) } < 0 {
+                    return Err(StorageError::Io);
+                }
             }
         }
 

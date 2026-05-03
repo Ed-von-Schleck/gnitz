@@ -1005,6 +1005,32 @@ impl DagEngine {
         0
     }
 
+    pub fn flush_deferred(&mut self, table_id: i64) -> Result<Vec<libc::c_int>, String> {
+        let entry = match self.tables.get_mut(&table_id) {
+            Some(e) => e,
+            None => return Ok(vec![]),
+        };
+        let mut dirfds: Vec<libc::c_int> = match &mut entry.handle {
+            StoreHandle::Single(t) => t.flush_deferred()
+                .map(|opt| opt.into_iter().collect())
+                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }
+                .flush_deferred()
+                .map(|opt| opt.into_iter().collect())
+                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
+            StoreHandle::Partitioned(pt) => pt.flush_deferred()
+                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
+        };
+        for ic in &mut entry.index_circuits {
+            if let Some(fd) = ic.index_table.flush_deferred()
+                .map_err(|_| format!("index flush_deferred failed for table_id={}", table_id))?
+            {
+                dirfds.push(fd);
+            }
+        }
+        Ok(dirfds)
+    }
+
     // ── DAG traversal helpers ───────────────────────────────────────────
 
     /// Seed the initial pending list for a DAG traversal.

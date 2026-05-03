@@ -169,6 +169,14 @@ pub struct WorkerProcess {
     expected_epoch: u32,
 }
 
+/// Deduplicate a list of (dev, ino, fd) triples by (dev, ino), returning one fd per
+/// unique directory inode. Both fields are u64 to handle varying ino_t/dev_t widths.
+pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc::c_int> {
+    inodes.sort_unstable_by_key(|&(dev, ino, _)| (dev, ino));
+    inodes.dedup_by_key(|&mut (dev, ino, _)| (dev, ino));
+    inodes.into_iter().map(|(_, _, fd)| fd).collect()
+}
+
 fn filter_by_pk(
     batch: &Option<Batch>,
     schema: SchemaDescriptor,
@@ -880,10 +888,25 @@ impl WorkerProcess {
     fn handle_flush_all(&mut self) -> Result<(), String> {
         self.pending_deltas.clear();
         let ids = self.cat().iter_user_table_ids();
+        let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
         for tid in ids {
-            self.cat()
-                .flush_family(tid)
+            let dirfds = self.cat()
+                .flush_family_deferred(tid)
                 .map_err(|e| format!("flush_family tid={} rc={}", tid, e))?;
+            for fd in dirfds {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!("fstat failed during directory deduplication: {}", err));
+                }
+                dir_inodes.push((stat.st_dev as u64, stat.st_ino as u64, fd));
+            }
+        }
+        for fd in dedup_dirfds(dir_inodes) {
+            if unsafe { libc::fsync(fd) } < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!("dir fsync failed: {}", err));
+            }
         }
         Ok(())
     }
@@ -1016,6 +1039,37 @@ enum DispatchResult {
 mod tests {
     use super::*;
     use crate::schema::SchemaDescriptor;
+
+    #[test]
+    fn test_dedup_dirfds_removes_duplicates() {
+        // Same (dev, ino) keeps only the first fd encountered after sort.
+        let inodes = vec![
+            (1u64, 10u64, 3i32),
+            (1u64, 10u64, 7i32),  // duplicate of (1,10)
+            (1u64, 20u64, 5i32),
+            (2u64, 10u64, 9i32),  // same ino, different dev — not a duplicate
+        ];
+        let mut result = dedup_dirfds(inodes);
+        result.sort_unstable();
+        assert_eq!(result.len(), 3, "one fd per unique (dev, ino)");
+        // No duplicate fds for (1, 10)
+        assert!(result.contains(&3i32) || result.contains(&7i32));
+        assert!(result.contains(&5i32));
+        assert!(result.contains(&9i32));
+    }
+
+    #[test]
+    fn test_dedup_dirfds_empty() {
+        assert_eq!(dedup_dirfds(vec![]), Vec::<libc::c_int>::new());
+    }
+
+    #[test]
+    fn test_dedup_dirfds_all_unique() {
+        let inodes = vec![(1u64, 1u64, 10i32), (1u64, 2u64, 20i32), (2u64, 1u64, 30i32)];
+        let mut result = dedup_dirfds(inodes);
+        result.sort_unstable();
+        assert_eq!(result, vec![10i32, 20i32, 30i32]);
+    }
 
     fn test_schema() -> SchemaDescriptor {
         use crate::schema::{SchemaColumn, type_code};

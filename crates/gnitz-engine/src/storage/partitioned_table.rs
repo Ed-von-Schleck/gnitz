@@ -212,6 +212,16 @@ impl PartitionedTable {
         Ok(any_wrote)
     }
 
+    pub fn flush_deferred(&mut self) -> Result<Vec<libc::c_int>, StorageError> {
+        let mut dirfds = Vec::new();
+        for table in &mut self.tables {
+            if let Some(fd) = table.flush_deferred()? {
+                dirfds.push(fd);
+            }
+        }
+        Ok(dirfds)
+    }
+
     pub fn current_lsn(&self) -> u64 {
         self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
     }

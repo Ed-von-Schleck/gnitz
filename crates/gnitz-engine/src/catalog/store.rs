@@ -318,6 +318,19 @@ impl CatalogEngine {
         }
     }
 
+    /// Like flush_family but defers the dir fsync to the caller.
+    /// System tables use the regular flush (inline fsync retained).
+    pub fn flush_family_deferred(&mut self, table_id: i64) -> Result<Vec<libc::c_int>, String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            if let Some(table) = self.sys_table_mut(table_id) {
+                table.flush().map_err(|e| format!("flush error: {}", e))?;
+            }
+            Ok(vec![])
+        } else {
+            self.dag.flush_deferred(table_id)
+        }
+    }
+
     /// Worker DDL sync: memonly ingest into system table + fire hooks.
     /// Workers receive DDL deltas from master and need to update their registry
     /// without writing to WAL (master owns durability).
