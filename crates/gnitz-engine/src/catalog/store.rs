@@ -614,11 +614,7 @@ impl CatalogEngine {
             Some(e) => e,
             None => return 0,
         };
-        match &entry.handle {
-            StoreHandle::Single(ref t) => t.current_lsn,
-            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
-            StoreHandle::Partitioned(ref pt) => pt.current_lsn(),
-        }
+        entry.handle.current_lsn()
     }
 
     /// Read `current_lsn` from a system table by id. Returns 0 for unknown
@@ -670,12 +666,7 @@ impl CatalogEngine {
             max_lsn = max_lsn.max(self.sys_table_current_lsn(tid));
         }
         for entry in self.dag.tables.values() {
-            let l = match &entry.handle {
-                StoreHandle::Single(t) => t.current_lsn,
-                StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
-                StoreHandle::Partitioned(pt) => pt.current_lsn(),
-            };
-            max_lsn = max_lsn.max(l);
+            max_lsn = max_lsn.max(entry.handle.current_lsn());
         }
         max_lsn
     }

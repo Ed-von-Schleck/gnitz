@@ -94,30 +94,20 @@ impl StoreHandle {
 
     /// Dispatched `has_pk` that works for every variant.
     pub fn has_pk(&self, key: u128) -> bool {
+        let tptr = self.table_ptr();
         unsafe {
-            match self {
-                StoreHandle::Single(t) => {
-                    (*(std::ptr::addr_of!(**t) as *mut Table)).has_pk(key)
-                }
-                StoreHandle::Borrowed(ptr) => (**ptr).has_pk(key),
-                StoreHandle::Partitioned(pt) => {
-                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable)).has_pk(key)
-                }
-            }
+            if !tptr.is_null() { (*tptr).has_pk(key) } else { (*self.ptable_ptr()).has_pk(key) }
         }
     }
 
     /// Dispatched `create_cursor` across all variants.
     pub fn create_cursor(&self) -> Result<CursorHandle, StorageError> {
+        let tptr = self.table_ptr();
         unsafe {
-            match self {
-                StoreHandle::Single(t) => {
-                    (*(std::ptr::addr_of!(**t) as *mut Table)).create_cursor()
-                }
-                StoreHandle::Borrowed(ptr) => (**ptr).create_cursor(),
-                StoreHandle::Partitioned(pt) => {
-                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable)).create_cursor()
-                }
+            if !tptr.is_null() {
+                (*tptr).create_cursor()
+            } else {
+                (*self.ptable_ptr()).create_cursor()
             }
         }
     }
@@ -127,17 +117,43 @@ impl StoreHandle {
     /// storage layer (zero-copy for single-partition stores; one
     /// MemBatch-borrowed scatter for multi-partition).
     pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
+        let tptr = self.table_ptr();
         unsafe {
-            match self {
-                StoreHandle::Single(t) => {
-                    (*(std::ptr::addr_of!(**t) as *mut Table)).ingest_owned_batch(batch)
-                }
-                StoreHandle::Borrowed(ptr) => (**ptr).ingest_owned_batch(batch),
-                StoreHandle::Partitioned(pt) => {
-                    (*(std::ptr::addr_of!(**pt) as *mut PartitionedTable))
-                        .ingest_owned_batch(batch)
-                }
+            if !tptr.is_null() {
+                (*tptr).ingest_owned_batch(batch)
+            } else {
+                (*self.ptable_ptr()).ingest_owned_batch(batch)
             }
+        }
+    }
+
+    /// Dispatched flush across all variants.
+    pub fn flush(&mut self) -> Result<bool, StorageError> {
+        match self {
+            StoreHandle::Single(t) => t.flush(),
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
+            StoreHandle::Partitioned(pt) => pt.flush(),
+        }
+    }
+
+    /// Dispatched flush_deferred across all variants. Returns dirfds to fsync
+    /// (0 or 1 for Table variants, 0..N for Partitioned).
+    pub fn flush_deferred(&mut self) -> Result<Vec<libc::c_int>, StorageError> {
+        match self {
+            StoreHandle::Single(t) => t.flush_deferred().map(|opt| opt.into_iter().collect()),
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }
+                .flush_deferred()
+                .map(|opt| opt.into_iter().collect()),
+            StoreHandle::Partitioned(pt) => pt.flush_deferred(),
+        }
+    }
+
+    /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).
+    pub fn current_lsn(&self) -> u64 {
+        match self {
+            StoreHandle::Single(t) => t.current_lsn,
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+            StoreHandle::Partitioned(pt) => pt.current_lsn(),
         }
     }
 }
@@ -989,12 +1005,7 @@ impl DagEngine {
             Some(e) => e,
             None => return -1,
         };
-        let result = match &mut entry.handle {
-            StoreHandle::Single(t) => t.flush().map(|_| ()),
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush().map(|_| ()),
-            StoreHandle::Partitioned(pt) => pt.flush().map(|_| ()),
-        };
-        if result.is_err() {
+        if entry.handle.flush().is_err() {
             return -1;
         }
         for ic in &mut entry.index_circuits {
@@ -1010,17 +1021,8 @@ impl DagEngine {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        let mut dirfds: Vec<libc::c_int> = match &mut entry.handle {
-            StoreHandle::Single(t) => t.flush_deferred()
-                .map(|opt| opt.into_iter().collect())
-                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }
-                .flush_deferred()
-                .map(|opt| opt.into_iter().collect())
-                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
-            StoreHandle::Partitioned(pt) => pt.flush_deferred()
-                .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?,
-        };
+        let mut dirfds = entry.handle.flush_deferred()
+            .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?;
         for ic in &mut entry.index_circuits {
             if let Some(fd) = ic.index_table.flush_deferred()
                 .map_err(|_| format!("index flush_deferred failed for table_id={}", table_id))?
