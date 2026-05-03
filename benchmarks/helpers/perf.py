@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -10,8 +11,24 @@ import subprocess
 from pathlib import Path
 
 
+def get_child_pids(parent_pid: int) -> list[int]:
+    """Return PIDs of direct children of parent_pid via ps."""
+    try:
+        result = subprocess.run(
+            ["ps", "--ppid", str(parent_pid), "-o", "pid="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return [int(p.strip()) for p in result.stdout.splitlines() if p.strip()]
+    except Exception:
+        return []
+
+
 class PerfRecorder:
-    """perf record -F 99 -g -p <pid> -o <output_dir>/perf.data
+    """perf record -F 99 -g -p <master>,<worker>... -o <output_dir>/perf.data
+
+    Profiles the master process and all its direct children (gnitz workers).
+    Worker PIDs are discovered via ps at start() time; a pids.json is written
+    alongside perf.data so report.py can split master vs worker sections.
 
     If dwarf=True, uses --call-graph=dwarf for full userspace stack unwinding
     (larger perf.data, but resolves callers through libc and inlined frames).
@@ -25,11 +42,22 @@ class PerfRecorder:
 
     def start(self) -> None:
         perf_data = self._output_dir / "perf.data"
+
+        worker_pids = get_child_pids(self._pid)
+        all_pids = [self._pid] + worker_pids
+        with open(self._output_dir / "pids.json", "w") as f:
+            json.dump({"master": self._pid, "workers": worker_pids}, f)
+        if worker_pids:
+            print(f"[perf] Profiling master={self._pid} + workers={worker_pids}")
+        else:
+            print(f"[perf] No worker children found; profiling master={self._pid} only")
+
+        pid_str = ",".join(str(p) for p in all_pids)
         callgraph = ["--call-graph", "dwarf,65528"] if self._dwarf else ["-g"]
         try:
             self._proc = subprocess.Popen(
                 ["perf", "record", "-F", "99", *callgraph, "-k", "1", "-e", "cycles",
-                 "-p", str(self._pid), "-o", str(perf_data)],
+                 "-p", pid_str, "-o", str(perf_data)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

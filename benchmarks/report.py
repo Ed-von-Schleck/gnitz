@@ -47,7 +47,7 @@ GROUPS = [
     ),
     (
         "Read paths",
-        lambda b: b["name"] in ("test_full_scan", "test_pk_seek", "test_index_seek"),
+        lambda b: b["name"] in ("test_full_scan", "test_pk_seek", "test_index_seek", "test_limit"),
     ),
     (
         "Point DML",
@@ -92,23 +92,16 @@ _PERF_LINE = re.compile(
 )
 
 
-def parse_perf(perf_data: Path, top_n: int = 20) -> list[dict]:
-    """Run perf report and return the top N self-overhead entries."""
+def parse_perf(perf_data: Path, top_n: int = 20, pid: str | None = None) -> list[dict]:
+    """Run perf report and return the top N self-overhead entries.
+
+    If pid is given (comma-separated string), filters samples to those PIDs.
+    """
+    cmd = ["perf", "report", "--input", str(perf_data), "--stdio", "--no-children", "-n"]
+    if pid:
+        cmd += ["--pid", pid]
     try:
-        result = subprocess.run(
-            [
-                "perf",
-                "report",
-                "--input",
-                str(perf_data),
-                "--stdio",
-                "--no-children",
-                "-n",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
@@ -124,6 +117,26 @@ def parse_perf(perf_data: Path, top_n: int = 20) -> list[dict]:
             break
 
     return entries
+
+
+def _emit_perf_tables(perf_data: Path, top_n: int, label: str,
+                      pid: str | None = None, file=None) -> None:
+    entries = parse_perf(perf_data, top_n=top_n * 2, pid=pid)
+    if not entries:
+        return
+    prefix = f"{label} " if label else ""
+    for kind_label, kind_key in (("Userspace", "userspace"), ("Kernel", "kernel")):
+        subset = [e for e in entries if e["kind"] == kind_key][:top_n]
+        if not subset:
+            continue
+        rows = [(f"{e['pct']:.2f}%", e["symbol"], e["dso"]) for e in subset]
+        print_table(
+            f"Hot functions — {prefix}{kind_label}",
+            ["%", "symbol", "dso"],
+            rows,
+            right_cols={0},
+            file=file,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -209,23 +222,25 @@ def report_throughput(benchmarks: list[dict], file=None):
 
 
 def report_perf(perf_data: Path, top_n: int = 15, file=None):
-    entries = parse_perf(perf_data, top_n=top_n * 2)
-    if not entries:
+    if not perf_data.exists():
         print("\n(no perf.data found or perf not available)", file=file)
         return
 
-    for kind_label, kind_key in (("Userspace", "userspace"), ("Kernel", "kernel")):
-        subset = [e for e in entries if e["kind"] == kind_key][:top_n]
-        if not subset:
-            continue
-        rows = [(f"{e['pct']:.2f}%", e["symbol"], e["dso"]) for e in subset]
-        print_table(
-            f"Hot functions — {kind_label}",
-            ["%", "symbol", "dso"],
-            rows,
-            right_cols={0},
-            file=file,
-        )
+    pids_file = perf_data.parent / "pids.json"
+    if pids_file.exists():
+        with open(pids_file) as f:
+            pids = json.load(f)
+        master_pid = pids.get("master")
+        worker_pids = pids.get("workers", [])
+
+        if master_pid:
+            _emit_perf_tables(perf_data, top_n, "Master", pid=str(master_pid), file=file)
+        if worker_pids:
+            pid_str = ",".join(str(p) for p in worker_pids)
+            _emit_perf_tables(perf_data, top_n, "Workers", pid=pid_str, file=file)
+    else:
+        # Old perf.data without pids.json: report combined, no split.
+        _emit_perf_tables(perf_data, top_n, "", file=file)
 
 
 # ---------------------------------------------------------------------------
