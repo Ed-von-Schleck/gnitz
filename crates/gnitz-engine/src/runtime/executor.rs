@@ -17,7 +17,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::runtime::committer::{self, CommitRequest};
@@ -319,7 +320,10 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
             let mut timer = Box::pin(shared.reactor.timer(deadline));
             loop {
                 match select2(rx.recv(), timer.as_mut()).await {
-                    Either::A(Some(more)) => triggers.push(more),
+                    Either::A(Some(more)) => {
+                        triggers.push(more);
+                        if shared.any_threshold_crossed() { break; }
+                    }
                     Either::A(None) => return, // channel closed mid-coalesce
                     Either::B(()) => break,    // deadline elapsed
                 }
@@ -335,7 +339,7 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         let mut tids: Vec<i64> = shared.drain_tick_rows();
         let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
         if has_drain {
-            let mut seen: std::collections::HashSet<i64> = tids.iter().copied().collect();
+            let mut seen: FxHashSet<i64> = tids.iter().copied().collect();
             for t in &triggers {
                 if let TickTrigger::Drain { tids: v, .. } = t {
                     for &tid in v {
@@ -522,7 +526,6 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
     }
 
     if target_id >= FIRST_USER_TABLE_ID && (!has_batch || batch_count == 0) {
-        let _g = shared.catalog_rwlock.read().await;
         handle_scan(shared, fd, client_id, target_id).await;
         return;
     }
@@ -584,8 +587,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
-                let schema = shared.get_schema_desc(target_id);
-                send_ok_response(shared, fd, target_id, None, client_id, &schema, lsn as u128).await;
+                send_ok_response(shared, fd, target_id, None, client_id, lsn as u128).await;
             }
             Ok(Err(e)) => {
                 send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
@@ -626,10 +628,9 @@ async fn handle_seek(
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
-        let schema = shared.get_schema_desc(target_id);
         match unsafe { (*shared.catalog).seek_family(target_id, pk) } {
             Ok(batch) => send_ok_response(
-                shared, fd, target_id, batch.as_ref(), client_id, &schema, pk,
+                shared, fd, target_id, batch.as_ref(), client_id, pk,
             ).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -657,10 +658,9 @@ async fn handle_seek_by_index(
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
-        let schema = shared.get_schema_desc(target_id);
         match unsafe { (*shared.catalog).seek_by_index(target_id, col_idx, key) } {
             Ok(batch) => send_ok_response(
-                shared, fd, target_id, batch.as_ref(), client_id, &schema, 0,
+                shared, fd, target_id, batch.as_ref(), client_id, 0,
             ).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -670,15 +670,15 @@ async fn handle_seek_by_index(
 async fn handle_scan(
     shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i64,
 ) {
-    if !shared.cat().has_id(target_id) {
-        let msg = format!("table {} not found", target_id);
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
-        return;
-    }
     // Drain pending ticks before reading: views derive from source-table
     // pushes through the DAG (IV.2). Loop until `tick_rows` is empty —
     // a push landing during the tick may add more rows; the outer
     // is_empty() re-check closes the race.
+    // The catalog lock is intentionally acquired AFTER the drain: the drain
+    // parks at rx.await, and AsyncRwLock is writer-preferring. Holding a
+    // read lock here while parked would block concurrent DDL writers and
+    // prevent tick_loop_async from acquiring its own read lock, causing a
+    // three-way deadlock (BF-1).
     loop {
         let snapshot: Vec<i64> = {
             let tids = shared.tick_tids.borrow();
@@ -691,6 +691,12 @@ async fn handle_scan(
             done: tx,
         });
         let _ = rx.await;
+    }
+    let _g = shared.catalog_rwlock.read().await;
+    if !shared.cat().has_id(target_id) {
+        let msg = format!("table {} not found", target_id);
+        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        return;
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
@@ -710,19 +716,8 @@ async fn handle_scan(
     }
 }
 
-fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> Vec<u8> {
-    let sz = ipc::wire_size(STATUS_OK, b"", None, None, None, None);
-    let total = 4 + sz;
-    let mut buf = vec![0u8; total];
-    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    ipc::encode_wire_into(
-        &mut buf[4..total], 0,
-        target_id as u64, client_id, 0,
-        lsn as u128, 0, 0,
-        STATUS_OK, b"",
-        None, None, None, None,
-    );
-    buf
+fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
+    encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128)
 }
 
 /// System-table path: catalog ingest + (optionally) DDL broadcast.
@@ -733,7 +728,6 @@ async fn handle_system_dml(
 ) {
     let batch = decoded.data_batch;
     let non_empty = batch.as_ref().map(|b| b.count > 0).unwrap_or(false);
-    let schema = shared.get_schema_desc(target_id);
 
     // Empty SCAN for system tables — no DDL, no lock needed.
     if !non_empty {
@@ -743,7 +737,7 @@ async fn handle_system_dml(
             Ok(b) => {
                 let batch_ref = if b.count > 0 { Some(b) } else { None };
                 send_ok_response(shared, fd, target_id, batch_ref.as_deref(),
-                                 client_id, &schema, shared.last_tick_lsn.get() as u128).await;
+                                 client_id, shared.last_tick_lsn.get() as u128).await;
             }
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -837,7 +831,7 @@ async fn handle_system_dml(
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
     unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
-    send_ok_response(shared, fd, target_id, None, client_id, &schema, zone_lsn as u128).await;
+    send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {
@@ -862,33 +856,38 @@ async fn handle_system_dml(
 fn encode_response_buffer(
     target_id: i64, client_id: u64,
     result: Option<&Batch>, status: u32, error_msg: &[u8],
-    schema: &SchemaDescriptor, prebuilt_schema: Option<&[u8]>,
+    prebuilt_schema: Option<&[u8]>,
     seek_pk: u128,
-) -> Vec<u8> {
-    let sz = ipc::wire_size(status, error_msg, Some(schema), None, result, prebuilt_schema);
+) -> PooledSendBuf {
+    let sz = ipc::wire_size(status, error_msg, None, None, result, prebuilt_schema);
     let total = 4 + sz;
-    let mut buf: Vec<u8> = vec![0; total];
-    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = ipc::encode_wire_into(
-        &mut buf[4..total], 0,
+    let mut inner = crate::storage::batch_pool::acquire_buf();
+    inner.reserve(total.max(8192));
+    // SAFETY: encode_wire_into_ipc writes every byte [0, sz). The 4-byte frame
+    // header is written immediately below. wal::encode zeros inter-region padding
+    // (Step 1), so no byte is left uninitialised regardless of column type.
+    unsafe { inner.set_len(total); }
+    inner[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
+    let written = ipc::encode_wire_into_ipc(
+        &mut inner[4..total], 0,
         target_id as u64, client_id,
         0, seek_pk, 0, 0,
         status, error_msg,
-        Some(schema), None, result, prebuilt_schema,
+        None, None, result, prebuilt_schema,
     );
     debug_assert_eq!(written, sz);
-    buf
+    inner.truncate(4 + written);
+    PooledSendBuf(inner)
 }
 
 async fn send_ok_response(
     shared: &Rc<Shared>, fd: i32, target_id: i64,
-    result: Option<&Batch>, client_id: u64,
-    schema: &SchemaDescriptor, seek_pk: u128,
+    result: Option<&Batch>, client_id: u64, seek_pk: u128,
 ) {
     let schema_block = shared.get_schema_wire_block(target_id);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
-        schema, Some(schema_block.as_slice()), seek_pk,
+        Some(schema_block.as_slice()), seek_pk,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -898,12 +897,11 @@ async fn send_error(
     shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64,
     error_msg: &[u8],
 ) {
-    let schema = SchemaDescriptor::minimal_u64();
     // STATUS_ERROR suppresses the schema block (has_schema = false), so
     // prebuilt_schema = None is correct and saves the cache lookup.
     let buf = encode_response_buffer(
         target_id, client_id, None, STATUS_ERROR, error_msg,
-        &schema, None, 0,
+        None, 0,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -912,18 +910,7 @@ async fn send_error(
 async fn send_alloc(
     shared: &Rc<Shared>, fd: i32, new_id: i64, client_id: u64,
 ) {
-    let sz = ipc::wire_size(STATUS_OK, b"", None, None, None, None);
-    let total = 4 + sz;
-    let mut buf: Vec<u8> = vec![0; total];
-    buf[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = ipc::encode_wire_into(
-        &mut buf[4..total], 0,
-        new_id as u64, client_id,
-        0, 0u128, 0, 0,
-        STATUS_OK, b"",
-        None, None, None, None,
-    );
-    debug_assert_eq!(written, sz);
+    let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0);
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
 }

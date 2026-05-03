@@ -81,7 +81,11 @@ pub fn encode(
     let mut positions = [0usize; 72];
     let mut pos = HEADER_SIZE + dir_size;
     for i in 0..num_regions {
-        pos = align8(pos);
+        let aligned = align8(pos);
+        if aligned > pos {
+            block[pos..aligned].fill(0);
+        }
+        pos = aligned;
         positions[i] = pos;
         let dir_off = HEADER_SIZE + i * 8;
         write_u32_le(block, dir_off, pos as u32);
@@ -95,7 +99,12 @@ pub fn encode(
     let mut i = 0;
     while i < num_regions {
         let sz = region_sizes[i] as usize;
-        if sz == 0 || region_ptrs[i].is_null() {
+        if sz == 0 {
+            i += 1;
+            continue;
+        }
+        if region_ptrs[i].is_null() {
+            block[positions[i]..positions[i] + sz].fill(0);
             i += 1;
             continue;
         }
@@ -190,7 +199,7 @@ pub fn validate_and_parse(
     for i in 0..n {
         let dir_off = HEADER_SIZE + i * 8;
         if dir_off + 8 > total_size {
-            break;
+            return Err(StorageError::Truncated);
         }
         out_region_offsets[i] = read_u32_le(block, dir_off) as u64;
         out_region_sizes[i] = read_u32_le(block, dir_off + 4);

@@ -1,53 +1,54 @@
 use super::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // ---------------------------------------------------------------------------
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
 pub(crate) struct CatalogCacheSet {
-    pub(crate) schema_by_name:   HashMap<String, i64>,
-    pub(crate) schema_by_id:     HashMap<i64, String>,
-    pub(crate) entity_by_qname:  HashMap<String, i64>,
-    pub(crate) entity_by_id:     HashMap<i64, (String, String)>,
-    pub(crate) schema_of:        HashMap<i64, i64>,
-    pub(crate) tables_by_schema: HashMap<i64, HashSet<i64>>,
-    pub(crate) views_by_schema:  HashMap<i64, HashSet<i64>>,
-    pub(crate) pk_col_of:        HashMap<i64, u32>,
-    pub(crate) col_names:        HashMap<i64, Vec<String>>,
-    pub(crate) col_names_bytes:  HashMap<i64, Rc<Vec<Vec<u8>>>>,
+    pub(crate) schema_by_name:   FxHashMap<String, i64>,
+    pub(crate) schema_by_id:     FxHashMap<i64, String>,
+    pub(crate) entity_by_qname:  FxHashMap<String, i64>,
+    pub(crate) entity_by_id:     FxHashMap<i64, (String, String)>,
+    pub(crate) schema_of:        FxHashMap<i64, i64>,
+    pub(crate) tables_by_schema: FxHashMap<i64, FxHashSet<i64>>,
+    pub(crate) views_by_schema:  FxHashMap<i64, FxHashSet<i64>>,
+    pub(crate) pk_col_of:        FxHashMap<i64, u32>,
+    pub(crate) col_names:        FxHashMap<i64, Vec<String>>,
+    pub(crate) col_names_bytes:  FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
     /// Cached encoded schema wire block per table. Built from
     /// (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
     /// Invalidated alongside col_names when DDL modifies the table schema.
-    pub(crate) schema_wire_block: HashMap<i64, Rc<Vec<u8>>>,
-    pub(crate) index_by_name:    HashMap<String, i64>,
-    pub(crate) index_by_id:      HashMap<i64, String>,
-    pub(crate) indices_by_owner: HashMap<i64, Vec<i64>>,
-    pub(crate) fk_by_child:      HashMap<i64, Vec<FkConstraint>>,
-    pub(crate) fk_by_parent:     HashMap<i64, Vec<(i64, usize)>>,
-    pub(crate) needs_lock:       HashSet<i64>,
+    pub(crate) schema_wire_block: FxHashMap<i64, Rc<Vec<u8>>>,
+    pub(crate) index_by_name:    FxHashMap<String, i64>,
+    pub(crate) index_by_id:      FxHashMap<i64, String>,
+    pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
+    pub(crate) fk_by_child:      FxHashMap<i64, Vec<FkConstraint>>,
+    pub(crate) fk_by_parent:     FxHashMap<i64, Vec<(i64, usize)>>,
+    pub(crate) needs_lock:       FxHashSet<i64>,
     pub(crate) cascade_enabled:  bool,
 }
 
 impl CatalogCacheSet {
     pub(crate) fn new() -> Self {
         CatalogCacheSet {
-            schema_by_name:    HashMap::new(),
-            schema_by_id:      HashMap::new(),
-            entity_by_qname:   HashMap::new(),
-            entity_by_id:      HashMap::new(),
-            schema_of:         HashMap::new(),
-            tables_by_schema:  HashMap::new(),
-            views_by_schema:   HashMap::new(),
-            pk_col_of:         HashMap::new(),
-            col_names:         HashMap::new(),
-            col_names_bytes:   HashMap::new(),
-            schema_wire_block: HashMap::new(),
-            index_by_name:     HashMap::new(),
-            index_by_id:       HashMap::new(),
-            indices_by_owner:  HashMap::new(),
-            fk_by_child:       HashMap::new(),
-            fk_by_parent:      HashMap::new(),
-            needs_lock:        HashSet::new(),
+            schema_by_name:    FxHashMap::default(),
+            schema_by_id:      FxHashMap::default(),
+            entity_by_qname:   FxHashMap::default(),
+            entity_by_id:      FxHashMap::default(),
+            schema_of:         FxHashMap::default(),
+            tables_by_schema:  FxHashMap::default(),
+            views_by_schema:   FxHashMap::default(),
+            pk_col_of:         FxHashMap::default(),
+            col_names:         FxHashMap::default(),
+            col_names_bytes:   FxHashMap::default(),
+            schema_wire_block: FxHashMap::default(),
+            index_by_name:     FxHashMap::default(),
+            index_by_id:       FxHashMap::default(),
+            indices_by_owner:  FxHashMap::default(),
+            fk_by_child:       FxHashMap::default(),
+            fk_by_parent:      FxHashMap::default(),
+            needs_lock:        FxHashSet::default(),
             cascade_enabled:   false,
         }
     }

@@ -377,7 +377,9 @@ pub fn wire_size(
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+    let has_schema = has_data
+        || (schema.is_some() && status == STATUS_OK)
+        || (prebuilt_schema_block.is_some() && status == STATUS_OK);
 
     let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
@@ -512,7 +514,9 @@ fn encode_wire_into_impl(
     checksum: bool,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+    let has_schema = has_data
+        || (schema.is_some() && status == STATUS_OK)
+        || (prebuilt_schema_block.is_some() && status == STATUS_OK);
 
     let mut wire_flags = flags;
     if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }

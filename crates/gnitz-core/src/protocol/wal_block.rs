@@ -3,6 +3,13 @@
 use super::error::ProtocolError;
 use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
 
+/// Whether `decode_wal_block` should verify the xxh3 checksum.
+/// Use `Yes` for WAL recovery and roundtrip tests.
+/// Use `No` for trusted Unix-socket response paths where OS delivery already
+/// guarantees integrity.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum VerifyChecksum { Yes, No }
+
 use gnitz_wire::{
     WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
     WAL_FORMAT_VERSION, SHORT_STRING_THRESHOLD,
@@ -247,6 +254,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
 pub fn decode_wal_block(
     data: &[u8],
     schema: &Schema,
+    verify_checksum: VerifyChecksum,
 ) -> Result<(ZSetBatch, u32, u64), ProtocolError> {
     if data.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError(format!(
@@ -274,7 +282,7 @@ pub fn decode_wal_block(
             "WAL block total_size {} exceeds data len {}", total_size, data.len()
         )));
     }
-    if total_size > WAL_BLOCK_HEADER_SIZE {
+    if verify_checksum == VerifyChecksum::Yes && total_size > WAL_BLOCK_HEADER_SIZE {
         let actual = xxh3_64(&data[WAL_BLOCK_HEADER_SIZE..total_size]);
         if actual != exp_checksum {
             return Err(ProtocolError::DecodeError("WAL checksum mismatch".into()));
@@ -587,7 +595,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 42, &batch);
-        let (decoded, tid, _lsn) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _lsn) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
 
         assert_eq!(tid, 42);
         assert_eq!(decoded.pks, pks);
@@ -621,7 +629,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 0, &batch);
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
 
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -644,7 +652,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 1, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 1);
         match &decoded.columns[1] {
             ColData::U128s(got) => assert_eq!(got, &vals),
@@ -660,7 +668,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
         };
         let encoded = encode_wal_block(&schema, 7, &empty);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.len(), 0);
     }
@@ -675,7 +683,7 @@ mod tests {
         let mut encoded = encode_wal_block(&schema, 0, &batch);
         // Flip a byte in the body (after header)
         encoded[WAL_BLOCK_HEADER_SIZE] ^= 0xFF;
-        let res = decode_wal_block(&encoded, &schema);
+        let res = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("checksum")));
     }
 
@@ -690,7 +698,7 @@ mod tests {
         // Set format_version = 1 (in header, offset 20..24)
         encoded[20..24].copy_from_slice(&1u32.to_le_bytes());
         // Note: checksum covers buf[48..] so changing header bytes does NOT invalidate checksum
-        let res = decode_wal_block(&encoded, &schema);
+        let res = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
     }
 
@@ -720,7 +728,7 @@ mod tests {
         let expected_first = 1u64.to_le_bytes();
         assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.pks, pks);
     }
 
@@ -743,7 +751,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.pks, pks);
     }
 
@@ -763,7 +771,7 @@ mod tests {
             ],
         };
         let encoded = encode_wal_block(&schema, 5, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 5);
         assert_eq!(decoded.pks, pks);
         assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
@@ -781,7 +789,7 @@ mod tests {
             a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
         }
         let encoded = encode_wal_block(&schema, 7, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.pks.len(), 3);
         assert_eq!(decoded.pks.get(0), 1u128);
@@ -803,7 +811,7 @@ mod tests {
             }
         }
         let encoded = encode_wal_block(&schema, 9, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema).unwrap();
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 9);
         assert_eq!(decoded.pks.len(), pks.len());
         for (i, &expected) in pks.iter().enumerate() {

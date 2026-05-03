@@ -209,6 +209,9 @@ struct ReactorShared {
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
+    /// Guards against spawning multiple concurrent EMFILE/ENFILE backoff tasks.
+    /// Set before spawn, cleared when the timer fires and accept is re-armed.
+    accept_backoff_armed: Cell<bool>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -318,6 +321,7 @@ impl Reactor {
             closing_fds: RefCell::new(FxHashSet::default()),
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
+            accept_backoff_armed: Cell::new(false),
         });
         // Publish the run-queue pointer for the waker vtable. ReactorShared
         // lives behind Rc with a stable address, so the pointer is valid
@@ -736,10 +740,10 @@ impl Reactor {
     /// Returns total bytes sent (>= 0) or negative errno. The loop is
     /// load-bearing: OP_SEND on a stream socket may return rc < len
     /// when the kernel's socket buffer fills up.
-    pub async fn send_buffer(&self, fd: i32, buf: Vec<u8>) -> i32 {
-        let len = buf.len();
-        let ptr = buf.as_ptr();
-        self.send_buf_inner(fd, ptr, len, SendAlive::Heap(Rc::new(buf))).await
+    pub async fn send_buffer(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) -> i32 {
+        let len = buf.0.len();
+        let ptr = buf.0.as_ptr();
+        self.send_buf_inner(fd, ptr, len, SendAlive::Pooled(Rc::new(buf))).await
     }
 
     /// Send the frame bytes of a W2M ring slot directly, without copying.
@@ -998,10 +1002,27 @@ impl Reactor {
                     }
                 }
                 if cqe.flags & CQE_F_MORE == 0 {
-                    // Multishot cancelled — re-arm.
+                    // Multishot cancelled — re-arm, but back off ~50ms on fd
+                    // exhaustion so reap_closing_conns can free FDs first.
                     let sfd = self.inner.server_fd.get();
                     if sfd >= 0 {
-                        self.inner.ring.borrow_mut().prep_accept(sfd, udata(KIND_ACCEPT, 0));
+                        if cqe.res == -(libc::EMFILE as i32) || cqe.res == -(libc::ENFILE as i32) {
+                            if !self.inner.accept_backoff_armed.get() {
+                                self.inner.accept_backoff_armed.set(true);
+                                let inner = Rc::clone(&self.inner);
+                                self.spawn(async move {
+                                    let deadline = Instant::now() + std::time::Duration::from_millis(50);
+                                    TimerFuture::new(deadline, Rc::clone(&inner)).await;
+                                    inner.accept_backoff_armed.set(false);
+                                    let current_sfd = inner.server_fd.get();
+                                    if current_sfd >= 0 {
+                                        inner.ring.borrow_mut().prep_accept(current_sfd, udata(KIND_ACCEPT, 0));
+                                    }
+                                });
+                            }
+                        } else {
+                            self.inner.ring.borrow_mut().prep_accept(sfd, udata(KIND_ACCEPT, 0));
+                        }
                     }
                 }
             }
@@ -1601,15 +1622,15 @@ impl Future for RecvFuture {
 }
 
 enum SendAlive {
-    Heap(Rc<Vec<u8>>),
+    Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
     Slot(Rc<W2mSlot>),
 }
 
 impl Clone for SendAlive {
     fn clone(&self) -> Self {
         match self {
-            SendAlive::Heap(rc) => SendAlive::Heap(Rc::clone(rc)),
-            SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
+            SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
+            SendAlive::Slot(rc)   => SendAlive::Slot(Rc::clone(rc)),
         }
     }
 }
@@ -2514,7 +2535,7 @@ mod tests {
         let r = make_reactor();
         // Pre-populate an in-flight buffer and a conn with send_inflight=1.
         r.inner.send_buffers_in_flight.borrow_mut()
-            .insert(77, SendAlive::Heap(Rc::new(vec![0u8; 16])));
+            .insert(77, SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16]))));
         r.inner.send_fd_for_id.borrow_mut().insert(77, 42);
         r.inner.conns.borrow_mut().insert(42, Box::new(io::Conn::new()));
         if let Some(c) = r.inner.conns.borrow_mut().get_mut(&42) {
@@ -2547,14 +2568,14 @@ mod tests {
             // Build and drop a SendFuture without it ever becoming Ready.
             let _fut = SendFuture {
                 send_id: 88,
-                _alive: Some(SendAlive::Heap(Rc::new(buf.clone()))),
+                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(buf.clone())))),
                 inner: Rc::clone(&r.inner),
             };
         }
         let parked = r.inner.send_buffers_in_flight.borrow();
         let stored = parked.get(&88).expect("drop must park keep-alive");
-        let SendAlive::Heap(stored_rc) = stored else { panic!("expected Heap variant") };
-        assert_eq!(stored_rc.as_slice(), &buf[..]);
+        let SendAlive::Pooled(stored_rc) = stored else { panic!("expected Pooled variant") };
+        assert_eq!(stored_rc.0.as_slice(), &buf[..]);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2679,7 +2700,7 @@ mod tests {
 
             let r2 = Rc::clone(&r);
             let sent = r.block_on(async move {
-                r2.send_buffer(sender_fd, payload).await
+                r2.send_buffer(sender_fd, crate::storage::batch_pool::PooledSendBuf(payload)).await
             });
             let received = drain_t.join().expect("drain thread");
 

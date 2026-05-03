@@ -1,6 +1,7 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 
 use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
@@ -259,14 +260,21 @@ pub trait ExchangeCallback {
 // ---------------------------------------------------------------------------
 
 pub struct DagEngine {
-    cache: HashMap<i64, CachedPlan>,
-    dep_map: HashMap<i64, Vec<i64>>,       // source_table_id → [view_ids]
-    source_map: HashMap<i64, Vec<i64>>,    // view_id → [source_table_ids]
+    cache: FxHashMap<i64, CachedPlan>,
+    dep_map: FxHashMap<i64, Vec<i64>>,       // source_table_id → [view_ids]
+    source_map: FxHashMap<i64, Vec<i64>>,    // view_id → [source_table_ids]
     dep_map_valid: bool,
-    shard_cols_cache: HashMap<i64, Vec<i32>>,
-    exchange_info_cache: HashMap<i64, ExchangeInfo>,
-    pub(crate) tables: HashMap<i64, TableEntry>,
+    shard_cols_cache: FxHashMap<i64, Vec<i32>>,
+    exchange_info_cache: FxHashMap<i64, ExchangeInfo>,
+    pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
+}
+
+struct PendingEntry {
+    depth: i32,
+    view_id: i64,
+    source_id: i64,
+    batch: Batch,
 }
 
 // SAFETY: DagEngine is only accessed from a single thread.
@@ -275,13 +283,13 @@ unsafe impl Send for DagEngine {}
 impl DagEngine {
     pub fn new() -> Self {
         DagEngine {
-            cache: HashMap::new(),
-            dep_map: HashMap::new(),
-            source_map: HashMap::new(),
+            cache: FxHashMap::default(),
+            dep_map: FxHashMap::default(),
+            source_map: FxHashMap::default(),
             dep_map_valid: false,
-            shard_cols_cache: HashMap::new(),
-            exchange_info_cache: HashMap::new(),
-            tables: HashMap::new(),
+            shard_cols_cache: FxHashMap::default(),
+            exchange_info_cache: FxHashMap::default(),
+            tables: FxHashMap::default(),
             sys: SysTableRefs::null(),
         }
     }
@@ -370,7 +378,7 @@ impl DagEngine {
 
     /// Rebuild the dep_map and source_map from the DepTab system table.
     /// Port of `ProgramCache.get_dep_map()`.
-    pub fn get_dep_map(&mut self) -> &HashMap<i64, Vec<i64>> {
+    pub fn get_dep_map(&mut self) -> &FxHashMap<i64, Vec<i64>> {
         if self.dep_map_valid {
             return &self.dep_map;
         }
@@ -992,6 +1000,45 @@ impl DagEngine {
         }
     }
 
+    // ── DAG traversal helpers ───────────────────────────────────────────
+
+    /// Seed the initial pending list for a DAG traversal.
+    /// Returns entries sorted descending by depth (shallowest at tail for
+    /// O(1) pop) plus a position index for merge-on-collision lookups.
+    fn build_pending(
+        &self,
+        view_ids: &[i64],
+        source_id: i64,
+        delta: Batch,
+    ) -> (Vec<PendingEntry>, FxHashMap<(i64, i64), usize>) {
+        let last_valid_idx = view_ids.iter().rposition(|&vid| self.tables.contains_key(&vid));
+        let mut delta_opt = Some(delta);
+        let mut pending: Vec<PendingEntry> = Vec::new();
+        if let Some(last_idx) = last_valid_idx {
+            for (i, &vid) in view_ids.iter().enumerate() {
+                let depth = match self.tables.get(&vid) {
+                    Some(e) => e.depth,
+                    None => continue,
+                };
+                let b = if i == last_idx {
+                    delta_opt.take().unwrap()
+                } else {
+                    delta_opt.as_ref().unwrap().clone_batch()
+                };
+                pending.push(PendingEntry { depth, view_id: vid, source_id, batch: b });
+            }
+        }
+        if let Some(d) = delta_opt {
+            crate::storage::batch_pool::recycle(d);
+        }
+        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+        let mut pending_pos: FxHashMap<(i64, i64), usize> = FxHashMap::default();
+        for (i, pe) in pending.iter().enumerate() {
+            pending_pos.insert((pe.view_id, pe.source_id), i);
+        }
+        (pending, pending_pos)
+    }
+
     // ── evaluate_dag (single-worker) ────────────────────────────────────
 
     /// Full single-worker DAG evaluation.
@@ -1009,39 +1056,9 @@ impl DagEngine {
             return 0;
         }
 
-        // 2. Build initial pending list: (depth, view_id, source_id, batch)
-        struct PendingEntry {
-            depth: i32,
-            view_id: i64,
-            source_id: i64,
-            batch: Batch,
-        }
-
-        let mut pending: Vec<PendingEntry> = Vec::new();
-        // pending_pos: (view_id, source_id) → index in pending
-        let mut pending_pos: HashMap<(i64, i64), usize> = HashMap::new();
-        let mut dirty_views: HashSet<i64> = HashSet::new();
-
-        for &vid in &view_ids {
-            let depth = match self.tables.get(&vid) {
-                Some(e) => e.depth,
-                None => continue, // lagging dep_map
-            };
-            pending.push(PendingEntry {
-                depth,
-                view_id: vid,
-                source_id,
-                batch: delta.clone_batch(),
-            });
-        }
-        crate::storage::batch_pool::recycle(delta);
-
-        // Sort descending by depth (shallowest at tail for O(1) pop)
-        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
-        // Rebuild pending_pos
-        for (i, pe) in pending.iter().enumerate() {
-            pending_pos.insert((pe.view_id, pe.source_id), i);
-        }
+        // 2. Build initial pending list
+        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
+        let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
 
         // 3. Process
         while let Some(entry) = pending.pop() {
@@ -1067,51 +1084,54 @@ impl DagEngine {
                 continue;
             }
 
-            // Ingest into view store (borrow — no clone)
-            self.ingest_by_ref(view_id, &out_delta);
-            dirty_views.insert(view_id);
-
             // Queue dependents
             let dep_view_ids: Vec<i64> = self.dep_map
                 .get(&view_id)
                 .cloned()
                 .unwrap_or_default();
 
-            for dep_id in dep_view_ids {
-                let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {
-                    Some(e) => (e.depth, e.schema),
-                    None => continue,
-                };
+            if dep_view_ids.is_empty() {
+                // Terminal view: move batch directly — no clone for unique_pk.
+                self.ingest_to_family(view_id, out_delta);
+            } else {
+                self.ingest_by_ref(view_id, &out_delta);
+                for dep_id in dep_view_ids {
+                    let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {
+                        Some(e) => (e.depth, e.schema),
+                        None => continue,
+                    };
 
-                if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
-                    if existing_idx < pending.len() {
-                        let schema = pending[existing_idx].batch.schema.unwrap_or(dep_schema);
-                        let merged = ops::op_union(
-                            &pending[existing_idx].batch,
-                            Some(&out_delta),
-                            &schema,
-                        );
-                        pending[existing_idx].batch = merged;
-                    }
-                } else {
-                    let new_idx = pending.len();
-                    pending.push(PendingEntry {
-                        depth: dep_depth,
-                        view_id: dep_id,
-                        source_id: view_id,
-                        batch: out_delta.clone_batch(),
-                    });
-                    pending_pos.insert((dep_id, view_id), new_idx);
-                    // Re-sort to maintain descending depth order
-                    pending.sort_by(|a, b| b.depth.cmp(&a.depth));
-                    // Rebuild pending_pos
-                    pending_pos.clear();
-                    for (i, pe) in pending.iter().enumerate() {
-                        pending_pos.insert((pe.view_id, pe.source_id), i);
+                    if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
+                        if existing_idx < pending.len() {
+                            let schema = pending[existing_idx].batch.schema.unwrap_or(dep_schema);
+                            let merged = ops::op_union(
+                                &pending[existing_idx].batch,
+                                Some(&out_delta),
+                                &schema,
+                            );
+                            pending[existing_idx].batch = merged;
+                        }
+                    } else {
+                        let new_idx = pending.len();
+                        pending.push(PendingEntry {
+                            depth: dep_depth,
+                            view_id: dep_id,
+                            source_id: view_id,
+                            batch: out_delta.clone_batch(),
+                        });
+                        pending_pos.insert((dep_id, view_id), new_idx);
+                        // Re-sort to maintain descending depth order
+                        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+                        // Rebuild pending_pos
+                        pending_pos.clear();
+                        for (i, pe) in pending.iter().enumerate() {
+                            pending_pos.insert((pe.view_id, pe.source_id), i);
+                        }
                     }
                 }
+                crate::storage::batch_pool::recycle(out_delta);
             }
-            crate::storage::batch_pool::recycle(out_delta);
+            dirty_views.insert(view_id);
         }
 
         // Flush each modified view trace exactly once after the full DAG settles.
@@ -1151,35 +1171,8 @@ impl DagEngine {
             return 0;
         }
 
-        struct PendingEntry {
-            depth: i32,
-            view_id: i64,
-            source_id: i64,
-            batch: Batch,
-        }
-
-        let mut pending: Vec<PendingEntry> = Vec::new();
-        let mut pending_pos: HashMap<(i64, i64), usize> = HashMap::new();
-        let mut dirty_views: HashSet<i64> = HashSet::new();
-
-        for &vid in &view_ids {
-            let depth = match self.tables.get(&vid) {
-                Some(e) => e.depth,
-                None => continue,
-            };
-            pending.push(PendingEntry {
-                depth,
-                view_id: vid,
-                source_id,
-                batch: delta.clone_batch(),
-            });
-        }
-        crate::storage::batch_pool::recycle(delta);
-
-        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
-        for (i, pe) in pending.iter().enumerate() {
-            pending_pos.insert((pe.view_id, pe.source_id), i);
-        }
+        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
+        let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
 
         while let Some(entry) = pending.pop() {
             let view_id = entry.view_id;
@@ -1247,17 +1240,23 @@ impl DagEngine {
             };
 
             let has_output = out_delta.as_ref().map(|b| b.count > 0).unwrap_or(false);
-            if has_output {
-                let out = out_delta.as_ref().unwrap();
-                self.ingest_by_ref(view_id, out);
-                dirty_views.insert(view_id);
-            }
 
             // Multi-worker: ALWAYS queue dependents (even empty output)
             let dep_view_ids: Vec<i64> = self.dep_map
                 .get(&view_id)
                 .cloned()
                 .unwrap_or_default();
+
+            if has_output {
+                if dep_view_ids.is_empty() {
+                    // Terminal view: move batch directly — no clone for unique_pk.
+                    self.ingest_to_family(view_id, out_delta.unwrap());
+                    dirty_views.insert(view_id);
+                    continue;
+                }
+                self.ingest_by_ref(view_id, out_delta.as_ref().unwrap());
+                dirty_views.insert(view_id);
+            }
 
             for dep_id in dep_view_ids {
                 let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {

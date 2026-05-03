@@ -24,7 +24,7 @@ pub use protocol::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_CONTINUATION,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK, MAX_COLUMNS,
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
-    encode_wal_block, decode_wal_block, recompute_block_checksum, get_region_offset_size,
+    encode_wal_block, decode_wal_block, VerifyChecksum, recompute_block_checksum, get_region_offset_size,
     schema_to_batch, batch_to_schema,
     connect, send_framed, send_framed_iov, recv_framed, close_fd,
     Message, send_message, recv_message, encode_message,

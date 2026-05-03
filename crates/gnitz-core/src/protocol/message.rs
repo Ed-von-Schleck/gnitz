@@ -6,7 +6,7 @@ use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_D
 use super::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, meta_schema};
 use super::codec::{schema_to_batch, batch_to_schema};
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use super::wal_block::{encode_wal_block, decode_wal_block};
+use super::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
 use super::transport::{send_framed, recv_framed};
 
 pub struct Message {
@@ -88,7 +88,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolError> {
     use gnitz_wire::control as ctrl;
     let cs = control_schema();
-    let (batch, tid, _lsn) = decode_wal_block(data, cs)?;
+    let (batch, tid, _lsn) = decode_wal_block(data, cs, VerifyChecksum::No)?;
 
     if tid != IPC_CONTROL_TID {
         return Err(ProtocolError::DecodeError(format!(
@@ -258,7 +258,7 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
             return Err(ProtocolError::DecodeError("schema block truncated".into()));
         }
         let ms = meta_schema();
-        let (sbatch, _, _) = decode_wal_block(&buf[off..off + sz], ms)?;
+        let (sbatch, _, _) = decode_wal_block(&buf[off..off + sz], ms, VerifyChecksum::No)?;
         wire_schema  = Some(batch_to_schema(&sbatch)?);
         schema_batch = Some(sbatch);
         off += sz;
@@ -274,7 +274,7 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
         if off + sz > buf.len() {
             return Err(ProtocolError::DecodeError("data block truncated".into()));
         }
-        let (batch, _, _) = decode_wal_block(&buf[off..off + sz], eff)?;
+        let (batch, _, _) = decode_wal_block(&buf[off..off + sz], eff, VerifyChecksum::No)?;
         Some(batch)
     } else {
         None

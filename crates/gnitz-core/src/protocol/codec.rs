@@ -107,7 +107,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 mod tests {
     use super::*;
     use crate::protocol::types::{ColData, PkColumn, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
-    use crate::protocol::wal_block::{encode_wal_block, decode_wal_block};
+    use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
 
     // ── TypeCode::try_from_u64 error paths ──────────────────────────────────
 
@@ -118,9 +118,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_type_code_13() {
+    fn test_unknown_type_code_14() {
         use crate::protocol::error::ProtocolError;
-        assert!(matches!(TypeCode::try_from_u64(13), Err(ProtocolError::UnknownTypeCode(13))));
+        assert!(matches!(TypeCode::try_from_u64(14), Err(ProtocolError::UnknownTypeCode(14))));
     }
 
     #[test]
@@ -213,7 +213,7 @@ mod tests {
         let ms = meta_schema();
         let meta_batch = schema_to_batch(&original);
         let encoded = encode_wal_block(ms, 0, &meta_batch);
-        let (decoded_batch, _, _) = decode_wal_block(&encoded, ms).unwrap();
+        let (decoded_batch, _, _) = decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
         let reconstructed = batch_to_schema(&decoded_batch).unwrap();
 
         assert_eq!(original, reconstructed, "schema mismatch after meta roundtrip");

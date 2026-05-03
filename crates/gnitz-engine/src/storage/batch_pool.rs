@@ -49,6 +49,15 @@ pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     });
 }
 
+/// A pooled send buffer that returns itself to the pool on drop.
+pub(crate) struct PooledSendBuf(pub(crate) Vec<u8>);
+
+impl Drop for PooledSendBuf {
+    fn drop(&mut self) {
+        recycle_buf(std::mem::take(&mut self.0));
+    }
+}
+
 /// Recycle an Batch's data and blob buffers back to the pool.
 pub(crate) fn recycle(batch: Batch) {
     let (data, blob) = batch.into_buffers();

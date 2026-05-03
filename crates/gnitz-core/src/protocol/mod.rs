@@ -20,7 +20,7 @@ pub use header::{
     MAX_COLUMNS,
 };
 pub use wal_block::{
-    encode_wal_block, decode_wal_block,
+    encode_wal_block, decode_wal_block, VerifyChecksum,
     recompute_block_checksum, get_region_offset_size,
 };
 pub use codec::{schema_to_batch, batch_to_schema};
