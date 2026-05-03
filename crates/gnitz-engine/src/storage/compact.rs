@@ -106,26 +106,8 @@ fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> 
     (null_word >> payload_idx) & 1 != 0
 }
 
-// ---------------------------------------------------------------------------
-// Guard key routing (binary search)
-// ---------------------------------------------------------------------------
-
 fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
-    let n = guard_keys.len();
-    if n == 0 {
-        return 0;
-    }
-    let mut lo = 0usize;
-    let mut hi = n - 1;
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if guard_keys[mid] <= key {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
+    guard_keys.partition_point(|&g| g <= key).saturating_sub(1)
 }
 
 // ---------------------------------------------------------------------------

@@ -107,24 +107,9 @@ impl FLSMLevel {
     }
 
     fn find_guard_idx(&self, key: u128) -> Option<usize> {
-        let n = self.guards.len();
-        if n == 0 {
-            return None;
-        }
-        let mut lo = 0usize;
-        let mut hi = n - 1;
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if self.guards[mid].guard_key <= key {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        if self.guards[lo].guard_key <= key {
-            Some(lo)
-        } else {
-            None
+        match self.guards.partition_point(|g| g.guard_key <= key) {
+            0 => None,
+            n => Some(n - 1),
         }
     }
 
