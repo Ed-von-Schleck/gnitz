@@ -76,6 +76,57 @@ class PerfRecorder:
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait()
+        self._fixup_perf_data_header()
+
+    def _fixup_perf_data_header(self) -> None:
+        """Patch perf.data header if data_size was not finalized (left as 0).
+
+        perf record writes data_size=0 initially and updates it on clean exit.
+        When the process is stopped via SIGINT before finalization completes,
+        the field stays at 0 and perf refuses to read the file. This scans
+        forward through the record stream to find the last complete record and
+        patches data_size to that offset.
+        """
+        import struct as _struct
+        perf_data = self._output_dir / "perf.data"
+        if not perf_data.exists():
+            return
+        with open(perf_data, "r+b") as f:
+            magic = f.read(8)
+            if magic != b"PERFILE2":
+                return
+            f.seek(40)
+            data_off = _struct.unpack("<Q", f.read(8))[0]
+            data_sz  = _struct.unpack("<Q", f.read(8))[0]
+            if data_sz != 0 or data_off == 0:
+                return
+
+            # Scan forward through 8-byte record headers (type u32, misc u16, size u16).
+            # Stop at the first record with size==0 or type==0, which marks
+            # the end of valid data (incomplete last record or trailing zeros).
+            file_size = perf_data.stat().st_size
+            pos = data_off
+            last_good = data_off
+            f.seek(pos)
+            while pos + 8 <= file_size:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                rec_type, _misc, rec_size = _struct.unpack("<IHH", hdr)
+                if rec_size == 0 or rec_type == 0:
+                    break
+                next_pos = pos + rec_size
+                if next_pos > file_size:
+                    break
+                last_good = next_pos
+                pos = next_pos
+                f.seek(pos)
+
+            new_data_sz = last_good - data_off
+            f.seek(48)
+            f.write(_struct.pack("<Q", new_data_sz))
+            print(f"[perf] Fixed data_size: 0 → {new_data_sz} "
+                  f"(scanned {last_good - data_off} of {file_size - data_off} bytes)")
 
     def flamegraph(self) -> Path | None:
         """Generate flamegraph SVG from perf.data.
