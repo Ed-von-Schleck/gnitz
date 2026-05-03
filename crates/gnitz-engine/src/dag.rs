@@ -994,10 +994,15 @@ impl DagEngine {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush().map(|_| ()),
             StoreHandle::Partitioned(pt) => pt.flush().map(|_| ()),
         };
-        match result {
-            Ok(()) => 0,
-            Err(_) => -1,
+        if result.is_err() {
+            return -1;
         }
+        for ic in &mut entry.index_circuits {
+            if ic.index_table.flush().is_err() {
+                return -1;
+            }
+        }
+        0
     }
 
     // ── DAG traversal helpers ───────────────────────────────────────────
@@ -1799,5 +1804,47 @@ mod tests {
     fn test_source_ids_empty() {
         let mut dag = DagEngine::new();
         assert!(dag.get_source_ids(42).is_empty());
+    }
+
+    #[test]
+    fn test_flush_includes_index_circuits() {
+        let mut dag = DagEngine::new();
+        let parent_schema = compiler::empty_schema();
+        let tbl = make_test_table("flush_ic_parent");
+        dag.register_table(70, StoreHandle::Single(tbl), parent_schema, 0, false, String::new());
+
+        // Durable index table: flush writes shard_*.db only if called.
+        let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
+        let idx_dir = "/tmp/gnitz_dag_test_flush_ic_idx".to_string();
+        let _ = std::fs::remove_dir_all(&idx_dir);
+        let idx_tbl = Box::new(
+            Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, true).unwrap(),
+        );
+        dag.add_index_circuit(70, 1, idx_tbl, idx_schema, false);
+
+        // Put one row in the index table's memtable.
+        {
+            let entry = dag.tables.get_mut(&70).unwrap();
+            let mut batch = Batch::with_schema(idx_schema, 1);
+            batch.extend_pk(1u128);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.count += 1;
+            entry.index_circuits[0].index_table.ingest_owned_batch(batch).unwrap();
+        }
+
+        // With the fix, flush propagates to index circuits and writes a shard.
+        // Without the fix, index circuits are skipped and no shard is written.
+        assert_eq!(dag.flush(70), 0);
+        let shard_count = std::fs::read_dir(&idx_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().unwrap_or("").starts_with("shard_"))
+            .count();
+        assert!(shard_count > 0, "index circuit shard must be written by flush");
+
+        dag.close();
+        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_flush_ic_parent");
+        let _ = std::fs::remove_dir_all(idx_dir);
     }
 }
