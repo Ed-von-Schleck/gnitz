@@ -448,6 +448,14 @@ pub fn server_main(
             // SAL recovery — replay unflushed push data
             recover_from_sal(&sal_reader, catalog);
 
+            // Durability: flush replayed rows to shards before accepting requests.
+            // reset_sal() resets the write cursor to 0, so a second crash before
+            // a checkpoint would overwrite SAL entries and make replayed data
+            // unreachable (SAL walk stops at the first partially-overwritten group).
+            for tid in catalog.iter_user_table_ids() {
+                let _ = catalog.flush_family(tid);
+            }
+
             catalog.invalidate_all_plans();
 
             let msg = format!(

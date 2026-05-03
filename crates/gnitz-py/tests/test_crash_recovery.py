@@ -97,6 +97,57 @@ def _is_debug_build():
     return os.environ.get("GNITZ_RELEASE", "0") == "0"
 
 
+def test_crash_after_push_no_tick():
+    """SIGKILL after push with no checkpoint: SAL replay must restore all rows.
+
+    Without per-push flush, rows only live in the SAL and memtable at kill
+    time.  Recovery re-applies the committed FLAG_PUSH zone so all rows are
+    visible after restart.
+    """
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: create schema and table cleanly. --------------------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("sal_recovery")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL)",
+            schema_name="sal_recovery",
+        )
+        conn.close()
+        _stop_server(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 2: restart, push rows, kill without checkpoint. --------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.execute_sql(
+            "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)",
+            schema_name="sal_recovery",
+        )
+        conn.close()
+        # Hard kill: no graceful shutdown, no checkpoint.
+        _stop_server(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: restart and verify SAL replay restored all rows. ----
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("sal_recovery", "t")
+        rows = list(conn.scan(tid))
+        assert len(rows) == 3, f"expected 3 rows after SAL recovery, got {rows}"
+        pks = {r["pk"] for r in rows}
+        assert pks == {1, 2, 3}, f"wrong PKs after recovery: {pks}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_ddl_crash_no_orphan_columns():
     """CREATE TABLE that aborts before its commit sentinel must leave no
     durable trace. Recovery skips the uncommitted zone; the table name is

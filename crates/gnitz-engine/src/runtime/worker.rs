@@ -805,14 +805,6 @@ impl WorkerProcess {
 
     // ── Request handlers ───────────────────────────────────────────────
 
-    /// Flush a family to disk, logging on failure without propagating — the
-    /// data remains safe in the memtable until the next checkpoint flush.
-    fn flush_family_best_effort(&mut self, target_id: i64) {
-        if let Err(rc) = self.cat().flush_family(target_id) {
-            gnitz_info!("W{} flush_family tid={} rc={} (data in memtable)", self.worker_id, target_id, rc);
-        }
-    }
-
     fn handle_push(
         &mut self, target_id: i64, batch: Batch, _request_id: u64,
     ) -> Result<(), String> {
@@ -832,7 +824,6 @@ impl WorkerProcess {
             ));
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
-            self.flush_family_best_effort(target_id);
             if let Some(existing) = self.pending_deltas.get_mut(&target_id) {
                 existing.append_batch(&effective, 0, effective.count);
             } else {

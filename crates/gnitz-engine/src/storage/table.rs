@@ -954,6 +954,34 @@ mod tests {
         assert_eq!(cursor.cursor.current_key_lo(), 1, "cursor should start at PK=1 from flushed shard");
     }
 
+    /// Two ingest calls that cumulatively cross the 75% threshold must produce
+    /// an L0 shard and an empty memtable without any explicit flush() call.
+    #[test]
+    fn test_memtable_overflow_auto_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("overflow_auto_flush");
+        let schema = make_u64_i64_schema();
+
+        // arena = 128 bytes → should_flush threshold = 96.
+        // Each row is 32 bytes (PK 8 + weight 8 + null_bmp 8 + col 8).
+        // First call: 2 rows = 64 bytes, below threshold → no flush.
+        // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 1200, 128, false,
+        ).unwrap();
+
+        t.ingest_owned_batch(make_batch(&[(1, 1, 10), (2, 1, 20)])).unwrap();
+        assert!(!t.memtable_is_empty(), "two rows must not yet trigger overflow");
+
+        t.ingest_owned_batch(make_batch(&[(3, 1, 30), (4, 1, 40)])).unwrap();
+
+        assert!(t.memtable_is_empty(), "overflow post-check must auto-flush to shard");
+        assert!(
+            !t.all_shard_arcs().is_empty(),
+            "at least one L0 shard must exist after overflow flush",
+        );
+    }
+
     /// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → retract_pk.
     /// The shard fallback must pick the live payload (val=200), not the cancelled one.
     #[test]
