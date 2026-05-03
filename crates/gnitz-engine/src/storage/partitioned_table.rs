@@ -10,7 +10,7 @@ use super::batch::Batch;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
-use super::table::{self, Table};
+use super::table::{self, FlushOutcome, FlushWork, Table};
 
 // ---------------------------------------------------------------------------
 // PartitionedTable
@@ -212,10 +212,29 @@ impl PartitionedTable {
         Ok(any_wrote)
     }
 
-    pub fn flush_deferred(&mut self) -> Result<Vec<libc::c_int>, StorageError> {
-        let mut dirfds = Vec::new();
-        for table in &mut self.tables {
-            if let Some(fd) = table.flush_deferred()? {
+    /// Phase 1 across all partitions. Returns one (partition_idx, FlushWork)
+    /// pair per partition that produced deferred work. `Empty`/`DoneInline`
+    /// outcomes are silently consumed (memtable already reset for those).
+    pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
+        let mut works = Vec::new();
+        for (i, table) in self.tables.iter_mut().enumerate() {
+            match table.flush_prepare(true)? {
+                FlushOutcome::Empty | FlushOutcome::DoneInline => {}
+                FlushOutcome::Pending(w) => works.push((i, w)),
+            }
+        }
+        Ok(works)
+    }
+
+    /// Phase 3: dispatch each FlushWork back to its partition's `flush_commit`.
+    /// Returns the dirfds to fsync (one per partition that committed).
+    pub fn flush_commit_batch(
+        &mut self,
+        works: Vec<(usize, FlushWork)>,
+    ) -> Result<Vec<libc::c_int>, StorageError> {
+        let mut dirfds = Vec::with_capacity(works.len());
+        for (idx, w) in works {
+            if let Some(fd) = self.tables[idx].flush_commit(w)? {
                 dirfds.push(fd);
             }
         }

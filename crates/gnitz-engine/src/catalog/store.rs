@@ -318,16 +318,34 @@ impl CatalogEngine {
         }
     }
 
-    /// Like flush_family but defers the dir fsync to the caller.
-    /// System tables use the regular flush (inline fsync retained).
-    pub fn flush_family_deferred(&mut self, table_id: i64) -> Result<Vec<libc::c_int>, String> {
+    /// Phase 1 across a table family. System tables flush inline (legacy
+    /// path; they checkpoint during DDL, not at `flush_all`).
+    pub fn flush_family_prepare(
+        &mut self,
+        table_id: i64,
+    ) -> Result<Vec<(usize, crate::storage::FlushWork)>, String> {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
                 table.flush().map_err(|e| format!("flush error: {}", e))?;
             }
-            Ok(vec![])
+            Ok(Vec::new())
         } else {
-            self.dag.flush_deferred(table_id)
+            self.dag.flush_prepare(table_id)
+        }
+    }
+
+    /// Phase 3 across a table family. Returns dirfds to fsync.
+    pub fn flush_family_commit_batch(
+        &mut self,
+        table_id: i64,
+        works: Vec<(usize, crate::storage::FlushWork)>,
+    ) -> Result<Vec<libc::c_int>, String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            // System tables commit inline; no FlushWork should arrive here.
+            debug_assert!(works.is_empty());
+            Ok(Vec::new())
+        } else {
+            self.dag.flush_commit_batch(table_id, works)
         }
     }
 

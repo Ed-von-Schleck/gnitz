@@ -234,27 +234,40 @@ pub fn read_file(
     }
 }
 
-/// Serialize entries and write atomically (write .tmp, fdatasync, rename).
-pub fn write_file(
+/// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
+/// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
+/// On any internal write error closes the fd and unlinks the .tmp.
+pub struct PreparedManifest {
+    pub fd: Option<libc::c_int>,
+    pub tmp_path: std::ffi::CString,
+    pub final_path: std::ffi::CString,
+}
+
+impl Drop for PreparedManifest {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            unsafe { libc::close(fd); }
+        }
+    }
+}
+
+pub fn prepare_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
     global_max_lsn: u64,
-) -> Result<(), StorageError> {
+) -> Result<PreparedManifest, StorageError> {
     let count = entries.len();
     let total = serialized_size(count);
 
     let mut buf = vec![0u8; total];
     let written = serialize(&mut buf, entries, global_max_lsn)?;
 
-    let path_bytes = path.to_bytes();
-    let mut tmp_path = Vec::with_capacity(path_bytes.len() + 5);
-    tmp_path.extend_from_slice(path_bytes);
-    tmp_path.extend_from_slice(b".tmp\0");
-    let tmp_cstr = tmp_path.as_ptr() as *const libc::c_char;
+    let tmp_path = super::cstr_with_tmp_suffix(path)?;
+    let final_path = std::ffi::CString::new(path.to_bytes()).map_err(|_| StorageError::InvalidPath)?;
 
     unsafe {
         let fd = libc::open(
-            tmp_cstr,
+            tmp_path.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644 as libc::mode_t,
         );
@@ -265,24 +278,34 @@ pub fn write_file(
         let rc = crate::util::write_all_fd(fd, &buf[..written]);
         if rc < 0 {
             libc::close(fd);
-            libc::unlink(tmp_cstr);
+            libc::unlink(tmp_path.as_ptr());
             return Err(StorageError::Io);
         }
 
+        Ok(PreparedManifest { fd: Some(fd), tmp_path, final_path })
+    }
+}
+
+/// Serialize entries and write atomically (prepare, fdatasync, close, rename).
+pub fn write_file(
+    path: &std::ffi::CStr,
+    entries: &[ManifestEntryRaw],
+    global_max_lsn: u64,
+) -> Result<(), StorageError> {
+    let mut prepared = prepare_file(path, entries, global_max_lsn)?;
+    let fd = prepared.fd.take().expect("prepare_file always returns fd");
+    unsafe {
         if libc::fdatasync(fd) < 0 {
             libc::close(fd);
-            libc::unlink(tmp_cstr);
+            libc::unlink(prepared.tmp_path.as_ptr());
             return Err(StorageError::Io);
         }
-
         libc::close(fd);
-
-        if libc::rename(tmp_cstr, path.as_ptr()) < 0 {
-            libc::unlink(tmp_cstr);
+        if libc::rename(prepared.tmp_path.as_ptr(), prepared.final_path.as_ptr()) < 0 {
+            libc::unlink(prepared.tmp_path.as_ptr());
             return Err(StorageError::Io);
         }
     }
-
     Ok(())
 }
 

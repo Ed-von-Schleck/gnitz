@@ -13,9 +13,73 @@ use super::memtable::MemTable;
 use super::batch::Batch;
 #[cfg(test)]
 use super::batch::ConsolidatedBatch;
+use super::manifest::PreparedManifest;
 use super::read_cursor::{self, CursorHandle};
-use super::shard_index::ShardIndex;
+use super::shard_file;
+use super::shard_index::{PendingShard, ShardIndex};
 use super::shard_reader::MappedShard;
+
+// ---------------------------------------------------------------------------
+// Two-phase flush API
+// ---------------------------------------------------------------------------
+
+/// Outcome of `Table::flush_prepare`.
+pub enum FlushOutcome {
+    /// memtable empty or consolidated count == 0 — nothing written, memtable reset.
+    Empty,
+    /// Non-durable shard written and committed inline; no deferred work.
+    DoneInline,
+    /// Durable: .tmp files written, fdatasync + rename pending.
+    Pending(FlushWork),
+}
+
+/// Open file descriptors and rename targets pending for one durable flush.
+/// Owned by the worker between `flush_prepare` and `flush_commit`. Drop
+/// unlinks any remaining `.tmp` files so a partial failure leaves no debris.
+pub struct FlushWork {
+    shard_fd: Option<libc::c_int>,
+    shard_rename: Option<ShardRename>,
+    manifest: Option<PreparedManifest>,
+    pending_shard: Option<PendingShard>,
+}
+
+pub struct ShardRename {
+    dirfd: libc::c_int,
+    tmp_name: CString,
+    final_name: CString,
+}
+
+impl FlushWork {
+    /// Close any still-open fds. Called by the worker after the io_uring
+    /// fdatasync batch completes and before renames start.
+    pub fn close_fds(&mut self) {
+        if let Some(fd) = self.shard_fd.take() {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(m) = &mut self.manifest {
+            if let Some(fd) = m.fd.take() {
+                unsafe { libc::close(fd); }
+            }
+        }
+    }
+
+    pub fn shard_fd(&self) -> Option<libc::c_int> { self.shard_fd }
+    pub fn manifest_fd(&self) -> Option<libc::c_int> {
+        self.manifest.as_ref().and_then(|m| m.fd)
+    }
+}
+
+impl Drop for FlushWork {
+    fn drop(&mut self) {
+        self.close_fds();
+        if let Some(r) = self.shard_rename.take() {
+            unsafe { libc::unlinkat(r.dirfd, r.tmp_name.as_ptr(), 0); }
+        }
+        if let Some(m) = self.manifest.take() {
+            unsafe { libc::unlink(m.tmp_path.as_ptr()); }
+        }
+    }
+}
 
 
 // ---------------------------------------------------------------------------
@@ -173,27 +237,34 @@ impl Table {
         self.flush_inner(true, true)
     }
 
-    /// Flush without issuing fsync(dirfd). Returns the dirfd to sync when Some.
-    /// Caller is responsible for fsync-ing the returned fd before acknowledging
-    /// durability (e.g. at the end of flush_all).
-    pub fn flush_deferred(&mut self) -> Result<Option<libc::c_int>, StorageError> {
-        // Capture before flush_inner because flush_inner resets the memtable.
-        // A non-empty durable flush always touches the directory (unlinkat + publish_manifest),
-        // even when wrote == false.
-        let needs_dir_sync = !self.memtable.is_empty() && self.durable;
-        self.flush_inner(self.durable, false)?;
-        if needs_dir_sync {
-            Ok(Some(self.dirfd))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn flush_inner(&mut self, durable: bool, sync_dir: bool) -> Result<bool, StorageError> {
+    /// Phase 1 of two-phase flush.
+    ///
+    /// `durable=true` and a non-empty consolidated snapshot:
+    ///   write shard `.tmp` (no fdatasync), open MappedShard against it for
+    ///   metadata, write manifest `.tmp`, return `Pending(FlushWork)`. The
+    ///   memtable is NOT reset.
+    ///
+    /// `durable=false` (index circuits, ephemeral overflow flushes) with a
+    /// non-empty consolidated snapshot:
+    ///   write the shard inline via `write_shard_streaming(durable=false)` —
+    ///   no fdatasync, no manifest. Memtable IS reset and `DoneInline` is
+    ///   returned.
+    ///
+    /// Empty memtable or `consolidated.count == 0`:
+    ///   reset memtable and return `Empty`. The cancelled rows are still
+    ///   recoverable from the SAL.
+    pub fn flush_prepare(&mut self, durable: bool) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
-            return Ok(false);
+            return Ok(FlushOutcome::Empty);
         }
+
+        let snapshot = self.memtable.get_snapshot();
+        if snapshot.count == 0 {
+            self.memtable.reset();
+            return Ok(FlushOutcome::Empty);
+        }
+
         let (shard_name, lsn_max) = if durable {
             (
                 format!("shard_{}_{}.db", self.table_id, self.current_lsn),
@@ -211,29 +282,124 @@ impl Table {
             )
         };
 
-        let shard_path = format!("{}/{}", self.directory, shard_name);
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let regions = snapshot.regions();
 
-        let wrote = self.memtable.flush(self.dirfd, &name_c, self.table_id, durable)?;
-        if wrote {
-            self.shard_index.add_shard(&shard_path, 0, lsn_max)?;
-        } else {
-            let _ = unlinkat(self.dirfd, &name_c);
+        if !durable {
+            shard_file::write_shard_streaming(
+                self.dirfd, &name_c, self.table_id, snapshot.count as u32,
+                &regions, false,
+            )?;
+            let final_full = format!("{}/{}", self.directory, shard_name);
+            self.shard_index.add_shard(&final_full, 0, 0)?;
+            self.memtable.reset();
+            return Ok(FlushOutcome::DoneInline);
         }
 
-        if durable {
-            if let Some(ref path) = self.manifest_path {
-                self.shard_index.publish_manifest(path)?;
+        let prepared = shard_file::write_shard_streaming_prepare(
+            self.dirfd, &name_c, self.table_id, snapshot.count as u32, &regions,
+        )?;
+        let shard_fd = prepared.fd;
+        let tmp_name = prepared.tmp_name;
+
+        let mut work = FlushWork {
+            shard_fd: Some(shard_fd),
+            shard_rename: Some(ShardRename {
+                dirfd: self.dirfd,
+                tmp_name: tmp_name.clone(),
+                final_name: name_c.clone(),
+            }),
+            manifest: None,
+            pending_shard: None,
+        };
+
+        let tmp_full_c = CString::new(format!(
+            "{}/{}", self.directory,
+            tmp_name.to_str().map_err(|_| StorageError::InvalidPath)?,
+        )).map_err(|_| StorageError::InvalidPath)?;
+        let final_full = format!("{}/{}", self.directory, shard_name);
+
+        let pending = self.shard_index.open_shard_for_pending(
+            &tmp_full_c, final_full, 0, lsn_max,
+        )?;
+
+        let manifest_path = self.manifest_path.as_ref()
+            .expect("durable table must have manifest_path");
+        let manifest_c = CString::new(manifest_path.as_str())
+            .map_err(|_| StorageError::InvalidPath)?;
+        work.manifest = Some(self.shard_index
+            .prepare_manifest_with_pending(&manifest_c, &pending)?);
+        work.pending_shard = Some(pending);
+
+        Ok(FlushOutcome::Pending(work))
+    }
+
+    /// Phase 3: rename shard then manifest into final names; insert
+    /// pending_shard into shard_index; reset the memtable. Returns
+    /// `Some(dirfd)` to fsync after all renames in the worker batch.
+    pub fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<libc::c_int>, StorageError> {
+        // Rename shard .tmp → final.
+        if let Some(rename) = work.shard_rename.take() {
+            let rc = unsafe {
+                libc::renameat(
+                    rename.dirfd, rename.tmp_name.as_ptr(),
+                    rename.dirfd, rename.final_name.as_ptr(),
+                )
+            };
+            if rc < 0 {
+                // Restore so Drop unlinks the shard .tmp.
+                work.shard_rename = Some(rename);
+                return Err(StorageError::Io);
             }
-            if sync_dir {
-                if unsafe { libc::fsync(self.dirfd) } < 0 {
-                    return Err(StorageError::Io);
-                }
+        }
+
+        // Rename manifest .tmp → final. fd already closed by close_fds.
+        if let Some(m) = work.manifest.take() {
+            let rc = unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) };
+            if rc < 0 {
+                // Restore so Drop unlinks the manifest .tmp. The shard is
+                // already at its final path and will be collected by orphan GC.
+                work.manifest = Some(m);
+                return Err(StorageError::Io);
             }
+        }
+
+        // Publish the pending shard into the index.
+        if let Some(pending) = work.pending_shard.take() {
+            self.shard_index.add_opened_shard(pending)?;
         }
 
         self.memtable.reset();
-        Ok(wrote)
+        Ok(Some(self.dirfd))
+    }
+
+    fn flush_inner(&mut self, durable: bool, sync_dir: bool) -> Result<bool, StorageError> {
+        match self.flush_prepare(durable)? {
+            FlushOutcome::Empty => Ok(false),
+            FlushOutcome::DoneInline => Ok(true),
+            FlushOutcome::Pending(mut work) => {
+                if let Some(fd) = work.shard_fd() {
+                    if unsafe { libc::fdatasync(fd) } < 0 {
+                        return Err(StorageError::Io);
+                    }
+                }
+                if let Some(fd) = work.manifest_fd() {
+                    if unsafe { libc::fdatasync(fd) } < 0 {
+                        return Err(StorageError::Io);
+                    }
+                }
+                work.close_fds();
+                let dirfd = self.flush_commit(work)?;
+                if sync_dir {
+                    if let Some(fd) = dirfd {
+                        if unsafe { libc::fsync(fd) } < 0 {
+                            return Err(StorageError::Io);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -514,10 +680,6 @@ fn set_nocow_dir(dir_c: &CStr) {
             libc::close(fd);
         }
     }
-}
-
-fn unlinkat(dirfd: libc::c_int, name: &CStr) -> i32 {
-    unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) }
 }
 
 fn erase_stale_shards(dir: &str, table_id: u32) {
@@ -824,5 +986,69 @@ mod tests {
             unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
         );
         assert_eq!(val, 200, "shard fallback must pick live payload (val=200), not cancelled (val=100)");
+    }
+
+    /// Dropping a `Pending` FlushWork without committing must unlink the
+    /// shard `.tmp` and the manifest `.tmp`, leaving the directory clean
+    /// for a future retry.
+    #[test]
+    fn flush_prepare_drop_cleans_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("drop_clean_test");
+        let schema = make_u64_i64_schema();
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 1100, 1 << 20, true,
+        ).unwrap();
+
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
+
+        match t.flush_prepare(true).unwrap() {
+            FlushOutcome::Pending(work) => {
+                let dir_entries: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect();
+                assert!(dir_entries.iter().any(|n| n.ends_with(".tmp")),
+                    ".tmp files must exist before Drop, got {:?}", dir_entries);
+                drop(work);
+            }
+            other => panic!("expected Pending, got non-pending outcome: {}",
+                match other { FlushOutcome::Empty => "Empty",
+                              FlushOutcome::DoneInline => "DoneInline",
+                              _ => "?" }),
+        }
+
+        let leftover_tmp: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftover_tmp.is_empty(),
+            "Drop must unlink all .tmp files, found: {:?}", leftover_tmp);
+    }
+
+    /// Non-durable `flush_prepare` performs the inline write itself and
+    /// returns `DoneInline`; the memtable is reset and the shard is visible
+    /// to subsequent reads via the in-memory shard index.
+    #[test]
+    fn flush_prepare_non_durable_done_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("done_inline_test");
+        let schema = make_u64_i64_schema();
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 1200, 1 << 20, false,
+        ).unwrap();
+
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
+        match t.flush_prepare(false).unwrap() {
+            FlushOutcome::DoneInline => {}
+            FlushOutcome::Empty => panic!("expected DoneInline, got Empty"),
+            FlushOutcome::Pending(_) => panic!("expected DoneInline, got Pending"),
+        }
+        assert!(t.memtable_is_empty(), "memtable must be reset after non-durable flush_prepare");
+        assert!(t.has_pk(10));
+        assert!(t.has_pk(20));
     }
 }

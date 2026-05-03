@@ -7,9 +7,21 @@ use std::rc::Rc;
 use super::compact;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::manifest::{self, ManifestEntryRaw};
+use super::manifest::{self, ManifestEntryRaw, PreparedManifest};
 use super::shard_reader::MappedShard;
 use crate::util::{make_pk, split_pk};
+
+/// A shard that has been written and mmap'd at its `.tmp` path but not yet
+/// inserted into the index. Held by `Table::flush_prepare` until the worker
+/// completes Phase 2 and `flush_commit` renames the .tmp into place.
+pub struct PendingShard {
+    pub(crate) mapped: Rc<MappedShard>,
+    pub(crate) final_path: String,
+    pub(crate) pk_min: u128,
+    pub(crate) pk_max: u128,
+    pub(crate) min_lsn: u64,
+    pub(crate) max_lsn: u64,
+}
 
 const MAX_LEVELS: usize = 3;
 const L0_COMPACT_THRESHOLD: usize = 4;
@@ -329,6 +341,69 @@ impl ShardIndex {
         let global_lsn = self.max_lsn();
         let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
         manifest::write_file(&cpath, &entries, global_lsn)
+    }
+
+    /// Open a shard mmap from `tmp_path` and return a PendingShard recording
+    /// the metadata needed to publish it later. The index is NOT mutated.
+    /// `final_path` is the full filesystem path the shard will live at after
+    /// the rename (matches existing `ShardEntry::filename`).
+    pub fn open_shard_for_pending(
+        &self,
+        tmp_path: &CStr,
+        final_path: String,
+        min_lsn: u64,
+        max_lsn: u64,
+    ) -> Result<PendingShard, StorageError> {
+        let mapped = Rc::new(MappedShard::open(tmp_path, &self.schema, false)?);
+        let (pk_min, pk_max) = if mapped.count > 0 {
+            (mapped.get_pk(0), mapped.get_pk(mapped.count - 1))
+        } else {
+            (u128::MAX, 0)
+        };
+        Ok(PendingShard { mapped, final_path, pk_min, pk_max, min_lsn, max_lsn })
+    }
+
+    /// Serialize all current entries plus one pending shard into a manifest
+    /// `.tmp`. Returns the prepared manifest (fd + paths) without modifying
+    /// any index state.
+    pub fn prepare_manifest_with_pending(
+        &self,
+        manifest_path: &CStr,
+        pending: &PendingShard,
+    ) -> Result<PreparedManifest, StorageError> {
+        let mut entries = self.build_manifest_entries();
+        // Temporary ShardEntry so we can reuse entry_to_raw (which only reads
+        // metadata fields — it never dereferences shard).
+        let tmp = ShardEntry {
+            shard: Rc::clone(&pending.mapped),
+            filename: pending.final_path.clone(),
+            min_lsn: pending.min_lsn,
+            max_lsn: pending.max_lsn,
+            pk_min: pending.pk_min,
+            pk_max: pending.pk_max,
+        };
+        entries.push(self.entry_to_raw(&tmp, 0, 0));
+
+        let global_lsn = self.max_lsn().max(pending.max_lsn);
+        manifest::prepare_file(manifest_path, &entries, global_lsn)
+    }
+
+    /// Insert an already-mmap'd PendingShard into L0. Caller must have
+    /// renamed the underlying .tmp into `pending.final_path` already; Linux
+    /// rename(2) does not invalidate existing mmaps.
+    pub fn add_opened_shard(&mut self, pending: PendingShard) -> Result<(), StorageError> {
+        let entry = ShardEntry {
+            shard: pending.mapped,
+            filename: pending.final_path,
+            min_lsn: pending.min_lsn,
+            max_lsn: pending.max_lsn,
+            pk_min: pending.pk_min,
+            pk_max: pending.pk_max,
+        };
+        self.l0.push(entry);
+        self.sort_l0();
+        self.update_flags();
+        Ok(())
     }
 
     fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {

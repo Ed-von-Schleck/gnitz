@@ -4,6 +4,7 @@
 //! (`memtable.rs`).
 
 use std::ffi::CStr;
+#[cfg(test)]
 use std::ptr;
 
 use libc::c_int;
@@ -117,6 +118,7 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
 /// The XOR8 filter is built internally from region[0] (pk) when `row_count > 0`.
 ///
 /// Returns the complete file image ready for writing.
+#[cfg(test)]
 pub fn build_shard_image(
     table_id: u32,
     row_count: u32,
@@ -285,11 +287,30 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(
     Ok(())
 }
 
-/// Write a shard directly to disk without building an intermediate Vec<u8>.
-///
-/// Same output format as `build_shard_image` + `write_shard_at`, but peak memory
-/// is only the header+directory buffer instead of the entire shard image.
+/// Open .tmp shard file (basename + ".tmp") and write the full shard image to
+/// it, but do NOT fdatasync, close, or rename. Returns the open fd plus the
+/// .tmp basename so the caller can batch the fdatasync and perform the rename
+/// later. On any internal error the fd is closed and the .tmp is unlinked.
+pub struct PreparedShard {
+    pub fd: c_int,
+    pub tmp_name: std::ffi::CString,
+}
+
 #[allow(clippy::needless_range_loop)]
+pub fn write_shard_streaming_prepare(
+    dirfd: c_int,
+    basename: &CStr,
+    table_id: u32,
+    row_count: u32,
+    regions: &[(*const u8, usize)],
+) -> Result<PreparedShard, StorageError> {
+    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions)?;
+    Ok(PreparedShard { fd, tmp_name })
+}
+
+/// Write the .tmp shard, then fdatasync (if durable), close, and rename to
+/// `basename`. Used by compaction outputs and non-durable / single-table flush
+/// paths where batching across partitions is not needed.
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
@@ -298,6 +319,33 @@ pub fn write_shard_streaming(
     regions: &[(*const u8, usize)],
     durable: bool,
 ) -> Result<(), StorageError> {
+    let prepared = write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions)?;
+    unsafe {
+        if durable && libc::fdatasync(prepared.fd) < 0 {
+            libc::close(prepared.fd);
+            libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
+            return Err(StorageError::Io);
+        }
+        libc::close(prepared.fd);
+        if libc::renameat(dirfd, prepared.tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
+            libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
+            return Err(StorageError::Io);
+        }
+    }
+    Ok(())
+}
+
+/// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
+/// Caller is responsible for fdatasync, close, and rename. On error the fd
+/// is closed and the .tmp is unlinked.
+#[allow(clippy::needless_range_loop)]
+fn write_shard_streaming_inner(
+    dirfd: c_int,
+    basename: &CStr,
+    table_id: u32,
+    row_count: u32,
+    regions: &[(*const u8, usize)],
+) -> Result<(c_int, std::ffi::CString), StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
@@ -415,17 +463,12 @@ pub fn write_shard_streaming(
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
 
-    // --- Phase 5-9: open file, pwrite regions, sync, rename ---
-    let base_bytes = basename.to_bytes();
-    let mut tmp_name_buf = Vec::with_capacity(base_bytes.len() + 5);
-    tmp_name_buf.extend_from_slice(base_bytes);
-    tmp_name_buf.extend_from_slice(b".tmp\0");
-    let tmp_name = tmp_name_buf.as_ptr() as *const libc::c_char;
+    let tmp_name = super::cstr_with_tmp_suffix(basename)?;
 
     unsafe {
         let fd = libc::openat(
             dirfd,
-            tmp_name,
+            tmp_name.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644,
         );
@@ -433,21 +476,18 @@ pub fn write_shard_streaming(
             return Err(StorageError::Io);
         }
 
-        // Helper: on any post-open failure, unlink the .tmp file and bubble Io.
-        let abort = |fd: c_int| -> StorageError {
+        let abort = |fd: c_int, tmp_ptr: *const libc::c_char| -> StorageError {
             libc::close(fd);
-            libc::unlinkat(dirfd, tmp_name, 0);
+            libc::unlinkat(dirfd, tmp_ptr, 0);
             StorageError::Io
         };
 
         if libc::ftruncate(fd, total_size as libc::off_t) < 0 {
-            return Err(abort(fd));
+            return Err(abort(fd, tmp_name.as_ptr()));
         }
 
-        // Phase 6: write header + directory
-        pwrite_all(fd, &hdr_buf, 0).map_err(|_| abort(fd))?;
+        pwrite_all(fd, &hdr_buf, 0).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
 
-        // Phase 7: write each region
         for i in 0..num_regions {
             let (src_ptr, orig_sz) = regions[i];
             let r_off = region_offsets[i] as libc::off_t;
@@ -456,58 +496,42 @@ pub fn write_shard_streaming(
                 RegionEncoding::Raw => {
                     if actual_sizes[i] > 0 && !src_ptr.is_null() {
                         let src = std::slice::from_raw_parts(src_ptr, orig_sz);
-                        pwrite_all(fd, src, r_off).map_err(|_| abort(fd))?;
+                        pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
                     }
                 }
                 RegionEncoding::Constant { .. } => {
                     let elem_width = actual_sizes[i];
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
-                    pwrite_all(fd, src, r_off).map_err(|_| abort(fd))?;
+                    pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
                 }
                 RegionEncoding::TwoValue { .. } => {
-                    // Reuse the buffer built in phase 4 — no second allocation.
                     let buf = two_value_bufs[i].as_ref().expect("TwoValue buf precomputed");
-                    pwrite_all(fd, buf, r_off).map_err(|_| abort(fd))?;
+                    pwrite_all(fd, buf, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
                 }
             }
         }
 
-        // Phase 8: write XOR8 filter
         if let Some(ref data) = xor8_data {
-            pwrite_all(fd, data, xor8_offset as libc::off_t).map_err(|_| abort(fd))?;
+            pwrite_all(fd, data, xor8_offset as libc::off_t)
+                .map_err(|_| abort(fd, tmp_name.as_ptr()))?;
         }
 
-        // Phase 9: sync and rename
-        if durable && libc::fdatasync(fd) < 0 {
-            return Err(abort(fd));
-        }
-
-        libc::close(fd);
-
-        if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
-            libc::unlinkat(dirfd, tmp_name, 0);
-            return Err(StorageError::Io);
-        }
+        Ok((fd, tmp_name))
     }
-
-    Ok(())
 }
 
 /// Write `image` atomically using openat/fdatasync/renameat.
 ///
 /// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
 /// for absolute paths.
+#[cfg(test)]
 pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> Result<(), StorageError> {
-    let base_bytes = basename.to_bytes();
-    let mut tmp_buf = Vec::with_capacity(base_bytes.len() + 5);
-    tmp_buf.extend_from_slice(base_bytes);
-    tmp_buf.extend_from_slice(b".tmp\0");
-    let tmp_name = tmp_buf.as_ptr() as *const libc::c_char;
+    let tmp_name = super::cstr_with_tmp_suffix(basename)?;
 
     unsafe {
         let fd = libc::openat(
             dirfd,
-            tmp_name,
+            tmp_name.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644,
         );
@@ -515,24 +539,24 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             return Err(StorageError::Io);
         }
 
-        let abort = |fd: c_int| -> StorageError {
+        let abort = |fd: c_int, tmp_ptr: *const libc::c_char| -> StorageError {
             libc::close(fd);
-            libc::unlinkat(dirfd, tmp_name, 0);
+            libc::unlinkat(dirfd, tmp_ptr, 0);
             StorageError::Io
         };
 
         if crate::util::write_all_fd(fd, image) < 0 {
-            return Err(abort(fd));
+            return Err(abort(fd, tmp_name.as_ptr()));
         }
 
         if durable && libc::fdatasync(fd) < 0 {
-            return Err(abort(fd));
+            return Err(abort(fd, tmp_name.as_ptr()));
         }
 
         libc::close(fd);
 
-        if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
-            libc::unlinkat(dirfd, tmp_name, 0);
+        if libc::renameat(dirfd, tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
+            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
             return Err(StorageError::Io);
         }
     }

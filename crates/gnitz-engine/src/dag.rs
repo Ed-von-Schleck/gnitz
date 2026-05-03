@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
-use crate::storage::{Batch, CursorHandle, Table, PartitionedTable, StorageError};
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
 
@@ -136,16 +136,39 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched flush_deferred across all variants. Returns dirfds to fsync
-    /// (0 or 1 for Table variants, 0..N for Partitioned).
-    pub fn flush_deferred(&mut self) -> Result<Vec<libc::c_int>, StorageError> {
+    /// Dispatched Phase 1 across all variants. Returns one
+    /// (partition_idx, FlushWork) per partition that produced deferred
+    /// work; for Single/Borrowed `partition_idx` is always 0.
+    pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
         match self {
-            StoreHandle::Single(t) => t.flush_deferred().map(|opt| opt.into_iter().collect()),
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }
-                .flush_deferred()
-                .map(|opt| opt.into_iter().collect()),
-            StoreHandle::Partitioned(pt) => pt.flush_deferred(),
+            StoreHandle::Single(t) => match t.flush_prepare(true)? {
+                FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
+                FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
+            },
+            StoreHandle::Borrowed(ptr) => match unsafe { &mut **ptr }.flush_prepare(true)? {
+                FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
+                FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
+            },
+            StoreHandle::Partitioned(pt) => pt.flush_prepare(),
         }
+    }
+
+    /// Dispatched Phase 3 across all variants. Returns one dirfd per
+    /// committed partition.
+    pub fn flush_commit_batch(
+        &mut self,
+        works: Vec<(usize, FlushWork)>,
+    ) -> Result<Vec<libc::c_int>, StorageError> {
+        let t: &mut Table = match self {
+            StoreHandle::Single(t) => t,
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
+            StoreHandle::Partitioned(pt) => return pt.flush_commit_batch(works),
+        };
+        let mut out = Vec::with_capacity(works.len());
+        for (_, w) in works {
+            if let Some(fd) = t.flush_commit(w)? { out.push(fd); }
+        }
+        Ok(out)
     }
 
     /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).
@@ -1016,21 +1039,55 @@ impl DagEngine {
         0
     }
 
-    pub fn flush_deferred(&mut self, table_id: i64) -> Result<Vec<libc::c_int>, String> {
+    /// Phase 1 of two-phase flush. Walks the table handle and any index
+    /// circuits, returning the FlushWorks the caller must drive through
+    /// the io_uring fdatasync batch and Phase 3.
+    ///
+    /// Index circuits are non-durable, so they execute their inline shard
+    /// write here and contribute nothing to the returned Vec.
+    pub fn flush_prepare(
+        &mut self,
+        table_id: i64,
+    ) -> Result<Vec<(usize, FlushWork)>, String> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        let mut dirfds = entry.handle.flush_deferred()
-            .map_err(|_| format!("flush_deferred failed for table_id={}", table_id))?;
+        let works = entry.handle.flush_prepare()
+            .map_err(|_| format!("flush_prepare failed for table_id={}", table_id))?;
         for ic in &mut entry.index_circuits {
-            if let Some(fd) = ic.index_table.flush_deferred()
-                .map_err(|_| format!("index flush_deferred failed for table_id={}", table_id))?
-            {
-                dirfds.push(fd);
+            // Index tables are non-durable; this is an inline write that
+            // returns DoneInline/Empty and resets the memtable. No FlushWork.
+            match ic.index_table.flush_prepare(false) {
+                Ok(FlushOutcome::Empty) | Ok(FlushOutcome::DoneInline) => {}
+                Ok(FlushOutcome::Pending(_)) => {
+                    return Err(format!(
+                        "index flush_prepare unexpectedly returned Pending for table_id={}",
+                        table_id
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "index flush_prepare failed for table_id={}", table_id
+                    ));
+                }
             }
         }
-        Ok(dirfds)
+        Ok(works)
+    }
+
+    /// Phase 3 of two-phase flush. Returns one dirfd per partition committed.
+    pub fn flush_commit_batch(
+        &mut self,
+        table_id: i64,
+        works: Vec<(usize, FlushWork)>,
+    ) -> Result<Vec<libc::c_int>, String> {
+        let entry = match self.tables.get_mut(&table_id) {
+            Some(e) => e,
+            None => return Ok(vec![]),
+        };
+        entry.handle.flush_commit_batch(works)
+            .map_err(|_| format!("flush_commit_batch failed for table_id={}", table_id))
     }
 
     // ── DAG traversal helpers ───────────────────────────────────────────

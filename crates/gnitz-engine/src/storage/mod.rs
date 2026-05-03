@@ -24,7 +24,7 @@ pub(crate) mod batch_pool;
 mod error;
 
 // ── Public API ──────────────────────────────────────────────────────────────
-pub use table::Table;
+pub use table::{Table, FlushOutcome, FlushWork};
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_arena_size};
 pub use read_cursor::CursorHandle;
 pub use batch::{Batch, ConsolidatedBatch, write_to_batch, decode_mem_batch_from_wal_block};
@@ -36,4 +36,13 @@ pub(crate) use read_cursor::{DRAIN_BUFFER, ReadCursor, create_cursor_from_snapsh
 pub(crate) use columnar::compare_rows;
 pub(crate) use merge::{BlobCacheGuard, DirectWriter};
 pub(crate) use batch::carve_writer_slices;
+
+/// Append the `.tmp` suffix to a CStr basename and return a new CString.
+pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {
+    let b = base.to_bytes();
+    let mut v = Vec::with_capacity(b.len() + 4);
+    v.extend_from_slice(b);
+    v.extend_from_slice(b".tmp");
+    std::ffi::CString::new(v).map_err(|_| error::StorageError::InvalidPath)
+}
 

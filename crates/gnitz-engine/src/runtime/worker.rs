@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
-use crate::storage::{BlobCacheGuard, partition_for_key};
+use crate::storage::{BlobCacheGuard, FlushWork, partition_for_key};
 use crate::ops::worker_for_partition;
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION};
 use crate::runtime::sal::{
@@ -175,6 +175,61 @@ pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc
     inodes.sort_unstable_by_key(|&(dev, ino, _)| (dev, ino));
     inodes.dedup_by_key(|&mut (dev, ino, _)| (dev, ino));
     inodes.into_iter().map(|(_, _, fd)| fd).collect()
+}
+
+/// Submit one FSYNC(DATASYNC) SQE per fd and await completion of all of them.
+/// Drains the SQ when full so a chunk of more than `sq_entries` fds requires
+/// multiple `submit_and_wait` calls.
+pub(crate) fn uring_batch_fdatasync(
+    ring: &mut io_uring::IoUring,
+    fds: &[libc::c_int],
+) -> Result<(), String> {
+    uring_batch_fdatasync_with(ring, fds, |r, want| r.submit_and_wait(want))
+}
+
+fn uring_batch_fdatasync_with(
+    ring: &mut io_uring::IoUring,
+    fds: &[libc::c_int],
+    mut submit: impl FnMut(&mut io_uring::IoUring, usize) -> std::io::Result<usize>,
+) -> Result<(), String> {
+    if fds.is_empty() { return Ok(()); }
+    let sq_capacity = ring.params().sq_entries() as usize;
+    let mut completed = 0usize;
+    let mut pushed = 0usize;
+    while completed < fds.len() {
+        while pushed < fds.len() {
+            if ring.submission().len() >= sq_capacity { break; }
+            let sqe = io_uring::opcode::Fsync::new(io_uring::types::Fd(fds[pushed]))
+                .flags(io_uring::types::FsyncFlags::DATASYNC)
+                .build();
+            unsafe {
+                ring.submission().push(&sqe).map_err(|_| "uring SQ push".to_string())?;
+            }
+            pushed += 1;
+        }
+        let want = pushed - completed;
+        match submit(ring, want) {
+            Ok(_) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {
+                // Drain any CQEs that arrived before the signal.
+                for cqe in ring.completion() {
+                    if cqe.result() < 0 {
+                        return Err(format!("fdatasync via uring failed: {}", cqe.result()));
+                    }
+                    completed += 1;
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("uring submit_and_wait: {}", e)),
+        }
+        for cqe in ring.completion() {
+            if cqe.result() < 0 {
+                return Err(format!("fdatasync via uring failed: {}", cqe.result()));
+            }
+            completed += 1;
+        }
+    }
+    Ok(())
 }
 
 fn filter_by_pk(
@@ -889,23 +944,68 @@ impl WorkerProcess {
         self.pending_deltas.clear();
         let ids = self.cat().iter_user_table_ids();
         let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
+
+        let mut ring = io_uring::IoUring::new(256)
+            .map_err(|e| format!("io_uring::new failed: {}", e))?;
+
+        const FD_CHUNK_THRESHOLD: usize = 256;
+        let mut pending: Vec<(i64, Vec<(usize, FlushWork)>)> = Vec::new();
+        let mut pending_fds = 0usize;
+
         for tid in ids {
-            let dirfds = self.cat()
-                .flush_family_deferred(tid)
-                .map_err(|e| format!("flush_family tid={} rc={}", tid, e))?;
-            for fd in dirfds {
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(fd, &mut stat) } < 0 {
-                    let err = std::io::Error::last_os_error();
-                    return Err(format!("fstat failed during directory deduplication: {}", err));
-                }
-                dir_inodes.push((stat.st_dev as u64, stat.st_ino as u64, fd));
+            let works = self.cat().flush_family_prepare(tid)
+                .map_err(|e| format!("flush_prepare tid={}: {}", tid, e))?;
+            if works.is_empty() { continue; }
+            let added_fds: usize = works.iter()
+                .map(|(_, w)| w.shard_fd().is_some() as usize
+                    + w.manifest_fd().is_some() as usize)
+                .sum();
+            pending.push((tid, works));
+            pending_fds += added_fds;
+            if pending_fds >= FD_CHUNK_THRESHOLD {
+                self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
+                pending_fds = 0;
             }
         }
+        self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
+
         for fd in dedup_dirfds(dir_inodes) {
             if unsafe { libc::fsync(fd) } < 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(format!("dir fsync failed: {}", err));
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(
+        &mut self,
+        ring: &mut io_uring::IoUring,
+        pending: &mut Vec<(i64, Vec<(usize, FlushWork)>)>,
+        dir_inodes: &mut Vec<(u64, u64, libc::c_int)>,
+    ) -> Result<(), String> {
+        if pending.is_empty() { return Ok(()); }
+
+        let fds: Vec<libc::c_int> = pending.iter()
+            .flat_map(|(_, ws)| ws.iter())
+            .flat_map(|(_, w)| w.shard_fd().into_iter().chain(w.manifest_fd()))
+            .collect();
+        uring_batch_fdatasync(ring, &fds)?;
+
+        for (_, ws) in pending.iter_mut() {
+            for (_, w) in ws { w.close_fds(); }
+        }
+
+        for (tid, works) in pending.drain(..) {
+            let dirfds = self.cat().flush_family_commit_batch(tid, works)
+                .map_err(|e| format!("flush_commit tid={}: {}", tid, e))?;
+            for dirfd in dirfds {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(dirfd, &mut stat) } < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!("fstat: {}", err));
+                }
+                dir_inodes.push((stat.st_dev as u64, stat.st_ino as u64, dirfd));
             }
         }
         Ok(())
@@ -1069,6 +1169,87 @@ mod tests {
         let mut result = dedup_dirfds(inodes);
         result.sort_unstable();
         assert_eq!(result, vec![10i32, 20i32, 30i32]);
+    }
+
+    /// uring_batch_fdatasync must complete one CQE per fd it submitted, and
+    /// drain the SQ when the fd count exceeds the ring's SQ entries (forcing
+    /// multiple submit_and_wait rounds).
+    #[test]
+    fn test_uring_batch_fdatasync_chunked() {
+        // Tiny ring forces multiple submit_and_wait rounds for >4 fds.
+        let mut ring = io_uring::IoUring::new(4).expect("io_uring::new");
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut fds: Vec<libc::c_int> = Vec::new();
+        for i in 0..10 {
+            let path = dir.path().join(format!("f_{}.bin", i));
+            let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    path_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o644 as libc::mode_t,
+                )
+            };
+            assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+            // Some content so fdatasync has data to flush.
+            let buf = b"hello";
+            let rc = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            assert_eq!(rc as usize, buf.len());
+            fds.push(fd);
+        }
+
+        uring_batch_fdatasync(&mut ring, &fds).expect("batch fdatasync");
+
+        for fd in fds {
+            unsafe { libc::close(fd); }
+        }
+    }
+
+    #[test]
+    fn test_uring_batch_fdatasync_empty() {
+        let mut ring = io_uring::IoUring::new(8).expect("io_uring::new");
+        uring_batch_fdatasync(&mut ring, &[]).expect("empty batch should succeed");
+    }
+
+    /// EINTR on the first submit_and_wait must not stall: any CQEs that arrived
+    /// before the interrupt are drained, the loop retries, and all fds complete.
+    #[test]
+    fn test_uring_batch_fdatasync_eintr_retries() {
+        let mut ring = io_uring::IoUring::new(8).expect("io_uring::new");
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut fds: Vec<libc::c_int> = Vec::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("eintr_{}.bin", i));
+            let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let fd = unsafe {
+                libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
+            };
+            assert!(fd >= 0);
+            let buf = b"x";
+            unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
+            fds.push(fd);
+        }
+
+        let mut call_count = 0usize;
+        let result = uring_batch_fdatasync_with(&mut ring, &fds, |r, want| {
+            call_count += 1;
+            if call_count == 1 {
+                // Simulate EINTR without submitting: the SQEs stay queued in the
+                // ring buffer. The loop must drain 0 CQEs, continue, and retry.
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                r.submit_and_wait(want)
+            }
+        });
+
+        assert!(result.is_ok(), "EINTR should be retried, got: {:?}", result);
+        assert_eq!(call_count, 2, "exactly one EINTR then one successful submit expected");
+
+        for fd in fds {
+            unsafe { libc::close(fd); }
+        }
     }
 
     fn test_schema() -> SchemaDescriptor {

@@ -2,7 +2,6 @@
 //! PK lookups, and shard flush.
 
 use std::cmp::Ordering;
-use std::ffi::CStr;
 use std::rc::Rc;
 
 use super::batch::{Batch, write_to_batch, ConsolidatedBatch};
@@ -11,7 +10,6 @@ use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use super::merge::{self, SortedMemBatch};
-use super::shard_file;
 
 // Accessible to the tests submodule (private items are visible to descendants).
 #[cfg(test)]
@@ -245,32 +243,6 @@ impl MemTable {
         }
         self.has_found = false;
         false
-    }
-
-    /// Consolidate all runs and write to a shard file.
-    ///
-    /// Returns `Ok(true)` on success, `Ok(false)` when there is nothing to
-    /// flush (no file written), or `Err(_)` on shard-write failure.
-    pub fn flush(
-        &mut self,
-        dirfd: libc::c_int,
-        basename: &CStr,
-        table_id: u32,
-        durable: bool,
-    ) -> Result<bool, StorageError> {
-        let snapshot = self.get_snapshot();
-        if snapshot.count == 0 {
-            return Ok(false);
-        }
-
-        let regions = snapshot.regions();
-        let image = shard_file::build_shard_image(
-            table_id,
-            snapshot.count as u32,
-            &regions,
-        );
-        shard_file::write_shard_at(dirfd, basename, &image, durable)?;
-        Ok(true)
     }
 
     /// Clear all runs, bloom filter, and cache.  Ready for reuse.
@@ -516,49 +488,6 @@ mod tests {
         let ref_mb3 = ref_batch3.as_mem_batch();
         let w3 = mt.find_weight_for_row(10, &ref_mb3, 0);
         assert_eq!(w3, 0);
-    }
-
-    #[test]
-    fn memtable_flush_to_shard() {
-        let schema = make_u64_i64_schema();
-        let mut mt = MemTable::new(schema, 1 << 20);
-        let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
-        mt.upsert_sorted_batch(b1).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let dir_cstr = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
-        let dirfd = unsafe {
-            libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
-        assert!(dirfd >= 0, "open({:?}) failed: {}", dir.path(), std::io::Error::last_os_error());
-
-        let name = std::ffi::CString::new("test_shard.db").unwrap();
-        let wrote = mt.flush(dirfd, &name, 42, false).unwrap();
-        assert!(wrote);
-
-        // Verify shard file exists
-        let shard_path = dir.path().join("test_shard.db");
-        assert!(shard_path.exists());
-        assert!(std::fs::metadata(&shard_path).unwrap().len() > 0);
-
-        unsafe { libc::close(dirfd); }
-    }
-
-    #[test]
-    fn memtable_flush_empty_returns_false() {
-        let schema = make_u64_i64_schema();
-        let mut mt = MemTable::new(schema, 1 << 20);
-        let dir = tempfile::tempdir().unwrap();
-        let dir_cstr = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
-        let dirfd = unsafe {
-            libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
-        assert!(dirfd >= 0, "open({:?}) failed: {}", dir.path(), std::io::Error::last_os_error());
-
-        let name = std::ffi::CString::new("empty.db").unwrap();
-        let wrote = mt.flush(dirfd, &name, 42, false).unwrap();
-        assert!(!wrote);
-        unsafe { libc::close(dirfd); }
     }
 
     #[test]
