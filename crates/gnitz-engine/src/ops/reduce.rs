@@ -338,7 +338,7 @@ fn read_col_value(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> i64 {
             // Must use stride=16 so get_col_ptr computes the correct row base address;
             // passing stride=8 gives the right offset only for row=0.
             i64::from_le_bytes(mb.get_col_ptr(row, pi, 16)[..8].try_into().unwrap()),
-        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID =>
+        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob =>
             unreachable!("read_col_value: non-integer/string type"),
     }
 }
@@ -357,7 +357,7 @@ fn read_col_value_f64(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> f64
         }
         TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
         TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String =>
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob =>
             unreachable!("read_col_value_f64: non-float type"),
     }
 }
@@ -378,7 +378,7 @@ fn pk_as_i64(pk: u128, tc: TypeCode) -> i64 {
         TypeCode::U64 => pk as u64 as i64,
         TypeCode::F32 => f32::from_bits(pk as u32) as f64 as i64,
         TypeCode::F64 => f64::from_bits(pk as u64) as i64,
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String =>
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob =>
             unreachable!("pk_as_i64: non-numeric PK type"),
     }
 }
@@ -401,7 +401,7 @@ pub(super) fn extract_gc_u64(
         let eligible = match tc {
             TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
             TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 => true,
-            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::String => false,
+            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob => false,
         };
         if eligible {
             let pi = payload_idx(c_idx, pki);
@@ -513,6 +513,7 @@ fn compare_by_group_cols(
                 b_buf[..cs].copy_from_slice(b_ptr);
                 u64::from_le_bytes(a_buf).cmp(&u64::from_le_bytes(b_buf))
             }
+            TypeCode::Blob => unreachable!("BLOB columns are not valid group-by keys"),
         };
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -650,6 +651,7 @@ fn apply_agg_from_value_index(
                 }
                 TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 |
                 TypeCode::U128 | TypeCode::UUID | TypeCode::String => {}
+                TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
             }
             acc.seed_from_raw_bits(encoded);
             return true;

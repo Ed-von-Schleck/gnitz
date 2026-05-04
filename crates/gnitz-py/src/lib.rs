@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
-use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
+use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, Circuit, GnitzClient};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, MAX_COLUMNS};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::{SqlPlanner, SqlResult};
@@ -338,6 +338,7 @@ impl PyZSetBatch {
                 buf.extend(std::iter::repeat(0u8).take(stride));
             }
             ColData::Strings(v) => v.push(None),
+            ColData::Bytes(v) => v.push(None),
             ColData::U128s(v) => v.push(0),
         }
         Ok(())
@@ -497,7 +498,7 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
         TypeCode::U64  => buf.extend_from_slice(&item.extract::<u64>()?.to_le_bytes()),
         TypeCode::I64  => buf.extend_from_slice(&item.extract::<i64>()?.to_le_bytes()),
         TypeCode::F64  => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID => unreachable!("handled before write_fixed_le"),
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob => unreachable!("handled before write_fixed_le"),
     }
     Ok(())
 }
@@ -515,7 +516,7 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
         TypeCode::U64  => u64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::I64  => i64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::F64  => f64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID => unreachable!(),
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob => unreachable!(),
     }
 }
 
@@ -589,6 +590,10 @@ fn build_row_values_into(
                     }
                     ColData::Strings(v) => match &v[row] {
                         Some(s) => out.push(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => out.push(py.None().into()),
+                    },
+                    ColData::Bytes(v) => match &v[row] {
+                        Some(b) => out.push(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
                         None    => out.push(py.None().into()),
                     },
                     ColData::U128s(v) => {
@@ -696,6 +701,15 @@ fn rust_batch_columns_to_py(
                 let items: Vec<PyObject> = v.iter()
                     .map(|s| match s {
                         Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => Ok(py.None().into()),
+                    })
+                    .collect::<PyResult<_>>()?;
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
+            }
+            ColData::Bytes(v) => {
+                let items: Vec<PyObject> = v.iter()
+                    .map(|b| match b {
+                        Some(b) => Ok(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
                         None    => Ok(py.None().into()),
                     })
                     .collect::<PyResult<_>>()?;
@@ -928,6 +942,20 @@ impl PyScanResult {
                     .collect::<PyResult<_>>()?;
                 Ok(PyList::new(py, items)?.unbind())
             }
+            ColData::Bytes(v) => {
+                let items: Vec<PyObject> = v.iter().enumerate()
+                    .map(|(i, b)| {
+                        if nulls[i] & null_bit != 0 {
+                            return Ok::<PyObject, PyErr>(py.None().into());
+                        }
+                        match b {
+                            Some(b) => Ok(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
+                            None    => Ok(py.None().into()),
+                        }
+                    })
+                    .collect::<PyResult<_>>()?;
+                Ok(PyList::new(py, items)?.unbind())
+            }
             ColData::U128s(v) => {
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, &x)| {
@@ -1152,13 +1180,13 @@ impl PyGnitzClient {
     pub fn create_view_with_circuit(
         &self, py: Python<'_>,
         schema_name: &str, view_name: &str,
-        mut circuit: PyRefMut<'_, PyCircuitGraph>,
+        mut circuit: PyRefMut<'_, PyCircuit>,
         output_schema: PyRef<'_, PySchema>,
     ) -> PyResult<u64> {
-        let graph = circuit.inner.take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("CircuitGraph already consumed"))?;
+        let circuit = circuit.inner.take()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Circuit already consumed"))?;
         let rust_schema = py_schema_to_rust(py, &output_schema)?;
-        client!(self).create_view_with_circuit(schema_name, view_name, "", graph, &rust_schema.columns)
+        client!(self).create_view_with_circuit(schema_name, view_name, "", circuit, &rust_schema.columns)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -1402,9 +1430,8 @@ impl PyCircuitBuilder {
         Ok(circuit_builder!(self).shard(input, &shard_columns))
     }
 
-    #[pyo3(signature = (input, worker_id = 0))]
-    pub fn gather(&mut self, input: u64, worker_id: u64) -> PyResult<u64> {
-        Ok(circuit_builder!(self).gather(input, worker_id))
+    pub fn gather(&mut self, input: u64) -> PyResult<u64> {
+        Ok(circuit_builder!(self).gather(input))
     }
 
     pub fn sink(&mut self, input: u64) -> PyResult<u64> {
@@ -1415,25 +1442,25 @@ impl PyCircuitBuilder {
         Ok(circuit_builder!(self).map_expr(input, expr.inner.clone()))
     }
 
-    /// Consume builder and produce a CircuitGraph for create_view_with_circuit.
-    pub fn build(&mut self) -> PyResult<PyCircuitGraph> {
+    /// Consume builder and produce a Circuit for create_view_with_circuit.
+    pub fn build(&mut self) -> PyResult<PyCircuit> {
         let b = self.inner.take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("CircuitBuilder already consumed"))?;
-        Ok(PyCircuitGraph { inner: Some(b.build()) })
+        Ok(PyCircuit { inner: Some(b.build()) })
     }
 }
 
-#[pyclass(name = "CircuitGraph")]
-pub struct PyCircuitGraph {
-    pub(crate) inner: Option<CircuitGraph>,
+#[pyclass(name = "Circuit")]
+pub struct PyCircuit {
+    pub(crate) inner: Option<Circuit>,
 }
 
 #[pymethods]
-impl PyCircuitGraph {
+impl PyCircuit {
     pub fn __repr__(&self) -> String {
         match &self.inner {
-            Some(g) => format!("CircuitGraph(view_id={}, nodes={})", g.view_id, g.nodes.len()),
-            None    => "CircuitGraph(consumed)".to_string(),
+            Some(c) => format!("Circuit(view_id={}, nodes={})", c.view_id, c.nodes.len()),
+            None    => "Circuit(consumed)".to_string(),
         }
     }
 }
@@ -1773,7 +1800,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExprBuilder>()?;
     m.add_class::<PyExprProgram>()?;
     m.add_class::<PyCircuitBuilder>()?;
-    m.add_class::<PyCircuitGraph>()?;
+    m.add_class::<PyCircuit>()?;
     m.add_class::<PyAsyncTransport>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     Ok(())

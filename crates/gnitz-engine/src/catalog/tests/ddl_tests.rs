@@ -194,77 +194,10 @@ fn test_edge_cases() {
 // schema_is_empty must return false when a view (not just a table) exists,
 // and drop_schema must collect and drop the view before the table.
 
-#[test]
-fn test_drop_schema_cascade_with_view() {
-    let dir = temp_dir("drop_schema_view");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    engine.create_schema("vs").unwrap();
-
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
-    let out_cols = vec![
-        ("id".to_string(), type_code::U64),
-        ("val".to_string(), type_code::I64),
-    ];
-    let tid = engine.create_table("vs.base", &cols, 0, true).unwrap();
-    let graph = make_passthrough_graph(tid, &out_cols);
-    let vid = engine.create_view("vs.vw", &graph, "").unwrap();
-
-    let sid = engine.get_schema_id("vs");
-    assert!(!engine.schema_is_empty("vs"), "schema with table+view must not be empty");
-    assert!(engine.caches.tables_by_schema.get(&sid).map(|s| s.contains(&tid)).unwrap_or(false),
-        "tables_by_schema must contain the base table");
-    assert!(engine.caches.views_by_schema.get(&sid).map(|s| s.contains(&vid)).unwrap_or(false),
-        "views_by_schema must contain the view");
-
-    // Drop schema — must cascade-drop the view and table in the right order
-    engine.drop_schema("vs").unwrap();
-
-    assert!(!engine.has_schema("vs"));
-    assert!(!engine.dag.tables.contains_key(&tid), "base table must be gone");
-    assert!(!engine.dag.tables.contains_key(&vid), "view must be gone");
-    assert!(engine.caches.views_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true),
-        "views_by_schema must be empty after cascade");
-    assert!(engine.caches.tables_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true),
-        "tables_by_schema must be empty after cascade");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_schema_is_empty_view_only ──────────────────────────────────────
-// schema_is_empty must return false when only a view (no table) exists
-// in the schema, and true after that view is dropped.
-
-#[test]
-fn test_schema_is_empty_view_only() {
-    let dir = temp_dir("empty_view_only");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-
-    // Base table lives in public; view lives in a separate schema
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
-    let out_cols = vec![
-        ("id".to_string(), type_code::U64),
-        ("val".to_string(), type_code::I64),
-    ];
-    let tid = engine.create_table("public.src", &cols, 0, true).unwrap();
-
-    engine.create_schema("vonly").unwrap();
-    assert!(engine.schema_is_empty("vonly"));
-
-    let graph = make_passthrough_graph(tid, &out_cols);
-    let vid = engine.create_view("vonly.vw", &graph, "").unwrap();
-    assert!(!engine.schema_is_empty("vonly"), "schema with a view must not be empty");
-
-    engine.drop_view("vonly.vw").unwrap();
-    assert!(engine.schema_is_empty("vonly"), "schema must be empty after dropping its only view");
-    assert!(!engine.dag.tables.contains_key(&vid));
-
-    engine.drop_schema("vonly").unwrap();
-    engine.drop_table("public.src").unwrap();
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
+// `test_drop_schema_cascade_with_view` and `test_schema_is_empty_view_only`
+// previously relied on `engine.create_view(qname, &CircuitGraph, sql)` —
+// removed alongside the circuit-graph schema redesign. Equivalent end-to-end
+// coverage runs through the wire path in the Python E2E suite.
 
 // ── test_unique_pk_metadata ──────────────────────────────────────────
 

@@ -14,16 +14,11 @@ pub(crate) struct ColumnDef {
     pub(crate) fk_col_idx: u32,
 }
 
-/// Circuit graph for create_view.
-pub(crate) struct CircuitGraph {
-    pub(crate) nodes: Vec<(i32, i32)>,           // (node_id, opcode)
-    pub(crate) edges: Vec<(i32, i32, i32, i32)>, // (edge_id, src, dst, port)
-    pub(crate) sources: Vec<(i32, i64)>,         // (node_id, table_id)
-    pub(crate) params: Vec<(i32, i32, i64)>,     // (node_id, slot, value)
-    pub(crate) group_cols: Vec<(i32, i32)>,      // (node_id, col_idx)
-    pub(crate) output_col_defs: Vec<(String, u8)>, // (name, type_code)
-    pub(crate) dependencies: Vec<i64>,           // source table_ids
-}
+// `CircuitGraph` previously lived here as the DTO for the now-deleted
+// `engine.create_view(qname, &CircuitGraph, sql)` direct path. After the
+// circuit-graph schema redesign, views always reach the engine via the
+// wire path (`client.rs::create_view_with_circuit`) using the typed
+// `gnitz_core::Circuit` instead.
 
 // ---------------------------------------------------------------------------
 // FK constraint

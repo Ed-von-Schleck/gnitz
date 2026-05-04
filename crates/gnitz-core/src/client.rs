@@ -3,16 +3,13 @@ use crate::protocol::types::type_code_from_u64;
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
 use crate::types::{
-    CircuitGraph,
-    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
-    CIRCUIT_PARAMS_TAB, CIRCUIT_GROUP_COLS_TAB,
+    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
     OWNER_KIND_TABLE, OWNER_KIND_VIEW,
-    OPCODE_SCAN_TRACE, OPCODE_INTEGRATE,
-    PORT_IN,
     schema_tab_schema, table_tab_schema, col_tab_schema, view_tab_schema,
     dep_tab_schema, circuit_nodes_schema, circuit_edges_schema,
-    circuit_sources_schema, circuit_params_schema, circuit_group_cols_schema,
+    circuit_node_columns_schema,
 };
+use crate::circuit::Circuit;
 
 // --- Module-private helpers ---
 
@@ -358,67 +355,18 @@ impl GnitzClient {
         source_table_id: u64,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
+        // Construct a minimal SCAN_DELTA → INTEGRATE_SINK circuit using the
+        // typed builder so the row materialisation matches the new layout
+        // bit-for-bit (no separate CircuitSources row, no PARAM_TABLE_ID,
+        // single dependency entry).
         let vid = self.conn.alloc_table_id()?;
 
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
-        })?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let mut cb = crate::circuit::CircuitBuilder::new(vid, source_table_id);
+        let scan = cb.input_delta();
+        cb.sink(scan);
+        let circuit = cb.build();
 
-        // 1. Column records
-        self.push_col_tab_records(vid, OWNER_KIND_VIEW, output_columns)?;
-
-        // 2. Dependency record (U128 PK: pk_hi=vid, pk_lo=source_table_id)
-        {
-            let dep_s = dep_tab_schema();
-            let mut dep = ZSetBatch::new(&dep_s);
-            BatchAppender::new(&mut dep, &dep_s)
-                .add_row(source_table_id as u128 | (vid as u128) << 64, 1)
-                .u64_val(vid)
-                .u64_val(0)
-                .u64_val(source_table_id);
-            self.conn.push(DEP_TAB, &dep_s, &dep)?;
-        }
-
-        // 3. Circuit nodes: SCAN_TRACE (node 0) + INTEGRATE (node 1)
-        {
-            let nodes_s = circuit_nodes_schema();
-            let mut nodes = ZSetBatch::new(&nodes_s);
-            {
-                let mut a = BatchAppender::new(&mut nodes, &nodes_s);
-                a.add_row((vid as u128) << 64, 1).u64_val(OPCODE_SCAN_TRACE);
-                a.add_row(1u128 | (vid as u128) << 64, 1).u64_val(OPCODE_INTEGRATE);
-            }
-            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
-        }
-
-        // 4. Circuit edge: node 0 -> node 1, port PORT_IN
-        {
-            let edges_s = circuit_edges_schema();
-            let mut edges = ZSetBatch::new(&edges_s);
-            BatchAppender::new(&mut edges, &edges_s)
-                .add_row((vid as u128) << 64, 1)
-                .u64_val(0)
-                .u64_val(1)
-                .u64_val(PORT_IN);
-            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
-        }
-
-        // 5. Circuit source: node 0, table_id=0 (primary input resolved from deps)
-        {
-            let sources_s = circuit_sources_schema();
-            let mut sources = ZSetBatch::new(&sources_s);
-            BatchAppender::new(&mut sources, &sources_s)
-                .add_row((vid as u128) << 64, 1)
-                .u64_val(0);
-            self.conn.push(CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
-        }
-
-        // 6. View record — must be last (triggers server-side hook + circuit compilation)
-        self.push_view_record(vid, schema_id, view_name, "")?;
-
-        Ok(vid)
+        self.write_circuit_rows(schema_name, view_name, "", vid, circuit, output_columns)
     }
 
     pub fn create_view_with_circuit(
@@ -426,17 +374,29 @@ impl GnitzClient {
         schema_name: &str,
         view_name: &str,
         sql_text: &str,
-        circuit: CircuitGraph,
+        circuit: Circuit,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
-        circuit.validate().map_err(ClientError::ServerError)?;
-
         let vid = if circuit.view_id == 0 {
             self.conn.alloc_table_id()?
         } else {
             circuit.view_id
         };
+        self.write_circuit_rows(schema_name, view_name, sql_text, vid, circuit, output_columns)
+    }
 
+    /// Shared serialisation path for `create_view` / `create_view_with_circuit`.
+    /// Writes columns, dependencies, the three circuit tables, and the view
+    /// record (which must come last — it triggers the server-side hook).
+    fn write_circuit_rows(
+        &self,
+        schema_name: &str,
+        view_name: &str,
+        sql_text: &str,
+        vid: u64,
+        circuit: Circuit,
+        output_columns: &[ColumnDef],
+    ) -> Result<u64, ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
@@ -446,13 +406,14 @@ impl GnitzClient {
         // 1. Column records
         self.push_col_tab_records(vid, OWNER_KIND_VIEW, output_columns)?;
 
-        // 2. Dependency records
-        if !circuit.dependencies.is_empty() {
+        // 2. Dependency records — every ScanDelta source_table.
+        let deps = circuit.dependencies();
+        if !deps.is_empty() {
             let dep_s = dep_tab_schema();
             let mut dep = ZSetBatch::new(&dep_s);
             {
                 let mut a = BatchAppender::new(&mut dep, &dep_s);
-                for &dep_tid in &circuit.dependencies {
+                for &dep_tid in &deps {
                     a.add_row(dep_tid as u128 | (vid as u128) << 64, 1)
                         .u64_val(vid)
                         .u64_val(0)
@@ -462,88 +423,85 @@ impl GnitzClient {
             self.conn.push(DEP_TAB, &dep_s, &dep)?;
         }
 
-        // 3. Circuit nodes
-        if !circuit.nodes.is_empty() {
+        // Materialise the typed circuit into the three-table row bundle.
+        let rows = circuit.into_rows();
+
+        // 3. CircuitNodes
+        if !rows.nodes.is_empty() {
             let nodes_s = circuit_nodes_schema();
             let mut nodes = ZSetBatch::new(&nodes_s);
             {
                 let mut a = BatchAppender::new(&mut nodes, &nodes_s);
-                for &(node_id, opcode) in &circuit.nodes {
-                    a.add_row(node_id as u128 | (vid as u128) << 64, 1).u64_val(opcode);
+                for (node_id, opcode, src_tab, reindex, expr_blob) in &rows.nodes {
+                    let pk = *node_id as u128 | (vid as u128) << 64;
+                    let mut null_mask: u64 = 0;
+                    // Payload column null-bit positions: source_table=3, reindex_col=4, expr_program=5.
+                    if src_tab.is_none()  { null_mask |= 1u64 << 3; }
+                    if reindex.is_none()  { null_mask |= 1u64 << 4; }
+                    if expr_blob.is_none() { null_mask |= 1u64 << 5; }
+                    a.add_row(pk, 1)
+                        .null_mask(null_mask)
+                        .u64_val(vid)
+                        .u64_val(*node_id)
+                        .u64_val(*opcode);
+                    match src_tab { Some(t) => { a.u64_val(*t); }, None => { a.u64_val(0); } }
+                    match reindex { Some(r) => { a.u64_val(*r as u64); }, None => { a.u64_val(0); } }
+                    match expr_blob {
+                        Some(b) => { a.bytes_val(b); }
+                        None    => { a.bytes_null(); }
+                    }
                 }
             }
             self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
         }
 
-        // 4. Circuit edges
-        if !circuit.edges.is_empty() {
+        // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
+        if !rows.edges.is_empty() {
             let edges_s = circuit_edges_schema();
             let mut edges = ZSetBatch::new(&edges_s);
             {
                 let mut a = BatchAppender::new(&mut edges, &edges_s);
-                for &(edge_id, src, dst, port) in &circuit.edges {
-                    a.add_row(edge_id as u128 | (vid as u128) << 64, 1)
-                        .u64_val(src)
-                        .u64_val(dst)
-                        .u64_val(port);
+                for (dst_node, dst_port, src_node) in &rows.edges {
+                    debug_assert!(*dst_node < (1u64 << 40), "dst_node {} exceeds 40-bit cap", dst_node);
+                    let pk_lo = ((*dst_node as u128) << 8) | (*dst_port as u128);
+                    let pk = pk_lo | (vid as u128) << 64;
+                    a.add_row(pk, 1)
+                        .u64_val(vid)
+                        .u64_val(*dst_node)
+                        .u64_val(*dst_port as u64)
+                        .u64_val(*src_node);
                 }
             }
             self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
         }
 
-        // 5. Circuit sources
-        if !circuit.sources.is_empty() {
-            let sources_s = circuit_sources_schema();
-            let mut sources = ZSetBatch::new(&sources_s);
+        // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
+        if !rows.node_columns.is_empty() {
+            let s = circuit_node_columns_schema();
+            let mut nc = ZSetBatch::new(&s);
             {
-                let mut a = BatchAppender::new(&mut sources, &sources_s);
-                for &(node_id, table_id) in &circuit.sources {
-                    a.add_row(node_id as u128 | (vid as u128) << 64, 1).u64_val(table_id);
+                let mut a = BatchAppender::new(&mut nc, &s);
+                for (node_id, kind, position, v1, v2) in &rows.node_columns {
+                    debug_assert!((*position as u64) <= 0xFFFF);
+                    debug_assert!((*kind) <= 0xFF);
+                    debug_assert!((*node_id) <= 0xFFFF_FFFF_FF);
+                    let pk_lo = ((*node_id as u128) << 24)
+                        | ((*kind as u128) << 16)
+                        | (*position as u128);
+                    let pk = pk_lo | (vid as u128) << 64;
+                    a.add_row(pk, 1)
+                        .u64_val(vid)
+                        .u64_val(*node_id)
+                        .u64_val(*kind)
+                        .u64_val(*position as u64)
+                        .u64_val(*v1)
+                        .u64_val(*v2);
                 }
             }
-            self.conn.push(CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
+            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, &s, &nc)?;
         }
 
-        // 6. Circuit params (3-column schema: param_pk, value, str_value)
-        if !circuit.params.is_empty() || !circuit.const_strings.is_empty() {
-            let params_s = circuit_params_schema();
-            let mut params = ZSetBatch::new(&params_s);
-            {
-                let mut a = BatchAppender::new(&mut params, &params_s);
-                // Numeric params: str_value = NULL
-                for &(node_id, slot, value) in &circuit.params {
-                    let param_lo = (node_id << 8) | slot;
-                    a.add_row(param_lo as u128 | (vid as u128) << 64, 1)
-                        .null_mask(1 << 1)
-                        .u64_val(value)
-                        .str_null();
-                }
-                // String constant params: str_value = actual string
-                for (node_id, slot, ref value) in &circuit.const_strings {
-                    let param_lo = (node_id << 8) | slot;
-                    a.add_row(param_lo as u128 | (vid as u128) << 64, 1)
-                        .u64_val(0)
-                        .str_val(value);
-                }
-            }
-            self.conn.push(CIRCUIT_PARAMS_TAB, &params_s, &params)?;
-        }
-
-        // 7. Circuit group cols
-        if !circuit.group_cols.is_empty() {
-            let gcols_s = circuit_group_cols_schema();
-            let mut gcols = ZSetBatch::new(&gcols_s);
-            {
-                let mut a = BatchAppender::new(&mut gcols, &gcols_s);
-                for &(node_id, col_idx) in &circuit.group_cols {
-                    let gcol_lo = (node_id << 16) | col_idx;
-                    a.add_row(gcol_lo as u128 | (vid as u128) << 64, 1).u64_val(col_idx);
-                }
-            }
-            self.conn.push(CIRCUIT_GROUP_COLS_TAB, &gcols_s, &gcols)?;
-        }
-
-        // 8. View record — must be last
+        // 6. View record — must be last (triggers server-side hook + circuit compilation).
         self.push_view_record(vid, schema_id, view_name, sql_text)?;
 
         Ok(vid)

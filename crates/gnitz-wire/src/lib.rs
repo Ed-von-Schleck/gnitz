@@ -42,6 +42,7 @@ pub mod type_code {
     pub const STRING: u8 = 11;
     pub const U128:   u8 = 12;
     pub const UUID:   u8 = 13;
+    pub const BLOB:   u8 = 14;
 }
 
 /// Typed column type code enum, mirroring the `type_code::*` constants.
@@ -65,6 +66,7 @@ pub enum TypeCode {
     String = type_code::STRING,
     U128   = type_code::U128,
     UUID   = type_code::UUID,
+    Blob   = type_code::BLOB,
 }
 
 impl TypeCode {
@@ -93,6 +95,7 @@ impl TypeCode {
             tc::STRING => Some(TypeCode::String),
             tc::U128   => Some(TypeCode::U128),
             tc::UUID   => Some(TypeCode::UUID),
+            tc::BLOB   => Some(TypeCode::Blob),
             _          => None,
         }
     }
@@ -104,7 +107,7 @@ impl TypeCode {
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
             TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
-            TypeCode::U128 | TypeCode::UUID | TypeCode::String => 16,
+            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob => 16,
         }
     }
 
@@ -127,8 +130,8 @@ pub const fn wire_stride(tc: u8) -> usize {
         3 | 4           => 2,   // U16, I16
         5..=7           => 4,   // U32, I32, F32
         8..=10          => 8,   // U64, I64, F64
-        11 | 12 | 13    => 16,  // STRING, U128, UUID
-        _                => 8,
+        11 | 12 | 13 | 14 => 16,  // STRING, U128, UUID, BLOB
+        _                 => 8,
     }
 }
 
@@ -198,7 +201,14 @@ pub const OPCODE_INTEGRATE:             u64 = 7;
 pub const OPCODE_DELAY:                 u64 = 8;
 pub const OPCODE_REDUCE:                u64 = 9;
 pub const OPCODE_DISTINCT:              u64 = 10;
-pub const OPCODE_SCAN_TRACE:            u64 = 11;
+/// Delta input source. Replaces both `input_delta()` and
+/// `input_delta_tagged()` from the legacy layout — the actual table_id
+/// lives in the node row's `source_table` column for both.
+/// (Numeric value preserved from the prior `OPCODE_SCAN_TRACE = 11`.)
+pub const OPCODE_SCAN_DELTA:            u64 = 11;
+/// Legacy alias retained temporarily during the circuit-graph schema
+/// rewrite. New code should use `OPCODE_SCAN_DELTA`.
+pub const OPCODE_SCAN_TRACE:            u64 = OPCODE_SCAN_DELTA;
 pub const OPCODE_SEEK_TRACE:            u64 = 12;
 pub const OPCODE_CLEAR_DELTAS:          u64 = 15;
 pub const OPCODE_ANTI_JOIN_DELTA_TRACE: u64 = 16;
@@ -210,6 +220,17 @@ pub const OPCODE_EXCHANGE_GATHER:       u64 = 21;
 pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
 pub const OPCODE_NULL_EXTEND:            u64 = 23;
 pub const OPCODE_GATHER_REDUCE:          u64 = 24;
+/// Discriminates IntegrateTrace from IntegrateSink (OPCODE_INTEGRATE=7)
+/// without a nullable column.
+pub const OPCODE_INTEGRATE_TRACE:        u64 = 25;
+/// MAP sub-variant: pure projection (column reorder/drop).
+pub const OPCODE_MAP_PROJ:               u64 = 26;
+/// MAP sub-variant: expression program (compute) with optional PK reindex.
+pub const OPCODE_MAP_EXPR:               u64 = 27;
+/// MAP sub-variant: drop payload, keep PK only.
+pub const OPCODE_MAP_KEY_ONLY:           u64 = 28;
+/// Read-only trace source for join trace ports; never participates in cascade.
+pub const OPCODE_SCAN_TRACE_TABLE:       u64 = 31;
 
 // ---------------------------------------------------------------------------
 // Port constants
@@ -244,6 +265,20 @@ pub const PARAM_CONST_STR_BASE:       u64 = 160;
 pub const PARAM_NULL_EXTEND_COL_BASE: u64 = 192;
 
 // ---------------------------------------------------------------------------
+// CircuitNodeColumns `kind` discriminator values
+// ---------------------------------------------------------------------------
+//
+// Every "ordered list of column indices" attached to a circuit node lives
+// in `CircuitNodeColumns` keyed by (view_id, node_id, kind, position). The
+// `kind` discriminator selects which list is being addressed:
+
+pub const NODE_COL_KIND_GROUP:    u64 = 0;  // REDUCE group-by columns
+pub const NODE_COL_KIND_SHARD:    u64 = 1;  // EXCHANGE_SHARD shard columns
+pub const NODE_COL_KIND_PROJ:     u64 = 2;  // MAP projection columns
+pub const NODE_COL_KIND_NULL_EXT: u64 = 3;  // NULL_EXTEND payload type codes
+pub const NODE_COL_KIND_AGG_SPEC: u64 = 4;  // REDUCE aggregate specs (value1=func_id, value2=col_idx)
+
+// ---------------------------------------------------------------------------
 // Aggregate function IDs
 // ---------------------------------------------------------------------------
 
@@ -264,11 +299,11 @@ pub const COL_TAB:              u64 = 4;
 pub const IDX_TAB:              u64 = 5;
 pub const DEP_TAB:              u64 = 6;
 pub const SEQ_TAB:              u64 = 7;
-pub const CIRCUIT_NODES_TAB:    u64 = 11;
-pub const CIRCUIT_EDGES_TAB:    u64 = 12;
-pub const CIRCUIT_SOURCES_TAB:  u64 = 13;
-pub const CIRCUIT_PARAMS_TAB:   u64 = 14;
-pub const CIRCUIT_GROUP_COLS_TAB: u64 = 15;
+pub const CIRCUIT_NODES_TAB:        u64 = 11;
+pub const CIRCUIT_EDGES_TAB:        u64 = 12;
+pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
+// IDs 14 and 15 were previously CIRCUIT_PARAMS_TAB and CIRCUIT_GROUP_COLS_TAB,
+// now folded into CircuitNodes / CircuitNodeColumns.
 
 pub const FIRST_USER_TABLE_ID:  u64 = 16;
 pub const FIRST_USER_SCHEMA_ID: u64 = 3;

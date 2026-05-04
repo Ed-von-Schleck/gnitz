@@ -15,12 +15,32 @@ use crate::vm;
 
 // Opcodes needed for metadata queries
 const OPCODE_EXCHANGE_SHARD: i32 = 20;
-const OPCODE_INTEGRATE: i32 = 7;
-const OPCODE_SCAN_TRACE: i32 = 11;
+const OPCODE_MAP:       i32 = gnitz_wire::OPCODE_MAP       as i32;
+const OPCODE_INTEGRATE: i32 = gnitz_wire::OPCODE_INTEGRATE as i32;
+const OPCODE_SCAN_TRACE: i32 = gnitz_wire::OPCODE_SCAN_TRACE as i32;
 
 const PARAM_SHARD_COL_BASE: i32 = 128;
 const PARAM_JOIN_SOURCE_TABLE: i32 = 11;
 const PARAM_REINDEX_COL: i32 = 10;
+const PARAM_PROJ_BASE: i32 = 32;
+const PARAM_NULL_EXTEND_COL_BASE: i32 = 192;
+const PARAM_AGG_SPEC_BASE: i32 = 13;
+
+/// Translate a wire-level opcode read from `CircuitNodes.opcode` into the
+/// legacy value the DAG metadata code expects. The new sub-variant opcodes
+/// (`MAP_PROJ`, `MAP_EXPR`, `MAP_KEY_ONLY`, `INTEGRATE_TRACE`,
+/// `SCAN_TRACE_TABLE`) all collapse onto the single discriminator the
+/// callers already match against.
+fn translate_legacy_opcode(op: i32) -> i32 {
+    match op as u64 {
+        gnitz_wire::OPCODE_INTEGRATE_TRACE  => OPCODE_INTEGRATE,
+        gnitz_wire::OPCODE_MAP_PROJ
+        | gnitz_wire::OPCODE_MAP_EXPR
+        | gnitz_wire::OPCODE_MAP_KEY_ONLY   => OPCODE_MAP,
+        gnitz_wire::OPCODE_SCAN_TRACE_TABLE => OPCODE_SCAN_TRACE,
+        _ => op,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Store handle — views vs base tables
@@ -226,21 +246,18 @@ pub type CachedPlan = CompileOutput;
 // System table references
 // ---------------------------------------------------------------------------
 
-/// Handles + schemas for the 6 circuit system tables.
+/// Handles + schemas for the four system tables that the compiler reads:
+/// CircuitNodes, CircuitEdges, CircuitNodeColumns, and DepTab.
 pub struct SysTableRefs {
     // Table handles (DagEngine borrows them).
     pub nodes: *mut Table,
     pub edges: *mut Table,
-    pub sources: *mut Table,
-    pub params: *mut Table,
-    pub group_cols: *mut Table,
+    pub node_columns: *mut Table,
     pub dep_tab: *mut Table,
     // Schemas
     pub nodes_schema: SchemaDescriptor,
     pub edges_schema: SchemaDescriptor,
-    pub sources_schema: SchemaDescriptor,
-    pub params_schema: SchemaDescriptor,
-    pub group_cols_schema: SchemaDescriptor,
+    pub node_columns_schema: SchemaDescriptor,
     pub dep_tab_schema: SchemaDescriptor,
 }
 
@@ -252,15 +269,11 @@ impl SysTableRefs {
         SysTableRefs {
             nodes: std::ptr::null_mut(),
             edges: std::ptr::null_mut(),
-            sources: std::ptr::null_mut(),
-            params: std::ptr::null_mut(),
-            group_cols: std::ptr::null_mut(),
+            node_columns: std::ptr::null_mut(),
             dep_tab: std::ptr::null_mut(),
             nodes_schema: crate::compiler::empty_schema(),
             edges_schema: crate::compiler::empty_schema(),
-            sources_schema: crate::compiler::empty_schema(),
-            params_schema: crate::compiler::empty_schema(),
-            group_cols_schema: crate::compiler::empty_schema(),
+            node_columns_schema: crate::compiler::empty_schema(),
             dep_tab_schema: crate::compiler::empty_schema(),
         }
     }
@@ -463,7 +476,11 @@ impl DagEngine {
     // ── Metadata queries (lightweight, no compilation) ──────────────────
 
     /// Load circuit nodes from the CircuitNodes system table for a view.
-    /// Returns [(node_id, opcode)].
+    /// Returns `[(node_id, opcode)]`. Translates new opcodes back into
+    /// the legacy values that downstream callers expect:
+    /// `OPCODE_INTEGRATE_TRACE → OPCODE_INTEGRATE`, `OPCODE_MAP_*  → OPCODE_MAP`,
+    /// `OPCODE_SCAN_TRACE_TABLE → OPCODE_SCAN_TRACE`. (`OPCODE_SCAN_DELTA`
+    /// already shares the numeric value 11 with `OPCODE_SCAN_TRACE`.)
     fn load_nodes_meta(&self, view_id: u64) -> Vec<(i32, i32)> {
         let mut result = Vec::new();
         if self.sys.nodes.is_null() { return result; }
@@ -475,10 +492,14 @@ impl DagEngine {
         ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
-                let node_id = ch.cursor.current_key as u64 as i32;
-                let opcode = compiler::cursor_read_i64(
-                    &ch.cursor, 1, &self.sys.nodes_schema,
+                // Read node_id from the denormalised payload column (col 2).
+                let node_id = compiler::cursor_read_i64(
+                    &ch.cursor, 2, &self.sys.nodes_schema,
                 ) as i32;
+                let opcode_raw = compiler::cursor_read_i64(
+                    &ch.cursor, 3, &self.sys.nodes_schema,
+                ) as i32;
+                let opcode = translate_legacy_opcode(opcode_raw);
                 result.push((node_id, opcode));
             }
             ch.cursor.advance();
@@ -486,7 +507,9 @@ impl DagEngine {
         result
     }
 
-    /// Load circuit edges for a view. Returns [(edge_id, src, dst, port)].
+    /// Load circuit edges for a view. Returns `[(0, src, dst, port)]`.
+    /// The leading `0` is a placeholder for the historical synthetic edge_id
+    /// (now removed; the natural-key PK has fully replaced it).
     fn load_edges_meta(&self, view_id: u64) -> Vec<(i32, i32, i32, i32)> {
         let mut result = Vec::new();
         if self.sys.edges.is_null() { return result; }
@@ -498,53 +521,126 @@ impl DagEngine {
         ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
-                let edge_id = ch.cursor.current_key as u64 as i32;
-                let src = compiler::cursor_read_i64(
-                    &ch.cursor, 1, &self.sys.edges_schema,
-                ) as i32;
                 let dst = compiler::cursor_read_i64(
                     &ch.cursor, 2, &self.sys.edges_schema,
                 ) as i32;
                 let port = compiler::cursor_read_i64(
                     &ch.cursor, 3, &self.sys.edges_schema,
                 ) as i32;
-                result.push((edge_id, src, dst, port));
+                let src = compiler::cursor_read_i64(
+                    &ch.cursor, 4, &self.sys.edges_schema,
+                ) as i32;
+                result.push((0, src, dst, port));
             }
             ch.cursor.advance();
         }
         result
     }
 
-    /// Load circuit params for a view. Returns {node_id: {slot: value}}.
+    /// Synthesise the legacy `params` map ({node_id: {slot: value}}) from
+    /// the new `CircuitNodes.source_table` / `reindex_col` columns and
+    /// `CircuitNodeColumns` (kind=SHARD/PROJ/NULL_EXT/AGG_SPEC). The DAG
+    /// metadata callers (`get_shard_cols`, `get_join_shard_cols`,
+    /// `get_exchange_info`) only inspect SHARD/REINDEX/JOIN_SOURCE_TABLE
+    /// slots, so the BLOB-encoded `expr_program` is intentionally NOT
+    /// decoded here.
     fn load_params_meta(&self, view_id: u64) -> HashMap<i32, HashMap<i32, i64>> {
         let mut result: HashMap<i32, HashMap<i32, i64>> = HashMap::new();
-        if self.sys.params.is_null() { return result; }
-        let t = unsafe { &mut *self.sys.params };
-        let mut ch = match t.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let lo64 = ch.cursor.current_key as u64;
-                let node_id = (lo64 >> 8) as i32;
-                let slot = (lo64 & 0xFF) as i32;
-                let value = compiler::cursor_read_i64(
-                    &ch.cursor, 1, &self.sys.params_schema,
-                );
-                result.entry(node_id).or_default().insert(slot, value);
+
+        // Pull source_table → PARAM_JOIN_SOURCE_TABLE and reindex_col → PARAM_REINDEX_COL
+        // from CircuitNodes for every node row.
+        if !self.sys.nodes.is_null() {
+            let t = unsafe { &mut *self.sys.nodes };
+            if let Ok(mut ch) = t.create_cursor() {
+                ch.cursor.seek(crate::util::make_pk(0, view_id));
+                while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
+                    if ch.cursor.current_weight > 0 {
+                        let node_id = compiler::cursor_read_i64(
+                            &ch.cursor, 2, &self.sys.nodes_schema,
+                        ) as i32;
+                        let opcode_raw = compiler::cursor_read_i64(
+                            &ch.cursor, 3, &self.sys.nodes_schema,
+                        ) as i32;
+                        let opcode = translate_legacy_opcode(opcode_raw);
+                        if !compiler::cursor_is_null(&ch.cursor, 4, &self.sys.nodes_schema) {
+                            let st = compiler::cursor_read_i64(
+                                &ch.cursor, 4, &self.sys.nodes_schema,
+                            );
+                            // Stash on SCAN_TRACE so get_join_shard_cols() finds it.
+                            if opcode == OPCODE_SCAN_TRACE {
+                                result.entry(node_id).or_default()
+                                    .insert(PARAM_JOIN_SOURCE_TABLE, st);
+                            }
+                        }
+                        if !compiler::cursor_is_null(&ch.cursor, 5, &self.sys.nodes_schema) {
+                            let rc = compiler::cursor_read_i64(
+                                &ch.cursor, 5, &self.sys.nodes_schema,
+                            );
+                            result.entry(node_id).or_default()
+                                .insert(PARAM_REINDEX_COL, rc);
+                        }
+                    }
+                    ch.cursor.advance();
+                }
             }
-            ch.cursor.advance();
         }
+
+        // Pull SHARD/PROJ/NULL_EXT/AGG_SPEC rows from CircuitNodeColumns.
+        if !self.sys.node_columns.is_null() {
+            let t = unsafe { &mut *self.sys.node_columns };
+            if let Ok(mut ch) = t.create_cursor() {
+                ch.cursor.seek(crate::util::make_pk(0, view_id));
+                while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
+                    if ch.cursor.current_weight > 0 {
+                        let node_id = compiler::cursor_read_i64(
+                            &ch.cursor, 2, &self.sys.node_columns_schema,
+                        ) as i32;
+                        let kind = compiler::cursor_read_i64(
+                            &ch.cursor, 3, &self.sys.node_columns_schema,
+                        );
+                        let position = compiler::cursor_read_i64(
+                            &ch.cursor, 4, &self.sys.node_columns_schema,
+                        ) as i32;
+                        let v1 = compiler::cursor_read_i64(
+                            &ch.cursor, 5, &self.sys.node_columns_schema,
+                        );
+                        let v2 = compiler::cursor_read_i64(
+                            &ch.cursor, 6, &self.sys.node_columns_schema,
+                        );
+                        let np = result.entry(node_id).or_default();
+                        match kind as u64 {
+                            gnitz_wire::NODE_COL_KIND_SHARD => {
+                                np.insert(PARAM_SHARD_COL_BASE + position, v1);
+                            }
+                            gnitz_wire::NODE_COL_KIND_PROJ => {
+                                np.insert(PARAM_PROJ_BASE + position, v1);
+                            }
+                            gnitz_wire::NODE_COL_KIND_NULL_EXT => {
+                                np.insert(PARAM_NULL_EXTEND_COL_BASE + position, v1);
+                            }
+                            gnitz_wire::NODE_COL_KIND_AGG_SPEC => {
+                                let packed = ((v1 as u64) << 32) | (v2 as u64 & 0xFFFFFFFF);
+                                np.insert(PARAM_AGG_SPEC_BASE + position, packed as i64);
+                            }
+                            _ => {}
+                        }
+                    }
+                    ch.cursor.advance();
+                }
+            }
+        }
+
         result
     }
 
     /// Load circuit sources for a view. Returns {node_id: table_id}.
+    /// New layout: only `OPCODE_SCAN_TRACE_TABLE` rows populate this map
+    /// (delta-side `OPCODE_SCAN_DELTA` carries source_table via
+    /// `PARAM_JOIN_SOURCE_TABLE` instead, mirroring the legacy convention).
     fn load_sources_meta(&self, view_id: u64) -> HashMap<i32, i64> {
         let mut result = HashMap::new();
-        if self.sys.sources.is_null() { return result; }
-        let t = unsafe { &mut *self.sys.sources };
+        if self.sys.nodes.is_null() { return result; }
+        let t = unsafe { &mut *self.sys.nodes };
         let mut ch = match t.create_cursor() {
             Ok(c) => c,
             Err(_) => return result,
@@ -552,11 +648,20 @@ impl DagEngine {
         ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
-                let node_id = ch.cursor.current_key as u64 as i32;
-                let table_id = compiler::cursor_read_i64(
-                    &ch.cursor, 1, &self.sys.sources_schema,
-                );
-                result.insert(node_id, table_id);
+                let node_id = compiler::cursor_read_i64(
+                    &ch.cursor, 2, &self.sys.nodes_schema,
+                ) as i32;
+                let opcode_raw = compiler::cursor_read_i64(
+                    &ch.cursor, 3, &self.sys.nodes_schema,
+                ) as i32;
+                if opcode_raw as u64 == gnitz_wire::OPCODE_SCAN_TRACE_TABLE
+                    && !compiler::cursor_is_null(&ch.cursor, 4, &self.sys.nodes_schema)
+                {
+                    let st = compiler::cursor_read_i64(
+                        &ch.cursor, 4, &self.sys.nodes_schema,
+                    );
+                    result.insert(node_id, st);
+                }
             }
             ch.cursor.advance();
         }
@@ -742,69 +847,6 @@ impl DagEngine {
         false
     }
 
-    /// Validate circuit graph structure before persistence.
-    /// Port of `ProgramCache.validate_graph_structure()`.
-    ///
-    /// Returns Ok(()) on success, Err(msg) on validation failure.
-    pub fn validate_graph_structure(
-        &self,
-        nodes: &[(i32, i32)],
-        edges: &[(i32, i32, i32, i32)],
-        sources: &[(i32, i64)],
-    ) -> Result<(), &'static str> {
-        if nodes.is_empty() {
-            return Err("View graph contains no nodes");
-        }
-
-        // Check for primary input (source with table_id=0)
-        let has_input = sources.iter().any(|&(_, tid)| tid == 0);
-        if !has_input {
-            return Err("View graph missing primary input (table_id=0)");
-        }
-
-        // Check for sink (INTEGRATE node)
-        let has_sink = nodes.iter().any(|&(_, op)| op == OPCODE_INTEGRATE);
-        if !has_sink {
-            return Err("View graph missing sink (INTEGRATE node)");
-        }
-
-        // Cycle detection via Kahn's algorithm
-        let mut in_degree: HashMap<i32, i32> = HashMap::new();
-        for &(nid, _) in nodes {
-            in_degree.insert(nid, 0);
-        }
-        for &(_eid, _src, dst, _port) in edges {
-            *in_degree.entry(dst).or_insert(0) += 1;
-        }
-
-        let mut queue: Vec<i32> = Vec::new();
-        for &(nid, _) in nodes {
-            if in_degree[&nid] == 0 {
-                queue.push(nid);
-            }
-        }
-
-        let mut count = 0;
-        while let Some(nid) = queue.pop() {
-            count += 1;
-            for &(_eid, src, dst, _port) in edges {
-                if src == nid {
-                    let d = in_degree.get_mut(&dst).unwrap();
-                    *d -= 1;
-                    if *d == 0 {
-                        queue.push(dst);
-                    }
-                }
-            }
-        }
-
-        if count != nodes.len() {
-            return Err("View graph contains cycles (not a DAG)");
-        }
-
-        Ok(())
-    }
-
     // ── Compilation ─────────────────────────────────────────────────────
 
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
@@ -824,11 +866,9 @@ impl DagEngine {
         let result = unsafe {
             compiler::compile_view(
                 view_id as u64,
-                self.sys.nodes, self.sys.edges, self.sys.sources,
-                self.sys.params, self.sys.group_cols, self.sys.dep_tab,
+                self.sys.nodes, self.sys.edges, self.sys.node_columns, self.sys.dep_tab,
                 &self.sys.nodes_schema, &self.sys.edges_schema,
-                &self.sys.sources_schema, &self.sys.params_schema,
-                &self.sys.group_cols_schema, &self.sys.dep_tab_schema,
+                &self.sys.node_columns_schema, &self.sys.dep_tab_schema,
                 &view_dir,
                 view_id as u32,
                 view_schema,
@@ -1823,59 +1863,13 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_idx_child");
     }
 
-    #[test]
-    fn test_validate_graph_ok() {
-        let dag = DagEngine::new();
-        let nodes = vec![(0, 11), (1, 7)]; // SCAN_TRACE, INTEGRATE
-        let edges = vec![(0, 0, 1, 0)];
-        let sources = vec![(0, 0)]; // primary input
-
-        assert!(dag.validate_graph_structure(&nodes, &edges, &sources).is_ok());
-    }
-
-    #[test]
-    fn test_validate_graph_no_nodes() {
-        let dag = DagEngine::new();
-        assert_eq!(
-            dag.validate_graph_structure(&[], &[], &[]).unwrap_err(),
-            "View graph contains no nodes",
-        );
-    }
-
-    #[test]
-    fn test_validate_graph_no_input() {
-        let dag = DagEngine::new();
-        let nodes = vec![(0, 7)];
-        let sources = vec![(0, 42)]; // not primary input
-        assert_eq!(
-            dag.validate_graph_structure(&nodes, &[], &sources).unwrap_err(),
-            "View graph missing primary input (table_id=0)",
-        );
-    }
-
-    #[test]
-    fn test_validate_graph_no_sink() {
-        let dag = DagEngine::new();
-        let nodes = vec![(0, 2)]; // MAP, not INTEGRATE
-        let sources = vec![(0, 0)];
-        assert_eq!(
-            dag.validate_graph_structure(&nodes, &[], &sources).unwrap_err(),
-            "View graph missing sink (INTEGRATE node)",
-        );
-    }
-
-    #[test]
-    fn test_validate_graph_cycle() {
-        let dag = DagEngine::new();
-        let nodes = vec![(0, 11), (1, 7)];
-        // Cycle: 0→1 and 1→0
-        let edges = vec![(0, 0, 1, 0), (1, 1, 0, 0)];
-        let sources = vec![(0, 0)];
-        assert_eq!(
-            dag.validate_graph_structure(&nodes, &edges, &sources).unwrap_err(),
-            "View graph contains cycles (not a DAG)",
-        );
-    }
+    // `test_validate_graph_*` tests previously exercised
+    // `DagEngine::validate_graph_structure`. The function is no longer
+    // load-bearing — its only non-test caller (`engine.create_view`) was
+    // removed alongside the circuit-graph schema redesign. The compiler's
+    // `topo_sort` already rejects cycles, and the typed `OpNode` enum makes
+    // "missing primary input" and "missing INTEGRATE sink" structurally
+    // checkable at the wire-construction site instead.
 
     #[test]
     fn test_dep_map_empty() {

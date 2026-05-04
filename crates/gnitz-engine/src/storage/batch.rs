@@ -700,7 +700,8 @@ impl Batch {
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
                 if pi >= npc { break; }
-                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING;
+                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING
+                    || col.type_code == crate::schema::type_code::BLOB;
             }
         }
         for pi in 0..npc {
@@ -925,7 +926,8 @@ impl Batch {
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
                 if pi >= npc { break; }
-                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING;
+                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING
+                    || col.type_code == crate::schema::type_code::BLOB;
             }
         }
 
@@ -968,7 +970,9 @@ impl Batch {
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
                 self.fill_col_zero(pi, cs);
-            } else if col_desc.type_code == crate::schema::type_code::STRING {
+            } else if col_desc.type_code == crate::schema::type_code::STRING
+                || col_desc.type_code == crate::schema::type_code::BLOB
+            {
                 let src = ptable.found_col_ptr(pi, cs);
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
@@ -1031,7 +1035,8 @@ impl Batch {
 
             let is_string = schema.map_or(false, |s| {
                 ci < s.num_columns as usize
-                    && s.columns[ci].type_code == crate::schema::type_code::STRING
+                    && (s.columns[ci].type_code == crate::schema::type_code::STRING
+                        || s.columns[ci].type_code == crate::schema::type_code::BLOB)
             });
             let is_null = (null_word >> pi) & 1 != 0;
             let col_size = sz as usize;
@@ -1082,7 +1087,7 @@ impl Batch {
                 self.fill_col_zero(pi, col_size);
             } else {
                 match col.type_code {
-                    crate::schema::type_code::STRING => {
+                    crate::schema::type_code::STRING | crate::schema::type_code::BLOB => {
                         let ptr = str_ptrs[pi];
                         let slen = str_lens[pi] as usize;
                         let bytes: &[u8] = if ptr.is_null() || slen == 0 {
@@ -1205,7 +1210,9 @@ impl Batch {
 
             if is_null {
                 self.fill_col_zero(pi, cs);
-            } else if col.type_code == crate::schema::type_code::STRING {
+            } else if col.type_code == crate::schema::type_code::STRING
+                || col.type_code == crate::schema::type_code::BLOB
+            {
                 let src_struct = source.get_col_ptr(row, pi, cs);
                 let dest = crate::schema::relocate_german_string_vec(
                     src_struct, src_blob, &mut self.blob, blob_cache.as_deref_mut(),
@@ -1644,7 +1651,9 @@ pub fn encode_multi_to_wire(
     let mut is_string = [false; MAX_BATCH_REGIONS + 1];
     if let Some(ref schema) = first.schema {
         for (pi, _ci, col) in schema.payload_columns() {
-            if col.type_code == crate::schema::type_code::STRING && col.size == 16 {
+            let is_string_like = col.type_code == crate::schema::type_code::STRING
+                || col.type_code == crate::schema::type_code::BLOB;
+            if is_string_like && col.size == 16 {
                 is_string[REG_PAYLOAD_START + pi] = true;
             }
         }

@@ -562,7 +562,7 @@ impl ReadCursor {
             let ptr = self.col_ptr(ci, col_size);
             if !ptr.is_null() {
                 let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
-                if col.type_code == type_code::STRING && col_size == 16 {
+                if (col.type_code == type_code::STRING || col.type_code == type_code::BLOB) && col_size == 16 {
                     let cell = crate::schema::relocate_german_string_vec(data, src_blob, &mut batch.blob, None);
                     batch.extend_col(payload_idx, &cell);
                 } else {

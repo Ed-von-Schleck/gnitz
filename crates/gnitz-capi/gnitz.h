@@ -202,7 +202,7 @@ uint64_t gnitz_circuit_shard(GnitzCircuitBuilder *cb,
                              const size_t *shard_cols,
                              size_t n_shard_cols);
 
-uint64_t gnitz_circuit_gather(GnitzCircuitBuilder *cb, uint64_t input, uint64_t worker_id);
+uint64_t gnitz_circuit_gather(GnitzCircuitBuilder *cb, uint64_t input);
 
 uint64_t gnitz_circuit_sink(GnitzCircuitBuilder *cb, uint64_t input);
 

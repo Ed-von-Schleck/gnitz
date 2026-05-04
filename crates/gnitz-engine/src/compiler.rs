@@ -27,21 +27,13 @@ gnitz_wire::cast_consts! { i32;
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_SHARD_COL_BASE, PARAM_CONST_STR_BASE,
 }
 // Engine-only constants
-const PARAM_CHUNK_LIMIT: i32 = 2;
 const PORT_DELTA: i32       = 0;
 const PORT_IN_REDUCE: i32   = 0;
 const PORT_TRACE_IN: i32    = 1;
 const PORT_IN_DISTINCT: i32 = 0;
 const PORT_EXCHANGE_IN: i32 = 0;
 
-// System table column indices (after PK column)
-const NODES_COL_OPCODE: usize = 1;
-const EDGES_COL_SRC: usize = 1;
-const EDGES_COL_DST: usize = 2;
-const EDGES_COL_PORT: usize = 3;
-const SOURCES_COL_TABLE_ID: usize = 1;
-const PARAMS_COL_VALUE: usize = 1;
-const PARAMS_COL_STR_VALUE: usize = 2;
+// System table column indices for DEP_TAB (used by resolve_primary_input_schema).
 const DEP_COL_DEP_TABLE_ID: usize = 3;
 
 // ---------------------------------------------------------------------------
@@ -186,7 +178,7 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
 }
 
 /// Check if a column is NULL in the current cursor row.
-fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
+pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
     if col_idx == schema.pk_index as usize {
         return false; // PK is never null
     }
@@ -214,132 +206,291 @@ fn open_system_cursor(
     Some(ch)
 }
 
-/// Load circuit nodes from system table.
-fn load_nodes(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> Vec<Node> {
-    let mut result = Vec::new();
-    let mut ch = match open_system_cursor(table, view_id) {
-        Some(c) => c,
-        None => return result,
-    };
-    let end_hi = view_id + 1;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let node_id = ch.cursor.current_key as u64 as i32;
-            let opcode = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE, schema) as i32;
-            result.push(Node { id: node_id, opcode });
-        }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
-        }
-    }
-    result
+/// Decoded `ExprProgram` blob (inline copy of the gnitz-core wire shape so the
+/// engine doesn't take a dependency on the client crate).
+struct DecodedExprProgram {
+    num_regs: u32,
+    result_reg: u32,
+    code: Vec<u32>,
+    const_strings: Vec<Vec<u8>>,
 }
 
-/// Load circuit edges from system table.
-fn load_edges(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> Vec<Edge> {
-    let mut result = Vec::new();
-    let mut ch = match open_system_cursor(table, view_id) {
-        Some(c) => c,
-        None => return result,
-    };
-    let end_hi = view_id + 1;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let edge_id = ch.cursor.current_key as u64 as i32;
-            let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC, schema) as i32;
-            let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST, schema) as i32;
-            let port = cursor_read_i64(&ch.cursor, EDGES_COL_PORT, schema) as i32;
-            result.push(Edge { _id: edge_id, src, dst, port });
-        }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
-        }
+const EXPR_BLOB_MAGIC: u32   = 0x5258_5045; // "EXPR" little-endian
+const EXPR_BLOB_VERSION: u8  = 1;
+const EXPR_BLOB_HEADER_SIZE: usize = 16;
+
+fn decode_expr_blob(blob: &[u8]) -> Option<DecodedExprProgram> {
+    if blob.len() < EXPR_BLOB_HEADER_SIZE { return None; }
+    if u32::from_le_bytes(blob[0..4].try_into().unwrap()) != EXPR_BLOB_MAGIC { return None; }
+    if blob[4] != EXPR_BLOB_VERSION { return None; }
+    if blob[5] != 0 || blob[10] != 0 || blob[11] != 0 { return None; }
+    let num_regs   = u16::from_le_bytes(blob[6..8].try_into().unwrap()) as u32;
+    let result_reg = u16::from_le_bytes(blob[8..10].try_into().unwrap()) as u32;
+    let n          = u32::from_le_bytes(blob[12..16].try_into().unwrap());
+    if n % 4 != 0 { return None; }
+    let code_bytes = (n as usize) * 4;
+    let code_end   = EXPR_BLOB_HEADER_SIZE + code_bytes;
+    if blob.len() < code_end + 4 { return None; }
+    let mut code = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        let off = EXPR_BLOB_HEADER_SIZE + i * 4;
+        code.push(u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()));
     }
-    result
+    let s_count = u32::from_le_bytes(blob[code_end..code_end + 4].try_into().unwrap());
+    let mut cur = code_end + 4;
+    let mut const_strings = Vec::with_capacity(s_count as usize);
+    for _ in 0..s_count {
+        if blob.len() < cur + 4 { return None; }
+        let l = u32::from_le_bytes(blob[cur..cur + 4].try_into().unwrap()) as usize;
+        cur += 4;
+        if blob.len() < cur + l { return None; }
+        const_strings.push(blob[cur..cur + l].to_vec());
+        cur += l;
+    }
+    Some(DecodedExprProgram { num_regs, result_reg, code, const_strings })
 }
 
-/// Load circuit sources from system table.
-fn load_sources(table: *mut Table, view_id: u64, schema: &SchemaDescriptor) -> HashMap<i32, i64> {
-    let mut result = HashMap::new();
-    let mut ch = match open_system_cursor(table, view_id) {
-        Some(c) => c,
-        None => return result,
-    };
-    let end_hi = view_id + 1;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let node_id = ch.cursor.current_key as u64 as i32;
-            let table_id = cursor_read_i64(&ch.cursor, SOURCES_COL_TABLE_ID, schema);
-            result.insert(node_id, table_id);
-        }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
-        }
-    }
-    result
-}
+// New CircuitNodes columns (PK is col 0; view_id at col 1 is denormalised
+// and not read here — the cursor is already seeked by view_id range).
+const NODES_COL_NODE_ID: usize      = 2;
+const NODES_COL_OPCODE_NEW: usize   = 3;
+const NODES_COL_SOURCE_TABLE: usize = 4;
+const NODES_COL_REINDEX_COL: usize  = 5;
+const NODES_COL_EXPR_PROGRAM: usize = 6;
 
-/// Load circuit params (int + string) from system table.
+// New CircuitEdges columns (PK is col 0).
+const EDGES_COL_DST_NODE: usize = 2;
+const EDGES_COL_DST_PORT: usize = 3;
+const EDGES_COL_SRC_NODE: usize = 4;
+
+// New CircuitNodeColumns columns (PK is col 0).
+const NODECOL_COL_NODE_ID:  usize = 2;
+const NODECOL_COL_KIND:     usize = 3;
+const NODECOL_COL_POSITION: usize = 4;
+const NODECOL_COL_VALUE1:   usize = 5;
+const NODECOL_COL_VALUE2:   usize = 6;
+
+// CircuitNodeColumns kind discriminator values (mirrors gnitz_wire::NODE_COL_KIND_*).
+const KIND_GROUP:    i64 = gnitz_wire::NODE_COL_KIND_GROUP    as i64;
+const KIND_SHARD:    i64 = gnitz_wire::NODE_COL_KIND_SHARD    as i64;
+const KIND_PROJ:     i64 = gnitz_wire::NODE_COL_KIND_PROJ     as i64;
+const KIND_NULL_EXT: i64 = gnitz_wire::NODE_COL_KIND_NULL_EXT as i64;
+const KIND_AGG_SPEC: i64 = gnitz_wire::NODE_COL_KIND_AGG_SPEC as i64;
+
+const OPCODE_INTEGRATE_TRACE_NEW: i32  = gnitz_wire::OPCODE_INTEGRATE_TRACE  as i32;
+const OPCODE_MAP_PROJ_NEW: i32         = gnitz_wire::OPCODE_MAP_PROJ         as i32;
+const OPCODE_MAP_EXPR_NEW: i32         = gnitz_wire::OPCODE_MAP_EXPR         as i32;
+const OPCODE_MAP_KEY_ONLY_NEW: i32     = gnitz_wire::OPCODE_MAP_KEY_ONLY     as i32;
+const OPCODE_SCAN_TRACE_TABLE_NEW: i32 = gnitz_wire::OPCODE_SCAN_TRACE_TABLE as i32;
+
 #[allow(clippy::type_complexity)]
-fn load_params(
-    table: *mut Table,
+fn load_circuit(
+    sys_nodes: *mut Table, sys_nodes_schema: &SchemaDescriptor,
+    sys_edges: *mut Table, sys_edges_schema: &SchemaDescriptor,
+    sys_node_cols: *mut Table, sys_node_cols_schema: &SchemaDescriptor,
     view_id: u64,
-    schema: &SchemaDescriptor,
-) -> (HashMap<i32, HashMap<i32, i64>>, HashMap<i32, HashMap<i32, Vec<u8>>>) {
-    let mut int_params: HashMap<i32, HashMap<i32, i64>> = HashMap::new();
+) -> (
+    Vec<Node>,
+    Vec<Edge>,
+    HashMap<i32, i64>,
+    HashMap<i32, HashMap<i32, i64>>,
+    HashMap<i32, HashMap<i32, Vec<u8>>>,
+    HashMap<i32, Vec<i32>>,
+) {
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut sources:    HashMap<i32, i64>                = HashMap::new();
+    let mut params:     HashMap<i32, HashMap<i32, i64>>  = HashMap::new();
     let mut str_params: HashMap<i32, HashMap<i32, Vec<u8>>> = HashMap::new();
-    let mut ch = match open_system_cursor(table, view_id) {
-        Some(c) => c,
-        None => return (int_params, str_params),
-    };
-    let end_hi = view_id + 1;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let lo64 = ch.cursor.current_key as u64;
-            let node_id = (lo64 >> 8) as i32;
-            let slot = (lo64 & 0xFF) as i32;
-            let value = cursor_read_i64(&ch.cursor, PARAMS_COL_VALUE, schema);
-            int_params.entry(node_id).or_default().insert(slot, value);
+    let mut group_cols: HashMap<i32, Vec<i32>>           = HashMap::new();
 
-            if !cursor_is_null(&ch.cursor, PARAMS_COL_STR_VALUE, schema) {
-                let sv = cursor_read_string(&ch.cursor, PARAMS_COL_STR_VALUE, schema);
-                if !sv.is_empty() {
-                    str_params.entry(node_id).or_default().insert(slot, sv);
-                }
+    // Phase 1: scan CircuitNodeColumns once and bucket rows by node_id so the
+    // node-row scan can resolve every typed payload in O(1) per node.
+    let mut cols_by_node: HashMap<i32, Vec<(i64, i64, i64, i64)>> = HashMap::new();
+    if let Some(mut ch) = open_system_cursor(sys_node_cols, view_id) {
+        let end_hi = view_id + 1;
+        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
+            if ch.cursor.current_weight > 0 {
+                let node_id = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID, sys_node_cols_schema) as i32;
+                let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema);
+                let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema);
+                let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema);
+                let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema);
+                cols_by_node.entry(node_id).or_default().push((kind, position, v1, v2));
+            }
+            ch.cursor.advance();
+            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
+                break;
             }
         }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
-        }
     }
-    (int_params, str_params)
-}
+    // Phase 2: scan CircuitNodes. Translate each row into the legacy bag-of-
+    // params shape so the rest of the compiler doesn't need to learn the new
+    // typed enum.
+    if let Some(mut ch) = open_system_cursor(sys_nodes, view_id) {
+        let end_hi = view_id + 1;
+        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
+            if ch.cursor.current_weight > 0 {
+                let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
+                let opcode_new = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as i32;
 
-/// Load circuit group columns from system table.
-fn load_group_cols(table: *mut Table, view_id: u64, _schema: &SchemaDescriptor) -> HashMap<i32, Vec<i32>> {
-    let mut result: HashMap<i32, Vec<i32>> = HashMap::new();
-    let mut ch = match open_system_cursor(table, view_id) {
-        Some(c) => c,
-        None => return result,
-    };
-    let end_hi = view_id + 1;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let lo64 = ch.cursor.current_key as u64;
-            let node_id = (lo64 >> 16) as i32;
-            let col_idx = (lo64 & 0xFFFF) as i32;
-            result.entry(node_id).or_default().push(col_idx);
-        }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
+                let source_table = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
+                    -1
+                } else {
+                    cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema)
+                };
+                let reindex_col = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
+                    -1
+                } else {
+                    cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema)
+                };
+                let expr_blob: Vec<u8> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
+                    Vec::new()
+                } else {
+                    cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema)
+                };
+
+                // Decode the BLOB once if non-empty — used by FILTER and MAP_EXPR.
+                let prog: Option<DecodedExprProgram> = if !expr_blob.is_empty() {
+                    decode_expr_blob(&expr_blob)
+                } else {
+                    None
+                };
+
+                // Translate the typed opcode + payload columns back into the
+                // legacy (opcode, params, sources, group_cols) representation.
+                let legacy_opcode = match opcode_new {
+                    OPCODE_INTEGRATE_TRACE_NEW => {
+                        // IntegrateTrace = legacy INTEGRATE with PARAM_TABLE_ID > 0.
+                        params.entry(node_id).or_default().insert(PARAM_TABLE_ID, 1);
+                        OPCODE_INTEGRATE
+                    }
+                    OPCODE_MAP_PROJ_NEW | OPCODE_MAP_EXPR_NEW | OPCODE_MAP_KEY_ONLY_NEW => {
+                        // All three sub-variants land back on legacy OPCODE_MAP.
+                        let np = params.entry(node_id).or_default();
+                        if opcode_new == OPCODE_MAP_KEY_ONLY_NEW {
+                            np.insert(PARAM_KEY_ONLY, 1);
+                        }
+                        if opcode_new == OPCODE_MAP_EXPR_NEW {
+                            if let Some(p) = &prog {
+                                np.insert(PARAM_EXPR_NUM_REGS, p.num_regs as i64);
+                                if p.result_reg != 0 {
+                                    np.insert(PARAM_EXPR_RESULT_REG, p.result_reg as i64);
+                                }
+                                for (i, &word) in p.code.iter().enumerate() {
+                                    np.insert(PARAM_EXPR_BASE + i as i32, word as i64);
+                                }
+                                let sp = str_params.entry(node_id).or_default();
+                                for (i, s) in p.const_strings.iter().enumerate() {
+                                    sp.insert(PARAM_CONST_STR_BASE + i as i32, s.clone());
+                                }
+                            }
+                            if reindex_col >= 0 {
+                                np.insert(PARAM_REINDEX_COL, reindex_col);
+                            }
+                        }
+                        OPCODE_MAP
+                    }
+                    OPCODE_SCAN_TRACE_TABLE_NEW => {
+                        // Trace-only scan: sources[node_id] = table_id.
+                        if source_table >= 0 {
+                            sources.insert(node_id, source_table);
+                        }
+                        OPCODE_SCAN_TRACE
+                    }
+                    other if other == OPCODE_SCAN_TRACE => {
+                        // OPCODE_SCAN_DELTA (= 11). Stash the source table as
+                        // PARAM_JOIN_SOURCE_TABLE so the legacy "tagged delta"
+                        // branch in emit_node picks the right schema.
+                        // sources[nid] stays unset (= 0 via unwrap_or).
+                        if source_table >= 0 {
+                            params.entry(node_id).or_default().insert(PARAM_JOIN_SOURCE_TABLE, source_table);
+                        }
+                        OPCODE_SCAN_TRACE
+                    }
+                    other if other == OPCODE_FILTER => {
+                        if let Some(p) = &prog {
+                            let np = params.entry(node_id).or_default();
+                            np.insert(PARAM_EXPR_NUM_REGS, p.num_regs as i64);
+                            np.insert(PARAM_EXPR_RESULT_REG, p.result_reg as i64);
+                            for (i, &word) in p.code.iter().enumerate() {
+                                np.insert(PARAM_EXPR_BASE + i as i32, word as i64);
+                            }
+                            let sp = str_params.entry(node_id).or_default();
+                            for (i, s) in p.const_strings.iter().enumerate() {
+                                sp.insert(PARAM_CONST_STR_BASE + i as i32, s.clone());
+                            }
+                        }
+                        OPCODE_FILTER
+                    }
+                    other => other,
+                };
+
+                // Drain CircuitNodeColumns rows for this node into the legacy maps.
+                if let Some(rows) = cols_by_node.get(&node_id) {
+                    let np = params.entry(node_id).or_default();
+                    let mut group: Vec<i32> = Vec::new();
+                    let mut null_ext_count: i64 = 0;
+                    let mut agg_count: i64 = 0;
+                    for &(kind, position, v1, v2) in rows {
+                        match kind {
+                            KIND_GROUP => group.push(v1 as i32),
+                            KIND_SHARD => {
+                                np.insert(PARAM_SHARD_COL_BASE + position as i32, v1);
+                            }
+                            KIND_PROJ => {
+                                np.insert(PARAM_PROJ_BASE + position as i32, v1);
+                            }
+                            KIND_NULL_EXT => {
+                                np.insert(PARAM_NULL_EXTEND_COL_BASE + position as i32, v1);
+                                null_ext_count = null_ext_count.max(position + 1);
+                            }
+                            KIND_AGG_SPEC => {
+                                let packed = ((v1 as u64) << 32) | (v2 as u64 & 0xFFFFFFFF);
+                                np.insert(PARAM_AGG_SPEC_BASE + position as i32, packed as i64);
+                                agg_count = agg_count.max(position + 1);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !group.is_empty() {
+                        group_cols.insert(node_id, group);
+                    }
+                    if null_ext_count > 0 {
+                        np.insert(PARAM_NULL_EXTEND_COUNT, null_ext_count);
+                    }
+                    if agg_count > 0 {
+                        np.insert(PARAM_AGG_COUNT, agg_count);
+                    }
+                }
+
+                nodes.push(Node { id: node_id, opcode: legacy_opcode });
+            }
+            ch.cursor.advance();
+            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
+                break;
+            }
         }
     }
-    result
+
+    // Phase 3: scan CircuitEdges (natural key — no synthetic edge_id).
+    if let Some(mut ch) = open_system_cursor(sys_edges, view_id) {
+        let end_hi = view_id + 1;
+        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
+            if ch.cursor.current_weight > 0 {
+                let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
+                let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
+                let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
+                edges.push(Edge { _id: 0, src, dst, port });
+            }
+            ch.cursor.advance();
+            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
+                break;
+            }
+        }
+    }
+
+    (nodes, edges, sources, params, str_params, group_cols)
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +1141,10 @@ fn emit_node(
     match op {
         OPCODE_SCAN_TRACE => {
             let table_id = graph.sources.get(&nid).copied().unwrap_or(0);
-            let chunk_limit = node_params.get(&PARAM_CHUNK_LIMIT).copied().unwrap_or(0) as i32;
+            // Legacy PARAM_CHUNK_LIMIT was always 0 — slot 2 was never written
+            // by any builder. Pass 0 directly so the SCAN_TRACE call signature
+            // is preserved.
+            let chunk_limit: i32 = 0;
 
             if table_id == 0 {
                 let join_source_table = node_params.get(&PARAM_JOIN_SOURCE_TABLE).copied().unwrap_or(0);
@@ -1851,16 +2005,12 @@ pub unsafe fn compile_view(
     // System table handles (NULL if absent)
     sys_nodes: *mut Table,
     sys_edges: *mut Table,
-    sys_sources: *mut Table,
-    sys_params: *mut Table,
-    sys_gcols: *mut Table,
+    sys_node_cols: *mut Table,
     sys_dep: *mut Table,
     // System table schemas (for column reading)
     sys_nodes_schema: &SchemaDescriptor,
     sys_edges_schema: &SchemaDescriptor,
-    sys_sources_schema: &SchemaDescriptor,
-    sys_params_schema: &SchemaDescriptor,
-    sys_gcols_schema: &SchemaDescriptor,
+    sys_node_cols_schema: &SchemaDescriptor,
     sys_dep_schema: &SchemaDescriptor,
     // View family directory (for creating child tables) and schema
     view_dir: &str,
@@ -1869,15 +2019,17 @@ pub unsafe fn compile_view(
     // External table registry
     ext_tables: &[ExternalTable],
 ) -> Result<CompileOutput, i32> {
-    // 1. Load circuit data from system tables
-    let nodes = load_nodes(sys_nodes, view_id, sys_nodes_schema);
+    // 1. Load circuit data from the three new system tables, synthesising
+    //    the legacy `params` / `str_params` / `sources` / `group_cols` maps
+    //    so the rest of the compiler stays unchanged.
+    let (nodes, edges, sources, params, str_params, group_cols) =
+        load_circuit(sys_nodes, sys_nodes_schema,
+                     sys_edges, sys_edges_schema,
+                     sys_node_cols, sys_node_cols_schema,
+                     view_id);
     if nodes.is_empty() {
         return Err(-1);
     }
-    let edges = load_edges(sys_edges, view_id, sys_edges_schema);
-    let sources = load_sources(sys_sources, view_id, sys_sources_schema);
-    let (params, str_params) = load_params(sys_params, view_id, sys_params_schema);
-    let group_cols = load_group_cols(sys_gcols, view_id, sys_gcols_schema);
 
     // 2. Build circuit graph + topological sort
     let mut graph = CircuitGraph {

@@ -487,6 +487,7 @@ fn append_value_to_col(
             Value::Null => {
                 match col {
                     ColData::Strings(v) => { v.push(None); }
+                    ColData::Bytes(v) => { v.push(None); }
                     ColData::Fixed(buf) => {
                         let stride = tc.wire_stride();
                         buf.extend(std::iter::repeat(0u8).take(stride));
@@ -528,6 +529,9 @@ fn append_value_to_col(
                     }
                     ColData::Strings(_) => Err(GnitzSqlError::Bind(
                         "number literal for string column".to_string()
+                    )),
+                    ColData::Bytes(_) => Err(GnitzSqlError::Bind(
+                        "number literal for blob column".to_string()
                     )),
                 }
             }
@@ -838,6 +842,9 @@ fn eval_expr(
                 ColData::Strings(_) => Err(GnitzSqlError::Unsupported(
                     "residual filter on string column not supported".to_string()
                 )),
+                ColData::Bytes(_) => Err(GnitzSqlError::Unsupported(
+                    "residual filter on blob column not supported".to_string()
+                )),
                 ColData::U128s(_) => {
                     let type_name = if schema.columns[*c].type_code == TypeCode::UUID { "UUID" } else { "U128" };
                     Err(GnitzSqlError::Unsupported(format!(
@@ -1023,6 +1030,7 @@ fn apply_limit(mut batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch
                 buf.truncate(limit * stride);
             }
             ColData::Strings(v) => { v.truncate(limit); }
+            ColData::Bytes(v) => { v.truncate(limit); }
             ColData::U128s(v) => { v.truncate(limit); }
         }
     }
@@ -1064,6 +1072,7 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
             match col {
                 ColData::Fixed(buf) => buf.extend(std::iter::repeat(0u8).take(tc.wire_stride())),
                 ColData::Strings(v) => v.push(None),
+                ColData::Bytes(v)   => v.push(None),
                 ColData::U128s(v)   => v.push(0u128),
             }
         }

@@ -56,10 +56,9 @@ pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
 use sys_tables::*;
 
 // Re-export types needed by other modules.
-pub(crate) use types::{ColumnDef, CircuitGraph, FkConstraint};
+pub(crate) use types::{ColumnDef, FkConstraint};
 pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_name,
                        make_fk_index_name, make_secondary_index_name, ingest_batch_into,
-                       flush_sys_table,
                        ensure_dir, fsync_dir,
                        get_index_key_type, make_index_schema,
                        cursor_read_u64, cursor_read_string,
@@ -99,9 +98,7 @@ pub struct CatalogEngine {
     pub(crate) sys_sequences: Box<Table>,
     pub(crate) sys_circuit_nodes: Box<Table>,
     pub(crate) sys_circuit_edges: Box<Table>,
-    pub(crate) sys_circuit_sources: Box<Table>,
-    pub(crate) sys_circuit_params: Box<Table>,
-    pub(crate) sys_circuit_group_cols: Box<Table>,
+    pub(crate) sys_circuit_node_columns: Box<Table>,
 
     // --- Pending broadcasts (ordered innermost → outermost) ---
     //

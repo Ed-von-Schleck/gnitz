@@ -30,12 +30,13 @@ pub use protocol::{
     Message, send_message, recv_message, encode_message,
     parse_response, encode_control_block, decode_control_block,
 };
-pub use expr::{ExprBuilder, ExprProgram};
-pub use circuit::{CircuitBuilder, NodeId};
+pub use expr::{ExprBuilder, ExprProgram, ExprDecodeErr, EXPR_BLOB_MAGIC, EXPR_BLOB_VERSION};
+pub use circuit::{
+    CircuitBuilder, NodeId, Port, TableId,
+    Circuit, OpNode, MapKind, JoinKind, AggKind, AggFunc, CircuitRows,
+};
 pub use types::{
-    CircuitGraph,
-    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
-    CIRCUIT_PARAMS_TAB, CIRCUIT_GROUP_COLS_TAB,
+    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
     OWNER_KIND_TABLE, OWNER_KIND_VIEW,
     OPCODE_SCAN_TRACE, OPCODE_INTEGRATE,
     OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
@@ -53,5 +54,5 @@ pub use types::{
     AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_COUNT_NON_NULL,
     schema_tab_schema, table_tab_schema, col_tab_schema, view_tab_schema,
     dep_tab_schema, circuit_nodes_schema, circuit_edges_schema,
-    circuit_sources_schema, circuit_params_schema, circuit_group_cols_schema,
+    circuit_node_columns_schema,
 };

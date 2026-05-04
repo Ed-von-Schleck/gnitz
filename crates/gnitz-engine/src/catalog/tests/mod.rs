@@ -51,19 +51,3 @@ fn count_records(table: &mut Table) -> usize {
     count
 }
 
-/// Build a passthrough (SELECT *) view graph over source_table_id.
-/// Node IDs start at 1, edge IDs start at 1.
-fn make_passthrough_graph(source_table_id: i64, output_cols: &[(String, u8)]) -> CircuitGraph {
-    // Node 1: SCAN_TRACE (opcode 11) — input delta (source table_id=0)
-    // Node 2: INTEGRATE (opcode 7) — sink
-    // Edge 1: node 1 → node 2, port 0 (PORT_IN)
-    CircuitGraph {
-        nodes: vec![(1, 11), (2, 7)],           // SCAN_TRACE, INTEGRATE
-        edges: vec![(1, 1, 2, 0)],              // edge 1: src=1 dst=2 port=0
-        sources: vec![(1, 0)],                   // node 1 reads from table_id=0 (primary delta)
-        params: vec![],
-        group_cols: vec![],
-        output_col_defs: output_cols.to_vec(),
-        dependencies: vec![source_table_id],
-    }
-}

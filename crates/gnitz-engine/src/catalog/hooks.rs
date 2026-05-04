@@ -262,9 +262,7 @@ impl CatalogEngine {
         for tab_id in [
             CIRCUIT_NODES_TAB_ID,
             CIRCUIT_EDGES_TAB_ID,
-            CIRCUIT_SOURCES_TAB_ID,
-            CIRCUIT_PARAMS_TAB_ID,
-            CIRCUIT_GROUP_COLS_TAB_ID,
+            CIRCUIT_NODE_COLUMNS_TAB_ID,
             DEP_TAB_ID,
         ] {
             let schema = sys_tab_schema(tab_id);

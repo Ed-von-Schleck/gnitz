@@ -16,6 +16,7 @@ use super::heap::MergeHeap;
 use crate::util::read_u64_le;
 
 use type_code::STRING as TYPE_STRING;
+use type_code::BLOB   as TYPE_BLOB;
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
@@ -83,7 +84,7 @@ pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 impl BlobCacheGuard {
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
         let has_strings = schema.payload_columns()
-            .any(|(_, _, col)| col.type_code == TYPE_STRING);
+            .any(|(_, _, col)| col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB);
         if has_strings {
             let mut cache = acquire_blob_cache();
             cache.reserve(max_rows);
@@ -337,7 +338,7 @@ impl<'a> DirectWriter<'a> {
             if is_null {
                 let off = out_row * col_size;
                 self.col_bufs[payload_idx][off..off + col_size].fill(0);
-            } else if col.type_code == TYPE_STRING {
+            } else if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
                 let src_struct = batch.get_col_ptr(row, payload_idx, 16);
                 self.write_string_cell(payload_idx, src_struct, batch.blob, out_row);
             } else {
@@ -389,7 +390,7 @@ impl<'a> DirectWriter<'a> {
         let schema = self.schema;
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size as usize;
-            if col.type_code == TYPE_STRING {
+            if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
                 let src_struct = source.get_col_ptr(row, pi, 16);
                 self.write_string_cell(pi, src_struct, src_blob, dst_row);
             } else {
@@ -660,7 +661,7 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
-        if col.type_code == TYPE_STRING {
+        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             // Blob relocation is sequential per-row; no way to batch.
             for (out, &idx) in indices.iter().enumerate() {
                 let row = idx as usize;
@@ -812,7 +813,7 @@ pub fn scatter_multi_source(
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
-        if col.type_code == TYPE_STRING {
+        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = sources[si as usize].as_ref().unwrap();
                 let row = ri as usize;
@@ -949,7 +950,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size as usize;
-        if col.type_code == TYPE_STRING {
+        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };

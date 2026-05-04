@@ -160,6 +160,22 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 }
                 col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
+            TypeCode::Blob => {
+                let bytes_col = match &batch.columns[ci] {
+                    ColData::Bytes(v) => v,
+                    _ => panic!("encode_wal_block: expected Bytes for BLOB column {}", ci),
+                };
+                let mut col_bytes = Vec::with_capacity(count * 16);
+                for (row, val) in bytes_col.iter().enumerate() {
+                    let is_null = (batch.nulls[row] & (1u64 << payload_idx)) != 0;
+                    if let (false, Some(b)) = (is_null, val.as_deref()) {
+                        col_bytes.extend_from_slice(&gnitz_wire::encode_german_string(b, &mut blob));
+                    } else {
+                        col_bytes.extend_from_slice(&[0u8; 16]);
+                    }
+                }
+                col_regions.push(ColRegion::Prebuilt(col_bytes));
+            }
             TypeCode::U128 | TypeCode::UUID => {
                 let vals = match &batch.columns[ci] {
                     ColData::U128s(v) => v,
@@ -407,6 +423,46 @@ pub fn decode_wal_block(
                     vals.push(Some(decode_german_string(st, blob)?));
                 }
                 columns.push(ColData::Strings(vals));
+            }
+            TypeCode::Blob => {
+                let expected_sz = count * 16;
+                if reg_sz != expected_sz {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "Blob column {} region size mismatch: expected {}, got {}",
+                        ci, expected_sz, reg_sz
+                    )));
+                }
+                let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+                for row in 0..count {
+                    let is_null = (nulls[row] & (1u64 << payload_idx)) != 0;
+                    if is_null {
+                        vals.push(None);
+                        continue;
+                    }
+                    let struct_start = reg_off + row * 16;
+                    if struct_start + 16 > data.len() {
+                        return Err(ProtocolError::DecodeError(format!(
+                            "Blob German struct out of bounds at row {}, col {}", row, ci
+                        )));
+                    }
+                    let mut st = [0u8; 16];
+                    st.copy_from_slice(&data[struct_start..struct_start + 16]);
+                    let length = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
+                    if length > SHORT_STRING_THRESHOLD {
+                        let offset = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
+                        let end = offset.checked_add(length).ok_or_else(|| {
+                            ProtocolError::DecodeError("BLOB blob offset overflow".into())
+                        })?;
+                        if end > blob.len() {
+                            return Err(ProtocolError::DecodeError(format!(
+                                "BLOB blob arena out of bounds: offset={}, length={}, blob.len()={}",
+                                offset, length, blob.len()
+                            )));
+                        }
+                    }
+                    vals.push(Some(gnitz_wire::decode_german_string(&st, blob)));
+                }
+                columns.push(ColData::Bytes(vals));
             }
             TypeCode::U128 | TypeCode::UUID => {
                 let expected_sz = count * 16;

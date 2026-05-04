@@ -4,9 +4,7 @@ use crate::storage::create_cursor_from_snapshots;
 const SYS_TABLE_IDS: &[i64] = &[
     SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
     DEP_TAB_ID, SEQ_TAB_ID,
-    CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
-    CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
-    CIRCUIT_GROUP_COLS_TAB_ID,
+    CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID, CIRCUIT_NODE_COLUMNS_TAB_ID,
 ];
 
 impl CatalogEngine {
@@ -24,9 +22,7 @@ impl CatalogEngine {
             SEQ_TAB_ID => Some(&mut self.sys_sequences),
             CIRCUIT_NODES_TAB_ID => Some(&mut self.sys_circuit_nodes),
             CIRCUIT_EDGES_TAB_ID => Some(&mut self.sys_circuit_edges),
-            CIRCUIT_SOURCES_TAB_ID => Some(&mut self.sys_circuit_sources),
-            CIRCUIT_PARAMS_TAB_ID => Some(&mut self.sys_circuit_params),
-            CIRCUIT_GROUP_COLS_TAB_ID => Some(&mut self.sys_circuit_group_cols),
+            CIRCUIT_NODE_COLUMNS_TAB_ID => Some(&mut self.sys_circuit_node_columns),
             _ => None,
         }
     }
@@ -195,16 +191,11 @@ impl CatalogEngine {
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Unknown table_id {}", table_id))?
         };
-        // CIRCUIT_* tables are internal DBSP bookkeeping, not part of the
-        // client catalog surface.  Consistent with seek_family returning None.
-        if matches!(table_id,
-            CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_SOURCES_TAB_ID |
-            CIRCUIT_PARAMS_TAB_ID | CIRCUIT_GROUP_COLS_TAB_ID)
-        {
-            return Ok(Rc::new(Batch::empty_with_schema(&schema)));
-        }
+        // The CIRCUIT_* tables are now SQL-introspectable: every operator's
+        // parameter shape is expressible in catalog schema.
         if matches!(table_id, SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID
-            | COL_TAB_ID | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID)
+            | COL_TAB_ID | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID
+            | CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_NODE_COLUMNS_TAB_ID)
         {
             let table = self.sys_table_mut(table_id).unwrap();
             return Ok(table.full_scan().unwrap_or_else(|_| {
@@ -224,13 +215,14 @@ impl CatalogEngine {
                 .ok_or_else(|| format!("Unknown table_id {}", table_id))?
         };
 
-        // Create cursor and seek.  Circuit_* system tables are intentionally
-        // excluded from the seek surface (internal DBSP bookkeeping, not
-        // part of the client catalog view).
+        // Create cursor and seek. The new CircuitNodes/CircuitEdges/
+        // CircuitNodeColumns layout is SQL-introspectable; only unrecognised
+        // system table IDs return None.
         let cursor_result = if table_id < FIRST_USER_TABLE_ID {
             match table_id {
                 SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID
-                | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID => {
+                | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID
+                | CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_NODE_COLUMNS_TAB_ID => {
                     let arc = match self.sys_table_mut(table_id).unwrap().full_scan() {
                         Ok(a) => a,
                         Err(_) => return Ok(None),
@@ -649,9 +641,7 @@ impl CatalogEngine {
             SEQ_TAB_ID => &self.sys_sequences,
             CIRCUIT_NODES_TAB_ID => &self.sys_circuit_nodes,
             CIRCUIT_EDGES_TAB_ID => &self.sys_circuit_edges,
-            CIRCUIT_SOURCES_TAB_ID => &self.sys_circuit_sources,
-            CIRCUIT_PARAMS_TAB_ID => &self.sys_circuit_params,
-            CIRCUIT_GROUP_COLS_TAB_ID => &self.sys_circuit_group_cols,
+            CIRCUIT_NODE_COLUMNS_TAB_ID => &self.sys_circuit_node_columns,
             _ => return 0,
         };
         table.current_lsn

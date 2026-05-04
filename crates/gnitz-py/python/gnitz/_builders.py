@@ -18,7 +18,7 @@ class CircuitBuilder:
     def anti_join(self, delta, trace_table_id):   return self._native.anti_join(delta, trace_table_id)
     def semi_join(self, delta, trace_table_id):   return self._native.semi_join(delta, trace_table_id)
     def shard(self, input, shard_columns):        return self._native.shard(input, shard_columns)
-    def gather(self, input, worker_id=0):         return self._native.gather(input, worker_id)
+    def gather(self, input):                      return self._native.gather(input)
     def sink(self, input):                        return self._native.sink(input)
 
     def reduce(self, input, group_by_cols, agg_func_id=0, agg_col_idx=0):
@@ -31,9 +31,9 @@ class CircuitBuilder:
         return self._native.reduce(input, group_by_cols, agg_func_id, agg_col_idx)
 
     def build(self):
-        return CircuitGraph(self._native.build())
+        return Circuit(self._native.build())
 
 
-class CircuitGraph:
-    def __init__(self, graph):
-        self._graph = graph  # _native.CircuitGraph (consumed on create_view_with_circuit)
+class Circuit:
+    def __init__(self, circuit):
+        self._graph = circuit  # _native.Circuit (consumed on create_view_with_circuit)

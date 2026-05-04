@@ -94,9 +94,13 @@ impl PartialEq<Vec<u128>> for PkColumn {
 /// Per-column payload data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColData {
-    /// Raw little-endian bytes; length = count * wire_stride (for all non-String, non-U128).
+    /// Raw little-endian bytes; length = count * wire_stride (for all non-String, non-U128, non-Blob).
     Fixed(Vec<u8>),
     Strings(Vec<Option<std::string::String>>),
+    /// Variable-length raw byte payloads. Same on-wire encoding as `Strings`
+    /// (16-byte German-string struct + blob arena spill) but the bytes are
+    /// not constrained to be valid UTF-8.
+    Bytes(Vec<Option<Vec<u8>>>),
     U128s(Vec<u128>),
 }
 
@@ -117,6 +121,7 @@ impl ZSetBatch {
             } else {
                 match col.type_code {
                     TypeCode::String => ColData::Strings(vec![]),
+                    TypeCode::Blob => ColData::Bytes(vec![]),
                     TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![]),
                     _                => ColData::Fixed(vec![]),
                 }
@@ -151,6 +156,7 @@ impl ZSetBatch {
             match (a, b) {
                 (ColData::Fixed(a), ColData::Fixed(b)) => a.extend_from_slice(b),
                 (ColData::Strings(a), ColData::Strings(b)) => a.extend(b.iter().cloned()),
+                (ColData::Bytes(a), ColData::Bytes(b)) => a.extend(b.iter().cloned()),
                 (ColData::U128s(a), ColData::U128s(b)) => a.extend_from_slice(b),
                 _ => panic!("extend_from: column type mismatch"),
             }
@@ -188,6 +194,14 @@ impl ZSetBatch {
                     if v.len() != n {
                         return Err(format!(
                             "column {} Strings length {} != row count {}",
+                            ci, v.len(), n
+                        ));
+                    }
+                }
+                ColData::Bytes(v) => {
+                    if v.len() != n {
+                        return Err(format!(
+                            "column {} Bytes length {} != row count {}",
                             ci, v.len(), n
                         ));
                     }
@@ -281,6 +295,28 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
+    /// Append a raw byte slice to the next Bytes (BLOB) column.
+    pub fn bytes_val(&mut self, b: &[u8]) -> &mut Self {
+        let ci = self.col_index();
+        match &mut self.batch.columns[ci] {
+            ColData::Bytes(v) => v.push(Some(b.to_vec())),
+            _ => panic!("BatchAppender: bytes_val called on non-Bytes column at schema index {}", ci),
+        }
+        self.cursor += 1;
+        self
+    }
+
+    /// Append a SQL NULL to the next Bytes (BLOB) column.
+    pub fn bytes_null(&mut self) -> &mut Self {
+        let ci = self.col_index();
+        match &mut self.batch.columns[ci] {
+            ColData::Bytes(v) => v.push(None),
+            _ => panic!("BatchAppender: bytes_null called on non-Bytes column at schema index {}", ci),
+        }
+        self.cursor += 1;
+        self
+    }
+
     /// Append a u128 value (split as lo/hi) to the next U128s column.
     pub fn u128_val(&mut self, lo: u64, hi: u64) -> &mut Self {
         let ci = self.col_index();
@@ -303,6 +339,9 @@ impl<'a> BatchAppender<'a> {
             }
             ColData::Strings(v) => {
                 v.push(Some(std::string::String::new()));
+            }
+            ColData::Bytes(v) => {
+                v.push(Some(Vec::new()));
             }
             ColData::U128s(v) => {
                 v.push(0);

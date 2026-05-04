@@ -48,7 +48,7 @@ pub struct GnitzExprProgram(gnitz_core::ExprProgram);
 
 pub struct GnitzCircuitBuilder(CircuitBuilder);
 
-pub struct GnitzCircuit(gnitz_core::CircuitGraph);
+pub struct GnitzCircuit(gnitz_core::Circuit);
 
 // ---------------------------------------------------------------------------
 // Thread-local error buffer
@@ -263,6 +263,10 @@ fn append_row_inner(
             ColData::Strings(_) => {
                 return Err(format!(
                     "col {} is a String column; use gnitz_batch_set_string", ci));
+            }
+            ColData::Bytes(_) => {
+                return Err(format!(
+                    "col {} is a BLOB column; not yet supported in C API row writer", ci));
             }
             ColData::U128s(v) => {
                 if offset + 16 > col_data.len() {
@@ -874,14 +878,13 @@ pub extern "C" fn gnitz_circuit_shard(
     cb_ref.0.shard(input, cols)
 }
 
-/// Exchange gather. Collects results from all workers at worker_id.
+/// Exchange gather. Collects results from all workers.
 #[no_mangle]
 pub extern "C" fn gnitz_circuit_gather(
-    cb:        *mut GnitzCircuitBuilder,
-    input:     u64,
-    worker_id: u64,
+    cb:    *mut GnitzCircuitBuilder,
+    input: u64,
 ) -> u64 {
-    check_ptr_mut!(cb, 0).0.gather(input, worker_id)
+    check_ptr_mut!(cb, 0).0.gather(input)
 }
 
 /// Add the integrate (sink) node.

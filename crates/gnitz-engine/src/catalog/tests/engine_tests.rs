@@ -435,25 +435,29 @@ fn test_get_column_names_cached() {
 }
 
 #[test]
-fn test_circuit_table_surface_restricted() {
+fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
+    // Schema layout: node_pk U128, view_id U64, node_id U64, opcode U64,
+    // source_table U64?, reindex_col U64?, expr_program BLOB?.
     let schema = circuit_nodes_schema();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(42u128, 1);
-    bb.put_u64(11); // opcode
+    bb.put_u64(0);   // view_id
+    bb.put_u64(42);  // node_id
+    bb.put_u64(11);  // opcode
+    bb.put_null();   // source_table (NULL)
+    bb.put_null();   // reindex_col (NULL)
+    bb.put_null();   // expr_program (NULL)
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
 
-    // scan_family must return empty (CIRCUIT_* tables not on the client surface).
+    // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
+    // must return what we just inserted (full-scan path, used by SQL planner).
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
-    assert_eq!(scan.count, 0, "scan_family must not expose CIRCUIT_NODES data");
-
-    // seek_family must also return None (already correct, assert for consistency).
-    let seek = engine.seek_family(CIRCUIT_NODES_TAB_ID, 42u128).unwrap();
-    assert!(seek.is_none(), "seek_family must not expose CIRCUIT_NODES data");
+    assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

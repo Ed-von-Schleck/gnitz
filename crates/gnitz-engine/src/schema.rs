@@ -135,7 +135,8 @@ pub(crate) fn promote_to_index_key(
         }
         TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
         TypeCode::U32 | TypeCode::I32 | TypeCode::F32 |
-        TypeCode::U64 | TypeCode::I64 | TypeCode::F64 | TypeCode::String => {
+        TypeCode::U64 | TypeCode::I64 | TypeCode::F64 |
+        TypeCode::String | TypeCode::Blob => {
             let mut bytes = [0u8; 8];
             let copy_len = col_size.min(8);
             bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
