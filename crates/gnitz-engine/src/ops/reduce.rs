@@ -419,7 +419,7 @@ fn compare_by_group_cols(
             let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
             let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
             a_f.total_cmp(&b_f)
-        } else if tc == type_code::U128 {
+        } else if tc == type_code::U128 || tc == type_code::UUID {
             let a_ptr = mb.get_col_ptr(row_a, pi, 16);
             let b_ptr = mb.get_col_ptr(row_b, pi, 16);
             let a_lo = u64::from_le_bytes(a_ptr[0..8].try_into().unwrap());
@@ -2023,5 +2023,126 @@ mod tests {
         let new_min = crate::util::read_i64_le(out2.col_data(0), 8);
         assert_eq!(new_min, 3, "new MIN should be 3 (min of old 5 and partial 3)");
         assert_eq!(out2.get_weight(1), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // UUID non-PK GROUP BY correctness
+    // -----------------------------------------------------------------------
+
+    /// Schema: pk(U64) + uuid_payload(UUID). UUID is at payload index 0.
+    fn make_schema_u64_pk_uuid_payload() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::UUID, size: 16, nullable: 0, _pad: 0 };
+        s
+    }
+
+    /// Schema: pk(U64) + uuid_col(UUID) + i64_col(I64).
+    fn make_schema_u64_uuid_i64() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::UUID, size: 16, nullable: 0, _pad: 0 };
+        s.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        s
+    }
+
+    fn build_batch_u64_uuid(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, uuid) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &uuid.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    fn build_batch_u64_uuid_i64(schema: &SchemaDescriptor, rows: &[(u64, u128, i64)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, uuid, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &uuid.to_le_bytes());
+            b.extend_col(1, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_compare_by_group_cols_uuid_non_pk() {
+        // UUID non-PK column used as GROUP BY column. Before the fix, compare_by_group_cols
+        // falls to the else branch with cs=16, panicking on a_buf[..16] (buf is [u8; 8]).
+        let schema = make_schema_u64_pk_uuid_payload();
+        let uuid_lo: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001u128;
+        let uuid_hi: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128;
+        let batch = build_batch_u64_uuid(&schema, &[(1, uuid_lo), (2, uuid_hi)]);
+        let mb = batch.as_mem_batch();
+
+        // uuid_lo < uuid_hi (compare by the 128-bit value)
+        let ord = compare_by_group_cols(&mb, 0, 1, &schema, &[1]);
+        assert_eq!(ord, std::cmp::Ordering::Less, "uuid_lo row must compare less than uuid_hi row");
+
+        let ord2 = compare_by_group_cols(&mb, 1, 0, &schema, &[1]);
+        assert_eq!(ord2, std::cmp::Ordering::Greater, "uuid_hi row must compare greater than uuid_lo row");
+
+        let ord3 = compare_by_group_cols(&mb, 0, 0, &schema, &[1]);
+        assert_eq!(ord3, std::cmp::Ordering::Equal, "same row must compare equal to itself");
+    }
+
+    #[test]
+    fn test_argsort_delta_uuid_group() {
+        // argsort_delta with UUID group column: calls compare_by_group_cols.
+        // Before fix: panics. After fix: rows sorted by UUID value.
+        let schema = make_schema_u64_pk_uuid_payload();
+        let uuid_a: u128 = 0x1000_0000_0000_0000_0000_0000_0000_0001u128;
+        let uuid_b: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0002u128;
+        // uuid_b < uuid_a (lower high byte)
+        let batch = build_batch_u64_uuid(&schema, &[(1, uuid_a), (2, uuid_b)]);
+        let indices = argsort_delta(&batch, &schema, &[1]);
+        assert_eq!(indices.len(), 2);
+        // Row with uuid_b (row 1) should sort before row with uuid_a (row 0)
+        assert_eq!(indices[0], 1, "uuid_b (smaller) must sort first");
+        assert_eq!(indices[1], 0, "uuid_a (larger) must sort second");
+    }
+
+    #[test]
+    fn test_extract_group_key_uuid_multi_col() {
+        // Multi-column GROUP BY that includes a UUID column. Before fix, extract_group_key's
+        // hash loop uses a [u8; 8] buffer for UUID (cs=16), panicking on buf[..16].
+        let schema = make_schema_u64_uuid_i64();
+        let uuid_a: u128 = 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_0001u128;
+        let uuid_b: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888u128;
+        let batch = build_batch_u64_uuid_i64(&schema, &[
+            (1, uuid_a, 42i64),
+            (2, uuid_b, 42i64),
+            (3, uuid_a, 43i64),
+        ]);
+        let mb = batch.as_mem_batch();
+
+        // GROUP BY (uuid_col=1, i64_col=2)
+        let key0 = extract_group_key(&mb, 0, &schema, &[1, 2]); // uuid_a, 42
+        let key1 = extract_group_key(&mb, 1, &schema, &[1, 2]); // uuid_b, 42
+        let key2 = extract_group_key(&mb, 2, &schema, &[1, 2]); // uuid_a, 43
+        let key0b = extract_group_key(&mb, 0, &schema, &[1, 2]); // same as key0
+
+        assert_ne!(key0, key1, "different UUIDs same int must yield different group keys");
+        assert_ne!(key0, key2, "same UUID different int must yield different group keys");
+        assert_ne!(key1, key2, "different UUID different int must yield different group keys");
+        assert_eq!(key0, key0b, "same inputs must yield the same group key");
     }
 }

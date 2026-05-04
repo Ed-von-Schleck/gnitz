@@ -191,6 +191,12 @@ pub(super) fn extract_group_key(
                     u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
                 xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
             }
+        } else if tc == type_code::U128 || tc == type_code::UUID {
+            let pi = payload_idx(c_idx, pki);
+            let ptr = mb.get_col_ptr(row, pi, 16);
+            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
+            mix64(lo ^ mix64(hi))
         } else {
             let pi = payload_idx(c_idx, pki);
             let cs = schema.columns[c_idx].size as usize;
