@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
-use crate::ops::AggDescriptor;
+use crate::ops::{AggDescriptor, AggOp};
 use crate::storage::{CursorHandle, Table, ReadCursor};
 use crate::vm::{ProgramBuilder, VmHandle};
 
@@ -26,7 +26,8 @@ gnitz_wire::cast_consts! { i32;
     PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_SHARD_COL_BASE, PARAM_CONST_STR_BASE,
 }
-gnitz_wire::cast_consts! { u8; AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_COUNT_NON_NULL }
+// AGG_* are expressed as AggOp variants; raw u8 values come from gnitz_wire
+// and are validated via AggOp::try_from at the compiler boundary.
 
 // Engine-only constants
 const PARAM_CHUNK_LIMIT: i32 = 2;
@@ -781,17 +782,17 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
 ///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)
-const fn agg_output_type(agg_op: u8, col_type_code: u8) -> (u8, u8) {
+const fn agg_output_type(agg_op: AggOp, col_type_code: u8) -> (u8, u8) {
     match agg_op {
-        AGG_COUNT | AGG_COUNT_NON_NULL => (type_code::I64, 8),
-        AGG_SUM | AGG_MIN | AGG_MAX => {
+        AggOp::Count | AggOp::CountNonNull => (type_code::I64, 8),
+        AggOp::Sum | AggOp::Min | AggOp::Max => {
             if col_type_code == type_code::F32 || col_type_code == type_code::F64 {
                 (type_code::F64, 8)
             } else {
                 (type_code::I64, 8)
             }
         }
-        _ => (type_code::I64, 8),
+        AggOp::Null => (type_code::I64, 8),
     }
 }
 
@@ -858,8 +859,8 @@ fn make_agg_value_idx_schema() -> SchemaDescriptor {
     s
 }
 
-fn is_linear_agg(agg_op: u8) -> bool {
-    agg_op == AGG_COUNT || agg_op == AGG_SUM || agg_op == AGG_COUNT_NON_NULL
+fn is_linear_agg(agg_op: AggOp) -> bool {
+    matches!(agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
 }
 
 fn agg_value_idx_eligible(col_type_code: u8) -> bool {
@@ -1389,7 +1390,7 @@ fn emit_reduce(
     // Parse aggregate descriptors
     let agg_count = node_params.get(&PARAM_AGG_COUNT).copied().unwrap_or(0);
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
-    let mut agg_func_id: u8 = 0;
+    let mut agg_func_id: AggOp = AggOp::Null;
     let mut agg_col_idx: u32 = 0;
 
     if agg_count > 0 {
@@ -1398,21 +1399,24 @@ fn emit_reduce(
             let func_id = (packed >> 32) as u8;
             let col_idx = (packed & 0xFFFFFFFF) as u32;
             let col_type_code = in_reg_schema.columns[col_idx as usize].type_code;
-            agg_descs.push(AggDescriptor { col_idx, agg_op: func_id, col_type_code, _pad: [0; 2] });
+            let agg_op = AggOp::try_from(func_id)
+                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
+            agg_descs.push(AggDescriptor { col_idx, agg_op, col_type_code, _pad: [0; 2] });
         }
         if agg_descs.len() == 1 {
             agg_func_id = agg_descs[0].agg_op;
             agg_col_idx = agg_descs[0].col_idx;
         }
     } else {
-        agg_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
+        let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
+        agg_func_id = AggOp::try_from(raw_func_id).unwrap_or(AggOp::Null);
         agg_col_idx = node_params.get(&PARAM_AGG_COL_IDX).copied().unwrap_or(0) as u32;
-        if agg_func_id > 0 {
+        if agg_func_id != AggOp::Null {
             let col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
             agg_descs.push(AggDescriptor { col_idx: agg_col_idx, agg_op: agg_func_id, col_type_code, _pad: [0; 2] });
         } else {
             // NullAggregate
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: 0, col_type_code: 0, _pad: [0; 2] });
+            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: 0, _pad: [0; 2] });
         }
     }
 
@@ -1455,7 +1459,7 @@ fn emit_reduce(
     // trace_in table (for non-linear aggregates)
     let all_linear = agg_descs.iter().all(|a| is_linear_agg(a.agg_op));
     let will_use_avi = agg_descs.len() == 1
-        && (agg_func_id == AGG_MIN || agg_func_id == AGG_MAX)
+        && matches!(agg_func_id, AggOp::Min | AggOp::Max)
         && agg_value_idx_eligible(in_reg_schema.columns[agg_col_idx as usize].type_code);
 
     let mut tr_in_reg_id: i32 = -1;
@@ -1519,7 +1523,7 @@ fn emit_reduce(
     let mut avi_agg_col_idx: u32 = 0;
 
     if will_use_avi {
-        avi_for_max = agg_func_id == AGG_MAX;
+        avi_for_max = agg_func_id == AggOp::Max;
         avi_agg_col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
         avi_agg_col_idx = agg_col_idx;
         avi_group_cols = gcols_u32.clone();
@@ -1630,18 +1634,21 @@ fn emit_gather_reduce(
         for ai in 0..agg_count as i32 {
             let packed = node_params.get(&(PARAM_AGG_SPEC_BASE + ai)).copied().unwrap_or(0);
             let func_id = (packed >> 32) as u8;
+            let agg_op = AggOp::try_from(func_id)
+                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
             let agg_col_in_partial = num_out_cols - agg_count as usize + ai as usize;
             let col_type = partial_schema.columns[agg_col_in_partial].type_code;
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: func_id, col_type_code: col_type, _pad: [0; 2] });
+            agg_descs.push(AggDescriptor { col_idx: 0, agg_op, col_type_code: col_type, _pad: [0; 2] });
         }
     } else {
-        let agg_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
-        if agg_func_id > 0 {
+        let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
+        let agg_func_id = AggOp::try_from(raw_func_id).unwrap_or(AggOp::Null);
+        if agg_func_id != AggOp::Null {
             let agg_col_in_partial = num_out_cols - 1;
             let col_type = partial_schema.columns[agg_col_in_partial].type_code;
             agg_descs.push(AggDescriptor { col_idx: 0, agg_op: agg_func_id, col_type_code: col_type, _pad: [0; 2] });
         } else {
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: 0, col_type_code: 0, _pad: [0; 2] });
+            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: 0, _pad: [0; 2] });
         }
     }
 
@@ -2129,12 +2136,12 @@ mod tests {
 
     #[test]
     fn test_agg_output_type() {
-        assert_eq!(agg_output_type(AGG_COUNT, type_code::I64), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AGG_SUM, type_code::F64), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AGG_SUM, type_code::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AGG_MIN, type_code::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AGG_MAX, type_code::F32), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AGG_MAX, type_code::STRING), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Count, type_code::I64), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Sum, type_code::F64), (type_code::F64, 8));
+        assert_eq!(agg_output_type(AggOp::Sum, type_code::I32), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Min, type_code::I32), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Max, type_code::F32), (type_code::F64, 8));
+        assert_eq!(agg_output_type(AggOp::Max, type_code::STRING), (type_code::I64, 8));
     }
 
     #[test]
@@ -2177,7 +2184,7 @@ mod tests {
         input.num_columns = 3;
         input.pk_index = 0;
 
-        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2] }];
+        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
         assert_eq!(out.num_columns, 2);
@@ -2194,7 +2201,7 @@ mod tests {
         input.num_columns = 3;
         input.pk_index = 0;
 
-        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AGG_COUNT, col_type_code: type_code::I64, _pad: [0; 2] }];
+        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: type_code::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
         assert_eq!(out.num_columns, 3);

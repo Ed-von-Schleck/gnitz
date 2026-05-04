@@ -43,18 +43,44 @@ use super::util::{
 // Aggregate opcodes
 // ---------------------------------------------------------------------------
 
-const AGG_COUNT: u8 = 1;
-const AGG_SUM: u8 = 2;
-const AGG_MIN: u8 = 3;
-const AGG_MAX: u8 = 4;
-const AGG_COUNT_NON_NULL: u8 = 5;
+/// Aggregate function selector.
+///
+/// `#[repr(u8)]` keeps `AggDescriptor` at its required 8-byte C layout, and
+/// lets the compiler enforce exhaustive matching instead of the previous bare
+/// `u8` with private named constants.  `Null` (0) is the NullAggregate
+/// sentinel emitted by the compiler when no aggregation is configured.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AggOp {
+    Null         = 0,
+    Count        = 1,
+    Sum          = 2,
+    Min          = 3,
+    Max          = 4,
+    CountNonNull = 5,
+}
+
+impl TryFrom<u8> for AggOp {
+    type Error = u8;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(AggOp::Null),
+            1 => Ok(AggOp::Count),
+            2 => Ok(AggOp::Sum),
+            3 => Ok(AggOp::Min),
+            4 => Ok(AggOp::Max),
+            5 => Ok(AggOp::CountNonNull),
+            other => Err(other),
+        }
+    }
+}
 
 /// Descriptor for one aggregate function.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {
     pub col_idx: u32,
-    pub agg_op: u8,
+    pub agg_op: AggOp,
     pub col_type_code: u8,
     pub _pad: [u8; 2],
 }
@@ -67,7 +93,7 @@ const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
 struct Accumulator {
     acc: i64,
     has_value: bool,
-    agg_op: u8,
+    agg_op: AggOp,
     col_type_code: u8,
     col_idx: u32,
 }
@@ -89,7 +115,7 @@ impl Accumulator {
     }
 
     fn is_linear(&self) -> bool {
-        self.agg_op == AGG_COUNT || self.agg_op == AGG_SUM || self.agg_op == AGG_COUNT_NON_NULL
+        matches!(self.agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
     }
 
     fn is_zero(&self) -> bool {
@@ -121,7 +147,7 @@ impl Accumulator {
         let pk_index = schema.pk_index as usize;
 
         // COUNT ignores nulls entirely
-        if self.agg_op != AGG_COUNT {
+        if self.agg_op != AggOp::Count {
             let payload_idx = payload_idx(col_idx, pk_index);
             let null_word = mb.get_null_word(row);
             if (null_word >> payload_idx) & 1 != 0 {
@@ -134,14 +160,14 @@ impl Accumulator {
         let is_f = self.is_float();
 
         match self.agg_op {
-            AGG_COUNT => {
+            AggOp::Count => {
                 self.acc = self.acc.wrapping_add(weight);
             }
-            AGG_COUNT_NON_NULL => {
+            AggOp::CountNonNull => {
                 // Already checked null above
                 self.acc = self.acc.wrapping_add(weight);
             }
-            AGG_SUM => {
+            AggOp::Sum => {
                 if is_f {
                     let val_f = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     let cur_f = f64::from_bits(self.acc as u64);
@@ -152,7 +178,7 @@ impl Accumulator {
                     self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
                 }
             }
-            AGG_MIN => {
+            AggOp::Min => {
                 if is_f {
                     let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v < f64::from_bits(self.acc as u64) {
@@ -165,7 +191,7 @@ impl Accumulator {
                     }
                 }
             }
-            AGG_MAX => {
+            AggOp::Max => {
                 if is_f {
                     let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v > f64::from_bits(self.acc as u64) {
@@ -178,7 +204,7 @@ impl Accumulator {
                     }
                 }
             }
-            _ => {}
+            AggOp::Null => {}
         }
     }
 
@@ -189,12 +215,12 @@ impl Accumulator {
     fn merge_accumulated(&mut self, value_bits: u64, weight: i64) {
         let is_f = self.is_float();
         match self.agg_op {
-            AGG_COUNT | AGG_COUNT_NON_NULL => {
+            AggOp::Count | AggOp::CountNonNull => {
                 let prev = value_bits as i64;
                 self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
                 self.has_value = true;
             }
-            AGG_SUM => {
+            AggOp::Sum => {
                 if is_f {
                     let prev_f = f64::from_bits(value_bits);
                     let w_f = weight as f64;
@@ -206,13 +232,13 @@ impl Accumulator {
                 }
                 self.has_value = true;
             }
-            AGG_MIN | AGG_MAX => {
+            AggOp::Min | AggOp::Max => {
                 if weight > 0 {
                     self.combine(value_bits);
                 }
                 // Negative weight: algebraically unsound for MIN/MAX — skip.
             }
-            _ => {}
+            AggOp::Null => {}
         }
     }
 
@@ -220,12 +246,12 @@ impl Accumulator {
     fn combine(&mut self, other_bits: u64) {
         let is_f = self.is_float();
         match self.agg_op {
-            AGG_COUNT | AGG_COUNT_NON_NULL => {
+            AggOp::Count | AggOp::CountNonNull => {
                 let prev = other_bits as i64;
                 self.acc = self.acc.wrapping_add(prev);
                 self.has_value = true;
             }
-            AGG_SUM => {
+            AggOp::Sum => {
                 if is_f {
                     let prev_f = f64::from_bits(other_bits);
                     let cur_f = f64::from_bits(self.acc as u64);
@@ -236,7 +262,7 @@ impl Accumulator {
                 }
                 self.has_value = true;
             }
-            AGG_MIN => {
+            AggOp::Min => {
                 let first = !self.has_value;
                 self.has_value = true;
                 if is_f {
@@ -251,7 +277,7 @@ impl Accumulator {
                     }
                 }
             }
-            AGG_MAX => {
+            AggOp::Max => {
                 let first = !self.has_value;
                 self.has_value = true;
                 if is_f {
@@ -266,7 +292,7 @@ impl Accumulator {
                     }
                 }
             }
-            _ => {}
+            AggOp::Null => {}
         }
     }
 }
@@ -565,7 +591,7 @@ pub fn op_reduce(
 
     // Linearity check
     let all_linear = agg_descs.iter().all(|d| {
-        d.agg_op == AGG_COUNT || d.agg_op == AGG_SUM || d.agg_op == AGG_COUNT_NON_NULL
+        matches!(d.agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
     });
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
@@ -1438,7 +1464,7 @@ mod tests {
         };
 
         let agg = AggDescriptor {
-            col_idx: 2, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 2, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
         let (out1, _) = op_reduce(
@@ -1507,7 +1533,7 @@ mod tests {
         let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         let agg = AggDescriptor {
-            col_idx: 0, agg_op: AGG_COUNT, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 0, agg_op: AggOp::Count, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
         // GROUP BY pk → each row is its own group
@@ -1556,7 +1582,7 @@ mod tests {
         // MAX on STRING agg col (col_idx=2, type=STRING); no AVI
         let agg_desc = AggDescriptor {
             col_idx: 2,
-            agg_op: AGG_MAX,
+            agg_op: AggOp::Max,
             col_type_code: type_code::STRING,
             _pad: [0; 2],
         };
@@ -1639,7 +1665,7 @@ mod tests {
         }
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
@@ -1823,7 +1849,7 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AGG_SUM, col_type_code: type_code::I32, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: type_code::I32, _pad: [0; 2],
         };
 
         // GROUP BY pk → each row is its own group
@@ -1870,7 +1896,7 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AGG_MIN, col_type_code: type_code::F32, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: type_code::F32, _pad: [0; 2],
         };
 
         // GROUP BY pk → all 3 rows in same group
@@ -1914,7 +1940,7 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AGG_MAX, col_type_code: type_code::I16, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Max, col_type_code: type_code::I16, _pad: [0; 2],
         };
 
         let (out, _) = op_reduce(
@@ -1962,7 +1988,7 @@ mod tests {
         partial1.count += 1;
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AGG_MIN, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);

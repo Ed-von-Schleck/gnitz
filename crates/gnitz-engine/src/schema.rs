@@ -73,6 +73,21 @@ impl SchemaDescriptor {
     }
 }
 
+impl PartialEq for SchemaDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        if self.num_columns != other.num_columns || self.pk_index != other.pk_index {
+            return false;
+        }
+        // Compare only the active columns; ignore _pad and unused slots.
+        self.columns[..self.num_columns as usize]
+            .iter()
+            .zip(other.columns[..other.num_columns as usize].iter())
+            .all(|(a, b)| a.type_code == b.type_code && a.size == b.size && a.nullable == b.nullable)
+    }
+}
+
+impl Eq for SchemaDescriptor {}
+
 impl Default for SchemaDescriptor {
     fn default() -> Self {
         SchemaDescriptor {

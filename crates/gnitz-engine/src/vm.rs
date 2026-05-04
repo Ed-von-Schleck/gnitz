@@ -146,21 +146,8 @@ impl ProgramBuilder {
     }
 
     fn schema_idx(&mut self, desc: SchemaDescriptor) -> u16 {
-        // Dedup by byte equality (SchemaDescriptor is Copy + repr(C))
-        for (i, s) in self.schemas.iter().enumerate() {
-            if s.num_columns == desc.num_columns && s.pk_index == desc.pk_index {
-                let mut same = true;
-                for c in 0..desc.num_columns as usize {
-                    if s.columns[c].type_code != desc.columns[c].type_code
-                        || s.columns[c].size != desc.columns[c].size
-                        || s.columns[c].nullable != desc.columns[c].nullable
-                    {
-                        same = false;
-                        break;
-                    }
-                }
-                if same { return i as u16; }
-            }
+        if let Some(i) = self.schemas.iter().position(|s| s == &desc) {
+            return i as u16;
         }
         let idx = self.schemas.len() as u16;
         self.schemas.push(desc);
@@ -302,6 +289,8 @@ impl ProgramBuilder {
             None
         };
         let avi = if !avi_table.is_null() {
+            assert!(!avi_input_schema.is_null(),
+                "add_integrate: avi_input_schema must be non-null when avi_table is non-null");
             let (gc_off, gc_cnt) = self.add_group_cols(avi_group_cols);
             let avi_schema = unsafe { *avi_input_schema };
             let schema_idx = self.schema_idx(avi_schema);
@@ -520,6 +509,9 @@ impl ProgramBuilder {
 /// `program.tables` / `program.funcs` / `program.expr_progs` borrow via
 /// raw pointers.  Rust drop order (declaration order) ensures `program`
 /// drops before the owned vecs, so dangling pointers are never chased.
+///
+/// The compile-time assertion below makes this invariant machine-checked:
+/// reordering fields will produce a compile error, not a use-after-free.
 #[allow(clippy::vec_box)]
 pub struct VmHandle {
     pub program: Program,
@@ -542,6 +534,13 @@ pub struct VmHandle {
     /// Indexed in parallel with `owned_trace_regs`.
     owned_cursor_handles: Vec<Option<Box<CursorHandle>>>,
 }
+
+// Compile-time proof that `program` precedes the owned resource vecs in
+// memory, guaranteeing Rust's declaration-order drop visits `program` first.
+const _: () = assert!(
+    std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_tables),
+    "VmHandle: program must be declared before owned_tables to ensure correct drop order",
+);
 
 impl VmHandle {
     /// Compact owned tables and create fresh cursors for owned trace registers.
@@ -777,6 +776,9 @@ pub fn execute_epoch(
             }
 
             Instr::Delay { src, state_reg, dst } => {
+                debug_assert_ne!(*src, *state_reg, "Delay: src and state_reg must be distinct");
+                debug_assert_ne!(*src, *dst, "Delay: src and dst must be distinct");
+                debug_assert_ne!(*state_reg, *dst, "Delay: state_reg and dst must be distinct");
                 let npc = reg!(*src).batch.num_payload_cols();
                 let curr = std::mem::replace(&mut reg_mut!(*src).batch, Batch::empty(npc, 16));
                 let prev = std::mem::replace(&mut reg_mut!(*state_reg).batch, curr);
@@ -802,11 +804,12 @@ pub fn execute_epoch(
             }
 
             Instr::Filter { in_reg, out_reg, func_idx } => {
+                debug_assert_ne!(*in_reg, *out_reg, "Filter: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
                 let in_batch = &reg!(*in_reg).batch;
                 let schema = reg!(*in_reg).schema;
                 let result = if func_ptr.is_null() {
-                    // NullPredicate: pass all rows unchanged
+                    // NullPredicate: clone — in_reg may be read by multiple instructions.
                     let mut out = in_batch.clone_batch();
                     out.set_schema(schema);
                     out.sorted = in_batch.sorted;
@@ -820,6 +823,7 @@ pub fn execute_epoch(
             }
 
             Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col } => {
+                debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
                 let in_schema = reg!(*in_reg).schema;
                 let out_schema = &program.schemas[*out_schema_idx as usize];
@@ -836,6 +840,7 @@ pub fn execute_epoch(
             }
 
             Instr::Negate { in_reg, out_reg } => {
+                debug_assert_ne!(*in_reg, *out_reg, "Negate: in_reg and out_reg must be distinct");
                 let result = ops::op_negate(&reg!(*in_reg).batch);
                 reg_mut!(*out_reg).batch = result;
             }
@@ -848,10 +853,10 @@ pub fn execute_epoch(
             }
 
             Instr::Distinct { in_reg, hist_reg, out_reg, hist_table_idx } => {
-                let schema = reg!(*in_reg).schema;
-                let npc = reg!(*in_reg).batch.num_payload_cols();
-                let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, 16));
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
+                    let schema = reg!(*in_reg).schema;
+                    let npc = reg!(*in_reg).batch.num_payload_cols();
+                    let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, 16));
                     let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
                     reg_mut!(*out_reg).batch = output.into_inner();
                     // Ingest consolidated delta into history table
@@ -861,6 +866,7 @@ pub fn execute_epoch(
                         let _ = table.ingest_owned_batch(consolidated.into_inner());
                     }
                 }
+                // If cursor is null, in_reg retains its data (not consumed).
             }
 
             Instr::JoinDT { delta_reg, trace_reg, out_reg, right_schema_idx } => {
@@ -885,6 +891,10 @@ pub fn execute_epoch(
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_join_delta_trace_outer(&reg!(*delta_reg).batch, cursor, &left_schema, right_schema);
                     reg_mut!(*out_reg).batch = result;
+                } else {
+                    // Absent trace ⟹ every delta row has no right-side match → null-extend.
+                    let result = ops::op_null_extend(&reg!(*delta_reg).batch, &left_schema, right_schema);
+                    reg_mut!(*out_reg).batch = result;
                 }
             }
 
@@ -893,6 +903,11 @@ pub fn execute_epoch(
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_anti_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
                     reg_mut!(*out_reg).batch = result.into_inner();
+                } else {
+                    // Absent trace ⟹ nothing to exclude; pass delta through unchanged.
+                    let npc = reg!(*delta_reg).batch.num_payload_cols();
+                    let batch = std::mem::replace(&mut reg_mut!(*delta_reg).batch, Batch::empty(npc, 16));
+                    reg_mut!(*out_reg).batch = batch;
                 }
             }
 
@@ -1116,7 +1131,7 @@ pub fn execute_epoch(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::ops::AggDescriptor;
+    use crate::ops::{AggDescriptor, AggOp};
 
     // ── Test helpers ─────────────────────────────────────────────────────
 
@@ -1948,10 +1963,10 @@ mod tests {
 
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
-        // Agg descriptors: SUM of payload col 1 (schema col 2)
+        // Agg descriptors: SUM of payload col 1 (schema col 2).
         let agg_descs = [AggDescriptor {
-            col_idx: 2,  // schema col index
-            agg_op: 1,   // AGG_SUM
+            col_idx: 2,
+            agg_op: AggOp::Sum,
             col_type_code: type_code::I64,
             _pad: [0; 2],
         }];
@@ -2030,7 +2045,9 @@ mod tests {
         ).unwrap().unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
-        assert!(r1.count >= 1);
+        assert_eq!(r1.count, 1, "one group → one output row");
+        let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
 
         // Cleanup
         unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
@@ -2326,13 +2343,13 @@ mod tests {
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column
-                agg_op: 1,            // AGG_COUNT
+                agg_op: AggOp::Count,
                 col_type_code: type_code::I64,
                 _pad: [0; 2],
             },
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column
-                agg_op: 2,            // AGG_SUM
+                agg_op: AggOp::Sum,
                 col_type_code: type_code::I64,
                 _pad: [0; 2],
             },
@@ -2430,6 +2447,153 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (1, 1, 10));
         assert_eq!(rows[1], (2, 1, 20));
+    }
+
+    // ── Regression: AntiJoinDT with null trace cursor ────────────────────
+
+    /// AntiJoinDT semantics: if the trace is absent (null cursor), nothing is
+    /// excluded → all delta rows should pass through unchanged.
+    /// Bug: current code silently returns empty instead.
+    #[test]
+    fn test_anti_join_dt_null_cursor() {
+        let schema = schema_1i64();
+
+        let mut builder = ProgramBuilder::new(3);
+        // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
+        builder.add_anti_join_dt(0, 1, 2);
+        builder.add_halt();
+
+        let reg_schemas = [schema; 3];
+        let reg_kinds = [0u8, 1u8, 0u8];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        // Pass null for the trace register — simulates cursor-create failure or
+        // an empty table that could not produce a cursor handle.
+        let cursors = vec![std::ptr::null_mut(); 3];
+
+        let input = make_batch(schema, &[
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+            (3u128, 1, 30),
+        ]);
+        let result = execute_epoch(
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
+        ).unwrap();
+
+        // With no trace to exclude against, all 3 delta rows must survive.
+        let result = result.expect("anti-join with null trace must pass all delta rows");
+        assert_eq!(result.count, 3, "all delta rows should survive when trace cursor is null");
+    }
+
+    /// JoinDTOuter semantics: if the trace is absent (null cursor), every delta
+    /// row has no right-side match → all should be null-extended.
+    /// Bug: current code silently returns empty instead.
+    #[test]
+    fn test_join_dt_outer_null_cursor() {
+        let left_schema = schema_1i64();
+        // right schema: same shape (one I64 payload col)
+        let right_schema = schema_1i64();
+        // outer join output: left col + right col (right cols will be null)
+        let out_schema = make_schema(&[(type_code::I64, 8), (type_code::I64, 8)]);
+
+        let mut builder = ProgramBuilder::new(3);
+        // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
+        builder.add_join_dt_outer(0, 1, 2, right_schema);
+        builder.add_halt();
+
+        let reg_schemas = [left_schema, right_schema, out_schema];
+        let reg_kinds = [0u8, 1u8, 0u8];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        let cursors = vec![std::ptr::null_mut(); 3];
+
+        let input = make_batch(left_schema, &[
+            (1u128, 1, 10),
+            (2u128, 1, 20),
+        ]);
+        let result = execute_epoch(
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
+        ).unwrap();
+
+        // With no trace, outer join must null-extend all 2 delta rows.
+        let result = result.expect("outer join with null trace must null-extend all delta rows");
+        assert_eq!(result.count, 2, "all delta rows should be null-extended when trace cursor is null");
+    }
+
+    /// Proper SUM test: use agg_op=2 (AGG_SUM) and verify the actual aggregate
+    /// value, not just that output is non-empty.
+    #[test]
+    fn test_reduce_sum_value() {
+        let in_schema = make_schema(&[(type_code::I64, 8)]);
+        let out_schema = make_schema(&[(type_code::I64, 8)]);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tout_dir = dir.path().join("sv_tr_out");
+        let mut trace_out_table = Table::new(
+            tout_dir.to_str().unwrap(), "sv_tr_out", out_schema, 0, 1 << 20, false,
+        ).unwrap();
+        let trace_out_ptr = &mut trace_out_table as *mut Table;
+
+        let tin_dir = dir.path().join("sv_tr_in");
+        let mut trace_in_table = Table::new(
+            tin_dir.to_str().unwrap(), "sv_tr_in", in_schema, 0, 1 << 20, false,
+        ).unwrap();
+        let trace_in_ptr = &mut trace_in_table as *mut Table;
+
+        // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT)
+        let agg_descs = [AggDescriptor {
+            col_idx: 1,
+            agg_op: AggOp::Sum,
+            col_type_code: type_code::I64,
+            _pad: [0; 2],
+        }];
+        // GROUP BY col 0 (pk)
+        let group_cols = [0u32];
+
+        let mut builder = ProgramBuilder::new(4);
+        builder.add_reduce(
+            0, 2, 1, 3, -1,
+            &agg_descs, &group_cols, out_schema,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null(), std::ptr::null(),
+        );
+        builder.add_integrate(3, trace_out_ptr,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
+        builder.add_integrate(0, trace_in_ptr,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
+        builder.add_halt();
+
+        let reg_schemas = [in_schema, out_schema, in_schema, out_schema];
+        let reg_kinds = [0, 1, 1, 0];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
+        let input = make_batch(in_schema, &[
+            (1u128, 1, 10),
+            (1u128, 1, 20),
+            (1u128, 1, 30),
+        ]);
+
+        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.create_cursor().unwrap())) as *mut libc::c_void;
+        let tr_in_ch  = Box::into_raw(Box::new(trace_in_table.create_cursor().unwrap()))  as *mut libc::c_void;
+        let cursors = vec![std::ptr::null_mut(), tr_out_ch, tr_in_ch, std::ptr::null_mut()];
+
+        let result = execute_epoch(
+            &vm.program, &mut vm.regfile, input, 0, 3, &cursors, &[],
+        ).unwrap().expect("SUM reduce must produce output");
+
+        assert_eq!(result.count, 1, "one group → one output row");
+        let sum_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
+        assert_eq!(sum_val, 60, "SUM(10+20+30) must be 60");
+
+        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_in_ch  as *mut CursorHandle)); }
+        trace_out_table.close();
+        trace_in_table.close();
     }
 
     // ── Fix regression: stale external cursor in bind_cursors ─────────────

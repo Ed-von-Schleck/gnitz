@@ -20,6 +20,6 @@ pub use join::{
     op_semi_join_delta_trace,
 };
 pub use linear::{op_filter, op_map, op_negate, op_null_extend, op_union};
-pub use reduce::{AggDescriptor, op_gather_reduce, op_reduce};
+pub use reduce::{AggDescriptor, AggOp, op_gather_reduce, op_reduce};
 pub use scan::op_scan_trace;
 
