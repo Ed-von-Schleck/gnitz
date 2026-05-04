@@ -44,6 +44,81 @@ pub mod type_code {
     pub const UUID:   u8 = 13;
 }
 
+/// Typed column type code enum, mirroring the `type_code::*` constants.
+///
+/// `#[repr(u8)]` — discriminants equal the corresponding `type_code::*` constant.
+/// Stored as `u8` on disk (`SchemaColumn.type_code`); use `from_validated_u8` to
+/// convert in-memory data that has already passed DDL validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TypeCode {
+    U8     = type_code::U8,
+    I8     = type_code::I8,
+    U16    = type_code::U16,
+    I16    = type_code::I16,
+    U32    = type_code::U32,
+    I32    = type_code::I32,
+    F32    = type_code::F32,
+    U64    = type_code::U64,
+    I64    = type_code::I64,
+    F64    = type_code::F64,
+    String = type_code::STRING,
+    U128   = type_code::U128,
+    UUID   = type_code::UUID,
+}
+
+impl TypeCode {
+    /// Convert a wire u8 that has already passed DDL validation. Panics on unknown codes.
+    #[inline]
+    pub fn from_validated_u8(v: u8) -> Self {
+        Self::try_from_u8(v)
+            .unwrap_or_else(|| panic!("invalid type_code {} in validated schema", v))
+    }
+
+    /// Convert a raw u8 wire value. Returns `None` for unknown codes.
+    #[inline]
+    pub fn try_from_u8(v: u8) -> Option<Self> {
+        use type_code as tc;
+        match v {
+            tc::U8     => Some(TypeCode::U8),
+            tc::I8     => Some(TypeCode::I8),
+            tc::U16    => Some(TypeCode::U16),
+            tc::I16    => Some(TypeCode::I16),
+            tc::U32    => Some(TypeCode::U32),
+            tc::I32    => Some(TypeCode::I32),
+            tc::F32    => Some(TypeCode::F32),
+            tc::U64    => Some(TypeCode::U64),
+            tc::I64    => Some(TypeCode::I64),
+            tc::F64    => Some(TypeCode::F64),
+            tc::STRING => Some(TypeCode::String),
+            tc::U128   => Some(TypeCode::U128),
+            tc::UUID   => Some(TypeCode::UUID),
+            _          => None,
+        }
+    }
+
+    /// Byte stride of this type in a column payload.
+    pub const fn stride(&self) -> u8 {
+        match self {
+            TypeCode::U8  | TypeCode::I8  => 1,
+            TypeCode::U16 | TypeCode::I16 => 2,
+            TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
+            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
+            TypeCode::U128 | TypeCode::UUID | TypeCode::String => 16,
+        }
+    }
+
+    pub const fn is_float(&self) -> bool {
+        matches!(self, TypeCode::F32 | TypeCode::F64)
+    }
+
+    /// Wire stride in bytes. Alias for `stride()` returning `usize`.
+    #[inline]
+    pub fn wire_stride(self) -> usize {
+        self.stride() as usize
+    }
+}
+
 /// Wire stride (byte width) for a column type code.
 /// Returns 8 for unknown codes (engine compare_rows depends on this default).
 pub const fn wire_stride(tc: u8) -> usize {

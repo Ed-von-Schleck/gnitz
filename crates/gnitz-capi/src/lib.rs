@@ -4,6 +4,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::SqlPlanner;
 
 // ---------------------------------------------------------------------------
@@ -162,7 +163,7 @@ pub extern "C" fn gnitz_schema_add_col(
     nullable:  c_int,
 ) -> c_int {
     let s = check_ptr_mut!(schema, -1);
-    let tc = match TypeCode::try_from_u64(type_code as u64) {
+    let tc = match type_code_from_u64(type_code as u64) {
         Ok(t)  => t,
         Err(e) => { set_error(e); return -1; }
     };

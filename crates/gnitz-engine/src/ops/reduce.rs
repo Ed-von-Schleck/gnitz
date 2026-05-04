@@ -1,7 +1,6 @@
 //! Reduce operator: accumulator, group key, argsort, AVI, op_reduce, op_gather_reduce.
 
-use crate::schema::{SchemaDescriptor, type_code};
-use crate::schema::type_code::STRING as TYPE_STRING;
+use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::storage::{
     Batch, ConsolidatedBatch, DRAIN_BUFFER, MemBatch, ReadCursor,
     scatter_copy, write_to_batch,
@@ -87,32 +86,40 @@ impl AggOp {
 pub struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggOp,
-    pub col_type_code: u8,
+    pub col_type_code: TypeCode,
     pub _pad: [u8; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<AggOp>() == 1);
+const _: () = assert!(std::mem::size_of::<TypeCode>() == 1);
 const _: () = assert!(std::mem::size_of::<AggDescriptor>() == 8);
 const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
 
 
 /// Accumulator: internal state for one aggregate column.
+///
+/// Field order: largest alignment first to minimise padding.
 struct Accumulator {
     acc: i64,
-    has_value: bool,
+    col_type_code: TypeCode,
     agg_op: AggOp,
-    col_type_code: u8,
-    col_idx: u32,
+    pi: u8,
+    is_pk_col: bool,
+    has_value: bool,
 }
 
 impl Accumulator {
-    fn new(desc: &AggDescriptor) -> Self {
+    fn new(desc: &AggDescriptor, pk_index: usize) -> Self {
+        let col_idx = desc.col_idx as usize;
+        let is_pk_col = col_idx == pk_index;
+        let tc = desc.col_type_code;
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
-            col_type_code: desc.col_type_code,
-            col_idx: desc.col_idx,
+            col_type_code: tc,
+            pi: if is_pk_col { 0 } else { payload_idx(col_idx, pk_index) as u8 },
+            is_pk_col,
         }
     }
 
@@ -139,7 +146,7 @@ impl Accumulator {
     }
 
     fn is_float(&self) -> bool {
-        self.col_type_code == type_code::F64 || self.col_type_code == type_code::F32
+        self.col_type_code.is_float()
     }
 
     /// Step: incorporate one input row into the accumulator.
@@ -147,17 +154,15 @@ impl Accumulator {
         &mut self,
         mb: &MemBatch,
         row: usize,
-        schema: &SchemaDescriptor,
         weight: i64,
     ) {
-        let col_idx = self.col_idx as usize;
-        let pk_index = schema.pk_index as usize;
+        let pi = self.pi as usize;
+        let tc = self.col_type_code;
 
-        // COUNT ignores nulls entirely
-        if self.agg_op != AggOp::Count {
-            let payload_idx = payload_idx(col_idx, pk_index);
+        // COUNT ignores nulls entirely; PK column is never null.
+        if self.agg_op != AggOp::Count && !self.is_pk_col {
             let null_word = mb.get_null_word(row);
-            if (null_word >> payload_idx) & 1 != 0 {
+            if (null_word >> pi) & 1 != 0 {
                 return; // null value — skip
             }
         }
@@ -171,28 +176,35 @@ impl Accumulator {
                 self.acc = self.acc.wrapping_add(weight);
             }
             AggOp::CountNonNull => {
-                // Already checked null above
                 self.acc = self.acc.wrapping_add(weight);
             }
             AggOp::Sum => {
                 if is_f {
-                    let val_f = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
+                    let val_f = read_col_value_f64(mb, row, pi, tc);
                     let cur_f = f64::from_bits(self.acc as u64);
                     let w_f = weight as f64;
                     self.acc = f64::to_bits(cur_f + val_f * w_f) as i64;
                 } else {
-                    let val = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
+                    let val = if self.is_pk_col {
+                        pk_as_i64(mb.get_pk(row), tc)
+                    } else {
+                        read_col_value(mb, row, pi, tc)
+                    };
                     self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
                 }
             }
             AggOp::Min => {
                 if is_f {
-                    let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
+                    let v = read_col_value_f64(mb, row, pi, tc);
                     if first || v < f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
+                    let v = if self.is_pk_col {
+                        pk_as_i64(mb.get_pk(row), tc)
+                    } else {
+                        read_col_value(mb, row, pi, tc)
+                    };
                     if first || v < self.acc {
                         self.acc = v;
                     }
@@ -200,12 +212,16 @@ impl Accumulator {
             }
             AggOp::Max => {
                 if is_f {
-                    let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
+                    let v = read_col_value_f64(mb, row, pi, tc);
                     if first || v > f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
+                    let v = if self.is_pk_col {
+                        pk_as_i64(mb.get_pk(row), tc)
+                    } else {
+                        read_col_value(mb, row, pi, tc)
+                    };
                     if first || v > self.acc {
                         self.acc = v;
                     }
@@ -304,31 +320,66 @@ impl Accumulator {
     }
 }
 
-/// Read a column value as sign-extended i64, respecting actual column size.
+/// Read a column value as sign-extended i64 using pre-hoisted payload index and TypeCode.
 /// STRING columns: reads first 8 bytes of the 16-byte German String struct (compare key).
 #[inline]
-fn read_col_value(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> i64 {
-    let pi = payload_idx(col_idx, pk_index);
-    let cs = crate::schema::type_size(col_type_code) as usize;
-    let ptr = mb.get_col_ptr(row, pi, cs);
-    if col_type_code == type_code::STRING {
-        // STRING agg: compare key is first 8 bytes of 16-byte German String
-        i64::from_le_bytes(ptr[..8].try_into().unwrap())
-    } else {
-        crate::schema::read_signed(ptr, cs)
+fn read_col_value(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> i64 {
+    match tc {
+        TypeCode::I8  => mb.get_col_ptr(row, pi, 1)[0] as i8 as i64,
+        TypeCode::U8  => mb.get_col_ptr(row, pi, 1)[0] as i64,
+        TypeCode::I16 => i16::from_le_bytes(mb.get_col_ptr(row, pi, 2).try_into().unwrap()) as i64,
+        TypeCode::U16 => u16::from_le_bytes(mb.get_col_ptr(row, pi, 2).try_into().unwrap()) as i64,
+        TypeCode::I32 => i32::from_le_bytes(mb.get_col_ptr(row, pi, 4).try_into().unwrap()) as i64,
+        TypeCode::U32 => u32::from_le_bytes(mb.get_col_ptr(row, pi, 4).try_into().unwrap()) as i64,
+        TypeCode::I64 | TypeCode::U64 =>
+            i64::from_le_bytes(mb.get_col_ptr(row, pi, 8).try_into().unwrap()),
+        TypeCode::String =>
+            // STRING agg: compare key is first 8 bytes of 16-byte German String struct.
+            // Must use stride=16 so get_col_ptr computes the correct row base address;
+            // passing stride=8 gives the right offset only for row=0.
+            i64::from_le_bytes(mb.get_col_ptr(row, pi, 16)[..8].try_into().unwrap()),
+        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID =>
+            unreachable!("read_col_value: non-integer/string type"),
     }
 }
 
 /// Read a float column value as f64, with proper F32→F64 promotion.
 #[inline]
-fn read_col_value_f64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> f64 {
-    let pi = payload_idx(col_idx, pk_index);
-    if col_type_code == type_code::F32 {
-        let ptr = mb.get_col_ptr(row, pi, 4);
-        f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
-    } else {
-        let ptr = mb.get_col_ptr(row, pi, 8);
-        f64::from_bits(u64::from_le_bytes(ptr.try_into().unwrap()))
+fn read_col_value_f64(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> f64 {
+    match tc {
+        TypeCode::F32 => {
+            let ptr = mb.get_col_ptr(row, pi, 4);
+            f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
+        }
+        TypeCode::F64 => {
+            let ptr = mb.get_col_ptr(row, pi, 8);
+            f64::from_bits(u64::from_le_bytes(ptr.try_into().unwrap()))
+        }
+        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
+        TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String =>
+            unreachable!("read_col_value_f64: non-float type"),
+    }
+}
+
+/// Extract a PK value (zero/sign-extended into u128) as i64 for accumulation.
+/// Narrow integer PKs are zero-extended in the 128-bit PK slot, so we must
+/// sign-extend here for signed types.
+#[inline]
+fn pk_as_i64(pk: u128, tc: TypeCode) -> i64 {
+    match tc {
+        TypeCode::I8  => (pk as u8)  as i8  as i64,
+        TypeCode::I16 => (pk as u16) as i16 as i64,
+        TypeCode::I32 => (pk as u32) as i32 as i64,
+        TypeCode::I64 => pk as u64 as i64,
+        TypeCode::U8  => (pk as u8)  as i64,
+        TypeCode::U16 => (pk as u16) as i64,
+        TypeCode::U32 => (pk as u32) as i64,
+        TypeCode::U64 => pk as u64 as i64,
+        TypeCode::F32 => f32::from_bits(pk as u32) as f64 as i64,
+        TypeCode::F64 => f64::from_bits(pk as u64) as i64,
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String =>
+            unreachable!("pk_as_i64: non-numeric PK type"),
     }
 }
 
@@ -346,12 +397,15 @@ pub(super) fn extract_gc_u64(
     let pki = schema.pk_index as usize;
     if group_by_cols.len() == 1 {
         let c_idx = group_by_cols[0] as usize;
-        let tc = schema.columns[c_idx].type_code;
-        if tc != type_code::U128 && tc != type_code::UUID && tc != TYPE_STRING
-            && tc != type_code::F32 && tc != type_code::F64
-        {
+        let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
+        let eligible = match tc {
+            TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
+            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 => true,
+            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::String => false,
+        };
+        if eligible {
             let pi = payload_idx(c_idx, pki);
-            let cs = crate::schema::type_size(tc) as usize;
+            let cs = tc.stride() as usize;
             let ptr = mb.get_col_ptr(row, pi, cs);
             let mut buf = [0u8; 8];
             buf[..cs].copy_from_slice(ptr);
@@ -388,69 +442,104 @@ fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 // Argsort
 // ---------------------------------------------------------------------------
 
-/// Compare two rows by group columns.
+/// Pre-computed per-column sort descriptor to avoid repeated schema lookups.
+///
+/// Four bytes per entry, no padding (all fields are u8-sized).
+/// A stack array of MAX_COLUMNS = 65 entries is 260 bytes — well within four cache lines.
+#[derive(Clone, Copy)]
+struct SortDesc {
+    pi: u8,
+    cs: u8,
+    tc: TypeCode,
+    c_idx: u8,
+}
+
+/// Compare two rows by group columns using pre-computed SortDesc array.
 fn compare_by_group_cols(
     mb: &MemBatch,
     row_a: usize,
     row_b: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
+    descs: &[SortDesc],
 ) -> std::cmp::Ordering {
-    let pki = schema.pk_index as usize;
-    for &c_idx_u32 in group_by_cols {
-        let c_idx = c_idx_u32 as usize;
-        let tc = schema.columns[c_idx].type_code;
-        let pi = payload_idx(c_idx, pki);
-
-        let ord = if tc == TYPE_STRING {
-            let a_bytes = mb.get_col_ptr(row_a, pi, 16);
-            let b_bytes = mb.get_col_ptr(row_b, pi, 16);
-            use crate::schema::compare_german_strings;
-            compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
-        } else if tc == type_code::F64 {
-            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
-            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
-            let a_f = f64::from_bits(crate::util::read_u64_le(a_ptr, 0));
-            let b_f = f64::from_bits(crate::util::read_u64_le(b_ptr, 0));
-            a_f.total_cmp(&b_f)
-        } else if tc == type_code::F32 {
-            let a_ptr = mb.get_col_ptr(row_a, pi, 4);
-            let b_ptr = mb.get_col_ptr(row_b, pi, 4);
-            let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
-            let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
-            a_f.total_cmp(&b_f)
-        } else if tc == type_code::U128 || tc == type_code::UUID {
-            let a_ptr = mb.get_col_ptr(row_a, pi, 16);
-            let b_ptr = mb.get_col_ptr(row_b, pi, 16);
-            let a_lo = u64::from_le_bytes(a_ptr[0..8].try_into().unwrap());
-            let a_hi = u64::from_le_bytes(a_ptr[8..16].try_into().unwrap());
-            let b_lo = u64::from_le_bytes(b_ptr[0..8].try_into().unwrap());
-            let b_hi = u64::from_le_bytes(b_ptr[8..16].try_into().unwrap());
-            (a_hi, a_lo).cmp(&(b_hi, b_lo))
-        } else if tc == type_code::I64 || tc == type_code::I32
-            || tc == type_code::I16 || tc == type_code::I8
-        {
-            let cs = crate::schema::type_size(tc) as usize;
-            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
-            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-            let a_v = crate::schema::read_signed(a_ptr, cs);
-            let b_v = crate::schema::read_signed(b_ptr, cs);
-            a_v.cmp(&b_v)
-        } else {
-            let cs = crate::schema::type_size(tc) as usize;
-            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
-            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-            let mut a_buf = [0u8; 8];
-            let mut b_buf = [0u8; 8];
-            a_buf[..cs].copy_from_slice(a_ptr);
-            b_buf[..cs].copy_from_slice(b_ptr);
-            u64::from_le_bytes(a_buf).cmp(&u64::from_le_bytes(b_buf))
+    for desc in descs {
+        let pi = desc.pi as usize;
+        let ord = match desc.tc {
+            TypeCode::String => {
+                let a_bytes = mb.get_col_ptr(row_a, pi, 16);
+                let b_bytes = mb.get_col_ptr(row_b, pi, 16);
+                use crate::schema::compare_german_strings;
+                compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
+            }
+            TypeCode::F64 => {
+                let a_ptr = mb.get_col_ptr(row_a, pi, 8);
+                let b_ptr = mb.get_col_ptr(row_b, pi, 8);
+                let a_f = f64::from_bits(crate::util::read_u64_le(a_ptr, 0));
+                let b_f = f64::from_bits(crate::util::read_u64_le(b_ptr, 0));
+                a_f.total_cmp(&b_f)
+            }
+            TypeCode::F32 => {
+                let a_ptr = mb.get_col_ptr(row_a, pi, 4);
+                let b_ptr = mb.get_col_ptr(row_b, pi, 4);
+                let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
+                let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
+                a_f.total_cmp(&b_f)
+            }
+            TypeCode::U128 | TypeCode::UUID => {
+                let a_ptr = mb.get_col_ptr(row_a, pi, 16);
+                let b_ptr = mb.get_col_ptr(row_b, pi, 16);
+                let a_hi = u64::from_le_bytes(a_ptr[8..16].try_into().unwrap());
+                let b_hi = u64::from_le_bytes(b_ptr[8..16].try_into().unwrap());
+                a_hi.cmp(&b_hi).then_with(|| {
+                    let a_lo = u64::from_le_bytes(a_ptr[0..8].try_into().unwrap());
+                    let b_lo = u64::from_le_bytes(b_ptr[0..8].try_into().unwrap());
+                    a_lo.cmp(&b_lo)
+                })
+            }
+            TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+                let cs = desc.cs as usize;
+                let a_ptr = mb.get_col_ptr(row_a, pi, cs);
+                let b_ptr = mb.get_col_ptr(row_b, pi, cs);
+                let a_v = crate::schema::read_signed(a_ptr, cs);
+                let b_v = crate::schema::read_signed(b_ptr, cs);
+                a_v.cmp(&b_v)
+            }
+            TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
+                let cs = desc.cs as usize;
+                let a_ptr = mb.get_col_ptr(row_a, pi, cs);
+                let b_ptr = mb.get_col_ptr(row_b, pi, cs);
+                let mut a_buf = [0u8; 8];
+                let mut b_buf = [0u8; 8];
+                a_buf[..cs].copy_from_slice(a_ptr);
+                b_buf[..cs].copy_from_slice(b_ptr);
+                u64::from_le_bytes(a_buf).cmp(&u64::from_le_bytes(b_buf))
+            }
         };
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
     }
     std::cmp::Ordering::Equal
+}
+
+/// Build the SortDesc array for a given schema and group_by_cols slice.
+/// Returns (array, length); only `&array[..length]` is valid.
+fn build_sort_descs(
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> ([SortDesc; crate::schema::MAX_COLUMNS], usize) {
+    let pki = schema.pk_index as usize;
+    let mut arr = [SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0 }; crate::schema::MAX_COLUMNS];
+    for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
+        let c_idx = c_idx_u32 as usize;
+        let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
+        arr[i] = SortDesc {
+            pi: payload_idx(c_idx, pki) as u8,
+            cs: tc.stride(),
+            tc,
+            c_idx: c_idx as u8,
+        };
+    }
+    (arr, group_by_cols.len())
 }
 
 /// Argsort delta batch by group columns.
@@ -470,8 +559,8 @@ fn argsort_delta(
     let pki = schema.pk_index as usize;
     if group_by_cols.len() == 1 {
         let ci = group_by_cols[0] as usize;
-        let tc = schema.columns[ci].type_code;
-        if tc == type_code::I64 {
+        let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
+        if tc == TypeCode::I64 {
             let pi = payload_idx(ci, pki);
             let keys: Vec<i64> = (0..n)
                 .map(|i| {
@@ -484,8 +573,10 @@ fn argsort_delta(
         }
     }
 
+    let (sort_descs, len) = build_sort_descs(schema, group_by_cols);
+    let descs = &sort_descs[..len];
     indices.sort_unstable_by(|&a, &b| {
-        compare_by_group_cols(&mb, a as usize, b as usize, schema, group_by_cols)
+        compare_by_group_cols(&mb, a as usize, b as usize, descs)
     });
     indices
 }
@@ -529,7 +620,7 @@ fn apply_agg_from_value_index(
     avi_cursor: &mut ReadCursor,
     gc_u64: u64,
     for_max: bool,
-    agg_col_type_code: u8,
+    agg_col_type_code: TypeCode,
     acc: &mut Accumulator,
 ) -> bool {
     avi_cursor.seek(crate::util::make_pk(0, gc_u64));
@@ -547,15 +638,18 @@ fn apply_agg_from_value_index(
             if for_max {
                 encoded = !encoded;
             }
-            let tc = agg_col_type_code;
-            if tc == type_code::I64 || tc == type_code::I32
-                || tc == type_code::I16 || tc == type_code::I8
-            {
-                encoded = (encoded as i64).wrapping_sub(1i64 << 63) as u64;
-            } else if tc == type_code::F64 {
-                encoded = ieee_order_bits_reverse(encoded);
-            } else if tc == type_code::F32 {
-                encoded = ieee_order_bits_f32_reverse(encoded) as u64;
+            match agg_col_type_code {
+                TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+                    encoded = (encoded as i64).wrapping_sub(1i64 << 63) as u64;
+                }
+                TypeCode::F64 => {
+                    encoded = ieee_order_bits_reverse(encoded);
+                }
+                TypeCode::F32 => {
+                    encoded = ieee_order_bits_f32_reverse(encoded) as u64;
+                }
+                TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 |
+                TypeCode::U128 | TypeCode::UUID | TypeCode::String => {}
             }
             acc.seed_from_raw_bits(encoded);
             return true;
@@ -582,12 +676,12 @@ pub fn op_reduce(
     agg_descs: &[AggDescriptor],
     avi_cursor: Option<&mut ReadCursor>,
     avi_for_max: bool,
-    avi_agg_col_type_code: u8,
+    avi_agg_col_type_code: TypeCode,
     avi_group_by_cols: &[u32],
     avi_input_schema: Option<&SchemaDescriptor>,
     gi_cursor: Option<&mut ReadCursor>,
     gi_col_idx: u32,
-    _gi_col_type_code: u8,
+    _gi_col_type_code: TypeCode,
     finalize_prog: Option<&crate::expr::ExprProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
 ) -> (Batch, Option<Batch>) {
@@ -614,6 +708,14 @@ pub fn op_reduce(
     let group_by_pk = group_by_cols.len() == 1
         && group_by_cols[0] as usize == in_pki;
 
+    // Pre-compute sort descriptors for group comparisons (non-pk path).
+    let (sort_descs, sort_descs_len) = if group_by_pk {
+        ([SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0 }; crate::schema::MAX_COLUMNS], 0)
+    } else {
+        build_sort_descs(input_schema, group_by_cols)
+    };
+    let group_descs = &sort_descs[..sort_descs_len];
+
     // Argsort
     let sorted_indices = if group_by_pk {
         (0..n as u32).collect()
@@ -625,8 +727,8 @@ pub fn op_reduce(
 
     // Determine output mapping: use_natural_pk
     let use_natural_pk = if group_by_cols.len() == 1 {
-        let grp_tc = input_schema.columns[group_by_cols[0] as usize].type_code;
-        grp_tc == type_code::U64 || grp_tc == type_code::U128 || grp_tc == type_code::UUID
+        let grp_tc = TypeCode::from_validated_u8(input_schema.columns[group_by_cols[0] as usize].type_code);
+        matches!(grp_tc, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
     } else {
         false
     };
@@ -636,7 +738,7 @@ pub fn op_reduce(
         Batch::with_schema(*fs, 32)
     });
 
-    let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, in_pki)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
@@ -675,7 +777,7 @@ pub fn op_reduce(
                     break;
                 }
             } else {
-                if compare_by_group_cols(&mb, curr_idx, group_start_idx, input_schema, group_by_cols)
+                if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs)
                     != std::cmp::Ordering::Equal
                 {
                     break;
@@ -685,7 +787,7 @@ pub fn op_reduce(
             let w = mb.get_weight(curr_idx);
             for acc in accs.iter_mut() {
                 if acc.is_linear() {
-                    acc.step_from_batch(&mb, curr_idx, input_schema, w);
+                    acc.step_from_batch(&mb, curr_idx, w);
                 }
             }
             idx += 1;
@@ -765,8 +867,11 @@ pub fn op_reduce(
                             let pki = input_schema.pk_index as usize;
                             let gi_ci = gi_col_idx as usize;
                             let pi = payload_idx(gi_ci, pki);
-                            let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
-                            let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
+                            let cs = input_schema.columns[gi_ci].size as usize;
+                            let ptr = mb.get_col_ptr(group_start_idx, pi, cs);
+                            let mut buf = [0u8; 8];
+                            buf[..cs].copy_from_slice(ptr);
+                            let gc_u64_val = u64::from_le_bytes(buf);
                             gi_c.seek(crate::util::make_pk(0, gc_u64_val));
                             while gi_c.valid {
                                 let gk_hi = (gi_c.current_key >> 64) as u64;
@@ -799,7 +904,7 @@ pub fn op_reduce(
                             while ti_cursor.valid {
                                 if cursor_matches_group(
                                     ti_cursor, &mb, ti_mb_exemplar_row,
-                                    input_schema, group_by_cols,
+                                    group_descs,
                                 ) {
                                     ti_cursor.push_current_row(&mut trace_rows);
                                 }
@@ -824,7 +929,7 @@ pub fn op_reduce(
                     let w = merged_mb.get_weight(m);
                     if w > 0 {
                         for acc in accs.iter_mut() {
-                            acc.step_from_batch(&merged_mb, m, input_schema, w);
+                            acc.step_from_batch(&merged_mb, m, w);
                         }
                     }
                 }
@@ -937,7 +1042,7 @@ fn emit_reduce_row(
                 if (in_null >> src_pi) & 1 != 0 {
                     null_word |= 1u64 << out_pi;
                     output.fill_col_zero(out_pi, cs);
-                } else if col.type_code == TYPE_STRING {
+                } else if col.type_code == TypeCode::String as u8 {
                     write_string_from_batch(
                         output, out_pi,
                         input_mb, exemplar_row, src_pi,
@@ -1011,7 +1116,7 @@ fn emit_finalized_row(
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
                             fin_output.fill_col_zero(fpi, cs);
-                        } else if raw_schema.columns[src_col].type_code == TYPE_STRING {
+                        } else if raw_schema.columns[src_col].type_code == TypeCode::String as u8 {
                             write_string_from_batch(
                                 fin_output, fpi,
                                 &raw_mb, raw_row, src_pi,
@@ -1053,24 +1158,20 @@ fn cursor_matches_group(
     cursor: &ReadCursor,
     exemplar_mb: &MemBatch,
     exemplar_row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
+    descs: &[SortDesc],
 ) -> bool {
-    let pki = schema.pk_index as usize;
-    for &c_idx_u32 in group_by_cols {
-        let c_idx = c_idx_u32 as usize;
-        let col = &schema.columns[c_idx];
-        let cs = col.size as usize;
-        let pi = payload_idx(c_idx, pki);
+    for desc in descs {
+        let pi = desc.pi as usize;
+        let cs = desc.cs as usize;
 
-        let cursor_ptr = cursor.col_ptr(c_idx, cs);
+        let cursor_ptr = cursor.col_ptr(desc.c_idx as usize, cs);
         if cursor_ptr.is_null() {
             return false;
         }
         let cursor_bytes = unsafe { std::slice::from_raw_parts(cursor_ptr, cs) };
         let exemplar_bytes = exemplar_mb.get_col_ptr(exemplar_row, pi, cs);
 
-        if col.type_code == TYPE_STRING {
+        if desc.tc == TypeCode::String {
             let cursor_blob = cursor.blob_ptr();
             let cmp = crate::schema::compare_german_strings(
                 cursor_bytes, if cursor_blob.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) } },
@@ -1079,10 +1180,8 @@ fn cursor_matches_group(
             if cmp != std::cmp::Ordering::Equal {
                 return false;
             }
-        } else {
-            if cursor_bytes != exemplar_bytes {
-                return false;
-            }
+        } else if cursor_bytes != exemplar_bytes {
+            return false;
         }
     }
     true
@@ -1116,8 +1215,9 @@ pub fn op_gather_reduce(
     let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
     let _use_natural_pk_gather = num_group_cols == 0;
 
+    let gather_pki = partial_schema.pk_index as usize;
     let mut output = Batch::with_schema(*partial_schema, n);
-    let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, gather_pki)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
     let smb_pks: Vec<u128> = (0..n).map(|i| smb.get_pk(i)).collect();
@@ -1243,7 +1343,7 @@ fn emit_gather_row(
             if (in_null >> src_pi) & 1 != 0 {
                 null_word |= 1u64 << out_pi;
                 output.fill_col_zero(out_pi, cs);
-            } else if col.type_code == TYPE_STRING {
+            } else if col.type_code == TypeCode::String as u8 {
                 write_string_from_batch(
                     output, out_pi,
                     input_mb, exemplar_row, src_pi,
@@ -1266,7 +1366,7 @@ fn emit_gather_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, type_code, SHORT_STRING_THRESHOLD};
     use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -1469,13 +1569,13 @@ mod tests {
         };
 
         let agg = AggDescriptor {
-            col_idx: 2, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
         };
 
         let (out1, _) = op_reduce(
             &delta1, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         // SUM of (100+200+300) = 600
         assert_eq!(out1.count, 1);
@@ -1503,7 +1603,7 @@ mod tests {
         let (out2, _) = op_reduce(
             &delta2, None, to_ch2.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows
         assert_eq!(out2.count, 2);
@@ -1538,14 +1638,14 @@ mod tests {
         let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         let agg = AggDescriptor {
-            col_idx: 0, agg_op: AggOp::Count, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 0, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
         };
 
         // GROUP BY pk → each row is its own group
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         // Each pk forms its own group, COUNT=1 for each
         assert_eq!(out.count, 3);
@@ -1588,7 +1688,7 @@ mod tests {
         let agg_desc = AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Max,
-            col_type_code: type_code::STRING,
+            col_type_code: TypeCode::String,
             _pad: [0; 2],
         };
 
@@ -1602,12 +1702,12 @@ mod tests {
             &[agg_desc],
             None,               // avi_cursor
             false,              // avi_for_max
-            type_code::STRING,  // avi_agg_col_type_code (unused; no AVI)
+            TypeCode::String,   // avi_agg_col_type_code (unused; no AVI)
             &[1u32],            // avi_group_by_cols (unused)
             None,               // avi_input_schema
             Some(gi_handle.cursor_mut()), // gi_cursor
             1u32,               // gi_col_idx: grp column
-            type_code::I64,     // gi_col_type_code
+            TypeCode::I64,      // gi_col_type_code
             None,               // finalize_prog
             None,               // finalize_out_schema
         );
@@ -1670,7 +1770,7 @@ mod tests {
         }
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
         };
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
@@ -1724,9 +1824,11 @@ mod tests {
             (2, 1, 3.0f32),
         ]);
         let mb = batch.as_mem_batch();
-        let ord = compare_by_group_cols(&mb, 0, 1, &schema, &[1]);
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
+        let descs = &descs_arr[..descs_len];
+        let ord = compare_by_group_cols(&mb, 0, 1, descs);
         assert_eq!(ord, std::cmp::Ordering::Less);
-        let ord2 = compare_by_group_cols(&mb, 1, 0, &schema, &[1]);
+        let ord2 = compare_by_group_cols(&mb, 1, 0, descs);
         assert_eq!(ord2, std::cmp::Ordering::Greater);
     }
 
@@ -1854,14 +1956,14 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AggOp::Sum, col_type_code: type_code::I32, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I32, _pad: [0; 2],
         };
 
         // GROUP BY pk → each row is its own group
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         assert_eq!(out.count, 3);
         // Check values: row offsets depend on PK order (group_by_pk path)
@@ -1901,14 +2003,14 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AggOp::Min, col_type_code: type_code::F32, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::F32, _pad: [0; 2],
         };
 
         // GROUP BY pk → all 3 rows in same group
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         assert_eq!(out.count, 1);
         // MIN should be -1.0 stored as f64 bits
@@ -1945,13 +2047,13 @@ mod tests {
         ]);
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AggOp::Max, col_type_code: type_code::I16, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Max, col_type_code: TypeCode::I16, _pad: [0; 2],
         };
 
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
-            None, false, 0, &[], None, None, 0, 0, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
         );
         assert_eq!(out.count, 1);
         let max_val = crate::util::read_i64_le(out.col_data(0), 0);
@@ -1993,7 +2095,7 @@ mod tests {
         partial1.count += 1;
 
         let agg = AggDescriptor {
-            col_idx: 1, agg_op: AggOp::Min, col_type_code: type_code::I64, _pad: [0; 2],
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
         };
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
@@ -2092,15 +2194,17 @@ mod tests {
         let uuid_hi: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128;
         let batch = build_batch_u64_uuid(&schema, &[(1, uuid_lo), (2, uuid_hi)]);
         let mb = batch.as_mem_batch();
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
+        let descs = &descs_arr[..descs_len];
 
         // uuid_lo < uuid_hi (compare by the 128-bit value)
-        let ord = compare_by_group_cols(&mb, 0, 1, &schema, &[1]);
+        let ord = compare_by_group_cols(&mb, 0, 1, descs);
         assert_eq!(ord, std::cmp::Ordering::Less, "uuid_lo row must compare less than uuid_hi row");
 
-        let ord2 = compare_by_group_cols(&mb, 1, 0, &schema, &[1]);
+        let ord2 = compare_by_group_cols(&mb, 1, 0, descs);
         assert_eq!(ord2, std::cmp::Ordering::Greater, "uuid_hi row must compare greater than uuid_lo row");
 
-        let ord3 = compare_by_group_cols(&mb, 0, 0, &schema, &[1]);
+        let ord3 = compare_by_group_cols(&mb, 0, 0, descs);
         assert_eq!(ord3, std::cmp::Ordering::Equal, "same row must compare equal to itself");
     }
 
@@ -2144,5 +2248,130 @@ mod tests {
         assert_ne!(key0, key2, "same UUID different int must yield different group keys");
         assert_ne!(key1, key2, "different UUID different int must yield different group keys");
         assert_eq!(key0, key0b, "same inputs must yield the same group key");
+    }
+
+    // -----------------------------------------------------------------------
+    // GI group-key over-read bug: narrow-type group column
+    // -----------------------------------------------------------------------
+
+    /// GI path reads the group key with a hardcoded col_size=8. When the group
+    /// column is narrower (e.g. I32, stride=4) and group_start_idx > 0, the
+    /// stride-8 indexing walks into the adjacent I64 column region, producing a
+    /// garbage gc_u64_val. The GI seek then misses and history rows are not
+    /// fetched, so MIN returns only the delta value instead of the true minimum.
+    #[test]
+    fn test_reduce_gi_i32_group_key_overread() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        // Input: U64 pk | I32 grp (4 bytes) | I64 val (8 bytes)
+        let mut in_schema = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        in_schema.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        in_schema.columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 0, _pad: 0 };
+        in_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+
+        // Output: U128 hash-pk | I32 grp | I64 min (nullable)
+        let mut out_schema = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        out_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        out_schema.columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 0, _pad: 0 };
+        out_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+
+        let gi_schema = make_gi_schema();
+
+        // trace_in: history row for grp=5, val=200, source pk=30
+        let ti_batch = Rc::new({
+            let mut b = Batch::with_schema(in_schema, 1);
+            b.extend_pk(30u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &5i32.to_le_bytes());
+            b.extend_col(1, &200i64.to_le_bytes());
+            b.count += 1;
+            b.sorted = true;
+            b.consolidated = true;
+            ConsolidatedBatch::new_unchecked(b).into_inner()
+        });
+
+        // GI: gc_u64=5 → source pk=30
+        let gi_batch = Rc::new(make_gi_batch(&[(30, 5, 0)]).into_inner());
+
+        // Empty trace_out (no prior aggregate)
+        let to_batch = Rc::new(Batch::empty(2, 16));
+
+        // Delta: 2 groups so that grp=5 is at group_start_idx=1 after argsort.
+        // With the bug: get_col_ptr(1, pi=0, col_size=8) uses stride 8 on a
+        // column with stride 4, landing at offset 48+8=56 in the batch buffer
+        // which is the start of the I64 val region. It reads val[row0]=100 as
+        // gc_u64_val instead of 5, the GI seek misses, and MIN(grp=5)=300.
+        let delta = {
+            let mut b = Batch::with_schema(in_schema, 2);
+            b.extend_pk(10u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &3i32.to_le_bytes());
+            b.extend_col(1, &100i64.to_le_bytes());
+            b.count += 1;
+            b.extend_pk(20u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &5i32.to_le_bytes());
+            b.extend_col(1, &300i64.to_le_bytes());
+            b.count += 1;
+            b.sorted = true;
+            b.consolidated = true;
+            ConsolidatedBatch::new_unchecked(b)
+        };
+
+        let mut ti_handle = CursorHandle::from_owned(&[ti_batch], in_schema);
+        let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
+        let mut to_handle = CursorHandle::from_owned(&[to_batch], out_schema);
+
+        let agg = AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Min,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta,
+            Some(ti_handle.cursor_mut()),
+            to_handle.cursor_mut(),
+            &in_schema,
+            &out_schema,
+            &[1u32],
+            &[agg],
+            None, false, TypeCode::U64, &[], None,
+            Some(gi_handle.cursor_mut()),
+            1u32,
+            TypeCode::I32,
+            None, None,
+        );
+
+        assert_eq!(out.count, 2, "expected 2 output groups (grp=3 and grp=5)");
+
+        // Output payload: col 0 = I32 grp (4 bytes/row), col 1 = I64 min (8 bytes/row)
+        let grp_data = out.col_data(0);
+        let min_data = out.col_data(1);
+        let mut min_for_5 = None;
+        for i in 0..2 {
+            let g = i32::from_le_bytes(grp_data[i * 4..(i + 1) * 4].try_into().unwrap());
+            if g == 5 {
+                let m = i64::from_le_bytes(min_data[i * 8..(i + 1) * 8].try_into().unwrap());
+                min_for_5 = Some(m);
+            }
+        }
+        let m = min_for_5.expect("no output row for grp=5");
+        assert_eq!(m, 200,
+            "MIN(grp=5) must include history row val=200; \
+             got {m} — GI group-key over-read produced a garbage gc_u64_val");
     }
 }

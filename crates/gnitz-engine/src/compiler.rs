@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::storage::{CursorHandle, Table, ReadCursor};
@@ -779,11 +779,11 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
 ///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)
-const fn agg_output_type(agg_op: AggOp, col_type_code: u8) -> (u8, u8) {
+const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> (u8, u8) {
     match agg_op {
         AggOp::Count | AggOp::CountNonNull => (type_code::I64, 8),
         AggOp::Sum | AggOp::Min | AggOp::Max => {
-            if col_type_code == type_code::F32 || col_type_code == type_code::F64 {
+            if col_type_code.is_float() {
                 (type_code::F64, 8)
             } else {
                 (type_code::I64, 8)
@@ -802,8 +802,8 @@ fn build_reduce_output_schema(
     let mut ci: usize = 0;
 
     let use_natural_pk = if group_cols.len() == 1 {
-        let gc_type = input.columns[group_cols[0] as usize].type_code;
-        gc_type == type_code::U64 || gc_type == type_code::U128 || gc_type == type_code::UUID
+        let gc_tc = TypeCode::from_validated_u8(input.columns[group_cols[0] as usize].type_code);
+        matches!(gc_tc, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
     } else {
         false
     };
@@ -856,8 +856,8 @@ fn make_agg_value_idx_schema() -> SchemaDescriptor {
     s
 }
 
-fn agg_value_idx_eligible(col_type_code: u8) -> bool {
-    col_type_code != type_code::U128 && col_type_code != type_code::UUID && col_type_code != type_code::STRING
+fn agg_value_idx_eligible(tc: TypeCode) -> bool {
+    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String)
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,7 +1391,7 @@ fn emit_reduce(
             let packed = node_params.get(&(PARAM_AGG_SPEC_BASE + ai)).copied().unwrap_or(0);
             let func_id = (packed >> 32) as u8;
             let col_idx = (packed & 0xFFFFFFFF) as u32;
-            let col_type_code = in_reg_schema.columns[col_idx as usize].type_code;
+            let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code);
             let agg_op = AggOp::try_from(func_id)
                 .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
             agg_descs.push(AggDescriptor { col_idx, agg_op, col_type_code, _pad: [0; 2] });
@@ -1406,11 +1406,11 @@ fn emit_reduce(
             .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
         agg_col_idx = node_params.get(&PARAM_AGG_COL_IDX).copied().unwrap_or(0) as u32;
         if agg_func_id != AggOp::Null {
-            let col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
+            let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code);
             agg_descs.push(AggDescriptor { col_idx: agg_col_idx, agg_op: agg_func_id, col_type_code, _pad: [0; 2] });
         } else {
             // NullAggregate
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: 0, _pad: [0; 2] });
+            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2] });
         }
     }
 
@@ -1454,7 +1454,7 @@ fn emit_reduce(
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
     let will_use_avi = agg_descs.len() == 1
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
-        && agg_value_idx_eligible(in_reg_schema.columns[agg_col_idx as usize].type_code);
+        && agg_value_idx_eligible(TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code));
 
     let mut tr_in_reg_id: i32 = -1;
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();
@@ -1488,13 +1488,12 @@ fn emit_reduce(
 
     if tr_in_table_idx.is_some() && gcols.len() == 1 {
         let gc_col_idx = gcols[0] as usize;
-        let gc_type = in_reg_schema.columns[gc_col_idx].type_code;
-        if gc_type != type_code::U128
-            && gc_type != type_code::UUID
-            && gc_type != type_code::STRING
-            && gc_type != type_code::F32
-            && gc_type != type_code::F64
-        {
+        let gc_raw = in_reg_schema.columns[gc_col_idx].type_code;
+        let gc_tc = TypeCode::from_validated_u8(gc_raw);
+        if matches!(gc_tc,
+            TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
+            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
+        ) {
             let gi_dir = format!(
                 "{}/scratch__reduce_in_{}_{}/_gidx",
                 view_dir, view_id, nid
@@ -1504,7 +1503,7 @@ fn emit_reduce(
                 owned_tables.push(Box::new(gi_table));
                 gi_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
                 gi_col_idx = gc_col_idx as u32;
-                gi_col_type_code = gc_type;
+                gi_col_type_code = gc_raw;
             }
         }
     }
@@ -1631,7 +1630,7 @@ fn emit_gather_reduce(
             let agg_op = AggOp::try_from(func_id)
                 .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
             let agg_col_in_partial = num_out_cols - agg_count as usize + ai as usize;
-            let col_type = partial_schema.columns[agg_col_in_partial].type_code;
+            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
             agg_descs.push(AggDescriptor { col_idx: 0, agg_op, col_type_code: col_type, _pad: [0; 2] });
         }
     } else {
@@ -1640,10 +1639,10 @@ fn emit_gather_reduce(
             .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
         if agg_func_id != AggOp::Null {
             let agg_col_in_partial = num_out_cols - 1;
-            let col_type = partial_schema.columns[agg_col_in_partial].type_code;
+            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
             agg_descs.push(AggDescriptor { col_idx: 0, agg_op: agg_func_id, col_type_code: col_type, _pad: [0; 2] });
         } else {
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: 0, _pad: [0; 2] });
+            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2] });
         }
     }
 
@@ -2131,12 +2130,12 @@ mod tests {
 
     #[test]
     fn test_agg_output_type() {
-        assert_eq!(agg_output_type(AggOp::Count, type_code::I64), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Sum, type_code::F64), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AggOp::Sum, type_code::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Min, type_code::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Max, type_code::F32), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AggOp::Max, type_code::STRING), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), (type_code::F64, 8));
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), (type_code::F64, 8));
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), (type_code::I64, 8));
     }
 
     #[test]
@@ -2179,7 +2178,7 @@ mod tests {
         input.num_columns = 3;
         input.pk_index = 0;
 
-        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Sum, col_type_code: type_code::I64, _pad: [0; 2] }];
+        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
         assert_eq!(out.num_columns, 2);
@@ -2196,7 +2195,7 @@ mod tests {
         input.num_columns = 3;
         input.pk_index = 0;
 
-        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: type_code::I64, _pad: [0; 2] }];
+        let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
         assert_eq!(out.num_columns, 3);

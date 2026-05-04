@@ -6,6 +6,7 @@ use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::{SqlPlanner, SqlResult};
 
 // ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ impl PyColumnDef {
 }
 
 fn py_col_to_rust(c: &PyColumnDef) -> PyResult<ColumnDef> {
-    TypeCode::try_from_u64(c.type_code as u64)
+    type_code_from_u64(c.type_code as u64)
         .map(|tc| ColumnDef { name: c.name.clone(), type_code: tc, is_nullable: c.is_nullable, fk_table_id: 0, fk_col_idx: 0 })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }

@@ -1,50 +1,15 @@
 use std::sync::OnceLock;
 use super::error::ProtocolError;
 
-use gnitz_wire::type_code as tc;
+pub use gnitz_wire::TypeCode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TypeCode {
-    U8     = tc::U8,
-    I8     = tc::I8,
-    U16    = tc::U16,
-    I16    = tc::I16,
-    U32    = tc::U32,
-    I32    = tc::I32,
-    F32    = tc::F32,
-    U64    = tc::U64,
-    I64    = tc::I64,
-    F64    = tc::F64,
-    String = tc::STRING,
-    U128   = tc::U128,
-    UUID   = tc::UUID,
-}
-
-impl TypeCode {
-    /// Wire stride in bytes. String returns 16 (German String struct).
-    pub fn wire_stride(self) -> usize {
-        gnitz_wire::wire_stride(self as u8)
+/// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
+/// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
+pub fn type_code_from_u64(v: u64) -> Result<TypeCode, ProtocolError> {
+    if v > u8::MAX as u64 {
+        return Err(ProtocolError::UnknownTypeCode(v));
     }
-
-    pub fn try_from_u64(v: u64) -> Result<Self, ProtocolError> {
-        match v {
-            _ if v == tc::U8     as u64 => Ok(TypeCode::U8),
-            _ if v == tc::I8     as u64 => Ok(TypeCode::I8),
-            _ if v == tc::U16    as u64 => Ok(TypeCode::U16),
-            _ if v == tc::I16    as u64 => Ok(TypeCode::I16),
-            _ if v == tc::U32    as u64 => Ok(TypeCode::U32),
-            _ if v == tc::I32    as u64 => Ok(TypeCode::I32),
-            _ if v == tc::F32    as u64 => Ok(TypeCode::F32),
-            _ if v == tc::U64    as u64 => Ok(TypeCode::U64),
-            _ if v == tc::I64    as u64 => Ok(TypeCode::I64),
-            _ if v == tc::F64    as u64 => Ok(TypeCode::F64),
-            _ if v == tc::STRING as u64 => Ok(TypeCode::String),
-            _ if v == tc::U128   as u64 => Ok(TypeCode::U128),
-            _ if v == tc::UUID   as u64 => Ok(TypeCode::UUID),
-            _ => Err(ProtocolError::UnknownTypeCode(v)),
-        }
-    }
+    TypeCode::try_from_u8(v as u8).ok_or(ProtocolError::UnknownTypeCode(v))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

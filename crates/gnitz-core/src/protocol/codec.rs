@@ -1,6 +1,6 @@
 use super::error::ProtocolError;
 use super::header::{META_FLAG_NULLABLE, META_FLAG_IS_PK};
-use super::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+use super::types::{ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_from_u64};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
@@ -82,7 +82,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
             None => return Err(ProtocolError::DecodeError(format!("null name at col {}", i))),
         };
 
-        let tc = TypeCode::try_from_u64(type_code_raw)?;
+        let tc = type_code_from_u64(type_code_raw)?;
         let is_nullable = (flags & META_FLAG_NULLABLE) != 0;
         let is_pk       = (flags & META_FLAG_IS_PK)    != 0;
 
@@ -109,24 +109,27 @@ mod tests {
     use crate::protocol::types::{ColData, PkColumn, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
     use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
 
-    // ── TypeCode::try_from_u64 error paths ──────────────────────────────────
+    // ── type_code_from_u64 error paths ──────────────────────────────────────
 
     #[test]
     fn test_unknown_type_code_zero() {
         use crate::protocol::error::ProtocolError;
-        assert!(matches!(TypeCode::try_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
+        use crate::protocol::types::type_code_from_u64;
+        assert!(matches!(type_code_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
     }
 
     #[test]
     fn test_unknown_type_code_14() {
         use crate::protocol::error::ProtocolError;
-        assert!(matches!(TypeCode::try_from_u64(14), Err(ProtocolError::UnknownTypeCode(14))));
+        use crate::protocol::types::type_code_from_u64;
+        assert!(matches!(type_code_from_u64(14), Err(ProtocolError::UnknownTypeCode(14))));
     }
 
     #[test]
     fn test_unknown_type_code_max() {
         use crate::protocol::error::ProtocolError;
-        assert!(matches!(TypeCode::try_from_u64(u64::MAX), Err(ProtocolError::UnknownTypeCode(_))));
+        use crate::protocol::types::type_code_from_u64;
+        assert!(matches!(type_code_from_u64(u64::MAX), Err(ProtocolError::UnknownTypeCode(_))));
     }
 
     // ── batch_to_schema error paths ──────────────────────────────────────────

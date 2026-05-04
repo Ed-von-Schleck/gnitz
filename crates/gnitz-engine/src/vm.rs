@@ -1065,6 +1065,17 @@ pub fn execute_epoch(
                 let gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut()
                     .map(|ch| ch.cursor_mut());
 
+                let avi_tc = if avi_opt.is_some() {
+                    crate::schema::TypeCode::from_validated_u8(*avi_agg_col_type_code)
+                } else {
+                    crate::schema::TypeCode::U64
+                };
+                let gi_tc = if gi_opt.is_some() {
+                    crate::schema::TypeCode::from_validated_u8(*gi_col_type_code)
+                } else {
+                    crate::schema::TypeCode::U64
+                };
+
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
                     ti_opt,
@@ -1075,12 +1086,12 @@ pub fn execute_epoch(
                     aggs,
                     avi_opt,
                     *avi_for_max,
-                    *avi_agg_col_type_code,
+                    avi_tc,
                     avi_gcols,
                     avi_in_schema,
                     gi_opt,
                     *gi_col_idx,
-                    *gi_col_type_code,
+                    gi_tc,
                     fin_prog,
                     fin_schema,
                 );
@@ -1129,7 +1140,7 @@ pub fn execute_epoch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, type_code};
     use crate::ops::{AggDescriptor, AggOp};
 
     // ── Test helpers ─────────────────────────────────────────────────────
@@ -1966,7 +1977,7 @@ mod tests {
         let agg_descs = [AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Sum,
-            col_type_code: type_code::I64,
+            col_type_code: TypeCode::I64,
             _pad: [0; 2],
         }];
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
@@ -2343,13 +2354,13 @@ mod tests {
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column
                 agg_op: AggOp::Count,
-                col_type_code: type_code::I64,
+                col_type_code: TypeCode::I64,
                 _pad: [0; 2],
             },
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column
                 agg_op: AggOp::Sum,
-                col_type_code: type_code::I64,
+                col_type_code: TypeCode::I64,
                 _pad: [0; 2],
             },
         ];
@@ -2544,7 +2555,7 @@ mod tests {
         let agg_descs = [AggDescriptor {
             col_idx: 1,
             agg_op: AggOp::Sum,
-            col_type_code: type_code::I64,
+            col_type_code: TypeCode::I64,
             _pad: [0; 2],
         }];
         // GROUP BY col 0 (pk)

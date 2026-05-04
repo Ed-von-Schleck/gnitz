@@ -1,4 +1,5 @@
 use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
+use crate::protocol::types::type_code_from_u64;
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
 use crate::types::{
@@ -658,7 +659,7 @@ fn extract_col_entries(
         let col_idx     = col_u64(&col_batch.columns[3], i)?;
         let name        = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
         let tc_val      = col_u64(&col_batch.columns[5], i)?;
-        let type_code   = TypeCode::try_from_u64(tc_val).map_err(ClientError::Protocol)?;
+        let type_code   = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
         let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
         let fk_table_id = col_u64(&col_batch.columns[7], i)?;
         let fk_col_idx  = col_u64(&col_batch.columns[8], i)?;

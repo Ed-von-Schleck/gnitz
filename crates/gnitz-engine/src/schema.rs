@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::util::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
+pub(crate) use gnitz_wire::TypeCode;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub use gnitz_wire::MAX_COLUMNS;
 
@@ -128,11 +129,13 @@ pub(crate) fn promote_to_index_key(
         "promote_to_index_key: buffer too short ({} < {})",
         col_data.len(), offset + col_size,
     );
-    match type_code_val {
-        type_code::U128 | type_code::UUID => {
+    match TypeCode::from_validated_u8(type_code_val) {
+        TypeCode::U128 | TypeCode::UUID => {
             u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
         }
-        _ => {
+        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
+        TypeCode::U32 | TypeCode::I32 | TypeCode::F32 |
+        TypeCode::U64 | TypeCode::I64 | TypeCode::F64 | TypeCode::String => {
             let mut bytes = [0u8; 8];
             let copy_len = col_size.min(8);
             bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
