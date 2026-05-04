@@ -510,8 +510,8 @@ impl ProgramBuilder {
 /// raw pointers.  Rust drop order (declaration order) ensures `program`
 /// drops before the owned vecs, so dangling pointers are never chased.
 ///
-/// The compile-time assertion below makes this invariant machine-checked:
-/// reordering fields will produce a compile error, not a use-after-free.
+/// The compile-time assertions below are machine-checked: reordering any
+/// owned vec before `program` produces a compile error, not a use-after-free.
 #[allow(clippy::vec_box)]
 pub struct VmHandle {
     pub program: Program,
@@ -535,12 +535,11 @@ pub struct VmHandle {
     owned_cursor_handles: Vec<Option<Box<CursorHandle>>>,
 }
 
-// Compile-time proof that `program` precedes the owned resource vecs in
-// memory, guaranteeing Rust's declaration-order drop visits `program` first.
-const _: () = assert!(
-    std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_tables),
-    "VmHandle: program must be declared before owned_tables to ensure correct drop order",
-);
+// Compile-time proof that `program` precedes all owned resource vecs, so
+// Rust's declaration-order drop visits `program` before any vec it borrows.
+const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_tables));
+const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_funcs));
+const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_expr_progs));
 
 impl VmHandle {
     /// Compact owned tables and create fresh cursors for owned trace registers.

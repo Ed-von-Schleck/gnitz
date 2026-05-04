@@ -75,6 +75,12 @@ impl TryFrom<u8> for AggOp {
     }
 }
 
+impl AggOp {
+    pub fn is_linear(self) -> bool {
+        matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
+    }
+}
+
 /// Descriptor for one aggregate function.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -85,6 +91,7 @@ pub struct AggDescriptor {
     pub _pad: [u8; 2],
 }
 
+const _: () = assert!(std::mem::size_of::<AggOp>() == 1);
 const _: () = assert!(std::mem::size_of::<AggDescriptor>() == 8);
 const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
 
@@ -115,7 +122,7 @@ impl Accumulator {
     }
 
     fn is_linear(&self) -> bool {
-        matches!(self.agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
+        self.agg_op.is_linear()
     }
 
     fn is_zero(&self) -> bool {
@@ -590,9 +597,7 @@ pub fn op_reduce(
 
 
     // Linearity check
-    let all_linear = agg_descs.iter().all(|d| {
-        matches!(d.agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
-    });
+    let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     // Fast path (linear or already consolidated): borrow delta directly — no allocation.

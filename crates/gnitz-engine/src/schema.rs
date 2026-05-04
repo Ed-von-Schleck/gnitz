@@ -15,7 +15,7 @@ pub use gnitz_wire::MAX_COLUMNS;
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchemaColumn {
     pub type_code: u8,
     pub size: u8,
@@ -78,11 +78,8 @@ impl PartialEq for SchemaDescriptor {
         if self.num_columns != other.num_columns || self.pk_index != other.pk_index {
             return false;
         }
-        // Compare only the active columns; ignore _pad and unused slots.
-        self.columns[..self.num_columns as usize]
-            .iter()
-            .zip(other.columns[..other.num_columns as usize].iter())
-            .all(|(a, b)| a.type_code == b.type_code && a.size == b.size && a.nullable == b.nullable)
+        // Compare only the active columns; _pad is always 0 (SchemaColumn::new enforces it).
+        self.columns[..self.num_columns as usize] == other.columns[..other.num_columns as usize]
     }
 }
 

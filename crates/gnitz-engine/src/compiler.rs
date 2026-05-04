@@ -26,9 +26,6 @@ gnitz_wire::cast_consts! { i32;
     PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_SHARD_COL_BASE, PARAM_CONST_STR_BASE,
 }
-// AGG_* are expressed as AggOp variants; raw u8 values come from gnitz_wire
-// and are validated via AggOp::try_from at the compiler boundary.
-
 // Engine-only constants
 const PARAM_CHUNK_LIMIT: i32 = 2;
 const PORT_DELTA: i32       = 0;
@@ -859,10 +856,6 @@ fn make_agg_value_idx_schema() -> SchemaDescriptor {
     s
 }
 
-fn is_linear_agg(agg_op: AggOp) -> bool {
-    matches!(agg_op, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
-}
-
 fn agg_value_idx_eligible(col_type_code: u8) -> bool {
     col_type_code != type_code::U128 && col_type_code != type_code::UUID && col_type_code != type_code::STRING
 }
@@ -1409,7 +1402,8 @@ fn emit_reduce(
         }
     } else {
         let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
-        agg_func_id = AggOp::try_from(raw_func_id).unwrap_or(AggOp::Null);
+        agg_func_id = AggOp::try_from(raw_func_id)
+            .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
         agg_col_idx = node_params.get(&PARAM_AGG_COL_IDX).copied().unwrap_or(0) as u32;
         if agg_func_id != AggOp::Null {
             let col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
@@ -1457,7 +1451,7 @@ fn emit_reduce(
     }
 
     // trace_in table (for non-linear aggregates)
-    let all_linear = agg_descs.iter().all(|a| is_linear_agg(a.agg_op));
+    let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
     let will_use_avi = agg_descs.len() == 1
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
         && agg_value_idx_eligible(in_reg_schema.columns[agg_col_idx as usize].type_code);
@@ -1642,7 +1636,8 @@ fn emit_gather_reduce(
         }
     } else {
         let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
-        let agg_func_id = AggOp::try_from(raw_func_id).unwrap_or(AggOp::Null);
+        let agg_func_id = AggOp::try_from(raw_func_id)
+            .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
         if agg_func_id != AggOp::Null {
             let agg_col_in_partial = num_out_cols - 1;
             let col_type = partial_schema.columns[agg_col_in_partial].type_code;
