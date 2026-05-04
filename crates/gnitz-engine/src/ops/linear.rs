@@ -490,11 +490,19 @@ pub(super) fn promote_col_to_pk(
             let bits = u32::from_le_bytes(ptr.try_into().unwrap()) as u64;
             bits as u128
         }
-        _ => {
+        type_code::UUID => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
-            let ptr = batch.get_col_ptr(row, pi, 8);
-            let val = u64::from_le_bytes(ptr.try_into().unwrap());
-            val as u128
+            let ptr = batch.get_col_ptr(row, pi, 16);
+            u128::from_le_bytes(ptr[0..16].try_into().unwrap())
+        }
+        _ => {
+            // U8, U16, U32, I8, I16, I32 — use correct stride from type_size.
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let cs = crate::schema::type_size(tc) as usize;
+            let ptr = batch.get_col_ptr(row, pi, cs);
+            let mut buf = [0u8; 8];
+            buf[..cs].copy_from_slice(ptr);
+            u64::from_le_bytes(buf) as u128
         }
     }
 }
@@ -669,6 +677,81 @@ mod tests {
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
         assert!(out.consolidated);
+    }
+
+    // -----------------------------------------------------------------------
+    // promote_col_to_pk tests
+    // -----------------------------------------------------------------------
+
+    fn make_schema_pk_u64_payload_u32() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::U32, 0);
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_schema_pk_u64_payload_uuid() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::UUID, 0);
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn build_batch_u32_payload(schema: &SchemaDescriptor, rows: &[(u64, u32)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    fn build_batch_uuid_payload(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    #[test]
+    fn test_promote_col_to_pk_u32_all_rows_correct() {
+        // U32 payload columns have stride 4. Passing col_size=8 to get_col_ptr gives
+        // wrong offsets for row > 0. Verify all three rows return the right value.
+        let schema = make_schema_pk_u64_payload_u32();
+        let batch = build_batch_u32_payload(&schema, &[(1, 100), (2, 200), (3, 300)]);
+        let mb = batch.as_mem_batch();
+
+        let pk0 = promote_col_to_pk(&mb, 0, 1, &schema);
+        let pk1 = promote_col_to_pk(&mb, 1, 1, &schema);
+        let pk2 = promote_col_to_pk(&mb, 2, 1, &schema);
+
+        assert_eq!(pk0, 100u128, "row 0 U32 promote");
+        assert_eq!(pk1, 200u128, "row 1 U32 promote — wrong col_size corrupts this");
+        assert_eq!(pk2, 300u128, "row 2 U32 promote");
+    }
+
+    #[test]
+    fn test_promote_col_to_pk_uuid_preserves_high_bits() {
+        // UUID has stride 16. Passing col_size=8 truncates the high 64 bits.
+        let schema = make_schema_pk_u64_payload_uuid();
+        let uuid_a: u128 = 0x550e8400_e29b_41d4_a716_446655440000u128;
+        let uuid_b: u128 = 0xdeadbeef_cafe_1234_5678_000000000001u128;
+        let batch = build_batch_uuid_payload(&schema, &[(1, uuid_a), (2, uuid_b)]);
+        let mb = batch.as_mem_batch();
+
+        let pk0 = promote_col_to_pk(&mb, 0, 1, &schema);
+        let pk1 = promote_col_to_pk(&mb, 1, 1, &schema);
+
+        assert_eq!(pk0, uuid_a, "row 0 UUID promote must keep all 128 bits");
+        assert_eq!(pk1, uuid_b, "row 1 UUID promote must keep all 128 bits");
     }
 
     // -----------------------------------------------------------------------

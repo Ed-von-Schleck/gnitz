@@ -1632,17 +1632,25 @@ async fn single_worker_async(
     Ok(slot)
 }
 
-/// Render a PK u128 as a human-readable decimal for error messages.
-/// Single-column PKs only; the high 64 bits are only non-zero for U128
-/// PKs, which we stringify as a combined u128 decimal.
+fn format_uuid_hyphenated(v: u128) -> String {
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (v >> 96) as u32,
+        (v >> 80) as u16,
+        (v >> 64) as u16,
+        (v >> 48) as u16,
+        v & 0x0000_ffff_ffff_ffff)
+}
+
+/// Render a PK u128 as a human-readable string for error messages.
 fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
     let pk_col = schema.columns[schema.pk_index as usize];
     match pk_col.type_code {
         crate::schema::type_code::U128 => format!("{}", pk),
-        crate::schema::type_code::I64 => format!("{}", pk as u64 as i64),
-        crate::schema::type_code::I32 => format!("{}", pk as u64 as i32),
-        crate::schema::type_code::I16 => format!("{}", pk as u64 as i16),
-        crate::schema::type_code::I8  => format!("{}", pk as u64 as i8),
+        crate::schema::type_code::UUID => format_uuid_hyphenated(pk),
+        crate::schema::type_code::I64  => format!("{}", pk as u64 as i64),
+        crate::schema::type_code::I32  => format!("{}", pk as u64 as i32),
+        crate::schema::type_code::I16  => format!("{}", pk as u64 as i16),
+        crate::schema::type_code::I8   => format!("{}", pk as u64 as i8),
         _ => format!("{}", pk as u64),
     }
 }
@@ -1795,5 +1803,36 @@ mod unique_filter_tests {
         filter.capped = true;
         extract_into_filter(&mut filter, &batch, &desc);
         assert!(filter.values.is_empty(), "no-op on capped filter");
+    }
+
+    #[test]
+    fn format_pk_value_uuid_full_128_bits() {
+        // A UUID with non-zero high 64 bits. The lower 64 bits alone would be
+        // misread as a different (truncated) value.
+        let uuid: u128 = 0x550e8400_e29b_41d4_a716_446655440000u128;
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        columns[0] = SchemaColumn::new(type_code::UUID, 0);
+        let schema = SchemaDescriptor { num_columns: 1, pk_index: 0, columns };
+
+        let s = format_pk_value(uuid, &schema);
+        // Must not be the lower-64 truncation (11975073520896 or similar).
+        let truncated = format!("{}", uuid as u64);
+        assert_ne!(s, truncated, "UUID must not be formatted as truncated u64");
+        // Must contain the high-word hex digits.
+        assert!(s.contains("550e8400"), "UUID formatting must include high bits");
+    }
+
+    #[test]
+    fn format_pk_value_uuid_two_distinct_uuids_differ() {
+        // Two UUIDs that differ only in the high 64 bits must produce different strings.
+        let uuid_a: u128 = 0x11111111_0000_0000_0000_000000000001u128;
+        let uuid_b: u128 = 0x22222222_0000_0000_0000_000000000001u128;
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        columns[0] = SchemaColumn::new(type_code::UUID, 0);
+        let schema = SchemaDescriptor { num_columns: 1, pk_index: 0, columns };
+
+        let sa = format_pk_value(uuid_a, &schema);
+        let sb = format_pk_value(uuid_b, &schema);
+        assert_ne!(sa, sb, "UUIDs differing in high bits must format differently");
     }
 }
