@@ -17,13 +17,6 @@ pub use gnitz_wire::{
     OPCODE_NULL_EXTEND,
     // Ports
     PORT_IN, PORT_TRACE, PORT_IN_A, PORT_IN_B,
-    // Param slots
-    PARAM_FUNC_ID, PARAM_AGG_FUNC_ID, PARAM_AGG_COL_IDX,
-    PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS,
-    PARAM_EXPR_RESULT_REG, PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
-    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE,
-    PARAM_TABLE_ID, PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
-    PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
     // Aggregates
     AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_COUNT_NON_NULL,
 };
@@ -103,60 +96,31 @@ pub fn dep_tab_schema() -> &'static Schema {
     })
 }
 
-/// CircuitNodes: one row per node, every operator-specific scalar
-/// columnar. PK encodes (view_id, node_id) as `(node_id, view_id)`.
+fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: usize) -> Schema {
+    Schema {
+        columns: cols.iter().map(|c| ColumnDef {
+            name:        c.name.into(),
+            type_code:   TypeCode::from_validated_u8(c.type_code),
+            is_nullable: c.nullable,
+            fk_table_id: 0,
+            fk_col_idx:  0,
+        }).collect(),
+        pk_index,
+    }
+}
+
 pub fn circuit_nodes_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef { name: "node_pk".into(),      type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "view_id".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "node_id".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "opcode".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "source_table".into(), type_code: TypeCode::U64,    is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "reindex_col".into(),  type_code: TypeCode::U64,    is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "expr_program".into(), type_code: TypeCode::Blob,   is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
-        ],
-        pk_index: 0,
-    })
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, 0))
 }
 
-/// CircuitEdges: natural-key composite of (view_id, dst_node, dst_port).
-/// PK encoding: hi = view_id, lo = (dst_node << 8) | dst_port.
 pub fn circuit_edges_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef { name: "edge_pk".into(),  type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "view_id".into(),  type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "dst_node".into(), type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "dst_port".into(), type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "src_node".into(), type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-        ],
-        pk_index: 0,
-    })
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, 0))
 }
 
-/// New CircuitNodeColumns schema (replaces the slot-encoded PARAM_*_BASE
-/// regions in CircuitParams plus the standalone CircuitGroupCols table).
-///
-/// 7 columns: u128 PK + 6 denormalised payload (view_id, node_id, kind,
-/// position, value1, value2). For single-value kinds (GROUP, SHARD, PROJ,
-/// NULL_EXTEND_TYPECODE), `value1` holds the column index / type code and
-/// `value2` is 0. For AGG_SPEC, `value1 = func_id` and `value2 = col_idx`.
 pub fn circuit_node_columns_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef { name: "node_col_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "view_id".into(),     type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "node_id".into(),     type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "kind".into(),        type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "position".into(),    type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "value1".into(),      type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "value2".into(),      type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-        ],
-        pk_index: 0,
-    })
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, 0))
 }
 

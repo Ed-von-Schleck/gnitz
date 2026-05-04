@@ -1,111 +1,10 @@
 use crate::expr::ExprProgram;
 
+pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode};
+
 pub type NodeId  = u64;
 pub type Port    = u8;
 pub type TableId = u64;
-
-/// Aggregate function discriminant. Numeric values match the wire-level
-/// `AGG_*` constants — `Count = 1`, `Sum = 2`, `Min = 3`, `Max = 4`,
-/// `CountNonNull = 5`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum AggFunc {
-    Count        = gnitz_wire::AGG_COUNT,
-    Sum          = gnitz_wire::AGG_SUM,
-    Min          = gnitz_wire::AGG_MIN,
-    Max          = gnitz_wire::AGG_MAX,
-    CountNonNull = gnitz_wire::AGG_COUNT_NON_NULL,
-}
-
-impl AggFunc {
-    /// Convert a wire-level aggregate function id to the typed variant.
-    pub fn from_wire(v: u64) -> Option<Self> {
-        match v {
-            gnitz_wire::AGG_COUNT          => Some(AggFunc::Count),
-            gnitz_wire::AGG_SUM            => Some(AggFunc::Sum),
-            gnitz_wire::AGG_MIN            => Some(AggFunc::Min),
-            gnitz_wire::AGG_MAX            => Some(AggFunc::Max),
-            gnitz_wire::AGG_COUNT_NON_NULL => Some(AggFunc::CountNonNull),
-            _ => None,
-        }
-    }
-    pub fn as_u64(self) -> u64 { self as u64 }
-}
-
-/// REDUCE aggregation kind. `Null` is GROUP BY without aggregation
-/// (equivalent to `AggOp::Null` in the engine and serialises to zero
-/// AGG_SPEC rows). `Specs` covers both single- and multi-aggregate REDUCE.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AggKind {
-    Null,
-    Specs(Vec<(AggFunc, u16)>),
-}
-
-/// Join physical strategy. `DeltaTrace` is the standard delta-vs-trace
-/// shape (port A = delta, port TRACE = integrated other side).
-/// `DeltaTraceOuter` is a left outer join. `DeltaDelta` joins two delta
-/// inputs directly (used when both sides are pre-integrated downstream).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JoinKind { DeltaTrace, DeltaTraceOuter, DeltaDelta }
-
-/// Discriminator for the three MAP variants. Each maps to a distinct wire
-/// opcode (`OPCODE_MAP_PROJ` / `OPCODE_MAP_EXPR` / `OPCODE_MAP_KEY_ONLY`),
-/// so `load_circuit()` dispatches on opcode alone.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MapKind {
-    /// Projection / column reorder, no compute. Carries the list of
-    /// payload column indices to keep.
-    Projection(Vec<u16>),
-    /// Expression-based map. Optional `reindex_col` flips the PK column
-    /// (equijoin pre-indexing).
-    Expression { program: ExprProgram, reindex_col: Option<u16> },
-    /// Drop all payload columns, keep only PK and weight. Used to project
-    /// reindexed batches down to join-key-only for distinct tracking.
-    KeyOnly,
-}
-
-/// Typed operator-node payload. Each variant maps to a distinct opcode;
-/// `load_circuit()` dispatches on opcode alone — no presence-of-param check.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OpNode {
-    /// `OPCODE_SCAN_DELTA = 11`. Delta input; carries the source `table_id`
-    /// directly. Replaces both `input_delta()` (primary trigger) and
-    /// `input_delta_tagged()` (secondary join input). Compiler reads
-    /// `ext_tables[source_table]` directly; no DEP_TAB walking needed.
-    ScanDelta(TableId),
-    /// `OPCODE_SCAN_TRACE_TABLE = 31`. Read-only trace source for join
-    /// trace ports; never participates in cascade.
-    ScanTrace(TableId),
-    Filter(Option<ExprProgram>),
-    Map(MapKind),
-    Negate,
-    Union,
-    Delay,
-    Distinct,
-    Reduce { group_cols: Vec<u16>, agg: AggKind },
-    Join(JoinKind),
-    AntiJoin(JoinKind),
-    SemiJoin(JoinKind),
-    /// `OPCODE_INTEGRATE = 7`. Primary INTEGRATE: writes to view storage.
-    IntegrateSink,
-    /// `OPCODE_INTEGRATE_TRACE = 25`. Accumulates Z-set for join trace.
-    IntegrateTrace,
-    ExchangeShard { shard_cols: Vec<u16> },
-    /// `OPCODE_EXCHANGE_GATHER = 21`. Compiler arm is a register-schema
-    /// pass-through (no VM instruction emitted). The legacy
-    /// `PARAM_GATHER_WORKER` is dead state and not stored.
-    ExchangeGather,
-    NullExtend { type_codes: Vec<u8> },
-    /// `OPCODE_GATHER_REDUCE = 24`. Server-internal opcode reserved for
-    /// future multi-worker REDUCE planning.
-    GatherReduce,
-    /// `OPCODE_SEEK_TRACE = 12`. Server-internal — emitted only by the
-    /// compiler.
-    SeekTrace,
-    /// `OPCODE_CLEAR_DELTAS = 15`. Server-internal — emitted only by the
-    /// compiler.
-    ClearDeltas,
-}
 
 /// In-memory circuit graph: typed `OpNode` per node + (dst,port) → src edges.
 #[derive(Clone, Debug)]
@@ -136,15 +35,11 @@ impl Circuit {
     /// deliberately excluded (they're read-only lookups; updating them
     /// must NOT trigger view recalculation).
     pub fn dependencies(&self) -> Vec<TableId> {
-        let mut deps: Vec<TableId> = Vec::new();
-        for op in self.nodes.values() {
-            if let OpNode::ScanDelta(tid) = op {
-                if !deps.contains(tid) {
-                    deps.push(*tid);
-                }
-            }
-        }
-        deps
+        let mut seen = std::collections::HashSet::new();
+        self.nodes.values()
+            .filter_map(|op| if let OpNode::ScanDelta(tid) = op { Some(*tid) } else { None })
+            .filter(|tid| seen.insert(*tid))
+            .collect()
     }
 
     /// Materialise the circuit into the three-table row bundle. Pure
@@ -183,8 +78,8 @@ impl Circuit {
 
         let mut nodes = BTreeMap::new();
         for (nid, opcode, src_tab, reindex, expr_blob) in rows.nodes {
-            let cols = per_node.remove(&nid).unwrap_or_default();
-            let op = decode_op_node(opcode, src_tab, reindex, expr_blob, &cols)?;
+            let cols: Vec<(u64, u16, u64, u64)> = per_node.remove(&nid).unwrap_or_default();
+            let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, &cols)?;
             nodes.insert(nid, op);
         }
         let mut edges = BTreeMap::new();
@@ -195,7 +90,16 @@ impl Circuit {
     }
 }
 
-// Helper: produce the row tuples for a single OpNode.
+fn encode_col_list<I, T>(kind: u64, iter: I) -> Vec<(u64, u16, u64, u64)>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<u64>,
+{
+    iter.into_iter().enumerate()
+        .map(|(i, v)| (kind, i as u16, v.into(), 0u64))
+        .collect()
+}
+
 fn encode_op_node(
     op: OpNode,
 ) -> (u64, Option<TableId>, Option<u16>, Option<Vec<u8>>, Vec<(u64, u16, u64, u64)>) {
@@ -203,15 +107,12 @@ fn encode_op_node(
     match op {
         OpNode::ScanDelta(tid) => (OPCODE_SCAN_DELTA, Some(tid), None, None, Vec::new()),
         OpNode::ScanTrace(tid) => (OPCODE_SCAN_TRACE_TABLE, Some(tid), None, None, Vec::new()),
-        OpNode::Filter(expr) => (OPCODE_FILTER, None, None, expr.as_ref().map(|e| e.encode()), Vec::new()),
+        OpNode::Filter(blob)   => (OPCODE_FILTER, None, None, blob, Vec::new()),
         OpNode::Map(MapKind::Projection(cols)) => {
-            let kind_rows = cols.into_iter().enumerate()
-                .map(|(i, c)| (NODE_COL_KIND_PROJ, i as u16, c as u64, 0u64))
-                .collect();
-            (OPCODE_MAP_PROJ, None, None, None, kind_rows)
+            (OPCODE_MAP_PROJ, None, None, None, encode_col_list(NODE_COL_KIND_PROJ, cols))
         }
         OpNode::Map(MapKind::Expression { program, reindex_col }) => {
-            (OPCODE_MAP_EXPR, None, reindex_col, Some(program.encode()), Vec::new())
+            (OPCODE_MAP_EXPR, None, reindex_col, Some(program), Vec::new())
         }
         OpNode::Map(MapKind::KeyOnly) => (OPCODE_MAP_KEY_ONLY, None, None, None, Vec::new()),
         OpNode::Negate         => (OPCODE_NEGATE, None, None, None, Vec::new()),
@@ -242,99 +143,16 @@ fn encode_op_node(
         OpNode::IntegrateSink  => (OPCODE_INTEGRATE, None, None, None, Vec::new()),
         OpNode::IntegrateTrace => (OPCODE_INTEGRATE_TRACE, None, None, None, Vec::new()),
         OpNode::ExchangeShard { shard_cols } => {
-            let kind_rows = shard_cols.into_iter().enumerate()
-                .map(|(i, c)| (NODE_COL_KIND_SHARD, i as u16, c as u64, 0))
-                .collect();
-            (OPCODE_EXCHANGE_SHARD, None, None, None, kind_rows)
+            (OPCODE_EXCHANGE_SHARD, None, None, None, encode_col_list(NODE_COL_KIND_SHARD, shard_cols))
         }
         OpNode::ExchangeGather => (OPCODE_EXCHANGE_GATHER, None, None, None, Vec::new()),
         OpNode::NullExtend { type_codes } => {
-            let kind_rows = type_codes.into_iter().enumerate()
-                .map(|(i, tc)| (NODE_COL_KIND_NULL_EXT, i as u16, tc as u64, 0))
-                .collect();
-            (OPCODE_NULL_EXTEND, None, None, None, kind_rows)
+            (OPCODE_NULL_EXTEND, None, None, None, encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes))
         }
         OpNode::GatherReduce  => (OPCODE_GATHER_REDUCE, None, None, None, Vec::new()),
         OpNode::SeekTrace     => (OPCODE_SEEK_TRACE, None, None, None, Vec::new()),
         OpNode::ClearDeltas   => (OPCODE_CLEAR_DELTAS, None, None, None, Vec::new()),
     }
-}
-
-// Helper: reconstruct an OpNode from its row tuples.
-fn decode_op_node(
-    opcode: u64,
-    src_tab: Option<TableId>,
-    reindex: Option<u16>,
-    expr_blob: Option<Vec<u8>>,
-    cols: &[(u64, u16, u64, u64)],
-) -> Result<OpNode, String> {
-    use gnitz_wire::*;
-    let collect_cols = |kind: u64| -> Vec<u16> {
-        cols.iter()
-            .filter(|(k, _, _, _)| *k == kind)
-            .map(|(_, _, v1, _)| *v1 as u16)
-            .collect()
-    };
-    let collect_typecodes = |kind: u64| -> Vec<u8> {
-        cols.iter()
-            .filter(|(k, _, _, _)| *k == kind)
-            .map(|(_, _, v1, _)| *v1 as u8)
-            .collect()
-    };
-    let collect_aggs = || -> Result<Vec<(AggFunc, u16)>, String> {
-        cols.iter()
-            .filter(|(k, _, _, _)| *k == NODE_COL_KIND_AGG_SPEC)
-            .map(|(_, _, v1, v2)| {
-                AggFunc::from_wire(*v1)
-                    .ok_or_else(|| format!("unknown agg func id {}", v1))
-                    .map(|f| (f, *v2 as u16))
-            })
-            .collect()
-    };
-    Ok(match opcode {
-        x if x == OPCODE_SCAN_DELTA => OpNode::ScanDelta(src_tab.unwrap_or(0)),
-        x if x == OPCODE_SCAN_TRACE_TABLE => OpNode::ScanTrace(src_tab.unwrap_or(0)),
-        x if x == OPCODE_FILTER => {
-            let expr = match expr_blob {
-                Some(b) => Some(ExprProgram::decode(&b).map_err(|e| e.to_string())?),
-                None => None,
-            };
-            OpNode::Filter(expr)
-        }
-        x if x == OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
-        x if x == OPCODE_MAP_EXPR => {
-            let blob = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
-            let program = ExprProgram::decode(&blob).map_err(|e| e.to_string())?;
-            OpNode::Map(MapKind::Expression { program, reindex_col: reindex })
-        }
-        x if x == OPCODE_MAP_KEY_ONLY => OpNode::Map(MapKind::KeyOnly),
-        x if x == OPCODE_NEGATE  => OpNode::Negate,
-        x if x == OPCODE_UNION   => OpNode::Union,
-        x if x == OPCODE_DELAY   => OpNode::Delay,
-        x if x == OPCODE_DISTINCT => OpNode::Distinct,
-        x if x == OPCODE_REDUCE => {
-            let group_cols = collect_cols(NODE_COL_KIND_GROUP);
-            let specs = collect_aggs()?;
-            let agg = if specs.is_empty() { AggKind::Null } else { AggKind::Specs(specs) };
-            OpNode::Reduce { group_cols, agg }
-        }
-        x if x == OPCODE_JOIN_DELTA_TRACE       => OpNode::Join(JoinKind::DeltaTrace),
-        x if x == OPCODE_JOIN_DELTA_TRACE_OUTER => OpNode::Join(JoinKind::DeltaTraceOuter),
-        x if x == OPCODE_JOIN_DELTA_DELTA       => OpNode::Join(JoinKind::DeltaDelta),
-        x if x == OPCODE_ANTI_JOIN_DELTA_TRACE  => OpNode::AntiJoin(JoinKind::DeltaTrace),
-        x if x == OPCODE_ANTI_JOIN_DELTA_DELTA  => OpNode::AntiJoin(JoinKind::DeltaDelta),
-        x if x == OPCODE_SEMI_JOIN_DELTA_TRACE  => OpNode::SemiJoin(JoinKind::DeltaTrace),
-        x if x == OPCODE_SEMI_JOIN_DELTA_DELTA  => OpNode::SemiJoin(JoinKind::DeltaDelta),
-        x if x == OPCODE_INTEGRATE              => OpNode::IntegrateSink,
-        x if x == OPCODE_INTEGRATE_TRACE        => OpNode::IntegrateTrace,
-        x if x == OPCODE_EXCHANGE_SHARD         => OpNode::ExchangeShard { shard_cols: collect_cols(NODE_COL_KIND_SHARD) },
-        x if x == OPCODE_EXCHANGE_GATHER        => OpNode::ExchangeGather,
-        x if x == OPCODE_NULL_EXTEND            => OpNode::NullExtend { type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT) },
-        x if x == OPCODE_GATHER_REDUCE          => OpNode::GatherReduce,
-        x if x == OPCODE_SEEK_TRACE             => OpNode::SeekTrace,
-        x if x == OPCODE_CLEAR_DELTAS           => OpNode::ClearDeltas,
-        _ => return Err(format!("unknown opcode {}", opcode)),
-    })
 }
 
 /// Fluent builder for DBSP circuit graphs, producing a typed [`Circuit`]
@@ -395,13 +213,14 @@ impl CircuitBuilder {
     }
 
     pub fn filter(&mut self, input: NodeId, expr: Option<ExprProgram>) -> NodeId {
-        let nid = self.alloc_node(OpNode::Filter(expr));
+        let nid = self.alloc_node(OpNode::Filter(expr.map(|e| e.encode())));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
 
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
-        let nid = self.alloc_node(OpNode::Map(MapKind::Expression { program, reindex_col: None }));
+        let blob = program.encode();
+        let nid = self.alloc_node(OpNode::Map(MapKind::Expression { program: blob, reindex_col: None }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
@@ -409,8 +228,9 @@ impl CircuitBuilder {
     /// Map with PK reindexing (equijoin pre-indexing). The new PK column is
     /// `reindex_col` from the input schema.
     pub fn map_reindex(&mut self, input: NodeId, reindex_col: usize, program: ExprProgram) -> NodeId {
+        let blob = program.encode();
         let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
-            program,
+            program: blob,
             reindex_col: Some(reindex_col as u16),
         }));
         self.connect(input, nid, gnitz_wire::PORT_IN);

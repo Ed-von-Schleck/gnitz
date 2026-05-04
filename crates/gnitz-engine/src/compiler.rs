@@ -1,7 +1,7 @@
 //! Circuit compiler: reads system tables, builds a DBSP circuit graph,
 //! runs annotation + optimization passes, and emits VM instructions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
@@ -9,78 +9,37 @@ use crate::ops::{AggDescriptor, AggOp};
 use crate::storage::{CursorHandle, Table, ReadCursor};
 use crate::vm::{ProgramBuilder, VmHandle};
 
-gnitz_wire::cast_consts! { i32;
-    OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
-    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_DELTA,
-    OPCODE_INTEGRATE, OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT,
-    OPCODE_SCAN_TRACE, OPCODE_SEEK_TRACE, OPCODE_CLEAR_DELTAS,
-    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_ANTI_JOIN_DELTA_DELTA,
-    OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_DELTA,
-    OPCODE_EXCHANGE_SHARD, OPCODE_JOIN_DELTA_TRACE_OUTER,
-    OPCODE_NULL_EXTEND, OPCODE_GATHER_REDUCE,
-    PORT_IN, PORT_IN_A, PORT_IN_B, PORT_TRACE,
-    PARAM_AGG_FUNC_ID, PARAM_TABLE_ID, PARAM_AGG_COL_IDX,
-    PARAM_EXPR_NUM_REGS, PARAM_EXPR_RESULT_REG,
-    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE,
-    PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
-    PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
-    PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_SHARD_COL_BASE, PARAM_CONST_STR_BASE,
-}
-// Engine-only constants
-const PORT_DELTA: i32       = 0;
-const PORT_IN_REDUCE: i32   = 0;
-const PORT_TRACE_IN: i32    = 1;
-const PORT_IN_DISTINCT: i32 = 0;
-const PORT_EXCHANGE_IN: i32 = 0;
-
-// System table column indices for DEP_TAB (used by resolve_primary_input_schema).
-const DEP_COL_DEP_TABLE_ID: usize = 3;
+// Engine-only port aliases (all equal to wire constants).
+const PORT_IN:    i32 = gnitz_wire::PORT_IN    as i32;
+const PORT_IN_A:  i32 = gnitz_wire::PORT_IN_A  as i32;
+const PORT_IN_B:  i32 = gnitz_wire::PORT_IN_B  as i32;
+const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
-/// A node in the circuit graph.
-#[derive(Clone, Copy)]
-struct Node {
-    id: i32,
-    opcode: i32,
-}
-
-/// An edge in the circuit graph.
-#[derive(Clone, Copy)]
-struct Edge {
-    _id: i32,
-    src: i32,
-    dst: i32,
-    port: i32,
-}
-
-/// Loaded + topologically sorted circuit graph.
-struct CircuitGraph {
-    view_id: u64,
-    nodes: Vec<Node>,
-    edges: Vec<Edge>,
-    sources: HashMap<i32, i64>,       // node_id → table_id
-    params: HashMap<i32, HashMap<i32, i64>>,  // node_id → {slot: value}
-    str_params: HashMap<i32, HashMap<i32, Vec<u8>>>, // node_id → {slot: bytes}
-    group_cols: HashMap<i32, Vec<i32>>, // node_id → [col_idx]
+/// Typed circuit graph with OpNode payloads. `edges` is the raw edge list
+/// before topological sort; the sorted helpers are populated by `topo_sort`.
+pub(crate) struct LoadedCircuit {
     out_schema: SchemaDescriptor,
-
-    // Derived by topo_sort
-    opcode_of: HashMap<i32, i32>,
+    pub(crate) nodes: HashMap<i32, gnitz_wire::OpNode>,
+    /// Raw (src, dst, port) tuples read from CircuitEdges — input to topo_sort.
+    pub(crate) edges: Vec<(i32, i32, i32)>,
+    // Populated by topo_sort:
     ordered: Vec<i32>,
-    outgoing: HashMap<i32, Vec<(i32, i32)>>, // node_id → [(dst, port)]
-    incoming: HashMap<i32, Vec<(i32, i32)>>, // node_id → [(src, port)]
-    consumers: HashMap<i32, Vec<i32>>,       // node_id → [consumer_ids]
+    pub(crate) outgoing: HashMap<i32, Vec<(i32, i32)>>,
+    incoming: HashMap<i32, Vec<(i32, i32)>>,
+    consumers: HashMap<i32, Vec<i32>>,
+    /// Raw node-column rows for GatherReduce nodes only (stays on legacy path
+    /// until OpNode::GatherReduce gains an `agg: AggKind` field).
+    gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>>,
 }
 
 /// Annotation results from pre-passes.
 struct Annotation {
-    trace_side_sources: HashSet<i32>,
-    in_schema: SchemaDescriptor,
-    co_partitioned: HashSet<i64>,               // source_tid set
-    is_distinct_at: HashSet<i32>,               // node_id set
+    co_partitioned: HashSet<i64>,
+    is_distinct_at: HashSet<i32>,
 }
 
 /// Optimization rewrite decisions.
@@ -270,52 +229,28 @@ const NODECOL_COL_POSITION: usize = 4;
 const NODECOL_COL_VALUE1:   usize = 5;
 const NODECOL_COL_VALUE2:   usize = 6;
 
-// CircuitNodeColumns kind discriminator values (mirrors gnitz_wire::NODE_COL_KIND_*).
-const KIND_GROUP:    i64 = gnitz_wire::NODE_COL_KIND_GROUP    as i64;
-const KIND_SHARD:    i64 = gnitz_wire::NODE_COL_KIND_SHARD    as i64;
-const KIND_PROJ:     i64 = gnitz_wire::NODE_COL_KIND_PROJ     as i64;
-const KIND_NULL_EXT: i64 = gnitz_wire::NODE_COL_KIND_NULL_EXT as i64;
-const KIND_AGG_SPEC: i64 = gnitz_wire::NODE_COL_KIND_AGG_SPEC as i64;
-
-const OPCODE_INTEGRATE_TRACE_NEW: i32  = gnitz_wire::OPCODE_INTEGRATE_TRACE  as i32;
-const OPCODE_MAP_PROJ_NEW: i32         = gnitz_wire::OPCODE_MAP_PROJ         as i32;
-const OPCODE_MAP_EXPR_NEW: i32         = gnitz_wire::OPCODE_MAP_EXPR         as i32;
-const OPCODE_MAP_KEY_ONLY_NEW: i32     = gnitz_wire::OPCODE_MAP_KEY_ONLY     as i32;
-const OPCODE_SCAN_TRACE_TABLE_NEW: i32 = gnitz_wire::OPCODE_SCAN_TRACE_TABLE as i32;
-
-#[allow(clippy::type_complexity)]
-fn load_circuit(
+pub(crate) fn load_circuit(
     sys_nodes: *mut Table, sys_nodes_schema: &SchemaDescriptor,
     sys_edges: *mut Table, sys_edges_schema: &SchemaDescriptor,
     sys_node_cols: *mut Table, sys_node_cols_schema: &SchemaDescriptor,
     view_id: u64,
-) -> (
-    Vec<Node>,
-    Vec<Edge>,
-    HashMap<i32, i64>,
-    HashMap<i32, HashMap<i32, i64>>,
-    HashMap<i32, HashMap<i32, Vec<u8>>>,
-    HashMap<i32, Vec<i32>>,
-) {
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut edges: Vec<Edge> = Vec::new();
-    let mut sources:    HashMap<i32, i64>                = HashMap::new();
-    let mut params:     HashMap<i32, HashMap<i32, i64>>  = HashMap::new();
-    let mut str_params: HashMap<i32, HashMap<i32, Vec<u8>>> = HashMap::new();
-    let mut group_cols: HashMap<i32, Vec<i32>>           = HashMap::new();
+    out_schema: SchemaDescriptor,
+) -> LoadedCircuit {
+    let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
+    let mut edges: Vec<(i32, i32, i32)> = Vec::new();
+    let mut gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
 
-    // Phase 1: scan CircuitNodeColumns once and bucket rows by node_id so the
-    // node-row scan can resolve every typed payload in O(1) per node.
-    let mut cols_by_node: HashMap<i32, Vec<(i64, i64, i64, i64)>> = HashMap::new();
+    // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
+    let mut cols_by_node: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
     if let Some(mut ch) = open_system_cursor(sys_node_cols, view_id) {
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
-                let node_id = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID, sys_node_cols_schema) as i32;
-                let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema);
-                let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema);
-                let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema);
-                let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema);
+                let node_id  = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID,  sys_node_cols_schema) as i32;
+                let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema) as u64;
+                let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
+                let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema) as u64;
+                let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema) as u64;
                 cols_by_node.entry(node_id).or_default().push((kind, position, v1, v2));
             }
             ch.cursor.advance();
@@ -324,147 +259,48 @@ fn load_circuit(
             }
         }
     }
-    // Phase 2: scan CircuitNodes. Translate each row into the legacy bag-of-
-    // params shape so the rest of the compiler doesn't need to learn the new
-    // typed enum.
+    // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
+    for v in cols_by_node.values_mut() {
+        v.sort_by_key(|&(kind, pos, _, _)| (kind, pos));
+    }
+
+    // Phase 2: read CircuitNodes; call decode_op_node for each.
     if let Some(mut ch) = open_system_cursor(sys_nodes, view_id) {
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
                 let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
-                let opcode_new = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as i32;
+                let opcode  = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
 
-                let source_table = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
-                    -1
-                } else {
-                    cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema)
-                };
-                let reindex_col = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
-                    -1
-                } else {
-                    cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema)
-                };
-                let expr_blob: Vec<u8> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
-                    Vec::new()
-                } else {
-                    cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema)
-                };
-
-                // Decode the BLOB once if non-empty — used by FILTER and MAP_EXPR.
-                let prog: Option<DecodedExprProgram> = if !expr_blob.is_empty() {
-                    decode_expr_blob(&expr_blob)
-                } else {
+                let src_tab: Option<u64> = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
                     None
+                } else {
+                    Some(cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) as u64)
+                };
+                let reindex: Option<u16> = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
+                    None
+                } else {
+                    Some(cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) as u16)
+                };
+                let expr_blob: Option<Vec<u8>> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
+                    None
+                } else {
+                    let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema);
+                    if b.is_empty() { None } else { Some(b) }
                 };
 
-                // Translate the typed opcode + payload columns back into the
-                // legacy (opcode, params, sources, group_cols) representation.
-                let legacy_opcode = match opcode_new {
-                    OPCODE_INTEGRATE_TRACE_NEW => {
-                        // IntegrateTrace = legacy INTEGRATE with PARAM_TABLE_ID > 0.
-                        params.entry(node_id).or_default().insert(PARAM_TABLE_ID, 1);
-                        OPCODE_INTEGRATE
-                    }
-                    OPCODE_MAP_PROJ_NEW | OPCODE_MAP_EXPR_NEW | OPCODE_MAP_KEY_ONLY_NEW => {
-                        // All three sub-variants land back on legacy OPCODE_MAP.
-                        let np = params.entry(node_id).or_default();
-                        if opcode_new == OPCODE_MAP_KEY_ONLY_NEW {
-                            np.insert(PARAM_KEY_ONLY, 1);
-                        }
-                        if opcode_new == OPCODE_MAP_EXPR_NEW {
-                            if let Some(p) = &prog {
-                                np.insert(PARAM_EXPR_NUM_REGS, p.num_regs as i64);
-                                if p.result_reg != 0 {
-                                    np.insert(PARAM_EXPR_RESULT_REG, p.result_reg as i64);
-                                }
-                                for (i, &word) in p.code.iter().enumerate() {
-                                    np.insert(PARAM_EXPR_BASE + i as i32, word as i64);
-                                }
-                                let sp = str_params.entry(node_id).or_default();
-                                for (i, s) in p.const_strings.iter().enumerate() {
-                                    sp.insert(PARAM_CONST_STR_BASE + i as i32, s.clone());
-                                }
-                            }
-                            if reindex_col >= 0 {
-                                np.insert(PARAM_REINDEX_COL, reindex_col);
+                let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
+                match gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
+                    Ok(op) => {
+                        if matches!(op, gnitz_wire::OpNode::GatherReduce) {
+                            if let Some(c) = cols_by_node.get(&node_id) {
+                                gather_reduce_cols.insert(node_id, c.clone());
                             }
                         }
-                        OPCODE_MAP
+                        nodes.insert(node_id, op);
                     }
-                    OPCODE_SCAN_TRACE_TABLE_NEW => {
-                        // Trace-only scan: sources[node_id] = table_id.
-                        if source_table >= 0 {
-                            sources.insert(node_id, source_table);
-                        }
-                        OPCODE_SCAN_TRACE
-                    }
-                    other if other == OPCODE_SCAN_TRACE => {
-                        // OPCODE_SCAN_DELTA (= 11). Stash the source table as
-                        // PARAM_JOIN_SOURCE_TABLE so the legacy "tagged delta"
-                        // branch in emit_node picks the right schema.
-                        // sources[nid] stays unset (= 0 via unwrap_or).
-                        if source_table >= 0 {
-                            params.entry(node_id).or_default().insert(PARAM_JOIN_SOURCE_TABLE, source_table);
-                        }
-                        OPCODE_SCAN_TRACE
-                    }
-                    other if other == OPCODE_FILTER => {
-                        if let Some(p) = &prog {
-                            let np = params.entry(node_id).or_default();
-                            np.insert(PARAM_EXPR_NUM_REGS, p.num_regs as i64);
-                            np.insert(PARAM_EXPR_RESULT_REG, p.result_reg as i64);
-                            for (i, &word) in p.code.iter().enumerate() {
-                                np.insert(PARAM_EXPR_BASE + i as i32, word as i64);
-                            }
-                            let sp = str_params.entry(node_id).or_default();
-                            for (i, s) in p.const_strings.iter().enumerate() {
-                                sp.insert(PARAM_CONST_STR_BASE + i as i32, s.clone());
-                            }
-                        }
-                        OPCODE_FILTER
-                    }
-                    other => other,
-                };
-
-                // Drain CircuitNodeColumns rows for this node into the legacy maps.
-                if let Some(rows) = cols_by_node.get(&node_id) {
-                    let np = params.entry(node_id).or_default();
-                    let mut group: Vec<i32> = Vec::new();
-                    let mut null_ext_count: i64 = 0;
-                    let mut agg_count: i64 = 0;
-                    for &(kind, position, v1, v2) in rows {
-                        match kind {
-                            KIND_GROUP => group.push(v1 as i32),
-                            KIND_SHARD => {
-                                np.insert(PARAM_SHARD_COL_BASE + position as i32, v1);
-                            }
-                            KIND_PROJ => {
-                                np.insert(PARAM_PROJ_BASE + position as i32, v1);
-                            }
-                            KIND_NULL_EXT => {
-                                np.insert(PARAM_NULL_EXTEND_COL_BASE + position as i32, v1);
-                                null_ext_count = null_ext_count.max(position + 1);
-                            }
-                            KIND_AGG_SPEC => {
-                                let packed = ((v1 as u64) << 32) | (v2 as u64 & 0xFFFFFFFF);
-                                np.insert(PARAM_AGG_SPEC_BASE + position as i32, packed as i64);
-                                agg_count = agg_count.max(position + 1);
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !group.is_empty() {
-                        group_cols.insert(node_id, group);
-                    }
-                    if null_ext_count > 0 {
-                        np.insert(PARAM_NULL_EXTEND_COUNT, null_ext_count);
-                    }
-                    if agg_count > 0 {
-                        np.insert(PARAM_AGG_COUNT, agg_count);
-                    }
+                    Err(_) => {} // unknown opcode: skip
                 }
-
-                nodes.push(Node { id: node_id, opcode: legacy_opcode });
             }
             ch.cursor.advance();
             if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
@@ -473,15 +309,15 @@ fn load_circuit(
         }
     }
 
-    // Phase 3: scan CircuitEdges (natural key — no synthetic edge_id).
+    // Phase 3: read CircuitEdges.
     if let Some(mut ch) = open_system_cursor(sys_edges, view_id) {
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
-                let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
+                let dst  = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
                 let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
-                let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
-                edges.push(Edge { _id: 0, src, dst, port });
+                let src  = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
+                edges.push((src, dst, port));
             }
             ch.cursor.advance();
             if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
@@ -490,56 +326,66 @@ fn load_circuit(
         }
     }
 
-    (nodes, edges, sources, params, str_params, group_cols)
+    LoadedCircuit {
+        out_schema,
+        nodes,
+        edges,
+        ordered: Vec::new(),
+        outgoing: HashMap::new(),
+        incoming: HashMap::new(),
+        consumers: HashMap::new(),
+        gather_reduce_cols,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Topological sort (Kahn's algorithm)
 // ---------------------------------------------------------------------------
 
-fn topo_sort(graph: &mut CircuitGraph) -> Result<(), i32> {
+fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
     let mut in_degree: HashMap<i32, i32> = HashMap::new();
-    for n in &graph.nodes {
-        graph.opcode_of.insert(n.id, n.opcode);
-        in_degree.insert(n.id, 0);
-        graph.outgoing.insert(n.id, Vec::new());
-        graph.incoming.insert(n.id, Vec::new());
-        graph.consumers.insert(n.id, Vec::new());
+    for &nid in loaded.nodes.keys() {
+        in_degree.insert(nid, 0);
+        loaded.outgoing.entry(nid).or_default();
+        loaded.incoming.entry(nid).or_default();
+        loaded.consumers.entry(nid).or_default();
     }
 
-    for e in &graph.edges {
-        graph.outgoing.entry(e.src).or_default().push((e.dst, e.port));
-        graph.incoming.entry(e.dst).or_default().push((e.src, e.port));
-        graph.consumers.entry(e.src).or_default().push(e.dst);
-        *in_degree.entry(e.dst).or_insert(0) += 1;
+    for &(src, dst, port) in &loaded.edges {
+        loaded.outgoing.entry(src).or_default().push((dst, port));
+        loaded.incoming.entry(dst).or_default().push((src, port));
+        loaded.consumers.entry(src).or_default().push(dst);
+        *in_degree.entry(dst).or_insert(0) += 1;
     }
 
-    let mut queue: Vec<i32> = Vec::new();
-    for n in &graph.nodes {
-        if *in_degree.get(&n.id).unwrap_or(&0) == 0 {
-            queue.push(n.id);
-        }
-    }
+    let mut init: Vec<i32> = loaded.nodes.keys()
+        .filter(|&&nid| *in_degree.get(&nid).unwrap_or(&0) == 0)
+        .copied()
+        .collect();
+    init.sort_unstable(); // deterministic order for tied sources
+    let mut queue: VecDeque<i32> = init.into();
 
-    let mut ordered = Vec::with_capacity(graph.nodes.len());
-    while let Some(nid) = queue.first().copied() {
-        queue.remove(0);
+    let mut ordered = Vec::with_capacity(loaded.nodes.len());
+    while let Some(nid) = queue.pop_front() {
         ordered.push(nid);
-        if let Some(outs) = graph.outgoing.get(&nid) {
+        if let Some(outs) = loaded.outgoing.get(&nid) {
+            let mut next_batch: Vec<i32> = Vec::new();
             for &(dst, _) in outs {
                 let deg = in_degree.get_mut(&dst).unwrap();
                 *deg -= 1;
                 if *deg == 0 {
-                    queue.push(dst);
+                    next_batch.push(dst);
                 }
             }
+            next_batch.sort_unstable();
+            queue.extend(next_batch);
         }
     }
 
-    if ordered.len() != graph.nodes.len() {
+    if ordered.len() != loaded.nodes.len() {
         return Err(-1); // cycle detected
     }
-    graph.ordered = ordered;
+    loaded.ordered = ordered;
     Ok(())
 }
 
@@ -547,87 +393,17 @@ fn topo_sort(graph: &mut CircuitGraph) -> Result<(), i32> {
 // Annotation passes
 // ---------------------------------------------------------------------------
 
-fn compute_trace_sides(graph: &CircuitGraph) -> HashSet<i32> {
-    let mut trace_side_sources = HashSet::new();
-    for e in &graph.edges {
-        if graph.opcode_of.get(&e.src) == Some(&OPCODE_SCAN_TRACE) && e.port == PORT_TRACE {
-            let dst_op = graph.opcode_of.get(&e.dst).copied().unwrap_or(-1);
-            if dst_op == OPCODE_JOIN_DELTA_TRACE
-                || dst_op == OPCODE_JOIN_DELTA_TRACE_OUTER
-                || dst_op == OPCODE_ANTI_JOIN_DELTA_TRACE
-                || dst_op == OPCODE_SEMI_JOIN_DELTA_TRACE
-                || dst_op == OPCODE_SEEK_TRACE
-            {
-                trace_side_sources.insert(e.src);
-            }
-        }
-    }
-    trace_side_sources
-}
-
-fn resolve_primary_input_schema(
-    dep_table: *mut Table,
-    dep_schema: &SchemaDescriptor,
-    view_id: u64,
-    sources: &HashMap<i32, i64>,
-    trace_side_sources: &HashSet<i32>,
-    ext_tables: &[ExternalTable],
-    fallback: &SchemaDescriptor,
-) -> SchemaDescriptor {
-    // Collect table IDs that feed trace ports
-    let mut trace_table_ids: HashSet<i64> = HashSet::new();
-    for &nid in trace_side_sources.iter() {
-        if let Some(&tid) = sources.get(&nid) {
-            if tid > 0 {
-                trace_table_ids.insert(tid);
-            }
-        }
-    }
-
-    let mut ch = match open_system_cursor(dep_table, view_id) {
-        Some(c) => c,
-        None => return *fallback,
-    };
-    let end_hi = view_id + 1;
-    let mut any_dep_schema: Option<SchemaDescriptor> = None;
-    while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-        if ch.cursor.current_weight > 0 {
-            let dep_tid = cursor_read_i64(&ch.cursor, DEP_COL_DEP_TABLE_ID, dep_schema);
-            if dep_tid > 0 {
-                if let Some(ext) = ext_tables.iter().find(|t| t.table_id == dep_tid) {
-                    if any_dep_schema.is_none() {
-                        any_dep_schema = Some(ext.schema);
-                    }
-                    if !trace_table_ids.contains(&dep_tid) {
-                        return ext.schema;
-                    }
-                }
-            }
-        }
-        ch.cursor.advance();
-        if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-            break;
-        }
-    }
-
-    any_dep_schema.unwrap_or(*fallback)
-}
-
-fn compute_join_shard_map(
-    graph: &CircuitGraph,
-    _trace_side_sources: &HashSet<i32>,
-) -> HashMap<i64, Vec<i32>> {
+/// Build the join-shard map by inspecting OpNode variants directly.
+/// Maps source_tid → [reindex_col] for ScanDelta → Map(Expression{reindex_col})
+/// chains (equijoin pre-indexing).
+fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<i32>> {
     let mut join_shard_map = HashMap::new();
-    for e in &graph.edges {
-        if graph.opcode_of.get(&e.src) == Some(&OPCODE_SCAN_TRACE) {
-            let src_params = graph.params.get(&e.src);
-            let source_tid = src_params.and_then(|p| p.get(&PARAM_JOIN_SOURCE_TABLE)).copied().unwrap_or(0);
-            if source_tid > 0 && graph.opcode_of.get(&e.dst) == Some(&OPCODE_MAP) {
-                let dst_params = graph.params.get(&e.dst);
-                let reindex_col = dst_params.and_then(|p| p.get(&PARAM_REINDEX_COL)).copied().unwrap_or(-1);
-                if reindex_col >= 0 {
-                    join_shard_map.insert(source_tid, vec![reindex_col as i32]);
-                }
+    for &(src, dst, _port) in &loaded.edges {
+        if let Some(gnitz_wire::OpNode::ScanDelta(tid)) = loaded.nodes.get(&src) {
+            if let Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                reindex_col: Some(rc), ..
+            })) = loaded.nodes.get(&dst) {
+                join_shard_map.insert(*tid as i64, vec![*rc as i32]);
             }
         }
     }
@@ -651,65 +427,44 @@ fn compute_co_partitioned(
     co_partitioned
 }
 
-fn propagate_distinct(graph: &CircuitGraph, ann: &mut Annotation) {
-    for &nid in &graph.ordered {
-        let op = graph.opcode_of.get(&nid).copied().unwrap_or(-1);
-        if op == OPCODE_REDUCE || op == OPCODE_DISTINCT {
-            ann.is_distinct_at.insert(nid);
-        } else if op == OPCODE_FILTER {
-            let in_nids = graph.incoming.get(&nid).cloned().unwrap_or_default();
-            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
+fn propagate_distinct(loaded: &LoadedCircuit, ann: &mut Annotation) {
+    for &nid in &loaded.ordered {
+        match loaded.nodes.get(&nid) {
+            Some(gnitz_wire::OpNode::Reduce { .. }) | Some(gnitz_wire::OpNode::Distinct) => {
                 ann.is_distinct_at.insert(nid);
             }
-        } else if op == OPCODE_MAP {
-            let node_params = graph.params.get(&nid);
-            let reindex = node_params.and_then(|p| p.get(&PARAM_REINDEX_COL)).copied().unwrap_or(-1);
-            if reindex < 0 {
-                let in_nids = graph.incoming.get(&nid).cloned().unwrap_or_default();
+            Some(gnitz_wire::OpNode::Filter(_)) => {
+                let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
                 if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
                     ann.is_distinct_at.insert(nid);
                 }
             }
+            Some(gnitz_wire::OpNode::Map(mk)) => {
+                let has_reindex = matches!(mk,
+                    gnitz_wire::MapKind::Expression { reindex_col: Some(_), .. });
+                if !has_reindex {
+                    let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
+                    if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
+                        ann.is_distinct_at.insert(nid);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn annotate(
-    graph: &CircuitGraph,
-    dep_table: *mut Table,
-    dep_schema: &SchemaDescriptor,
-    ext_tables: &[ExternalTable],
-) -> Annotation {
-    let trace_side_sources = compute_trace_sides(graph);
-    let in_schema = resolve_primary_input_schema(
-        dep_table, dep_schema, graph.view_id,
-        &graph.sources, &trace_side_sources, ext_tables, &graph.out_schema,
-    );
-    let join_shard_map = compute_join_shard_map(graph, &trace_side_sources);
+fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> Annotation {
+    let join_shard_map = compute_join_shard_map(loaded);
     let co_partitioned = compute_co_partitioned(&join_shard_map, ext_tables);
-    let mut ann = Annotation {
-        trace_side_sources,
-        in_schema,
-        co_partitioned,
-        is_distinct_at: HashSet::new(),
-    };
-    propagate_distinct(graph, &mut ann);
+    let mut ann = Annotation { co_partitioned, is_distinct_at: HashSet::new() };
+    propagate_distinct(loaded, &mut ann);
     ann
 }
 
 // ---------------------------------------------------------------------------
 // Optimization passes
 // ---------------------------------------------------------------------------
-
-fn extract_map_code(node_params: &HashMap<i32, i64>) -> Vec<i64> {
-    let mut code = Vec::new();
-    let mut idx = 0;
-    while node_params.contains_key(&(PARAM_EXPR_BASE + idx)) {
-        code.push(node_params[&(PARAM_EXPR_BASE + idx)]);
-        idx += 1;
-    }
-    code
-}
 
 fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
     if a.num_columns != b.num_columns || a.pk_index != b.pk_index {
@@ -775,12 +530,12 @@ fn split_fold_programs(
     (rw_pre, pre_progs, rw_post, post_progs)
 }
 
-fn opt_distinct(graph: &CircuitGraph, ann: &Annotation, rw: &mut Rewrites) {
-    for n in &graph.nodes {
-        if n.opcode == OPCODE_DISTINCT {
-            let in_nids = graph.incoming.get(&n.id).cloned().unwrap_or_default();
+fn opt_distinct(loaded: &LoadedCircuit, ann: &Annotation, rw: &mut Rewrites) {
+    for (&nid, op) in &loaded.nodes {
+        if matches!(op, gnitz_wire::OpNode::Distinct) {
+            let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
             if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
-                rw.skip_nodes.insert(n.id);
+                rw.skip_nodes.insert(nid);
             }
         }
     }
@@ -788,46 +543,41 @@ fn opt_distinct(graph: &CircuitGraph, ann: &Annotation, rw: &mut Rewrites) {
 
 #[allow(clippy::vec_box, clippy::ptr_arg)]
 fn opt_fold_reduce_map(
-    graph: &CircuitGraph,
-    _ann: &Annotation,
+    loaded: &LoadedCircuit,
     rw: &mut Rewrites,
     owned_expr_progs: &mut Vec<Box<ExprProgram>>,
 ) {
-    for n in &graph.nodes {
-        if n.opcode != OPCODE_MAP {
-            continue;
-        }
-        let in_nids = graph.incoming.get(&n.id).cloned().unwrap_or_default();
+    for (&nid, op) in &loaded.nodes {
+        let blob = match op {
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression { program, reindex_col: None }) => program,
+            _ => continue,
+        };
+        let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
         if in_nids.len() != 1 {
             continue;
         }
         let reduce_nid = in_nids[0].0;
-        if graph.opcode_of.get(&reduce_nid) != Some(&OPCODE_REDUCE) {
+        if !matches!(loaded.nodes.get(&reduce_nid), Some(gnitz_wire::OpNode::Reduce { .. })) {
             continue;
         }
-        let consumers = graph.consumers.get(&reduce_nid).cloned().unwrap_or_default();
+        let consumers = loaded.consumers.get(&reduce_nid).cloned().unwrap_or_default();
         if consumers.len() != 1 {
             continue;
         }
-        let node_params = match graph.params.get(&n.id) {
-            Some(p) => p,
+        let dep = match decode_expr_blob(blob) {
+            Some(d) => d,
             None => continue,
         };
-        let num_regs = node_params.get(&PARAM_EXPR_NUM_REGS).copied().unwrap_or(0);
-        let has_code = num_regs > 0 || node_params.contains_key(&PARAM_EXPR_BASE);
-        if !has_code {
-            continue;
-        }
-        let code = extract_map_code(node_params);
-        let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
+        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+        let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
         if prog.is_sequential_copy_projection() {
-            continue; // identity MAP handled inline
+            continue;
         }
         if prog.code.len() <= 63 {
             let idx = owned_expr_progs.len();
             owned_expr_progs.push(Box::new(prog));
             rw.fold_finalize.insert(reduce_nid, idx);
-            rw.folded_maps.insert(n.id, reduce_nid);
+            rw.folded_maps.insert(nid, reduce_nid);
         }
     }
 }
@@ -850,36 +600,11 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
 
 
 
-fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
-    let total = left.num_columns as usize + right.num_columns as usize - 1;
-    assert!(total <= crate::schema::MAX_COLUMNS,
-        "join output schema exceeds {}-column limit: {} + {} - 1 = {}",
-        crate::schema::MAX_COLUMNS, left.num_columns, right.num_columns, total);
-    let mut out = empty_schema();
-    let mut ci: usize = 0;
-    // PK from left
-    out.columns[ci] = left.columns[left.pk_index as usize];
-    ci += 1;
-    // Left payloads
-    for i in 0..left.num_columns as usize {
-        if i != left.pk_index as usize {
-            out.columns[ci] = left.columns[i];
-            ci += 1;
-        }
-    }
-    // Right payloads (skip right PK)
-    for i in 0..right.num_columns as usize {
-        if i != right.pk_index as usize {
-            out.columns[ci] = right.columns[i];
-            ci += 1;
-        }
-    }
-    out.num_columns = ci as u32;
-    out.pk_index = 0;
-    out
-}
-
-fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+fn merge_schemas_for_join_impl(
+    left: &SchemaDescriptor,
+    right: &SchemaDescriptor,
+    right_nullable: bool,
+) -> SchemaDescriptor {
     let total = left.num_columns as usize + right.num_columns as usize - 1;
     assert!(total <= crate::schema::MAX_COLUMNS,
         "join output schema exceeds {}-column limit: {} + {} - 1 = {}",
@@ -897,7 +622,7 @@ fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescripto
     for i in 0..right.num_columns as usize {
         if i != right.pk_index as usize {
             let mut c = right.columns[i];
-            c.nullable = 1; // right side nullable in outer join
+            if right_nullable { c.nullable = 1; }
             out.columns[ci] = c;
             ci += 1;
         }
@@ -905,6 +630,14 @@ fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescripto
     out.num_columns = ci as u32;
     out.pk_index = 0;
     out
+}
+
+fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    merge_schemas_for_join_impl(left, right, false)
+}
+
+fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    merge_schemas_for_join_impl(left, right, true)
 }
 
 fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
@@ -924,7 +657,6 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
     out
 }
 
-/// Determine the output type for an aggregate function.
 /// Determine the output type for an aggregate function.
 /// Must match `UniversalAccumulator.output_column_type()`:
 ///   COUNT, COUNT_NON_NULL → I64
@@ -1015,30 +747,18 @@ fn agg_value_idx_eligible(tc: TypeCode) -> bool {
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
 
-fn extract_const_strings(str_params: &HashMap<i32, HashMap<i32, Vec<u8>>>, nid: i32) -> Vec<Vec<u8>> {
-    let mut consts = Vec::new();
-    if let Some(node_str) = str_params.get(&nid) {
-        let mut sidx = 0;
-        while node_str.contains_key(&(PARAM_CONST_STR_BASE + sidx)) {
-            consts.push(node_str[&(PARAM_CONST_STR_BASE + sidx)].clone());
-            sidx += 1;
-        }
-    }
-    consts
-}
-
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn create_expr_predicate(
     code: Vec<i64>,
-    num_regs: i64,
-    result_reg: i64,
+    num_regs: u32,
+    result_reg: u32,
     const_strings: Vec<Vec<u8>>,
     pk_index: u32,
     schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let mut prog = ExprProgram::new(code, num_regs as u32, result_reg as u32, const_strings);
+    let mut prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
     prog.set_payload_col_info(schema);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
@@ -1049,14 +769,14 @@ fn create_expr_predicate(
 #[allow(clippy::vec_box, clippy::ptr_arg)]
 fn create_expr_map(
     code: Vec<i64>,
-    num_regs: i64,
+    num_regs: u32,
     const_strings: Vec<Vec<u8>>,
     pk_index: u32,
     schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let mut prog = ExprProgram::new(code, num_regs as u32, 0, const_strings);
+    let mut prog = ExprProgram::new(code, num_regs, 0, const_strings);
     prog.set_payload_col_info(schema);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
@@ -1099,6 +819,21 @@ fn create_child_table(
 // Instruction emission — per-node handler
 // ---------------------------------------------------------------------------
 
+fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
+    loaded.outgoing.get(&nid).map(|outs| {
+        outs.iter().any(|&(dst, port)| {
+            port == PORT_TRACE
+                && matches!(
+                    loaded.nodes.get(&dst),
+                    Some(gnitz_wire::OpNode::Join(_))
+                    | Some(gnitz_wire::OpNode::AntiJoin(_))
+                    | Some(gnitz_wire::OpNode::SemiJoin(_))
+                    | Some(gnitz_wire::OpNode::SeekTrace)
+                )
+        })
+    }).unwrap_or(false)
+}
+
 struct EmitState {
     next_extra_reg: i32,
     sink_reg_id: i32,
@@ -1106,15 +841,11 @@ struct EmitState {
     emit_failed: bool,
 }
 
-/// Emit instructions for a single circuit node.
-/// Returns true if this is an EXCHANGE_SHARD node (special handling needed).
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_node(
-    graph: &CircuitGraph,
-    ann: &Annotation,
+    loaded: &LoadedCircuit,
     rw: &Rewrites,
     nid: i32,
-    op: i32,
     reg_id: i32,
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
@@ -1135,153 +866,141 @@ fn emit_node(
     view_table_id: u32,
     view_id: u64,
 ) {
-    let node_params = graph.params.get(&nid).cloned().unwrap_or_default();
-    let in_regs = compute_in_regs(graph, nid, out_reg_of);
+    let in_regs = compute_in_regs(loaded, nid, out_reg_of);
+    let op = match loaded.nodes.get(&nid) {
+        Some(op) => op,
+        None => return,
+    };
 
     match op {
-        OPCODE_SCAN_TRACE => {
-            let table_id = graph.sources.get(&nid).copied().unwrap_or(0);
-            // Legacy PARAM_CHUNK_LIMIT was always 0 — slot 2 was never written
-            // by any builder. Pass 0 directly so the SCAN_TRACE call signature
-            // is preserved.
-            let chunk_limit: i32 = 0;
-
-            if table_id == 0 {
-                let join_source_table = node_params.get(&PARAM_JOIN_SOURCE_TABLE).copied().unwrap_or(0);
-                if join_source_table > 0 {
-                    if let Some(ext) = ext_tables.iter().find(|t| t.table_id == join_source_table) {
-                        reg_schemas[reg_id as usize] = ext.schema;
-                        reg_kinds[reg_id as usize] = 0;
-                        source_reg_map.insert(join_source_table, reg_id);
-                    }
-                    return;
-                }
-                // Primary input
-                reg_schemas[reg_id as usize] = ann.in_schema;
+        gnitz_wire::OpNode::ScanDelta(tid) => {
+            if let Some(ext) = ext_tables.iter().find(|t| t.table_id == *tid as i64) {
+                reg_schemas[reg_id as usize] = ext.schema;
                 reg_kinds[reg_id as usize] = 0;
-                state.input_delta_reg_id = reg_id;
-            } else if ann.trace_side_sources.contains(&nid) {
-                // Trace side (join probe)
-                if let Some(ext) = ext_tables.iter().find(|t| t.table_id == table_id) {
-                    reg_schemas[reg_id as usize] = ext.schema;
-                    reg_kinds[reg_id as usize] = 1;
-                    ext_trace_regs.push((reg_id as u16, table_id));
-                }
-            } else {
-                // Non-trace SCAN_TRACE (e.g., view reading from a base table)
-                if let Some(ext) = ext_tables.iter().find(|t| t.table_id == table_id) {
-                    reg_schemas[reg_id as usize] = ext.schema;
-                    reg_kinds[reg_id as usize] = 1;
-                    ext_trace_regs.push((reg_id as u16, table_id));
+                source_reg_map.insert(*tid as i64, reg_id);
+            }
+        }
+
+        gnitz_wire::OpNode::ScanTrace(tid) => {
+            if let Some(ext) = ext_tables.iter().find(|t| t.table_id == *tid as i64) {
+                reg_schemas[reg_id as usize] = ext.schema;
+                reg_kinds[reg_id as usize] = 1;
+                ext_trace_regs.push((reg_id as u16, *tid as i64));
+
+                if !is_join_trace_side(loaded, nid) {
                     let out_delta_id = state.next_extra_reg;
                     state.next_extra_reg += 1;
                     reg_schemas[out_delta_id as usize] = ext.schema;
                     reg_kinds[out_delta_id as usize] = 0;
                     out_reg_of.insert(nid, out_delta_id);
-                    builder.add_scan_trace(reg_id as u16, out_delta_id as u16, chunk_limit);
+                    builder.add_scan_trace(reg_id as u16, out_delta_id as u16, 0);
                 }
             }
         }
 
-        OPCODE_FILTER => {
+        gnitz_wire::OpNode::Filter(blob) => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_schema = reg_schemas[in_reg as usize];
             reg_schemas[reg_id as usize] = in_schema;
             reg_kinds[reg_id as usize] = 0;
-
-            let num_regs = node_params.get(&PARAM_EXPR_NUM_REGS).copied().unwrap_or(0);
-            let func_ptr = if num_regs > 0 {
-                let result_reg = node_params.get(&PARAM_EXPR_RESULT_REG).copied().unwrap_or(0);
-                let code = extract_map_code(&node_params);
-                let const_strings = extract_const_strings(&graph.str_params, nid);
-                create_expr_predicate(code, num_regs, result_reg, const_strings, in_schema.pk_index, &in_schema, owned_expr_progs, owned_funcs)
+            let func_ptr = if let Some(blob) = blob {
+                if let Some(dep) = decode_expr_blob(blob) {
+                    let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+                    create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
+                        in_schema.pk_index, &in_schema, owned_expr_progs, owned_funcs)
+                } else {
+                    null_func_ptr()
+                }
             } else {
                 null_func_ptr()
             };
             builder.add_filter(in_reg as u16, reg_id as u16, func_ptr);
         }
 
-        OPCODE_MAP => {
+        gnitz_wire::OpNode::Map(mk) => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
-            let reindex_col_check = node_params.get(&PARAM_REINDEX_COL).copied().unwrap_or(-1);
-            let num_regs = node_params.get(&PARAM_EXPR_NUM_REGS).copied().unwrap_or(0);
-            let has_expr_code = num_regs > 0 || node_params.contains_key(&PARAM_EXPR_BASE);
-
-            // Identity MAP optimization: sequential COPY_COL with matching schemas
-            if reindex_col_check < 0 && has_expr_code
-                && schemas_physically_identical(&in_reg_schema, &graph.out_schema) {
-                    let code = extract_map_code(&node_params);
-                    let prog = ExprProgram::new(code, num_regs as u32, 0, Vec::new());
-                    if prog.is_sequential_copy_projection() {
-                        out_reg_of.insert(nid, in_reg);
+            match mk {
+                gnitz_wire::MapKind::Expression { program, reindex_col } => {
+                    let dep = decode_expr_blob(program);
+                    // Identity MAP: if no reindex and schemas match, skip if sequential copy.
+                    if reindex_col.is_none()
+                        && schemas_physically_identical(&in_reg_schema, &loaded.out_schema)
+                    {
+                        if let Some(ref d) = dep {
+                            let code: Vec<i64> = d.code.iter().map(|&w| w as i64).collect();
+                            let prog = ExprProgram::new(code, d.num_regs, 0, Vec::new());
+                            if prog.is_sequential_copy_projection() {
+                                out_reg_of.insert(nid, in_reg);
+                                return;
+                            }
+                        }
+                    }
+                    // Folded MAP (absorbed into upstream REDUCE's finalize program).
+                    if let Some(&reduce_nid) = rw.folded_maps.get(&nid) {
+                        out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
                         return;
                     }
-            }
-
-            // Folded MAP (into upstream REDUCE)
-            if let Some(&reduce_nid) = rw.folded_maps.get(&nid) {
-                out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
-                return;
-            }
-
-            let (func_ptr, node_schema) = if has_expr_code {
-                let code = extract_map_code(&node_params);
-                let const_strings = extract_const_strings(&graph.str_params, nid);
-                let fp = create_expr_map(code, num_regs, const_strings, in_reg_schema.pk_index, &in_reg_schema, owned_expr_progs, owned_funcs);
-                let schema = if reindex_col_check >= 0 {
-                    // Reindex MAP: output has synthetic PK + all input cols
-                    let mut s = empty_schema();
-                    s.columns[0] = col(type_code::U128, 16, false); // __pk
-                    for i in 0..in_reg_schema.num_columns as usize {
-                        s.columns[i + 1] = in_reg_schema.columns[i];
+                    if let Some(dep) = dep {
+                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+                        let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
+                            in_reg_schema.pk_index, &in_reg_schema, owned_expr_progs, owned_funcs);
+                        let node_schema = if reindex_col.is_some() {
+                            let mut s = empty_schema();
+                            s.columns[0] = col(type_code::U128, 16, false);
+                            for i in 0..in_reg_schema.num_columns as usize {
+                                s.columns[i + 1] = in_reg_schema.columns[i];
+                            }
+                            s.num_columns = in_reg_schema.num_columns + 1;
+                            s.pk_index = 0;
+                            s
+                        } else {
+                            loaded.out_schema
+                        };
+                        reg_schemas[reg_id as usize] = node_schema;
+                        reg_kinds[reg_id as usize] = 0;
+                        let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
+                        builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc);
                     }
-                    s.num_columns = in_reg_schema.num_columns + 1;
-                    s.pk_index = 0;
-                    s
-                } else {
-                    graph.out_schema
-                };
-                (fp, schema)
-            } else if node_params.contains_key(&PARAM_PROJ_BASE) {
-                let mut src_indices = Vec::new();
-                let mut src_types = Vec::new();
-                let mut idx = 0;
-                while node_params.contains_key(&(PARAM_PROJ_BASE + idx)) {
-                    let src_col = node_params[&(PARAM_PROJ_BASE + idx)] as i32;
-                    src_indices.push(src_col);
-                    src_types.push(in_reg_schema.columns[src_col as usize].type_code);
-                    idx += 1;
                 }
-                let fp = create_universal_projection(&src_indices, &src_types, in_reg_schema.pk_index, owned_funcs);
-                let schema = build_map_output_schema(&in_reg_schema, &src_indices);
-                (fp, schema)
-            } else if node_params.get(&PARAM_KEY_ONLY).copied().unwrap_or(0) != 0 {
-                // Key-only projection: strip all payload, keep only PK.
-                let fp = create_universal_projection(&[], &[], in_reg_schema.pk_index, owned_funcs);
-                let mut s = empty_schema();
-                s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index as usize];
-                s.num_columns = 1;
-                s.pk_index = 0;
-                (fp, s)
-            } else {
-                (null_func_ptr(), in_reg_schema)
-            };
 
-            let reindex_col = node_params.get(&PARAM_REINDEX_COL).copied().unwrap_or(-1) as i32;
-            reg_schemas[reg_id as usize] = node_schema;
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_map(in_reg as u16, reg_id as u16, func_ptr, node_schema, reindex_col);
+                gnitz_wire::MapKind::Projection(cols) => {
+                    let src_indices: Vec<i32> = cols.iter().map(|&c| c as i32).collect();
+                    let src_types: Vec<u8> = src_indices.iter()
+                        .map(|&i| in_reg_schema.columns[i as usize].type_code)
+                        .collect();
+                    let fp = create_universal_projection(
+                        &src_indices, &src_types, in_reg_schema.pk_index, owned_funcs,
+                    );
+                    let schema = build_map_output_schema(&in_reg_schema, &src_indices);
+                    reg_schemas[reg_id as usize] = schema;
+                    reg_kinds[reg_id as usize] = 0;
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, schema, -1);
+                }
+
+                gnitz_wire::MapKind::KeyOnly => {
+                    let fp = create_universal_projection(
+                        &[], &[], in_reg_schema.pk_index, owned_funcs,
+                    );
+                    let mut s = empty_schema();
+                    s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index as usize];
+                    s.num_columns = 1;
+                    s.pk_index = 0;
+                    reg_schemas[reg_id as usize] = s;
+                    reg_kinds[reg_id as usize] = 0;
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, -1);
+                }
+            }
         }
 
-        OPCODE_NEGATE => {
+        gnitz_wire::OpNode::Negate => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
             reg_kinds[reg_id as usize] = 0;
             builder.add_negate(in_reg as u16, reg_id as u16);
         }
 
-        OPCODE_UNION => {
+        gnitz_wire::OpNode::Union => {
             let in_a = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
             reg_schemas[reg_id as usize] = reg_schemas[in_a as usize];
             reg_kinds[reg_id as usize] = 0;
@@ -1290,128 +1009,7 @@ fn emit_node(
             builder.add_union(in_a as u16, in_b as u16, has_b, reg_id as u16);
         }
 
-        OPCODE_JOIN_DELTA_TRACE => {
-            let delta_reg = in_regs.get(&PORT_DELTA).copied().unwrap_or(0);
-            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            let delta_schema = reg_schemas[delta_reg as usize];
-            let trace_schema = reg_schemas[trace_reg as usize];
-            let join_schema = merge_schemas_for_join(&delta_schema, &trace_schema);
-            reg_schemas[reg_id as usize] = join_schema;
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_join_dt(delta_reg as u16, trace_reg as u16, reg_id as u16, trace_schema);
-        }
-
-        OPCODE_JOIN_DELTA_TRACE_OUTER => {
-            let delta_reg = in_regs.get(&PORT_DELTA).copied().unwrap_or(0);
-            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            let delta_schema = reg_schemas[delta_reg as usize];
-            let trace_schema = reg_schemas[trace_reg as usize];
-            let outer_schema = merge_schemas_for_join_outer(&delta_schema, &trace_schema);
-            reg_schemas[reg_id as usize] = outer_schema;
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_join_dt_outer(delta_reg as u16, trace_reg as u16, reg_id as u16, trace_schema);
-        }
-
-        OPCODE_NULL_EXTEND => {
-            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_schema = reg_schemas[in_reg as usize];
-            let n_cols = node_params.get(&PARAM_NULL_EXTEND_COUNT).copied().unwrap_or(0) as usize;
-            assert!(n_cols < crate::schema::MAX_COLUMNS,
-                "NULL_EXTEND n_cols={} would overflow schema array (max {})",
-                n_cols, crate::schema::MAX_COLUMNS - 1);
-            // Build right schema from type codes stored in params
-            let mut right = empty_schema();
-            right.columns[0] = col(type_code::U128, 16, false); // dummy PK
-            for i in 0..n_cols {
-                let tc = node_params.get(&(PARAM_NULL_EXTEND_COL_BASE + i as i32)).copied().unwrap_or(type_code::I64 as i64) as u8;
-                let sz = crate::schema::type_size(tc);
-                right.columns[i + 1] = col(tc, sz, true);
-            }
-            right.num_columns = (n_cols + 1) as u32;
-            right.pk_index = 0;
-
-            let out_schema = merge_schemas_for_join_outer(&in_schema, &right);
-            reg_schemas[reg_id as usize] = out_schema;
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_null_extend(in_reg as u16, reg_id as u16, right);
-        }
-
-        OPCODE_JOIN_DELTA_DELTA => {
-            let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            let b_reg = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
-            let a_schema = reg_schemas[a_reg as usize];
-            let b_schema = reg_schemas[b_reg as usize];
-            let join_schema = merge_schemas_for_join(&a_schema, &b_schema);
-            reg_schemas[reg_id as usize] = join_schema;
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
-        }
-
-        OPCODE_DISTINCT => {
-            let in_reg = in_regs.get(&PORT_IN_DISTINCT).copied().unwrap_or(0);
-            let in_reg_schema = reg_schemas[in_reg as usize];
-
-            if rw.skip_nodes.contains(&nid) {
-                out_reg_of.insert(nid, in_reg);
-                return;
-            }
-
-            // Create history table as child of view dir
-            let child_name = format!("_hist_{}_{}", view_id, nid);
-            let hist_table = match create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
-                Ok(t) => t,
-                Err(_) => { state.emit_failed = true; return; }
-            };
-            let table_idx = owned_tables.len();
-            owned_tables.push(Box::new(hist_table));
-            let hist_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-
-            reg_schemas[reg_id as usize] = in_reg_schema;
-            reg_kinds[reg_id as usize] = 1;
-            owned_trace_regs.push((reg_id as u16, table_idx));
-
-            let out_delta_id = state.next_extra_reg;
-            state.next_extra_reg += 1;
-            reg_schemas[out_delta_id as usize] = in_reg_schema;
-            reg_kinds[out_delta_id as usize] = 0;
-            out_reg_of.insert(nid, out_delta_id);
-
-            builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
-        }
-
-        OPCODE_REDUCE => {
-            emit_reduce(
-                graph, ann, rw, nid, reg_id, &node_params, &in_regs,
-                builder, state, out_reg_of, reg_schemas, reg_kinds,
-                owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs,
-                view_dir, view_table_id, view_id,
-            );
-        }
-
-        OPCODE_INTEGRATE => {
-            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_reg_schema = reg_schemas[in_reg as usize];
-            let int_table_id = node_params.get(&PARAM_TABLE_ID).copied().unwrap_or(0);
-
-            if int_table_id > 0 && int_table_id != view_id as i64 {
-                let child_name = format!("_int_{}_{}", view_id, nid);
-                if let Ok(t) = create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
-                    let table_idx = owned_tables.len();
-                    owned_tables.push(Box::new(t));
-                    let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-                    reg_schemas[reg_id as usize] = in_reg_schema;
-                    reg_kinds[reg_id as usize] = 1;
-                    owned_trace_regs.push((reg_id as u16, table_idx));
-                    emit_simple_integrate(builder, in_reg as u16, table_ptr);
-                }
-                return;
-            }
-
-            state.sink_reg_id = in_reg;
-            emit_simple_integrate(builder, in_reg as u16, std::ptr::null_mut());
-        }
-
-        OPCODE_DELAY => {
+        gnitz_wire::OpNode::Delay => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let state_reg = state.next_extra_reg;
             state.next_extra_reg += 1;
@@ -1423,70 +1021,174 @@ fn emit_node(
             builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
 
-        OPCODE_ANTI_JOIN_DELTA_TRACE => {
-            let delta_reg = in_regs.get(&PORT_DELTA).copied().unwrap_or(0);
-            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[delta_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_anti_join_dt(delta_reg as u16, trace_reg as u16, reg_id as u16);
+        gnitz_wire::OpNode::Distinct => {
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            let in_reg_schema = reg_schemas[in_reg as usize];
+            if rw.skip_nodes.contains(&nid) {
+                out_reg_of.insert(nid, in_reg);
+                return;
+            }
+            let child_name = format!("_hist_{}_{}", view_id, nid);
+            let hist_table = match create_child_table(
+                view_dir, &child_name, in_reg_schema, view_table_id,
+            ) {
+                Ok(t) => t,
+                Err(_) => { state.emit_failed = true; return; }
+            };
+            let table_idx = owned_tables.len();
+            owned_tables.push(Box::new(hist_table));
+            let hist_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
+            reg_schemas[reg_id as usize] = in_reg_schema;
+            reg_kinds[reg_id as usize] = 1;
+            owned_trace_regs.push((reg_id as u16, table_idx));
+            let out_delta_id = state.next_extra_reg;
+            state.next_extra_reg += 1;
+            reg_schemas[out_delta_id as usize] = in_reg_schema;
+            reg_kinds[out_delta_id as usize] = 0;
+            out_reg_of.insert(nid, out_delta_id);
+            builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
         }
 
-        OPCODE_ANTI_JOIN_DELTA_DELTA => {
+        gnitz_wire::OpNode::Reduce { group_cols, agg } => {
+            emit_reduce(
+                loaded, rw, nid, reg_id, group_cols, agg, &in_regs,
+                builder, state, out_reg_of, reg_schemas, reg_kinds,
+                owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs,
+                view_dir, view_table_id, view_id,
+            );
+        }
+
+        gnitz_wire::OpNode::Join(kind) => {
+            // PORT_IN_A == 0 (delta side); PORT_TRACE == PORT_IN_B == 1 (trace/right side).
             let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            let b_reg = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
+            let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
+            let a_schema = reg_schemas[a_reg as usize];
+            let b_schema = reg_schemas[b_reg as usize];
+            reg_kinds[reg_id as usize] = 0;
+            match kind {
+                gnitz_wire::JoinKind::DeltaTrace => {
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
+                }
+                gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join_outer(&a_schema, &b_schema);
+                    builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
+                }
+                gnitz_wire::JoinKind::DeltaDelta => {
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
+                }
+            }
+        }
+
+        gnitz_wire::OpNode::AntiJoin(kind) => {
+            let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
+            let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             reg_schemas[reg_id as usize] = reg_schemas[a_reg as usize];
             reg_kinds[reg_id as usize] = 0;
-            builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
+            match kind {
+                gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
+                }
+                gnitz_wire::JoinKind::DeltaDelta => {
+                    builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
+                }
+            }
         }
 
-        OPCODE_SEMI_JOIN_DELTA_TRACE => {
-            let delta_reg = in_regs.get(&PORT_DELTA).copied().unwrap_or(0);
-            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[delta_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
-            builder.add_semi_join_dt(delta_reg as u16, trace_reg as u16, reg_id as u16);
-        }
-
-        OPCODE_SEMI_JOIN_DELTA_DELTA => {
+        gnitz_wire::OpNode::SemiJoin(kind) => {
             let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            let b_reg = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
+            let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             reg_schemas[reg_id as usize] = reg_schemas[a_reg as usize];
             reg_kinds[reg_id as usize] = 0;
-            builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
+            match kind {
+                gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
+                }
+                gnitz_wire::JoinKind::DeltaDelta => {
+                    builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
+                }
+            }
         }
 
-        OPCODE_SEEK_TRACE => {
-            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            let key_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            builder.add_seek_trace(trace_reg as u16, key_reg as u16);
+        gnitz_wire::OpNode::IntegrateSink => {
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            state.sink_reg_id = in_reg;
+            emit_simple_integrate(builder, in_reg as u16, std::ptr::null_mut());
         }
 
-        OPCODE_CLEAR_DELTAS => {
-            builder.add_clear_deltas();
+        gnitz_wire::OpNode::IntegrateTrace => {
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            let in_reg_schema = reg_schemas[in_reg as usize];
+            let child_name = format!("_int_{}_{}", view_id, nid);
+            if let Ok(t) = create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
+                let table_idx = owned_tables.len();
+                owned_tables.push(Box::new(t));
+                let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
+                reg_schemas[reg_id as usize] = in_reg_schema;
+                reg_kinds[reg_id as usize] = 1;
+                owned_trace_regs.push((reg_id as u16, table_idx));
+                emit_simple_integrate(builder, in_reg as u16, table_ptr);
+            }
         }
 
-        OPCODE_GATHER_REDUCE => {
+        gnitz_wire::OpNode::ExchangeShard { .. } => {}
+
+        gnitz_wire::OpNode::ExchangeGather => {
+            if let Some(&in_reg) = in_regs.get(&PORT_IN) {
+                reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
+                reg_kinds[reg_id as usize] = reg_kinds[in_reg as usize];
+            }
+        }
+
+        gnitz_wire::OpNode::NullExtend { type_codes } => {
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            let in_schema = reg_schemas[in_reg as usize];
+            assert!(
+                type_codes.len() < crate::schema::MAX_COLUMNS,
+                "NULL_EXTEND n_cols={} would overflow schema array (max {})",
+                type_codes.len(),
+                crate::schema::MAX_COLUMNS - 1,
+            );
+            let mut right = empty_schema();
+            right.columns[0] = col(type_code::U128, 16, false); // dummy PK
+            for (i, &tc) in type_codes.iter().enumerate() {
+                let sz = crate::schema::type_size(tc);
+                right.columns[i + 1] = col(tc, sz, true);
+            }
+            right.num_columns = (type_codes.len() + 1) as u32;
+            right.pk_index = 0;
+            let out_schema = merge_schemas_for_join_outer(&in_schema, &right);
+            reg_schemas[reg_id as usize] = out_schema;
+            reg_kinds[reg_id as usize] = 0;
+            builder.add_null_extend(in_reg as u16, reg_id as u16, right);
+        }
+
+        gnitz_wire::OpNode::GatherReduce => {
+            let raw_cols = loaded.gather_reduce_cols.get(&nid).map(|v| v.as_slice()).unwrap_or(&[]);
             emit_gather_reduce(
-                graph, nid, reg_id, &node_params, &in_regs,
+                raw_cols, nid, reg_id, &in_regs,
                 builder, state, out_reg_of, reg_schemas, reg_kinds,
                 owned_tables, owned_trace_regs,
                 view_dir, view_table_id, view_id,
             );
         }
 
-        _ => {
-            // Unknown opcode: pass-through
-            if let Some(&in_reg) = in_regs.get(&PORT_IN) {
-                reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
-                reg_kinds[reg_id as usize] = reg_kinds[in_reg as usize];
-            }
+        gnitz_wire::OpNode::SeekTrace => {
+            let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
+            let key_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            builder.add_seek_trace(trace_reg as u16, key_reg as u16);
+        }
+
+        gnitz_wire::OpNode::ClearDeltas => {
+            builder.add_clear_deltas();
         }
     }
 }
 
-fn compute_in_regs(graph: &CircuitGraph, nid: i32, out_reg_of: &HashMap<i32, i32>) -> HashMap<i32, i32> {
+fn compute_in_regs(loaded: &LoadedCircuit, nid: i32, out_reg_of: &HashMap<i32, i32>) -> HashMap<i32, i32> {
     let mut in_regs = HashMap::new();
-    if let Some(in_edges) = graph.incoming.get(&nid) {
+    if let Some(in_edges) = loaded.incoming.get(&nid) {
         for &(src, port) in in_edges {
             if let Some(&reg) = out_reg_of.get(&src) {
                 in_regs.insert(port, reg);
@@ -1506,17 +1208,17 @@ fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, table_ptr: *
 }
 
 // ---------------------------------------------------------------------------
-// REDUCE emission (complex enough to warrant its own function)
+// REDUCE emission
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_reduce(
-    graph: &CircuitGraph,
-    _ann: &Annotation,
+    loaded: &LoadedCircuit,
     rw: &Rewrites,
     nid: i32,
     reg_id: i32,
-    node_params: &HashMap<i32, i64>,
+    group_cols: &[u16],
+    agg: &gnitz_wire::AggKind,
     in_regs: &HashMap<i32, i32>,
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
@@ -1531,50 +1233,44 @@ fn emit_reduce(
     view_table_id: u32,
     view_id: u64,
 ) {
-    let in_reg_id = in_regs.get(&PORT_IN_REDUCE).copied().unwrap_or(0);
+    let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let in_reg_schema = reg_schemas[in_reg_id as usize];
 
-    // Parse aggregate descriptors
-    let agg_count = node_params.get(&PARAM_AGG_COUNT).copied().unwrap_or(0);
+    let gcols: Vec<i32> = group_cols.iter().map(|&c| c as i32).collect();
+    let gcols_u32: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
+
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
     let mut agg_func_id: AggOp = AggOp::Null;
     let mut agg_col_idx: u32 = 0;
 
-    if agg_count > 0 {
-        for ai in 0..agg_count as i32 {
-            let packed = node_params.get(&(PARAM_AGG_SPEC_BASE + ai)).copied().unwrap_or(0);
-            let func_id = (packed >> 32) as u8;
-            let col_idx = (packed & 0xFFFFFFFF) as u32;
-            let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code);
-            let agg_op = AggOp::try_from(func_id)
-                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-            agg_descs.push(AggDescriptor { col_idx, agg_op, col_type_code, _pad: [0; 2] });
+    match agg {
+        gnitz_wire::AggKind::Null => {
+            agg_descs.push(AggDescriptor {
+                col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
+            });
         }
-        if agg_descs.len() == 1 {
-            agg_func_id = agg_descs[0].agg_op;
-            agg_col_idx = agg_descs[0].col_idx;
-        }
-    } else {
-        let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
-        agg_func_id = AggOp::try_from(raw_func_id)
-            .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-        agg_col_idx = node_params.get(&PARAM_AGG_COL_IDX).copied().unwrap_or(0) as u32;
-        if agg_func_id != AggOp::Null {
-            let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code);
-            agg_descs.push(AggDescriptor { col_idx: agg_col_idx, agg_op: agg_func_id, col_type_code, _pad: [0; 2] });
-        } else {
-            // NullAggregate
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2] });
+        gnitz_wire::AggKind::Specs(specs) => {
+            for &(ref func, col_idx) in specs {
+                let agg_op = AggOp::from(*func);
+                let col_type_code = TypeCode::from_validated_u8(
+                    in_reg_schema.columns[col_idx as usize].type_code,
+                );
+                agg_descs.push(AggDescriptor {
+                    col_idx: col_idx as u32, agg_op, col_type_code, _pad: [0; 2],
+                });
+            }
+            if agg_descs.len() == 1 {
+                agg_func_id = agg_descs[0].agg_op;
+                agg_col_idx = agg_descs[0].col_idx;
+            }
         }
     }
 
-    let gcols: Vec<i32> = graph.group_cols.get(&nid).cloned().unwrap_or_default();
-    let gcols_u32: Vec<u32> = gcols.iter().map(|&c| c as u32).collect();
-
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs);
 
-    // Create trace table (output history)
-    let trace_table = match create_child_table(view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id) {
+    let trace_table = match create_child_table(
+        view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id,
+    ) {
         Ok(t) => t,
         Err(_) => { state.emit_failed = true; return; }
     };
@@ -1591,30 +1287,30 @@ fn emit_reduce(
     reg_schemas[raw_delta_id as usize] = reduce_out_schema;
     reg_kinds[raw_delta_id as usize] = 0;
 
-    // Check for folded finalize MAP
     let finalize_prog_idx = rw.fold_finalize.get(&nid).copied();
     let mut fin_delta_id: i32 = -1;
     if finalize_prog_idx.is_some() {
         fin_delta_id = state.next_extra_reg;
         state.next_extra_reg += 1;
-        reg_schemas[fin_delta_id as usize] = graph.out_schema;
+        reg_schemas[fin_delta_id as usize] = loaded.out_schema;
         reg_kinds[fin_delta_id as usize] = 0;
         out_reg_of.insert(nid, fin_delta_id);
     } else {
         out_reg_of.insert(nid, raw_delta_id);
     }
 
-    // trace_in table (for non-linear aggregates)
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
     let will_use_avi = agg_descs.len() == 1
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
-        && agg_value_idx_eligible(TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code));
+        && agg_value_idx_eligible(
+            TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code),
+        );
 
     let mut tr_in_reg_id: i32 = -1;
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();
     let mut tr_in_table_idx: Option<usize> = None;
 
-    if let Some(&existing) = in_regs.get(&PORT_TRACE_IN) {
+    if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
     } else if !all_linear && !will_use_avi {
         let tr_in = match create_child_table(
@@ -1635,7 +1331,6 @@ fn emit_reduce(
         owned_trace_regs.push((tr_in_reg_id as u16, idx));
     }
 
-    // GI table
     let mut gi_table_ptr: *mut Table = std::ptr::null_mut();
     let mut gi_col_idx: u32 = 0;
     let mut gi_col_type_code: u8 = 0;
@@ -1649,10 +1344,11 @@ fn emit_reduce(
             TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
         ) {
             let gi_dir = format!(
-                "{}/scratch__reduce_in_{}_{}/_gidx",
-                view_dir, view_id, nid
+                "{}/scratch__reduce_in_{}_{}/_gidx", view_dir, view_id, nid,
             );
-            if let Ok(gi_table) = Table::new(&gi_dir, "_gidx", make_group_idx_schema(), 0, 1024 * 1024, false) {
+            if let Ok(gi_table) = Table::new(
+                &gi_dir, "_gidx", make_group_idx_schema(), 0, 1024 * 1024, false,
+            ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));
                 gi_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
@@ -1662,7 +1358,6 @@ fn emit_reduce(
         }
     }
 
-    // AVI table
     let mut avi_table_ptr: *mut Table = std::ptr::null_mut();
     let mut avi_for_max = false;
     let mut avi_agg_col_type_code: u8 = 0;
@@ -1675,42 +1370,41 @@ fn emit_reduce(
         avi_agg_col_idx = agg_col_idx;
         avi_group_cols = gcols_u32.clone();
         let avi_child = format!("_avidx_{}_{}", view_id, nid);
-        if let Ok(av_table) = create_child_table(view_dir, &avi_child, make_agg_value_idx_schema(), view_table_id) {
+        if let Ok(av_table) = create_child_table(
+            view_dir, &avi_child, make_agg_value_idx_schema(), view_table_id,
+        ) {
             let idx = owned_tables.len();
             owned_tables.push(Box::new(av_table));
             avi_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
         }
     }
 
-    // AVI INTEGRATE must precede REDUCE
     if !avi_table_ptr.is_null() {
         builder.add_integrate(
             in_reg_id as u16,
-            std::ptr::null_mut(), // no target table (AVI-only)
-            std::ptr::null_mut(), 0, 0, // no GI
+            std::ptr::null_mut(),
+            std::ptr::null_mut(), 0, 0,
             avi_table_ptr, avi_for_max, avi_agg_col_type_code,
             &avi_group_cols, &in_reg_schema as *const SchemaDescriptor, avi_agg_col_idx,
         );
     }
 
-    // Finalize program
     let fin_prog_ptr: *const ExprProgram = if let Some(idx) = finalize_prog_idx {
         &*owned_expr_progs[idx] as *const ExprProgram
     } else {
         std::ptr::null()
     };
     let fin_schema_ptr: *const SchemaDescriptor = if finalize_prog_idx.is_some() {
-        &graph.out_schema as *const SchemaDescriptor
+        &loaded.out_schema as *const SchemaDescriptor
     } else {
         std::ptr::null()
     };
 
-    // Emit REDUCE
     builder.add_reduce(
         in_reg_id as u16,
         tr_in_reg_id as i16,
-        reg_id as u16,       // trace_out_reg
-        raw_delta_id as u16, // out_reg
+        reg_id as u16,
+        raw_delta_id as u16,
         fin_delta_id as i16,
         &agg_descs,
         &gcols_u32,
@@ -1724,7 +1418,6 @@ fn emit_reduce(
         fin_schema_ptr,
     );
 
-    // INTEGRATE input → trace_in (after REDUCE)
     if !tr_in_table_ptr.is_null() {
         builder.add_integrate(
             in_reg_id as u16,
@@ -1737,7 +1430,6 @@ fn emit_reduce(
         );
     }
 
-    // INTEGRATE raw_delta → trace_out (always, for trace_out history)
     emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);
 }
 
@@ -1747,10 +1439,9 @@ fn emit_reduce(
 
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_gather_reduce(
-    _graph: &CircuitGraph,
+    raw_cols: &[(u64, u16, u64, u64)],
     nid: i32,
     reg_id: i32,
-    node_params: &HashMap<i32, i64>,
     in_regs: &HashMap<i32, i32>,
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
@@ -1763,41 +1454,38 @@ fn emit_gather_reduce(
     view_table_id: u32,
     view_id: u64,
 ) {
-    let in_reg_id = in_regs.get(&PORT_IN_REDUCE).copied().unwrap_or(0);
+    let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let partial_schema = reg_schemas[in_reg_id as usize];
     let num_out_cols = partial_schema.num_columns as usize;
 
-    let agg_count = node_params.get(&PARAM_AGG_COUNT).copied().unwrap_or(0);
+    let agg_specs: Vec<(u64, u64)> = raw_cols.iter()
+        .filter(|(k, _, _, _)| *k == gnitz_wire::NODE_COL_KIND_AGG_SPEC)
+        .map(|(_, _, v1, v2)| (*v1, *v2))
+        .collect();
+    let agg_count = agg_specs.len();
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
 
     if agg_count > 0 {
         assert!(
-            num_out_cols >= agg_count as usize,
+            num_out_cols >= agg_count,
             "GATHER_REDUCE node {}: agg_count ({}) exceeds partial schema column count ({})",
-            nid,
-            agg_count,
-            num_out_cols
+            nid, agg_count, num_out_cols,
         );
-        for ai in 0..agg_count as i32 {
-            let packed = node_params.get(&(PARAM_AGG_SPEC_BASE + ai)).copied().unwrap_or(0);
-            let func_id = (packed >> 32) as u8;
-            let agg_op = AggOp::try_from(func_id)
+        for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
+            let agg_op = AggOp::try_from(func_id as u8)
                 .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-            let agg_col_in_partial = num_out_cols - agg_count as usize + ai as usize;
-            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op, col_type_code: col_type, _pad: [0; 2] });
+            let agg_col_in_partial = num_out_cols - agg_count + ai;
+            let col_type = TypeCode::from_validated_u8(
+                partial_schema.columns[agg_col_in_partial].type_code,
+            );
+            agg_descs.push(AggDescriptor {
+                col_idx: 0, agg_op, col_type_code: col_type, _pad: [0; 2],
+            });
         }
     } else {
-        let raw_func_id = node_params.get(&PARAM_AGG_FUNC_ID).copied().unwrap_or(0) as u8;
-        let agg_func_id = AggOp::try_from(raw_func_id)
-            .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-        if agg_func_id != AggOp::Null {
-            let agg_col_in_partial = num_out_cols - 1;
-            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: agg_func_id, col_type_code: col_type, _pad: [0; 2] });
-        } else {
-            agg_descs.push(AggDescriptor { col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2] });
-        }
+        agg_descs.push(AggDescriptor {
+            col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
+        });
     }
 
     let trace_table = match create_child_table(
@@ -1839,24 +1527,17 @@ struct PlanBuildResult {
 
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
 fn build_plan(
-    graph: &CircuitGraph,
-    ann: &Annotation,
+    loaded: &LoadedCircuit,
     rw: &Rewrites,
     ordered: &[i32],
     ext_tables: &[ExternalTable],
     view_dir: &str,
     view_table_id: u32,
     view_id: u64,
-    _in_schema_override: &SchemaDescriptor,
-    // For pre-exchange plans: the node whose output register is the plan output
     output_node_id: Option<i32>,
-    // For post-exchange plans: (exchange_nid, exchange_schema) — allocates an
-    // extra input register and maps the exchange node to it.
     exchange_input: Option<(i32, SchemaDescriptor)>,
-    // Pre-built expression programs (from optimization passes like fold_reduce_map)
     pre_built_expr_progs: Vec<Box<ExprProgram>>,
 ) -> Option<PlanBuildResult> {
-    // Register assignment
     let mut out_reg_of: HashMap<i32, i32> = HashMap::new();
     let mut next_reg: i32 = 0;
     for &nid in ordered {
@@ -1866,39 +1547,35 @@ fn build_plan(
 
     let mut extra_regs = 0;
     for &nid in ordered {
-        let op = graph.opcode_of.get(&nid).copied().unwrap_or(-1);
-        if op == OPCODE_DISTINCT && !rw.skip_nodes.contains(&nid) {
+        let op = loaded.nodes.get(&nid);
+        if matches!(op, Some(gnitz_wire::OpNode::Distinct)) && !rw.skip_nodes.contains(&nid) {
             extra_regs += 1;
-        } else if op == OPCODE_REDUCE {
-            extra_regs += 2; // raw_delta + tr_in (may not be used, but safe)
+        } else if matches!(op, Some(gnitz_wire::OpNode::Reduce { .. })) {
+            extra_regs += 2; // raw_delta + optional tr_in (safe to over-allocate)
             if rw.fold_finalize.contains_key(&nid) {
                 extra_regs += 1;
             }
-        } else if op == OPCODE_GATHER_REDUCE {
+        } else if matches!(op, Some(gnitz_wire::OpNode::GatherReduce)) {
             extra_regs += 1;
-        } else if op == OPCODE_SCAN_TRACE {
-            let table_id = graph.sources.get(&nid).copied().unwrap_or(0);
-            if table_id > 0 && !ann.trace_side_sources.contains(&nid) {
+        } else if matches!(op, Some(gnitz_wire::OpNode::ScanTrace(_))) {
+            if !is_join_trace_side(loaded, nid) {
                 extra_regs += 1;
             }
-        } else if op == OPCODE_DELAY {
+        } else if matches!(op, Some(gnitz_wire::OpNode::Delay)) {
             extra_regs += 1;
         }
     }
 
-    // For post-exchange plans: add an extra input register for the exchange output
     let mut exchange_input_reg_id: i32 = -1;
     if exchange_input.is_some() {
         exchange_input_reg_id = next_reg;
         next_reg += 1;
-        extra_regs += 0; // already counted in next_reg
     }
 
     let num_regs = (next_reg + extra_regs) as usize;
     let mut reg_schemas = vec![empty_schema(); num_regs];
     let mut reg_kinds = vec![0u8; num_regs];
 
-    // Map exchange node to the input register
     if let Some((ex_nid, ex_schema)) = exchange_input {
         out_reg_of.insert(ex_nid, exchange_input_reg_id);
         reg_schemas[exchange_input_reg_id as usize] = ex_schema;
@@ -1907,7 +1584,6 @@ fn build_plan(
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
     let mut owned_funcs: Vec<Box<ScalarFuncKind>> = Vec::new();
-    // Start with any expression programs from the optimization passes (fold_reduce_map)
     let mut owned_expr_progs: Vec<Box<ExprProgram>> = pre_built_expr_progs;
     let mut owned_trace_regs: Vec<(u16, usize)> = Vec::new();
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();
@@ -1922,14 +1598,12 @@ fn build_plan(
     };
 
     for &nid in ordered {
-        let op = graph.opcode_of.get(&nid).copied().unwrap_or(-1);
-        if op == OPCODE_EXCHANGE_SHARD {
+        if matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })) {
             continue;
         }
         let reg_id = *out_reg_of.get(&nid).unwrap();
-
         emit_node(
-            graph, ann, rw, nid, op, reg_id,
+            loaded, rw, nid, reg_id,
             &mut builder, &mut state, &mut out_reg_of,
             &mut reg_schemas, &mut reg_kinds,
             &mut owned_tables, &mut owned_funcs, &mut owned_expr_progs, &mut owned_trace_regs,
@@ -1944,13 +1618,11 @@ fn build_plan(
 
     builder.add_halt();
 
-    // Determine input reg
     let mut input_delta_reg_id = state.input_delta_reg_id;
     if input_delta_reg_id == -1 && !source_reg_map.is_empty() {
         input_delta_reg_id = *source_reg_map.values().next().unwrap();
     }
 
-    // For pre-exchange plans: use the register assigned to the output node
     let mut sink_reg = state.sink_reg_id;
     if sink_reg == -1 {
         if let Some(out_nid) = output_node_id {
@@ -1967,10 +1639,9 @@ fn build_plan(
         return None;
     }
 
-    // Schema mismatch validation (only for plans with explicit sink, not pre-exchange)
     if output_node_id.is_none() && sink_reg >= 0 {
         let sink_schema = &reg_schemas[sink_reg as usize];
-        let out_schema = &graph.out_schema;
+        let out_schema = &loaded.out_schema;
         if sink_schema.num_columns > 0 && sink_schema.num_columns != out_schema.num_columns {
             return None;
         }
@@ -2002,83 +1673,54 @@ fn build_plan(
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn compile_view(
     view_id: u64,
-    // System table handles (NULL if absent)
     sys_nodes: *mut Table,
     sys_edges: *mut Table,
     sys_node_cols: *mut Table,
-    sys_dep: *mut Table,
-    // System table schemas (for column reading)
     sys_nodes_schema: &SchemaDescriptor,
     sys_edges_schema: &SchemaDescriptor,
     sys_node_cols_schema: &SchemaDescriptor,
-    sys_dep_schema: &SchemaDescriptor,
-    // View family directory (for creating child tables) and schema
     view_dir: &str,
     view_table_id: u32,
     view_schema: &SchemaDescriptor,
-    // External table registry
     ext_tables: &[ExternalTable],
 ) -> Result<CompileOutput, i32> {
-    // 1. Load circuit data from the three new system tables, synthesising
-    //    the legacy `params` / `str_params` / `sources` / `group_cols` maps
-    //    so the rest of the compiler stays unchanged.
-    let (nodes, edges, sources, params, str_params, group_cols) =
-        load_circuit(sys_nodes, sys_nodes_schema,
-                     sys_edges, sys_edges_schema,
-                     sys_node_cols, sys_node_cols_schema,
-                     view_id);
-    if nodes.is_empty() {
+    let mut loaded = load_circuit(
+        sys_nodes, sys_nodes_schema,
+        sys_edges, sys_edges_schema,
+        sys_node_cols, sys_node_cols_schema,
+        view_id, *view_schema,
+    );
+    if loaded.nodes.is_empty() {
         return Err(-1);
     }
-
-    // 2. Build circuit graph + topological sort
-    let mut graph = CircuitGraph {
-        view_id,
-        nodes,
-        edges,
-        sources,
-        params,
-        str_params,
-        group_cols,
-        out_schema: *view_schema,
-        opcode_of: HashMap::new(),
-        ordered: Vec::new(),
-        outgoing: HashMap::new(),
-        incoming: HashMap::new(),
-        consumers: HashMap::new(),
-    };
-    if topo_sort(&mut graph).is_err() {
-        return Err(-2); // cycle
+    if topo_sort(&mut loaded).is_err() {
+        return Err(-2);
     }
-    // 3. Annotate
-    let ann = annotate(&graph, sys_dep, sys_dep_schema, ext_tables);
 
-    // 4. Optimization passes
+    let ann = annotate(&loaded, ext_tables);
+
     let mut owned_expr_progs_for_rw: Vec<Box<ExprProgram>> = Vec::new();
     let mut rw = Rewrites {
         skip_nodes: HashSet::new(),
         fold_finalize: HashMap::new(),
         folded_maps: HashMap::new(),
     };
-    opt_distinct(&graph, &ann, &mut rw);
-    opt_fold_reduce_map(&graph, &ann, &mut rw, &mut owned_expr_progs_for_rw);
+    opt_distinct(&loaded, &ann, &mut rw);
+    opt_fold_reduce_map(&loaded, &mut rw, &mut owned_expr_progs_for_rw);
 
-    // 5. Check for EXCHANGE_SHARD
     let mut exchange_nid: Option<i32> = None;
-    for &nid in &graph.ordered {
-        let op = graph.opcode_of.get(&nid).copied().unwrap_or(-1);
-        if op == OPCODE_EXCHANGE_SHARD {
+    for &nid in &loaded.ordered {
+        if matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })) {
             exchange_nid = Some(nid);
             break;
         }
     }
 
     if let Some(ex_nid) = exchange_nid {
-        // Split into pre + post plans
         let mut pre_ordered = Vec::new();
         let mut post_ordered = Vec::new();
         let mut found_exchange = false;
-        for &nid in &graph.ordered {
+        for &nid in &loaded.ordered {
             if nid == ex_nid {
                 found_exchange = true;
                 continue;
@@ -2090,40 +1732,34 @@ pub unsafe fn compile_view(
             }
         }
 
-        // Find the exchange input: the node feeding PORT_EXCHANGE_IN of ex_nid
         let mut exchange_input_nid: i32 = -1;
-        for e in &graph.edges {
-            if e.dst == ex_nid && e.port == PORT_EXCHANGE_IN {
-                exchange_input_nid = e.src;
+        for &(src, dst, port) in &loaded.edges {
+            if dst == ex_nid && port == PORT_IN {
+                exchange_input_nid = src;
                 break;
             }
         }
 
-        // Split fold programs between pre and post plans so each half gets
-        // only the ExprPrograms for REDUCE nodes in its own ordered slice.
         let pre_nids: HashSet<i32> = pre_ordered.iter().copied().collect();
         let (rw_pre, pre_progs, rw_post, post_progs) =
             split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
 
-        // Build pre-plan (output is the exchange input node's register)
         let pre = build_plan(
-            &graph, &ann, &rw_pre, &pre_ordered, ext_tables,
-            view_dir, view_table_id, view_id, &ann.in_schema,
+            &loaded, &rw_pre, &pre_ordered, ext_tables,
+            view_dir, view_table_id, view_id,
             if exchange_input_nid >= 0 { Some(exchange_input_nid) } else { None },
             None,
             pre_progs,
         ).ok_or(-3)?;
 
-        // Exchange schema = pre-plan output schema
         if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
             return Err(-3);
         }
         let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
 
-        // Build post-plan
         let post = build_plan(
-            &graph, &ann, &rw_post, &post_ordered, ext_tables,
-            view_dir, view_table_id, view_id, &exchange_schema,
+            &loaded, &rw_post, &post_ordered, ext_tables,
+            view_dir, view_table_id, view_id,
             None,
             Some((ex_nid, exchange_schema)),
             post_progs,
@@ -2148,10 +1784,10 @@ pub unsafe fn compile_view(
             post_ext_trace_regs: post.ext_trace_regs,
         })
     } else {
-        // Single plan (no exchange)
+        let ordered = loaded.ordered.clone();
         let plan = build_plan(
-            &graph, &ann, &rw, &graph.ordered.clone(), ext_tables,
-            view_dir, view_table_id, view_id, &ann.in_schema,
+            &loaded, &rw, &ordered, ext_tables,
+            view_dir, view_table_id, view_id,
             None, None,
             owned_expr_progs_for_rw,
         ).ok_or(-5)?;
@@ -2188,56 +1824,44 @@ mod tests {
 
     #[test]
     fn test_topo_sort_simple() {
-        let mut graph = CircuitGraph {
-            view_id: 1,
-            nodes: vec![
-                Node { id: 0, opcode: OPCODE_SCAN_TRACE },
-                Node { id: 1, opcode: OPCODE_FILTER },
-                Node { id: 2, opcode: OPCODE_INTEGRATE },
-            ],
-            edges: vec![
-                Edge { _id: 0, src: 0, dst: 1, port: 0 },
-                Edge { _id: 1, src: 1, dst: 2, port: 0 },
-            ],
-            sources: HashMap::new(),
-            params: HashMap::new(),
-            str_params: HashMap::new(),
-            group_cols: HashMap::new(),
+        let mut loaded = LoadedCircuit {
             out_schema: empty_schema(),
-            opcode_of: HashMap::new(),
+            nodes: {
+                let mut m = HashMap::new();
+                m.insert(0, gnitz_wire::OpNode::ScanDelta(0));
+                m.insert(1, gnitz_wire::OpNode::Filter(None));
+                m.insert(2, gnitz_wire::OpNode::IntegrateSink);
+                m
+            },
+            edges: vec![(0, 1, 0), (1, 2, 0)],
             ordered: Vec::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
         };
-        assert!(topo_sort(&mut graph).is_ok());
-        assert_eq!(graph.ordered, vec![0, 1, 2]);
+        assert!(topo_sort(&mut loaded).is_ok());
+        assert_eq!(loaded.ordered, vec![0, 1, 2]);
     }
 
     #[test]
     fn test_topo_sort_cycle() {
-        let mut graph = CircuitGraph {
-            view_id: 1,
-            nodes: vec![
-                Node { id: 0, opcode: OPCODE_FILTER },
-                Node { id: 1, opcode: OPCODE_FILTER },
-            ],
-            edges: vec![
-                Edge { _id: 0, src: 0, dst: 1, port: 0 },
-                Edge { _id: 1, src: 1, dst: 0, port: 0 },
-            ],
-            sources: HashMap::new(),
-            params: HashMap::new(),
-            str_params: HashMap::new(),
-            group_cols: HashMap::new(),
+        let mut loaded = LoadedCircuit {
             out_schema: empty_schema(),
-            opcode_of: HashMap::new(),
+            nodes: {
+                let mut m = HashMap::new();
+                m.insert(0, gnitz_wire::OpNode::Filter(None));
+                m.insert(1, gnitz_wire::OpNode::Filter(None));
+                m
+            },
+            edges: vec![(0, 1, 0), (1, 0, 0)],
             ordered: Vec::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
         };
-        assert!(topo_sort(&mut graph).is_err());
+        assert!(topo_sort(&mut loaded).is_err());
     }
 
     #[test]
@@ -2356,24 +1980,17 @@ mod tests {
         assert_eq!(out.columns[2].type_code, type_code::I64);
     }
 
-    /// Verify that split_fold_programs correctly routes each ExprProgram to the
-    /// plan half that owns its REDUCE node, and re-indexes fold_finalize to
-    /// zero-based indices within each half.
-    ///
-    /// Graph: SCAN(0) → REDUCE(1) → MAP(2) → EXCHANGE_SHARD(3) → GATHER_REDUCE(4)
-    /// REDUCE(1) is in pre_ordered; MAP(2) is folded into REDUCE(1).
-    /// After split: pre_progs has 1 program (for REDUCE 1), post_progs is empty.
     #[test]
     fn test_split_fold_programs_routes_to_pre() {
-        let code = vec![0i64; 4]; // minimal non-identity code
+        let code = vec![0i64; 4];
         let prog = ExprProgram::new(code, 1, 0, Vec::new());
         let progs: Vec<Box<ExprProgram>> = vec![Box::new(prog)];
 
         let mut fold_finalize = HashMap::new();
-        fold_finalize.insert(1i32, 0usize); // REDUCE node 1 → program index 0
+        fold_finalize.insert(1i32, 0usize);
 
         let mut folded_maps = HashMap::new();
-        folded_maps.insert(2i32, 1i32); // MAP node 2 folded into REDUCE node 1
+        folded_maps.insert(2i32, 1i32);
 
         let rw = Rewrites {
             skip_nodes: HashSet::new(),
@@ -2381,90 +1998,70 @@ mod tests {
             folded_maps,
         };
 
-        // pre_ordered contains only the REDUCE node (1)
         let mut pre_nids = HashSet::new();
         pre_nids.insert(1i32);
 
         let (rw_pre, pre_progs, rw_post, post_progs) =
             split_fold_programs(rw, progs, &pre_nids);
 
-        // The program must land in pre_progs with re-indexed entry 0
         assert_eq!(pre_progs.len(), 1);
         assert_eq!(post_progs.len(), 0);
         assert_eq!(rw_pre.fold_finalize.get(&1), Some(&0usize));
         assert!(!rw_post.fold_finalize.contains_key(&1));
-
-        // folded_maps and skip_nodes are cloned to both halves
         assert!(rw_pre.folded_maps.contains_key(&2));
         assert!(rw_post.folded_maps.contains_key(&2));
     }
 
-    // Issue #3: build_plan must return None when create_child_table fails (e.g. disk full,
-    // missing dir), not silently produce a corrupted plan with empty-schema registers and no
-    // instructions emitted for the failed node.
     #[test]
     fn test_build_plan_returns_none_when_child_table_fails() {
         // Circuit: SCAN(0) → DISTINCT(1) → INTEGRATE(2)
         // An invalid view_dir forces create_child_table to fail inside emit_node.
-        let mut graph = CircuitGraph {
-            view_id: 99,
-            nodes: vec![
-                Node { id: 0, opcode: OPCODE_SCAN_TRACE },
-                Node { id: 1, opcode: OPCODE_DISTINCT },
-                Node { id: 2, opcode: OPCODE_INTEGRATE },
-            ],
-            edges: vec![
-                Edge { _id: 0, src: 0, dst: 1, port: PORT_IN_DISTINCT },
-                Edge { _id: 1, src: 1, dst: 2, port: PORT_IN },
-            ],
-            sources: { let mut m = HashMap::new(); m.insert(0, 0i64); m },
-            params:      HashMap::new(),
-            str_params:  HashMap::new(),
-            group_cols:  HashMap::new(),
-            out_schema:  empty_schema(),
-            opcode_of:   HashMap::new(),
-            ordered:     Vec::new(),
-            outgoing:    HashMap::new(),
-            incoming:    HashMap::new(),
-            consumers:   HashMap::new(),
+        let mut loaded = LoadedCircuit {
+            out_schema: empty_schema(),
+            nodes: {
+                let mut m = HashMap::new();
+                m.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+                m.insert(1, gnitz_wire::OpNode::Distinct);
+                m.insert(2, gnitz_wire::OpNode::IntegrateSink);
+                m
+            },
+            edges: vec![(0, 1, 0), (1, 2, 0)],
+            ordered: Vec::new(),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
         };
-        topo_sort(&mut graph).unwrap();
+        topo_sort(&mut loaded).unwrap();
 
+        // Provide an external table so ScanDelta finds its schema and sets source_reg_map.
         let in_schema = {
             let mut s = empty_schema();
             s.columns[0] = col(type_code::U64, 8, false);
             s.num_columns = 1;
             s
         };
-        let ann = Annotation {
-            trace_side_sources: HashSet::new(),
-            in_schema,
-            co_partitioned: HashSet::new(),
-            is_distinct_at: HashSet::new(),
-        };
+        let ext_tables = [ExternalTable { table_id: 99, schema: in_schema }];
         let rw = Rewrites {
-            skip_nodes:   HashSet::new(),
+            skip_nodes:    HashSet::new(),
             fold_finalize: HashMap::new(),
-            folded_maps:  HashMap::new(),
+            folded_maps:   HashMap::new(),
         };
 
-        let ordered = graph.ordered.clone();
+        let ordered = loaded.ordered.clone();
         let result = build_plan(
-            &graph, &ann, &rw, &ordered, &[],
+            &loaded, &rw, &ordered, &ext_tables,
             "/nonexistent_gnitz_test_path_xyz_abc",
-            0, 99, &empty_schema(),
-            None, None, vec![],
+            0, 99, None, None, vec![],
         );
         assert!(result.is_none(), "build_plan must return None when child table creation fails");
     }
 
-    // Issue #4: merge_schemas_for_join must panic with a clear message (not a cryptic
-    // index-out-of-bounds) when the combined column count exceeds MAX_COLUMNS.
     #[test]
     #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
         use crate::schema::MAX_COLUMNS;
-        let half = MAX_COLUMNS / 2 + 2; // 2*half - 1 (right PK excluded) > MAX_COLUMNS for any parity
+        let half = MAX_COLUMNS / 2 + 2;
         let make = |n: usize| {
             let mut s = empty_schema();
             s.columns[0] = col(type_code::U128, 16, false);
@@ -2476,5 +2073,228 @@ mod tests {
             s
         };
         merge_schemas_for_join(&make(half), &make(half));
+    }
+
+    // ── helpers shared by join tests ─────────────────────────────────────
+
+    fn two_col_schema() -> SchemaDescriptor {
+        let mut s = empty_schema();
+        s.columns[0] = col(type_code::U128, 16, false);
+        s.columns[1] = col(type_code::U64, 8, false);
+        s.num_columns = 2;
+        s.pk_index = 0;
+        s
+    }
+
+    fn make_loaded(
+        nodes: HashMap<i32, gnitz_wire::OpNode>,
+        edges: Vec<(i32, i32, i32)>,
+    ) -> LoadedCircuit {
+        let mut lc = LoadedCircuit {
+            out_schema: empty_schema(),
+            nodes,
+            edges,
+            ordered: Vec::new(),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
+        };
+        topo_sort(&mut lc).expect("test circuit must be acyclic");
+        lc
+    }
+
+    fn empty_rw() -> Rewrites {
+        Rewrites {
+            skip_nodes:    HashSet::new(),
+            fold_finalize: HashMap::new(),
+            folded_maps:   HashMap::new(),
+        }
+    }
+
+    // ── ScanTrace join-trace-side: no add_scan_trace when feeding port=1 ──
+
+    /// A ScanTrace node feeding a Join via PORT_TRACE must not emit add_scan_trace
+    /// or allocate an extra delta register.
+    #[test]
+    fn test_scan_trace_join_trace_side_no_extra_reg() {
+        // Circuit: ScanDelta(10) --port0--> Join(DT)(2)
+        //          ScanTrace(20) --port1--> Join(DT)(2)
+        //          Join(2) --port0--> IntegrateSink(3)
+        let schema = two_col_schema();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN_A),  // delta side
+            (1, 2, PORT_TRACE), // trace side — must NOT emit add_scan_trace
+            (2, 3, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            "", 0, 1,
+            Some(2), // bypass out_schema mismatch check; sink_reg already set by IntegrateSink
+            None, vec![],
+        );
+        let plan = result.expect("build_plan must succeed for this circuit");
+
+        // The trace-side ScanTrace (node 1) uses reg_id as the trace register;
+        // no extra delta register is allocated for it.  The minimum register
+        // count is: one per node (4) + zero extras from ScanTrace on trace side.
+        // (There are no Distinct/Reduce/Delay nodes adding extras.)
+        assert!(
+            plan.num_regs == 4,
+            "expected exactly 4 regs (one per node, no extra for trace-side ScanTrace), got {}",
+            plan.num_regs
+        );
+    }
+
+    /// A ScanTrace node that does NOT feed a join's TRACE port must still emit
+    /// add_scan_trace and allocate an extra delta register.
+    #[test]
+    fn test_scan_trace_non_join_side_emits_scan_trace() {
+        // Circuit: ScanDelta(10) --port0--> Union(2)
+        //          ScanTrace(20) --port1--> Union(2)   [port=1 but Union ≠ Join → NOT join-trace-side]
+        //          Union(2) --port0--> IntegrateSink(3)
+        //
+        // ScanDelta provides input_delta_reg_id via source_reg_map.
+        // ScanTrace feeds Union on PORT_IN_B (=1), but Union is not in
+        // {Join, AntiJoin, SemiJoin, SeekTrace}, so is_join_trace_side = false →
+        // add_scan_trace is emitted and one extra delta register is allocated.
+        let schema = two_col_schema();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(2, gnitz_wire::OpNode::Union);
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN_A),  // ScanDelta → Union left
+            (1, 2, PORT_IN_B),  // ScanTrace → Union right (port=1, not a join)
+            (2, 3, PORT_IN),
+        ];
+
+        let loaded = make_loaded(nodes, edges);
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            "", 0, 1,
+            Some(2), // bypass out_schema mismatch check
+            None, vec![],
+        );
+        let plan = result.expect("build_plan must succeed");
+
+        // 4 nodes → base regs 0-3, plus 1 extra delta reg for ScanTrace.
+        assert!(
+            plan.num_regs == 5,
+            "expected 5 regs (4 base + 1 extra delta for non-join-side ScanTrace), got {}",
+            plan.num_regs
+        );
+    }
+
+    // ── compute_join_shard_map covers ScanDelta (SQL-planner join pattern) ──
+
+    /// compute_join_shard_map must find ScanDelta → Map(reindex) chains, not
+    /// just ScanTrace sources.
+    #[test]
+    fn test_compute_join_shard_map_scan_delta() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        // Minimal two-sided SQL join circuit skeleton:
+        //   ScanDelta(left_tid=10) → Map(reindex_col=1) → Join → IntegrateSink
+        //   ScanDelta(right_tid=20) → Map(reindex_col=0) → Join
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, // magic
+            0x01,                   // version
+            0, 0, 0, 0, 0,          // reserved
+            0, 0, 0, 0,             // code_len = 0
+            0,                      // nconst = 0
+        ];
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(),
+            reindex_col: Some(1),
+        }));
+        nodes.insert(2, OpNode::ScanDelta(20));
+        nodes.insert(3, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_col: Some(0),
+        }));
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        let map = compute_join_shard_map(&loaded);
+
+        assert_eq!(
+            map.get(&10).cloned().unwrap_or_default(),
+            vec![1],
+            "left side (source 10) must map to reindex_col=1"
+        );
+        assert_eq!(
+            map.get(&20).cloned().unwrap_or_default(),
+            vec![0],
+            "right side (source 20) must map to reindex_col=0"
+        );
+    }
+
+    /// Pure ScanTrace sources (Python-API joins) must also appear in the map.
+    #[test]
+    fn test_compute_join_shard_map_scan_trace_unchanged() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(1, OpNode::ScanTrace(20));
+        nodes.insert(2, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_col: Some(2),
+        }));
+        nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(4, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN),     // ScanDelta → reindex Map
+            (1, 3, PORT_TRACE),  // ScanTrace → join trace port (no reindex)
+            (2, 3, PORT_IN_A),
+            (3, 4, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        let map = compute_join_shard_map(&loaded);
+
+        // ScanDelta(10) → Map(reindex_col=2) must be found.
+        assert_eq!(
+            map.get(&10).cloned().unwrap_or_default(),
+            vec![2],
+            "ScanDelta source must be in join_shard_map"
+        );
+        // ScanTrace(20) has no downstream reindex Map — must NOT appear.
+        assert!(
+            !map.contains_key(&20),
+            "ScanTrace-only source with no reindex Map must not be in join_shard_map"
+        );
     }
 }

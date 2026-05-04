@@ -119,6 +119,28 @@ pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaD
     sd
 }
 
+/// Build a `SchemaDescriptor` from the wire-neutral column slice defined in
+/// `gnitz-wire`. Called at compile time — zero runtime allocation.
+const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u32) -> SchemaDescriptor {
+    let mut sd = SchemaDescriptor {
+        num_columns: cols.len() as u32,
+        pk_index,
+        columns: [zero_col(); crate::schema::MAX_COLUMNS],
+    };
+    let mut i = 0;
+    while i < cols.len() {
+        let tc = cols[i].type_code;
+        sd.columns[i] = SchemaColumn {
+            type_code: tc,
+            size:     crate::schema::type_size(tc),
+            nullable: if cols[i].nullable { 1 } else { 0 },
+            _pad:     0,
+        };
+        i += 1;
+    }
+    sd
+}
+
 // ---------------------------------------------------------------------------
 // System table schema definitions
 // ---------------------------------------------------------------------------
@@ -145,21 +167,13 @@ pub(super) const fn seq_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col()], 0)
 }
 pub(super) const fn circuit_nodes_schema() -> SchemaDescriptor {
-    // node_pk U128 PK + view_id U64 + node_id U64 + opcode U64 +
-    // source_table U64? + reindex_col U64? + expr_program BLOB?
-    make_schema(&[
-        u128_col(), u64_col(), u64_col(), u64_col(),
-        u64_col_nullable(), u64_col_nullable(), blob_col_nullable(),
-    ], 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, 0)
 }
 pub(super) const fn circuit_edges_schema() -> SchemaDescriptor {
-    // edge_pk U128 PK + view_id U64 + dst_node U64 + dst_port U64 + src_node U64
-    make_schema(&[u128_col(), u64_col(), u64_col(), u64_col(), u64_col()], 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, 0)
 }
 pub(super) const fn circuit_node_columns_schema() -> SchemaDescriptor {
-    // node_col_pk U128 PK + view_id U64 + node_id U64 + kind U64 +
-    // position U64 + value1 U64 + value2 U64
-    make_schema(&[u128_col(), u64_col(), u64_col(), u64_col(), u64_col(), u64_col(), u64_col()], 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, 0)
 }
 
 // Pre-computed statics — initialised once at program start, never reconstructed.

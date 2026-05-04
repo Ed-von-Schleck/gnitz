@@ -459,6 +459,9 @@ fn test_circuit_table_surface_introspectable() {
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
     assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
+    // TODO: add seek_family assertion once seek for system tables is fixed;
+    // currently returns None for a system table seeded with a single row.
+
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }

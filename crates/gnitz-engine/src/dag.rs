@@ -10,39 +10,6 @@ use crate::ops;
 use crate::vm;
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-// Opcodes needed for metadata queries
-const OPCODE_EXCHANGE_SHARD: i32 = 20;
-const OPCODE_MAP:       i32 = gnitz_wire::OPCODE_MAP       as i32;
-const OPCODE_INTEGRATE: i32 = gnitz_wire::OPCODE_INTEGRATE as i32;
-const OPCODE_SCAN_TRACE: i32 = gnitz_wire::OPCODE_SCAN_TRACE as i32;
-
-const PARAM_SHARD_COL_BASE: i32 = 128;
-const PARAM_JOIN_SOURCE_TABLE: i32 = 11;
-const PARAM_REINDEX_COL: i32 = 10;
-const PARAM_PROJ_BASE: i32 = 32;
-const PARAM_NULL_EXTEND_COL_BASE: i32 = 192;
-const PARAM_AGG_SPEC_BASE: i32 = 13;
-
-/// Translate a wire-level opcode read from `CircuitNodes.opcode` into the
-/// legacy value the DAG metadata code expects. The new sub-variant opcodes
-/// (`MAP_PROJ`, `MAP_EXPR`, `MAP_KEY_ONLY`, `INTEGRATE_TRACE`,
-/// `SCAN_TRACE_TABLE`) all collapse onto the single discriminator the
-/// callers already match against.
-fn translate_legacy_opcode(op: i32) -> i32 {
-    match op as u64 {
-        gnitz_wire::OPCODE_INTEGRATE_TRACE  => OPCODE_INTEGRATE,
-        gnitz_wire::OPCODE_MAP_PROJ
-        | gnitz_wire::OPCODE_MAP_EXPR
-        | gnitz_wire::OPCODE_MAP_KEY_ONLY   => OPCODE_MAP,
-        gnitz_wire::OPCODE_SCAN_TRACE_TABLE => OPCODE_SCAN_TRACE,
-        _ => op,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Store handle — views vs base tables
 // ---------------------------------------------------------------------------
 
@@ -475,262 +442,60 @@ impl DagEngine {
 
     // ── Metadata queries (lightweight, no compilation) ──────────────────
 
-    /// Load circuit nodes from the CircuitNodes system table for a view.
-    /// Returns `[(node_id, opcode)]`. Translates new opcodes back into
-    /// the legacy values that downstream callers expect:
-    /// `OPCODE_INTEGRATE_TRACE → OPCODE_INTEGRATE`, `OPCODE_MAP_*  → OPCODE_MAP`,
-    /// `OPCODE_SCAN_TRACE_TABLE → OPCODE_SCAN_TRACE`. (`OPCODE_SCAN_DELTA`
-    /// already shares the numeric value 11 with `OPCODE_SCAN_TRACE`.)
-    fn load_nodes_meta(&self, view_id: u64) -> Vec<(i32, i32)> {
-        let mut result = Vec::new();
-        if self.sys.nodes.is_null() { return result; }
-        let t = unsafe { &mut *self.sys.nodes };
-        let mut ch = match t.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                // Read node_id from the denormalised payload column (col 2).
-                let node_id = compiler::cursor_read_i64(
-                    &ch.cursor, 2, &self.sys.nodes_schema,
-                ) as i32;
-                let opcode_raw = compiler::cursor_read_i64(
-                    &ch.cursor, 3, &self.sys.nodes_schema,
-                ) as i32;
-                let opcode = translate_legacy_opcode(opcode_raw);
-                result.push((node_id, opcode));
-            }
-            ch.cursor.advance();
-        }
-        result
-    }
-
-    /// Load circuit edges for a view. Returns `[(0, src, dst, port)]`.
-    /// The leading `0` is a placeholder for the historical synthetic edge_id
-    /// (now removed; the natural-key PK has fully replaced it).
-    fn load_edges_meta(&self, view_id: u64) -> Vec<(i32, i32, i32, i32)> {
-        let mut result = Vec::new();
-        if self.sys.edges.is_null() { return result; }
-        let t = unsafe { &mut *self.sys.edges };
-        let mut ch = match t.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let dst = compiler::cursor_read_i64(
-                    &ch.cursor, 2, &self.sys.edges_schema,
-                ) as i32;
-                let port = compiler::cursor_read_i64(
-                    &ch.cursor, 3, &self.sys.edges_schema,
-                ) as i32;
-                let src = compiler::cursor_read_i64(
-                    &ch.cursor, 4, &self.sys.edges_schema,
-                ) as i32;
-                result.push((0, src, dst, port));
-            }
-            ch.cursor.advance();
-        }
-        result
-    }
-
-    /// Synthesise the legacy `params` map ({node_id: {slot: value}}) from
-    /// the new `CircuitNodes.source_table` / `reindex_col` columns and
-    /// `CircuitNodeColumns` (kind=SHARD/PROJ/NULL_EXT/AGG_SPEC). The DAG
-    /// metadata callers (`get_shard_cols`, `get_join_shard_cols`,
-    /// `get_exchange_info`) only inspect SHARD/REINDEX/JOIN_SOURCE_TABLE
-    /// slots, so the BLOB-encoded `expr_program` is intentionally NOT
-    /// decoded here.
-    fn load_params_meta(&self, view_id: u64) -> HashMap<i32, HashMap<i32, i64>> {
-        let mut result: HashMap<i32, HashMap<i32, i64>> = HashMap::new();
-
-        // Pull source_table → PARAM_JOIN_SOURCE_TABLE and reindex_col → PARAM_REINDEX_COL
-        // from CircuitNodes for every node row.
-        if !self.sys.nodes.is_null() {
-            let t = unsafe { &mut *self.sys.nodes };
-            if let Ok(mut ch) = t.create_cursor() {
-                ch.cursor.seek(crate::util::make_pk(0, view_id));
-                while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-                    if ch.cursor.current_weight > 0 {
-                        let node_id = compiler::cursor_read_i64(
-                            &ch.cursor, 2, &self.sys.nodes_schema,
-                        ) as i32;
-                        let opcode_raw = compiler::cursor_read_i64(
-                            &ch.cursor, 3, &self.sys.nodes_schema,
-                        ) as i32;
-                        let opcode = translate_legacy_opcode(opcode_raw);
-                        if !compiler::cursor_is_null(&ch.cursor, 4, &self.sys.nodes_schema) {
-                            let st = compiler::cursor_read_i64(
-                                &ch.cursor, 4, &self.sys.nodes_schema,
-                            );
-                            // Stash on SCAN_TRACE so get_join_shard_cols() finds it.
-                            if opcode == OPCODE_SCAN_TRACE {
-                                result.entry(node_id).or_default()
-                                    .insert(PARAM_JOIN_SOURCE_TABLE, st);
-                            }
-                        }
-                        if !compiler::cursor_is_null(&ch.cursor, 5, &self.sys.nodes_schema) {
-                            let rc = compiler::cursor_read_i64(
-                                &ch.cursor, 5, &self.sys.nodes_schema,
-                            );
-                            result.entry(node_id).or_default()
-                                .insert(PARAM_REINDEX_COL, rc);
-                        }
-                    }
-                    ch.cursor.advance();
-                }
-            }
-        }
-
-        // Pull SHARD/PROJ/NULL_EXT/AGG_SPEC rows from CircuitNodeColumns.
-        if !self.sys.node_columns.is_null() {
-            let t = unsafe { &mut *self.sys.node_columns };
-            if let Ok(mut ch) = t.create_cursor() {
-                ch.cursor.seek(crate::util::make_pk(0, view_id));
-                while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-                    if ch.cursor.current_weight > 0 {
-                        let node_id = compiler::cursor_read_i64(
-                            &ch.cursor, 2, &self.sys.node_columns_schema,
-                        ) as i32;
-                        let kind = compiler::cursor_read_i64(
-                            &ch.cursor, 3, &self.sys.node_columns_schema,
-                        );
-                        let position = compiler::cursor_read_i64(
-                            &ch.cursor, 4, &self.sys.node_columns_schema,
-                        ) as i32;
-                        let v1 = compiler::cursor_read_i64(
-                            &ch.cursor, 5, &self.sys.node_columns_schema,
-                        );
-                        let v2 = compiler::cursor_read_i64(
-                            &ch.cursor, 6, &self.sys.node_columns_schema,
-                        );
-                        let np = result.entry(node_id).or_default();
-                        match kind as u64 {
-                            gnitz_wire::NODE_COL_KIND_SHARD => {
-                                np.insert(PARAM_SHARD_COL_BASE + position, v1);
-                            }
-                            gnitz_wire::NODE_COL_KIND_PROJ => {
-                                np.insert(PARAM_PROJ_BASE + position, v1);
-                            }
-                            gnitz_wire::NODE_COL_KIND_NULL_EXT => {
-                                np.insert(PARAM_NULL_EXTEND_COL_BASE + position, v1);
-                            }
-                            gnitz_wire::NODE_COL_KIND_AGG_SPEC => {
-                                let packed = ((v1 as u64) << 32) | (v2 as u64 & 0xFFFFFFFF);
-                                np.insert(PARAM_AGG_SPEC_BASE + position, packed as i64);
-                            }
-                            _ => {}
-                        }
-                    }
-                    ch.cursor.advance();
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Load circuit sources for a view. Returns {node_id: table_id}.
-    /// New layout: only `OPCODE_SCAN_TRACE_TABLE` rows populate this map
-    /// (delta-side `OPCODE_SCAN_DELTA` carries source_table via
-    /// `PARAM_JOIN_SOURCE_TABLE` instead, mirroring the legacy convention).
-    fn load_sources_meta(&self, view_id: u64) -> HashMap<i32, i64> {
-        let mut result = HashMap::new();
-        if self.sys.nodes.is_null() { return result; }
-        let t = unsafe { &mut *self.sys.nodes };
-        let mut ch = match t.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        ch.cursor.seek(crate::util::make_pk(0, view_id));
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let node_id = compiler::cursor_read_i64(
-                    &ch.cursor, 2, &self.sys.nodes_schema,
-                ) as i32;
-                let opcode_raw = compiler::cursor_read_i64(
-                    &ch.cursor, 3, &self.sys.nodes_schema,
-                ) as i32;
-                if opcode_raw as u64 == gnitz_wire::OPCODE_SCAN_TRACE_TABLE
-                    && !compiler::cursor_is_null(&ch.cursor, 4, &self.sys.nodes_schema)
-                {
-                    let st = compiler::cursor_read_i64(
-                        &ch.cursor, 4, &self.sys.nodes_schema,
-                    );
-                    result.insert(node_id, st);
-                }
-            }
-            ch.cursor.advance();
-        }
-        result
+    /// Load typed circuit nodes/edges for metadata queries. Cheaper than full
+    /// compilation: no topo sort, no optimization passes, no code emission.
+    fn load_meta_circuit(&self, view_id: i64) -> compiler::LoadedCircuit {
+        compiler::load_circuit(
+            self.sys.nodes, &self.sys.nodes_schema,
+            self.sys.edges, &self.sys.edges_schema,
+            self.sys.node_columns, &self.sys.node_columns_schema,
+            view_id as u64,
+            compiler::empty_schema(),
+        )
     }
 
     /// Extract shard columns for a view without full compilation.
-    /// Port of `ProgramCache.get_shard_cols()`.
     pub fn get_shard_cols(&mut self, view_id: i64) -> Vec<i32> {
         if let Some(cols) = self.shard_cols_cache.get(&view_id) {
             return cols.clone();
         }
-        let nodes = self.load_nodes_meta(view_id as u64);
-        let params = self.load_params_meta(view_id as u64);
-        for &(nid, op) in &nodes {
-            if op == OPCODE_EXCHANGE_SHARD {
-                let node_params = params.get(&nid);
-                let mut shard_cols = Vec::new();
-                let mut idx = 0;
-                loop {
-                    let key = PARAM_SHARD_COL_BASE + idx;
-                    match node_params.and_then(|p| p.get(&key)) {
-                        Some(&val) => {
-                            shard_cols.push(val as i32);
-                            idx += 1;
-                        }
-                        None => break,
-                    }
+        let loaded = self.load_meta_circuit(view_id);
+        let shard_cols = loaded.nodes.values()
+            .find_map(|op| {
+                if let gnitz_wire::OpNode::ExchangeShard { shard_cols: sc } = op {
+                    Some(sc.iter().map(|&c| c as i32).collect::<Vec<_>>())
+                } else {
+                    None
                 }
-                self.shard_cols_cache.insert(view_id, shard_cols.clone());
-                return shard_cols;
-            }
-        }
-        self.shard_cols_cache.insert(view_id, Vec::new());
-        Vec::new()
+            })
+            .unwrap_or_default();
+        self.shard_cols_cache.insert(view_id, shard_cols.clone());
+        shard_cols
     }
 
     /// Get join shard columns for a specific source within a view.
-    /// Port of `ProgramCache.get_join_shard_cols()`.
     pub fn get_join_shard_cols(&mut self, view_id: i64, source_id: i64) -> Vec<i32> {
-        let nodes = self.load_nodes_meta(view_id as u64);
-        let params = self.load_params_meta(view_id as u64);
-        let edges = self.load_edges_meta(view_id as u64);
+        let loaded = self.load_meta_circuit(view_id);
 
-        // Find SCAN_TRACE node for this source_id
-        let mut scan_nid: i32 = -1;
-        for &(nid, op) in &nodes {
-            if op == OPCODE_SCAN_TRACE {
-                if let Some(np) = params.get(&nid) {
-                    if np.get(&PARAM_JOIN_SOURCE_TABLE).copied().unwrap_or(0) == source_id {
-                        scan_nid = nid;
-                        break;
-                    }
-                }
-            }
-        }
-        if scan_nid < 0 {
-            return Vec::new();
-        }
+        // Find the scan node (ScanTrace or ScanDelta) for this source.
+        // ScanTrace: Python API joins (trace-only source).
+        // ScanDelta: SQL joins (reindex both sides as delta inputs).
+        let scan_nid = loaded.nodes.iter().find_map(|(&nid, op)| {
+            let tid = match op {
+                gnitz_wire::OpNode::ScanTrace(t) | gnitz_wire::OpNode::ScanDelta(t) => t,
+                _ => return None,
+            };
+            if *tid as i64 == source_id { Some(nid) } else { None }
+        });
+        let scan_nid = match scan_nid { Some(n) => n, None => return Vec::new() };
 
-        // Find MAP node that this SCAN_TRACE feeds into
-        for &(_eid, src, dst, _port) in &edges {
+        // Find the downstream Map(Expression { reindex_col }) node.
+        for &(src, dst, _port) in &loaded.edges {
             if src == scan_nid {
-                if let Some(dst_params) = params.get(&dst) {
-                    if let Some(&reindex_col) = dst_params.get(&PARAM_REINDEX_COL) {
-                        if reindex_col >= 0 {
-                            return vec![reindex_col as i32];
-                        }
-                    }
+                if let Some(gnitz_wire::OpNode::Map(
+                    gnitz_wire::MapKind::Expression { reindex_col: Some(c), .. }
+                )) = loaded.nodes.get(&dst) {
+                    return vec![*c as i32];
                 }
             }
         }
@@ -738,61 +503,41 @@ impl DagEngine {
     }
 
     /// Get exchange info for a view: (shard_cols, is_trivial, is_co_partitioned).
-    /// Port of `ProgramCache.get_exchange_info()`.
     pub fn get_exchange_info(&mut self, view_id: i64) -> &ExchangeInfo {
         if self.exchange_info_cache.contains_key(&view_id) {
             return &self.exchange_info_cache[&view_id];
         }
 
-        let nodes = self.load_nodes_meta(view_id as u64);
-        let edges = self.load_edges_meta(view_id as u64);
-        let params = self.load_params_meta(view_id as u64);
-        let sources = self.load_sources_meta(view_id as u64);
-
-        // Compute in-degrees
-        let mut in_deg: HashMap<i32, i32> = HashMap::new();
-        for &(nid, _) in &nodes {
-            in_deg.insert(nid, 0);
-        }
-        for &(_eid, _src, dst, _port) in &edges {
-            *in_deg.entry(dst).or_insert(0) += 1;
-        }
+        let loaded = self.load_meta_circuit(view_id);
 
         let mut shard_cols = Vec::new();
         let mut is_trivial = false;
         let mut is_co_partitioned = false;
 
-        for &(nid, op) in &nodes {
-            if op == OPCODE_EXCHANGE_SHARD {
-                if let Some(node_params) = params.get(&nid) {
-                    let mut idx = 0;
-                    loop {
-                        let key = PARAM_SHARD_COL_BASE + idx;
-                        match node_params.get(&key) {
-                            Some(&val) => {
-                                shard_cols.push(val as i32);
-                                idx += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                }
+        // Find the ExchangeShard node and its shard columns.
+        let exchange_nid = loaded.nodes.iter().find_map(|(&nid, op)| {
+            if let gnitz_wire::OpNode::ExchangeShard { shard_cols: sc } = op {
+                Some((nid, sc.iter().map(|&c| c as i32).collect::<Vec<_>>()))
+            } else {
+                None
+            }
+        });
+        if let Some((enid, cols)) = exchange_nid {
+            shard_cols = cols;
 
-                // is_trivial: SHARD has exactly 1 incoming edge, and that source
-                // node has in-degree 0
-                let mut incoming_srcs = Vec::new();
-                for &(_eid2, src2, dst2, _port2) in &edges {
-                    if dst2 == nid {
-                        incoming_srcs.push(src2);
-                    }
-                }
-                if incoming_srcs.len() == 1 {
-                    let src_nid = incoming_srcs[0];
-                    if in_deg.get(&src_nid).copied().unwrap_or(0) == 0 {
-                        is_trivial = true;
-                        let src_tid = sources.get(&src_nid).copied().unwrap_or(0);
-                        if src_tid > 0 && shard_cols.len() == 1 {
-                            if let Some(entry) = self.tables.get(&src_tid) {
+            // Collect nodes that feed directly into ExchangeShard.
+            let incoming_srcs: Vec<i32> = loaded.edges.iter()
+                .filter(|&&(_, dst, _)| dst == enid)
+                .map(|&(src, _, _)| src)
+                .collect();
+
+            if incoming_srcs.len() == 1 {
+                let src_nid = incoming_srcs[0];
+                if !loaded.edges.iter().any(|&(_, dst, _)| dst == src_nid) {
+                    is_trivial = true;
+                    if let Some(gnitz_wire::OpNode::ScanTrace(tid)) = loaded.nodes.get(&src_nid) {
+                        if *tid > 0 && shard_cols.len() == 1 {
+                            if let Some(entry) = self.tables.get(&(*tid as i64)) {
                                 if shard_cols[0] == entry.schema.pk_index as i32 {
                                     is_co_partitioned = true;
                                 }
@@ -800,17 +545,11 @@ impl DagEngine {
                         }
                     }
                 }
-                break; // only one EXCHANGE_SHARD per view
             }
         }
 
-        // Keep shard_cols_cache coherent
         self.shard_cols_cache.insert(view_id, shard_cols.clone());
-
-        self.exchange_info_cache.insert(view_id, ExchangeInfo {
-            is_trivial,
-            is_co_partitioned,
-        });
+        self.exchange_info_cache.insert(view_id, ExchangeInfo { is_trivial, is_co_partitioned });
         &self.exchange_info_cache[&view_id]
     }
 
@@ -838,13 +577,8 @@ impl DagEngine {
 
     /// Check if a view needs exchange (has EXCHANGE_SHARD node).
     pub fn view_needs_exchange(&mut self, view_id: i64) -> bool {
-        let nodes = self.load_nodes_meta(view_id as u64);
-        for &(_, op) in &nodes {
-            if op == OPCODE_EXCHANGE_SHARD {
-                return true;
-            }
-        }
-        false
+        let loaded = self.load_meta_circuit(view_id);
+        loaded.nodes.values().any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }))
     }
 
     // ── Compilation ─────────────────────────────────────────────────────
@@ -866,9 +600,9 @@ impl DagEngine {
         let result = unsafe {
             compiler::compile_view(
                 view_id as u64,
-                self.sys.nodes, self.sys.edges, self.sys.node_columns, self.sys.dep_tab,
+                self.sys.nodes, self.sys.edges, self.sys.node_columns,
                 &self.sys.nodes_schema, &self.sys.edges_schema,
-                &self.sys.node_columns_schema, &self.sys.dep_tab_schema,
+                &self.sys.node_columns_schema,
                 &view_dir,
                 view_id as u32,
                 view_schema,

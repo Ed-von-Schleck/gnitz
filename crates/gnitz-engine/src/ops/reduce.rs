@@ -74,6 +74,18 @@ impl TryFrom<u8> for AggOp {
     }
 }
 
+impl From<gnitz_wire::AggFunc> for AggOp {
+    fn from(f: gnitz_wire::AggFunc) -> Self {
+        match f {
+            gnitz_wire::AggFunc::Count        => AggOp::Count,
+            gnitz_wire::AggFunc::Sum          => AggOp::Sum,
+            gnitz_wire::AggFunc::Min          => AggOp::Min,
+            gnitz_wire::AggFunc::Max          => AggOp::Max,
+            gnitz_wire::AggFunc::CountNonNull => AggOp::CountNonNull,
+        }
+    }
+}
+
 impl AggOp {
     pub fn is_linear(self) -> bool {
         matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
