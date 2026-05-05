@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 
 use super::error::ProtocolError;
 use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
-use super::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, meta_schema};
+use super::types::{ColData, PkColumn, Schema, ZSetBatch, meta_schema};
+use crate::types::schema_from_wire_cols;
 use super::codec::{schema_to_batch, batch_to_schema};
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
 use super::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
@@ -31,23 +32,9 @@ pub struct Message {
 // the wire format.
 
 fn control_schema() -> &'static Schema {
-    use gnitz_wire::control as ctrl;
-    const _: () = assert!(ctrl::NUM_COLUMNS == 9,
-        "control_schema column list out of sync with gnitz_wire::control::NUM_COLUMNS");
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef { name: "msg_idx".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "status".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "client_id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "target_id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "flags".into(),        type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "seek_pk".into(),      type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "seek_col_idx".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "request_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "error_msg".into(),    type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
-        ],
-        pk_index: 0,
+    INSTANCE.get_or_init(|| {
+        schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, gnitz_wire::control::COL_MSG_IDX)
     })
 }
 
@@ -60,18 +47,19 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
     let has_error = !error_msg.is_empty();
     let nulls_val: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
 
-    let mut columns: Vec<ColData> = Vec::with_capacity(ctrl::NUM_COLUMNS);
-    columns.push(ColData::Fixed(vec![]));   // col 0: pk placeholder
-    columns.push(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
-    columns.push(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
-    columns.push(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
-    columns.push(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
-    columns.push(ColData::U128s(vec![header.seek_pk]));
-    columns.push(ColData::Fixed(header.seek_col_idx.to_le_bytes().to_vec()));
-    columns.push(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
-    columns.push(ColData::Strings(vec![
+    let mut columns: [Option<ColData>; ctrl::NUM_COLUMNS] = std::array::from_fn(|_| None);
+    columns[ctrl::COL_MSG_IDX]      = Some(ColData::Fixed(vec![]));
+    columns[ctrl::COL_STATUS]       = Some(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
+    columns[ctrl::COL_CLIENT_ID]    = Some(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_TARGET_ID]    = Some(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_FLAGS]        = Some(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
+    columns[ctrl::COL_SEEK_PK]      = Some(ColData::U128s(vec![header.seek_pk]));
+    columns[ctrl::COL_SEEK_COL_IDX] = Some(ColData::Fixed(header.seek_col_idx.to_le_bytes().to_vec()));
+    columns[ctrl::COL_REQUEST_ID]   = Some(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_ERROR_MSG]    = Some(ColData::Strings(vec![
         if has_error { Some(error_msg.to_string()) } else { None }
     ]));
+    let columns: Vec<ColData> = columns.into_iter().map(|c| c.unwrap()).collect();
 
     let batch = ZSetBatch {
         pks:     PkColumn::U64s(vec![0u64]),

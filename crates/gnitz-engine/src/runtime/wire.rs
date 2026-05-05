@@ -50,9 +50,7 @@ const WAL_OFF_NUM_REGIONS: usize = 32;
 
 const ZERO_COL: SchemaColumn = SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 };
 const U64_COL: SchemaColumn = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-const U128_COL: SchemaColumn = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
 const STR_COL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
-const STR_COL_NULL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0 };
 
 pub(crate) const META_SCHEMA_DESC: SchemaDescriptor = {
     let mut sd = SchemaDescriptor { num_columns: 4, pk_index: 0, columns: [ZERO_COL; crate::schema::MAX_COLUMNS] };
@@ -68,18 +66,18 @@ const _: () = assert!(
     "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
 );
 
-// col 0: msg_idx (PK, U64); col 1: status; col 2: client_id; col 3: target_id;
-// col 4: flags; col 5: seek_pk (U128); col 6: seek_col_idx; col 7: request_id;
-// col 8: error_msg (String, nullable)
 pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
     let mut sd = SchemaDescriptor {
         num_columns: gnitz_wire::control::NUM_COLUMNS as u32,
-        pk_index: 0,
-        columns: [ZERO_COL; crate::schema::MAX_COLUMNS],
+        pk_index:    gnitz_wire::control::COL_MSG_IDX as u32,
+        columns:     [ZERO_COL; crate::schema::MAX_COLUMNS],
     };
-    sd.columns[0] = U64_COL; sd.columns[1] = U64_COL; sd.columns[2] = U64_COL;
-    sd.columns[3] = U64_COL; sd.columns[4] = U64_COL; sd.columns[5] = U128_COL;
-    sd.columns[6] = U64_COL; sd.columns[7] = U64_COL; sd.columns[8] = STR_COL_NULL;
+    let mut i = 0;
+    while i < gnitz_wire::control::NUM_COLUMNS {
+        let c = &gnitz_wire::control::CONTROL_COLS[i];
+        sd.columns[i] = SchemaColumn::new(c.type_code, c.nullable as u8);
+        i += 1;
+    }
     sd
 };
 
@@ -1068,4 +1066,50 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     };
 
     Ok(DecodedWireZeroCopy { control, schema: wire_schema, data_batch })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-level cross-crate consistency check: the engine encoder
+    /// (`encode_ctrl_block_ipc`) and the client encoder
+    /// (`gnitz_core::protocol::message::encode_control_block`) must produce
+    /// identical bytes for the same logical message.  Any drift in column
+    /// ordering between `CONTROL_SCHEMA_DESC` and `control_schema()` would
+    /// cause silent corruption on the other side of the wire.
+    #[test]
+    fn test_ctrl_block_client_server_byte_equality() {
+        use gnitz_core::protocol::header::Header;
+        use gnitz_core::protocol::message::encode_control_block;
+
+        let cases: &[(u32, u64, u64, u64, u128, u64, u64, &str)] = &[
+            // status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg
+            (0, 0, 0, 0, 0, 0, 0, ""),
+            (1, 0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, 0xFFFF, 42u128 | (99u128 << 64), 7, 0xCAFE_BABE_DEAD_F00D, ""),
+            (2, 1, 2, 3, u128::MAX, u64::MAX, u64::MAX, "something went wrong"),
+            (0, 0, 0, 0, 0, 0, 0, "a longer error message that exceeds the German string inline threshold of twelve bytes"),
+        ];
+
+        for &(status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg) in cases {
+            let header = Header { status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id };
+            let client_bytes = encode_control_block(&header, error_msg)
+                .expect("encode_control_block failed");
+
+            let mut engine_buf = vec![0u8; client_bytes.len() + 64];
+            let written = encode_ctrl_block_ipc(
+                &mut engine_buf, 0,
+                target_id, client_id, flags,
+                seek_pk, seek_col_idx, request_id,
+                status, error_msg.as_bytes(),
+                true, // checksum, matching encode_wal_block's unconditional checksum
+            );
+
+            assert_eq!(
+                &client_bytes[..],
+                &engine_buf[..written],
+                "ctrl block byte mismatch for error_msg={:?}", error_msg,
+            );
+        }
+    }
 }

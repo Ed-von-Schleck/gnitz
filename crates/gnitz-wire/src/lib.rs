@@ -612,48 +612,80 @@ pub const SHORT_STRING_THRESHOLD: usize = 12;
 // indices, payload indices, and null-bit positions live here so the two
 // implementations cannot drift.
 //
-// Schema (10 columns, pk_index = 0):
+// Schema (9 columns, pk_index = 0):
 //   col  0: msg_idx       U64   (PK placeholder; always 0)
 //   col  1: status        U64
 //   col  2: client_id     U64
 //   col  3: target_id     U64
 //   col  4: flags         U64
-//   col  5: seek_pk_lo    U64
-//   col  6: seek_pk_hi    U64
-//   col  7: seek_col_idx  U64
-//   col  8: request_id    U64    -- reactor reply-routing key
-//   col  9: error_msg     STRING (nullable)
+//   col  5: seek_pk       U128
+//   col  6: seek_col_idx  U64
+//   col  7: request_id    U64    -- reactor reply-routing key
+//   col  8: error_msg     STRING (nullable)
 //
 // Reserved request_id values:
 //   0          -- "unsolicited"/"untagged" (pre-reactor reply path)
 //   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
 //   other      -- master-allocated, monotonic per request
 pub mod control {
-    /// Total number of columns in CONTROL_SCHEMA (9: msg_idx PK + 7 U64 + seek_pk U128 + error_msg String).
-    pub const NUM_COLUMNS: usize = 9;
+    use super::{WireSysCol, type_code};
 
-    // Schema column indices (the column number, including the PK placeholder).
-    pub const COL_MSG_IDX:      usize = 0;
-    pub const COL_STATUS:       usize = 1;
-    pub const COL_CLIENT_ID:    usize = 2;
-    pub const COL_TARGET_ID:    usize = 3;
-    pub const COL_FLAGS:        usize = 4;
-    pub const COL_SEEK_PK:      usize = 5;  // U128; replaces seek_pk_lo + seek_pk_hi
-    pub const COL_SEEK_COL_IDX: usize = 6;
-    pub const COL_REQUEST_ID:   usize = 7;
-    pub const COL_ERROR_MSG:    usize = 8;
+    pub const CONTROL_COLS: &[WireSysCol] = &[
+        WireSysCol { name: "msg_idx",      type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "status",       type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "client_id",    type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "target_id",    type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "flags",        type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "seek_pk",      type_code: type_code::U128,   nullable: false },
+        WireSysCol { name: "seek_col_idx", type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "request_id",   type_code: type_code::U64,    nullable: false },
+        WireSysCol { name: "error_msg",    type_code: type_code::STRING, nullable: true  },
+    ];
 
-    /// Payload index = schema column index − 1 (PK at col 0 is excluded
-    /// from the payload). Used by encoders that index payload columns
-    /// directly (server) and by null-bitmap callers (both sides).
-    pub const PAYLOAD_STATUS:       usize = COL_STATUS - 1;
-    pub const PAYLOAD_CLIENT_ID:    usize = COL_CLIENT_ID - 1;
-    pub const PAYLOAD_TARGET_ID:    usize = COL_TARGET_ID - 1;
-    pub const PAYLOAD_FLAGS:        usize = COL_FLAGS - 1;
-    pub const PAYLOAD_SEEK_PK:      usize = COL_SEEK_PK - 1;
-    pub const PAYLOAD_SEEK_COL_IDX: usize = COL_SEEK_COL_IDX - 1;
-    pub const PAYLOAD_REQUEST_ID:   usize = COL_REQUEST_ID - 1;
-    pub const PAYLOAD_ERROR_MSG:    usize = COL_ERROR_MSG - 1;
+    pub const NUM_COLUMNS: usize = CONTROL_COLS.len();
+
+    pub const fn col_index(name: &str) -> usize {
+        let mut i = 0;
+        while i < CONTROL_COLS.len() {
+            let a = CONTROL_COLS[i].name.as_bytes();
+            let b = name.as_bytes();
+            if a.len() == b.len() {
+                let mut j = 0;
+                let mut matched = true;
+                while j < a.len() {
+                    if a[j] != b[j] { matched = false; break; }
+                    j += 1;
+                }
+                if matched { return i; }
+            }
+            i += 1;
+        }
+        panic!("Column not found in CONTROL_COLS")
+    }
+
+    pub const COL_MSG_IDX:      usize = col_index("msg_idx");
+    pub const COL_STATUS:       usize = col_index("status");
+    pub const COL_CLIENT_ID:    usize = col_index("client_id");
+    pub const COL_TARGET_ID:    usize = col_index("target_id");
+    pub const COL_FLAGS:        usize = col_index("flags");
+    pub const COL_SEEK_PK:      usize = col_index("seek_pk");
+    pub const COL_SEEK_COL_IDX: usize = col_index("seek_col_idx");
+    pub const COL_REQUEST_ID:   usize = col_index("request_id");
+    pub const COL_ERROR_MSG:    usize = col_index("error_msg");
+
+    const fn payload_index(col_idx: usize) -> usize {
+        assert!(col_idx != COL_MSG_IDX, "PK column has no payload index");
+        if col_idx < COL_MSG_IDX { col_idx } else { col_idx - 1 }
+    }
+
+    pub const PAYLOAD_STATUS:       usize = payload_index(COL_STATUS);
+    pub const PAYLOAD_CLIENT_ID:    usize = payload_index(COL_CLIENT_ID);
+    pub const PAYLOAD_TARGET_ID:    usize = payload_index(COL_TARGET_ID);
+    pub const PAYLOAD_FLAGS:        usize = payload_index(COL_FLAGS);
+    pub const PAYLOAD_SEEK_PK:      usize = payload_index(COL_SEEK_PK);
+    pub const PAYLOAD_SEEK_COL_IDX: usize = payload_index(COL_SEEK_COL_IDX);
+    pub const PAYLOAD_REQUEST_ID:   usize = payload_index(COL_REQUEST_ID);
+    pub const PAYLOAD_ERROR_MSG:    usize = payload_index(COL_ERROR_MSG);
 
     /// Null-bit position for `error_msg` in the row null bitmap.
     /// Equals the payload index of the column.

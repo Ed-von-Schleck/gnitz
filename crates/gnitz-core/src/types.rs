@@ -96,7 +96,7 @@ pub fn dep_tab_schema() -> &'static Schema {
     })
 }
 
-fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: usize) -> Schema {
+pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: usize) -> Schema {
     Schema {
         columns: cols.iter().map(|c| ColumnDef {
             name:        c.name.into(),
