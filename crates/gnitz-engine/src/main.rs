@@ -1,3 +1,6 @@
+#[cfg(not(target_endian = "little"))]
+compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
+
 #[macro_use]
 mod log;
 mod util;

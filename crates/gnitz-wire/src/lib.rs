@@ -3,6 +3,9 @@
 //! Single source of truth for constants and codecs that both the client
 //! (gnitz-protocol, gnitz-core) and server (gnitz-engine) must agree on.
 
+#[cfg(not(target_endian = "little"))]
+compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
+
 /// Re-declare gnitz-wire constants as a different integer type.
 ///
 /// ```ignore
