@@ -163,7 +163,8 @@ impl Table {
 
         if durable {
             let manifest_path = format!("{}/manifest.bin", dir);
-            let _ = table.shard_index.load_manifest(&manifest_path);
+            table.shard_index.load_manifest(&manifest_path)?;
+            table.shard_index.gc_orphans();
             table.current_lsn = table.shard_index.max_lsn() + 1;
             if table.current_lsn == 0 {
                 table.current_lsn = 1;
@@ -1054,6 +1055,30 @@ mod tests {
             .collect();
         assert!(leftover_tmp.is_empty(),
             "Drop must unlink all .tmp files, found: {:?}", leftover_tmp);
+    }
+
+    /// Table::new on a corrupted manifest must return Err and must not run
+    /// gc_orphans — any stray shard files must survive untouched.
+    #[test]
+    fn table_new_corrupted_manifest_preserves_stray_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("corrupted_manifest_test");
+        std::fs::create_dir_all(&tdir).unwrap();
+        let schema = make_u64_i64_schema();
+
+        // Write a corrupted manifest (wrong magic).
+        let manifest_path = tdir.join("manifest.bin");
+        std::fs::write(&manifest_path, b"not a valid manifest").unwrap();
+
+        // Drop a stray shard file.
+        let stray = tdir.join("shard_200_1.db");
+        std::fs::write(&stray, b"orphan").unwrap();
+
+        let result = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, true,
+        );
+        assert!(result.is_err(), "Table::new must fail on corrupted manifest");
+        assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
     }
 
     /// Non-durable `flush_prepare` performs the inline write itself and

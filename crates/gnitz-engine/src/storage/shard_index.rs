@@ -1,5 +1,6 @@
 //! FLSM Shard Index: manages shard lifecycle, compaction, and manifest I/O.
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::rc::Rc;
@@ -287,7 +288,6 @@ impl ShardIndex {
         let mut global_lsn = 0u64;
         let count = match manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn) {
             Ok(n) => n,
-            Err(StorageError::Io) => return Ok(()),
             Err(e) => return Err(e),
         };
 
@@ -312,6 +312,48 @@ impl ShardIndex {
         self.sort_l0();
         self.update_flags();
         Ok(())
+    }
+
+    /// Startup GC: removes orphaned shard/compaction files and stale `.tmp`
+    /// artifacts left by crashes.  Must run after a successful load_manifest()
+    /// so the live set is populated before files are deleted.
+    pub fn gc_orphans(&self) -> usize {
+        let shard_prefix = format!("shard_{}_", self.table_id);
+        let hcomp_prefix = format!("hcomp_{}_", self.table_id);
+
+        let live: HashSet<&str> = self
+            .all_entries()
+            .filter_map(|e| {
+                std::path::Path::new(&e.filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+            })
+            .collect();
+
+        let mut removed = 0usize;
+
+        // Stray manifest .tmp from a crash mid-publish.
+        let manifest_tmp = format!("{}/manifest.bin.tmp", self.output_dir);
+        if std::fs::remove_file(&manifest_tmp).is_ok() {
+            removed += 1;
+        }
+
+        let Ok(rd) = std::fs::read_dir(&self.output_dir) else {
+            return removed;
+        };
+        for entry in rd.flatten() {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            if (name.starts_with(&shard_prefix) || name.starts_with(&hcomp_prefix))
+                && !live.contains(name)
+            {
+                let _ = std::fs::remove_file(entry.path());
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub fn publish_manifest(&self, path: &str) -> Result<(), StorageError> {
@@ -1132,5 +1174,94 @@ mod tests {
         let mut found_250 = false;
         idx.find_pk(250, &mut |_, _| found_250 = true);
         assert!(found_250, "destination key 250 lost after vertical compaction");
+    }
+
+    #[test]
+    fn test_gc_orphans_removes_stale_shard() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Write a live shard and add it to the index.
+        let live_path = write_test_shard(dir.path(), "shard_42_1.db", &[10], &[100]);
+        idx.add_shard(&live_path, 1, 1).unwrap();
+
+        // Drop an orphan shard that the manifest never referenced.
+        let orphan_path = dir.path().join("shard_42_99.db");
+        std::fs::write(&orphan_path, b"garbage").unwrap();
+
+        let removed = idx.gc_orphans();
+        assert_eq!(removed, 1, "expected 1 file removed");
+        assert!(!orphan_path.exists(), "orphan shard must be deleted");
+        assert!(std::path::Path::new(&live_path).exists(), "live shard must survive");
+    }
+
+    #[test]
+    fn test_gc_orphans_ignores_other_table_id() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Files belonging to a different table must not be touched.
+        let other_path = dir.path().join("shard_99_1.db");
+        std::fs::write(&other_path, b"data").unwrap();
+        let other_hcomp = dir.path().join("hcomp_99_L1_G0_1.db");
+        std::fs::write(&other_hcomp, b"data").unwrap();
+
+        let removed = idx.gc_orphans();
+        assert_eq!(removed, 0);
+        assert!(other_path.exists(), "other-table shard must not be removed");
+        assert!(other_hcomp.exists(), "other-table hcomp must not be removed");
+    }
+
+    #[test]
+    fn test_gc_orphans_removes_manifest_tmp() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        let tmp_path = dir.path().join("manifest.bin.tmp");
+        std::fs::write(&tmp_path, b"stray").unwrap();
+
+        let removed = idx.gc_orphans();
+        assert_eq!(removed, 1);
+        assert!(!tmp_path.exists(), "manifest.bin.tmp must be removed");
+    }
+
+    #[test]
+    fn test_gc_orphans_removes_tmp_suffix_orphans() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        let shard_tmp = dir.path().join("shard_42_5.db.tmp");
+        std::fs::write(&shard_tmp, b"half-written").unwrap();
+        let hcomp_tmp = dir.path().join("hcomp_42_L1_G0_3.db.tmp");
+        std::fs::write(&hcomp_tmp, b"half-written").unwrap();
+
+        let removed = idx.gc_orphans();
+        assert_eq!(removed, 2);
+        assert!(!shard_tmp.exists(), "shard .tmp must be removed");
+        assert!(!hcomp_tmp.exists(), "hcomp .tmp must be removed");
+    }
+
+    #[test]
+    fn test_gc_orphans_empty_index_removes_stray() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        // Empty index — no load_manifest call.
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        let stray = dir.path().join("shard_42_7.db");
+        std::fs::write(&stray, b"orphan").unwrap();
+
+        let removed = idx.gc_orphans();
+        assert_eq!(removed, 1);
+        assert!(!stray.exists(), "stray shard must be removed when index is empty");
     }
 }
