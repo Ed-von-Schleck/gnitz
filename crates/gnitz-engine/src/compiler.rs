@@ -36,6 +36,21 @@ pub(crate) struct LoadedCircuit {
     gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>>,
 }
 
+impl LoadedCircuit {
+    pub(crate) fn empty() -> Self {
+        LoadedCircuit {
+            out_schema: empty_schema(),
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            ordered: Vec::new(),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
+        }
+    }
+}
+
 /// Annotation results from pre-passes.
 struct Annotation {
     co_partitioned: HashSet<i64>,
@@ -235,7 +250,7 @@ pub(crate) fn load_circuit(
     sys_node_cols: *mut Table, sys_node_cols_schema: &SchemaDescriptor,
     view_id: u64,
     out_schema: SchemaDescriptor,
-) -> LoadedCircuit {
+) -> Option<LoadedCircuit> {
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
     let mut gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
@@ -258,6 +273,8 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
+    } else {
+        return None;
     }
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
     for v in cols_by_node.values_mut() {
@@ -307,6 +324,8 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
+    } else {
+        return None;
     }
 
     // Phase 3: read CircuitEdges.
@@ -324,9 +343,11 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
+    } else {
+        return None;
     }
 
-    LoadedCircuit {
+    Some(LoadedCircuit {
         out_schema,
         nodes,
         edges,
@@ -335,7 +356,7 @@ pub(crate) fn load_circuit(
         incoming: HashMap::new(),
         consumers: HashMap::new(),
         gather_reduce_cols,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1159,10 @@ fn emit_node(
             if let Some(&in_reg) = in_regs.get(&PORT_IN) {
                 reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
                 reg_kinds[reg_id as usize] = reg_kinds[in_reg as usize];
+                // ExchangeGather is a logical passthrough: the exchange mechanism
+                // injects gathered data directly into the exchange-input register.
+                // Redirect downstream reads to that register; reg_id is never written.
+                out_reg_of.insert(nid, in_reg);
             }
         }
 
@@ -1689,7 +1714,7 @@ pub unsafe fn compile_view(
         sys_edges, sys_edges_schema,
         sys_node_cols, sys_node_cols_schema,
         view_id, *view_schema,
-    );
+    ).ok_or(-1)?;
     if loaded.nodes.is_empty() {
         return Err(-1);
     }
@@ -2295,6 +2320,72 @@ mod tests {
         assert!(
             !map.contains_key(&20),
             "ScanTrace-only source with no reindex Map must not be in join_shard_map"
+        );
+    }
+
+    // ── Finding 1: ExchangeGather must forward its output to exchange-input reg ──
+
+    /// ExchangeGather is a logical passthrough: at runtime the exchange mechanism
+    /// injects gathered data into the exchange-input register (`plan.in_reg`).
+    /// GatherReduce reads from ExchangeGather's output, so ExchangeGather's output
+    /// register must alias the exchange-input register — not a separate unwritten one.
+    #[test]
+    fn test_exchange_gather_routes_to_exchange_input_register() {
+        let schema = two_col_schema();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Post-exchange circuit: ExchangeShard(0) → ExchangeGather(1) → GatherReduce(2).
+        // We build only the post-plan: post_ordered = [1, 2], exchange_input = Some((0, schema)).
+        let loaded = {
+            let mut nodes = HashMap::new();
+            nodes.insert(0, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![] });
+            nodes.insert(1, gnitz_wire::OpNode::ExchangeGather);
+            nodes.insert(2, gnitz_wire::OpNode::GatherReduce);
+            make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)])
+        };
+
+        let post_ordered = vec![1, 2];
+        let plan = build_plan(
+            &loaded, &empty_rw(), &post_ordered, &[],
+            dir.path().to_str().unwrap(), 0, 1,
+            Some(2), // GatherReduce(2) is the output node; skips schema mismatch check
+            Some((0, schema)),
+            vec![],
+        ).expect("post-plan must compile");
+
+        let gather_in_reg = plan.vm.program.instructions.iter().find_map(|instr| {
+            if let crate::vm::Instr::GatherReduce { in_reg, .. } = instr {
+                Some(*in_reg)
+            } else {
+                None
+            }
+        }).expect("post-plan must contain a GatherReduce instruction");
+
+        assert_eq!(
+            gather_in_reg as i32, plan.in_reg,
+            "GatherReduce reads from register {} but exchange data arrives at register {}: \
+             ExchangeGather did not forward its output to the exchange-input register",
+            gather_in_reg, plan.in_reg
+        );
+    }
+
+    // ── Finding 2: load_circuit must return None for null system-table pointers ──
+
+    /// Null system-table pointers are a programming error; the engine always supplies
+    /// valid handles.  load_circuit must return None so callers get an explicit failure
+    /// rather than silently reading an incomplete circuit and producing wrong results.
+    #[test]
+    fn test_load_circuit_returns_none_for_null_system_tables() {
+        let result = load_circuit(
+            std::ptr::null_mut(), &empty_schema(),
+            std::ptr::null_mut(), &empty_schema(),
+            std::ptr::null_mut(), &empty_schema(),
+            0,
+            empty_schema(),
+        );
+        assert!(
+            result.is_none(),
+            "null system-table pointers must return None, not a silently empty circuit"
         );
     }
 }

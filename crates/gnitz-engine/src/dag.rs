@@ -451,7 +451,7 @@ impl DagEngine {
             self.sys.node_columns, &self.sys.node_columns_schema,
             view_id as u64,
             compiler::empty_schema(),
-        )
+        ).unwrap_or_else(compiler::LoadedCircuit::empty)
     }
 
     /// Extract shard columns for a view without full compilation.
