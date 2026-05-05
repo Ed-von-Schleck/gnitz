@@ -33,7 +33,6 @@ use crate::ops::{
     worker_for_partition, compute_worker_indices, with_worker_indices,
 };
 
-const FLAGS_PUSH_CONFLICT_MODE: u32 = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -275,7 +274,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
@@ -288,7 +287,7 @@ impl MasterDispatcher {
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
-            target_id, lsn, flags, worker_batches, schema, col_names,
+            target_id, lsn, sal_flags, worker_batches, schema, col_names,
             seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0,
         )
     }
@@ -301,7 +300,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
@@ -315,7 +314,7 @@ impl MasterDispatcher {
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_group_direct(
-            target_id as u32, lsn, flags, worker_batches,
+            target_id as u32, lsn, sal_flags, 0, worker_batches,
             schema, col_names_opt,
             seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
         )
@@ -328,7 +327,7 @@ impl MasterDispatcher {
         &mut self,
         target_id: i64,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
@@ -340,7 +339,7 @@ impl MasterDispatcher {
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_broadcast_direct(
-            target_id as u32, lsn, flags, batch, schema, col_names_opt,
+            target_id as u32, lsn, sal_flags, 0, batch, schema, col_names_opt,
             seek_pk, seek_col_idx, request_id,
         )
     }
@@ -747,7 +746,7 @@ impl MasterDispatcher {
                         CheckPayload::ScatterSource { source, worker_indices } => {
                             disp.sal.scatter_wire_group(
                                 source, worker_indices, &check.schema, None,
-                                check.target_id as u32, lsn, check.flags,
+                                check.target_id as u32, lsn, check.flags, 0,
                                 0, check.col_hint, req_slice, -1,
                             )?;
                         }
@@ -1451,7 +1450,8 @@ impl MasterDispatcher {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
                 batch, worker_indices, &schema, col_names_opt,
-                target_id as u32, lsn, FLAGS_PUSH_CONFLICT_MODE,
+                target_id as u32, lsn, FLAG_PUSH,
+                FLAG_CONFLICT_MODE_PRESENT as u64,
                 0, mode.as_u8() as u64, req_ids, -1,
             )
         })

@@ -15,6 +15,8 @@ use crate::runtime::wire::{
     build_schema_wire_block, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED,
 };
+#[cfg(test)]
+use crate::runtime::wire::FLAG_CONFLICT_MODE_PRESENT;
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -315,6 +317,10 @@ pub(crate) unsafe fn sal_write_group(
     worker_ptrs: *const *const u8,
     worker_sizes: *const u32,
 ) -> SalWriteResult {
+    debug_assert!(
+        flags & FLAG_CONFLICT_MODE_PRESENT == 0,
+        "sal_write_group: FLAG_CONFLICT_MODE_PRESENT must not appear in SAL flags"
+    );
     let nw = num_workers as usize;
     let mut sizes = [0u32; MAX_WORKERS];
     for w in 0..nw { sizes[w] = *worker_sizes.add(w); }
@@ -556,7 +562,8 @@ impl SalWriter {
         &mut self,
         target_id: u32,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
+        wire_flags: u64,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
@@ -584,7 +591,7 @@ impl SalWriter {
         let group = unsafe {
             sal_begin_group(
                 self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, flags, self.epoch, &worker_sizes[..nw],
+                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
             )
         }.ok_or_else(|| format!(
             "SAL write_group_direct failed (cursor={})", self.write_cursor
@@ -597,7 +604,7 @@ impl SalWriter {
                 let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
-                    slot, 0, target_id as u64, client_id, flags as u64,
+                    slot, 0, target_id as u64, client_id, wire_flags,
                     seek_pk, seek_col_idx, req_ids[w],
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
                 );
@@ -626,7 +633,8 @@ impl SalWriter {
         col_names_opt: Option<&[&[u8]]>,
         target_id: u32,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
+        wire_flags: u64,
         seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
@@ -655,7 +663,7 @@ impl SalWriter {
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             return self.write_group_direct(
-                target_id, lsn, flags, &refs, schema, col_names_opt,
+                target_id, lsn, sal_flags, wire_flags, &refs, schema, col_names_opt,
                 seek_pk, seek_col_idx, req_ids, unicast_worker, 0,
             );
         }
@@ -677,7 +685,7 @@ impl SalWriter {
         let group = unsafe {
             sal_begin_group(
                 self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, flags, self.epoch, &worker_sizes[..nw],
+                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
             )
         }.ok_or_else(|| format!(
             "SAL scatter_wire_group failed (cursor={})", self.write_cursor
@@ -705,15 +713,15 @@ impl SalWriter {
                 );
             }
 
-            // c. Ctrl block last (needs wire_flags which depends on count_w).
-            let wire_flags = flags as u64
+            // c. Ctrl block last (needs full_wire_flags which depends on count_w).
+            let full_wire_flags = wire_flags
                 | FLAG_HAS_SCHEMA
                 | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
                 | if input_batch.sorted { FLAG_BATCH_SORTED } else { 0 }
                 | if input_batch.consolidated { FLAG_BATCH_CONSOLIDATED } else { 0 };
             encode_ctrl_block_direct(
                 slot, 0,
-                target_id as u64, 0, wire_flags,
+                target_id as u64, 0, full_wire_flags,
                 seek_pk, seek_col_idx, req_ids[w],
                 STATUS_OK, b"", false,
             );
@@ -732,7 +740,8 @@ impl SalWriter {
         &mut self,
         target_id: u32,
         lsn: u64,
-        flags: u32,
+        sal_flags: u32,
+        wire_flags: u64,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
@@ -752,7 +761,7 @@ impl SalWriter {
         let group = unsafe {
             sal_begin_group(
                 self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, flags, self.epoch, &worker_sizes[..nw],
+                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
             )
         }.ok_or_else(|| format!(
             "SAL write_broadcast_direct failed (cursor={})", self.write_cursor
@@ -762,7 +771,7 @@ impl SalWriter {
             let wsz = wsz as usize;
             let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
             let written = encode_wire_into(
-                slot0, 0, target_id as u64, 0, flags as u64,
+                slot0, 0, target_id as u64, 0, wire_flags,
                 seek_pk, seek_col_idx, request_id,
                 STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
             );
