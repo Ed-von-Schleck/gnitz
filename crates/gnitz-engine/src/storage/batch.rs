@@ -1296,6 +1296,60 @@ impl Batch {
         super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
+    /// Byte count of the WAL-block encoding for `count` rows from this batch.
+    /// Only valid for wire-safe schemas — all region strides are multiples of 8
+    /// so there is no alignment padding and the result is linear in `count`.
+    pub fn wire_byte_size_range(&self, count: usize) -> usize {
+        let nr_wire = self.num_regions_total();
+        let blob_idx = nr_wire - 1;
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..blob_idx {
+            sizes[i] = (count * self.strides[i] as usize) as u32;
+        }
+        // blob is always empty for wire-safe schemas
+        sizes[blob_idx] = 0;
+        super::wal::block_size(nr_wire, &sizes[..nr_wire])
+    }
+
+    /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
+    /// `out[offset..]`. Returns bytes written. Only valid for wire-safe schemas
+    /// (no STRING columns, all strides 8-aligned). The blob region is encoded
+    /// as empty since wire-safe batches carry no long strings.
+    pub fn encode_range_to_wire(
+        &self,
+        start_row: usize,
+        count: usize,
+        table_id: u32,
+        out: &mut [u8],
+        offset: usize,
+        checksum: bool,
+    ) -> usize {
+        debug_assert!(
+            start_row + count <= self.count,
+            "encode_range_to_wire: range [{start_row}, {}) out of bounds (batch count = {})",
+            start_row + count, self.count,
+        );
+        let nr_wire = self.num_regions_total();
+        let blob_idx = nr_wire - 1;
+        let mut ptrs  = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
+        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        for i in 0..blob_idx {
+            let stride = self.strides[i] as usize;
+            // SAFETY: start_row * stride is within the allocated region (the
+            // debug_assert above guarantees start_row + count <= self.count).
+            ptrs[i]  = unsafe { self.region_ptr(i).add(start_row * stride) };
+            sizes[i] = (count * stride) as u32;
+        }
+        // blob: null ptr with 0 bytes — no long strings in wire-safe schemas
+        ptrs[blob_idx]  = std::ptr::null();
+        sizes[blob_idx] = 0;
+        let new_offset = super::wal::encode(
+            out, offset, 0, table_id, count as u32,
+            &ptrs[..nr_wire], &sizes[..nr_wire], 0, checksum,
+        ).expect("WAL encode failed: buffer too small");
+        new_offset - offset
+    }
+
     /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let nr_wire = self.num_regions_total();

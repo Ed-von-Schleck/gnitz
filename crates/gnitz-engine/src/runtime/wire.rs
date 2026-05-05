@@ -29,6 +29,12 @@ pub fn decode_conflict_mode(flags: u64, seek_col_idx: u64) -> WireConflictMode {
 
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
+/// W2M-internal flag set on the last (or only) scan chunk from a worker.
+/// Not part of the public wire protocol; stripped before reaching clients.
+/// The master uses this to detect end-of-train without removing FLAG_CONTINUATION
+/// from the TCP frame (FLAG_CONTINUATION must stay set on all worker scan frames
+/// so the client's loop termination — "stop on no FLAG_CONTINUATION" — still works).
+pub(crate) const FLAG_SCAN_LAST: u64 = 1 << 53;
 
 // WAL block header field offsets (matches storage/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
@@ -495,6 +501,113 @@ pub fn encode_wire_into_ipc(
 }
 
 
+/// Compute total encoded wire size for `count` rows of `data_batch`.
+///
+/// Pass `schema`/`prebuilt_schema_block` for the first chunk of a multi-chunk
+/// SCAN; pass `None` for both on continuation chunks (no schema block).
+/// Only valid for wire-safe schemas (no STRING columns).
+pub fn wire_size_range(
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    data_batch: &Batch,
+    count: usize,
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    let has_data = count > 0;
+    // A schema block is only emitted when we have schema info to write.
+    // Continuation frames pass schema=None/prebuilt=None intentionally.
+    let has_schema = (schema.is_some() || prebuilt_schema_block.is_some())
+        && (has_data || status == STATUS_OK);
+
+    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+        error_msg.len()
+    } else { 0 };
+    let mut total = if ctrl_blob == 0 {
+        CTRL_BLOCK_SIZE_NO_BLOB
+    } else {
+        schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob)
+    };
+
+    if has_schema {
+        if let Some(prebuilt) = prebuilt_schema_block {
+            total += prebuilt.len();
+        } else {
+            let s = schema.unwrap();
+            let ncols = s.num_columns as usize;
+            let schema_blob: usize = col_names.unwrap_or(&[]).iter().take(ncols)
+                .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
+                .sum();
+            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
+        }
+    }
+
+    if has_data {
+        total += data_batch.wire_byte_size_range(count);
+    }
+    total
+}
+
+/// Encode a wire message that carries only rows `[start_row, start_row+count)`
+/// from `data_batch`. No checksums (IPC fast path). For the first chunk pass
+/// `schema`/`prebuilt_schema_block`; pass `None` for both on continuations.
+/// The `sorted`/`consolidated` flags are propagated from `data_batch`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_wire_into_range(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    request_id: u64,
+    status: u32,
+    schema: Option<&SchemaDescriptor>,
+    data_batch: &Batch,
+    start_row: usize,
+    count: usize,
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    let has_data = count > 0;
+    // A schema block is only emitted when we have schema info to write.
+    // Continuation frames pass schema=None/prebuilt=None intentionally.
+    let has_schema = (schema.is_some() || prebuilt_schema_block.is_some())
+        && (has_data || status == STATUS_OK);
+
+    let mut wire_flags = flags;
+    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
+    if has_data {
+        wire_flags |= FLAG_HAS_DATA;
+        if data_batch.sorted      { wire_flags |= FLAG_BATCH_SORTED; }
+        if data_batch.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
+    }
+
+    let written = encode_ctrl_block_direct(
+        out, offset, target_id, client_id, wire_flags,
+        0u128, 0, request_id, status, &[], false,
+    );
+    let mut pos = offset + written;
+
+    if has_schema {
+        if let Some(prebuilt) = prebuilt_schema_block {
+            let end = pos + prebuilt.len();
+            out[pos..end].copy_from_slice(prebuilt);
+            pos = end;
+        } else if let Some(s) = schema {
+            let schema_batch = schema_to_batch(s, &[]);
+            let w = schema_batch.encode_to_wire(target_id as u32, out, pos, false);
+            pos += w;
+        }
+    }
+
+    if has_data {
+        let w = data_batch.encode_range_to_wire(start_row, count, target_id as u32, out, pos, false);
+        pos += w;
+    }
+
+    pos - offset
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_wire_into_impl(
     out: &mut [u8],
@@ -808,6 +921,16 @@ fn decode_wire_impl(
     decode_wire_body(data, ctrl_size, control, schema_hint, verify_checksum)
 }
 
+/// Like `decode_wire_ipc` but supplies a schema for continuation frames that
+/// carry `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA`. The client decoder reuses
+/// the schema from the first frame of a multi-chunk SCAN response.
+pub fn decode_wire_ipc_with_schema(
+    data: &[u8],
+    schema: &SchemaDescriptor,
+) -> Result<DecodedWire, &'static str> {
+    decode_wire_impl(data, Some(schema), false)
+}
+
 /// Like `decode_wire_ipc` but reuses a pre-parsed control block, avoiding a
 /// redundant parse of the control WAL block.
 pub(crate) fn decode_wire_ipc_with_ctrl(
@@ -829,12 +952,19 @@ fn decode_wire_body(
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data   = (flags & FLAG_HAS_DATA)   != 0;
 
-    if has_data && !has_schema {
+    // Continuation chunks carry FLAG_HAS_DATA without FLAG_HAS_SCHEMA; callers
+    // supply the schema from the first frame via schema_hint.
+    if has_data && !has_schema && schema_hint.is_none() {
         return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
     }
 
     let mut off = ctrl_size;
-    let mut wire_schema: Option<SchemaDescriptor> = None;
+    let mut wire_schema: Option<SchemaDescriptor> = if !has_schema && has_data {
+        // Continuation frame: reuse caller-supplied schema.
+        schema_hint.copied()
+    } else {
+        None
+    };
 
     if has_schema {
         if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {

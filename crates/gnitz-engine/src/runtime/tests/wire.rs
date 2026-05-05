@@ -592,6 +592,105 @@ fn encode_ctrl_block_direct_matches_ipc() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scan chunking tests (plan 03-ipc-scan-chunking)
+// ---------------------------------------------------------------------------
+
+use crate::runtime::wire::{
+    wire_size_range, encode_wire_into_range, decode_wire_ipc,
+    decode_wire_ipc_with_schema, FLAG_CONTINUATION,
+};
+
+fn make_wire_safe_batch(n: usize) -> Batch {
+    let sd = simple_schema();
+    let mut b = Batch::with_schema(sd, n.max(1));
+    for i in 0..n {
+        b.extend_pk(i as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &(i as u64).to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
+/// `wire_size_range` must match the actual encoded byte count.
+#[test]
+fn wire_size_range_matches_encoded_size() {
+    let sd = simple_schema();
+    let batch = make_wire_safe_batch(8);
+
+    for count in [0usize, 1, 4, 8] {
+        let sz = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, count, None);
+        let mut buf = vec![0u8; sz];
+        let written = encode_wire_into_range(
+            &mut buf, 0, 1, 0, 0, 0, STATUS_OK, Some(&sd), &batch, 0, count, None,
+        );
+        assert_eq!(written, sz, "wire_size_range mismatch for count={count}");
+    }
+}
+
+/// `wire_size_range` with count=1 minus count=0 gives positive per-row delta.
+#[test]
+fn wire_size_range_positive_per_row_delta() {
+    let sd = simple_schema();
+    let batch = make_wire_safe_batch(1);
+    let sz0 = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, 0, None);
+    let sz1 = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, 1, None);
+    assert!(sz1 > sz0, "adding 1 row must increase wire size");
+}
+
+/// `encode_wire_into_range` round-trips a sub-range of a batch correctly.
+#[test]
+fn encode_range_roundtrip() {
+    let sd = simple_schema();
+    let batch = make_wire_safe_batch(8);
+
+    // Encode rows [2, 5) into a wire frame with the schema block.
+    let sz = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, 3, None);
+    let mut buf = vec![0u8; sz];
+    encode_wire_into_range(&mut buf, 0, 1, 0, 0, 0, STATUS_OK, Some(&sd), &batch, 2, 3, None);
+
+    // Decode and verify row values.
+    let decoded = decode_wire_ipc(&buf).expect("decode_wire_ipc");
+    let b = decoded.data_batch.expect("data_batch");
+    assert_eq!(b.count, 3);
+    for i in 0..3usize {
+        assert_eq!(b.get_pk(i), (i + 2) as u128);
+    }
+}
+
+/// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) can be decoded
+/// using `decode_wire_ipc_with_schema` with a schema hint.
+#[test]
+fn continuation_frame_decoded_with_schema_hint() {
+    let sd = simple_schema();
+    let batch = make_wire_safe_batch(4);
+
+    // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
+    let sz = wire_size_range(STATUS_OK, &[], None, None, &batch, 4, None);
+    let mut buf = vec![0u8; sz];
+    encode_wire_into_range(
+        &mut buf, 0, 1, 0, FLAG_CONTINUATION, 0, STATUS_OK,
+        None, &batch, 0, 4, None,
+    );
+
+    // decode_wire_ipc must fail (no schema in frame).
+    assert!(
+        decode_wire_ipc(&buf).is_err(),
+        "decode_wire_ipc should fail for continuation frame without schema"
+    );
+
+    // decode_wire_ipc_with_schema must succeed.
+    let decoded = decode_wire_ipc_with_schema(&buf, &sd)
+        .expect("decode_wire_ipc_with_schema");
+    let b = decoded.data_batch.expect("data_batch");
+    assert_eq!(b.count, 4);
+    for i in 0..4usize {
+        assert_eq!(b.get_pk(i), i as u128);
+    }
+}
+
 /// `encode_ctrl_block_direct` falls back to `encode_ctrl_block_ipc` when an
 /// error message is present; verify byte-identical output on that path too.
 #[test]

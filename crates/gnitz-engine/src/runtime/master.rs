@@ -24,7 +24,7 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{self, FLAG_CONFLICT_MODE_PRESENT, FLAG_HAS_DATA, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
+use crate::runtime::wire::{self, FLAG_CONFLICT_MODE_PRESENT, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
@@ -655,7 +655,7 @@ impl MasterDispatcher {
 
         // Cache miss: broadcast to all workers with per-worker req_ids and
         // forward the slot whose worker found a row (or slot 0 if none).
-        let mut slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        let (mut slots, _req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -680,14 +680,22 @@ impl MasterDispatcher {
         Ok(slots.swap_remove(data_idx.unwrap_or(0)))
     }
 
+    /// Fan out a SCAN to all workers, forward every response frame directly
+    /// to `fd` (including continuation chunks), and return `Ok(true)` when
+    /// all workers finish. Returns `Ok(false)` if the client disconnects
+    /// mid-stream; returns `Err` on a worker error.
+    ///
+    /// Each slot is dropped (advancing `consume_cursor`) before the next
+    /// continuation frame is awaited to prevent W2M ring deadlock.
     pub async fn fan_out_scan_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
         client_id: u64,
-    ) -> Result<Vec<W2mSlot>, String> {
-        let slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        fd: i32,
+    ) -> Result<bool, String> {
+        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -695,15 +703,33 @@ impl MasterDispatcher {
                 0, 0, req_ids, -1, client_id,
             )
         }).await?;
-        for (w, slot) in slots.iter().enumerate() {
-            let ctrl = peek_control_block(slot.bytes())
-                .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
-            if ctrl.status != 0 {
-                let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
-                return Err(format!("worker {}: scan: {}", w, msg));
+
+        let mut disconnected = false;
+        for (w, mut slot) in slots.into_iter().enumerate() {
+            loop {
+                let ctrl = peek_control_block(slot.bytes())
+                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                if ctrl.status != 0 {
+                    let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
+                    return Err(format!("worker {}: scan: {}", w, msg));
+                }
+                // FLAG_SCAN_LAST marks the last (or only) chunk from this worker.
+                // FLAG_CONTINUATION is always set on worker frames (client compat).
+                let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
+                if !disconnected {
+                    // Forward slot to client; send_slot drops it on return.
+                    let rc = reactor.send_slot(fd, slot).await;
+                    if rc < 0 { disconnected = true; }
+                } else {
+                    // Client disconnected: drop slot to free W2M ring space so
+                    // the worker can finish emitting its pending_scan train.
+                    drop(slot);
+                }
+                if !has_more { break; }
+                slot = reactor.await_scan_slot(req_ids[w] as u32).await;
             }
         }
-        Ok(slots)
+        Ok(!disconnected)
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
@@ -1393,7 +1419,7 @@ impl MasterDispatcher {
             missing
         };
 
-        let slots = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -1402,32 +1428,49 @@ impl MasterDispatcher {
             )
         }).await?;
 
-        let decoded_vec: Vec<DecodedWire> = slots.iter().enumerate()
-            .map(|(w, slot)| {
-                decode_wire_ipc(slot.bytes())
-                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(slots);
-
-        if let Some(e) = first_worker_error("scan", &decoded_vec) {
-            return Err(e);
-        }
-
-        unsafe {
-            let disp = &mut *disp_ptr;
-            for decoded in decoded_vec {
-                let batch = match decoded.data_batch {
-                    Some(b) if b.count > 0 => b,
-                    _ => continue,
+        // Drain all continuation frames per worker, decoding directly into filters.
+        // Each slot is dropped before the next is awaited to prevent ring deadlock.
+        // Continuation frames carry no schema; reuse the schema from the first frame.
+        use crate::runtime::wire::decode_wire_ipc_with_schema;
+        use crate::schema::SchemaDescriptor;
+        for (w, mut slot) in slots.into_iter().enumerate() {
+            let mut saved_schema: Option<SchemaDescriptor> = None;
+            loop {
+                let ctrl = peek_control_block(slot.bytes())
+                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                if ctrl.status != 0 {
+                    let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
+                    return Err(format!("worker {}: scan: {}", w, msg));
+                }
+                let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
+                let decoded = if let Some(ref s) = saved_schema {
+                    decode_wire_ipc_with_schema(slot.bytes(), s)
+                        .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?
+                } else {
+                    let d = decode_wire_ipc(slot.bytes())
+                        .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                    if let Some(s) = d.schema { saved_schema = Some(s); }
+                    d
                 };
-                for d in &missing {
-                    if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                        if !filter.capped {
-                            extract_into_filter(filter, &batch, d);
+                drop(slot);
+
+                if let Some(batch) = decoded.data_batch {
+                    if batch.count > 0 {
+                        unsafe {
+                            let disp = &mut *disp_ptr;
+                            for d in &missing {
+                                if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                                    if !filter.capped {
+                                        extract_into_filter(filter, &batch, d);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+
+                if !has_more { break; }
+                slot = reactor.await_scan_slot(req_ids[w] as u32).await;
             }
         }
         Ok(())
@@ -1567,7 +1610,7 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex<()>>,
     submit: F,
-) -> Result<Vec<W2mSlot>, String>
+) -> Result<(Vec<W2mSlot>, Vec<u64>), String>
 where
     F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
 {
@@ -1584,9 +1627,10 @@ where
             disp.signal_all();
         }
     }
-    Ok(crate::runtime::reactor::join_all_unpin(
+    let slots = crate::runtime::reactor::join_all_unpin(
         req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
-    ).await)
+    ).await;
+    Ok((slots, req_ids[..nw].to_vec()))
 }
 
 /// Common body for every single-worker async fan-out. Submits the SAL

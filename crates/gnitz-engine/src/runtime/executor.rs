@@ -700,17 +700,16 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id, client_id,
+        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id, client_id, fd,
     ).await;
     match result {
-        Ok(worker_slots) => {
-            for slot in worker_slots {
-                let rc = shared.reactor.send_slot(fd, slot).await;
-                if rc < 0 { shared.reactor.close_fd(fd); return; }
-            }
+        Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
             let rc = shared.reactor.send_buffer(fd, terminal).await;
             if rc < 0 { shared.reactor.close_fd(fd); }
+        }
+        Ok(false) => {
+            shared.reactor.close_fd(fd);
         }
         Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }

@@ -179,7 +179,7 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 /// True when every column has a fixed-width 8-aligned stride and no STRING
 /// columns. Batches satisfying this can be scatter-encoded directly into SAL
 /// slots without intermediate per-worker Batch allocations.
-fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
+pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     (0..schema.num_columns as usize).all(|ci| {
         let c = &schema.columns[ci];
         c.type_code != type_code::STRING && c.size % 8 == 0
