@@ -388,50 +388,43 @@ impl WorkerProcess {
         let schema_owned: Option<SchemaDescriptor> = if is_first { batch.schema } else { None };
         let schema_opt = schema_owned.as_ref();
         let prebuilt_opt: Option<&[u8]> = if is_first {
-            prebuilt_schema.as_deref().map(|v: &Vec<u8>| v.as_slice())
+            prebuilt_schema.as_deref().map(Vec::as_slice)
         } else {
             None
         };
 
         let remaining = batch.count - next_row;
-        let frame_limit = w2m_ring::MAX_W2M_MSG as usize;
-
         // Compute rows per chunk via linear interpolation (wire-safe schemas have
         // constant per-row stride, so wire size is linear in count).
         let sz_0 = ipc::wire_size_range(STATUS_OK, &[], schema_opt, None, &batch, 0, prebuilt_opt);
         let sz_1 = ipc::wire_size_range(STATUS_OK, &[], schema_opt, None, &batch, 1, prebuilt_opt);
         let per_row = sz_1.saturating_sub(sz_0);
         let max_rows = if per_row > 0 {
-            let usable = frame_limit.saturating_sub(sz_0);
+            let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
             (usable / per_row).max(1).min(remaining)
         } else {
             remaining.max(1)
         };
-        let count = max_rows;
-        let has_more = next_row + count < batch.count;
+        let has_more = next_row + max_rows < batch.count;
         // FLAG_CONTINUATION is always set on worker scan frames so the client's
         // loop termination ("stop on no FLAG_CONTINUATION") still works.
         // FLAG_SCAN_LAST is the W2M-internal signal that this is the last chunk.
         let flags: u64 = FLAG_CONTINUATION | if !has_more { FLAG_SCAN_LAST } else { 0 };
-        let new_next_row = next_row + count;
-
-        let sz = ipc::wire_size_range(STATUS_OK, &[], schema_opt, None, &batch, count, prebuilt_opt);
-        // Pre-check ring capacity to skip the atomic fetch_or(FLAG_WRITER_PARKED) in
-        // try_reserve when the ring is already full. send_encoded still parks via
-        // futex_wait if the ring fills between this check and the reservation.
-        let _ = self.w2m_writer.has_room(sz);
+        // wire_size_range is linear in count for wire-safe schemas; avoid a third call.
+        let sz = sz_0 + per_row * max_rows;
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_range(
                 buf, 0, target_id, client_id, flags,
                 0, STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
                 schema_opt, &batch,
-                next_row, count,
+                next_row, max_rows,
                 prebuilt_opt,
             );
         });
 
         if has_more {
-            self.pending_scan.as_mut().unwrap().next_row = new_next_row;
+            debug_assert!(self.pending_scan.is_some());
+            self.pending_scan.as_mut().unwrap().next_row = next_row + max_rows;
         } else {
             self.pending_scan = None;
         }
@@ -896,10 +889,9 @@ impl WorkerProcess {
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
-            let prebuilt = prebuilt_rc.as_deref().map(|v: &Vec<u8>| v.as_slice());
+            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             let wire_sz = ipc::wire_size(STATUS_OK, &[], schema, None, Some(&*batch), prebuilt);
             if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
-                self.pending_scan = None;
                 return Some(format!(
                     "scan: batch wire_size={wire_sz} > MAX_W2M_MSG={}; \
                      STRING-column chunking not yet implemented",
@@ -920,7 +912,7 @@ impl WorkerProcess {
         // Wire-safe path: range encoder supports chunking.
         let total_rows = batch.count;
         let total_sz = {
-            let prebuilt = prebuilt_rc.as_deref().map(|v: &Vec<u8>| v.as_slice());
+            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             ipc::wire_size_range(STATUS_OK, &[], schema, None, &batch, total_rows, prebuilt)
         };
 
@@ -928,7 +920,7 @@ impl WorkerProcess {
             // Single-frame response: FLAG_CONTINUATION keeps the client reading
             // (terminal frame signals scan end); FLAG_SCAN_LAST tells master this
             // worker's chunk train is done.
-            let prebuilt = prebuilt_rc.as_deref().map(|v: &Vec<u8>| v.as_slice());
+            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into_range(
                     buf, 0, target_id, client_id,
@@ -2000,6 +1992,197 @@ mod tests {
         assert!(wp.next_sal_message().is_none());
 
         unsafe { libc::munmap(sal_ptr as *mut libc::c_void, SAL_SIZE); }
+    }
+
+    // -- pending_scan chunking tests -----------------------------------------------
+
+    fn make_ring() -> (*mut u8, W2mWriter) {
+        let size = w2m_ring::W2M_REGION_SIZE;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1, 0,
+            ) as *mut u8
+        };
+        assert_ne!(ptr, libc::MAP_FAILED as *mut u8);
+        unsafe { w2m_ring::init_region(ptr, size as u64); }
+        (ptr, W2mWriter::new(ptr, size as u64))
+    }
+
+    fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
+        let mut b = Batch::with_schema(schema, n.max(1));
+        for i in 0..n {
+            b.extend_pk(i as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(i as u64).to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    fn consume_one(ptr: *mut u8) -> Vec<u8> {
+        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(ptr as *const u8) };
+        let rc = w2m_ring::W2M_HEADER_SIZE as u64;
+        let (data_ptr, sz, _, _) = unsafe {
+            w2m_ring::try_consume(hdr, ptr as *const u8, rc)
+                .expect("expected one ring message")
+        };
+        unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) }.to_vec()
+    }
+
+    /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
+    /// block must appear in the frame and decode_wire_ipc must succeed without a hint.
+    #[test]
+    fn test_pending_scan_first_chunk_includes_schema() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 10);
+        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 1));
+
+        let (ptr, writer) = make_ring();
+        let mut wp = WorkerProcess {
+            worker_id: 0, num_workers: 1, master_pid: 0,
+            catalog: std::ptr::null_mut(),
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer: writer,
+            exchange: make_handler(),
+            pending_deltas: HashMap::new(),
+            pending_scan: Some(PendingScan {
+                batch: Rc::new(batch),
+                next_row: 0,
+                request_id: 7,
+                client_id: 42,
+                target_id: 1,
+                prebuilt_schema: Some(schema_block),
+            }),
+            read_cursor: 0,
+            expected_epoch: 1,
+        };
+
+        wp.emit_pending_scan_chunk();
+        assert!(wp.pending_scan.is_none(), "10 rows fit in one chunk; pending_scan must clear");
+
+        let data = consume_one(ptr);
+        let decoded = ipc::decode_wire_ipc(&data)
+            .expect("first chunk must decode without schema hint");
+        assert!(decoded.schema.is_some(), "first chunk must carry schema block");
+        let b = decoded.data_batch.expect("first chunk must carry data");
+        assert_eq!(b.count, 10);
+        for i in 0..10usize { assert_eq!(b.get_pk(i), i as u128); }
+        assert_ne!(decoded.control.flags & FLAG_SCAN_LAST, 0,
+            "FLAG_SCAN_LAST must be set on the only chunk");
+        assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0,
+            "FLAG_CONTINUATION must always be set on worker scan frames");
+
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    /// Continuation chunk — next_row > 0, prebuilt_schema == None. The frame carries
+    /// no schema block; decode_wire_ipc fails but decode_wire_ipc_with_schema succeeds
+    /// and returns only the remaining rows (rows [5, 10)).
+    #[test]
+    fn test_pending_scan_continuation_chunk_excludes_schema() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 10);
+
+        let (ptr, writer) = make_ring();
+        let mut wp = WorkerProcess {
+            worker_id: 0, num_workers: 1, master_pid: 0,
+            catalog: std::ptr::null_mut(),
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer: writer,
+            exchange: make_handler(),
+            pending_deltas: HashMap::new(),
+            pending_scan: Some(PendingScan {
+                batch: Rc::new(batch),
+                next_row: 5,
+                request_id: 9,
+                client_id: 0,
+                target_id: 1,
+                prebuilt_schema: None,
+            }),
+            read_cursor: 0,
+            expected_epoch: 1,
+        };
+
+        wp.emit_pending_scan_chunk();
+        assert!(wp.pending_scan.is_none(), "remaining 5 rows fit in one chunk");
+
+        let data = consume_one(ptr);
+        assert!(
+            ipc::decode_wire_ipc(&data).is_err(),
+            "continuation frame without schema must fail decode_wire_ipc"
+        );
+        let decoded = ipc::decode_wire_ipc_with_schema(&data, &schema)
+            .expect("decode_wire_ipc_with_schema must succeed for continuation frame");
+        let b = decoded.data_batch.expect("continuation chunk must carry data");
+        assert_eq!(b.count, 5);
+        for i in 0..5usize { assert_eq!(b.get_pk(i), (i + 5) as u128); }
+        assert_ne!(decoded.control.flags & FLAG_SCAN_LAST, 0,
+            "FLAG_SCAN_LAST must be set on the last chunk");
+        assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0);
+
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    /// send_scan_response with schema=None (avoids catalog) emits a single ring
+    /// message with FLAG_CONTINUATION | FLAG_SCAN_LAST for a small wire-safe batch,
+    /// and leaves pending_scan == None.
+    #[test]
+    fn test_send_scan_response_single_frame() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 5);
+
+        let (ptr, writer) = make_ring();
+        let mut wp = WorkerProcess {
+            worker_id: 0, num_workers: 1, master_pid: 0,
+            catalog: std::ptr::null_mut(),
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer: writer,
+            exchange: make_handler(),
+            pending_deltas: HashMap::new(),
+            pending_scan: None,
+            read_cursor: 0,
+            expected_epoch: 1,
+        };
+
+        let err = wp.send_scan_response(1, Rc::new(batch), None, 3, 0);
+        assert!(err.is_none(), "small wire-safe batch must not error");
+        assert!(wp.pending_scan.is_none(),
+            "batch fits in one frame; send_scan_response must not set pending_scan");
+
+        let data = consume_one(ptr);
+        let ctrl = ipc::peek_control_block(&data).expect("peek_control_block");
+        assert_eq!(ctrl.status, STATUS_OK);
+        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single-frame response must set FLAG_SCAN_LAST");
+        assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+
+        let decoded = ipc::decode_wire_ipc_with_schema(&data, &schema)
+            .expect("decode with schema hint");
+        let b = decoded.data_batch.expect("data block");
+        assert_eq!(b.count, 5);
+        for i in 0..5usize { assert_eq!(b.get_pk(i), i as u128); }
+
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    /// STRING-column schemas are not wire-safe: send_scan_response sends them as a
+    /// single frame without chunking (and returns an error if the batch exceeds
+    /// MAX_W2M_MSG). The full error path requires a CatalogEngine + a > 256 MiB
+    /// batch; this test verifies the predicate that gates that branch.
+    #[test]
+    fn test_string_schema_not_wire_safe() {
+        use crate::schema::{SchemaColumn, type_code};
+        let mut sd = SchemaDescriptor::default();
+        sd.num_columns = 1;
+        sd.pk_index = 0;
+        sd.columns[0] = SchemaColumn::new(type_code::STRING, 0);
+        assert!(!schema_wire_safe(&sd),
+            "STRING-column schema must not be wire-safe (no chunking)");
+        assert!(schema_wire_safe(&test_schema()),
+            "U64-only schema must be wire-safe (chunking enabled)");
     }
 
 }

@@ -708,7 +708,7 @@ impl MasterDispatcher {
         for (w, mut slot) in slots.into_iter().enumerate() {
             loop {
                 let ctrl = peek_control_block(slot.bytes())
-                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                    .map_err(|e| scan_decode_err(w, e))?;
                 if ctrl.status != 0 {
                     let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
                     return Err(format!("worker {}: scan: {}", w, msg));
@@ -1437,7 +1437,7 @@ impl MasterDispatcher {
             let mut saved_schema: Option<SchemaDescriptor> = None;
             loop {
                 let ctrl = peek_control_block(slot.bytes())
-                    .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                    .map_err(|e| scan_decode_err(w, e))?;
                 if ctrl.status != 0 {
                     let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
                     return Err(format!("worker {}: scan: {}", w, msg));
@@ -1445,10 +1445,10 @@ impl MasterDispatcher {
                 let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
                 let decoded = if let Some(ref s) = saved_schema {
                     decode_wire_ipc_with_schema(slot.bytes(), s)
-                        .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?
+                        .map_err(|e| scan_decode_err(w, e))?
                 } else {
                     let d = decode_wire_ipc(slot.bytes())
-                        .map_err(|e| format!("scan: worker {}: decode error: {}", w, e))?;
+                        .map_err(|e| scan_decode_err(w, e))?;
                     if let Some(s) = d.schema { saved_schema = Some(s); }
                     d
                 };
@@ -1605,12 +1605,16 @@ fn worker_error_scan<'a>(
 /// concurrent checkpoint FLAG_FLUSH groups: without the lock a fan-out
 /// could write with the old epoch during the checkpoint window, workers
 /// would skip it, and the caller would hang waiting for an ACK.
+fn scan_decode_err(w: usize, e: &'static str) -> String {
+    format!("scan: worker {w}: decode error: {e}")
+}
+
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex<()>>,
     submit: F,
-) -> Result<(Vec<W2mSlot>, Vec<u64>), String>
+) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS]), String>
 where
     F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
 {
@@ -1630,7 +1634,7 @@ where
     let slots = crate::runtime::reactor::join_all_unpin(
         req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
     ).await;
-    Ok((slots, req_ids[..nw].to_vec()))
+    Ok((slots, req_ids))
 }
 
 /// Common body for every single-worker async fan-out. Submits the SAL

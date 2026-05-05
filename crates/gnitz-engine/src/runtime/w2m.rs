@@ -24,16 +24,6 @@ impl W2mWriter {
         W2mWriter { region_ptr }
     }
 
-    /// Non-atomic ring capacity pre-check. Returns `true` when `sz` bytes can
-    /// likely be reserved without parking. Use as a fast-path guard before
-    /// `send_encoded` to skip encoding work when the ring is known full.
-    /// Note: `send_encoded` itself correctly handles the full-ring case via
-    /// `futex_wait`; this is a performance optimisation only.
-    pub fn has_room(&self, sz: usize) -> bool {
-        let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
-        unsafe { w2m_ring::has_room(hdr, sz) }
-    }
-
     /// Encode wire data into the W2M ring. Blocks on `writer_seq` if full.
     /// `internal_req_id` is stored in the slot prefix so the master can route
     /// scan responses without decoding the wire frame.
