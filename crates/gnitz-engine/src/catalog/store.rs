@@ -1,5 +1,4 @@
 use super::*;
-use crate::storage::create_cursor_from_snapshots;
 
 const SYS_TABLE_IDS: &[i64] = &[
     SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
@@ -193,11 +192,7 @@ impl CatalogEngine {
         };
         // The CIRCUIT_* tables are now SQL-introspectable: every operator's
         // parameter shape is expressible in catalog schema.
-        if matches!(table_id, SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID
-            | COL_TAB_ID | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID
-            | CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_NODE_COLUMNS_TAB_ID)
-        {
-            let table = self.sys_table_mut(table_id).unwrap();
+        if let Some(table) = self.sys_table_mut(table_id) {
             return Ok(table.full_scan().unwrap_or_else(|_| {
                 Rc::new(Batch::empty_with_schema(&schema))
             }));
@@ -219,17 +214,10 @@ impl CatalogEngine {
         // CircuitNodeColumns layout is SQL-introspectable; only unrecognised
         // system table IDs return None.
         let cursor_result = if table_id < FIRST_USER_TABLE_ID {
-            match table_id {
-                SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID
-                | IDX_TAB_ID | DEP_TAB_ID | SEQ_TAB_ID
-                | CIRCUIT_NODES_TAB_ID | CIRCUIT_EDGES_TAB_ID | CIRCUIT_NODE_COLUMNS_TAB_ID => {
-                    let arc = match self.sys_table_mut(table_id).unwrap().full_scan() {
-                        Ok(a) => a,
-                        Err(_) => return Ok(None),
-                    };
-                    Ok(create_cursor_from_snapshots(&[arc], &[], schema))
-                }
-                _ => return Ok(None),
+            if let Some(table) = self.sys_table_mut(table_id) {
+                table.create_cursor()
+            } else {
+                return Ok(None);
             }
         } else {
             self.dag.tables.get(&table_id).unwrap().handle.create_cursor()
@@ -684,8 +672,7 @@ impl CatalogEngine {
     pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Result<Vec<ColumnDef>, String> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
-        let arc = self.sys_columns.full_scan().map_err(|e| e.to_string())?;
-        let mut cursor = create_cursor_from_snapshots(&[arc], &[], sys_tab_schema(COL_TAB_ID));
+        let mut cursor = self.sys_columns.create_cursor().map_err(|e| e.to_string())?;
         cursor.cursor.seek(start_pk as u128);
 
         let mut defs = Vec::new();
