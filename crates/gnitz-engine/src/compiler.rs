@@ -257,7 +257,8 @@ pub(crate) fn load_circuit(
 
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
-    if let Some(mut ch) = open_system_cursor(sys_node_cols, view_id) {
+    {
+        let mut ch = open_system_cursor(sys_node_cols, view_id)?;
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
@@ -273,8 +274,6 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
-    } else {
-        return None;
     }
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
     for v in cols_by_node.values_mut() {
@@ -282,7 +281,8 @@ pub(crate) fn load_circuit(
     }
 
     // Phase 2: read CircuitNodes; call decode_op_node for each.
-    if let Some(mut ch) = open_system_cursor(sys_nodes, view_id) {
+    {
+        let mut ch = open_system_cursor(sys_nodes, view_id)?;
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
@@ -324,12 +324,11 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
-    } else {
-        return None;
     }
 
     // Phase 3: read CircuitEdges.
-    if let Some(mut ch) = open_system_cursor(sys_edges, view_id) {
+    {
+        let mut ch = open_system_cursor(sys_edges, view_id)?;
         let end_hi = view_id + 1;
         while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
             if ch.cursor.current_weight > 0 {
@@ -343,19 +342,14 @@ pub(crate) fn load_circuit(
                 break;
             }
         }
-    } else {
-        return None;
     }
 
     Some(LoadedCircuit {
         out_schema,
         nodes,
         edges,
-        ordered: Vec::new(),
-        outgoing: HashMap::new(),
-        incoming: HashMap::new(),
-        consumers: HashMap::new(),
         gather_reduce_cols,
+        ..LoadedCircuit::empty()
     })
 }
 
