@@ -93,13 +93,14 @@ impl Shared {
             .unwrap_or_else(SchemaDescriptor::minimal_u64)
     }
 
-    /// Return (or build and cache) the encoded schema wire block for `target_id`.
-    /// The block is stable for the lifetime of the table schema — it is
-    /// invalidated alongside col_names whenever DDL modifies the table.
-    fn get_schema_wire_block(&self, target_id: i64) -> Rc<Vec<u8>> {
+    /// Return (or build and cache) the encoded schema wire block and current
+    /// schema version for `target_id`. The block is stable for the lifetime
+    /// of the table schema — it is invalidated alongside col_names whenever
+    /// DDL modifies the table.
+    fn get_schema_wire_block(&self, target_id: i64) -> (Rc<Vec<u8>>, u16) {
         let cat = self.cat();
-        if let Some(block) = cat.get_cached_schema_wire_block(target_id) {
-            return block;
+        if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
+            return cached;
         }
         let schema = cat.get_schema_desc(target_id)
             .unwrap_or_else(SchemaDescriptor::minimal_u64);
@@ -109,8 +110,9 @@ impl Shared {
         let block = Rc::new(ipc::build_schema_wire_block(
             &schema, names_slice, target_id as u32,
         ));
+        let version = cat.get_schema_version(target_id);
         cat.set_schema_wire_block(target_id, block.clone());
-        block
+        (block, version)
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
@@ -561,12 +563,7 @@ async fn handle_message(
     }
 
     let decoded = {
-        let schema_hint = shared.cat().get_schema_desc(peeked_target_id as i64);
-        let result = match schema_hint.as_ref() {
-            Some(s) => ipc::decode_wire_with_schema(data, s),
-            None    => ipc::decode_wire(data),
-        };
-        match result {
+        match ipc::decode_wire(data) {
             Ok(d) => d,
             Err(e) => {
                 let msg = format!("decode error: {}", e);
@@ -579,6 +576,7 @@ async fn handle_message(
     let client_id = decoded.control.client_id;
     let target_id = decoded.control.target_id as i64;
     let flags = decoded.control.flags;
+    let client_version = ipc::wire_flags_get_schema_version(flags);
 
     // ---------- ID allocations ----------
     if target_id == 0 {
@@ -609,19 +607,19 @@ async fn handle_message(
     if flags & FLAG_SEEK != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek(shared, fd, client_id, target_id,
-                    decoded.control.seek_pk).await;
+                    decoded.control.seek_pk, client_version).await;
         return;
     }
     if flags & FLAG_SEEK_BY_INDEX != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index(shared, fd, client_id, target_id,
                              decoded.control.seek_col_idx as u32,
-                             decoded.control.seek_pk).await;
+                             decoded.control.seek_pk, client_version).await;
         return;
     }
 
     if target_id >= FIRST_USER_TABLE_ID && (!has_batch || batch_count == 0) {
-        handle_scan(shared, fd, client_id, target_id).await;
+        handle_scan(shared, fd, client_id, target_id, client_version).await;
         return;
     }
 
@@ -638,7 +636,7 @@ async fn handle_message(
 
     // ---------- User-table INSERT ----------
     if target_id >= FIRST_USER_TABLE_ID && has_batch && batch_count > 0 {
-        let mode = ipc::decode_conflict_mode(flags, decoded.control.seek_col_idx);
+        let mode = ipc::wire_flags_get_conflict_mode(flags);
         let batch = decoded.data_batch.unwrap();
 
         let _cat = shared.catalog_rwlock.read().await;
@@ -682,7 +680,7 @@ async fn handle_message(
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
-                send_ok_response(shared, fd, target_id, None, client_id, lsn as u128).await;
+                send_ok_response(shared, fd, target_id, None, client_id, lsn as u128, client_version).await;
             }
             Ok(Err(e)) => {
                 send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
@@ -696,7 +694,7 @@ async fn handle_message(
 
     // ---------- System-table DML (catalog + optional DDL broadcast) ----------
     if target_id < FIRST_USER_TABLE_ID {
-        handle_system_dml(shared, fd, client_id, target_id, decoded).await;
+        handle_system_dml(shared, fd, client_id, target_id, decoded, client_version).await;
     }
 
     // Fallthrough: ignore (should not happen).
@@ -704,7 +702,7 @@ async fn handle_message(
 
 async fn handle_seek(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, pk: u128,
+    target_id: i64, pk: u128, client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -725,7 +723,7 @@ async fn handle_seek(
     } else {
         match unsafe { (*shared.catalog).seek_family(target_id, pk) } {
             Ok(batch) => send_ok_response(
-                shared, fd, target_id, batch.as_ref(), client_id, pk,
+                shared, fd, target_id, batch.as_ref(), client_id, pk, client_version,
             ).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -734,7 +732,7 @@ async fn handle_seek(
 
 async fn handle_seek_by_index(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, col_idx: u32, key: u128,
+    target_id: i64, col_idx: u32, key: u128, client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -755,7 +753,7 @@ async fn handle_seek_by_index(
     } else {
         match unsafe { (*shared.catalog).seek_by_index(target_id, col_idx, key) } {
             Ok(batch) => send_ok_response(
-                shared, fd, target_id, batch.as_ref(), client_id, 0,
+                shared, fd, target_id, batch.as_ref(), client_id, 0, client_version,
             ).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -764,6 +762,7 @@ async fn handle_seek_by_index(
 
 async fn handle_scan(
     shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i64,
+    client_version: u16,
 ) {
     // Drain pending ticks before reading: views derive from source-table
     // pushes through the DAG (IV.2). Loop until `tick_rows` is empty —
@@ -795,7 +794,8 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
     let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, target_id, client_id, fd,
+        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+        target_id, client_id, fd, client_version,
     ).await;
     match result {
         Ok(true) => {
@@ -811,14 +811,15 @@ async fn handle_scan(
 }
 
 fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
-    encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128)
+    // Terminal scan frame: no schema block, no data. Client ignores schema version here.
+    encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128, 0)
 }
 
 /// System-table path: catalog ingest + (optionally) DDL broadcast.
 /// DDL path acquires the catalog write lock and drains the committer.
 async fn handle_system_dml(
     shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i64,
-    decoded: ipc::DecodedWire,
+    decoded: ipc::DecodedWire, client_version: u16,
 ) {
     let batch = decoded.data_batch;
     let non_empty = batch.as_ref().map(|b| b.count > 0).unwrap_or(false);
@@ -831,7 +832,8 @@ async fn handle_system_dml(
             Ok(b) => {
                 let batch_ref = if b.count > 0 { Some(b) } else { None };
                 send_ok_response(shared, fd, target_id, batch_ref.as_deref(),
-                                 client_id, shared.last_tick_lsn.get() as u128).await;
+                                 client_id, shared.last_tick_lsn.get() as u128,
+                                 client_version).await;
             }
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -925,7 +927,7 @@ async fn handle_system_dml(
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
     unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
-    send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128).await;
+    send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {
@@ -952,6 +954,7 @@ fn encode_response_buffer(
     result: Option<&Batch>, status: u32, error_msg: &[u8],
     prebuilt_schema: Option<&[u8]>,
     seek_pk: u128,
+    flags: u64,
 ) -> PooledSendBuf {
     let sz = ipc::wire_size(status, error_msg, None, None, result, prebuilt_schema);
     let total = 4 + sz;
@@ -965,7 +968,7 @@ fn encode_response_buffer(
     let written = ipc::encode_wire_into_ipc(
         &mut inner[4..total], 0,
         target_id as u64, client_id,
-        0, seek_pk, 0, 0,
+        flags, seek_pk, 0, 0,
         status, error_msg,
         None, None, result, prebuilt_schema,
     );
@@ -977,11 +980,18 @@ fn encode_response_buffer(
 async fn send_ok_response(
     shared: &Rc<Shared>, fd: i32, target_id: i64,
     result: Option<&Batch>, client_id: u64, seek_pk: u128,
+    client_version: u16,
 ) {
-    let schema_block = shared.get_schema_wire_block(target_id);
+    let (schema_block, server_version) = shared.get_schema_wire_block(target_id);
+    let schema_arg = if gnitz_wire::wire_should_include_schema(client_version, server_version) {
+        Some(schema_block.as_slice())
+    } else {
+        None
+    };
+    let flags = ipc::wire_flags_set_schema_version(0, server_version);
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
-        Some(schema_block.as_slice()), seek_pk,
+        schema_arg, seek_pk, flags,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -993,9 +1003,10 @@ async fn send_error(
 ) {
     // STATUS_ERROR suppresses the schema block (has_schema = false), so
     // prebuilt_schema = None is correct and saves the cache lookup.
+    // flags=0: client ignores schema version on error responses.
     let buf = encode_response_buffer(
         target_id, client_id, None, STATUS_ERROR, error_msg,
-        None, 0,
+        None, 0, 0,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
@@ -1004,7 +1015,8 @@ async fn send_error(
 async fn send_alloc(
     shared: &Rc<Shared>, fd: i32, new_id: i64, client_id: u64,
 ) {
-    let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0);
+    // Alloc responses carry no schema block; schema version irrelevant.
+    let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0, 0);
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }
 }

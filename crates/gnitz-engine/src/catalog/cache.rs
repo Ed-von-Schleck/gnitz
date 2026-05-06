@@ -22,6 +22,10 @@ pub(crate) struct CatalogCacheSet {
     /// (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
     /// Invalidated alongside col_names when DDL modifies the table schema.
     pub(crate) schema_wire_block: FxHashMap<i64, Rc<Vec<u8>>>,
+    /// Monotonically increasing schema version per table (wraps 65535→1, never 0).
+    /// Absent entries implicitly resolve to version 1 (base version).
+    /// Version 0 is reserved as "client has no cached schema".
+    pub(crate) schema_version: FxHashMap<i64, u16>,
     pub(crate) index_by_name:    FxHashMap<String, i64>,
     pub(crate) index_by_id:      FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
@@ -31,15 +35,39 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) cascade_enabled:  bool,
 }
 
+/// Increment a schema version counter: wraps 65535 → 1, never 0.
+/// 0 is reserved as the client sentinel meaning "no cached schema".
+#[inline]
+fn bump_schema_version(v: u16) -> u16 {
+    if v == u16::MAX { 1 } else { v + 1 }
+}
+
 impl CatalogCacheSet {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn invalidate_col_names(&mut self, id: i64) {
+    /// Remove the three derived column caches without bumping the schema version.
+    /// Use for table drop (no new schema to advertise) or as the inner step of
+    /// `invalidate_col_names`.
+    pub(crate) fn clear_col_cache_no_bump(&mut self, id: i64) {
         self.col_names.remove(&id);
         self.col_names_bytes.remove(&id);
         self.schema_wire_block.remove(&id);
+    }
+
+    pub(crate) fn invalidate_col_names(&mut self, id: i64) {
+        self.clear_col_cache_no_bump(id);
+        // Absent entries implicitly resolve to version 1 (the base sentinel);
+        // first invalidation produces 2, so a client holding version 1 always
+        // sees a mismatch. Version 0 is reserved for "client has no cached schema".
+        let v = self.schema_version.entry(id).or_insert(1);
+        *v = bump_schema_version(*v);
+    }
+
+    /// Return the current schema version for `id`. Absent = version 1.
+    pub(crate) fn get_schema_version(&self, id: i64) -> u16 {
+        self.schema_version.get(&id).copied().unwrap_or(1)
     }
 }
 
@@ -111,7 +139,10 @@ impl CatalogEngine {
                 let schema_name = self.caches.schema_by_id.get(&sid).map_or_else(String::new, String::clone);
                 self.caches.entity_by_id.insert(tid, (schema_name, name));
             } else {
-                self.caches.invalidate_col_names(tid);
+                // Table dropped: clear per-table cache entries without bumping the
+                // schema version (there is no new schema to advertise).
+                self.caches.clear_col_cache_no_bump(tid);
+                self.caches.schema_version.remove(&tid);
                 self.caches.entity_by_id.remove(&tid);
             }
         }
@@ -155,14 +186,20 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            
+
             if weight > 0 {
                 let pk_col = if is_table {
                     self.read_batch_u64(batch, i, 3) as u32 // TABLETAB_COL_PK_COL_IDX
                 } else {
                     0u32 // views always pk_col=0
                 };
-                self.caches.pk_col_of.insert(tid, pk_col);
+                // Only invalidate schema cache when the PK column assignment changes.
+                // Unconditional invalidation would produce spurious bumps on no-op updates
+                // and retract-reinsert cycles with an identical PK column.
+                let old = self.caches.pk_col_of.insert(tid, pk_col);
+                if old.map_or(true, |prev| prev != pk_col) {
+                    self.caches.invalidate_col_names(tid);
+                }
             } else {
                 self.caches.pk_col_of.remove(&tid);
             }

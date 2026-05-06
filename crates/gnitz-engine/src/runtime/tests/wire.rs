@@ -1,5 +1,5 @@
 use crate::runtime::wire::{
-    encode_wire, encode_wire_into, decode_wire, decode_wire_with_schema,
+    encode_wire, encode_wire_into, decode_wire,
     wire_size, schema_to_batch, batch_to_schema, peek_routing_header,
     build_schema_wire_block,
     encode_ctrl_block_ipc, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
@@ -395,51 +395,30 @@ fn test_decode_truncated_control_block_returns_err() {
         "decode should reject truncated control block, got Ok");
 }
 
+/// `decode_wire` decodes from the wire block's embedded schema; schema
+/// validation against the catalog happens separately in the executor.
 #[test]
-fn test_decode_wire_with_schema_rejects_nullable_mismatch() {
-    let mut server_sd = SchemaDescriptor {
+fn test_decode_wire_uses_embedded_schema() {
+    let mut sd = SchemaDescriptor {
         num_columns: 2,
         pk_index: 0,
         columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
     };
-    server_sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    server_sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 1, _pad: 0 };
-
-    let mut client_sd = server_sd;
-    client_sd.columns[1].nullable = 0;
+    sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+    sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
 
     let batch = make_simple_batch(1, 42);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = encode_wire(
         1, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
-        Some(&client_sd), Some(&names), Some(&batch),
+        Some(&sd), Some(&names), Some(&batch),
     );
-    let result = decode_wire_with_schema(&wire, &server_sd);
-    assert!(result.is_err(),
-        "decode_wire_with_schema should reject nullable mismatch but accepted it");
-}
-
-#[test]
-fn test_decode_wire_with_schema_accepts_nullable_match() {
-    let mut server_sd = SchemaDescriptor {
-        num_columns: 2,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    server_sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    server_sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 1, _pad: 0 };
-
-    let batch = make_simple_batch(1, 42);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
-    let wire = encode_wire(
-        1, 0, 0, 0u128, 0, 0,
-        STATUS_OK, b"",
-        Some(&server_sd), Some(&names), Some(&batch),
-    );
-    let result = decode_wire_with_schema(&wire, &server_sd);
-    assert!(result.is_ok(),
-        "decode_wire_with_schema should accept matching nullable");
+    let result = decode_wire(&wire);
+    assert!(result.is_ok(), "decode_wire should succeed for a valid frame");
+    let decoded = result.unwrap();
+    assert!(decoded.schema.is_some());
+    assert!(decoded.data_batch.is_some());
 }
 
 /// decode_control_block reads error_msg from the blob arena when the string
@@ -599,7 +578,9 @@ fn encode_ctrl_block_direct_matches_ipc() {
 
 use crate::runtime::wire::{
     wire_size_range, encode_wire_into_range, decode_wire_ipc,
-    decode_wire_ipc_with_schema, FLAG_CONTINUATION,
+    decode_wire_ipc_with_schema, SchemaWithVersion,
+    wire_flags_set_schema_version,
+    FLAG_CONTINUATION,
 };
 
 fn make_wire_safe_batch(n: usize) -> Batch {
@@ -662,34 +643,44 @@ fn encode_range_roundtrip() {
 }
 
 /// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) can be decoded
-/// using `decode_wire_ipc_with_schema` with a schema hint.
+/// using `decode_wire_ipc_with_schema` with a versioned schema hint.
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {
     let sd = simple_schema();
     let batch = make_wire_safe_batch(4);
 
     // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
+    // Embed server_version=7 in wire_flags bits 24-39.
+    let server_version: u16 = 7;
+    let frame_flags = wire_flags_set_schema_version(FLAG_CONTINUATION, server_version);
     let sz = wire_size_range(STATUS_OK, &[], None, None, &batch, 4, None);
     let mut buf = vec![0u8; sz];
     encode_wire_into_range(
-        &mut buf, 0, 1, 0, FLAG_CONTINUATION, 0, STATUS_OK,
+        &mut buf, 0, 1, 0, frame_flags, 0, STATUS_OK,
         None, &batch, 0, 4, None,
     );
 
-    // decode_wire_ipc must fail (no schema in frame).
+    // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(
         decode_wire_ipc(&buf).is_err(),
         "decode_wire_ipc should fail for continuation frame without schema"
     );
 
-    // decode_wire_ipc_with_schema must succeed.
-    let decoded = decode_wire_ipc_with_schema(&buf, &sd)
-        .expect("decode_wire_ipc_with_schema");
+    // decode_wire_ipc_with_schema with matching version must succeed.
+    let decoded = decode_wire_ipc_with_schema(
+        &buf, SchemaWithVersion { descriptor: &sd, version: server_version },
+    ).expect("decode_wire_ipc_with_schema");
     let b = decoded.data_batch.expect("data_batch");
     assert_eq!(b.count, 4);
     for i in 0..4usize {
         assert_eq!(b.get_pk(i), i as u128);
     }
+
+    // decode_wire_ipc_with_schema with mismatched version must fail.
+    let err = decode_wire_ipc_with_schema(
+        &buf, SchemaWithVersion { descriptor: &sd, version: server_version + 1 },
+    );
+    assert!(err.is_err(), "version mismatch must return Err");
 }
 
 /// `encode_ctrl_block_direct` falls back to `encode_ctrl_block_ipc` when an

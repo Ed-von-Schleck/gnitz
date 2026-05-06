@@ -15,8 +15,6 @@ use crate::runtime::wire::{
     build_schema_wire_block, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED,
 };
-#[cfg(test)]
-use crate::runtime::wire::FLAG_CONFLICT_MODE_PRESENT;
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -317,10 +315,6 @@ pub(crate) unsafe fn sal_write_group(
     worker_ptrs: *const *const u8,
     worker_sizes: *const u32,
 ) -> SalWriteResult {
-    debug_assert!(
-        flags & FLAG_CONFLICT_MODE_PRESENT == 0,
-        "sal_write_group: FLAG_CONFLICT_MODE_PRESENT must not appear in SAL flags"
-    );
     let nw = num_workers as usize;
     let mut sizes = [0u32; MAX_WORKERS];
     for w in 0..nw { sizes[w] = *worker_sizes.add(w); }

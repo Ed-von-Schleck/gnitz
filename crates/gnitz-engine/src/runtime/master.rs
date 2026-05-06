@@ -24,7 +24,8 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{self, FLAG_CONFLICT_MODE_PRESENT, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc};
+use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc, decode_wire_ipc_with_schema};
+use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
@@ -287,7 +288,7 @@ impl MasterDispatcher {
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
-            target_id, lsn, sal_flags, worker_batches, schema, col_names,
+            target_id, lsn, sal_flags, 0, worker_batches, schema, col_names,
             seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0,
         )
     }
@@ -301,6 +302,7 @@ impl MasterDispatcher {
         target_id: i64,
         lsn: u64,
         sal_flags: u32,
+        wire_flags: u64,
         worker_batches: &[Option<&Batch>],
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
@@ -314,7 +316,7 @@ impl MasterDispatcher {
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_group_direct(
-            target_id as u32, lsn, sal_flags, 0, worker_batches,
+            target_id as u32, lsn, sal_flags, wire_flags, worker_batches,
             schema, col_names_opt,
             seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
         )
@@ -659,7 +661,7 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                target_id, lsn, FLAG_SEEK_BY_INDEX, &[], &schema, &col_names,
+                target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
                 key, col_idx as u64, req_ids, -1, 0,
             )
         }).await?;
@@ -694,12 +696,16 @@ impl MasterDispatcher {
         target_id: i64,
         client_id: u64,
         fd: i32,
+        client_version: u16,
     ) -> Result<bool, String> {
         let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
+            // Embed client_version in wire_flags bits 24-39 so workers can
+            // decide whether to include the schema block in their response.
+            let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
             disp.write_group_with_req_ids(
-                target_id, lsn, 0, &[], &schema, &col_names,
+                target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
                 0, 0, req_ids, -1, client_id,
             )
         }).await?;
@@ -764,7 +770,7 @@ impl MasterDispatcher {
                         CheckPayload::Broadcast(batch) => {
                             let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
                             disp.write_group_with_req_ids(
-                                check.target_id, lsn, check.flags, &refs,
+                                check.target_id, lsn, check.flags, 0, &refs,
                                 &check.schema, &[], 0, check.col_hint,
                                 req_slice, -1, 0,
                             )?;
@@ -850,7 +856,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(tid);
         self.write_group_with_req_ids(
-            tid, lsn, FLAG_TICK, &[], &schema, &col_names,
+            tid, lsn, FLAG_TICK, 0, &[], &schema, &col_names,
             0, 0, req_ids, -1, 0,
         )
     }
@@ -1363,7 +1369,7 @@ impl MasterDispatcher {
                             .map_err(|e| e.to_string())?;
                         if ctrl.flags & FLAG_HAS_DATA != 0 {
                             let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                                slot.bytes(), ctrl.block_size, ctrl,
+                                slot.bytes(), ctrl.block_size, ctrl, None,
                             ).map_err(|e| e.to_string())?;
                             if let Some(ref found) = zc.data_batch {
                                 if found.count > 0 && found.get_pk(0) != pk_i {
@@ -1423,18 +1429,17 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                table_id, lsn, 0, &[], &schema, &col_names,
+                table_id, lsn, 0, 0, &[], &schema, &col_names,
                 0, 0, req_ids, -1, 0,
             )
         }).await?;
 
         // Drain all continuation frames per worker, decoding directly into filters.
         // Each slot is dropped before the next is awaited to prevent ring deadlock.
-        // Continuation frames carry no schema; reuse the schema from the first frame.
-        use crate::runtime::wire::decode_wire_ipc_with_schema;
+        // Continuation frames carry no schema; reuse the schema + version from the first frame.
         use crate::schema::SchemaDescriptor;
         for (w, mut slot) in slots.into_iter().enumerate() {
-            let mut saved_schema: Option<SchemaDescriptor> = None;
+            let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
             loop {
                 let ctrl = peek_control_block(slot.bytes())
                     .map_err(|e| scan_decode_err(w, e))?;
@@ -1443,13 +1448,15 @@ impl MasterDispatcher {
                     return Err(format!("worker {}: scan: {}", w, msg));
                 }
                 let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
-                let decoded = if let Some(ref s) = saved_schema {
-                    decode_wire_ipc_with_schema(slot.bytes(), s)
+                let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
+                let decoded = if let Some((ref s, ver)) = saved_schema {
+                    let hint = SchemaWithVersion { descriptor: s, version: ver };
+                    decode_wire_ipc_with_schema(slot.bytes(), hint)
                         .map_err(|e| scan_decode_err(w, e))?
                 } else {
                     let d = decode_wire_ipc(slot.bytes())
                         .map_err(|e| scan_decode_err(w, e))?;
-                    if let Some(s) = d.schema { saved_schema = Some(s); }
+                    if let Some(ref s) = d.schema { saved_schema = Some((s.clone(), server_version)); }
                     d
                 };
                 drop(slot);
@@ -1489,13 +1496,14 @@ impl MasterDispatcher {
         let pk_col = &[schema.pk_index];
         let (name_refs, n) = col_names_as_refs(&col_names);
         let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
+        let wire_flags = wire_flags_set_conflict_mode(0, mode);
         with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
                 batch, worker_indices, &schema, col_names_opt,
                 target_id as u32, lsn, FLAG_PUSH,
-                FLAG_CONFLICT_MODE_PRESENT as u64,
-                0, mode.as_u8() as u64, req_ids, -1,
+                wire_flags,
+                0, 0, req_ids, -1,
             )
         })
     }
@@ -1511,7 +1519,7 @@ impl MasterDispatcher {
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, lsn, FLAG_FLUSH, &refs, &schema, &[], 0, 0, req_ids, -1, 0,
+            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0,
         )
     }
 

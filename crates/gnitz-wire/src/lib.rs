@@ -627,6 +627,11 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
+/// Bits 0-15 are the SAL-level flags carried verbatim from the on-disk log
+/// into every control block.  Bits 16+ are wire-level fields (conflict mode,
+/// schema version) that are encoded by the sender and decoded by the receiver.
+pub const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
+
 pub const FLAG_SHUTDOWN:       u64 = 4;
 pub const FLAG_DDL_SYNC:       u64 = 8;
 pub const FLAG_EXCHANGE:       u64 = 16;
@@ -634,11 +639,6 @@ pub const FLAG_PUSH:           u64 = 32;
 pub const FLAG_HAS_PK:         u64 = 64;
 pub const FLAG_SEEK:           u64 = 128;
 pub const FLAG_SEEK_BY_INDEX:  u64 = 256;
-/// Marker bit set on FLAG_PUSH messages that carry an explicit
-/// `WireConflictMode` in the low byte of `seek_col_idx`. When the bit
-/// is absent, decoders default to `WireConflictMode::Update`, so SAL
-/// entries written without a mode retain silent-upsert semantics.
-pub const FLAG_CONFLICT_MODE_PRESENT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA:     u64 = 1 << 48;
 pub const FLAG_HAS_DATA:       u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
@@ -647,24 +647,64 @@ pub const FLAG_HAS_DATA:       u64 = 1 << 49;
 pub const FLAG_CONTINUATION:   u64 = 1 << 52;
 
 // ---------------------------------------------------------------------------
+// Wire-level packed fields: bits 16-39 of wire_flags
+// ---------------------------------------------------------------------------
+
+/// Bits 16-23: conflict mode (8 bits). Value 0 = Update (default).
+pub const WIRE_CONFLICT_MODE_SHIFT: u32 = 16;
+pub const WIRE_CONFLICT_MODE_MASK:  u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
+/// Bits 24-39: schema version (16 bits). Value 0 = client has no cached schema.
+pub const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
+pub const WIRE_SCHEMA_VERSION_MASK:  u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
+
+// Compile-time guard: SAL flags (bits 0-15) must not overlap the wire-level
+// packed fields (bits 16-39).
+const _: () = assert!(SAL_FLAGS_MASK & (WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK) == 0);
+
+#[inline]
+pub fn wire_flags_set_conflict_mode(flags: u64, mode: WireConflictMode) -> u64 {
+    (flags & !WIRE_CONFLICT_MODE_MASK) | ((mode as u64) << WIRE_CONFLICT_MODE_SHIFT)
+}
+#[inline]
+pub fn wire_flags_get_conflict_mode(flags: u64) -> WireConflictMode {
+    WireConflictMode::from_u8(((flags & WIRE_CONFLICT_MODE_MASK) >> WIRE_CONFLICT_MODE_SHIFT) as u8)
+}
+#[inline]
+pub fn wire_flags_set_schema_version(flags: u64, version: u16) -> u64 {
+    (flags & !WIRE_SCHEMA_VERSION_MASK) | ((version as u64) << WIRE_SCHEMA_VERSION_SHIFT)
+}
+#[inline]
+pub fn wire_flags_get_schema_version(flags: u64) -> u16 {
+    ((flags & WIRE_SCHEMA_VERSION_MASK) >> WIRE_SCHEMA_VERSION_SHIFT) as u16
+}
+/// Returns true when the server should include a schema block in its response.
+/// `client_version == 0` means the client has no cached schema; any non-zero
+/// mismatch means the server's schema has changed since the client last saw it.
+#[inline]
+pub fn wire_should_include_schema(client_version: u16, server_version: u16) -> bool {
+    client_version == 0 || client_version != server_version
+}
+
+// ---------------------------------------------------------------------------
 // Wire-level conflict mode for INSERT / UPSERT semantics
 // ---------------------------------------------------------------------------
 
-/// Conflict-resolution mode carried on FLAG_PUSH messages. Encoded as
-/// the low byte of `seek_col_idx` when `FLAG_CONFLICT_MODE_PRESENT` is
-/// set.
+/// Conflict-resolution mode packed into bits 16-23 of `wire_flags` on
+/// FLAG_PUSH messages. Discriminant 0 = Update (default), so zero-filled
+/// flags resolve to the upsert default without explicit encoding.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WireConflictMode {
+    /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
+    /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
+    /// merging), and explicit Python `push(conflict_mode="update")`.
+    #[default]
+    Update = 0,
     /// Reject the batch on any PK conflict. The master runs both an
     /// intra-batch duplicate check and an against-store PK existence
     /// check, and returns a PG-style `duplicate key value violates
     /// unique constraint` error.
-    Error = 0,
-    /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
-    /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
-    /// merging), and explicit Python `push(conflict_mode="update")`.
-    Update = 1,
+    Error = 1,
 }
 
 impl WireConflictMode {
@@ -676,7 +716,7 @@ impl WireConflictMode {
     #[inline]
     pub const fn from_u8(v: u8) -> Self {
         match v {
-            0 => WireConflictMode::Error,
+            1 => WireConflictMode::Error,
             _ => WireConflictMode::Update,
         }
     }

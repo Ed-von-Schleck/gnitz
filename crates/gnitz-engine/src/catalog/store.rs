@@ -523,10 +523,18 @@ impl CatalogEngine {
         bytes
     }
 
-    /// Return the cached encoded schema wire block for `table_id`, or `None` if not yet built.
-    /// The caller is responsible for building and storing the block on a miss.
-    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<Rc<Vec<u8>>> {
-        self.caches.schema_wire_block.get(&table_id).cloned()
+    /// Return the cached encoded schema wire block and current schema version
+    /// for `table_id`, or `None` if not yet built. The caller is responsible
+    /// for building and storing the block on a miss.
+    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<(Rc<Vec<u8>>, u16)> {
+        let block = self.caches.schema_wire_block.get(&table_id)?.clone();
+        let version = self.caches.get_schema_version(table_id);
+        Some((block, version))
+    }
+
+    /// Return the current schema version for `table_id` (1 if unknown).
+    pub fn get_schema_version(&self, table_id: i64) -> u16 {
+        self.caches.get_schema_version(table_id)
     }
 
     /// Store an encoded schema wire block in the cache.

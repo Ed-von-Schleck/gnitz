@@ -1229,7 +1229,7 @@ impl Reactor {
     /// `consume_cursor` advances before the awaiter wakes.
     fn ingest_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl, None)
             .expect("W2M zero-copy decode failed — ring corrupt");
         let flags = zc.control.flags;
         let schema = zc.schema;
@@ -1249,7 +1249,7 @@ impl Reactor {
     /// but feeds the result into `exchange_acc` instead of routing to an awaiter.
     fn process_exchange_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl, None)
             .expect("W2M exchange decode failed — ring corrupt");
         let flags = zc.control.flags;
         let control = zc.control;

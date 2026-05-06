@@ -1629,7 +1629,7 @@ fn recv_scan_response(
     let mut data:   Option<ZSetBatch> = None;
     let lsn: u128 = loop {
         let buf = gnitz_core::recv_framed(sock_fd, max_payload_len).map_err(|e| e.to_string())?;
-        let msg = gnitz_core::parse_response(&buf).map_err(|e| e.to_string())?;
+        let msg = gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string())?;
         if msg.status != 0 {
             return Err(msg.error_text.unwrap_or_default());
         }
@@ -1716,7 +1716,7 @@ fn async_io_loop(
                 ResponseKind::Push => {
                     gnitz_core::recv_framed(sock_fd, max_payload_len)
                         .map_err(|e| e.to_string())
-                        .and_then(|buf| gnitz_core::parse_response(&buf).map_err(|e| e.to_string()))
+                        .and_then(|buf| gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string()))
                 }
             };
             match recv_result {

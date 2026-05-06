@@ -1,10 +1,14 @@
 use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+
+const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
+use std::sync::{atomic::{AtomicU32, Ordering}, Mutex};
+use lru::LruCache;
 use crate::protocol::{
     Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
-    FLAG_CONFLICT_MODE_PRESENT, FLAG_CONTINUATION, WireConflictMode,
+    FLAG_CONTINUATION, WireConflictMode,
+    wire_flags_set_conflict_mode, wire_flags_set_schema_version, wire_flags_get_schema_version,
     send_message, recv_message,
     connect as proto_connect,
     hello_handshake,
@@ -44,6 +48,9 @@ pub struct Connection {
     /// pass this value through so a compromised server cannot force the
     /// client to allocate up to the historical 256 MB ceiling.
     max_payload_len: usize,
+    /// Per-table schema cache: target_id → (Schema, server_version).
+    /// Mutex for interior mutability; Connection is used in Send+Sync pyclasses.
+    schema_cache: Mutex<LruCache<u64, (Schema, u16)>>,
 }
 
 impl Connection {
@@ -59,6 +66,7 @@ impl Connection {
             sock,
             client_id: new_client_id(),
             max_payload_len: limit as usize,
+            schema_cache: Mutex::new(LruCache::new(SCHEMA_CACHE_CAP)),
         })
     }
 
@@ -108,13 +116,18 @@ impl Connection {
         &self,
         target_id: u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+        let cached_version = {
+            let cache = self.schema_cache.lock().unwrap();
+            cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0)
+        };
+        let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, 0, 0u128, 0, None, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, None, None)?;
         let mut schema: Option<Schema> = None;
         let mut data:   Option<ZSetBatch> = None;
         let lsn: u64 = loop {
-            let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
+            let msg = check_response(self.recv_message_cached(target_id)?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
             schema = schema.or(msg.schema);
             if let Some(batch) = msg.data_batch {
@@ -149,6 +162,28 @@ impl Connection {
         Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
     }
 
+    /// Receive one framed message, using the LRU cache to decode continuation
+    /// frames that arrive without a schema block.
+    fn recv_message_cached(&self, target_id: u64) -> Result<Message, ClientError> {
+        let hint = {
+            let mut cache = self.schema_cache.lock().unwrap();
+            cache.get(&target_id).map(|(s, v)| (s.clone(), *v))
+        };
+        let msg = recv_message(
+            self.sock.as_raw_fd(),
+            hint.as_ref().map(|(s, v)| (s, *v)),
+            self.max_payload_len,
+        )?;
+        // schema_batch is Some only when the schema block was physically in the frame;
+        // schema is always Some when schema_batch is (invariant in parse_response).
+        if msg.schema_batch.is_some() {
+            let version = wire_flags_get_schema_version(msg.flags);
+            let s = msg.schema.as_ref().unwrap();
+            self.schema_cache.lock().unwrap().put(target_id, (s.clone(), version));
+        }
+        Ok(msg)
+    }
+
     fn roundtrip(
         &self,
         target_id: u64,
@@ -157,13 +192,11 @@ impl Connection {
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, schema, data)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
+        let msg = self.recv_message_cached(target_id)?;
         check_response(msg)
     }
 
-    /// Push path: encodes the requested `WireConflictMode` into the
-    /// control block by setting `FLAG_CONFLICT_MODE_PRESENT` and
-    /// packing the mode byte into the low byte of `seek_col_idx`.
+    /// Push path: packs `WireConflictMode` into bits 16-23 of `wire_flags`.
     fn roundtrip_push(
         &self,
         target_id: u64,
@@ -171,14 +204,13 @@ impl Connection {
         batch:     &ZSetBatch,
         mode:      WireConflictMode,
     ) -> Result<Message, ClientError> {
-        let flags = FLAG_CONFLICT_MODE_PRESENT;
-        let seek_col_idx = mode.as_u8() as u64;
+        let flags = wire_flags_set_conflict_mode(0, mode);
         send_message(
             self.sock.as_raw_fd(), target_id, self.client_id, flags,
-            0u128, seek_col_idx,
+            0u128, 0,
             Some(schema), Some(batch),
         )?;
-        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
+        let msg = self.recv_message_cached(target_id)?;
         check_response(msg)
     }
 
@@ -189,7 +221,7 @@ impl Connection {
         key:      u128,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, col_idx, None, None)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
+        let msg = self.recv_message_cached(table_id)?;
         check_response(msg)
     }
 
@@ -199,7 +231,7 @@ impl Connection {
         pk:        u128,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk, 0, None, None)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
+        let msg = self.recv_message_cached(target_id)?;
         check_response(msg)
     }
 }

@@ -36,6 +36,7 @@ struct PendingScan {
     client_id: u64,
     target_id: u64,
     prebuilt_schema: Option<Rc<Vec<u8>>>,
+    server_version: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ impl WorkerProcess {
     /// the last chunk is sent. Called at the top of every `drain_sal` pass when
     /// `pending_scan.is_some()`.
     fn emit_pending_scan_chunk(&mut self) {
-        let (batch, next_row, request_id, client_id, target_id, prebuilt_schema) = {
+        let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version) = {
             let ps = match self.pending_scan.as_ref() {
                 Some(ps) => ps,
                 None => return,
@@ -379,14 +380,14 @@ impl WorkerProcess {
                 ps.client_id,
                 ps.target_id,
                 ps.prebuilt_schema.clone(),
+                ps.server_version,
             )
         };
 
         let is_first = next_row == 0;
-        // Copy schema (SchemaDescriptor is Copy) so it can be used in the
-        // closure without conflicting with the borrow of `batch`.
-        let schema_owned: Option<SchemaDescriptor> = if is_first { batch.schema } else { None };
-        let schema_opt = schema_owned.as_ref();
+        // prebuilt_opt drives the schema block: Some on the first chunk when the
+        // client needs the schema, None on continuations and schema-suppressed frames.
+        // encode_wire_into_range uses the prebuilt bytes directly; no schema arg needed.
         let prebuilt_opt: Option<&[u8]> = if is_first {
             prebuilt_schema.as_deref().map(Vec::as_slice)
         } else {
@@ -396,8 +397,8 @@ impl WorkerProcess {
         let remaining = batch.count - next_row;
         // Compute rows per chunk via linear interpolation (wire-safe schemas have
         // constant per-row stride, so wire size is linear in count).
-        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], schema_opt, None, &batch, 0, prebuilt_opt);
-        let sz_1 = ipc::wire_size_range(STATUS_OK, &[], schema_opt, None, &batch, 1, prebuilt_opt);
+        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
+        let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, prebuilt_opt);
         let per_row = sz_1.saturating_sub(sz_0);
         let max_rows = if per_row > 0 {
             let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
@@ -409,14 +410,18 @@ impl WorkerProcess {
         // FLAG_CONTINUATION is always set on worker scan frames so the client's
         // loop termination ("stop on no FLAG_CONTINUATION") still works.
         // FLAG_SCAN_LAST is the W2M-internal signal that this is the last chunk.
-        let flags: u64 = FLAG_CONTINUATION | if !has_more { FLAG_SCAN_LAST } else { 0 };
+        // server_version is always embedded so the master decode path can verify.
+        let flags: u64 = gnitz_wire::wire_flags_set_schema_version(
+            FLAG_CONTINUATION | if !has_more { FLAG_SCAN_LAST } else { 0 },
+            server_version,
+        );
         // wire_size_range is linear in count for wire-safe schemas; avoid a third call.
         let sz = sz_0 + per_row * max_rows;
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_range(
                 buf, 0, target_id, client_id, flags,
                 0, STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
-                schema_opt, &batch,
+                None, &batch,
                 next_row, max_rows,
                 prebuilt_opt,
             );
@@ -687,6 +692,8 @@ impl WorkerProcess {
         let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
         let client_id = decoded.as_ref().map(|d| d.control.client_id).unwrap_or(0);
+        let ctrl_wire_flags = decoded.as_ref().map(|d| d.control.flags).unwrap_or(0);
+        let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
 
         // Extract batch (consumes decoded)
         let batch = decoded.and_then(|d| d.data_batch);
@@ -783,7 +790,7 @@ impl WorkerProcess {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         if let Some(err) = self.send_scan_response(
-                            target_id as u64, result, schema.as_ref(), request_id, client_id,
+                            target_id as u64, result, schema.as_ref(), request_id, client_id, client_version,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -840,7 +847,7 @@ impl WorkerProcess {
             if !table_schema_matches {
                 return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
             }
-            if let Some(block) = self.cat().get_cached_schema_wire_block(tid_key) {
+            if let Some((block, _version)) = self.cat().get_cached_schema_wire_block(tid_key) {
                 return block;
             }
             let col_names = self.cat().get_col_names_bytes(tid_key);
@@ -872,25 +879,43 @@ impl WorkerProcess {
         schema: Option<&SchemaDescriptor>,
         request_id: u64,
         client_id: u64,
+        client_version: u16,
     ) -> Option<String> {
         let tid_key = target_id as i64;
-        let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
-            if let Some(block) = self.cat().get_cached_schema_wire_block(tid_key) {
-                return block;
-            }
-            let col_names = self.cat().get_col_names_bytes(tid_key);
-            let (name_refs, n) = ipc::col_names_as_refs(&col_names);
-            let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
-            self.cat().set_schema_wire_block(tid_key, block.clone());
-            block
-        });
+        // Obtain prebuilt schema block + server version. include_schema controls
+        // whether the first frame carries a schema block; server_version is always
+        // embedded in wire_flags so the client can cache/verify.
+        let (prebuilt_rc, server_version) = if let Some(s) = schema {
+            let (block, server_version) = match self.cat().get_cached_schema_wire_block(tid_key) {
+                Some((block, ver)) => (block, ver),
+                None => {
+                    let col_names = self.cat().get_col_names_bytes(tid_key);
+                    let (name_refs, n) = ipc::col_names_as_refs(&col_names);
+                    let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
+                    let ver = self.cat().get_schema_version(tid_key);
+                    self.cat().set_schema_wire_block(tid_key, block.clone());
+                    (block, ver)
+                }
+            };
+            let prebuilt = if gnitz_wire::wire_should_include_schema(client_version, server_version) { Some(block) } else { None };
+            (prebuilt, server_version)
+        } else {
+            (None, 0u16)
+        };
+        let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
+
+        // When schema omission is in effect (prebuilt_rc=None), pass schema=None to
+        // the encode functions so has_schema stays false. Passing schema=Some with
+        // prebuilt=None would cause encode_wire_into_range to emit a schema block
+        // with empty column names, corrupting the client's schema cache.
+        let schema_for_encode = if prebuilt_rc.is_some() { schema } else { None };
 
         let is_wire_safe = schema.map(|s| schema_wire_safe(s)).unwrap_or(true);
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            let wire_sz = ipc::wire_size(STATUS_OK, &[], schema, None, Some(&*batch), prebuilt);
+            let wire_sz = ipc::wire_size(STATUS_OK, &[], schema_for_encode, None, Some(&*batch), prebuilt);
             if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
                 return Some(format!(
                     "scan: batch wire_size={wire_sz} > MAX_W2M_MSG={}; \
@@ -898,12 +923,12 @@ impl WorkerProcess {
                     w2m_ring::MAX_W2M_MSG
                 ));
             }
+            let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(wire_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into(
-                    buf, 0, target_id, client_id,
-                    FLAG_CONTINUATION | FLAG_SCAN_LAST,
+                    buf, 0, target_id, client_id, flags,
                     0u128, 0, 0, STATUS_OK, &[],
-                    schema, None, Some(&*batch), prebuilt,
+                    schema_for_encode, None, Some(&*batch), prebuilt,
                 );
             });
             return None;
@@ -913,7 +938,7 @@ impl WorkerProcess {
         let total_rows = batch.count;
         let total_sz = {
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            ipc::wire_size_range(STATUS_OK, &[], schema, None, &batch, total_rows, prebuilt)
+            ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &batch, total_rows, prebuilt)
         };
 
         if total_sz <= w2m_ring::MAX_W2M_MSG as usize {
@@ -921,12 +946,12 @@ impl WorkerProcess {
             // (terminal frame signals scan end); FLAG_SCAN_LAST tells master this
             // worker's chunk train is done.
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
+            let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into_range(
-                    buf, 0, target_id, client_id,
-                    FLAG_CONTINUATION | FLAG_SCAN_LAST,
+                    buf, 0, target_id, client_id, flags,
                     0, STATUS_OK,
-                    schema, &batch, 0, total_rows, prebuilt,
+                    schema_for_encode, &batch, 0, total_rows, prebuilt,
                 );
             });
         } else {
@@ -938,6 +963,7 @@ impl WorkerProcess {
                 client_id,
                 target_id,
                 prebuilt_schema: prebuilt_rc,
+                server_version,
             });
         }
 
@@ -2056,6 +2082,7 @@ mod tests {
                 client_id: 42,
                 target_id: 1,
                 prebuilt_schema: Some(schema_block),
+                server_version: 0,
             }),
             read_cursor: 0,
             expected_epoch: 1,
@@ -2102,6 +2129,7 @@ mod tests {
                 client_id: 0,
                 target_id: 1,
                 prebuilt_schema: None,
+                server_version: 0,
             }),
             read_cursor: 0,
             expected_epoch: 1,
@@ -2115,7 +2143,8 @@ mod tests {
             ipc::decode_wire_ipc(&data).is_err(),
             "continuation frame without schema must fail decode_wire_ipc"
         );
-        let decoded = ipc::decode_wire_ipc_with_schema(&data, &schema)
+        let hint = ipc::SchemaWithVersion { descriptor: &schema, version: 0 };
+        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint)
             .expect("decode_wire_ipc_with_schema must succeed for continuation frame");
         let b = decoded.data_batch.expect("continuation chunk must carry data");
         assert_eq!(b.count, 5);
@@ -2148,7 +2177,7 @@ mod tests {
             expected_epoch: 1,
         };
 
-        let err = wp.send_scan_response(1, Rc::new(batch), None, 3, 0);
+        let err = wp.send_scan_response(1, Rc::new(batch), None, 3, 0, 0);
         assert!(err.is_none(), "small wire-safe batch must not error");
         assert!(wp.pending_scan.is_none(),
             "batch fits in one frame; send_scan_response must not set pending_scan");
@@ -2159,7 +2188,8 @@ mod tests {
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single-frame response must set FLAG_SCAN_LAST");
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 
-        let decoded = ipc::decode_wire_ipc_with_schema(&data, &schema)
+        let hint = ipc::SchemaWithVersion { descriptor: &schema, version: 0 };
+        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint)
             .expect("decode with schema hint");
         let b = decoded.data_batch.expect("data block");
         assert_eq!(b.count, 5);

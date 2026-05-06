@@ -2,7 +2,8 @@ use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 use super::error::ProtocolError;
-use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
+use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
+    wire_flags_get_schema_version};
 use super::types::{ColData, PkColumn, Schema, ZSetBatch, meta_schema};
 use crate::types::schema_from_wire_cols;
 use super::codec::{schema_to_batch, batch_to_schema};
@@ -18,8 +19,8 @@ pub struct Message {
     pub seek_pk:      u128,
     pub seek_col_idx: u64,
     pub request_id:   u64,
-    pub schema:       Option<Schema>,     // derived from schema_batch (avoids re-deriving)
-    pub schema_batch: Option<ZSetBatch>,
+    pub schema:       Option<Schema>,     // derived from schema_batch or hint (avoids re-deriving)
+    pub schema_batch: Option<ZSetBatch>,  // Some only when schema block was physically in frame
     pub data_batch:   Option<ZSetBatch>,
     pub error_text:   Option<String>,     // Some(_) when status == STATUS_ERROR
 }
@@ -158,7 +159,7 @@ pub fn encode_message(
     data_batch:   Option<&ZSetBatch>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let has_data   = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
-    let has_schema = has_data || schema.is_some();
+    let has_schema = schema.is_some();
 
     let mut flags_out = flags;
     if has_schema { flags_out |= FLAG_HAS_SCHEMA; }
@@ -211,7 +212,13 @@ pub fn send_message(
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
 /// The payload is what `recv_framed()` returns.
-pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
+///
+/// `schema_hint` is `Some((schema, cached_version))` when the client has a
+/// cached schema for the responding table. On continuation frames (no schema
+/// block), the hint is used to decode the data block; a version mismatch is a
+/// hard protocol error. Pass `None` for the initial frame or when no cache
+/// entry exists.
+pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result<Message, ProtocolError> {
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
@@ -227,14 +234,8 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data   = (flags & FLAG_HAS_DATA)   != 0;
 
-    if has_data && !has_schema {
-        return Err(ProtocolError::DecodeError(
-            "FLAG_HAS_DATA without FLAG_HAS_SCHEMA".into()
-        ));
-    }
-
     let mut off = ctrl_size;
-    let mut wire_schema: Option<Schema>   = None;
+    let mut wire_schema: Option<Schema>     = None;
     let mut schema_batch: Option<ZSetBatch> = None;
 
     if has_schema {
@@ -250,6 +251,21 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
         wire_schema  = Some(batch_to_schema(&sbatch)?);
         schema_batch = Some(sbatch);
         off += sz;
+    } else if has_data {
+        match schema_hint {
+            None => return Err(ProtocolError::DecodeError(
+                "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into()
+            )),
+            Some((hint_schema, cached_version)) => {
+                let server_version = wire_flags_get_schema_version(flags);
+                if server_version != cached_version {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "schema version mismatch: cached={cached_version} server={server_version}"
+                    )));
+                }
+                wire_schema = Some(hint_schema.clone());
+            }
+        }
     }
 
     let data_batch = if has_data {
@@ -291,15 +307,11 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
 
 pub fn recv_message(
     sock_fd:         RawFd,
-    data_schema:     Option<&Schema>,
+    schema_hint:     Option<(&Schema, u16)>,
     max_payload_len: usize,
 ) -> Result<Message, ProtocolError> {
     let buf = recv_framed(sock_fd, max_payload_len)?;
-    // data_schema fallback: only needed when server sends data without schema.
-    // The server always sends FLAG_HAS_SCHEMA with FLAG_HAS_DATA, so
-    // parse_response() works without it.  Keep the parameter for API compat.
-    let _ = data_schema;
-    parse_response(&buf)
+    parse_response(&buf, schema_hint)
 }
 
 #[cfg(test)]
@@ -554,7 +566,7 @@ mod tests {
             seek_pk, 7,
             None, None,
         ).unwrap();
-        let msg = parse_response(&payload).unwrap();
+        let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id,    0xDEAD);
         assert_eq!(msg.client_id,    0xBEEF);
         assert_eq!(msg.seek_pk,      seek_pk);
@@ -591,7 +603,7 @@ mod tests {
             42, 1, 0, 0u128, 0,
             Some(&schema), Some(&batch),
         ).unwrap();
-        let msg = parse_response(&payload).unwrap();
+        let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
         let data = msg.data_batch.unwrap();
@@ -613,7 +625,7 @@ mod tests {
             10, 1, 0, 0u128, 0,
             Some(&schema), Some(&empty),
         ).unwrap();
-        let msg = parse_response(&payload).unwrap();
+        let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
         assert!(msg.data_batch.is_none());

@@ -9,4 +9,5 @@ integration = []
 [dependencies]
 gnitz-wire  = { path = "../gnitz-wire" }
 libc        = "0.2"
+lru         = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

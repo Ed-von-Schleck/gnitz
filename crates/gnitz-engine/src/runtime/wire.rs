@@ -11,21 +11,10 @@ use crate::util::align8;
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_CONTINUATION, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
-    FLAG_CONFLICT_MODE_PRESENT as FLAG_CONFLICT_MODE_PRESENT_U64,
     WireConflictMode,
+    wire_flags_get_conflict_mode,
+    wire_flags_set_schema_version, wire_flags_get_schema_version,
 };
-
-/// Engine-side u32 alias for the cross-crate conflict-mode marker bit.
-pub const FLAG_CONFLICT_MODE_PRESENT: u32 = FLAG_CONFLICT_MODE_PRESENT_U64 as u32;
-
-#[inline]
-pub fn decode_conflict_mode(flags: u64, seek_col_idx: u64) -> WireConflictMode {
-    if flags & FLAG_CONFLICT_MODE_PRESENT_U64 != 0 {
-        WireConflictMode::from_u8((seek_col_idx & 0xFF) as u8)
-    } else {
-        WireConflictMode::Update
-    }
-}
 
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
@@ -366,6 +355,16 @@ pub(crate) fn encode_ctrl_block_direct(
     CTRL_BLOCK_SIZE_NO_BLOB
 }
 
+#[inline]
+fn should_include_schema(
+    schema: Option<&SchemaDescriptor>,
+    prebuilt: Option<&[u8]>,
+    has_data: bool,
+    status: u32,
+) -> bool {
+    (schema.is_some() || prebuilt.is_some()) && (has_data || status == STATUS_OK)
+}
+
 /// Compute total encoded wire size without allocating.
 ///
 /// `prebuilt_schema_block`: when `Some`, use its length as the schema block
@@ -381,9 +380,7 @@ pub fn wire_size(
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = has_data
-        || (schema.is_some() && status == STATUS_OK)
-        || (prebuilt_schema_block.is_some() && status == STATUS_OK);
+    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
@@ -398,7 +395,7 @@ pub fn wire_size(
         if let Some(prebuilt) = prebuilt_schema_block {
             total += prebuilt.len();
         } else {
-            let s = schema.unwrap_or_else(|| data_batch.unwrap().schema.as_ref().unwrap());
+            let s = schema.unwrap();
             let names = col_names.unwrap_or(&[]);
             let ncols = s.num_columns as usize;
             let schema_blob: usize = names.iter().take(ncols)
@@ -514,10 +511,7 @@ pub fn wire_size_range(
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = count > 0;
-    // A schema block is only emitted when we have schema info to write.
-    // Continuation frames pass schema=None/prebuilt=None intentionally.
-    let has_schema = (schema.is_some() || prebuilt_schema_block.is_some())
-        && (has_data || status == STATUS_OK);
+    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
@@ -567,10 +561,7 @@ pub fn encode_wire_into_range(
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
     let has_data = count > 0;
-    // A schema block is only emitted when we have schema info to write.
-    // Continuation frames pass schema=None/prebuilt=None intentionally.
-    let has_schema = (schema.is_some() || prebuilt_schema_block.is_some())
-        && (has_data || status == STATUS_OK);
+    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let mut wire_flags = flags;
     if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
@@ -625,9 +616,7 @@ fn encode_wire_into_impl(
     checksum: bool,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = has_data
-        || (schema.is_some() && status == STATUS_OK)
-        || (prebuilt_schema_block.is_some() && status == STATUS_OK);
+    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let mut wire_flags = flags;
     if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
@@ -650,9 +639,7 @@ fn encode_wire_into_impl(
             out[pos..end].copy_from_slice(prebuilt);
             pos = end;
         } else {
-            let eff_schema = if let Some(s) = schema { s } else {
-                data_batch.unwrap().schema.as_ref().unwrap()
-            };
+            let eff_schema = schema.unwrap();
             let names = col_names.unwrap_or(&[]);
             let schema_batch = schema_to_batch(eff_schema, names);
             let written = schema_batch.encode_to_wire(target_id as u32, out, pos, checksum);
@@ -701,6 +688,15 @@ pub struct DecodedWireZeroCopy<'a> {
     pub control: DecodedControl,
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<MemBatch<'a>>,
+}
+
+/// A schema descriptor paired with the server-side schema version.
+/// Passed to decode functions so continuation frames (no schema block)
+/// can be decoded against a cached schema and the version can be verified
+/// against what the sender embedded in `wire_flags`.
+pub struct SchemaWithVersion<'a> {
+    pub descriptor: &'a SchemaDescriptor,
+    pub version:    u16,
 }
 
 /// Read the (data_offset, data_size) directory entry for region `r` from a
@@ -901,11 +897,6 @@ pub fn peek_routing_header(data: &[u8]) -> Result<(u64, u64), &'static str> {
     Ok((target_id, client_id))
 }
 
-/// Decode a wire message using a caller-provided schema.
-pub fn decode_wire_with_schema(data: &[u8], schema: &SchemaDescriptor) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, Some(schema), true)
-}
-
 /// Decode a full IPC wire message from raw bytes.
 pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, true)
@@ -919,7 +910,7 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
 
 fn decode_wire_impl(
     data: &[u8],
-    schema_hint: Option<&SchemaDescriptor>,
+    schema_hint: Option<SchemaWithVersion<'_>>,
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
     if data.len() < gnitz_wire::WAL_HEADER_SIZE {
@@ -935,14 +926,15 @@ fn decode_wire_impl(
     decode_wire_body(data, ctrl_size, control, schema_hint, verify_checksum)
 }
 
-/// Like `decode_wire_ipc` but supplies a schema for continuation frames that
-/// carry `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA`. The client decoder reuses
-/// the schema from the first frame of a multi-chunk SCAN response.
-pub fn decode_wire_ipc_with_schema(
+/// Like `decode_wire_ipc` but supplies a versioned schema hint for W2M
+/// continuation frames that carry `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA`.
+/// Callers must supply the `server_version` that matches what the sender
+/// embedded in `wire_flags` bits 24-39; a version mismatch is a hard error.
+pub fn decode_wire_ipc_with_schema<'a>(
     data: &[u8],
-    schema: &SchemaDescriptor,
+    hint: SchemaWithVersion<'a>,
 ) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, Some(schema), false)
+    decode_wire_impl(data, Some(hint), false)
 }
 
 /// Like `decode_wire_ipc` but reuses a pre-parsed control block, avoiding a
@@ -955,30 +947,45 @@ pub(crate) fn decode_wire_ipc_with_ctrl(
     decode_wire_body(data, ctrl_size, control, None, false)
 }
 
+/// Resolve the schema for a continuation frame (`has_data && !has_schema`).
+/// Verifies the server version embedded in `flags` against the hint version.
+fn resolve_continuation_schema(
+    hint: &Option<SchemaWithVersion<'_>>,
+    flags: u64,
+) -> Result<SchemaDescriptor, &'static str> {
+    match hint.as_ref() {
+        None => Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA"),
+        Some(h) => {
+            let server_version = wire_flags_get_schema_version(flags);
+            if server_version != h.version {
+                return Err("schema version mismatch on continuation frame");
+            }
+            Ok(*h.descriptor)
+        }
+    }
+}
+
 fn decode_wire_body(
     data: &[u8],
     ctrl_size: usize,
     control: DecodedControl,
-    schema_hint: Option<&SchemaDescriptor>,
+    schema_hint: Option<SchemaWithVersion<'_>>,
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data   = (flags & FLAG_HAS_DATA)   != 0;
 
-    // Continuation chunks carry FLAG_HAS_DATA without FLAG_HAS_SCHEMA; callers
-    // supply the schema from the first frame via schema_hint.
-    if has_data && !has_schema && schema_hint.is_none() {
-        return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
-    }
-
     let mut off = ctrl_size;
-    let mut wire_schema: Option<SchemaDescriptor> = if !has_schema && has_data {
-        // Continuation frame: reuse caller-supplied schema.
-        schema_hint.copied()
-    } else {
-        None
-    };
+    let mut wire_schema: Option<SchemaDescriptor> = None;
+
+    if has_data && !has_schema {
+        // External client traffic must always include the schema block.
+        if verify_checksum {
+            return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
+        }
+        wire_schema = Some(resolve_continuation_schema(&schema_hint, flags)?);
+    }
 
     if has_schema {
         if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
@@ -991,11 +998,12 @@ fn decode_wire_body(
             return Err("schema block truncated");
         }
         let parsed = decode_schema_block(&data[off..off + schema_size], verify_checksum)?;
-        if let Some(hint) = schema_hint {
-            if !schemas_layout_equal(&parsed, hint) {
+        // Integrity cross-check against hint even when versions match.
+        if let Some(ref hint) = schema_hint {
+            if !schemas_layout_equal(&parsed, hint.descriptor) {
                 return Err("schema mismatch: client schema differs from server schema");
             }
-            wire_schema = Some(*hint);
+            wire_schema = Some(*hint.descriptor);
         } else {
             wire_schema = Some(parsed);
         }
@@ -1036,17 +1044,18 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     data: &'a [u8],
     ctrl_size: usize,
     control: DecodedControl,
+    schema_hint: Option<SchemaWithVersion<'_>>,
 ) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data   = (flags & FLAG_HAS_DATA)   != 0;
 
-    if has_data && !has_schema {
-        return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
-    }
-
     let mut off = ctrl_size;
     let mut wire_schema: Option<SchemaDescriptor> = None;
+
+    if has_data && !has_schema {
+        wire_schema = Some(resolve_continuation_schema(&schema_hint, flags)?);
+    }
 
     if has_schema {
         if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {

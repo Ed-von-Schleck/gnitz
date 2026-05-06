@@ -280,7 +280,7 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
     }
     // SAFETY: recv_exact_uninit wrote exactly `payload_len` bytes.
     unsafe { buf.set_len(payload_len); }
-    let msg = super::message::parse_response(&buf)?;
+    let msg = super::message::parse_response(&buf, None)?;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
     Err(ProtocolError::DecodeError(err))
 }
