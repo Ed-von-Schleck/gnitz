@@ -870,19 +870,35 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     Ok(sd)
 }
 
-/// Peek at just the `target_id` from a wire message's control block.
-pub fn peek_target_id(data: &[u8]) -> Result<i64, &'static str> {
+/// Read just the `(target_id, client_id)` routing tuple from a wire
+/// message. Two `wal_dir_entry` lookups + two u64 reads — no allocation,
+/// no checksum, no `decode_german_string`. This is the hot path used by
+/// the executor's schema-hint lookup and by the auth-bound client_id
+/// check; both share one parse so a malicious client cannot forge a
+/// directory that points the auth check at one offset and the full
+/// decoder at another.
+pub fn peek_routing_header(data: &[u8]) -> Result<(u64, u64), &'static str> {
+    use gnitz_wire::control as ctrl;
+
     if data.len() < gnitz_wire::WAL_HEADER_SIZE {
         return Err("IPC payload too small");
     }
-    let ctrl_size = u32::from_le_bytes(
-        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad control size")?
-    ) as usize;
-    if ctrl_size > data.len() {
-        return Err("control block truncated");
+    let dir_end = gnitz_wire::WAL_HEADER_SIZE + ctrl::NUM_REGIONS * 8;
+    if data.len() < dir_end {
+        return Err("control block too small");
     }
-    let ctrl = peek_control_block(&data[..ctrl_size])?;
-    Ok(ctrl.target_id as i64)
+
+    let read_u64 = |r: usize| -> Result<u64, &'static str> {
+        let (off, sz) = wal_dir_entry(data, r);
+        if sz < 8 || off + 8 > data.len() {
+            return Err("control block region out of bounds");
+        }
+        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+    };
+
+    let target_id = read_u64(ctrl::REGION_TARGET_ID)?;
+    let client_id = read_u64(ctrl::REGION_CLIENT_ID)?;
+    Ok((target_id, client_id))
 }
 
 /// Decode a wire message using a caller-provided schema.

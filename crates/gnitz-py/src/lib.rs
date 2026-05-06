@@ -1548,6 +1548,18 @@ impl PyAsyncTransport {
     ) -> PyResult<Self> {
         let sock_fd = gnitz_core::connect(socket_path)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        // HELLO handshake on the calling thread — captures the negotiated
+        // payload limit before the I/O thread starts queueing reads. Drop
+        // the GIL across the blocking syscalls so other Python threads
+        // can progress if the server is slow to respond.
+        let handshake = py.allow_threads(|| gnitz_core::hello_handshake(sock_fd));
+        let max_payload_len = match handshake {
+            Ok(limit) => limit as usize,
+            Err(e) => {
+                gnitz_core::close_fd(sock_fd);
+                return Err(GnitzError::new_err(e.to_string()));
+            }
+        };
         let client_id = std::process::id() as u64;
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1556,7 +1568,7 @@ impl PyAsyncTransport {
         let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py).into();
 
         let handle = std::thread::spawn(move || {
-            async_io_loop(sock_fd, rx, loop_ref, sr_fn, se_fn);
+            async_io_loop(sock_fd, max_payload_len, rx, loop_ref, sr_fn, se_fn);
         });
 
         Ok(PyAsyncTransport {
@@ -1610,11 +1622,13 @@ impl Drop for PyAsyncTransport {
 /// Receive a streaming scan response: loop on `recv_framed` + `parse_response`
 /// until a frame without `FLAG_CONTINUATION` arrives, accumulating schema and
 /// data from each worker frame.  The terminal frame carries the LSN in seek_pk.
-fn recv_scan_response(sock_fd: std::os::unix::io::RawFd) -> Result<gnitz_core::Message, String> {
+fn recv_scan_response(
+    sock_fd: std::os::unix::io::RawFd, max_payload_len: usize,
+) -> Result<gnitz_core::Message, String> {
     let mut schema: Option<Schema> = None;
     let mut data:   Option<ZSetBatch> = None;
     let lsn: u128 = loop {
-        let buf = gnitz_core::recv_framed(sock_fd).map_err(|e| e.to_string())?;
+        let buf = gnitz_core::recv_framed(sock_fd, max_payload_len).map_err(|e| e.to_string())?;
         let msg = gnitz_core::parse_response(&buf).map_err(|e| e.to_string())?;
         if msg.status != 0 {
             return Err(msg.error_text.unwrap_or_default());
@@ -1640,11 +1654,12 @@ fn recv_scan_response(sock_fd: std::os::unix::io::RawFd) -> Result<gnitz_core::M
 }
 
 fn async_io_loop(
-    sock_fd:  std::os::unix::io::RawFd,
-    rx:       std::sync::mpsc::Receiver<IoRequest>,
-    loop_ref: Py<PyAny>,
-    sr_fn:    Py<PyAny>,
-    se_fn:    Py<PyAny>,
+    sock_fd:         std::os::unix::io::RawFd,
+    max_payload_len: usize,
+    rx:              std::sync::mpsc::Receiver<IoRequest>,
+    loop_ref:        Py<PyAny>,
+    sr_fn:           Py<PyAny>,
+    se_fn:           Py<PyAny>,
 ) {
     use std::collections::VecDeque;
 
@@ -1697,9 +1712,9 @@ fn async_io_loop(
                 continue;
             }
             let recv_result = match req.kind {
-                ResponseKind::Scan => recv_scan_response(sock_fd),
+                ResponseKind::Scan => recv_scan_response(sock_fd, max_payload_len),
                 ResponseKind::Push => {
-                    gnitz_core::recv_framed(sock_fd)
+                    gnitz_core::recv_framed(sock_fd, max_payload_len)
                         .map_err(|e| e.to_string())
                         .and_then(|buf| gnitz_core::parse_response(&buf).map_err(|e| e.to_string()))
                 }

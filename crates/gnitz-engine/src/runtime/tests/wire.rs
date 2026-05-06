@@ -1,6 +1,6 @@
 use crate::runtime::wire::{
     encode_wire, encode_wire_into, decode_wire, decode_wire_with_schema,
-    wire_size, schema_to_batch, batch_to_schema, peek_target_id,
+    wire_size, schema_to_batch, batch_to_schema, peek_routing_header,
     build_schema_wire_block,
     encode_ctrl_block_ipc, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     STATUS_OK, STATUS_ERROR,
@@ -493,21 +493,22 @@ fn decode_control_block_all_fields_round_trip() {
 }
 
 #[test]
-fn peek_target_id_on_valid_wire() {
+fn peek_routing_header_on_valid_wire() {
     let wire = encode_wire(
-        99, 0, 0, 0u128, 0, 0,
+        99, 0xCAFE_BABE, 0, 0u128, 0, 0,
         STATUS_OK, b"",
         None, None, None,
     );
-    let tid = peek_target_id(&wire).unwrap();
+    let (tid, cid) = peek_routing_header(&wire).unwrap();
     assert_eq!(tid, 99);
+    assert_eq!(cid, 0xCAFE_BABE);
 }
 
 #[test]
-fn peek_target_id_rejects_short_data() {
+fn peek_routing_header_rejects_short_data() {
     // Any slice shorter than WAL_HEADER_SIZE (48 bytes) must fail.
-    let result = peek_target_id(&[0u8; 10]);
-    assert!(result.is_err(), "peek_target_id should reject slices < WAL_HEADER_SIZE");
+    let result = peek_routing_header(&[0u8; 10]);
+    assert!(result.is_err(), "peek_routing_header should reject slices < WAL_HEADER_SIZE");
 }
 
 #[test]

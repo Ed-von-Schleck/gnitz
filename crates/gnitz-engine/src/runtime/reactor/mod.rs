@@ -691,6 +691,19 @@ impl Reactor {
         AcceptFuture { inner: Rc::clone(&self.inner) }
     }
 
+    /// Elevate `fd`'s per-connection payload ceiling. Called after the
+    /// HELLO handshake validates a connection. Must run synchronously
+    /// before any `.await` inside `connection_loop`: the reactor re-arms
+    /// `recv` immediately after the HELLO `MessageDone`, so a pipelined
+    /// frame's length prefix can arrive while the handshake task is
+    /// still parked. If `max_payload_len` is left at the pre-handshake
+    /// 8-byte value, `handle_recv_cqe` would disconnect the second frame.
+    pub fn set_max_payload_len(&self, fd: i32, limit: usize) {
+        if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
+            conn.max_payload_len = limit;
+        }
+    }
+
     /// Initial arm of a recv SQE on a new connection fd.
     pub fn register_conn(&self, fd: i32) {
         // Clear any stale close-sentinel from a prior incarnation of
@@ -755,6 +768,17 @@ impl Reactor {
         let frame = slot.frame_bytes();
         let (ptr, len) = (frame.as_ptr(), frame.len());
         self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))).await
+    }
+
+    /// Send the precomputed OK HELLO ACK frame. The bytes are a `'static`
+    /// const, so no per-connection allocation or liveness tracking is
+    /// required.
+    pub async fn send_hello_ack(&self, fd: i32) -> i32 {
+        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] = gnitz_wire::encode_hello_ack(
+            gnitz_wire::HELLO_STATUS_OK,
+            gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32,
+        );
+        self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static).await
     }
 
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
@@ -1075,7 +1099,7 @@ impl Reactor {
             }
             io::RecvAdvance::HeaderDone => {
                 let plen = conn.recv_state.payload_len();
-                if plen > io::MAX_PAYLOAD_LEN {
+                if plen > conn.max_payload_len {
                     conn.closing = true;
                     self.inner.closing_fds.borrow_mut().insert(fd);
                     self.inner.recv_closed.borrow_mut().insert(fd, true);
@@ -1624,6 +1648,10 @@ impl Future for RecvFuture {
 enum SendAlive {
     Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
     Slot(Rc<W2mSlot>),
+    /// The backing memory lives `'static` (e.g. the precomputed HELLO
+    /// ACK), so no liveness tracking is required — the kernel pointer
+    /// remains valid for the lifetime of the process.
+    Static,
 }
 
 impl Clone for SendAlive {
@@ -1631,6 +1659,7 @@ impl Clone for SendAlive {
         match self {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
             SendAlive::Slot(rc)   => SendAlive::Slot(Rc::clone(rc)),
+            SendAlive::Static     => SendAlive::Static,
         }
     }
 }

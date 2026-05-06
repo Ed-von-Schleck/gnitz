@@ -7,6 +7,7 @@ use crate::protocol::{
     FLAG_CONFLICT_MODE_PRESENT, FLAG_CONTINUATION, WireConflictMode,
     send_message, recv_message,
     connect as proto_connect,
+    hello_handshake,
 };
 use crate::error::ClientError;
 
@@ -38,6 +39,11 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
 pub struct Connection {
     sock:          OwnedFd,
     pub client_id: u64,
+    /// Server-negotiated per-connection frame payload ceiling. Set during
+    /// `connect()` from the HELLO ACK; subsequent `recv_message` calls
+    /// pass this value through so a compromised server cannot force the
+    /// client to allocate up to the historical 256 MB ceiling.
+    max_payload_len: usize,
 }
 
 impl Connection {
@@ -45,7 +51,15 @@ impl Connection {
         let fd = proto_connect(socket_path)?;
         // SAFETY: proto_connect returns a valid, exclusively-owned file descriptor.
         let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Connection { sock, client_id: new_client_id() })
+        // Run the HELLO handshake before any data flows. The server
+        // accepts the first frame at an 8-byte limit, so this must
+        // happen before `send_message` would emit a control block.
+        let limit = hello_handshake(sock.as_raw_fd())?;
+        Ok(Connection {
+            sock,
+            client_id: new_client_id(),
+            max_payload_len: limit as usize,
+        })
     }
 
     pub fn close(self) {
@@ -100,7 +114,7 @@ impl Connection {
         let mut schema: Option<Schema> = None;
         let mut data:   Option<ZSetBatch> = None;
         let lsn: u64 = loop {
-            let msg = check_response(recv_message(self.sock.as_raw_fd(), None)?)?;
+            let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
             schema = schema.or(msg.schema);
             if let Some(batch) = msg.data_batch {
@@ -143,7 +157,7 @@ impl Connection {
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, schema, data)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
     }
 
@@ -164,7 +178,7 @@ impl Connection {
             0u128, seek_col_idx,
             Some(schema), Some(batch),
         )?;
-        let msg = recv_message(self.sock.as_raw_fd(), None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
     }
 
@@ -175,7 +189,7 @@ impl Connection {
         key:      u128,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, col_idx, None, None)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
     }
 
@@ -185,7 +199,7 @@ impl Connection {
         pk:        u128,
     ) -> Result<Message, ClientError> {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk, 0, None, None)?;
-        let msg = recv_message(self.sock.as_raw_fd(), None)?;
+        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
     }
 }

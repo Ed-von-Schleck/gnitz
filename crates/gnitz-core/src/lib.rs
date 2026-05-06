@@ -29,7 +29,8 @@ pub use protocol::{
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
     encode_wal_block, decode_wal_block, VerifyChecksum, recompute_block_checksum, get_region_offset_size,
     schema_to_batch, batch_to_schema,
-    connect, send_framed, send_framed_iov, recv_framed, close_fd,
+    connect, connect_unix, send_framed, send_framed_iov, recv_framed, close_fd,
+    hello_handshake,
     Message, send_message, recv_message, encode_message,
     parse_response, encode_control_block, decode_control_block,
 };

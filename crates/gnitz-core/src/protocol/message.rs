@@ -290,10 +290,11 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
 }
 
 pub fn recv_message(
-    sock_fd:     RawFd,
-    data_schema: Option<&Schema>,
+    sock_fd:         RawFd,
+    data_schema:     Option<&Schema>,
+    max_payload_len: usize,
 ) -> Result<Message, ProtocolError> {
-    let buf = recv_framed(sock_fd)?;
+    let buf = recv_framed(sock_fd, max_payload_len)?;
     // data_schema fallback: only needed when server sends data without schema.
     // The server always sends FLAG_HAS_SCHEMA with FLAG_HAS_DATA, so
     // parse_response() works without it.  Keep the parameter for API compat.
@@ -379,7 +380,7 @@ mod tests {
         let empty_batch = ZSetBatch::new(&schema);
         let (a, b) = make_socketpair();
         send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&empty_batch)).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
         assert!(msg.schema_batch.is_some());
@@ -424,7 +425,7 @@ mod tests {
 
         let (a, b) = make_socketpair();
         send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&batch)).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.pks,     pks);
@@ -477,7 +478,7 @@ mod tests {
 
         let (a, b) = make_socketpair();
         send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, Some(&schema), Some(&batch)).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.nulls, nulls);
@@ -499,7 +500,7 @@ mod tests {
         // Control-only message (scan/alloc style)
         let (a, b) = make_socketpair();
         send_message(a, 0, 0, FLAG_PUSH, 0u128, 0, None, None).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
         unsafe { libc::close(a); libc::close(b); }
@@ -522,7 +523,7 @@ mod tests {
             None,
             None,
         ).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.target_id,    0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.client_id,    0xCAFE_BABE_0000_0001);
         assert_eq!(msg.seek_pk,      seek_pk);
@@ -537,7 +538,7 @@ mod tests {
         let err_hdr = Header { status: STATUS_ERROR, ..Header::default() };
         let encoded = encode_control_block(&err_hdr, "something broke").unwrap();
         crate::protocol::transport::send_framed(a, &encoded).unwrap();
-        let msg = recv_message(b, None).unwrap();
+        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
         unsafe { libc::close(a); libc::close(b); }

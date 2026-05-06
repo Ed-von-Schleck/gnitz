@@ -3,7 +3,11 @@
 //! only callers. Re-homed from `gnitz-transport::{conn,recv,send}` so
 //! the reactor's single io_uring owns the client ring in Stage 4.
 
-pub(super) const MAX_PAYLOAD_LEN: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
+/// Pre-handshake limit applied to every newly registered connection.
+/// Equals the HELLO payload size in bytes; any first frame larger than
+/// this is rejected before allocation. The handshake elevates the
+/// limit to the negotiated value via `Reactor::set_max_payload_len`.
+pub(super) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
 
 pub(super) enum RecvPhase {
     Header { pos: usize },
@@ -95,6 +99,12 @@ pub(super) struct Conn {
     pub(super) recv_armed: bool,
     pub(super) closing: bool,
     pub(super) send_inflight: usize,
+    /// Per-connection ceiling on incoming frame payload size. Initialised
+    /// to `HELLO_PRE_HANDSHAKE_LEN` (HELLO payload size) so a peer sending
+    /// garbage as its first frame cannot drive an allocation larger than
+    /// the HELLO message. Elevated to the negotiated transport limit by
+    /// `Reactor::set_max_payload_len` after HELLO validation.
+    pub(super) max_payload_len: usize,
 }
 
 impl Conn {
@@ -104,6 +114,7 @@ impl Conn {
             recv_armed: false,
             closing: false,
             send_inflight: 0,
+            max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
         }
     }
 

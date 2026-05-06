@@ -24,7 +24,10 @@ pub use wal_block::{
     recompute_block_checksum, get_region_offset_size,
 };
 pub use codec::{schema_to_batch, batch_to_schema};
-pub use transport::{connect, send_framed, send_framed_iov, recv_framed, close_fd};
+pub use transport::{
+    connect, connect_unix, send_framed, send_framed_iov, recv_framed, close_fd,
+    hello_handshake,
+};
 pub use message::{
     Message, send_message, recv_message, encode_message,
     parse_response, encode_control_block, decode_control_block,

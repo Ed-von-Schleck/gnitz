@@ -236,7 +236,34 @@ async fn accept_loop(shared: Rc<Shared>) {
     }
 }
 
+enum HelloOutcome {
+    /// Connection accepted; optionally bound to an authenticated client_id.
+    Pass(Option<u64>),
+    /// Caller must close the fd.
+    Reject,
+}
+
 async fn connection_loop(fd: i32, shared: Rc<Shared>) {
+    let bound_client_id = match shared.reactor.recv(fd).await {
+        Some((ptr, len)) => {
+            let outcome = run_hello_handshake(fd, &shared, ptr, len).await;
+            if !ptr.is_null() {
+                unsafe { libc::free(ptr as *mut libc::c_void); }
+            }
+            match outcome {
+                HelloOutcome::Pass(b) => b,
+                HelloOutcome::Reject => {
+                    shared.reactor.close_fd(fd);
+                    return;
+                }
+            }
+        }
+        None => {
+            shared.reactor.close_fd(fd);
+            return;
+        }
+    };
+
     loop {
         let next = shared.reactor.recv(fd).await;
         let (ptr, len) = match next {
@@ -244,12 +271,55 @@ async fn connection_loop(fd: i32, shared: Rc<Shared>) {
             None => break,
         };
         let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-        handle_message(fd, data, &shared).await;
+        handle_message(fd, data, &shared, bound_client_id).await;
         if !ptr.is_null() {
             unsafe { libc::free(ptr as *mut libc::c_void); }
         }
     }
     shared.reactor.close_fd(fd);
+}
+
+/// Validate a HELLO frame, elevate the connection's payload limit, and
+/// reply with the symmetric ACK. See `Reactor::set_max_payload_len` for
+/// why the limit must be raised before any `.await` here.
+async fn run_hello_handshake(
+    fd: i32, shared: &Rc<Shared>,
+    ptr: *mut u8, len: usize,
+) -> HelloOutcome {
+    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+    // `decode_hello_payload` validates the 8-byte length; the magic
+    // check below is defence-in-depth on top of the pre-handshake recv
+    // ceiling that already excludes non-HELLO first frames.
+    let hello = match gnitz_wire::decode_hello_payload(data) {
+        Ok(h) => h,
+        Err(_) => return HelloOutcome::Reject,
+    };
+    if hello.magic != gnitz_wire::HELLO_MAGIC {
+        return HelloOutcome::Reject;
+    }
+
+    let server_version = gnitz_wire::WAL_FORMAT_VERSION as u16;
+    if hello.version != server_version {
+        let msg = format!(
+            "unsupported wire version: peer={}, server={}",
+            hello.version, server_version,
+        );
+        send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+        return HelloOutcome::Reject;
+    }
+
+    // Auth method bits live in `hello.flags`. Only "none" (flags=0) is
+    // wired today; future auth hooks would set `bound_client_id` here.
+    let bound_client_id: Option<u64> = None;
+
+    shared.reactor.set_max_payload_len(fd, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
+
+    let rc = shared.reactor.send_hello_ack(fd).await;
+    if rc < 0 {
+        return HelloOutcome::Reject;
+    }
+    HelloOutcome::Pass(bound_client_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -463,10 +533,35 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>) {
+async fn handle_message(
+    fd: i32, data: &[u8], shared: &Rc<Shared>,
+    bound_client_id: Option<u64>,
+) {
+    // Routing fast path: read (target_id, client_id) directly from the
+    // control block's directory without allocating or running the full
+    // decode. The auth check below uses the same parse the schema-hint
+    // lookup uses; a forged directory cannot point one at an authorized
+    // id and the other at a different region.
+    let (peeked_target_id, peeked_client_id) = match ipc::peek_routing_header(data) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("decode error: {}", e);
+            send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+            return;
+        }
+    };
+    if let Some(bound) = bound_client_id {
+        if peeked_client_id != bound {
+            // Reject before any heap-allocating decode path. A forged
+            // client_id never reaches Batch::decode_from_wal_block.
+            send_error(shared, fd, peeked_target_id as i64, bound,
+                       b"client_id not bound to this connection").await;
+            return;
+        }
+    }
+
     let decoded = {
-        let schema_hint = ipc::peek_target_id(data).ok()
-            .and_then(|tid| shared.cat().get_schema_desc(tid));
+        let schema_hint = shared.cat().get_schema_desc(peeked_target_id as i64);
         let result = match schema_hint.as_ref() {
             Some(s) => ipc::decode_wire_with_schema(data, s),
             None    => ipc::decode_wire(data),
