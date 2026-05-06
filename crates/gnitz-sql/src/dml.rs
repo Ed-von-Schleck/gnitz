@@ -74,7 +74,7 @@ fn validate_conflict_target(
 }
 
 pub fn execute_insert(
-    client:       &GnitzClient,
+    client:       &mut GnitzClient,
     _schema_name: &str,
     stmt:         &Statement,
     binder:       &mut Binder<'_>,
@@ -82,7 +82,7 @@ pub fn execute_insert(
     // Extract table name, row source, and ON CONFLICT action.
     let (table_name_str, rows, on_insert) = extract_insert_parts(stmt)?;
 
-    let (tid, schema) = binder.resolve(&table_name_str)?;
+    let (tid, schema) = binder.resolve(client, &table_name_str)?;
 
     // Resolve the ON CONFLICT clause into a `ConflictPlan`.
     let plan = match on_insert {
@@ -264,7 +264,7 @@ fn expr_contains_excluded(expr: &Expr) -> bool {
 ///
 /// Intra-batch duplicate PKs keep only the first occurrence.
 fn client_side_filter_do_nothing(
-    client: &GnitzClient,
+    client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
     batch: &ZSetBatch,
@@ -302,7 +302,7 @@ fn client_side_filter_do_nothing(
 /// Intra-batch duplicate PKs are rejected — this matches PG's
 /// "command cannot affect row a second time" behavior.
 fn client_side_merge_do_update(
-    client: &GnitzClient,
+    client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
     batch: &ZSetBatch,
@@ -560,7 +560,7 @@ fn append_value_to_col(
 // ---------------------------------------------------------------------------
 
 pub fn execute_select(
-    client:       &GnitzClient,
+    client:       &mut GnitzClient,
     _schema_name: &str,
     query:        &Query,
     binder:       &mut Binder<'_>,
@@ -585,14 +585,14 @@ pub fn execute_select(
     }
     let table_name = extract_table_factor_name(&from.relation, "FROM")?;
 
-    let (tid, schema) = binder.resolve(&table_name)?;
+    let (tid, schema) = binder.resolve(client, &table_name)?;
 
     // Check WHERE clause
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
         if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
             client.seek(tid, pk)?
         } else if let Some((col_idx, key, residual)) =
-            try_extract_index_seek(where_expr, &schema, binder, tid, false)?
+            try_extract_index_seek(client, where_expr, &schema, binder, tid, false)?
         {
             let (s, b, lsn) = client.seek_by_index(tid, col_idx as u64, key)?;
             let (s2, b2) = apply_residual_filter((s, b), residual.as_ref(), &schema)?;
@@ -725,6 +725,7 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
 /// Returns Some((col_idx, key, residual)) when WHERE contains an equality on an indexed column.
 /// When `require_unique` is true, only matches indexes where `is_unique` is set.
 fn try_extract_index_seek(
+    client:         &mut GnitzClient,
     expr:           &Expr,
     schema:         &Schema,
     binder:         &mut Binder<'_>,
@@ -734,7 +735,7 @@ fn try_extract_index_seek(
     // Case 1: simple `col = literal`
     if let Some((col_idx, key)) = try_col_eq_literal(expr, schema) {
         if col_idx != schema.pk_index {
-            if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+            if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
                 if !require_unique || is_unique {
                     return Ok(Some((col_idx, key, None)));
                 }
@@ -749,7 +750,7 @@ fn try_extract_index_seek(
         ] {
             if let Some((col_idx, key)) = try_col_eq_literal(candidate, schema) {
                 if col_idx != schema.pk_index {
-                    if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+                    if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
                         if !require_unique || is_unique {
                             let residual = binder.bind_expr(other, schema)?;
                             return Ok(Some((col_idx, key, Some(residual))));
@@ -1191,7 +1192,7 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
 // ---------------------------------------------------------------------------
 
 pub fn execute_update(
-    client:       &GnitzClient,
+    client:       &mut GnitzClient,
     _schema_name: &str,
     stmt:         &Statement,
     binder:       &mut Binder<'_>,
@@ -1203,7 +1204,7 @@ pub fn execute_update(
 
     let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
 
-    let (table_id, schema) = binder.resolve(&table_name)?;
+    let (table_id, schema) = binder.resolve(client, &table_name)?;
 
     // Bind SET assignments; reject any assignment to the PK column
     let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
@@ -1241,7 +1242,7 @@ pub fn execute_update(
 
         // Path 2: Unique index seek
         if let Some((col_idx, key, residual)) =
-            try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
+            try_extract_index_seek(client, where_expr, &schema, binder, table_id, true)?
         {
             let (schema_opt, batch_opt, _) =
                 client.seek_by_index(table_id, col_idx as u64, key)?;
@@ -1305,7 +1306,7 @@ pub fn execute_update(
 // ---------------------------------------------------------------------------
 
 pub fn execute_delete(
-    client:       &GnitzClient,
+    client:       &mut GnitzClient,
     _schema_name: &str,
     stmt:         &Statement,
     binder:       &mut Binder<'_>,
@@ -1325,7 +1326,7 @@ pub fn execute_delete(
     }
     let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
 
-    let (table_id, schema) = binder.resolve(&table_name)?;
+    let (table_id, schema) = binder.resolve(client, &table_name)?;
 
     match &del.selection {
         None => {
@@ -1361,7 +1362,7 @@ pub fn execute_delete(
 
             // Path 3: Unique index seek
             if let Some((col_idx, key, residual)) =
-                try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
+                try_extract_index_seek(client, where_expr, &schema, binder, table_id, true)?
             {
                 let (schema_opt, batch_opt, _) =
                     client.seek_by_index(table_id, col_idx as u64, key)?;

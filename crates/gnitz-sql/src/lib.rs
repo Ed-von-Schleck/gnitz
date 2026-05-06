@@ -24,20 +24,18 @@ pub enum SqlResult {
 }
 
 /// High-level SQL execution planner.
-///
-/// Uses a shared reference to `GnitzClient` — no `Arc` needed.
 pub struct SqlPlanner<'a> {
-    client:      &'a GnitzClient,
+    client:      &'a mut GnitzClient,
     schema_name: String,
 }
 
 impl<'a> SqlPlanner<'a> {
-    pub fn new(client: &'a GnitzClient, schema_name: impl Into<String>) -> Self {
+    pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
         SqlPlanner { client, schema_name: schema_name.into() }
     }
 
     /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.
-    pub fn execute(&self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql)?;
         let mut results = Vec::with_capacity(stmts.len());

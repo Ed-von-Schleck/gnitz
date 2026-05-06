@@ -1056,10 +1056,10 @@ fn response_to_lazy(
     Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
 }
 
-/// Macro to borrow the live inner client or raise GnitzError.
+/// Macro to mutably borrow the live inner client or raise GnitzError.
 macro_rules! client {
     ($self:expr) => {
-        $self.inner.as_ref()
+        $self.inner.as_mut()
             .ok_or_else(|| GnitzError::new_err("client already closed"))?
     };
 }
@@ -1091,17 +1091,17 @@ impl PyGnitzClient {
 
     // ----- DDL -----
 
-    pub fn create_schema(&self, name: &str) -> PyResult<u64> {
+    pub fn create_schema(&mut self, name: &str) -> PyResult<u64> {
         client!(self).create_schema(name).map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    pub fn drop_schema(&self, name: &str) -> PyResult<()> {
+    pub fn drop_schema(&mut self, name: &str) -> PyResult<()> {
         client!(self).drop_schema(name).map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
     #[pyo3(signature = (schema_name, table_name, columns, pk_col_idx = 0, unique_pk = true))]
     pub fn create_table(
-        &self, _py: Python<'_>,
+        &mut self, _py: Python<'_>,
         schema_name: &str, table_name: &str,
         columns: Bound<'_, PyList>,
         pk_col_idx: usize,
@@ -1114,7 +1114,7 @@ impl PyGnitzClient {
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    pub fn drop_table(&self, schema_name: &str, table_name: &str) -> PyResult<()> {
+    pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> PyResult<()> {
         client!(self).drop_table(schema_name, table_name)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
@@ -1130,7 +1130,7 @@ impl PyGnitzClient {
     ///     `duplicate key value violates unique constraint` error.
     #[pyo3(signature = (target_id, batch, conflict_mode=None))]
     pub fn push(
-        &self, _py: Python<'_>,
+        &mut self, _py: Python<'_>,
         target_id: u64,
         batch: PyRef<'_, PyZSetBatch>,
         conflict_mode: Option<&str>,
@@ -1147,13 +1147,13 @@ impl PyGnitzClient {
     }
 
     /// scan(target_id) -> (Schema | None, ZSetBatch | None, view_lsn: int)
-    pub fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
+    pub fn scan(&mut self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
         response_to_py_tuple(py, client!(self).scan(target_id))
     }
 
     /// delete(target_id, schema, pks: list[int]) — pks are full U128 primary keys.
     pub fn delete(
-        &self, py: Python<'_>,
+        &mut self, py: Python<'_>,
         target_id: u64,
         schema: PyRef<'_, PySchema>,
         pks: Vec<u128>,
@@ -1166,7 +1166,7 @@ impl PyGnitzClient {
     // ----- Views -----
 
     pub fn create_view(
-        &self, py: Python<'_>,
+        &mut self, py: Python<'_>,
         schema_name: &str, view_name: &str,
         source_table_id: u64,
         output_schema: PyRef<'_, PySchema>,
@@ -1178,7 +1178,7 @@ impl PyGnitzClient {
 
     /// create_view_with_circuit — CONSUMES circuit.
     pub fn create_view_with_circuit(
-        &self, py: Python<'_>,
+        &mut self, py: Python<'_>,
         schema_name: &str, view_name: &str,
         mut circuit: PyRefMut<'_, PyCircuit>,
         output_schema: PyRef<'_, PySchema>,
@@ -1190,14 +1190,14 @@ impl PyGnitzClient {
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    pub fn drop_view(&self, schema_name: &str, view_name: &str) -> PyResult<()> {
+    pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> PyResult<()> {
         client!(self).drop_view(schema_name, view_name)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
     /// resolve_table_id(schema_name, table_name) -> (tid: int, schema: Schema)
     pub fn resolve_table_id(
-        &self, py: Python<'_>,
+        &mut self, py: Python<'_>,
         schema_name: &str, table_name: &str,
     ) -> PyResult<PyObject> {
         let (tid, schema) = client!(self).resolve_table_or_view_id(schema_name, table_name)
@@ -1208,50 +1208,50 @@ impl PyGnitzClient {
     }
 
     /// allocate_table_id() — name matches py_client API
-    pub fn allocate_table_id(&self) -> PyResult<u64> {
+    pub fn allocate_table_id(&mut self) -> PyResult<u64> {
         client!(self).alloc_table_id().map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
     /// allocate_schema_id()
-    pub fn allocate_schema_id(&self) -> PyResult<u64> {
+    pub fn allocate_schema_id(&mut self) -> PyResult<u64> {
         client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
     /// seek_by_index(table_id, col_idx, key) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek_by_index(
-        &self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
+        &mut self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
     ) -> PyResult<PyObject> {
         response_to_py_tuple(py, client!(self).seek_by_index(table_id, col_idx, key))
     }
 
     /// seek(table_id, pk) -> (Schema | None, ZSetBatch | None, view_lsn: int)
-    pub fn seek(&self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<PyObject> {
+    pub fn seek(&mut self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<PyObject> {
         response_to_py_tuple(py, client!(self).seek(table_id, pk))
     }
 
     // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
 
     /// scan_lazy(target_id) -> ScanResult (native)
-    pub fn scan_lazy(&self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
+    pub fn scan_lazy(&mut self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
         response_to_lazy(py, client!(self).scan(target_id))
     }
 
     /// seek_lazy(table_id, pk) -> ScanResult (native)
-    pub fn seek_lazy(&self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<Py<PyScanResult>> {
+    pub fn seek_lazy(&mut self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<Py<PyScanResult>> {
         response_to_lazy(py, client!(self).seek(table_id, pk))
     }
 
     /// seek_by_index_lazy(table_id, col_idx, key) -> ScanResult (native)
     pub fn seek_by_index_lazy(
-        &self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
+        &mut self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
     ) -> PyResult<Py<PyScanResult>> {
         response_to_lazy(py, client!(self).seek_by_index(table_id, col_idx, key))
     }
 
     /// execute_sql(schema_name, sql) -> list of result dicts
-    pub fn execute_sql(&self, py: Python<'_>, schema_name: &str, sql: &str) -> PyResult<PyObject> {
+    pub fn execute_sql(&mut self, py: Python<'_>, schema_name: &str, sql: &str) -> PyResult<PyObject> {
         let client_ref = client!(self);
-        let planner = SqlPlanner::new(client_ref, schema_name);
+        let mut planner = SqlPlanner::new(client_ref, schema_name);
         let results = planner.execute(sql)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
 
@@ -1626,15 +1626,20 @@ fn recv_scan_response(
     sock_fd: std::os::unix::io::RawFd, max_payload_len: usize,
 ) -> Result<gnitz_core::Message, String> {
     let mut schema: Option<Schema> = None;
+    let mut schema_version: u16 = 0;
     let mut data:   Option<ZSetBatch> = None;
     let lsn: u128 = loop {
         let buf = gnitz_core::recv_framed(sock_fd, max_payload_len).map_err(|e| e.to_string())?;
-        let msg = gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string())?;
+        let hint = schema.as_ref().map(|s| (s, schema_version));
+        let msg = gnitz_core::parse_response(&buf, hint).map_err(|e| e.to_string())?;
         if msg.status != 0 {
             return Err(msg.error_text.unwrap_or_default());
         }
         let is_continuation = (msg.flags & gnitz_core::FLAG_CONTINUATION) != 0;
-        schema = schema.or(msg.schema);
+        if msg.schema.is_some() {
+            schema_version = gnitz_core::wire_flags_get_schema_version(msg.flags);
+            schema = msg.schema;
+        }
         if let Some(batch) = msg.data_batch {
             match data.as_mut() {
                 Some(acc) => acc.extend_from(&batch),

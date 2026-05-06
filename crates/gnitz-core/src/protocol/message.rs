@@ -2,7 +2,7 @@ use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 use super::error::ProtocolError;
-use super::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
+use super::header::{Header, STATUS_ERROR, STATUS_OK, STATUS_SCHEMA_MISMATCH, FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     wire_flags_get_schema_version};
 use super::types::{ColData, PkColumn, Schema, ZSetBatch, meta_schema};
 use crate::types::schema_from_wire_cols;
@@ -210,6 +210,37 @@ pub fn send_message(
     send_framed(sock_fd, &payload)
 }
 
+/// Like `send_message` but omits the schema block from the wire frame.
+/// The data block is still encoded using `data_schema`; the server must
+/// reconstruct the schema from its catalog (guided by the schema version in
+/// `flags`). Used by warm-cache PUSH paths where the server already knows the
+/// schema (version embedded in `flags` bits 24-39).
+pub fn send_message_noschema(
+    sock_fd:      RawFd,
+    target_id:    u64,
+    client_id:    u64,
+    flags:        u64,
+    data_schema:  &Schema,
+    data_batch:   &ZSetBatch,
+) -> Result<(), ProtocolError> {
+    let has_data = !data_batch.is_empty();
+    let mut flags_out = flags;
+    if has_data { flags_out |= FLAG_HAS_DATA; }
+    let ctrl_hdr = Header {
+        status: STATUS_OK, target_id, client_id, flags: flags_out,
+        seek_pk: 0, seek_col_idx: 0, request_id: 0,
+    };
+    let ctrl_block = encode_control_block(&ctrl_hdr, "")?;
+    let data_block = if has_data {
+        Some(encode_wal_block(data_schema, target_id as u32, data_batch))
+    } else {
+        None
+    };
+    let mut out = ctrl_block;
+    if let Some(db) = data_block { out.extend_from_slice(&db); }
+    send_framed(sock_fd, &out)
+}
+
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
 /// The payload is what `recv_framed()` returns.
 ///
@@ -286,6 +317,9 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 
     let (schema, schema_batch, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
         (None, None, None, Some(error_msg))
+    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH {
+        // Schema-mismatch response: control-only frame, no schema/data/error.
+        (None, None, None, None)
     } else {
         (wire_schema, schema_batch, data_batch, None)
     };

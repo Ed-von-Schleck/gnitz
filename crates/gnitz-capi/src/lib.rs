@@ -994,7 +994,7 @@ pub unsafe extern "C" fn gnitz_execute_sql(
         Err(e) => { set_error(e); return -1; }
     };
     let schema_name = cstr(schema);
-    let planner = SqlPlanner::new(&c.0, schema_name);
+    let mut planner = SqlPlanner::new(&mut c.0, schema_name);
     match planner.execute(sql_str) {
         Ok(results) => {
             if !out_id.is_null() {

@@ -10,7 +10,7 @@ use crate::util::align8;
 
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_CONTINUATION, IPC_CONTROL_TID,
-    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     WireConflictMode,
     wire_flags_get_conflict_mode,
     wire_flags_set_schema_version, wire_flags_get_schema_version,
@@ -908,6 +908,14 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, false)
 }
 
+/// Like `decode_wire` but supplies a catalog schema hint for schema-less
+/// external PUSH frames. The hint is used when `FLAG_HAS_DATA` is set but
+/// `FLAG_HAS_SCHEMA` is absent (warm-cache PUSH path). Checksum verification
+/// is still performed (verify_checksum = true).
+pub fn decode_wire_with_hint(data: &[u8], hint: SchemaWithVersion<'_>) -> Result<DecodedWire, &'static str> {
+    decode_wire_impl(data, Some(hint), true)
+}
+
 fn decode_wire_impl(
     data: &[u8],
     schema_hint: Option<SchemaWithVersion<'_>>,
@@ -985,8 +993,9 @@ fn decode_wire_body(
     let mut wire_schema: Option<SchemaDescriptor> = None;
 
     if has_data && !has_schema {
-        // External client traffic must always include the schema block.
-        if verify_checksum {
+        // External client traffic must include the schema block unless the
+        // caller supplies an explicit catalog hint (warm-cache PUSH path).
+        if verify_checksum && schema_hint.is_none() {
             return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
         }
         wire_schema = Some(resolve_continuation_schema(&schema_hint, flags)?);

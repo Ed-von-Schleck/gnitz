@@ -19,11 +19,11 @@ use crate::dml;
 use crate::SqlResult;
 
 pub fn execute_statement(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     stmt:        &Statement,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let mut binder = Binder::new(client, schema_name);
+    let mut binder = Binder::new(schema_name);
 
     match stmt {
         Statement::CreateTable(create) => {
@@ -66,7 +66,7 @@ fn fk_key_type(tc: TypeCode) -> TypeCode {
 /// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx).
 /// Validates that fk_col_type is compatible with the parent PK type.
 fn resolve_fk_target(
-    client:           &GnitzClient,
+    client:           &mut GnitzClient,
     schema_name:      &str,
     foreign_table:    &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
@@ -96,7 +96,7 @@ fn resolve_fk_target(
 }
 
 fn execute_create_table(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     create:      &sqlparser::ast::CreateTable,
     _binder:     &mut Binder<'_>,
@@ -183,7 +183,7 @@ fn execute_create_table(
 }
 
 fn execute_drop(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     object_type: &ObjectType,
     names:       &[sqlparser::ast::ObjectName],
@@ -210,7 +210,7 @@ fn execute_drop(
 }
 
 fn execute_create_view(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     view_name_obj: &sqlparser::ast::ObjectName,
     query:       &Query,
@@ -251,7 +251,7 @@ fn execute_create_view(
                 &format!("CTE '{}'", cte_name),
             )?;
             // Resolve the CTE's source table and cache the CTE name as an alias
-            let resolved = binder.resolve(&cte_table_name)?;
+            let resolved = binder.resolve(client, &cte_table_name)?;
             binder.cache_alias(cte_name, resolved);
         }
     }
@@ -303,7 +303,7 @@ fn execute_create_view(
 
     let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
 
-    let (source_tid, source_schema) = binder.resolve(&table_name)?;
+    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
     // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
@@ -380,7 +380,7 @@ fn execute_create_view(
 }
 
 fn execute_create_index(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     ci:          &sqlparser::ast::CreateIndex,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -514,7 +514,7 @@ fn build_projection(
 // ---------------------------------------------------------------------------
 
 fn execute_create_join_view(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     view_name:   &str,
     sql_text:    &str,
@@ -562,8 +562,8 @@ fn execute_create_join_view(
     };
 
     // Resolve both tables
-    let (left_tid, left_schema) = binder.resolve(&left_name)?;
-    let (right_tid, right_schema) = binder.resolve(&right_name)?;
+    let (left_tid, left_schema) = binder.resolve(client, &left_name)?;
+    let (right_tid, right_schema) = binder.resolve(client, &right_name)?;
 
     // Build alias map for qualified column resolution
     let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
@@ -818,7 +818,7 @@ enum GroupBySelectItem {
 }
 
 fn execute_create_group_by_view(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     view_name:   &str,
     sql_text:    &str,
@@ -827,7 +827,7 @@ fn execute_create_group_by_view(
 ) -> Result<SqlResult, GnitzSqlError> {
     // 1. Resolve source table
     let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
-    let (source_tid, source_schema) = binder.resolve(&table_name)?;
+    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
     // 2. Parse GROUP BY → group column indices
     let group_exprs = match &select.group_by {
@@ -1201,6 +1201,7 @@ fn extract_func_arg_col(func: &sqlparser::ast::Function, schema: &Schema) -> Res
 // ---------------------------------------------------------------------------
 
 fn compile_set_op_side(
+    client:      &mut GnitzClient,
     select:      &sqlparser::ast::Select,
     binder:      &mut Binder<'_>,
     cb:          &mut CircuitBuilder,
@@ -1211,7 +1212,7 @@ fn compile_set_op_side(
         ));
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "set operation")?;
-    let (source_tid, source_schema) = binder.resolve(&table_name)?;
+    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
     let inp = cb.input_delta_tagged(source_tid);
 
@@ -1236,7 +1237,7 @@ fn compile_set_op_side(
 }
 
 fn execute_create_set_op_view(
-    client:          &GnitzClient,
+    client:          &mut GnitzClient,
     schema_name:     &str,
     view_name:       &str,
     sql_text:        &str,
@@ -1259,8 +1260,8 @@ fn execute_create_set_op_view(
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
 
-    let (left_node, left_cols) = compile_set_op_side(left_select, binder, &mut cb)?;
-    let (right_node, right_cols) = compile_set_op_side(right_select, binder, &mut cb)?;
+    let (left_node, left_cols) = compile_set_op_side(client, left_select, binder, &mut cb)?;
+    let (right_node, right_cols) = compile_set_op_side(client, right_select, binder, &mut cb)?;
 
     // Schema compatibility check
     if left_cols.len() != right_cols.len() {
@@ -1325,7 +1326,7 @@ fn execute_create_set_op_view(
 // ---------------------------------------------------------------------------
 
 fn execute_create_distinct_view(
-    client:      &GnitzClient,
+    client:      &mut GnitzClient,
     schema_name: &str,
     view_name:   &str,
     sql_text:    &str,
@@ -1338,7 +1339,7 @@ fn execute_create_distinct_view(
         ));
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "SELECT DISTINCT")?;
-    let (source_tid, source_schema) = binder.resolve(&table_name)?;
+    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, source_tid);

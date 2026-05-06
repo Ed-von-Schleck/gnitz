@@ -1,7 +1,10 @@
+use lru::LruCache;
 use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
 use crate::protocol::types::type_code_from_u64;
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
+
+const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 use crate::types::{
     CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
     OWNER_KIND_TABLE, OWNER_KIND_VIEW,
@@ -103,12 +106,16 @@ struct ViewRecord {
 // --- GnitzClient ---
 
 pub struct GnitzClient {
-    conn: Connection,
+    conn:         Connection,
+    schema_cache: LruCache<u64, (Schema, u16)>,
 }
 
 impl GnitzClient {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
-        Ok(GnitzClient { conn: Connection::connect(socket_path)? })
+        Ok(GnitzClient {
+            conn:         Connection::connect(socket_path)?,
+            schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
+        })
     }
 
     pub fn close(self) {
@@ -117,20 +124,20 @@ impl GnitzClient {
 
     // --- Raw ops ---
 
-    pub fn alloc_table_id(&self) -> Result<u64, ClientError> {
+    pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
         self.conn.alloc_table_id()
     }
 
-    pub fn alloc_schema_id(&self) -> Result<u64, ClientError> {
+    pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
         self.conn.alloc_schema_id()
     }
 
-    pub fn alloc_index_id(&self) -> Result<u64, ClientError> {
+    pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
         self.conn.alloc_index_id()
     }
 
-    pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        self.conn.push(table_id, schema, batch)
+    pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
+        self.conn.push(table_id, schema, batch, &mut self.schema_cache)
     }
 
     /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses
@@ -138,34 +145,34 @@ impl GnitzClient {
     /// callers pass `Update` (or use the plain `push` which defaults
     /// to `Update` for backward compatibility).
     pub fn push_with_mode(
-        &self, table_id: u64, schema: &Schema, batch: &ZSetBatch,
+        &mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        self.conn.push_with_mode(table_id, schema, batch, mode)
+        self.conn.push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
     }
 
-    pub fn scan(&self, table_id: u64) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        self.conn.scan(table_id)
+    pub fn scan(&mut self, table_id: u64) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+        self.conn.scan(table_id, &mut self.schema_cache)
     }
 
     pub fn seek(
-        &self,
+        &mut self,
         table_id: u64,
         pk:       u128,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        self.conn.seek(table_id, pk)
+        self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
 
     pub fn seek_by_index(
-        &self, table_id: u64, col_idx: u64, key: u128,
+        &mut self, table_id: u64, col_idx: u64, key: u128,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        self.conn.seek_by_index(table_id, col_idx, key)
+        self.conn.seek_by_index(table_id, col_idx, key, &mut self.schema_cache)
     }
 
     pub fn find_index_for_column(
-        &self, table_id: u64, col_idx: usize,
+        &mut self, table_id: u64, col_idx: usize,
     ) -> Result<Option<(u64, bool)>, ClientError> {
-        let (_, idx_batch, _) = self.conn.scan(IDX_TAB)?;
+        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
@@ -180,7 +187,7 @@ impl GnitzClient {
     }
 
     pub fn create_index(
-        &self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
+        &mut self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
     ) -> Result<u64, ClientError> {
         let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
         let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
@@ -207,8 +214,8 @@ impl GnitzClient {
         Ok(index_id)
     }
 
-    pub fn drop_index_by_name(&self, index_name: &str) -> Result<(), ClientError> {
-        let (_, idx_batch, _) = self.conn.scan(IDX_TAB)?;
+    pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
+        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         let idx_batch = idx_batch.ok_or_else(|| {
             ClientError::ServerError(format!("index '{}' not found", index_name))
         })?;
@@ -240,7 +247,7 @@ impl GnitzClient {
         Err(ClientError::ServerError(format!("index '{}' not found", index_name)))
     }
 
-    pub fn delete(&self, table_id: u64, schema: &Schema, pks: &[u128]) -> Result<(), ClientError> {
+    pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: &[u128]) -> Result<(), ClientError> {
         let mut batch = ZSetBatch::new(schema);
         {
             let mut a = BatchAppender::new(&mut batch, schema);
@@ -252,25 +259,25 @@ impl GnitzClient {
                 }
             }
         }
-        self.conn.push(table_id, schema, &batch)?;
+        self.conn.push(table_id, schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }
 
     // --- DDL ---
 
-    pub fn create_schema(&self, name: &str) -> Result<u64, ClientError> {
+    pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
         let new_sid = self.conn.alloc_schema_id()?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(new_sid as u128, 1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, &schema, &batch)?;
+        self.conn.push(SCHEMA_TAB, &schema, &batch, &mut self.schema_cache)?;
         Ok(new_sid)
     }
 
-    pub fn drop_schema(&self, name: &str) -> Result<(), ClientError> {
-        let (_, data, _) = self.conn.scan(SCHEMA_TAB)?;
+    pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
+        let (_, data, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let data = data.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", name))
         })?;
@@ -281,12 +288,12 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, &schema)
             .add_row(schema_id as u128, -1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, &schema, &batch)?;
+        self.conn.push(SCHEMA_TAB, &schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }
 
     pub fn create_table(
-        &self,
+        &mut self,
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
@@ -295,7 +302,7 @@ impl GnitzClient {
     ) -> Result<u64, ClientError> {
         let new_tid = self.conn.alloc_table_id()?;
 
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
@@ -315,19 +322,19 @@ impl GnitzClient {
             .u64_val(pk_col_idx as u64)
             .u64_val(0)
             .u64_val(unique_pk as u64);
-        self.conn.push(TABLE_TAB, &tbl_schema, &tb)?;
+        self.conn.push(TABLE_TAB, &tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(new_tid)
     }
 
-    pub fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+    pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
         })?;
@@ -343,13 +350,13 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        self.conn.push(TABLE_TAB, &tbl_schema, &tb)?;
+        self.conn.push(TABLE_TAB, &tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(())
     }
 
     pub fn create_view(
-        &self,
+        &mut self,
         schema_name: &str,
         view_name: &str,
         source_table_id: u64,
@@ -370,7 +377,7 @@ impl GnitzClient {
     }
 
     pub fn create_view_with_circuit(
-        &self,
+        &mut self,
         schema_name: &str,
         view_name: &str,
         sql_text: &str,
@@ -389,7 +396,7 @@ impl GnitzClient {
     /// Writes columns, dependencies, the three circuit tables, and the view
     /// record (which must come last — it triggers the server-side hook).
     fn write_circuit_rows(
-        &self,
+        &mut self,
         schema_name: &str,
         view_name: &str,
         sql_text: &str,
@@ -397,7 +404,7 @@ impl GnitzClient {
         circuit: Circuit,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
@@ -420,7 +427,7 @@ impl GnitzClient {
                         .u64_val(dep_tid);
                 }
             }
-            self.conn.push(DEP_TAB, &dep_s, &dep)?;
+            self.conn.push(DEP_TAB, &dep_s, &dep, &mut self.schema_cache)?;
         }
 
         // Materialise the typed circuit into the three-table row bundle.
@@ -452,7 +459,7 @@ impl GnitzClient {
                     }
                 }
             }
-            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
+            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes, &mut self.schema_cache)?;
         }
 
         // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
@@ -472,7 +479,7 @@ impl GnitzClient {
                         .u64_val(*src_node);
                 }
             }
-            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
+            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges, &mut self.schema_cache)?;
         }
 
         // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
@@ -498,7 +505,7 @@ impl GnitzClient {
                         .u64_val(*v2);
                 }
             }
-            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, &s, &nc)?;
+            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, &s, &nc, &mut self.schema_cache)?;
         }
 
         // 6. View record — must be last (triggers server-side hook + circuit compilation).
@@ -507,14 +514,14 @@ impl GnitzClient {
         Ok(vid)
     }
 
-    pub fn drop_view(&self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+    pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, view_batch, _) = self.conn.scan(VIEW_TAB)?;
+        let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch.ok_or_else(|| {
             ClientError::ServerError(format!("View '{}.{}' not found", schema_name, view_name))
         })?;
@@ -529,29 +536,29 @@ impl GnitzClient {
             .str_val(&vr.sql_definition)
             .str_val(&vr.cache_directory)
             .u64_val(vr.created_lsn);
-        self.conn.push(VIEW_TAB, &view_s, &vb)?;
+        self.conn.push(VIEW_TAB, &view_s, &vb, &mut self.schema_cache)?;
 
         Ok(())
     }
 
     pub fn resolve_table_id(
-        &self,
+        &mut self,
         schema_name: &str,
         table_name: &str,
     ) -> Result<(u64, Schema), ClientError> {
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
         })?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
-        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
         let col_batch = col_batch.ok_or_else(|| {
             ClientError::ServerError("COL_TAB is empty".to_string())
         })?;
@@ -561,24 +568,24 @@ impl GnitzClient {
     }
 
     pub fn resolve_table_or_view_id(
-        &self,
+        &mut self,
         schema_name: &str,
         name: &str,
     ) -> Result<(u64, Schema), ClientError> {
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // Scan COL_TAB once — shared by both the table and view branches below
-        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
         let col_batch = col_batch.ok_or_else(|| {
             ClientError::ServerError("COL_TAB is empty".to_string())
         })?;
 
         // Try TABLE_TAB first (most common path)
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
@@ -587,7 +594,7 @@ impl GnitzClient {
         }
 
         // Fall back to VIEW_TAB
-        let (_, view_batch, _) = self.conn.scan(VIEW_TAB)?;
+        let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch.ok_or_else(|| {
             ClientError::ServerError(
                 format!("Table or view '{}.{}' not found", schema_name, name)
@@ -684,7 +691,7 @@ fn find_view_record(
 
 impl GnitzClient {
     fn push_col_tab_records(
-        &self,
+        &mut self,
         owner_id: u64,
         owner_kind: u64,
         columns: &[ColumnDef],
@@ -705,11 +712,11 @@ impl GnitzClient {
                     .u64_val(columns[i].fk_col_idx);
             }
         }
-        self.conn.push(COL_TAB, &schema, &batch)?;
+        self.conn.push(COL_TAB, &schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }
 
-    fn push_view_record(&self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
+    fn push_view_record(&mut self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(&view_s);
         BatchAppender::new(&mut vb, &view_s)
@@ -719,7 +726,7 @@ impl GnitzClient {
             .str_val(sql_text)
             .str_val("")
             .u64_val(0);
-        self.conn.push(VIEW_TAB, &view_s, &vb)?;
+        self.conn.push(VIEW_TAB, &view_s, &vb, &mut self.schema_cache)?;
         Ok(())
     }
 }

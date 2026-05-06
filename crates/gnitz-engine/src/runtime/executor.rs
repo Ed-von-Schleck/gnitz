@@ -22,7 +22,7 @@ use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::runtime::committer::{self, CommitRequest};
-use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
 use crate::runtime::reactor::{
     AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture, join_into,
@@ -569,13 +569,49 @@ async fn handle_message(
         }
     }
 
+    // Decode the frame. Schema-less PUSH frames (warm-cache path) have
+    // FLAG_HAS_DATA but not FLAG_HAS_SCHEMA; they need a catalog hint.
     let decoded = {
-        match ipc::decode_wire(data) {
-            Ok(d) => d,
+        let ctrl = match ipc::peek_control_block(data) {
+            Ok(c) => c,
             Err(e) => {
                 let msg = format!("decode error: {}", e);
                 send_error(shared, fd, 0, 0, msg.as_bytes()).await;
                 return;
+            }
+        };
+        let has_schema = (ctrl.flags & ipc::FLAG_HAS_SCHEMA) != 0;
+        let has_data   = (ctrl.flags & ipc::FLAG_HAS_DATA)   != 0;
+        if has_data && !has_schema {
+            let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
+            if client_version == 0 {
+                send_error(shared, fd, ctrl.target_id as i64, ctrl.client_id,
+                           b"FLAG_HAS_DATA without FLAG_HAS_SCHEMA").await;
+                return;
+            }
+            let server_version = shared.cat().get_schema_version(ctrl.target_id as i64);
+            if client_version != server_version {
+                send_schema_mismatch(shared, fd, ctrl.target_id as i64, ctrl.client_id).await;
+                return;
+            }
+            let catalog_schema = shared.get_schema_desc(ctrl.target_id as i64);
+            let hint = SchemaWithVersion { descriptor: &catalog_schema, version: server_version };
+            match ipc::decode_wire_with_hint(data, hint) {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("decode error: {}", e);
+                    send_error(shared, fd, ctrl.target_id as i64, ctrl.client_id, msg.as_bytes()).await;
+                    return;
+                }
+            }
+        } else {
+            match ipc::decode_wire(data) {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("decode error: {}", e);
+                    send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+                    return;
+                }
             }
         }
     };
@@ -800,9 +836,34 @@ async fn handle_scan(
         return;
     }
     let lsn = shared.last_tick_lsn.get();
+
+    // Plan 08B: on a cache miss, master sends a preliminary schema-only frame
+    // before dispatching workers. This eliminates N-1 redundant schema blocks
+    // (one per worker) from the client's perspective.
+    let server_version = shared.cat().get_schema_version(target_id);
+    let include_schema = gnitz_wire::wire_should_include_schema(client_version, server_version);
+    let effective_client_version = if include_schema {
+        let (schema_block, _) = shared.get_schema_wire_block(target_id);
+        // Emit preliminary schema frame first, then tell workers to skip schema.
+        let prelim_flags = ipc::wire_flags_set_schema_version(ipc::FLAG_CONTINUATION, server_version);
+        let prelim = encode_response_buffer(
+            target_id, client_id, None, STATUS_OK, b"",
+            Some(schema_block.as_slice()), 0, prelim_flags,
+        );
+        let rc = shared.reactor.send_buffer(fd, prelim).await;
+        if rc < 0 {
+            shared.reactor.close_fd(fd);
+            return;
+        }
+        // Embed server_version as client_version so workers omit their schema blocks.
+        server_version
+    } else {
+        client_version
+    };
+
     let result = MasterDispatcher::fan_out_scan_async(
         shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
-        target_id, client_id, fd, client_version,
+        target_id, client_id, fd, effective_client_version,
     ).await;
     match result {
         Ok(true) => {
@@ -999,6 +1060,17 @@ async fn send_ok_response(
     let buf = encode_response_buffer(
         target_id, client_id, result, STATUS_OK, b"",
         schema_arg, seek_pk, flags,
+    );
+    let rc = shared.reactor.send_buffer(fd, buf).await;
+    if rc < 0 { shared.reactor.close_fd(fd); }
+}
+
+async fn send_schema_mismatch(
+    shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64,
+) {
+    let buf = encode_response_buffer(
+        target_id, client_id, None, STATUS_SCHEMA_MISMATCH, b"",
+        None, 0, 0,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;
     if rc < 0 { shared.reactor.close_fd(fd); }

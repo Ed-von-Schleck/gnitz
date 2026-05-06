@@ -722,8 +722,11 @@ impl WireConflictMode {
     }
 }
 
-pub const STATUS_OK:    u32 = 0;
-pub const STATUS_ERROR: u32 = 1;
+pub const STATUS_OK:             u32 = 0;
+pub const STATUS_ERROR:          u32 = 1;
+/// Server-side version mismatch on schema-less PUSH: client must evict its
+/// schema cache entry for the target table and retry with the full schema.
+pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK:    u64 = 2;

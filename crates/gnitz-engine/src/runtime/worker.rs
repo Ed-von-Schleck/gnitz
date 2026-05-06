@@ -708,7 +708,7 @@ impl WorkerProcess {
                 self.read_cursor = 0;
                 self.expected_epoch += 1;
                 match self.handle_flush_all() {
-                    Ok(()) => self.send_ack(0, FLAG_CHECKPOINT, request_id),
+                    Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
                 DispatchResult::Continue
@@ -817,11 +817,11 @@ impl WorkerProcess {
 
     // ── W2M response helpers ───────────────────────────────────────────
 
-    fn send_ack(&self, target_id: u64, flags: u32, request_id: u64) {
+    fn send_ack(&self, target_id: u64, flags: u64, request_id: u64) {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
-                buf, 0, target_id, 0, flags as u64,
+                buf, 0, target_id, 0, flags,
                 0u128, 0, request_id, STATUS_OK, &[], None, None, None, None,
             );
         });
@@ -858,10 +858,12 @@ impl WorkerProcess {
             block
         });
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
+        let server_version = if schema.is_some() { self.cat().get_schema_version(tid_key) } else { 0 };
+        let flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
         let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into(
-                buf, 0, target_id, client_id, 0,
+                buf, 0, target_id, client_id, flags,
                 seek_pk, 0, request_id, STATUS_OK, &[],
                 schema, None, result, prebuilt,
             );

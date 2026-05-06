@@ -17,7 +17,7 @@ pub use header::{
     wire_flags_set_conflict_mode, wire_flags_get_conflict_mode,
     wire_flags_set_schema_version, wire_flags_get_schema_version,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_CONTINUATION,
-    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
     MAX_COLUMNS,
 };
@@ -31,6 +31,6 @@ pub use transport::{
     hello_handshake,
 };
 pub use message::{
-    Message, send_message, recv_message, encode_message,
+    Message, send_message, send_message_noschema, recv_message, encode_message,
     parse_response, encode_control_block, decode_control_block,
 };

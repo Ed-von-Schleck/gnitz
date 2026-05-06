@@ -50,22 +50,21 @@ pub fn resolve_unqualified_column(
 }
 
 pub struct Binder<'a> {
-    client:      &'a GnitzClient,
     schema_name: &'a str,
     cache:       HashMap<String, (u64, Rc<Schema>)>,
     index_cache: HashMap<(u64, usize), Option<(u64, bool)>>,
 }
 
 impl<'a> Binder<'a> {
-    pub fn new(client: &'a GnitzClient, schema_name: &'a str) -> Self {
-        Binder { client, schema_name, cache: HashMap::new(), index_cache: HashMap::new() }
+    pub fn new(schema_name: &'a str) -> Self {
+        Binder { schema_name, cache: HashMap::new(), index_cache: HashMap::new() }
     }
 
-    pub fn resolve(&mut self, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    pub fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
         if let Some(entry) = self.cache.get(name) {
             return Ok((entry.0, Rc::clone(&entry.1)));
         }
-        let (tid, schema) = self.client.resolve_table_or_view_id(self.schema_name, name)
+        let (tid, schema) = client.resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
         let rc = Rc::new(schema);
         self.cache.insert(name.to_string(), (tid, Rc::clone(&rc)));
@@ -78,12 +77,12 @@ impl<'a> Binder<'a> {
     }
 
     pub fn find_index(
-        &mut self, table_id: u64, col_idx: usize,
+        &mut self, client: &mut GnitzClient, table_id: u64, col_idx: usize,
     ) -> Result<Option<(u64, bool)>, GnitzSqlError> {
         if let Some(&cached) = self.index_cache.get(&(table_id, col_idx)) {
             return Ok(cached);
         }
-        let result = self.client.find_index_for_column(table_id, col_idx)
+        let result = client.find_index_for_column(table_id, col_idx)
             .map_err(GnitzSqlError::Exec)?;
         self.index_cache.insert((table_id, col_idx), result);
         Ok(result)
