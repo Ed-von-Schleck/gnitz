@@ -55,9 +55,14 @@ pub enum CommitRequest {
 }
 
 /// Pending entry within the committer's current batch.
+///
+/// `batch` is an `Option` so the single-push commit fast path can move
+/// ownership into `GroupInfo.merged` via `Option::take` without copying
+/// (see Phase A below). After that, the slot is `None` and only metadata
+/// (`tid`, `mode`, `done`) remains addressable.
 struct PendingPush {
     tid: i64,
-    batch: Batch,
+    batch: Option<Batch>,
     mode: WireConflictMode,
     done: oneshot::Sender<Result<u64, String>>,
 }
@@ -107,6 +112,13 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     // them on the first multi-group batch and reuses the capacity thereafter.
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(shared.num_workers);
     let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(shared.num_workers);
+    // Per-(tid, mode) merged-batch pool. `Batch::clear()` resets count and
+    // blob without freeing the data buffer, so subsequent multi-push runs
+    // skip the `strides_from_schema + zero-fill via buf.resize` cost.
+    // Capacity sized for typical hot-table fan-out; grows on demand.
+    const EXPECTED_HOT_TABLES: usize = 16;
+    let mut merge_pool: FxHashMap<(i64, u8), Batch> = FxHashMap::with_capacity_and_hasher(
+        EXPECTED_HOT_TABLES, Default::default());
     loop {
         // Block for the first request, exit if no senders remain.
         let first = match rx.recv().await {
@@ -123,6 +135,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
 
         // Barrier-only tick: nothing to commit, just signal.
         if pushes.is_empty() {
+            merge_pool.clear();
             for b in barrier_senders { let _ = b.send(()); }
             continue;
         }
@@ -141,8 +154,11 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         }
 
         // Phase 2 — commit the batched pushes.  Its own lock scope.
-        commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots).await;
+        commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
 
+        if !barrier_senders.is_empty() {
+            merge_pool.clear();
+        }
         for b in barrier_senders { let _ = b.send(()); }
     }
 }
@@ -153,7 +169,7 @@ fn start_batch(req: CommitRequest) -> (Vec<PendingPush>, Vec<oneshot::Sender<()>
     let mut barriers = Vec::new();
     match req {
         CommitRequest::Push { tid, batch, mode, done } => {
-            pushes.push(PendingPush { tid, batch, mode, done });
+            pushes.push(PendingPush { tid, batch: Some(batch), mode, done });
         }
         CommitRequest::Barrier { done } => barriers.push(done),
     }
@@ -170,12 +186,14 @@ fn debounce_drain(
     mut pushes: Vec<PendingPush>,
     mut barrier_senders: Vec<oneshot::Sender<()>>,
 ) -> (Vec<PendingPush>, Vec<oneshot::Sender<()>>) {
-    let mut row_count: usize = pushes.iter().map(|p| p.batch.count).sum();
+    let mut row_count: usize = pushes.iter()
+        .map(|p| p.batch.as_ref().expect("batch present in debounce_drain").count)
+        .sum();
     while row_count < MAX_PENDING_ROWS {
         match rx.try_recv() {
             Some(CommitRequest::Push { tid, batch, mode, done }) => {
                 row_count += batch.count;
-                pushes.push(PendingPush { tid, batch, mode, done });
+                pushes.push(PendingPush { tid, batch: Some(batch), mode, done });
             }
             Some(CommitRequest::Barrier { done }) => {
                 barrier_senders.push(done);
@@ -236,6 +254,7 @@ async fn commit_pushes(
     mut pushes: Vec<PendingPush>,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<DecodedWire>>,
+    merge_pool: &mut FxHashMap<(i64, u8), Batch>,
 ) {
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
@@ -244,8 +263,9 @@ async fn commit_pushes(
         start: usize,
         end: usize,
         tid: i64,
+        mode_u8: u8,
         req_ids: Vec<u64>,
-        merged: Batch,
+        merged: Option<Batch>,
         write_err: Option<String>,
         lsn: u64,
     }
@@ -262,6 +282,7 @@ async fn commit_pushes(
         while run_start < n {
             let tid = pushes[run_start].tid;
             let mode = pushes[run_start].mode;
+            let mode_u8 = mode.as_u8();
             let mut run_end = run_start + 1;
             while run_end < n && pushes[run_end].tid == tid && pushes[run_end].mode == mode {
                 run_end += 1;
@@ -269,28 +290,45 @@ async fn commit_pushes(
 
             let total_rows: usize = pushes[run_start..run_end]
                 .iter()
-                .map(|p| p.batch.count)
+                .map(|p| p.batch.as_ref().map(|b| b.count).unwrap_or(0))
                 .sum();
             let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
+            let single_push = run_end - run_start == 1;
 
-            let merged = match guard_panic("commit_merge", || Ok({
-                let schema = shared.disp().schema_desc_for(tid);
-                let mut m = Batch::with_schema(schema, total_rows.max(1));
-                for p in pushes[run_start..run_end].iter() {
-                    m.append_batch(&p.batch, 0, p.batch.count);
+            // Single-push: take ownership of the client's batch (no merge).
+            // Multi-push: pop a pooled merged batch (or alloc fresh) and
+            // refill it. DDL between bursts can change the schema, so
+            // mismatched pool entries are dropped and reallocated — without
+            // this, append_batch writes rows under the wrong column layout.
+            let merged = match guard_panic("commit_merge", || {
+                if single_push {
+                    Ok(pushes[run_start].batch.take()
+                        .expect("PendingPush.batch already taken"))
+                } else {
+                    let schema = shared.disp().schema_desc_for(tid);
+                    let mut m = match merge_pool.remove(&(tid, mode_u8)) {
+                        Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
+                        _ => Batch::with_schema(schema, total_rows.max(1)),
+                    };
+                    m.clear();
+                    for p in pushes[run_start..run_end].iter() {
+                        let pb = p.batch.as_ref()
+                            .expect("PendingPush.batch is missing in multi-push run");
+                        m.append_batch(pb, 0, pb.count);
+                    }
+                    Ok(m)
                 }
-                m
-            })) {
+            }) {
                 Ok(m) => m,
                 Err(panic_msg) => {
                     let placeholder = guard_panic("commit_fallback_schema", || Ok(
-                        Batch::with_schema(shared.disp().schema_desc_for(tid), 1)
+                        Batch::empty_with_schema(&shared.disp().schema_desc_for(tid))
                     ))
-                    .unwrap_or_else(|_| Batch::with_schema(
-                        crate::schema::SchemaDescriptor::minimal_u64(), 1));
+                    .unwrap_or_else(|_| Batch::empty_with_schema(
+                        &crate::schema::SchemaDescriptor::minimal_u64()));
                     groups.push(GroupInfo {
-                        start: run_start, end: run_end, tid, req_ids,
-                        merged: placeholder,
+                        start: run_start, end: run_end, tid, mode_u8, req_ids,
+                        merged: Some(placeholder),
                         write_err: Some(panic_msg), lsn: 0,
                     });
                     run_start = run_end;
@@ -299,7 +337,8 @@ async fn commit_pushes(
             };
 
             groups.push(GroupInfo {
-                start: run_start, end: run_end, tid, req_ids, merged,
+                start: run_start, end: run_end, tid, mode_u8, req_ids,
+                merged: Some(merged),
                 write_err: None, lsn: 0,
             });
             run_start = run_end;
@@ -323,8 +362,9 @@ async fn commit_pushes(
         for g in groups.iter_mut() {
             if g.write_err.is_some() { continue; }
             let mode = pushes[g.start].mode;
+            let merged = g.merged.as_ref().expect("merged set in Phase A");
             let err = guard_panic("commit_write", || Ok(
-                shared.disp().write_commit_group(g.tid, zone_lsn, &g.merged, mode, &g.req_ids).err()
+                shared.disp().write_commit_group(g.tid, zone_lsn, merged, mode, &g.req_ids).err()
             )).unwrap_or_else(Some);
             g.write_err = err;
             g.lsn = zone_lsn;
@@ -425,7 +465,7 @@ async fn commit_pushes(
                 if g.write_err.is_none() {
                     let entry = tr.entry(g.tid).or_insert(0);
                     if *entry == 0 { tids.push(g.tid); }
-                    *entry += g.merged.count;
+                    *entry += g.merged.as_ref().expect("merged set in Phase A").count;
                 }
             }
             shared.t_last_push.set(Some(Instant::now()));
@@ -462,8 +502,9 @@ async fn commit_pushes(
     {
         for g in groups.iter_mut() {
             if g.write_err.is_some() { continue; }
+            let merged = g.merged.as_ref().expect("merged set in Phase A");
             if let Err(e) = guard_panic("unique_filter_ingest", || {
-                shared.disp().unique_filter_ingest_batch(g.tid, &g.merged);
+                shared.disp().unique_filter_ingest_batch(g.tid, merged);
                 Ok(())
             }) {
                 let _ = guard_panic("unique_filter_invalidate", || {
@@ -472,6 +513,16 @@ async fn commit_pushes(
                 });
                 crate::gnitz_warn!("{}", e);
             }
+        }
+    }
+
+    // Return merged batches to the (tid, mode) pool so the next burst
+    // skips the strides_from_schema + zero-fill cost. Single-push batches
+    // (originally the client's, taken via `Option::take`) are pooled too —
+    // the schema-staleness guard above will discard them on a DDL change.
+    for g in groups.iter_mut() {
+        if let Some(b) = g.merged.take() {
+            merge_pool.insert((g.tid, g.mode_u8), b);
         }
     }
 

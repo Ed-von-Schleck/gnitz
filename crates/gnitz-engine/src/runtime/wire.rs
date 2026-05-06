@@ -930,6 +930,11 @@ fn decode_wire_impl(
 /// continuation frames that carry `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA`.
 /// Callers must supply the `server_version` that matches what the sender
 /// embedded in `wire_flags` bits 24-39; a version mismatch is a hard error.
+///
+/// Currently only used by tests; the production warmup path now decodes
+/// continuation frames via `decode_wire_ipc_zero_copy_with_ctrl` to avoid
+/// the owned `Batch` allocation.
+#[cfg(test)]
 pub fn decode_wire_ipc_with_schema<'a>(
     data: &[u8],
     hint: SchemaWithVersion<'a>,

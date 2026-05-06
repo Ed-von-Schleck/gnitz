@@ -184,22 +184,37 @@ pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     })
 }
 
-/// Compute the byte size of the data WAL block for `count` rows of `schema`.
-/// Only correct when `schema_wire_safe(schema)` holds (all strides are 8-aligned
-/// so align8 is always a noop).
-fn data_wire_block_size(count: usize, schema: &SchemaDescriptor) -> usize {
-    let pk_stride = schema.columns[schema.pk_index as usize].size as usize;
-    let npc = schema.num_columns as usize - 1;
-    let num_regions = 3 + npc + 1;
-    let mut size = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
-    size += pk_stride * count; // pk
-    size += 8 * count;         // weight
-    size += 8 * count;         // null_bmp
-    for (_pi, _ci, col) in schema.payload_columns() {
-        size += col.size as usize * count;
+/// Compute `(wire_safe, wire_row_fixed_stride)` for `schema`. The stride is
+/// only meaningful when `wire_safe` is true: it's the byte cost of one row
+/// in the SAL data block (`pk_stride + weight + null_bmp + payload strides`,
+/// all already 8-aligned because `wire_safe` rejects non-8-aligned columns).
+/// Caching the result lets `scatter_wire_group` skip the per-call iteration.
+pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
+    let safe = schema_wire_safe(schema);
+    if !safe {
+        return (false, 0);
     }
-    // blob = 0 bytes
-    size
+    let pk_stride = schema.columns[schema.pk_index as usize].size as u32;
+    let mut stride = pk_stride + 8 + 8;
+    for (_pi, _ci, col) in schema.payload_columns() {
+        stride += col.size as u32;
+    }
+    (true, stride)
+}
+
+/// Header + directory size for a wire-safe data block of `npc` payload columns.
+#[inline]
+fn data_wire_header_dir_size(npc: usize) -> usize {
+    let num_regions = 3 + npc + 1;
+    gnitz_wire::WAL_HEADER_SIZE + num_regions * 8
+}
+
+/// Compute the byte size of the data WAL block for `count` rows on a schema
+/// with `npc` payload columns and a precomputed `wire_row_fixed_stride`.
+/// Only correct when the schema is `wire_safe` (caller's responsibility).
+#[inline]
+fn data_wire_block_size_cached(count: usize, npc: usize, stride: u32) -> usize {
+    data_wire_header_dir_size(npc) + count * stride as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +566,10 @@ impl SalWriter {
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
     /// `lsn` is supplied by the caller; the SAL writer no longer owns the
     /// counter (Design 2: caller controls zone-LSN allocation).
+    ///
+    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
+    /// slot's schema region instead of building one from `schema` + names.
+    /// Mutually exclusive with `col_names_opt`; passing both is a bug.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn write_group_direct(
         &mut self,
@@ -566,19 +585,25 @@ impl SalWriter {
         req_ids: &[u64],
         unicast_worker: i32,
         client_id: u64,
+        prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
         assert_eq!(req_ids.len(), nw,
             "write_group_direct: req_ids.len()={} != num_workers={}",
             req_ids.len(), nw);
+        debug_assert!(
+            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
+            "write_group_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
+        );
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
             if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
             let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
             worker_sizes[w] = wire_size(
-                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
+                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
+                prebuilt_schema_block,
             ) as u32;
         }
 
@@ -600,7 +625,8 @@ impl SalWriter {
                 let written = encode_wire_into(
                     slot, 0, target_id as u64, client_id, wire_flags,
                     seek_pk, seek_col_idx, req_ids[w],
-                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(), None,
+                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
+                    prebuilt_schema_block,
                 );
                 debug_assert_eq!(written, wsz);
                 off += align8(wsz);
@@ -618,6 +644,14 @@ impl SalWriter {
     ///
     /// Falls back to `write_group_direct` (two-copy) for other schemas.
     /// Does NOT sync/signal. `lsn` is supplied by the caller.
+    ///
+    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
+    /// slot's schema region instead of building one from `schema` + names.
+    /// Mutually exclusive with `col_names_opt`; passing both is a bug.
+    /// `wire_props`: `(wire_safe, wire_row_fixed_stride)` derived from the
+    /// schema. When `Some`, the values are reused directly so the function
+    /// avoids the per-call column iteration; when `None`, they're computed
+    /// inline. `wire_row_fixed_stride` is only meaningful when `wire_safe`.
     #[allow(clippy::too_many_arguments)]
     pub fn scatter_wire_group(
         &mut self,
@@ -633,14 +667,23 @@ impl SalWriter {
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
+        prebuilt_schema_block: Option<&[u8]>,
+        wire_props: Option<(bool, u32)>,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
         assert_eq!(req_ids.len(), nw,
             "scatter_wire_group: req_ids.len()={} != num_workers={}",
             req_ids.len(), nw);
+        debug_assert!(
+            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
+            "scatter_wire_group: prebuilt_schema_block and col_names_opt are mutually exclusive",
+        );
 
-        if !schema_wire_safe(schema) {
+        let (wire_safe, wire_row_stride) = wire_props
+            .unwrap_or_else(|| compute_wire_props(schema));
+
+        if !wire_safe {
             // Fallback: reconstruct per-worker Batches and use existing path.
             let npc = schema.num_columns as usize - 1;
             let mb = input_batch.as_mem_batch();
@@ -659,20 +702,33 @@ impl SalWriter {
             return self.write_group_direct(
                 target_id, lsn, sal_flags, wire_flags, &refs, schema, col_names_opt,
                 seek_pk, seek_col_idx, req_ids, unicast_worker, 0,
+                prebuilt_schema_block,
             );
         }
 
-        // Fast path: scatter directly into SAL slots.
-        let col_names = col_names_opt.unwrap_or(&[]);
-        let schema_block = build_schema_wire_block(schema, col_names, target_id);
+        // Fast path: scatter directly into SAL slots. The schema block is
+        // either supplied prebuilt (cached at the caller) or built once here
+        // and reused across all worker slots.
+        let owned_block: Vec<u8>;
+        let schema_block: &[u8] = match prebuilt_schema_block {
+            Some(b) => b,
+            None => {
+                let col_names = col_names_opt.unwrap_or(&[]);
+                owned_block = build_schema_wire_block(schema, col_names, target_id);
+                &owned_block
+            }
+        };
         // ctrl block size for the no-error fast path is a compile-time constant.
         let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
+        let npc = schema.num_columns as usize - 1;
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
             if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
             let count_w = worker_indices[w].len();
-            let data_sz = if count_w > 0 { data_wire_block_size(count_w, schema) } else { 0 };
+            let data_sz = if count_w > 0 {
+                data_wire_block_size_cached(count_w, npc, wire_row_stride)
+            } else { 0 };
             worker_sizes[w] = (ctrl_size + schema_block.len() + data_sz) as u32;
         }
 
@@ -695,12 +751,12 @@ impl SalWriter {
             let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
 
             // a. Schema block immediately after the ctrl slot.
-            slot[ctrl_size..ctrl_size + schema_block.len()].copy_from_slice(&schema_block);
+            slot[ctrl_size..ctrl_size + schema_block.len()].copy_from_slice(schema_block);
 
             // b. Data block when there are rows for this worker.
             if count_w > 0 {
                 let data_start = ctrl_size + schema_block.len();
-                let data_sz = data_wire_block_size(count_w, schema);
+                let data_sz = data_wire_block_size_cached(count_w, npc, wire_row_stride);
                 let data_slot = &mut slot[data_start..data_start + data_sz];
                 write_scattered_data_block(
                     &mb, &worker_indices[w], schema, count_w, target_id, data_slot,
@@ -729,6 +785,10 @@ impl SalWriter {
 
     /// Encode once into worker 0's slot, memcpy to workers 1..N-1.
     /// Does NOT sync/signal. `lsn` is supplied by the caller.
+    ///
+    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into the
+    /// schema region instead of being built from `schema` + names. Mutually
+    /// exclusive with `col_names_opt`; passing both is a bug.
     #[allow(clippy::too_many_arguments)]
     pub fn write_broadcast_direct(
         &mut self,
@@ -742,12 +802,17 @@ impl SalWriter {
         seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
+        prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
+        debug_assert!(
+            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
+            "write_broadcast_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
+        );
 
         let wsz = wire_size(
-            STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
+            STATUS_OK, b"", Some(schema), col_names_opt, batch, prebuilt_schema_block,
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for item in worker_sizes.iter_mut().take(nw) { *item = wsz; }
@@ -767,7 +832,8 @@ impl SalWriter {
             let written = encode_wire_into(
                 slot0, 0, target_id as u64, 0, wire_flags,
                 seek_pk, seek_col_idx, request_id,
-                STATUS_OK, b"", Some(schema), col_names_opt, batch, None,
+                STATUS_OK, b"", Some(schema), col_names_opt, batch,
+                prebuilt_schema_block,
             );
             debug_assert_eq!(written, wsz);
             let mut off = GROUP_HEADER_SIZE + align8(wsz);

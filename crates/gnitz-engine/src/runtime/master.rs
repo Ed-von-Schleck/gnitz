@@ -24,7 +24,7 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, SalWriter,
 };
-use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block, decode_wire_ipc, decode_wire_ipc_with_schema};
+use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
@@ -161,7 +161,15 @@ struct UniqueIndexDesc {
 
 /// Walk every positive-weight, non-null row of `batch` and insert the
 /// indexed-column value into `filter`. Respects the filter's capped state.
-fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndexDesc) {
+///
+/// Accepts a `MemBatch` so callers can feed wire bytes without an
+/// intermediate owned `Batch` allocation (zero-copy warmup path); owned
+/// batches use `Batch::as_mem_batch()`.
+fn extract_into_filter(
+    filter: &mut UniqueFilter,
+    batch: &crate::storage::MemBatch<'_>,
+    d: &UniqueIndexDesc,
+) {
     for i in 0..batch.count {
         if filter.capped { return; }
         if batch.get_weight(i) <= 0 { continue; }
@@ -172,7 +180,7 @@ fn extract_into_filter(filter: &mut UniqueFilter, batch: &Batch, d: &UniqueIndex
         let key = if d.is_pk_col {
             batch.get_pk(i)
         } else {
-            let col_data = batch.col_data(d.src_payload_idx);
+            let col_data = batch.col_data(d.src_payload_idx, d.col_size);
             promote_to_index_key(col_data, i * d.col_size, d.col_size, d.type_code)
         };
         filter.insert(key);
@@ -210,6 +218,13 @@ pub struct MasterDispatcher {
     /// unique-index broadcasts. See the UniqueFilter comment block above.
     unique_filters: FxHashMap<(i64, u32), UniqueFilter>,
 
+    /// Per-`target_id` pool of `Batch`es reused by `build_check_batch` for
+    /// FK / unique-index validation. After the awaited pipeline returns,
+    /// each check's batch is taken via `mem::replace` and pushed back here;
+    /// the next check on the same target reuses it via `clear` + reload.
+    /// Schema staleness (DDL between bursts) is checked at pop time.
+    check_batch_pool: FxHashMap<i64, Vec<Batch>>,
+
     /// Monotonic LSN allocator. The SAL writer no longer owns a counter;
     /// the dispatcher hands out LSNs (one per zone) via `next_lsn`.
     /// Reset on checkpoint via `reset_sal`.
@@ -235,6 +250,7 @@ impl MasterDispatcher {
             catalog,
             router: PartitionRouter::new(),
             unique_filters: FxHashMap::default(),
+            check_batch_pool: FxHashMap::default(),
             next_lsn: 0,
         }
     }
@@ -258,6 +274,36 @@ impl MasterDispatcher {
             .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
         let names = cat.get_col_names_bytes(target_id);
         (schema, names)
+    }
+
+    /// Return the schema descriptor, a cached prebuilt schema wire block,
+    /// and the derived `(wire_safe, wire_row_fixed_stride)` for `target_id`.
+    /// The block is built lazily on first call and stored in the catalog
+    /// cache; it is invalidated alongside col_names whenever DDL modifies
+    /// the table. Used by SAL write paths (commit/tick/broadcast) to skip
+    /// per-call `build_schema_wire_block` allocations and per-column
+    /// iteration in `scatter_wire_group`.
+    fn cached_schema_block(&mut self, target_id: i64)
+        -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32)
+    {
+        let cat = unsafe { &mut *self.catalog };
+        let schema = cat.get_schema_desc(target_id)
+            .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
+        if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
+            return (schema, cached.block, cached.wire_safe, cached.wire_row_fixed_stride);
+        }
+        let names = cat.get_col_names_bytes(target_id);
+        let (name_refs, n) = col_names_as_refs(&names);
+        let block = Rc::new(crate::runtime::wire::build_schema_wire_block(
+            &schema, &name_refs[..n], target_id as u32,
+        ));
+        let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);
+        cat.set_schema_wire_block(target_id, block.clone(), wire_safe, wire_row_stride);
+        (schema, block, wire_safe, wire_row_stride)
+    }
+
+    fn pool_pop_batch(&mut self, id: i64) -> Option<Batch> {
+        self.check_batch_pool.get_mut(&id).and_then(|v| v.pop())
     }
 
     // -----------------------------------------------------------------------
@@ -289,13 +335,16 @@ impl MasterDispatcher {
         for item in ids.iter_mut().take(nw) { *item = request_id; }
         self.write_group_with_req_ids(
             target_id, lsn, sal_flags, 0, worker_batches, schema, col_names,
-            seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0,
+            seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0, None,
         )
     }
 
     /// Encode per-worker data with per-worker request ids. Used by async
     /// fan-outs that need distinct ids per worker for reply routing.
     /// `lsn` is supplied by the caller.
+    ///
+    /// `prebuilt_schema_block`: when `Some`, must be paired with empty
+    /// `col_names` (computing names only to discard them negates the savings).
     #[allow(clippy::too_many_arguments)]
     fn write_group_with_req_ids(
         &mut self,
@@ -311,19 +360,28 @@ impl MasterDispatcher {
         req_ids: &[u64],
         unicast_worker: i32,
         client_id: u64,
+        prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         let (name_refs, n) = col_names_as_refs(col_names);
-        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
+        let col_names_opt = if n == 0 || prebuilt_schema_block.is_some() {
+            None
+        } else {
+            Some(&name_refs[..n])
+        };
 
         self.sal.write_group_direct(
             target_id as u32, lsn, sal_flags, wire_flags, worker_batches,
             schema, col_names_opt,
             seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
+            prebuilt_schema_block,
         )
     }
 
     /// Encode batch once directly into SAL mmap, replicate to all workers.
     /// `lsn` is supplied by the caller.
+    ///
+    /// `prebuilt_schema_block`: when `Some`, must be paired with empty
+    /// `col_names` (computing names only to discard them negates the savings).
     #[allow(clippy::too_many_arguments)]
     fn write_broadcast(
         &mut self,
@@ -336,13 +394,18 @@ impl MasterDispatcher {
         seek_pk: u128,
         seek_col_idx: u64,
         request_id: u64,
+        prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         let (name_refs, n) = col_names_as_refs(col_names);
-        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
+        let col_names_opt = if n == 0 || prebuilt_schema_block.is_some() {
+            None
+        } else {
+            Some(&name_refs[..n])
+        };
 
         self.sal.write_broadcast_direct(
             target_id as u32, lsn, sal_flags, 0, batch, schema, col_names_opt,
-            seek_pk, seek_col_idx, request_id,
+            seek_pk, seek_col_idx, request_id, prebuilt_schema_block,
         )
     }
 
@@ -362,7 +425,7 @@ impl MasterDispatcher {
         request_id: u64,
     ) -> Result<(), String> {
         self.write_broadcast(target_id, lsn, flags, batch, schema, col_names,
-                            seek_pk, seek_col_idx, request_id)?;
+                            seek_pk, seek_col_idx, request_id, None)?;
         self.signal_all();
         Ok(())
     }
@@ -662,7 +725,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
-                key, col_idx as u64, req_ids, -1, 0,
+                key, col_idx as u64, req_ids, -1, 0, None,
             )
         }).await?;
 
@@ -706,7 +769,7 @@ impl MasterDispatcher {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
             disp.write_group_with_req_ids(
                 target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
-                0, 0, req_ids, -1, client_id,
+                0, 0, req_ids, -1, client_id, None,
             )
         }).await?;
 
@@ -747,7 +810,7 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        checks: Vec<PipelinedCheck>,
+        checks: &mut [PipelinedCheck],
     ) -> Result<Vec<HashSet<u128>>, String> {
         let num_checks = checks.len();
         if num_checks == 0 {
@@ -772,14 +835,14 @@ impl MasterDispatcher {
                             disp.write_group_with_req_ids(
                                 check.target_id, lsn, check.flags, 0, &refs,
                                 &check.schema, &[], 0, check.col_hint,
-                                req_slice, -1, 0,
+                                req_slice, -1, 0, None,
                             )?;
                         }
                         CheckPayload::ScatterSource { source, worker_indices } => {
                             disp.sal.scatter_wire_group(
                                 source, worker_indices, &check.schema, None,
                                 check.target_id as u32, lsn, check.flags, 0,
-                                0, check.col_hint, req_slice, -1,
+                                0, check.col_hint, req_slice, -1, None, None,
                             )?;
                         }
                     }
@@ -823,9 +886,9 @@ impl MasterDispatcher {
     /// caller — Phase 3 uses one zone-LSN across all broadcasts in a DDL
     /// so recovery can group them as an atomic zone.
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.write_broadcast(target_id, lsn, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
-                            0, 0, 0)?;
+        let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
+        self.write_broadcast(target_id, lsn, FLAG_DDL_SYNC, Some(batch), &schema, &[],
+                            0, 0, 0, Some(schema_block.as_slice()))?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
         Ok(())
@@ -854,10 +917,10 @@ impl MasterDispatcher {
     pub(crate) fn write_tick_group(
         &mut self, tid: i64, lsn: u64, req_ids: &[u64],
     ) -> Result<(), String> {
-        let (schema, col_names) = self.get_schema_and_names(tid);
+        let (schema, schema_block, _safe, _stride) = self.cached_schema_block(tid);
         self.write_group_with_req_ids(
-            tid, lsn, FLAG_TICK, 0, &[], &schema, &col_names,
-            0, 0, req_ids, -1, 0,
+            tid, lsn, FLAG_TICK, 0, &[], &schema, &[],
+            0, 0, req_ids, -1, 0, Some(schema_block.as_slice()),
         )
     }
 
@@ -957,13 +1020,14 @@ impl MasterDispatcher {
             Some(x) => x,
             None => return,
         };
+        let mb = batch.as_mem_batch();
         for d in descs {
             let filter = match self.unique_filters.get_mut(&(table_id, d.col_idx)) {
                 Some(f) => f,
                 None => continue, // not warm — warmup will pick this up
             };
             if filter.capped { continue; }
-            extract_into_filter(filter, batch, &d);
+            extract_into_filter(filter, &mb, &d);
         }
     }
 
@@ -1101,7 +1165,8 @@ impl MasterDispatcher {
             if keys.is_empty() { continue; }
 
             let expected_count = keys.len();
-            let check_batch = build_check_batch(&parent_schema, &keys);
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
+            let check_batch = build_check_batch(&parent_schema, &keys, pooled);
             let pk_col = &[parent_schema.pk_index];
             let worker_indices = compute_worker_indices(
                 &check_batch, pk_col, &parent_schema, num_workers);
@@ -1148,7 +1213,8 @@ impl MasterDispatcher {
                         (child_tid, fk_col_idx, idx_schema)
                     };
 
-                    let check_batch = build_check_batch(&idx_schema, &keys);
+                    let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
+                    let check_batch = build_check_batch(&idx_schema, &keys, pooled);
                     p1_labels.push(P1Label::FkRestrict { child_tid });
                     p1_checks.push(PipelinedCheck {
                         target_id: child_tid,
@@ -1163,7 +1229,8 @@ impl MasterDispatcher {
 
         if let Some(keys) = pk_lo_hi {
             if !keys.is_empty() {
-                let check_batch = build_check_batch(&source_schema, &keys);
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
+                let check_batch = build_check_batch(&source_schema, &keys, pooled);
                 let pk_col = &[source_schema.pk_index];
                 let worker_indices = compute_worker_indices(
                     &check_batch, pk_col, &source_schema, num_workers);
@@ -1181,7 +1248,8 @@ impl MasterDispatcher {
         // ----- Phase 1 execute + interpret --------------------------------
         let mut existing_pks: HashSet<u128> = HashSet::new();
         if !p1_checks.is_empty() {
-            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, p1_checks).await?;
+            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p1_checks).await?;
+            unsafe { reclaim_check_batches(&mut *disp_ptr, &mut p1_checks); }
 
             for (idx, label) in p1_labels.iter().enumerate() {
                 match label {
@@ -1316,7 +1384,8 @@ impl MasterDispatcher {
                 };
 
                 if !skip_broadcast {
-                    let chk_batch = build_check_batch(&idx_schema, &check_keys);
+                    let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
+                    let chk_batch = build_check_batch(&idx_schema, &check_keys, pooled);
                     p2_labels.push(P2Label::NonUpsert { source_col });
                     p2_checks.push(PipelinedCheck {
                         target_id,
@@ -1330,7 +1399,8 @@ impl MasterDispatcher {
 
             if !upsert_keys.is_empty() {
                 let u_keys: Vec<u128> = upsert_keys.iter().map(|&(k, _)| k).collect();
-                let u_batch = build_check_batch(&idx_schema, &u_keys);
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
+                let u_batch = build_check_batch(&idx_schema, &u_keys, pooled);
                 p2_labels.push(P2Label::Upsert { col_idx, source_col, upsert_keys });
                 p2_checks.push(PipelinedCheck {
                     target_id,
@@ -1346,7 +1416,8 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, p2_checks).await?;
+        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p2_checks).await?;
+        unsafe { reclaim_check_batches(&mut *disp_ptr, &mut p2_checks); }
 
         for (idx, label) in p2_labels.iter().enumerate() {
             match label {
@@ -1430,13 +1501,16 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 table_id, lsn, 0, 0, &[], &schema, &col_names,
-                0, 0, req_ids, -1, 0,
+                0, 0, req_ids, -1, 0, None,
             )
         }).await?;
 
         // Drain all continuation frames per worker, decoding directly into filters.
-        // Each slot is dropped before the next is awaited to prevent ring deadlock.
-        // Continuation frames carry no schema; reuse the schema + version from the first frame.
+        // Each slot is dropped before the next is awaited to prevent ring deadlock,
+        // but only AFTER `extract_into_filter` finishes — the zero-copy `MemBatch`
+        // borrows from `slot.bytes()` and dropping the slot first would
+        // use-after-free. Continuation frames carry no schema; reuse the schema +
+        // version saved from the first frame as a hint.
         use crate::schema::SchemaDescriptor;
         for (w, mut slot) in slots.into_iter().enumerate() {
             let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
@@ -1449,32 +1523,35 @@ impl MasterDispatcher {
                 }
                 let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
                 let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-                let decoded = if let Some((ref s, ver)) = saved_schema {
-                    let hint = SchemaWithVersion { descriptor: s, version: ver };
-                    decode_wire_ipc_with_schema(slot.bytes(), hint)
-                        .map_err(|e| scan_decode_err(w, e))?
-                } else {
-                    let d = decode_wire_ipc(slot.bytes())
-                        .map_err(|e| scan_decode_err(w, e))?;
-                    if let Some(ref s) = d.schema { saved_schema = Some((s.clone(), server_version)); }
-                    d
-                };
-                drop(slot);
+                let ctrl_size = ctrl.block_size;
+                let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
+                    descriptor: s, version: *v,
+                });
+                let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
+                    slot.bytes(), ctrl_size, ctrl, schema_hint,
+                ).map_err(|e| scan_decode_err(w, e))?;
+                if saved_schema.is_none() {
+                    if let Some(ref s) = zc.schema {
+                        saved_schema = Some((*s, server_version));
+                    }
+                }
 
-                if let Some(batch) = decoded.data_batch {
-                    if batch.count > 0 {
+                if let Some(ref mb) = zc.data_batch {
+                    if mb.count > 0 {
                         unsafe {
                             let disp = &mut *disp_ptr;
                             for d in &missing {
                                 if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
                                     if !filter.capped {
-                                        extract_into_filter(filter, &batch, d);
+                                        extract_into_filter(filter, mb, d);
                                     }
                                 }
                             }
                         }
                     }
                 }
+                drop(zc);
+                drop(slot);
 
                 if !has_more { break; }
                 slot = reactor.await_scan_slot(req_ids[w] as u32).await;
@@ -1492,18 +1569,19 @@ impl MasterDispatcher {
         target_id: i64, lsn: u64, batch: &Batch, mode: WireConflictMode,
         req_ids: &[u64],
     ) -> Result<(), String> {
-        let (schema, col_names) = self.get_schema_and_names(target_id);
+        let (schema, schema_block, wire_safe, wire_row_stride) =
+            self.cached_schema_block(target_id);
         let pk_col = &[schema.pk_index];
-        let (name_refs, n) = col_names_as_refs(&col_names);
-        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
-                batch, worker_indices, &schema, col_names_opt,
+                batch, worker_indices, &schema, None,
                 target_id as u32, lsn, FLAG_PUSH,
                 wire_flags,
                 0, 0, req_ids, -1,
+                Some(schema_block.as_slice()),
+                Some((wire_safe, wire_row_stride)),
             )
         })
     }
@@ -1519,7 +1597,7 @@ impl MasterDispatcher {
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0,
+            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0, None,
         )
     }
 
@@ -1711,9 +1789,28 @@ fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
     }
 }
 
-fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128]) -> Batch {
+/// Build a constraint-check batch for `keys`, optionally reusing a
+/// previously-pooled batch from `MasterDispatcher::check_batch_pool`.
+///
+/// Schema staleness guard: a pooled batch built before a DDL change has
+/// the wrong column layout; populating it would silently corrupt rows or
+/// panic on column writes. When `pooled.schema != Some(schema)`, the
+/// pooled allocation is dropped and a fresh batch is allocated instead.
+fn build_check_batch(
+    schema: &SchemaDescriptor,
+    keys: &[u128],
+    pooled: Option<Batch>,
+) -> Batch {
     let npc = schema.num_columns as usize - 1;
-    let mut batch = Batch::with_schema(*schema, keys.len());
+    let mut batch = match pooled {
+        Some(b) if b.schema.as_ref() == Some(schema) => {
+            let mut b = b;
+            b.clear();
+            b.reserve_rows(keys.len());
+            b
+        }
+        _ => Batch::with_schema(*schema, keys.len()),
+    };
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
     for &key in keys {
         batch.ensure_row_capacity();
@@ -1727,6 +1824,26 @@ fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128]) -> Batch {
         batch.count += 1;
     }
     batch
+}
+
+/// Take each `Batch` out of `checks` (leaving a zero-allocation sentinel),
+/// push it into `disp.check_batch_pool[target_id]`, and cap the pool depth.
+/// Called after `execute_pipeline_async` to recycle allocations.
+fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedCheck]) {
+    const POOL_MAX_DEPTH: usize = 4;
+    for check in checks.iter_mut() {
+        let target_id = check.target_id;
+        let sentinel = Batch::empty_with_schema(&check.schema);
+        let batch = match &mut check.payload {
+            CheckPayload::Broadcast(b) => std::mem::replace(b, sentinel),
+            CheckPayload::ScatterSource { source, .. } => std::mem::replace(source, sentinel),
+        };
+        let pool = disp.check_batch_pool.entry(target_id).or_default();
+        pool.push(batch);
+        if pool.len() > POOL_MAX_DEPTH {
+            pool.remove(0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1811,7 +1928,7 @@ mod unique_filter_tests {
             col_size: 8,
         };
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch, &desc);
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&10u128));
         assert!(filter.values.contains(&20u128));
         assert!(!filter.values.contains(&30u128), "negative weight skipped");
@@ -1834,7 +1951,7 @@ mod unique_filter_tests {
             col_size: 8,
         };
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch, &desc);
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&100u128));
         assert!(!filter.values.contains(&200u128), "null values skipped");
         assert!(filter.values.contains(&300u128));
@@ -1857,7 +1974,7 @@ mod unique_filter_tests {
         };
         let mut filter = UniqueFilter::new();
         filter.capped = true;
-        extract_into_filter(&mut filter, &batch, &desc);
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.is_empty(), "no-op on capped filter");
     }
 

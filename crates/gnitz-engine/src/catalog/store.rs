@@ -1,5 +1,20 @@
 use super::*;
 
+/// Cached schema wire block plus derived properties needed by the SAL
+/// ingest fast path. Returned by `get_cached_schema_wire_block`; all four
+/// fields share the same invalidation lifecycle (DDL on the owning table
+/// drops every entry together).
+pub struct CachedSchemaWire {
+    pub block: Rc<Vec<u8>>,
+    pub version: u16,
+    /// True when every column has a fixed-width 8-aligned stride and no
+    /// STRING columns. Drives the `scatter_wire_group` fast path.
+    pub wire_safe: bool,
+    /// Sum of pk_stride + 8 (weight) + 8 (null_bmp) + every payload column's
+    /// stride. Only meaningful when `wire_safe`.
+    pub wire_row_fixed_stride: u32,
+}
+
 const SYS_TABLE_IDS: &[i64] = &[
     SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
     DEP_TAB_ID, SEQ_TAB_ID,
@@ -523,13 +538,15 @@ impl CatalogEngine {
         bytes
     }
 
-    /// Return the cached encoded schema wire block and current schema version
-    /// for `table_id`, or `None` if not yet built. The caller is responsible
-    /// for building and storing the block on a miss.
-    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<(Rc<Vec<u8>>, u16)> {
-        let block = self.caches.schema_wire_block.get(&table_id)?.clone();
+    /// Return the cached encoded schema wire block, current schema version,
+    /// and derived wire properties (`wire_safe`, `wire_row_fixed_stride`)
+    /// for `table_id`, or `None` if the block isn't yet cached. Wire props
+    /// are paired with the block so they share invalidation.
+    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<CachedSchemaWire> {
+        let (block, wire_safe, wire_row_fixed_stride) =
+            self.caches.schema_wire_cache.get(&table_id)?.clone();
         let version = self.caches.get_schema_version(table_id);
-        Some((block, version))
+        Some(CachedSchemaWire { block, version, wire_safe, wire_row_fixed_stride })
     }
 
     /// Return the current schema version for `table_id` (1 if unknown).
@@ -537,9 +554,17 @@ impl CatalogEngine {
         self.caches.get_schema_version(table_id)
     }
 
-    /// Store an encoded schema wire block in the cache.
-    pub fn set_schema_wire_block(&mut self, table_id: i64, block: Rc<Vec<u8>>) {
-        self.caches.schema_wire_block.insert(table_id, block);
+    /// Store an encoded schema wire block in the cache, along with its
+    /// derived wire properties. The two are written together so the
+    /// invalidation in `clear_col_cache_no_bump` keeps them consistent.
+    pub fn set_schema_wire_block(
+        &mut self,
+        table_id: i64,
+        block: Rc<Vec<u8>>,
+        wire_safe: bool,
+        wire_row_fixed_stride: u32,
+    ) {
+        self.caches.schema_wire_cache.insert(table_id, (block, wire_safe, wire_row_fixed_stride));
     }
 
     /// True if any lock is needed for inserts into this table.

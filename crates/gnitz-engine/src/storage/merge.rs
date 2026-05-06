@@ -1038,35 +1038,6 @@ fn gather_unified_col<const N: usize>(
     }
 }
 
-/// Sort a single batch by (PK, payload) WITHOUT consolidation.
-/// All N input rows produce N output rows — no weight merging, no ghost elimination.
-/// Duplicate (PK, payload) entries are preserved as separate rows.
-#[allow(dead_code)]
-pub fn sort_only(
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
-) {
-    let n = batch.count;
-    if n == 0 {
-        return;
-    }
-
-    let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
-        .collect();
-
-    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-        Ordering::Equal => columnar::compare_rows(schema, batch, a.idx as usize, batch, b.idx as usize),
-        ord => ord,
-    });
-
-    for e in &entries {
-        let idx = e.idx as usize;
-        writer.write_row(batch, idx, batch.get_weight(idx));
-    }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1548,96 +1519,6 @@ mod tests {
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // sort_only tests
-    // -----------------------------------------------------------------------
-
-    fn run_sort(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
-        let batch = b.as_mem_batch();
-        let n = batch.count;
-        let total_blob = batch.blob.len();
-
-        let mut out_pk = vec![0u8; n * 16];
-        let mut out_weight = vec![0u8; n * 8];
-        let mut out_null = vec![0u8; n * 8];
-        let mut out_col0 = vec![0u8; n * 8];
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
-
-        let count;
-        {
-            let mut writer = DirectWriter {
-                pk: &mut out_pk,
-                pk_stride: 16,
-                weight: &mut out_weight,
-                null_bmp: &mut out_null,
-                col_bufs: vec![&mut out_col0],
-                blob: &mut out_blob,
-                blob_cache: BlobCacheGuard::acquire(schema, 0),
-                count: 0,
-                schema: *schema,
-            };
-            sort_only(&batch, schema, &mut writer);
-            count = writer.row_count();
-        }
-
-        let mut result = Vec::new();
-        for i in 0..count {
-            let pk = read_pk_u128(&out_pk, i);
-            let lo = pk as u64;
-            let hi = (pk >> 64) as u64;
-            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
-            let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
-            result.push((lo, hi, w, val));
-        }
-        result
-    }
-
-    #[test]
-    fn test_sort_unsorted() {
-        let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (3, 1, 30),
-            (1, 1, 10),
-            (2, 1, 20),
-        ]);
-
-        let result = run_sort(&b, &schema);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], (1, 0, 1, 10));
-        assert_eq!(result[1], (2, 0, 1, 20));
-        assert_eq!(result[2], (3, 0, 1, 30));
-    }
-
-    #[test]
-    fn test_sort_preserves_duplicates() {
-        let schema = make_schema_i64();
-        // Same (PK, payload) with +1 and -1 — both MUST survive (no consolidation)
-        let b = make_batch_i64(&[
-            (5, -1, 42),
-            (5, 1, 42),
-            (10, 1, 100),
-        ]);
-
-        let result = run_sort(&b, &schema);
-        assert_eq!(result.len(), 3); // ALL rows preserved
-        assert_eq!(result[0].0, 5);
-        assert_eq!(result[1].0, 5);
-        assert_eq!(result[2].0, 10);
-    }
-
-    #[test]
-    fn test_sort_already_sorted() {
-        let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (1, 1, 10),
-            (2, 1, 20),
-        ]);
-
-        let result = run_sort(&b, &schema);
-        assert_eq!(result, vec![(1, 0, 1, 10), (2, 0, 1, 20)]);
     }
 
     // -----------------------------------------------------------------------

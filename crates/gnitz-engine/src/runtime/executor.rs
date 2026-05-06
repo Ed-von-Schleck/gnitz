@@ -100,7 +100,7 @@ impl Shared {
     fn get_schema_wire_block(&self, target_id: i64) -> (Rc<Vec<u8>>, u16) {
         let cat = self.cat();
         if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
-            return cached;
+            return (cached.block, cached.version);
         }
         let schema = cat.get_schema_desc(target_id)
             .unwrap_or_else(SchemaDescriptor::minimal_u64);
@@ -111,7 +111,8 @@ impl Shared {
             &schema, names_slice, target_id as u32,
         ));
         let version = cat.get_schema_version(target_id);
-        cat.set_schema_wire_block(target_id, block.clone());
+        let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);
+        cat.set_schema_wire_block(target_id, block.clone(), wire_safe, wire_row_stride);
         (block, version)
     }
 
@@ -129,14 +130,17 @@ impl Shared {
         self.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS)
     }
 
-    /// Drain `tick_rows` and `tick_tids`, returning the union of pending
-    /// tids in stable insertion order.
-    fn drain_tick_rows(&self) -> Vec<i64> {
+    /// Drain `tick_rows` and `tick_tids` into `out`, retaining `out`'s
+    /// capacity. Stable insertion order is preserved (anti-join semantics
+    /// require that the b-side trace runs after a-side ticks). The caller's
+    /// scratch buffer is reused across ticks instead of allocating a fresh
+    /// `Vec` per drain.
+    fn drain_tick_rows_into(&self, out: &mut Vec<i64>) {
+        out.clear();
         let mut tids = self.tick_tids.borrow_mut();
-        let v = std::mem::take(&mut *tids);
+        out.extend(tids.drain(..));
         self.tick_rows.borrow_mut().clear();
         self.t_last_push.set(None);
-        v
     }
 }
 
@@ -365,6 +369,9 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
     let mut req_ids: Vec<u64> = Vec::with_capacity(nw);
     let mut triggers: Vec<TickTrigger> = Vec::new();
+    // Reused across every tick; `drain_tick_rows_into` clears it before
+    // refilling so capacity is retained.
+    let mut tids_scratch: Vec<i64> = Vec::new();
     loop {
         let first = match rx.recv().await {
             Some(t) => t,
@@ -408,23 +415,23 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         // ticks in the order pushes arrived. Reordering causes the b-side
         // trace to be empty when a-side ticks (and vice versa), leaking
         // rows that should have cancelled.
-        let mut tids: Vec<i64> = shared.drain_tick_rows();
+        shared.drain_tick_rows_into(&mut tids_scratch);
         let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
         if has_drain {
-            let mut seen: FxHashSet<i64> = tids.iter().copied().collect();
+            let mut seen: FxHashSet<i64> = tids_scratch.iter().copied().collect();
             for t in &triggers {
                 if let TickTrigger::Drain { tids: v, .. } = t {
                     for &tid in v {
-                        if seen.insert(tid) { tids.push(tid); }
+                        if seen.insert(tid) { tids_scratch.push(tid); }
                     }
                 }
             }
         }
-        tids.retain(|&tid| shared.cat().has_id(tid));
+        tids_scratch.retain(|&tid| shared.cat().has_id(tid));
 
         // Run the tick. Errors are reported in logs; every Drain trigger's
         // `done` is signalled regardless so callers don't hang.
-        if let Err(e) = run_tick(&shared, &tids, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await {
+        if let Err(e) = run_tick(&shared, &tids_scratch, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await {
             gnitz_warn!("tick error: {}", e);
         }
         for t in triggers.drain(..) {

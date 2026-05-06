@@ -18,10 +18,11 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) pk_col_of:        FxHashMap<i64, u32>,
     pub(crate) col_names:        FxHashMap<i64, Vec<String>>,
     pub(crate) col_names_bytes:  FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
-    /// Cached encoded schema wire block per table. Built from
-    /// (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
+    /// Cached schema wire data per table: (encoded block, wire_safe, wire_row_fixed_stride).
+    /// Built from (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
+    /// `wire_row_fixed_stride` is only meaningful when `wire_safe == true`.
     /// Invalidated alongside col_names when DDL modifies the table schema.
-    pub(crate) schema_wire_block: FxHashMap<i64, Rc<Vec<u8>>>,
+    pub(crate) schema_wire_cache: FxHashMap<i64, (Rc<Vec<u8>>, bool, u32)>,
     /// Monotonically increasing schema version per table (wraps 65535→1, never 0).
     /// Absent entries implicitly resolve to version 1 (base version).
     /// Version 0 is reserved as "client has no cached schema".
@@ -53,7 +54,7 @@ impl CatalogCacheSet {
     pub(crate) fn clear_col_cache_no_bump(&mut self, id: i64) {
         self.col_names.remove(&id);
         self.col_names_bytes.remove(&id);
-        self.schema_wire_block.remove(&id);
+        self.schema_wire_cache.remove(&id);
     }
 
     pub(crate) fn invalidate_col_names(&mut self, id: i64) {

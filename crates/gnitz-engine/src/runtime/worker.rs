@@ -10,8 +10,7 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
-use crate::storage::{BlobCacheGuard, FlushWork, partition_for_key};
-use crate::ops::worker_for_partition;
+use crate::storage::{BlobCacheGuard, FlushWork};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
 use crate::runtime::sal::{
     SAL_MMAP_SIZE, FLAG_EXCHANGE, FLAG_CHECKPOINT,
@@ -177,6 +176,7 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
 
 pub struct WorkerProcess {
     worker_id: u32,
+    #[allow(dead_code)]
     num_workers: usize,
     master_pid: i32,
     catalog: *mut CatalogEngine,
@@ -847,13 +847,14 @@ impl WorkerProcess {
             if !table_schema_matches {
                 return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
             }
-            if let Some((block, _version)) = self.cat().get_cached_schema_wire_block(tid_key) {
-                return block;
+            if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
+                return cached.block;
             }
             let col_names = self.cat().get_col_names_bytes(tid_key);
             let (name_refs, n) = ipc::col_names_as_refs(&col_names);
             let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
-            self.cat().set_schema_wire_block(tid_key, block.clone());
+            let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
+            self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
             block
         });
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
@@ -887,13 +888,14 @@ impl WorkerProcess {
         // embedded in wire_flags so the client can cache/verify.
         let (prebuilt_rc, server_version) = if let Some(s) = schema {
             let (block, server_version) = match self.cat().get_cached_schema_wire_block(tid_key) {
-                Some((block, ver)) => (block, ver),
+                Some(cached) => (cached.block, cached.version),
                 None => {
                     let col_names = self.cat().get_col_names_bytes(tid_key);
                     let (name_refs, n) = ipc::col_names_as_refs(&col_names);
                     let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
                     let ver = self.cat().get_schema_version(tid_key);
-                    self.cat().set_schema_wire_block(tid_key, block.clone());
+                    let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
+                    self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
                     (block, ver)
                 }
             };
@@ -986,8 +988,9 @@ impl WorkerProcess {
     fn handle_push(
         &mut self, target_id: i64, batch: Batch, _request_id: u64,
     ) -> Result<(), String> {
-        // Filter to only rows belonging to this worker's partitions.
-        let batch = self.filter_my_partition(batch);
+        // Master pre-partitions FLAG_PUSH rows in `scatter_wire_group`,
+        // so every slot already contains only this worker's rows. A second
+        // partition-hash filter here would be pure overhead.
         if batch.count == 0 {
             return Ok(());
         }
@@ -1010,38 +1013,6 @@ impl WorkerProcess {
         }
         gnitz_debug!("W{} push tid={} rows={}", self.worker_id, target_id, row_count);
         Ok(())
-    }
-
-    /// Filter a broadcast batch to only rows belonging to this worker's partitions.
-    fn filter_my_partition(&self, batch: Batch) -> Batch {
-        let schema = match batch.schema {
-            Some(s) => s,
-            None => return batch,
-        };
-        let n = batch.count;
-        if n == 0 {
-            return batch;
-        }
-
-        // Single pass: collect matching row indices.
-        let wid = self.worker_id as usize;
-        let nw = self.num_workers;
-        let mut indices: Vec<u32> = Vec::new();
-        for i in 0..n {
-            if worker_for_partition(partition_for_key(batch.get_pk(i)), nw) == wid {
-                indices.push(i as u32);
-            }
-        }
-        if indices.len() == n {
-            return batch;
-        }
-        if indices.is_empty() {
-            return Batch::with_schema(schema, 0);
-        }
-
-        // Vectorized scatter: one bulk copy per column, no per-row overhead.
-        let mb = batch.as_mem_batch();
-        Batch::from_indexed_rows(&mb, &indices, &schema)
     }
 
     fn handle_tick(&mut self, target_id: i64, request_id: u64) -> Result<(), String> {
@@ -1495,104 +1466,6 @@ mod tests {
             existing.append_batch(&b2, 0, b2.count);
         }
         assert_eq!(pending[&100].count, 2);
-    }
-
-    // -- filter_my_partition tests ----------------------------------------
-
-    /// Build a batch with the given PK values (pk_lo only, pk_hi=0).
-    fn make_batch(schema: SchemaDescriptor, pks: &[u64]) -> Batch {
-        let mut b = Batch::with_schema(schema, pks.len());
-        for &pk in pks {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &pk.to_le_bytes());
-            b.count += 1;
-        }
-        b
-    }
-
-    #[test]
-    fn test_filter_my_partition_all_workers_cover_all_rows() {
-        let schema = test_schema();
-        let pks: Vec<u64> = (0..200).collect();
-        let batch = make_batch(schema, &pks);
-        let nw = 4usize;
-
-        let mut total = 0usize;
-        for wid in 0..nw as u32 {
-            let wp = WorkerProcess {
-                worker_id: wid,
-                num_workers: nw,
-                master_pid: 0,
-                catalog: std::ptr::null_mut(),
-                sal_reader: unsafe { std::mem::zeroed() },
-                w2m_writer: unsafe { std::mem::zeroed() },
-                exchange: make_handler(),
-                pending_deltas: HashMap::new(),
-                pending_scan: None,
-                read_cursor: 0,
-                expected_epoch: 1,
-            };
-            let filtered = wp.filter_my_partition(batch.clone_batch());
-            // Every row in the filtered batch must belong to this worker.
-            for i in 0..filtered.count {
-                let part = partition_for_key(filtered.get_pk(i));
-                assert_eq!(worker_for_partition(part, nw), wid as usize);
-            }
-            total += filtered.count;
-        }
-        // No rows lost or duplicated.
-        assert_eq!(total, 200);
-    }
-
-    #[test]
-    fn test_filter_my_partition_empty_batch() {
-        let schema = test_schema();
-        let batch = Batch::with_schema(schema, 0);
-        let wp = WorkerProcess {
-            worker_id: 0,
-            num_workers: 4,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
-        let result = wp.filter_my_partition(batch);
-        assert_eq!(result.count, 0);
-    }
-
-    #[test]
-    fn test_filter_my_partition_no_schema_passthrough() {
-        let schema = test_schema();
-        let mut batch = Batch::with_schema(schema, 1);
-        batch.extend_pk(1u128);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(0, &1u64.to_le_bytes());
-        batch.count = 1;
-        // filter_my_partition short-circuits when schema is None.
-        batch.schema = None;
-        let wp = WorkerProcess {
-            worker_id: 0,
-            num_workers: 4,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
-        let result = wp.filter_my_partition(batch);
-        assert_eq!(result.count, 1);
     }
 
     // -- pending_relays tests ------------------------------------------------

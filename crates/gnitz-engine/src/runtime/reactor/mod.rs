@@ -209,6 +209,10 @@ struct ReactorShared {
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
+    /// Scratch buffer for `reap_closing_conns` to avoid a per-tick `Vec<i32>`
+    /// allocation. Cleared on entry, repopulated from `closing_fds`, and
+    /// retained across ticks.
+    closing_scratch: RefCell<Vec<i32>>,
     /// Guards against spawning multiple concurrent EMFILE/ENFILE backoff tasks.
     /// Set before spawn, cleared when the timer fires and accept is re-armed.
     accept_backoff_armed: Cell<bool>,
@@ -319,6 +323,7 @@ impl Reactor {
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
             closing_fds: RefCell::new(FxHashSet::default()),
+            closing_scratch: RefCell::new(Vec::new()),
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
             accept_backoff_armed: Cell::new(false),
@@ -1157,8 +1162,14 @@ impl Reactor {
     /// not all connections.
     fn reap_closing_conns(&self) {
         if self.inner.closing_fds.borrow().is_empty() { return; }
-        let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
-        for fd in closing {
+        // Take ownership of the scratch (leaves a zero-cap Vec sentinel so
+        // the borrow of `closing_scratch` ends immediately) and refill it.
+        // The body re-borrows `closing_fds` and `conns`, which would deadlock
+        // if we held the scratch borrow live.
+        let mut closing = std::mem::take(&mut *self.inner.closing_scratch.borrow_mut());
+        closing.clear();
+        closing.extend(self.inner.closing_fds.borrow().iter().copied());
+        for &fd in &closing {
             let ready = {
                 let conns = self.inner.conns.borrow();
                 match conns.get(&fd) {
@@ -1179,6 +1190,8 @@ impl Reactor {
             }
             unsafe { libc::close(fd); }
         }
+        // Return the scratch Vec to the cell so its capacity is retained.
+        *self.inner.closing_scratch.borrow_mut() = closing;
     }
 
     /// Drain every unread W2M slot for worker `w` and route each reply.

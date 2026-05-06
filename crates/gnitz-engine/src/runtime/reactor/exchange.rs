@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
+use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::wire::DecodedWire;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
@@ -20,12 +21,12 @@ use crate::storage::Batch;
 /// because `worker_watcher` (executor.rs) triggers reactor shutdown on
 /// any worker crash, tearing down all parked tasks.
 pub struct ExchangeAccumulator {
-    rounds: HashMap<(i64, i64), ExchangeRound>,
+    rounds: FxHashMap<(i64, i64), ExchangeRound>,
     nw: usize,
 }
 
 struct ExchangeRound {
-    payloads: Vec<Option<Batch>>,
+    payloads: [Option<Batch>; MAX_WORKERS],
     count:    usize,
     schema:   Option<SchemaDescriptor>,
 }
@@ -42,7 +43,8 @@ pub struct PendingRelay {
 
 impl ExchangeAccumulator {
     pub fn new(nw: usize) -> Self {
-        ExchangeAccumulator { rounds: HashMap::new(), nw }
+        debug_assert!(nw <= MAX_WORKERS, "ExchangeAccumulator: nw={} exceeds MAX_WORKERS={}", nw, MAX_WORKERS);
+        ExchangeAccumulator { rounds: FxHashMap::default(), nw }
     }
 
     /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once
@@ -57,7 +59,7 @@ impl ExchangeAccumulator {
         let nw = self.nw;
 
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
-            payloads: vec![None; nw],
+            payloads: [const { None }; MAX_WORKERS],
             count:    0,
             schema:   None,
         });
@@ -78,7 +80,8 @@ impl ExchangeAccumulator {
                     return None;
                 }
             };
-            Some(PendingRelay { view_id: vid, payloads: round.payloads, schema, source_id })
+            let payloads: Vec<Option<Batch>> = round.payloads.into_iter().take(nw).collect();
+            Some(PendingRelay { view_id: vid, payloads, schema, source_id })
         } else {
             None
         }
