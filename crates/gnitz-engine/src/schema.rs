@@ -104,7 +104,7 @@ pub(crate) const fn type_size(tc: u8) -> u8 {
 // Row-format utilities
 // ---------------------------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     debug_assert!(bytes.len() >= size, "read_signed: buffer too short ({} < {})", bytes.len(), size);
     match size {

@@ -54,6 +54,10 @@ pub struct MemTable {
     found_run: usize,
     found_row: usize,
     has_found: bool,
+    // Scratch buffers reused across calls to `find_positive_payload_row`.
+    // Capacity persists; contents do not.
+    candidate_scratch: Vec<(u16, u32, i64)>,
+    processed_scratch: Vec<bool>,
 }
 
 impl MemTable {
@@ -70,6 +74,8 @@ impl MemTable {
             found_run: 0,
             found_row: 0,
             has_found: false,
+            candidate_scratch: Vec::with_capacity(16),
+            processed_scratch: Vec::with_capacity(16),
         }
     }
 
@@ -225,24 +231,51 @@ impl MemTable {
     /// sequence where the old payload has been cancelled but the new payload
     /// is still positive.
     pub fn find_positive_payload_row(&mut self, key: u128) -> bool {
-        // Single pass: for each PK-matching row, compute its net weight immediately.
-        // find_weight_for_row takes &self, so it can overlap with the iterator's
-        // immutable borrow of self.runs. Mutable writes to self.found_* touch
-        // disjoint fields and are fine under NLL.
+        self.candidate_scratch.clear();
         for (ri, run) in self.runs.iter().enumerate() {
             if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
                 continue;
             }
+            debug_assert!(ri <= u16::MAX as usize, "run index overflows u16");
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
-                let net_w = self.find_weight_for_row(key, run, lo);
-                if net_w > 0 {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
-                    return true;
-                }
+                debug_assert!(lo <= u32::MAX as usize, "row index overflows u32");
+                self.candidate_scratch.push((ri as u16, lo as u32, run.get_weight(lo)));
                 lo += 1;
+            }
+        }
+
+        let n = self.candidate_scratch.len();
+        self.processed_scratch.clear();
+        self.processed_scratch.resize(n, false);
+
+        let is_fast = columnar::schema_is_int_nonnull(&self.schema);
+
+        for i in 0..n {
+            if self.processed_scratch[i] { continue; }
+            let (ri, row_i, wi) = self.candidate_scratch[i];
+            let run_i = &self.runs[ri as usize];
+            let mut net_w: i64 = wi;
+            self.processed_scratch[i] = true;
+            for j in (i + 1)..n {
+                if self.processed_scratch[j] { continue; }
+                let (rj, row_j, wj) = self.candidate_scratch[j];
+                let ord = columnar::compare_rows_dispatch(
+                    &self.schema,
+                    run_i, row_i as usize,
+                    &self.runs[rj as usize], row_j as usize,
+                    is_fast,
+                );
+                if ord == Ordering::Equal {
+                    net_w += wj;
+                    self.processed_scratch[j] = true;
+                }
+            }
+            if net_w > 0 {
+                self.found_run = ri as usize;
+                self.found_row = row_i as usize;
+                self.has_found = true;
+                return true;
             }
         }
         self.has_found = false;
@@ -885,6 +918,82 @@ mod tests {
         let found2 = mt.find_positive_payload_row(99);
         assert!(!found2);
         assert!(!mt.has_found);
+    }
+
+    /// Multi-run scenario: K=3 distinct payloads per key spread across 8 runs
+    /// with mixed positive/negative weights. Exercises the single-pass collect
+    /// and the cross-run payload grouping logic.
+    #[test]
+    fn test_find_positive_payload_row_multi_run() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // 8 runs, each touches PK=10 with a different mix of payloads.
+        // Group A (val=100): +1, +1, -1, -1 → net 0  (cancelled)
+        // Group B (val=200): -1, +1         → net 0  (cancelled)
+        // Group C (val=300): +1             → net +1 (live)
+        let runs: &[&[(u64, i64, i64)]] = &[
+            &[(10, 1, 100)],                 // A+
+            &[(10, 1, 100), (10, -1, 200)],  // A+, B-
+            &[(10, -1, 100)],                // A-
+            &[(10, -1, 100)],                // A-
+            &[(10, 1, 200)],                 // B+
+            &[(10, 1, 300)],                 // C+
+            &[(10, 1, 300), (10, -1, 300)],  // C+, C-  (within-run cancel)
+            &[(5, 1, 50)],                   // unrelated PK
+        ];
+        for r in runs {
+            mt.upsert_sorted_batch(make_batch(&schema, r)).unwrap();
+        }
+
+        let found = mt.find_positive_payload_row(10);
+        assert!(found);
+        assert!(mt.has_found);
+
+        // The found row must have payload 300 (the only group with net > 0).
+        let col_ptr = mt.found_col_ptr(0, 8);
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 300, "expected live payload=300, got {val}");
+    }
+
+    /// Every payload group nets to zero. Must return false and clear has_found.
+    #[test]
+    fn test_find_positive_payload_row_all_cancelled() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // PK=42 with two payloads, each fully cancelled across runs.
+        mt.upsert_sorted_batch(make_batch(&schema, &[(42, 1, 100)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(42, 1, 200)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(42, -1, 100)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(42, -1, 200)])).unwrap();
+
+        let found = mt.find_positive_payload_row(42);
+        assert!(!found, "all groups cancelled → no positive row");
+        assert!(!mt.has_found);
+    }
+
+    /// First candidate already has net_w > 0; the early return must fire
+    /// without scanning later groups.
+    #[test]
+    fn test_find_positive_payload_row_first_group_positive() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Run 0 has the live row first; runs 1+ contain a cancelled group.
+        mt.upsert_sorted_batch(make_batch(&schema, &[(7, 1, 999)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(7, 1, 111)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(7, -1, 111)])).unwrap();
+
+        let found = mt.find_positive_payload_row(7);
+        assert!(found);
+        let col_ptr = mt.found_col_ptr(0, 8);
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 999);
     }
 
     #[test]

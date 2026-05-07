@@ -386,6 +386,7 @@ fn merge_entry_less<'c>(
     cursors: &'c [MemBatchCursor],
     batches: &'c [SortedMemBatch],
     schema: &'c SchemaDescriptor,
+    is_fast: bool,
 ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
     move |a, b| {
         if a.key != b.key {
@@ -395,7 +396,9 @@ fn merge_entry_less<'c>(
         let bj = cursors[b.idx].batch_idx;
         let ri = cursors[a.idx].position;
         let rj = cursors[b.idx].position;
-        columnar::compare_rows(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
+        columnar::compare_rows_dispatch(
+            schema, &batches[bi].0, ri, &batches[bj].0, rj, is_fast,
+        ) == Ordering::Less
     }
 }
 
@@ -424,6 +427,8 @@ pub fn merge_batches(
         .map(|i| MemBatchCursor::new(i, batches[i].count))
         .collect();
 
+    let is_fast = columnar::schema_is_int_nonnull(schema);
+
     let mut tree = MergeHeap::build(
         cursors.len(),
         |i| {
@@ -433,7 +438,7 @@ pub fn merge_batches(
                 None
             }
         },
-        merge_entry_less(&cursors, batches, schema),
+        merge_entry_less(&cursors, batches, schema, is_fast),
     );
 
     let mut has_pending = false;
@@ -451,10 +456,11 @@ pub fn merge_batches(
 
         let same_group = has_pending
             && cur_pk == pending_pk
-            && columnar::compare_rows(
+            && columnar::compare_rows_dispatch(
                 schema,
                 &batches[pending_batch].0, pending_row,
                 &batches[bi].0, ri,
+                is_fast,
             ) == Ordering::Equal;
 
         if same_group {
@@ -476,7 +482,7 @@ pub fn merge_batches(
         } else {
             None
         };
-        tree.advance(ci, new_key, &merge_entry_less(&cursors, batches, schema));
+        tree.advance(ci, new_key, &merge_entry_less(&cursors, batches, schema, is_fast));
     }
 
     if has_pending && pending_weight != 0 {
@@ -511,16 +517,20 @@ pub fn sort_and_consolidate(
         return;
     }
 
+    let is_fast = columnar::schema_is_int_nonnull(schema);
+
     let mut entries: Vec<SortEntry> = (0..n as u32)
         .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
         .collect();
 
     entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-        Ordering::Equal => columnar::compare_rows(schema, batch, a.idx as usize, batch, b.idx as usize),
+        Ordering::Equal => columnar::compare_rows_dispatch(
+            schema, batch, a.idx as usize, batch, b.idx as usize, is_fast,
+        ),
         ord => ord,
     });
 
-    drain_groups_into(n, batch, schema, writer, |pos| {
+    drain_groups_into(n, batch, schema, writer, is_fast, |pos| {
         (entries[pos].idx as usize, entries[pos].pk)
     });
 }
@@ -536,7 +546,8 @@ pub fn fold_sorted(
     if n == 0 {
         return;
     }
-    drain_groups_into(n, batch, schema, writer, |pos| (pos, batch.get_pk(pos)));
+    let is_fast = columnar::schema_is_int_nonnull(schema);
+    drain_groups_into(n, batch, schema, writer, is_fast, |pos| (pos, batch.get_pk(pos)));
 }
 
 /// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
@@ -549,6 +560,7 @@ fn drain_groups_into(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
+    is_fast: bool,
     resolve: impl Fn(usize) -> (usize, u128),
 ) {
     let (mut pending_idx, mut pending_pk) = resolve(0);
@@ -557,7 +569,9 @@ fn drain_groups_into(
     for pos in 1..n {
         let (cur_idx, cur_pk) = resolve(pos);
         let same_group = cur_pk == pending_pk
-            && columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
+            && columnar::compare_rows_dispatch(
+                schema, batch, pending_idx, batch, cur_idx, is_fast,
+            ) == Ordering::Equal;
 
         if same_group {
             pending_weight += batch.get_weight(cur_idx);

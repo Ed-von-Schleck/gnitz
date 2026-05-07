@@ -98,6 +98,63 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     Ordering::Equal
 }
 
+// ---------------------------------------------------------------------------
+// Fast path: signed-integer, non-nullable schemas
+// ---------------------------------------------------------------------------
+
+/// Returns true iff every payload column is non-nullable and a signed
+/// fixed-width integer (I8/I16/I32/I64). Unsigned types are excluded:
+/// `compare_rows_int_nonnull` reads via `read_signed` and would misorder
+/// values ≥ the sign bit.
+#[inline]
+pub(crate) fn schema_is_int_nonnull(schema: &SchemaDescriptor) -> bool {
+    use crate::schema::type_code::{I8, I16, I32, I64};
+    schema.payload_columns().all(|(_, _, col)| {
+        col.nullable == 0 && matches!(col.type_code, I8 | I16 | I32 | I64)
+    })
+}
+
+/// Fast path for `compare_rows`: skips null-bitmap reads and the per-column
+/// type-code dispatch. Caller MUST guarantee `schema_is_int_nonnull(schema)`
+/// — otherwise the lack of null/float/string/U128 arms produces silent
+/// miscompares.
+#[inline]
+pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
+    schema: &SchemaDescriptor,
+    src_a: &A, row_a: usize,
+    src_b: &B, row_b: usize,
+) -> Ordering {
+    debug_assert!(
+        schema_is_int_nonnull(schema),
+        "compare_rows_int_nonnull called on schema with non-signed-integer or nullable columns",
+    );
+    for (payload_col, _ci, col) in schema.payload_columns() {
+        let col_size = col.size as usize;
+        let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
+        let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
+        let ord = read_signed(raw_a, col_size).cmp(&read_signed(raw_b, col_size));
+        if ord != Ordering::Equal { return ord; }
+    }
+    Ordering::Equal
+}
+
+/// Dispatch to `compare_rows_int_nonnull` when `is_fast` is set, else the
+/// generic `compare_rows`. Inlining keeps the branch loop-invariant for
+/// callers that hoist `is_fast` once per merge.
+#[inline]
+pub(crate) fn compare_rows_dispatch<A: ColumnarSource, B: ColumnarSource>(
+    schema: &SchemaDescriptor,
+    src_a: &A, row_a: usize,
+    src_b: &B, row_b: usize,
+    is_fast: bool,
+) -> Ordering {
+    if is_fast {
+        compare_rows_int_nonnull(schema, src_a, row_a, src_b, row_b)
+    } else {
+        compare_rows(schema, src_a, row_a, src_b, row_b)
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -365,5 +422,150 @@ mod tests {
         let batch = single_col_batch(&[0, 0], col0);
         // "abc" < "abd"
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast path: schema_is_int_nonnull / compare_rows_int_nonnull
+    // -----------------------------------------------------------------------
+
+    fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
+        // First column is PK (U64); subsequent are payload columns.
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        for (i, &(tc, nullable)) in cols.iter().enumerate() {
+            columns[i + 1] = SchemaColumn::new(tc, nullable);
+        }
+        SchemaDescriptor {
+            num_columns: 1 + cols.len() as u32,
+            pk_index: 0,
+            columns,
+        }
+    }
+
+    /// Verify the fast path agrees with the generic `compare_rows` for I8/I16/I32/I64.
+    #[test]
+    fn test_compare_rows_int_nonnull_matches_generic() {
+        // I64
+        {
+            let schema = make_schema(&[(type_code::I64, 0)]);
+            let mut col = Vec::new();
+            col.extend_from_slice(&(-42i64).to_le_bytes());
+            col.extend_from_slice(&0i64.to_le_bytes());
+            col.extend_from_slice(&42i64.to_le_bytes());
+            let batch = single_col_batch(&[0, 0, 0], col);
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_eq!(
+                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows(&schema, &batch, i, &batch, j),
+                        "I64 mismatch at ({i}, {j})",
+                    );
+                }
+            }
+        }
+        // I32
+        {
+            let schema = make_schema(&[(type_code::I32, 0)]);
+            let vals: [i32; 4] = [i32::MIN, -1, 0, i32::MAX];
+            let mut col = Vec::new();
+            for v in vals { col.extend_from_slice(&v.to_le_bytes()); }
+            let batch = single_col_batch(&[0; 4], col);
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert_eq!(
+                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows(&schema, &batch, i, &batch, j),
+                    );
+                }
+            }
+        }
+        // I16
+        {
+            let schema = make_schema(&[(type_code::I16, 0)]);
+            let vals: [i16; 4] = [i16::MIN, -1, 0, i16::MAX];
+            let mut col = Vec::new();
+            for v in vals { col.extend_from_slice(&v.to_le_bytes()); }
+            let batch = single_col_batch(&[0; 4], col);
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert_eq!(
+                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows(&schema, &batch, i, &batch, j),
+                    );
+                }
+            }
+        }
+        // I8
+        {
+            let schema = make_schema(&[(type_code::I8, 0)]);
+            let vals: [i8; 4] = [i8::MIN, -1, 0, i8::MAX];
+            let mut col = Vec::new();
+            for v in vals { col.push(v as u8); }
+            let batch = single_col_batch(&[0; 4], col);
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert_eq!(
+                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows(&schema, &batch, i, &batch, j),
+                    );
+                }
+            }
+        }
+        // Multi-column (I32, I64): primary diff in col 0, tie-break in col 1.
+        {
+            let schema = make_schema(&[(type_code::I32, 0), (type_code::I64, 0)]);
+            // Two payload cols means `single_col_batch` is wrong shape.
+            // Build inline: 3 rows × (i32, i64).
+            let rows: &[(i32, i64)] = &[(1, 100), (1, 200), (2, 50)];
+            let mut col0 = Vec::new();
+            let mut col1 = Vec::new();
+            for &(a, b) in rows {
+                col0.extend_from_slice(&a.to_le_bytes());
+                col1.extend_from_slice(&b.to_le_bytes());
+            }
+            let mut null_bmp = Vec::new();
+            for _ in rows { null_bmp.extend_from_slice(&0u64.to_le_bytes()); }
+            let batch = TestBatch { null_bmp, col_data: vec![col0, col1], blob: vec![] };
+            for i in 0..rows.len() {
+                for j in 0..rows.len() {
+                    assert_eq!(
+                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows(&schema, &batch, i, &batch, j),
+                        "multi-col mismatch at ({i}, {j})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify `schema_is_int_nonnull` rejects unsigned ints, U128, floats,
+    /// strings, blobs, and any nullable column.
+    #[test]
+    fn test_schema_is_int_nonnull_excludes_unsigned() {
+        // All-signed-int, non-nullable → true
+        assert!(schema_is_int_nonnull(&make_schema(&[
+            (type_code::I8, 0), (type_code::I16, 0),
+            (type_code::I32, 0), (type_code::I64, 0),
+        ])));
+
+        // Nullable signed int → false
+        assert!(!schema_is_int_nonnull(&make_schema(&[(type_code::I32, 1)])));
+
+        // Each disqualifying type → false
+        for tc in [
+            type_code::U8, type_code::U16, type_code::U32, type_code::U64,
+            type_code::U128, type_code::F32, type_code::F64,
+            type_code::STRING, type_code::BLOB,
+        ] {
+            assert!(
+                !schema_is_int_nonnull(&make_schema(&[(tc, 0)])),
+                "expected schema with type_code={tc} to be rejected",
+            );
+        }
+
+        // Mixed: signed int + unsigned → false (any disqualifier kills it)
+        assert!(!schema_is_int_nonnull(&make_schema(&[
+            (type_code::I64, 0), (type_code::U32, 0),
+        ])));
     }
 }
