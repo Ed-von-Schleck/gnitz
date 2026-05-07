@@ -88,15 +88,6 @@ impl ShardCursor {
             u128::MAX
         }
     }
-
-    #[allow(dead_code)]
-    fn weight(&self, shard: &MappedShard) -> i64 {
-        if self.is_valid() {
-            shard.get_weight(self.position)
-        } else {
-            0
-        }
-    }
 }
 
 #[cfg(test)]
@@ -125,15 +116,17 @@ fn shard_entry_less<'a>(
     cursors: &'a [ShardCursor],
     shards: &'a [MappedShard],
     schema: &'a SchemaDescriptor,
+    is_fast: bool,
 ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'a {
     move |a, b| {
         if a.key != b.key {
             return a.key < b.key;
         }
-        columnar::compare_rows(
+        columnar::compare_rows_dispatch(
             schema,
             &shards[cursors[a.idx].shard_idx], cursors[a.idx].position,
             &shards[cursors[b.idx].shard_idx], cursors[b.idx].position,
+            is_fast,
         ) == std::cmp::Ordering::Less
     }
 }
@@ -161,6 +154,8 @@ fn open_and_merge(
         .map(|i| ShardCursor::new(i, &shards[i]))
         .collect();
 
+    let is_fast = columnar::schema_is_int_nonnull(schema);
+
     let mut tree = MergeHeap::build(
         cursors.len(),
         |i| {
@@ -170,7 +165,7 @@ fn open_and_merge(
                 None
             }
         },
-        shard_entry_less(&cursors, &shards, schema),
+        shard_entry_less(&cursors, &shards, schema, is_fast),
     );
 
     let mut has_pending = false;
@@ -188,10 +183,11 @@ fn open_and_merge(
 
         let same_group = has_pending
             && cur_key == pending_key
-            && columnar::compare_rows(
+            && columnar::compare_rows_dispatch(
                 schema,
                 &shards[pending_shard_idx], pending_row,
                 &shards[si], row,
+                is_fast,
             ) == std::cmp::Ordering::Equal;
 
         if same_group {
@@ -213,7 +209,7 @@ fn open_and_merge(
         } else {
             None
         };
-        tree.advance(ci, new_key, &shard_entry_less(&cursors, &shards, schema));
+        tree.advance(ci, new_key, &shard_entry_less(&cursors, &shards, schema, is_fast));
     }
 
     if has_pending && pending_weight != 0 {

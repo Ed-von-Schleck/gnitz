@@ -95,25 +95,6 @@ impl MergeHeap {
         }
     }
 
-    /// Sift up operating on heap/pos_map directly.
-    #[inline]
-    pub fn sift_up_static(
-        heap: &mut [HeapNode],
-        pos_map: &mut [i32],
-        mut idx: usize,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-    ) {
-        while idx > 0 {
-            let parent = (idx - 1) / 2;
-            if less(&heap[idx], &heap[parent]) {
-                swap_entries(heap, pos_map, idx, parent);
-                idx = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
     /// Advance a cursor/entry.  If `new_key` is `None` the entry is
     /// exhausted and removed from the heap; otherwise its key is updated
     /// and sifted down.
@@ -135,9 +116,17 @@ impl MergeHeap {
 
         match new_key {
             None => {
-                // Removal: move last element into the vacated slot.  The
-                // replacement has no ordering relationship to its new
-                // neighbors, so both sift-down and sift-up are needed.
+                // Removal: move last element into the vacated slot, then
+                // sift down. Sift-up is intentionally absent: MergeHeap is
+                // not a generic updatable heap. Every advance(None) caller
+                // (read_cursor.rs, merge.rs, compact.rs) removes an entry
+                // drawn from min_indices, i.e. tied with the root. By the
+                // heap property heap[0] <= heap[parent] <= heap[node] =
+                // heap[0], so the parent is also tied; the replacement
+                // (last element >= root) cannot be < parent. If a future
+                // caller removes an entry that is NOT tied with the root,
+                // re-introduce sift_up here and audit all advance(None)
+                // sites.
                 self.pos_map[entry_idx] = -1;
                 let last = self.heap.len() - 1;
                 if heap_idx != last {
@@ -150,7 +139,6 @@ impl MergeHeap {
                     self.heap.pop();
                     if !self.heap.is_empty() && heap_idx < self.heap.len() {
                         Self::sift_down_static(&mut self.heap, &mut self.pos_map, heap_idx, less);
-                        Self::sift_up_static(&mut self.heap, &mut self.pos_map, heap_idx, less);
                     }
                 } else {
                     self.heap.pop();
