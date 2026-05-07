@@ -34,11 +34,12 @@ pub(crate) struct ColPtr {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct UnifiedSource<'a> {
+pub(crate) struct UnifiedSource {
     pub pk: ColPtr,
     pub null_bmp: ColPtr,
     pub cols: [ColPtr; MAX_COLUMNS - 1],
-    pub blob: &'a [u8],
+    pub blob_ptr: *const u8,
+    pub blob_len: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,43 +363,6 @@ impl<'a> DirectWriter<'a> {
         );
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
-    }
-
-    /// Write one row by reading from a `ColumnarSource`. Used by the cursor
-    /// scatter path (`ReadCursor::scatter_drained_into`) so the writer's
-    /// internal field layout stays private to this module.
-    pub(super) fn scatter_row<S: ColumnarSource>(
-        &mut self,
-        source: &S,
-        pk: u128,
-        weight: i64,
-        row: usize,
-    ) {
-        let dst_row = self.count;
-        let stride = self.pk_stride as usize;
-        debug_assert!(stride == 16 || pk >> 64 == 0,
-            "scatter_row: U64 batch requires high bits == 0");
-        self.pk[dst_row * stride..][..stride]
-            .copy_from_slice(&pk.to_le_bytes()[..stride]);
-        self.weight[dst_row * 8..][..8]
-            .copy_from_slice(&weight.to_le_bytes());
-        let null_word = source.get_null_word(row);
-        self.null_bmp[dst_row * 8..][..8]
-            .copy_from_slice(&null_word.to_le_bytes());
-
-        let src_blob = source.blob_slice();
-        let schema = self.schema;
-        for (pi, _ci, col) in schema.payload_columns() {
-            let cs = col.size as usize;
-            if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
-                let src_struct = source.get_col_ptr(row, pi, 16);
-                self.write_string_cell(pi, src_struct, src_blob, dst_row);
-            } else {
-                let src = source.get_col_ptr(row, pi, cs);
-                self.col_bufs[pi][dst_row * cs..][..cs].copy_from_slice(src);
-            }
-        }
-        self.count += 1;
     }
 
     pub fn row_count(&self) -> usize {
@@ -906,24 +870,10 @@ fn gather_mb_col<const N: usize>(
 /// Column-first scatter from multiple `UnifiedSource`s with explicit per-row
 /// weights from the merge walk.
 ///
-/// Used by `ReadCursor::scatter_drained_into`: the merge produces a *net*
-/// consolidated weight per (PK, payload) group, which may differ from any
-/// single source's stored weight when multiple inputs contribute to the same
-/// group. Callers must filter zero-weight rows before calling — `drain_sorted_into`
-/// does so.
-///
-/// `UnifiedSource` covers both `MemBatch` and `MappedShard` regions through a
-/// flat `(base, stride)` representation; `as_unified` (in `read_cursor.rs`)
-/// validates encodings and returns `None` for unsupported ones (e.g. Constant
-/// pk, TwoValue non-weight regions), in which case the caller uses the
-/// row-major loop.
-///
-/// **Precondition:** every `sources[si]` referenced by `rows[*].0` must be
-/// `Some`. The inner loop uses `unwrap_unchecked` for codegen — a `None` slot
-/// is UB. `scatter_drained_into` upholds this by aborting the whole fast path
-/// if any `as_unified` returns `None`.
+/// Used by `ReadCursor::scatter_drained_into`. Callers must filter zero-weight
+/// rows before calling — `drain_sorted_into` does so.
 pub(crate) fn scatter_unified_sources_with_weights(
-    sources: &[Option<UnifiedSource<'_>>],
+    sources: &[UnifiedSource],
     rows: &[(u32, u32, i64)],
     writer: &mut DirectWriter<'_>,
 ) {
@@ -953,11 +903,12 @@ pub(crate) fn scatter_unified_sources_with_weights(
         if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
-                let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
+                let src = unsafe { sources.get_unchecked(si as usize) };
                 let cp = src.cols[pi];
                 let p = unsafe { cp.base.add(ri as usize * cp.stride) };
                 let src_struct = unsafe { std::slice::from_raw_parts(p, 16) };
-                writer.write_string_cell(pi, src_struct, src.blob, base + out);
+                let src_blob = unsafe { std::slice::from_raw_parts(src.blob_ptr, src.blob_len) };
+                writer.write_string_cell(pi, src_struct, src_blob, base + out);
             }
         } else {
             let dst = &mut writer.col_bufs[pi][base * cs..];
@@ -968,21 +919,21 @@ pub(crate) fn scatter_unified_sources_with_weights(
     writer.count += n;
 }
 
-// PK stride is `PKS` (literal 8 or 16); weight and null_bmp are always 8.
-// `null_bmp.stride == 0` for shard Constant regions, in which case
-// `base.add(ri * 0) == base` reads the same bytes for every output row.
+// PK stride is `PKS` (literal 8 or 16) for the destination; source reads use
+// `src.pk.stride` so Constant PK regions (stride=0) read the same bytes for
+// every output row — identical to the existing null_bmp Constant behaviour.
 #[inline(always)]
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
-    sources: &[Option<UnifiedSource<'_>>],
+    sources: &[UnifiedSource],
     rows: &[(u32, u32, i64)],
     base: usize,
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
+        let src = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.base.add(ri as usize * PKS) };
+        let pk_ptr = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
         let nbm_ptr = unsafe { src.null_bmp.base.add(ri as usize * src.null_bmp.stride) };
         writer.pk[dst_row * PKS..][..PKS]
             .copy_from_slice(unsafe { std::slice::from_raw_parts(pk_ptr, PKS) });
@@ -994,7 +945,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 
 #[inline(always)]
 fn gather_unified_col_dispatch(
-    sources: &[Option<UnifiedSource<'_>>],
+    sources: &[UnifiedSource],
     rows: &[(u32, u32, i64)],
     pi: usize,
     cs: usize,
@@ -1008,9 +959,7 @@ fn gather_unified_col_dispatch(
         16 => gather_unified_col::<16>(sources, rows, pi, dst),
         _  => {
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
-                let src = unsafe {
-                    sources.get_unchecked(si as usize).as_ref().unwrap_unchecked()
-                };
+                let src = unsafe { sources.get_unchecked(si as usize) };
                 let cp = src.cols[pi];
                 let p = unsafe { cp.base.add(ri as usize * cp.stride) };
                 dst[out * cs..][..cs]
@@ -1025,13 +974,13 @@ fn gather_unified_col_dispatch(
 // so the bounds check stays out of the hot inner loop.
 #[inline(always)]
 fn gather_unified_col<const N: usize>(
-    sources: &[Option<UnifiedSource<'_>>],
+    sources: &[UnifiedSource],
     rows: &[(u32, u32, i64)],
     pi: usize,
     dst: &mut [u8],
 ) {
     for (out, &(si, ri, _)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
+        let src = unsafe { sources.get_unchecked(si as usize) };
         let cp = src.cols[pi];
         let ptr = unsafe { cp.base.add(ri as usize * cp.stride) };
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(out * N), N) };

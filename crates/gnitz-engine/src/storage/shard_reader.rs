@@ -223,6 +223,22 @@ impl MappedShard {
         let weight = build_region_view(&entries[1])?;
         let null_bmp = build_region_view(&entries[2])?;
 
+        // Reject TwoValue for pk/null_bmp: encoder never emits this.
+        if matches!(pk, RegionView::TwoValue { .. }) || matches!(null_bmp, RegionView::TwoValue { .. }) {
+            return Err(StorageError::InvalidShard);
+        }
+        // Validate Raw region sizes before the has_ghosts scan (which reads
+        // count*8 bytes from the weight region and would panic on undersize).
+        if let RegionView::Raw { size, .. } = &weight {
+            if *size < count * 8 { return Err(StorageError::InvalidShard); }
+        }
+        if let RegionView::Raw { size, .. } = &pk {
+            if *size < count * pk_stride as usize { return Err(StorageError::InvalidShard); }
+        }
+        if let RegionView::Raw { size, .. } = &null_bmp {
+            if *size < count * 8 { return Err(StorageError::InvalidShard); }
+        }
+
         // has_ghosts: true only if at least one row actually has weight == 0.
         // For Raw regions we scan the weight data once at open rather than
         // assuming any Raw-encoded shard has ghosts. The drain-then-scatter
@@ -253,6 +269,18 @@ impl MappedShard {
                 reg_idx += 1;
             }
         }
+        // Reject TwoValue for payload columns (encoder never emits this) and
+        // validate Raw sizes so to_unified can be infallible.
+        for (pi, _ci, col) in schema.payload_columns() {
+            match &col_regions[pi] {
+                RegionView::TwoValue { .. } => return Err(StorageError::InvalidShard),
+                RegionView::Raw { size, .. } if *size < count * col.size as usize => {
+                    return Err(StorageError::InvalidShard);
+                }
+                _ => {}
+            }
+        }
+
         let blob_off = entries[reg_idx].offset;
         let blob_len = entries[reg_idx].size;
 

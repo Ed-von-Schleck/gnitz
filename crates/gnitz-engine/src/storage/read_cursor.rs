@@ -107,14 +107,9 @@ impl CursorSource {
     /// buffer (always Raw regions) or a `MappedShard`'s mmap (Raw or Constant
     /// regions, indexed by payload position).
     ///
-    /// Returns `None` for any source that cannot be expressed as a flat
-    /// `(base, stride)` per region: shards with a Constant pk (single-row
-    /// shards), or any non-weight TwoValue region (impossible with the current
-    /// encoder, defensive backstop). Also returns `None` if a Raw region's
-    /// stored size is too small for `count * stride`, which would only happen
-    /// with a malformed shard. The row-major fallback handles all of these
-    /// cases correctly.
-    fn as_unified<'a>(&'a self, schema: &SchemaDescriptor) -> Option<UnifiedSource<'a>> {
+    /// Infallible: `MappedShard::open` validates all encoding constraints and
+    /// region sizes at open time, so no arm here can fail.
+    fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
         let mut cols = [ColPtr { base: ptr::null(), stride: 0 }; MAX_COLUMNS - 1];
         match self {
             CursorSource::Batch(b) => {
@@ -130,7 +125,7 @@ impl CursorSource {
                         stride: col.size as usize,
                     };
                 }
-                Some(UnifiedSource {
+                UnifiedSource {
                     pk: ColPtr {
                         base: unsafe { data_ptr.add(pk_off) },
                         stride: pk_stride,
@@ -140,28 +135,29 @@ impl CursorSource {
                         stride: FIXED_REGION_BYTES,
                     },
                     cols,
-                    blob: mb.blob,
-                })
+                    blob_ptr: mb.blob.as_ptr(),
+                    blob_len: mb.blob.len(),
+                }
             }
             CursorSource::Shard(s) => {
-                let count = s.count;
                 let pk_stride = s.pk_stride as usize;
                 let data_ptr = s.data().as_ptr();
 
                 let pk = match &s.pk {
-                    RegionView::Raw { offset, size } => {
-                        if *size < count * pk_stride { return None; }
+                    RegionView::Raw { offset, .. } => {
                         ColPtr { base: unsafe { data_ptr.add(*offset) }, stride: pk_stride }
                     }
-                    // Constant pk only happens on single-row shards; rare enough
-                    // that the row-major fallback is fine.
-                    RegionView::Constant { .. } => return None,
-                    RegionView::TwoValue { .. } => return None,
+                    // stride=0: base.add(ri * 0) == base for every row, reads
+                    // the constant value identically to null_bmp Constant.
+                    RegionView::Constant { value, .. } => ColPtr {
+                        base: value.as_ptr(),
+                        stride: 0,
+                    },
+                    RegionView::TwoValue { .. } => unreachable!(),
                 };
 
                 let null_bmp = match &s.null_bmp {
-                    RegionView::Raw { offset, size } => {
-                        if *size < count * FIXED_REGION_BYTES { return None; }
+                    RegionView::Raw { offset, .. } => {
                         ColPtr {
                             base: unsafe { data_ptr.add(*offset) },
                             stride: FIXED_REGION_BYTES,
@@ -171,33 +167,31 @@ impl CursorSource {
                         base: value.as_ptr(),
                         stride: 0,
                     },
-                    RegionView::TwoValue { .. } => return None,
+                    RegionView::TwoValue { .. } => unreachable!(),
                 };
 
                 for (pi, _ci, col) in schema.payload_columns() {
                     let cs = col.size as usize;
                     cols[pi] = match &s.col_regions[pi] {
-                        RegionView::Raw { offset, size } => {
-                            if *size < count * cs { return None; }
+                        RegionView::Raw { offset, .. } => {
                             ColPtr { base: unsafe { data_ptr.add(*offset) }, stride: cs }
                         }
                         RegionView::Constant { value, .. } => ColPtr {
                             base: value.as_ptr(),
                             stride: 0,
                         },
-                        // TwoValue is only used by the encoder for the weight
-                        // region, never for pk/null_bmp/payload columns; bail
-                        // defensively if a malformed shard violates that.
-                        RegionView::TwoValue { .. } => return None,
+                        RegionView::TwoValue { .. } => unreachable!(),
                     };
                 }
 
-                Some(UnifiedSource {
+                let blob = s.blob_slice();
+                UnifiedSource {
                     pk,
                     null_bmp,
                     cols,
-                    blob: s.blob_slice(),
-                })
+                    blob_ptr: blob.as_ptr(),
+                    blob_len: blob.len(),
+                }
             }
         }
     }
@@ -329,6 +323,7 @@ impl ReadCursorEntry {
 
 pub struct ReadCursor {
     entries: Vec<ReadCursorEntry>,
+    unified_sources: Vec<UnifiedSource>,
     tree: Option<MergeHeap>,
     schema: SchemaDescriptor,
     // Current row state
@@ -362,6 +357,9 @@ impl ReadCursor {
 
     fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
+        let unified_sources: Vec<UnifiedSource> = entries.iter()
+            .map(|e| e.source.to_unified(&schema))
+            .collect();
         let tree = if n > 1 {
             Some(Self::build_tree(&entries, &schema))
         } else {
@@ -369,6 +367,7 @@ impl ReadCursor {
         };
         let mut cursor = ReadCursor {
             entries,
+            unified_sources,
             tree,
             schema,
             valid: false,
@@ -735,52 +734,15 @@ impl ReadCursor {
         }
     }
 
-    /// Scatter `rows` (collected via `drain_sorted_into`) into `writer`.
-    ///
-    /// Fast path: build a `UnifiedSource` view per entry (covers both
-    /// in-memory batches and mmap'd shards) and run the column-major scatter.
-    /// The common 1-shard + 1-batch cursor takes this path. The row-major
-    /// fallback fires when `as_unified` returns `None` for any source —
-    /// single-row shards with Constant PK encoding, malformed shards with
-    /// undersized Raw regions, or TwoValue non-weight regions — or when the
-    /// entry count exceeds `MAX_INLINE_BATCH_SOURCES`.
     pub(crate) fn scatter_drained_into(
         &self,
         rows: &[(u32, u32, i64)],
         writer: &mut super::merge::DirectWriter<'_>,
     ) {
-        if rows.is_empty() {
-            return;
-        }
-        if self.entries.len() <= MAX_INLINE_BATCH_SOURCES {
-            // ~1 072 bytes per slot × 16 slots ≈ 17 KB, comfortably on stack.
-            let mut sources: [Option<UnifiedSource<'_>>; MAX_INLINE_BATCH_SOURCES] =
-                [const { None }; MAX_INLINE_BATCH_SOURCES];
-            let mut all_unified = true;
-            for (i, e) in self.entries.iter().enumerate() {
-                match e.source.as_unified(&self.schema) {
-                    Some(u) => sources[i] = Some(u),
-                    None => { all_unified = false; break; }
-                }
-            }
-            if all_unified {
-                super::merge::scatter_unified_sources_with_weights(&sources, rows, writer);
-                return;
-            }
-        }
-        for &(si, ri, w) in rows {
-            let entry = &self.entries[si as usize];
-            let row = ri as usize;
-            let pk = entry.source.get_pk(row);
-            writer.scatter_row(&entry.source, pk, w, row);
-        }
+        if rows.is_empty() { return; }
+        super::merge::scatter_unified_sources_with_weights(&self.unified_sources, rows, writer);
     }
 }
-
-/// Upper bound for the column-major scatter fast path in
-/// `scatter_drained_into`. Above this we degrade to the row-major loop —
-/// not a correctness limit, just a stack-size cap on the inline source array.
-const MAX_INLINE_BATCH_SOURCES: usize = 16;
 
 /// Build a ReadCursor from in-memory batches + shard Rcs.
 ///
@@ -1144,5 +1106,64 @@ mod tests {
         let cursor = ReadCursor::new(entries, schema);
         assert!(cursor.valid);
         assert_eq!(cursor.current_key, expected);
+    }
+
+    /// Cursor backed by a shard whose PK region is Constant-encoded (single-row
+    /// shard).  Previously `to_unified` returned `None` for this, falling back
+    /// to the row-major scatter.  Now the column-major path handles it directly.
+    #[test]
+    fn test_scatter_constant_pk_shard() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_i64();
+
+        let pk_bytes: Vec<u8> = 42u128.to_le_bytes().to_vec();
+        let weights: Vec<i64> = vec![1i64];
+        let null_bm: Vec<u64> = vec![0u64];
+        let col_data: Vec<i64> = vec![999i64];
+        let blob: Vec<u8> = Vec::new();
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
+            (col_data.as_ptr() as *const u8, col_data.len() * 8),
+            (blob.as_ptr(), blob.len()),
+        ];
+        let image = super::super::shard_file::build_shard_image(0, 1, &regions);
+        let path = dir.path().join("const_pk.db");
+        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let shard = Rc::new(
+            super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap(),
+        );
+
+        let entries = vec![ReadCursorEntry::new_shard(shard)];
+        let cursor = ReadCursor::new(entries, schema);
+        let result = cursor.materialize();
+
+        assert_eq!(result.count, 1);
+        assert_eq!(result.get_pk(0), 42u128);
+    }
+
+    /// Cursor with more than 16 entries (formerly above `MAX_INLINE_BATCH_SOURCES`)
+    /// previously fell through to the row-major scatter.  Now the column-major
+    /// path handles any number of sources.
+    #[test]
+    fn test_scatter_many_sources_beyond_old_cap() {
+        let schema = make_schema_i64();
+        let n = 33usize;
+        let batches: Vec<Rc<super::super::batch::Batch>> = (0..n)
+            .map(|i| make_batch(&[(i as u128, 1i64, (i * 100) as i64)]))
+            .collect();
+        let entries: Vec<ReadCursorEntry> = batches.iter()
+            .map(|b| ReadCursorEntry::new_batch(Rc::clone(b)))
+            .collect();
+        let cursor = ReadCursor::new(entries, schema);
+        let result = cursor.materialize();
+
+        assert_eq!(result.count, n);
+        for i in 0..n {
+            assert_eq!(result.get_pk(i), i as u128);
+        }
     }
 }
