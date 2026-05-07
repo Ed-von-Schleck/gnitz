@@ -133,8 +133,11 @@ impl MemTable {
     ///
     /// Returns `(net_weight, Some((run_idx, row_idx)))` if found, else
     /// `(0, None)`.
-    pub fn lookup_pk(&mut self, key: u128) -> (i64, bool) {
+    /// Returns `(net_weight, has_found, row_count)` where `row_count` is the
+    /// number of memtable rows matching `key` (across all runs).
+    pub fn lookup_pk(&mut self, key: u128) -> (i64, bool, usize) {
         let mut total_w: i64 = 0;
+        let mut row_count: usize = 0;
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
@@ -149,11 +152,12 @@ impl MemTable {
                     self.found_row = lo;
                     self.has_found = true;
                 }
+                row_count += 1;
                 lo += 1;
             }
         }
 
-        (total_w, self.has_found)
+        (total_w, self.has_found, row_count)
     }
 
     fn found_entry(&self) -> Option<(&Batch, usize)> {
@@ -231,7 +235,7 @@ impl MemTable {
             }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
-                let net_w = self.find_weight_for_row(key, &run.as_mem_batch(), lo);
+                let net_w = self.find_weight_for_row(key, run, lo);
                 if net_w > 0 {
                     self.found_run = ri;
                     self.found_row = lo;
@@ -387,11 +391,11 @@ mod tests {
         mt.upsert_sorted_batch(b1).unwrap();
         mt.upsert_sorted_batch(b2).unwrap();
 
-        let (w, found) = mt.lookup_pk(20);
+        let (w, found, _) = mt.lookup_pk(20);
         assert_eq!(w, 3); // 1 + 2
         assert!(found);
 
-        let (w, found) = mt.lookup_pk(99);
+        let (w, found, _) = mt.lookup_pk(99);
         assert_eq!(w, 0);
         assert!(!found);
     }
@@ -473,20 +477,17 @@ mod tests {
 
         // Search for PK 10, payload 100 — should find weight 1
         let ref_batch = make_batch(&schema, &[(10, 1, 100)]);
-        let ref_mb = ref_batch.as_mem_batch();
-        let w = mt.find_weight_for_row(10, &ref_mb, 0);
+        let w = mt.find_weight_for_row(10, &*ref_batch, 0);
         assert_eq!(w, 1);
 
         // Search for PK 10, payload 200 — should find weight 1
         let ref_batch2 = make_batch(&schema, &[(10, 1, 200)]);
-        let ref_mb2 = ref_batch2.as_mem_batch();
-        let w2 = mt.find_weight_for_row(10, &ref_mb2, 0);
+        let w2 = mt.find_weight_for_row(10, &*ref_batch2, 0);
         assert_eq!(w2, 1);
 
         // Search for PK 10, payload 999 — should find weight 0
         let ref_batch3 = make_batch(&schema, &[(10, 1, 999)]);
-        let ref_mb3 = ref_batch3.as_mem_batch();
-        let w3 = mt.find_weight_for_row(10, &ref_mb3, 0);
+        let w3 = mt.find_weight_for_row(10, &*ref_batch3, 0);
         assert_eq!(w3, 0);
     }
 
@@ -1046,7 +1047,7 @@ mod tests {
             mt.upsert_sorted_batch(b).unwrap();
         }
         // lookup_pk sets has_found
-        let (w, found) = mt.lookup_pk(5);
+        let (w, found, _) = mt.lookup_pk(5);
         assert_eq!(w, 1);
         assert!(found);
         assert!(mt.has_found);

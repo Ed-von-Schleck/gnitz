@@ -462,10 +462,10 @@ impl Table {
     pub fn has_pk(&mut self, key: u128) -> bool {
         let mut total_w: i64 = 0;
         if self.memtable.may_contain_pk(key) {
-            let (w, _) = self.memtable.lookup_pk(key);
+            let (w, _, _) = self.memtable.lookup_pk(key);
             total_w = w;
         }
-        let (shard_w, _) = self.scan_shards_for_pk(key);
+        let (shard_w, _) = self.scan_shards_for_pk(key, false);
         total_w += shard_w;
         total_w > 0
     }
@@ -477,28 +477,45 @@ impl Table {
     /// old-payload rows with net weight 0 in the memtable), the found row is
     /// the live (PK, new_payload) entry, not the cancelled old one.
     pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
-        let mut total_w: i64 = 0;
         self.found_source = FoundSource::None;
 
-        // Step 1: compute total weight (PK-only sum is correct for existence check).
-        if self.memtable.may_contain_pk(key) {
-            let (w, _) = self.memtable.lookup_pk(key);
-            total_w = w;
-        }
-        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key);
+        // Step 1: memtable weight and row count.
+        let (mt_w, _, mt_row_count) = if self.memtable.may_contain_pk(key) {
+            self.memtable.lookup_pk(key)
+        } else {
+            (0, false, 0)
+        };
+
+        // Only collect shard candidates when Fast Path A won't apply.
+        // When mt_row_count == 1 && mt_w > 0 the memtable row is definitively
+        // live; shard candidates are not needed.
+        let need_candidates = !(mt_row_count == 1 && mt_w > 0);
+        let mut total_w = mt_w;
+        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key, need_candidates);
         total_w += shard_w;
 
         if total_w <= 0 {
             return (total_w, false);
         }
 
-        // Step 2: find the specific live (PK, payload) row by checking net weight
-        // per distinct payload — skips cancelled rows whose net weight is 0.
-        let mt_live = self.memtable.find_positive_payload_row(key);
-        if mt_live {
-            self.found_source = FoundSource::MemTable;
+        // Step 2: find the live (PK, payload) row.
+        // Fast path A: lookup_pk already set found_run/found_row; no payload scan.
+        // Multi-row path: scan memtable for positive-weight (PK, payload) row.
+        let in_memtable = if mt_row_count == 1 && mt_w > 0 {
+            true
+        } else if mt_row_count > 1 {
+            self.memtable.find_positive_payload_row(key)
         } else {
-            // Payload-aware shard fallback: check net weight per (PK, payload)
+            false
+        };
+
+        if in_memtable {
+            self.found_source = FoundSource::MemTable;
+        } else if shard_candidates.len() == 1 {
+            // Fast path B: single shard candidate must be the live row.
+            let (rc, idx) = &shard_candidates[0];
+            self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
+        } else {
             for (rc, idx) in &shard_candidates {
                 let net_w = self.get_weight_for_row(key, rc.as_ref(), *idx);
                 if net_w > 0 {
@@ -528,10 +545,7 @@ impl Table {
         // Shards
         self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_rc.count {
-                if shard_rc.get_pk(idx) != key {
-                    break;
-                }
+            while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
                 );
@@ -629,18 +643,18 @@ impl Table {
     fn scan_shards_for_pk(
         &self,
         key: u128,
+        need_candidates: bool,
     ) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
         let mut total_w: i64 = 0;
         let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
 
         self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_rc.count {
-                if shard_rc.get_pk(idx) != key {
-                    break;
-                }
+            while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
                 total_w += shard_rc.get_weight(idx);
-                candidates.push((Rc::clone(&shard_rc), idx));
+                if need_candidates {
+                    candidates.push((Rc::clone(&shard_rc), idx));
+                }
                 idx += 1;
             }
         });
