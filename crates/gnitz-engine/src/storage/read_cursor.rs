@@ -3,7 +3,7 @@
 //! Produces rows in (PK, payload) order with inline ghost elimination
 //! (net weight=0 rows are skipped).
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ptr;
 use std::rc::Rc;
@@ -20,8 +20,42 @@ thread_local! {
     /// 16-byte tuple is much smaller than the corresponding output row, so
     /// keeping peak capacity for the thread's lifetime is cheap relative to
     /// the batches it feeds.
-    pub(crate) static DRAIN_BUFFER: RefCell<Vec<(u32, u32, i64)>> =
-        const { RefCell::new(Vec::new()) };
+    ///
+    /// `Cell<Vec<_>>` (not `RefCell`) — `DrainGuard` moves the Vec out via
+    /// `Cell::take` and returns it on drop, skipping the runtime borrow
+    /// check `RefCell` would impose.
+    static DRAIN_BUFFER: Cell<Vec<(u32, u32, i64)>> =
+        const { Cell::new(Vec::new()) };
+}
+
+/// RAII handle wrapping the thread-local drain scratch buffer.  Behaves like
+/// `&mut Vec<_>` via `Deref`/`DerefMut`.  On unwind `Drop` swaps in an empty
+/// Vec via `mem::take`, costing a one-time capacity reset (not a poison).
+pub(crate) struct DrainGuard {
+    inner: Vec<(u32, u32, i64)>,
+}
+
+impl DrainGuard {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self { inner: DRAIN_BUFFER.with(|b| b.take()) }
+    }
+}
+
+impl std::ops::Deref for DrainGuard {
+    type Target = Vec<(u32, u32, i64)>;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+impl std::ops::DerefMut for DrainGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
+}
+
+impl Drop for DrainGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DRAIN_BUFFER.with(|b| b.set(std::mem::take(&mut self.inner)));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,29 +246,6 @@ impl ColumnarSource for CursorSource {
     }
 }
 
-/// Compare two heap nodes by (PK, payload) for ReadCursorEntry-based heaps.
-#[inline]
-fn entry_cmp(
-    entries: &[ReadCursorEntry],
-    schema: &SchemaDescriptor,
-    is_fast: bool,
-    a: &super::heap::HeapNode,
-    b: &super::heap::HeapNode,
-) -> Ordering {
-    let key_ord = a.key.cmp(&b.key);
-    if key_ord != Ordering::Equal {
-        return key_ord;
-    }
-    columnar::compare_rows_dispatch(
-        schema,
-        &entries[a.idx].source,
-        entries[a.idx].position,
-        &entries[b.idx].source,
-        entries[b.idx].position,
-        is_fast,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // ReadCursorEntry — per-source position tracker
 // ---------------------------------------------------------------------------
@@ -340,14 +351,27 @@ pub struct ReadCursor {
     advance_buf: Vec<usize>,
 }
 
+/// Row comparator alias for the monomorphized `_with` variants.  `Copy` lets
+/// callers forward the same comparator down the call chain at zero cost.
+trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
+impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
+
 impl ReadCursor {
-    fn build_tree(
+    #[inline]
+    fn build_tree_with<RowCmp: RowComparator>(
         entries: &[ReadCursorEntry],
         schema: &SchemaDescriptor,
-        is_fast: bool,
+        row_cmp: RowCmp,
     ) -> MergeHeap {
-        let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
-            entry_cmp(entries, schema, is_fast, a, b).is_lt()
+        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            row_cmp(
+                schema,
+                &entries[a.idx].source, entries[a.idx].position,
+                &entries[b.idx].source, entries[b.idx].position,
+            ) == Ordering::Less
         };
         MergeHeap::build(
             entries.len(),
@@ -360,6 +384,22 @@ impl ReadCursor {
             },
             less,
         )
+    }
+
+    fn build_tree(
+        entries: &[ReadCursorEntry],
+        schema: &SchemaDescriptor,
+        is_fast: bool,
+    ) -> MergeHeap {
+        // Wrap as a non-capturing closure: a direct fn-item reference would
+        // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
+        if is_fast {
+            Self::build_tree_with(entries, schema,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi))
+        } else {
+            Self::build_tree_with(entries, schema,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi))
+        }
     }
 
     fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
@@ -405,20 +445,27 @@ impl ReadCursor {
         if !self.valid {
             return;
         }
+        if self.is_fast {
+            self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+        } else {
+            self.advance_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        }
+    }
 
+    #[inline]
+    fn advance_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         if self.entries.len() == 1 {
             self.entries[0].advance();
-            self.find_next_non_ghost();
+            self.find_next_non_ghost_with(row_cmp);
             return;
         }
 
         let Some(tree) = self.tree.as_mut() else {
-            self.find_next_non_ghost();
+            self.find_next_non_ghost_with(row_cmp);
             return;
         };
         self.advance_buf.clear();
         self.advance_buf.extend_from_slice(&tree.min_indices);
-        let is_fast = self.is_fast;
         for &ei in &self.advance_buf {
             self.entries[ei].advance();
             let new_key = if self.entries[ei].is_valid() {
@@ -426,13 +473,22 @@ impl ReadCursor {
             } else {
                 None
             };
-            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
-                entry_cmp(&self.entries, &self.schema, is_fast, a, b).is_lt()
+            let entries = &self.entries;
+            let schema = &self.schema;
+            let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+                if a.key != b.key {
+                    return a.key < b.key;
+                }
+                row_cmp(
+                    schema,
+                    &entries[a.idx].source, entries[a.idx].position,
+                    &entries[b.idx].source, entries[b.idx].position,
+                ) == Ordering::Less
             };
             tree.advance(ei, new_key, &less);
         }
 
-        self.find_next_non_ghost();
+        self.find_next_non_ghost_with(row_cmp);
     }
 
     /// Copy the row at entries[idx] into the public cursor state with an
@@ -451,6 +507,15 @@ impl ReadCursor {
     }
 
     fn find_next_non_ghost(&mut self) {
+        if self.is_fast {
+            self.find_next_non_ghost_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+        } else {
+            self.find_next_non_ghost_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        }
+    }
+
+    #[inline]
+    fn find_next_non_ghost_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         if self.entries.len() == 1 {
             if self.entries[0].is_valid() {
                 let w = self.entries[0].source.get_weight(self.entries[0].position);
@@ -466,11 +531,19 @@ impl ReadCursor {
             return;
         };
         let schema = &self.schema;
-        let is_fast = self.is_fast;
 
         while !tree.is_empty() {
-            let eq_root = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> Ordering {
-                entry_cmp(&self.entries, schema, is_fast, a, b)
+            let entries = &self.entries;
+            let eq_root = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> Ordering {
+                let key_ord = a.key.cmp(&b.key);
+                if key_ord != Ordering::Equal {
+                    return key_ord;
+                }
+                row_cmp(
+                    schema,
+                    &entries[a.idx].source, entries[a.idx].position,
+                    &entries[b.idx].source, entries[b.idx].position,
+                )
             };
             let num_min = tree.collect_min_indices(&eq_root);
             if num_min == 0 {
@@ -498,8 +571,16 @@ impl ReadCursor {
                 } else {
                     None
                 };
-                let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
-                    entry_cmp(&self.entries, schema, is_fast, a, b).is_lt()
+                let entries = &self.entries;
+                let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+                    if a.key != b.key {
+                        return a.key < b.key;
+                    }
+                    row_cmp(
+                        schema,
+                        &entries[a.idx].source, entries[a.idx].position,
+                        &entries[b.idx].source, entries[b.idx].position,
+                    ) == Ordering::Less
                 };
                 tree.advance(ei, new_key, &less);
             }
@@ -603,25 +684,23 @@ impl ReadCursor {
             return Rc::new(Batch::empty_with_schema(&self.schema));
         }
 
-        DRAIN_BUFFER.with(|buf| {
-            let mut merge_order = buf.borrow_mut();
-            self.drain_sorted_into(0, &mut merge_order);
-            if merge_order.is_empty() {
-                return Rc::new(Batch::empty_with_schema(&self.schema));
-            }
-            let blob_cap: usize = self.entries.iter().map(|e| e.source_blob_len()).sum();
-            let mut batch = super::batch::write_to_batch(
-                &self.schema,
-                merge_order.len(),
-                blob_cap,
-                |writer| self.scatter_drained_into(&merge_order, writer),
-            );
-            // The merge walk emits in (PK, payload) order with consolidated
-            // weights; `write_to_batch` doesn't know that, so restore the flags.
-            batch.sorted = true;
-            batch.consolidated = true;
-            Rc::new(batch)
-        })
+        let mut merge_order = DrainGuard::new();
+        self.drain_sorted_into(0, &mut merge_order);
+        if merge_order.is_empty() {
+            return Rc::new(Batch::empty_with_schema(&self.schema));
+        }
+        let blob_cap = self.total_blob_len();
+        let mut batch = super::batch::write_to_batch(
+            &self.schema,
+            merge_order.len(),
+            blob_cap,
+            |writer| self.scatter_drained_into(&merge_order, writer),
+        );
+        // The merge walk emits in (PK, payload) order with consolidated
+        // weights; `write_to_batch` doesn't know that, so restore the flags.
+        batch.sorted = true;
+        batch.consolidated = true;
+        Rc::new(batch)
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
@@ -726,6 +805,22 @@ impl ReadCursor {
         limit: usize,
         out: &mut Vec<(u32, u32, i64)>,
     ) {
+        if self.is_fast {
+            self.drain_sorted_into_with(limit, out,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+        } else {
+            self.drain_sorted_into_with(limit, out,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        }
+    }
+
+    #[inline]
+    fn drain_sorted_into_with<RowCmp: RowComparator>(
+        &mut self,
+        limit: usize,
+        out: &mut Vec<(u32, u32, i64)>,
+        row_cmp: RowCmp,
+    ) {
         out.clear();
         let mut count = 0usize;
         while self.valid {
@@ -743,7 +838,7 @@ impl ReadCursor {
                 ));
                 count += 1;
             }
-            self.advance();
+            self.advance_with(row_cmp);
         }
     }
 

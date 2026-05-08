@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, ReadCursor, DRAIN_BUFFER, write_to_batch};
+use crate::storage::{Batch, ConsolidatedBatch, DrainGuard, ReadCursor, write_to_batch};
 
 
 // ---------------------------------------------------------------------------
@@ -25,23 +25,21 @@ pub fn op_scan_trace(
         return ConsolidatedBatch::new_unchecked(batch);
     }
 
-    DRAIN_BUFFER.with(|buf| {
-        let mut rows = buf.borrow_mut();
-        cursor.drain_sorted_into(limit, &mut rows);
-        if rows.is_empty() {
-            return ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema));
-        }
-        // For full drains the entry sum is a tight upper bound; for chunked
-        // drains it can be orders of magnitude too large. Pass 0 there and
-        // let `extend_from_slice` grow the blob on demand.
-        let blob_cap = if limit > 0 { 0 } else { cursor.total_blob_len() };
-        let mut b = write_to_batch(schema, rows.len(), blob_cap, |writer| {
-            cursor.scatter_drained_into(&rows, writer);
-        });
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
-    })
+    let mut rows = DrainGuard::new();
+    cursor.drain_sorted_into(limit, &mut rows);
+    if rows.is_empty() {
+        return ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema));
+    }
+    // For full drains the entry sum is a tight upper bound; for chunked
+    // drains it can be orders of magnitude too large. Pass 0 there and
+    // let `extend_from_slice` grow the blob on demand.
+    let blob_cap = if limit > 0 { 0 } else { cursor.total_blob_len() };
+    let mut b = write_to_batch(schema, rows.len(), blob_cap, |writer| {
+        cursor.scatter_drained_into(&rows, writer);
+    });
+    b.sorted = true;
+    b.consolidated = true;
+    ConsolidatedBatch::new_unchecked(b)
 }
 
 // ---------------------------------------------------------------------------

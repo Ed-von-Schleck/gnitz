@@ -29,6 +29,7 @@ pub trait ColumnarSource {
 ///
 /// This is the canonical implementation with the hoisted null_word optimisation:
 /// null words are read once per row outside the column loop.
+#[inline]
 pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
@@ -136,23 +137,6 @@ pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
         if ord != Ordering::Equal { return ord; }
     }
     Ordering::Equal
-}
-
-/// Dispatch to `compare_rows_int_nonnull` when `is_fast` is set, else the
-/// generic `compare_rows`. Inlining keeps the branch loop-invariant for
-/// callers that hoist `is_fast` once per merge.
-#[inline]
-pub(crate) fn compare_rows_dispatch<A: ColumnarSource, B: ColumnarSource>(
-    schema: &SchemaDescriptor,
-    src_a: &A, row_a: usize,
-    src_b: &B, row_b: usize,
-    is_fast: bool,
-) -> Ordering {
-    if is_fast {
-        compare_rows_int_nonnull(schema, src_a, row_a, src_b, row_b)
-    } else {
-        compare_rows(schema, src_a, row_a, src_b, row_b)
-    }
 }
 
 // ===========================================================================

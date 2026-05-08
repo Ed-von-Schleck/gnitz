@@ -374,34 +374,6 @@ impl<'a> DirectWriter<'a> {
 // merge_batches: the main entry point
 // ---------------------------------------------------------------------------
 
-/// Less-than predicate for the N-way merge heap: orders by PK first, then
-/// by full payload via `columnar::compare_rows`.  Equal (PK, payload) entries
-/// therefore surface at the heap root in adjacent iterations, which the
-/// pending-group drain in `merge_batches` relies on for O(1) consolidation.
-///
-/// Recreated per-call by callers so the captured borrow of `cursors` stays
-/// scoped to a single heap operation, leaving `cursors` free to be mutated
-/// between operations.
-fn merge_entry_less<'c>(
-    cursors: &'c [MemBatchCursor],
-    batches: &'c [SortedMemBatch],
-    schema: &'c SchemaDescriptor,
-    is_fast: bool,
-) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
-    move |a, b| {
-        if a.key != b.key {
-            return a.key < b.key;
-        }
-        let bi = cursors[a.idx].batch_idx;
-        let bj = cursors[b.idx].batch_idx;
-        let ri = cursors[a.idx].position;
-        let rj = cursors[b.idx].position;
-        columnar::compare_rows_dispatch(
-            schema, &batches[bi].0, ri, &batches[bj].0, rj, is_fast,
-        ) == Ordering::Less
-    }
-}
-
 /// Perform N-way merge + consolidation of **sorted** `MemBatch` slices.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
@@ -427,19 +399,54 @@ pub fn merge_batches(
         .map(|i| MemBatchCursor::new(i, batches[i].count))
         .collect();
 
-    let is_fast = columnar::schema_is_int_nonnull(schema);
+    // Wrap as a non-capturing closure: a direct fn-item reference would fix
+    // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
+    if columnar::schema_is_int_nonnull(schema) {
+        merge_batches_inner(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+    } else {
+        merge_batches_inner(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    }
+}
 
-    let mut tree = MergeHeap::build(
-        cursors.len(),
-        |i| {
-            if cursors[i].is_valid() {
-                Some(cursors[i].peek_key(batches))
-            } else {
-                None
-            }
-        },
-        merge_entry_less(&cursors, batches, schema, is_fast),
-    );
+/// Monomorphised on the row comparator so LLVM emits two specialised copies
+/// of the merge body — fast/generic — with the comparator inlined.
+#[inline]
+fn merge_batches_inner<RowCmp>(
+    cursors: &mut [MemBatchCursor],
+    batches: &[SortedMemBatch],
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
+{
+    // HeapNode comparator is rebuilt at each heap op so its capture of
+    // `cursors` stays scoped to a single call, leaving `cursors` free to be
+    // mutated in between (a factory closure couldn't express the lifetime).
+    let mut tree = {
+        let cursors_ref: &[MemBatchCursor] = cursors;
+        MergeHeap::build(
+            cursors_ref.len(),
+            |i| {
+                if cursors_ref[i].is_valid() {
+                    Some(cursors_ref[i].peek_key(batches))
+                } else {
+                    None
+                }
+            },
+            move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+                if a.key != b.key {
+                    return a.key < b.key;
+                }
+                let bi = cursors_ref[a.idx].batch_idx;
+                let bj = cursors_ref[b.idx].batch_idx;
+                let ri = cursors_ref[a.idx].position;
+                let rj = cursors_ref[b.idx].position;
+                row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
+            },
+        )
+    };
 
     let mut has_pending = false;
     let mut pending_batch: usize = 0;
@@ -456,11 +463,10 @@ pub fn merge_batches(
 
         let same_group = has_pending
             && cur_pk == pending_pk
-            && columnar::compare_rows_dispatch(
+            && row_cmp(
                 schema,
                 &batches[pending_batch].0, pending_row,
                 &batches[bi].0, ri,
-                is_fast,
             ) == Ordering::Equal;
 
         if same_group {
@@ -482,7 +488,18 @@ pub fn merge_batches(
         } else {
             None
         };
-        tree.advance(ci, new_key, &merge_entry_less(&cursors, batches, schema, is_fast));
+        let cursors_ref: &[MemBatchCursor] = cursors;
+        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            let bi = cursors_ref[a.idx].batch_idx;
+            let bj = cursors_ref[b.idx].batch_idx;
+            let ri = cursors_ref[a.idx].position;
+            let rj = cursors_ref[b.idx].position;
+            row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
+        };
+        tree.advance(ci, new_key, &less);
     }
 
     if has_pending && pending_weight != 0 {
@@ -517,22 +534,33 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    let is_fast = columnar::schema_is_int_nonnull(schema);
-
     let mut entries: Vec<SortEntry> = (0..n as u32)
         .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
         .collect();
 
-    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-        Ordering::Equal => columnar::compare_rows_dispatch(
-            schema, batch, a.idx as usize, batch, b.idx as usize, is_fast,
-        ),
-        ord => ord,
-    });
-
-    drain_groups_into(n, batch, schema, writer, is_fast, |pos| {
-        (entries[pos].idx as usize, entries[pos].pk)
-    });
+    if columnar::schema_is_int_nonnull(schema) {
+        // Standard-library sort is extremely sensitive to comparator inlining;
+        // the fast-path branch is hoisted out of the per-comparison closure.
+        entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
+            Ordering::Equal => columnar::compare_rows_int_nonnull(
+                schema, batch, a.idx as usize, batch, b.idx as usize,
+            ),
+            ord => ord,
+        });
+        drain_groups_into(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
+            |pos| (entries[pos].idx as usize, entries[pos].pk));
+    } else {
+        entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
+            Ordering::Equal => columnar::compare_rows(
+                schema, batch, a.idx as usize, batch, b.idx as usize,
+            ),
+            ord => ord,
+        });
+        drain_groups_into(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
+            |pos| (entries[pos].idx as usize, entries[pos].pk));
+    }
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -546,8 +574,15 @@ pub fn fold_sorted(
     if n == 0 {
         return;
     }
-    let is_fast = columnar::schema_is_int_nonnull(schema);
-    drain_groups_into(n, batch, schema, writer, is_fast, |pos| (pos, batch.get_pk(pos)));
+    if columnar::schema_is_int_nonnull(schema) {
+        drain_groups_into(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
+            |pos| (pos, batch.get_pk(pos)));
+    } else {
+        drain_groups_into(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
+            |pos| (pos, batch.get_pk(pos)));
+    }
 }
 
 /// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
@@ -555,23 +590,23 @@ pub fn fold_sorted(
 /// `resolve(pos)` maps an iteration position to `(batch_row_idx, pk)`.
 /// For `sort_and_consolidate` this is an indirection through a sorted index array;
 /// for `fold_sorted` the input is already sorted so `pos == batch_row_idx`.
-fn drain_groups_into(
+#[inline]
+fn drain_groups_into<RowCmp>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
-    is_fast: bool,
+    row_cmp: RowCmp,
     resolve: impl Fn(usize) -> (usize, u128),
-) {
+) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
+{
     let (mut pending_idx, mut pending_pk) = resolve(0);
     let mut pending_weight = batch.get_weight(pending_idx);
 
     for pos in 1..n {
         let (cur_idx, cur_pk) = resolve(pos);
         let same_group = cur_pk == pending_pk
-            && columnar::compare_rows_dispatch(
-                schema, batch, pending_idx, batch, cur_idx, is_fast,
-            ) == Ordering::Equal;
+            && row_cmp(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
 
         if same_group {
             pending_weight += batch.get_weight(cur_idx);

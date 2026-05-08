@@ -105,42 +105,20 @@ fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
 // Shared merge infrastructure
 // ---------------------------------------------------------------------------
 
-/// Payload-aware less-than predicate used for the merge heap ordering.
-/// Ordering by PK then full payload guarantees equal (PK, payload) entries
-/// surface adjacently at the root, which `open_and_merge`'s pending-group
-/// drain relies on for O(1) consolidation.
-///
-/// Recreated per-call so the captured borrow of `cursors` stays scoped to a
-/// single heap operation, leaving `cursors` free to be mutated between ops.
-fn shard_entry_less<'a>(
-    cursors: &'a [ShardCursor],
-    shards: &'a [MappedShard],
-    schema: &'a SchemaDescriptor,
-    is_fast: bool,
-) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'a {
-    move |a, b| {
-        if a.key != b.key {
-            return a.key < b.key;
-        }
-        columnar::compare_rows_dispatch(
-            schema,
-            &shards[cursors[a.idx].shard_idx], cursors[a.idx].position,
-            &shards[cursors[b.idx].shard_idx], cursors[b.idx].position,
-            is_fast,
-        ) == std::cmp::Ordering::Less
-    }
-}
-
 /// Open input shards, build cursors and heap, run N-way merge loop.
 /// Calls `emit(key, net_weight, shard, row)` for each non-ghost consolidated row.
 ///
-/// The payload-aware heap ordering (`shard_entry_less`) ensures equal
-/// (PK, payload) entries appear consecutively at the heap minimum, so the
-/// pending-group drain below accumulates their weights in O(1) per step.
+/// The payload-aware heap ordering ensures equal (PK, payload) entries appear
+/// consecutively at the heap minimum, so the pending-group drain accumulates
+/// their weights in O(1) per step.
+///
+/// File I/O lives here (not in `open_and_merge_inner`) so the cursor + heap
+/// loop is the only piece monomorphised across the two comparator
+/// specialisations — no duplicated open/error code in the binary.
 fn open_and_merge(
     input_files: &[&CStr],
     schema: &SchemaDescriptor,
-    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
+    emit: impl FnMut(u128, i64, &MappedShard, usize),
 ) -> Result<(), StorageError> {
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
@@ -150,23 +128,60 @@ fn open_and_merge(
         }
     }
 
-    let mut cursors: Vec<ShardCursor> = (0..shards.len())
+    let cursors: Vec<ShardCursor> = (0..shards.len())
         .map(|i| ShardCursor::new(i, &shards[i]))
         .collect();
 
-    let is_fast = columnar::schema_is_int_nonnull(schema);
+    // Wrap as a non-capturing closure: a direct fn-item reference would fix
+    // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
+    if columnar::schema_is_int_nonnull(schema) {
+        open_and_merge_inner(&shards, cursors, schema, emit,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+    } else {
+        open_and_merge_inner(&shards, cursors, schema, emit,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    }
+    Ok(())
+}
 
-    let mut tree = MergeHeap::build(
-        cursors.len(),
-        |i| {
-            if cursors[i].is_valid() {
-                Some(cursors[i].peek_key(&shards[cursors[i].shard_idx]))
-            } else {
-                None
-            }
-        },
-        shard_entry_less(&cursors, &shards, schema, is_fast),
-    );
+/// Inner cursor + heap merge body, monomorphised on the row comparator so
+/// LLVM can inline the fast/generic body across `MergeHeap::build`'s N/2
+/// initial sift_downs and the per-row advance loop alike.
+#[inline]
+fn open_and_merge_inner<RowCmp>(
+    shards: &[MappedShard],
+    mut cursors: Vec<ShardCursor>,
+    schema: &SchemaDescriptor,
+    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
+    row_cmp: RowCmp,
+) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
+{
+    // HeapNode comparator is rebuilt at each heap op so its capture of
+    // `cursors` stays scoped to a single call, leaving `cursors` free to be
+    // mutated in between (a factory closure couldn't express the lifetime).
+    let mut tree = {
+        let cursors_ref: &[ShardCursor] = &cursors;
+        MergeHeap::build(
+            cursors_ref.len(),
+            |i| {
+                if cursors_ref[i].is_valid() {
+                    Some(cursors_ref[i].peek_key(&shards[cursors_ref[i].shard_idx]))
+                } else {
+                    None
+                }
+            },
+            move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+                if a.key != b.key {
+                    return a.key < b.key;
+                }
+                row_cmp(
+                    schema,
+                    &shards[cursors_ref[a.idx].shard_idx], cursors_ref[a.idx].position,
+                    &shards[cursors_ref[b.idx].shard_idx], cursors_ref[b.idx].position,
+                ) == std::cmp::Ordering::Less
+            },
+        )
+    };
 
     let mut has_pending = false;
     let mut pending_shard_idx: usize = 0;
@@ -183,11 +198,10 @@ fn open_and_merge(
 
         let same_group = has_pending
             && cur_key == pending_key
-            && columnar::compare_rows_dispatch(
+            && row_cmp(
                 schema,
                 &shards[pending_shard_idx], pending_row,
                 &shards[si], row,
-                is_fast,
             ) == std::cmp::Ordering::Equal;
 
         if same_group {
@@ -209,14 +223,23 @@ fn open_and_merge(
         } else {
             None
         };
-        tree.advance(ci, new_key, &shard_entry_less(&cursors, &shards, schema, is_fast));
+        let cursors_ref: &[ShardCursor] = &cursors;
+        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            row_cmp(
+                schema,
+                &shards[cursors_ref[a.idx].shard_idx], cursors_ref[a.idx].position,
+                &shards[cursors_ref[b.idx].shard_idx], cursors_ref[b.idx].position,
+            ) == std::cmp::Ordering::Less
+        };
+        tree.advance(ci, new_key, &less);
     }
 
     if has_pending && pending_weight != 0 {
         emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
