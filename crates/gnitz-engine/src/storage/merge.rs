@@ -259,11 +259,8 @@ impl MemBatchCursor {
 
     #[inline]
     pub fn peek_key(&self, batches: &[SortedMemBatch]) -> u128 {
-        if self.is_valid() {
-            batches[self.batch_idx].get_pk(self.position)
-        } else {
-            u128::MAX
-        }
+        debug_assert!(self.is_valid());
+        batches[self.batch_idx].get_pk(self.position)
     }
 }
 
@@ -439,71 +436,67 @@ fn merge_batches_inner<RowCmp>(
                 if a.key != b.key {
                     return a.key < b.key;
                 }
-                let bi = cursors_ref[a.idx].batch_idx;
-                let bj = cursors_ref[b.idx].batch_idx;
-                let ri = cursors_ref[a.idx].position;
-                let rj = cursors_ref[b.idx].position;
+                let bi = cursors_ref[a.source_idx].batch_idx;
+                let bj = cursors_ref[b.source_idx].batch_idx;
+                let ri = cursors_ref[a.source_idx].position;
+                let rj = cursors_ref[b.source_idx].position;
                 row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
             },
         )
     };
 
-    let mut has_pending = false;
-    let mut pending_batch: usize = 0;
-    let mut pending_row: usize = 0;
-    let mut pending_pk: u128 = 0;
-    let mut pending_weight: i64 = 0;
-
     while !tree.is_empty() {
-        let ci = tree.min_idx();
-        let bi = cursors[ci].batch_idx;
-        let ri = cursors[ci].position;
-        let cur_pk = batches[bi].get_pk(ri);
-        let cur_weight = batches[bi].get_weight(ri);
+        // Open a new group from the heap root.
+        let group_src = tree.peek().source_idx;
+        let group_batch = cursors[group_src].batch_idx;
+        let group_row = cursors[group_src].position;
+        let group_key = tree.peek().key;
+        let mut net_weight: i64 = 0;
 
-        let same_group = has_pending
-            && cur_pk == pending_pk
-            && row_cmp(
-                schema,
-                &batches[pending_batch].0, pending_row,
-                &batches[bi].0, ri,
-            ) == Ordering::Equal;
+        // Inner fold: drain every row tied with (group_batch, group_row).
+        loop {
+            let cur_src = tree.peek().source_idx;
+            let cur_key = tree.peek().key;
+            let cur_batch = cursors[cur_src].batch_idx;
+            let cur_row = cursors[cur_src].position;
 
-        if same_group {
-            pending_weight += cur_weight;
-        } else {
-            if has_pending && pending_weight != 0 {
-                writer.write_row(&batches[pending_batch], pending_row, pending_weight);
+            if cur_key != group_key
+                || row_cmp(
+                    schema,
+                    &batches[group_batch].0, group_row,
+                    &batches[cur_batch].0, cur_row,
+                ) != Ordering::Equal
+            {
+                break;
             }
-            pending_batch = bi;
-            pending_row = ri;
-            pending_pk = cur_pk;
-            pending_weight = cur_weight;
-            has_pending = true;
+
+            net_weight += batches[cur_batch].get_weight(cur_row);
+            cursors[cur_src].advance();
+
+            let cursors_ref: &[MemBatchCursor] = cursors;
+            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+                if a.key != b.key {
+                    return a.key < b.key;
+                }
+                let bi = cursors_ref[a.source_idx].batch_idx;
+                let bj = cursors_ref[b.source_idx].batch_idx;
+                let ri = cursors_ref[a.source_idx].position;
+                let rj = cursors_ref[b.source_idx].position;
+                row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
+            };
+            if cursors[cur_src].is_valid() {
+                tree.replace_top_key(cursors[cur_src].peek_key(batches), less);
+            } else {
+                tree.pop_top(less);
+                if tree.is_empty() {
+                    break;
+                }
+            }
         }
 
-        cursors[ci].advance();
-        let new_key = if cursors[ci].is_valid() {
-            Some(cursors[ci].peek_key(batches))
-        } else {
-            None
-        };
-        let cursors_ref: &[MemBatchCursor] = cursors;
-        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-            if a.key != b.key {
-                return a.key < b.key;
-            }
-            let bi = cursors_ref[a.idx].batch_idx;
-            let bj = cursors_ref[b.idx].batch_idx;
-            let ri = cursors_ref[a.idx].position;
-            let rj = cursors_ref[b.idx].position;
-            row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
-        };
-        tree.advance(ci, new_key, &less);
-    }
-
-    if has_pending && pending_weight != 0 {
-        writer.write_row(&batches[pending_batch], pending_row, pending_weight);
+        if net_weight != 0 {
+            writer.write_row(&batches[group_batch], group_row, net_weight);
+        }
     }
 }
 

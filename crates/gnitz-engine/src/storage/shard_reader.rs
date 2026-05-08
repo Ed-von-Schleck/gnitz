@@ -343,6 +343,20 @@ impl MappedShard {
         }
     }
 
+    /// Advance `pos` past any ghost (weight == 0) rows. Returns the first
+    /// position at or after `pos` whose weight is non-zero, or `self.count`
+    /// if no such row exists.
+    #[inline]
+    pub fn next_non_ghost(&self, mut pos: usize) -> usize {
+        if !self.has_ghosts {
+            return pos;
+        }
+        while pos < self.count && self.get_weight(pos) == 0 {
+            pos += 1;
+        }
+        pos
+    }
+
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
         match &self.null_bmp {

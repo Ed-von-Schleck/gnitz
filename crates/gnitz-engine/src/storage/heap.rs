@@ -1,63 +1,53 @@
 //! Generic min-heap for N-way merge operations.
 //!
-//! Replaces the duplicated TournamentTree (compact.rs, merge.rs) and
-//! CursorTree (read_cursor.rs) with a single `MergeHeap`.
+//! Two operations on the root drive every caller:
+//! - `replace_top_key(new_key, less)` — overwrite `heap[0].key` and sift
+//!   down. The fast path used by every emit; `new_key >= old_key` always
+//!   (sources are sorted, advance produces ≥ keys), so sift-up is unreachable.
+//! - `pop_top(less)` — remove `heap[0]`. swap_remove + sift down.
+//!
+//! `sift_down_hole` is the half-swap form: extract the moving node into a
+//! local, shift the smaller child up into the hole one level at a time
+//! (one write per level), then place the extracted node at the final hole
+//! position. Vs full-swap sift down (three writes per level) this is the
+//! constant-factor win that motivates the custom heap; std `BinaryHeap`
+//! also uses the hole pattern but exposes neither replace-top nor a
+//! min-heap variant without `Reverse` wrappers that obstruct inlining.
+//!
+//! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
+//! tied rows by repeatedly popping/replacing the root, and merge_batches
+//! and compact peel the root one at a time. The slot-tracking that an
+//! entry-indexed advance would need is therefore pure overhead and is gone.
 
-use std::cmp::Ordering;
-
+#[derive(Clone, Copy)]
 pub struct HeapNode {
     pub key: u128,
-    pub idx: usize,
+    pub source_idx: usize,
 }
 
 pub struct MergeHeap {
     pub heap: Vec<HeapNode>,
-    pub pos_map: Vec<i32>,
-    pub min_indices: Vec<usize>,
-    scratch: Vec<usize>,
-}
-
-#[inline]
-fn swap_entries(heap: &mut [HeapNode], pos_map: &mut [i32], a: usize, b: usize) {
-    let ai = heap[a].idx;
-    let bi = heap[b].idx;
-    heap.swap(a, b);
-    pos_map[ai] = b as i32;
-    pos_map[bi] = a as i32;
 }
 
 impl MergeHeap {
-    /// Build a heap from `n` entries.  `key_fn(i)` returns `Some(pk)` for
+    /// Build a heap from `n` entries. `key_fn(i)` returns `Some(pk)` for
     /// valid entries and `None` for invalid/exhausted ones.
-    ///
-    /// `less(a, b)` compares two `HeapNode` references and returns true if a < b.
     pub fn build(
         n: usize,
         key_fn: impl Fn(usize) -> Option<u128>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) -> Self {
         let mut heap = Vec::with_capacity(n);
-        let mut pos_map = vec![-1i32; n];
-
-        for (i, pm) in pos_map.iter_mut().enumerate().take(n) {
+        for i in 0..n {
             if let Some(k) = key_fn(i) {
-                let idx = heap.len();
-                *pm = idx as i32;
-                heap.push(HeapNode { key: k, idx: i });
+                heap.push(HeapNode { key: k, source_idx: i });
             }
         }
-
-        let mut h = MergeHeap {
-            heap,
-            pos_map,
-            min_indices: Vec::with_capacity(8),
-            scratch: Vec::with_capacity(64),
-        };
-        let size = h.heap.len();
+        let size = heap.len();
         for i in (0..size / 2).rev() {
-            Self::sift_down_static(&mut h.heap, &mut h.pos_map, i, &less);
+            sift_down_hole(&mut heap, i, &less);
         }
-        h
+        MergeHeap { heap }
     }
 
     #[inline]
@@ -66,145 +56,96 @@ impl MergeHeap {
     }
 
     #[inline]
-    pub fn min_idx(&self) -> usize {
-        self.heap[0].idx
+    pub fn peek(&self) -> &HeapNode {
+        &self.heap[0]
     }
 
-    /// Sift down operating on heap/pos_map directly — avoids &mut self borrow conflicts.
+    /// Overwrite `heap[0].key` and sift the root down.
+    /// Caller must guarantee `new_key >= old_key`.
     #[inline]
-    pub fn sift_down_static(
-        heap: &mut [HeapNode],
-        pos_map: &mut [i32],
-        mut idx: usize,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+    pub fn replace_top_key(
+        &mut self,
+        new_key: u128,
+        less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        let len = heap.len();
-        loop {
-            let left = 2 * idx + 1;
-            if left >= len {
-                break;
-            }
-            let right = left + 1;
-            let child =
-                if right < len && less(&heap[right], &heap[left]) { right } else { left };
-            if !less(&heap[child], &heap[idx]) {
-                break;
-            }
-            swap_entries(heap, pos_map, idx, child);
-            idx = child;
-        }
+        debug_assert!(new_key >= self.heap[0].key, "replace_top_key: new < old");
+        self.heap[0].key = new_key;
+        sift_down_hole(&mut self.heap, 0, &less);
     }
 
-    /// Advance a cursor/entry.  If `new_key` is `None` the entry is
-    /// exhausted and removed from the heap; otherwise its key is updated
-    /// and sifted down.
-    ///
-    /// Only sift-down is needed on the `Some` path: all callers are merge
-    /// cursors advancing through sorted input, so the new key is always
-    /// >= the old key.  Do NOT add sift-up here.
-    pub fn advance(
+    /// Remove `heap[0]`. After return, the new root (if any) is the next-min.
+    #[inline]
+    pub fn pop_top(
         &mut self,
-        entry_idx: usize,
-        new_key: Option<u128>,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+        less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        let heap_idx = self.pos_map[entry_idx];
-        if heap_idx < 0 {
+        debug_assert!(!self.heap.is_empty());
+        let last = self.heap.len() - 1;
+        if last == 0 {
+            self.heap.pop();
             return;
         }
-        let heap_idx = heap_idx as usize;
-
-        match new_key {
-            None => {
-                // Removal: move last element into the vacated slot, then
-                // sift down. Sift-up is intentionally absent: MergeHeap is
-                // not a generic updatable heap. Every advance(None) caller
-                // (read_cursor.rs, merge.rs, compact.rs) removes an entry
-                // drawn from min_indices, i.e. tied with the root. By the
-                // heap property heap[0] <= heap[parent] <= heap[node] =
-                // heap[0], so the parent is also tied; the replacement
-                // (last element >= root) cannot be < parent. If a future
-                // caller removes an entry that is NOT tied with the root,
-                // re-introduce sift_up here and audit all advance(None)
-                // sites.
-                self.pos_map[entry_idx] = -1;
-                let last = self.heap.len() - 1;
-                if heap_idx != last {
-                    let last_entry = self.heap[last].idx;
-                    self.heap[heap_idx] = HeapNode {
-                        key: self.heap[last].key,
-                        idx: last_entry,
-                    };
-                    self.pos_map[last_entry] = heap_idx as i32;
-                    self.heap.pop();
-                    if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                        Self::sift_down_static(&mut self.heap, &mut self.pos_map, heap_idx, less);
-                    }
-                } else {
-                    self.heap.pop();
-                }
-            }
-            Some(k) => {
-                self.heap[heap_idx].key = k;
-                Self::sift_down_static(&mut self.heap, &mut self.pos_map, heap_idx, less);
-            }
-        }
+        self.heap[0] = self.heap[last];
+        self.heap.pop();
+        sift_down_hole(&mut self.heap, 0, &less);
     }
+}
 
-    /// Collect all entries equal to the root into `min_indices`.
-    /// `eq_root(node_at_idx, root_node)` compares a heap node to the root
-    /// and returns `Ordering::Equal` if the entry should be included.
-    pub fn collect_min_indices(
-        &mut self,
-        eq_root: &impl Fn(&HeapNode, &HeapNode) -> Ordering,
-    ) -> usize {
-        self.min_indices.clear();
-        if self.heap.is_empty() {
-            return 0;
+/// Hole-pattern sift down. Extract `heap[hole]` into `saved`, shift the
+/// smaller child up one level at a time (one write per level), then place
+/// `saved` at the final hole position.
+#[inline]
+fn sift_down_hole(
+    heap: &mut [HeapNode],
+    mut hole: usize,
+    less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+) {
+    let len = heap.len();
+    debug_assert!(hole < len);
+    let saved = heap[hole];
+    loop {
+        let left = 2 * hole + 1;
+        if left >= len {
+            break;
         }
-        self.scratch.clear();
-        self.scratch.push(0usize);
-        while let Some(idx) = self.scratch.pop() {
-            if idx == 0 || eq_root(&self.heap[idx], &self.heap[0]) == Ordering::Equal {
-                self.min_indices.push(self.heap[idx].idx);
-                let right = 2 * idx + 2;
-                if right < self.heap.len() {
-                    self.scratch.push(right);
-                }
-                let left = 2 * idx + 1;
-                if left < self.heap.len() {
-                    self.scratch.push(left);
-                }
-            }
+        let right = left + 1;
+        let child = if right < len && less(&heap[right], &heap[left]) {
+            right
+        } else {
+            left
+        };
+        if !less(&heap[child], &saved) {
+            break;
         }
-        self.min_indices.len()
+        heap[hole] = heap[child];
+        hole = child;
     }
+    heap[hole] = saved;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cmp::Ordering;
 
-    fn less(a: &HeapNode, b: &HeapNode) -> bool { a.key < b.key }
-
-    fn eq_root(a: &HeapNode, root: &HeapNode) -> Ordering { a.key.cmp(&root.key) }
+    fn less(a: &HeapNode, b: &HeapNode) -> bool {
+        a.key < b.key
+    }
 
     fn build(keys: &[Option<u128>]) -> MergeHeap {
         MergeHeap::build(keys.len(), |i| keys[i], less)
     }
 
-    /// After every mutation, verify that pos_map[entry] == the heap position
-    /// holding that entry, and heap[pos_map[entry]].idx == entry.
-    fn assert_pos_map_consistent(h: &MergeHeap, n: usize) {
-        for (hp, node) in h.heap.iter().enumerate() {
-            assert_eq!(h.pos_map[node.idx], hp as i32, "heap[{hp}].idx={} but pos_map[{}]={}", node.idx, node.idx, h.pos_map[node.idx]);
-        }
-        for i in 0..n {
-            let hp = h.pos_map[i];
-            if hp >= 0 {
-                assert_eq!(h.heap[hp as usize].idx, i, "pos_map[{i}]={hp} but heap[{hp}].idx={}", h.heap[hp as usize].idx);
-            }
+    /// Verify the binary-heap invariant: every parent is `<=` its children
+    /// under `less`. (Equality is allowed.)
+    fn assert_heap_invariant(h: &MergeHeap) {
+        for i in 1..h.heap.len() {
+            let parent = (i - 1) / 2;
+            assert!(
+                !less(&h.heap[i], &h.heap[parent]),
+                "heap invariant violated at index {i}: child key {} < parent key {} (parent idx {parent})",
+                h.heap[i].key,
+                h.heap[parent].key,
+            );
         }
     }
 
@@ -221,17 +162,14 @@ mod tests {
         let h = build(&[Some(42)]);
         assert!(!h.is_empty());
         assert_eq!(h.heap.len(), 1);
-        assert_eq!(h.heap[0].key, 42);
-        assert_eq!(h.min_idx(), 0);
-        assert_eq!(h.pos_map[0], 0);
+        assert_eq!(h.peek().key, 42);
+        assert_eq!(h.peek().source_idx, 0);
     }
 
     #[test]
     fn build_all_exhausted() {
         let h = build(&[None, None, None]);
         assert!(h.is_empty());
-        // All pos_map entries should be -1.
-        assert!(h.pos_map.iter().all(|&p| p == -1));
     }
 
     #[test]
@@ -239,145 +177,173 @@ mod tests {
         // Entries: 0→30, 1→None, 2→10.  Only 0 and 2 are valid.
         let h = build(&[Some(30), None, Some(10)]);
         assert_eq!(h.heap.len(), 2);
-        assert_eq!(h.heap[0].key, 10);  // min at root
-        assert_eq!(h.min_idx(), 2);     // entry 2 holds key=10
-        assert_eq!(h.pos_map[1], -1);   // exhausted entry
-        assert_pos_map_consistent(&h, 3);
+        assert_eq!(h.peek().key, 10);
+        assert_eq!(h.peek().source_idx, 2);
+        assert_heap_invariant(&h);
     }
 
     #[test]
     fn build_min_at_root() {
-        // 5 entries in reverse order: keys 50,40,30,20,10
         let h = build(&[Some(50), Some(40), Some(30), Some(20), Some(10)]);
-        assert_eq!(h.heap[0].key, 10);
-        assert_eq!(h.min_idx(), 4);
-        assert_pos_map_consistent(&h, 5);
+        assert_eq!(h.peek().key, 10);
+        assert_eq!(h.peek().source_idx, 4);
+        assert_heap_invariant(&h);
     }
 
-    // --- advance(Some) ---
+    // --- replace_top_key ---
 
     #[test]
-    fn advance_some_sinks_below_sibling() {
+    fn replace_top_sinks_below_sibling() {
         // Heap built from keys 10, 20, 30; entry 0 at root (key=10).
-        // Advance entry 0 to key=25 — it should sink below 20 but stay above 30.
+        // Replace root key with 25 — should sink below 20 but stay above 30.
         let mut h = build(&[Some(10), Some(20), Some(30)]);
-        assert_eq!(h.min_idx(), 0);
+        assert_eq!(h.peek().source_idx, 0);
 
-        h.advance(0, Some(25), &less);
+        h.replace_top_key(25, less);
 
-        assert_eq!(h.heap[0].key, 20);
-        assert_eq!(h.min_idx(), 1);
-        assert_pos_map_consistent(&h, 3);
+        assert_eq!(h.peek().key, 20);
+        assert_eq!(h.peek().source_idx, 1);
+        assert_heap_invariant(&h);
+        // The advanced source's source_idx is preserved — it's now somewhere
+        // below the root, but still source_idx=0.
+        assert!(h.heap.iter().any(|n| n.source_idx == 0 && n.key == 25));
     }
 
     #[test]
-    fn advance_some_to_max_sinks_to_leaf() {
+    fn replace_top_to_max_sinks_to_leaf() {
         let mut h = build(&[Some(1), Some(2), Some(3)]);
-        h.advance(0, Some(1000), &less);
-        assert_eq!(h.heap[0].key, 2);
-        assert_eq!(h.min_idx(), 1);
-        assert_pos_map_consistent(&h, 3);
+        h.replace_top_key(1000, less);
+        assert_eq!(h.peek().key, 2);
+        assert_eq!(h.peek().source_idx, 1);
+        assert_heap_invariant(&h);
     }
 
     #[test]
-    fn advance_some_already_min_stays_root() {
-        // Advance root to a key still smaller than all others.
+    fn replace_top_already_min_stays_root() {
         let mut h = build(&[Some(1), Some(5), Some(10)]);
-        h.advance(0, Some(3), &less);
-        assert_eq!(h.heap[0].key, 3);
-        assert_eq!(h.min_idx(), 0);
-        assert_pos_map_consistent(&h, 3);
+        h.replace_top_key(3, less);
+        assert_eq!(h.peek().key, 3);
+        assert_eq!(h.peek().source_idx, 0);
+        assert_heap_invariant(&h);
     }
 
-    // --- advance(None) ---
+    // --- pop_top ---
 
     #[test]
-    fn advance_none_removes_root() {
+    fn pop_top_removes_root() {
         let mut h = build(&[Some(10), Some(20), Some(30)]);
-        h.advance(0, None, &less);
+        h.pop_top(less);
 
         assert_eq!(h.heap.len(), 2);
-        assert_eq!(h.pos_map[0], -1);
-        assert_eq!(h.heap[0].key, 20);
-        assert_pos_map_consistent(&h, 3);
+        assert_eq!(h.peek().key, 20);
+        assert_heap_invariant(&h);
     }
 
     #[test]
-    fn advance_none_removes_non_root() {
-        // Entry 2 (key=30) is a leaf; removing it should not disturb the root.
-        let mut h = build(&[Some(10), Some(20), Some(30)]);
-        h.advance(2, None, &less);
-
-        assert_eq!(h.heap.len(), 2);
-        assert_eq!(h.pos_map[2], -1);
-        assert_eq!(h.heap[0].key, 10);
-        assert_eq!(h.min_idx(), 0);
-        assert_pos_map_consistent(&h, 3);
-    }
-
-    #[test]
-    fn advance_none_single_entry() {
+    fn pop_top_single_entry_empties() {
         let mut h = build(&[Some(42)]);
-        h.advance(0, None, &less);
+        h.pop_top(less);
         assert!(h.is_empty());
     }
 
     #[test]
-    fn advance_none_drains_all() {
-        // Drain a 4-entry heap one-by-one; heap invariant must hold at each step.
+    fn pop_top_drains_in_sorted_order() {
         let mut h = build(&[Some(40), Some(10), Some(30), Some(20)]);
-        let mut n = 4;
         let mut prev_min = 0u128;
+        let mut n = 4;
         while !h.is_empty() {
-            let min_key = h.heap[0].key;
-            assert!(min_key >= prev_min, "heap order violated: {min_key} < {prev_min}");
-            prev_min = min_key;
-            let entry = h.min_idx();
-            h.advance(entry, None, &less);
+            let k = h.peek().key;
+            assert!(k >= prev_min, "drain order violated: {k} < {prev_min}");
+            prev_min = k;
+            h.pop_top(less);
             n -= 1;
             assert_eq!(h.heap.len(), n);
-            // We can't call assert_pos_map_consistent with the original n=4 here
-            // because some entries' pos_map slots have been freed, so just check heap consistency.
-            for (hp, node) in h.heap.iter().enumerate() {
-                assert_eq!(h.pos_map[node.idx], hp as i32);
-            }
+            assert_heap_invariant(&h);
         }
     }
 
-    // --- collect_min_indices ---
+    // --- mixed ops: replace, pop, replace ---
 
     #[test]
-    fn collect_min_indices_empty() {
-        let mut h = build(&[]);
-        assert_eq!(h.collect_min_indices(&eq_root), 0);
-        assert!(h.min_indices.is_empty());
+    fn mixed_ops_preserve_invariant() {
+        let mut h = build(&[Some(5), Some(15), Some(25), Some(35), Some(45)]);
+        // simulate an N-way merge over 5 sorted streams
+        // step 1: root=5 (src 0), advance to 50
+        h.replace_top_key(50, less);
+        assert_heap_invariant(&h);
+        assert_eq!(h.peek().key, 15);
+        // step 2: root=15 (src 1), advance to 16
+        h.replace_top_key(16, less);
+        assert_heap_invariant(&h);
+        assert_eq!(h.peek().key, 16);
+        // step 3: root=16, exhaust
+        h.pop_top(less);
+        assert_heap_invariant(&h);
+        assert_eq!(h.peek().key, 25);
+        // step 4: drain
+        let mut prev = 0u128;
+        while !h.is_empty() {
+            let k = h.peek().key;
+            assert!(k >= prev);
+            prev = k;
+            h.pop_top(less);
+            assert_heap_invariant(&h);
+        }
     }
 
+    /// Build a heap from a sequence of keys, then drain it, simulating
+    /// a concurrent k-way merge by repeatedly popping the root. Verify
+    /// the emitted key sequence is non-decreasing (the heap-min property).
     #[test]
-    fn collect_min_indices_all_distinct() {
-        let mut h = build(&[Some(10), Some(20), Some(30)]);
-        assert_eq!(h.collect_min_indices(&eq_root), 1);
-        assert_eq!(h.min_indices, vec![0]); // only entry 0 (key=10)
+    fn drain_emits_sorted() {
+        let keys = [97u128, 12, 53, 88, 1, 44, 73, 25, 60, 32, 18, 91];
+        let mut h = MergeHeap::build(keys.len(), |i| Some(keys[i]), less);
+
+        let mut emitted = Vec::with_capacity(keys.len());
+        while !h.is_empty() {
+            emitted.push(h.peek().key);
+            h.pop_top(less);
+        }
+        let mut sorted = keys.to_vec();
+        sorted.sort();
+        assert_eq!(emitted, sorted);
     }
 
+    /// Simulate the read-cursor pattern: many sources, each contributing a
+    /// sorted run; emit by repeatedly replacing root with the next key from
+    /// the winning source and popping when a source exhausts. Output must
+    /// equal the merged-and-sorted concatenation.
     #[test]
-    fn collect_min_indices_two_tied() {
-        // Entries 0 and 1 both have key=10; entry 2 has key=20.
-        let mut h = build(&[Some(10), Some(10), Some(20)]);
-        let n = h.collect_min_indices(&eq_root);
-        assert_eq!(n, 2);
-        let mut got = h.min_indices.clone();
-        got.sort();
-        assert_eq!(got, vec![0, 1]);
-    }
+    fn k_way_merge_against_reference() {
+        let runs: Vec<Vec<u128>> = vec![
+            vec![1, 4, 7, 10, 13],
+            vec![2, 5, 8, 11, 14],
+            vec![3, 6, 9, 12, 15],
+            vec![],                // exhausted source
+            vec![0, 100, 200],
+        ];
+        let mut positions = vec![0usize; runs.len()];
+        let mut h = MergeHeap::build(
+            runs.len(),
+            |i| runs[i].first().copied(),
+            less,
+        );
 
-    #[test]
-    fn collect_min_indices_all_equal() {
-        let mut h = build(&[Some(5), Some(5), Some(5), Some(5)]);
-        let n = h.collect_min_indices(&eq_root);
-        assert_eq!(n, 4);
-        let mut got = h.min_indices.clone();
-        got.sort();
-        assert_eq!(got, vec![0, 1, 2, 3]);
+        let mut emitted = Vec::new();
+        while !h.is_empty() {
+            let src = h.peek().source_idx;
+            let key = h.peek().key;
+            emitted.push(key);
+            positions[src] += 1;
+            if positions[src] < runs[src].len() {
+                h.replace_top_key(runs[src][positions[src]], less);
+            } else {
+                h.pop_top(less);
+            }
+        }
+
+        let mut expected: Vec<u128> = runs.iter().flatten().copied().collect();
+        expected.sort();
+        assert_eq!(emitted, expected);
     }
 }

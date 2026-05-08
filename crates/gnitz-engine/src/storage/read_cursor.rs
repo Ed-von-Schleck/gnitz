@@ -296,23 +296,15 @@ impl ReadCursorEntry {
 
     fn skip_ghosts(&mut self) {
         // Batch sources are always consolidated — no ghost rows.
-        let CursorSource::Shard(s) = &self.source else { return; };
-        if !s.has_ghosts { return; }
-        while self.position < self.count {
-            if self.source.get_weight(self.position) != 0 {
-                return;
-            }
-            self.position += 1;
+        if let CursorSource::Shard(s) = &self.source {
+            self.position = s.next_non_ghost(self.position);
         }
     }
 
     #[inline]
     fn peek_key(&self) -> u128 {
-        if self.is_valid() {
-            self.source.get_pk(self.position)
-        } else {
-            u128::MAX
-        }
+        debug_assert!(self.is_valid());
+        self.source.get_pk(self.position)
     }
 
     #[inline]
@@ -334,12 +326,21 @@ impl ReadCursorEntry {
 // ReadCursor
 // ---------------------------------------------------------------------------
 
+/// Three-way dispatch on source count, replacing the previous
+/// `tree: Option<MergeHeap>` + parallel `entries.len() == 1` checks.
+/// `Empty`/`Single`/`Multi` are exhaustive so each call site dispatches once.
+enum SourceMode {
+    Empty,
+    Single,
+    Multi(MergeHeap),
+}
+
 pub struct ReadCursor {
     entries: Vec<ReadCursorEntry>,
     /// Many cursor consumers (point lookups, seeks) never call
     /// `scatter_drained_into`; build on first use.
     unified_sources: OnceCell<Vec<UnifiedSource>>,
-    tree: Option<MergeHeap>,
+    mode: SourceMode,
     schema: SchemaDescriptor,
     is_fast: bool,
     // Current row state
@@ -349,8 +350,6 @@ pub struct ReadCursor {
     pub current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
-    // Reusable buffer for advance indices
-    advance_buf: Vec<usize>,
 }
 
 /// Row comparator alias for the monomorphized `_with` variants.  `Copy` lets
@@ -371,8 +370,8 @@ impl ReadCursor {
             }
             row_cmp(
                 schema,
-                &entries[a.idx].source, entries[a.idx].position,
-                &entries[b.idx].source, entries[b.idx].position,
+                &entries[a.source_idx].source, entries[a.source_idx].position,
+                &entries[b.source_idx].source, entries[b.source_idx].position,
             ) == Ordering::Less
         };
         MergeHeap::build(
@@ -405,17 +404,16 @@ impl ReadCursor {
     }
 
     fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
-        let n = entries.len();
         let is_fast = columnar::schema_is_int_nonnull(&schema);
-        let tree = if n > 1 {
-            Some(Self::build_tree(&entries, &schema, is_fast))
-        } else {
-            None
+        let mode = match entries.len() {
+            0 => SourceMode::Empty,
+            1 => SourceMode::Single,
+            _ => SourceMode::Multi(Self::build_tree(&entries, &schema, is_fast)),
         };
         let mut cursor = ReadCursor {
             entries,
             unified_sources: OnceCell::new(),
-            tree,
+            mode,
             schema,
             is_fast,
             valid: false,
@@ -424,9 +422,8 @@ impl ReadCursor {
             current_null_word: 0,
             current_entry_idx: 0,
             current_row: 0,
-            advance_buf: Vec::with_capacity(n),
         };
-        cursor.find_next_non_ghost();
+        cursor.drive();
         cursor
     }
 
@@ -434,10 +431,10 @@ impl ReadCursor {
         for e in &mut self.entries {
             e.seek(key);
         }
-        if self.tree.is_some() {
-            self.tree = Some(Self::build_tree(&self.entries, &self.schema, self.is_fast));
+        if let SourceMode::Multi(_) = &self.mode {
+            self.mode = SourceMode::Multi(Self::build_tree(&self.entries, &self.schema, self.is_fast));
         }
-        self.find_next_non_ghost();
+        self.drive();
     }
 
     pub fn advance(&mut self) {
@@ -451,141 +448,136 @@ impl ReadCursor {
         }
     }
 
+    /// Step past the previously-emitted row, then drive to the next group.
+    /// For single-source cursors `drive` just commits the row at the
+    /// current position, so we must step past it first. Multi-source
+    /// cursors don't pre-advance: `drive`'s inner fold popped the
+    /// previously-emitted group's rows from the heap, so the next call
+    /// opens a new group from the heap root.
     #[inline]
     fn advance_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        if self.entries.len() == 1 {
+        if matches!(self.mode, SourceMode::Single) {
             self.entries[0].advance();
-            self.find_next_non_ghost_with(row_cmp);
-            return;
         }
-
-        let Some(tree) = self.tree.as_mut() else {
-            self.find_next_non_ghost_with(row_cmp);
-            return;
-        };
-        self.advance_buf.clear();
-        self.advance_buf.extend_from_slice(&tree.min_indices);
-        for &ei in &self.advance_buf {
-            self.entries[ei].advance();
-            let new_key = if self.entries[ei].is_valid() {
-                Some(self.entries[ei].peek_key())
-            } else {
-                None
-            };
-            let entries = &self.entries;
-            let schema = &self.schema;
-            let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
-                if a.key != b.key {
-                    return a.key < b.key;
-                }
-                row_cmp(
-                    schema,
-                    &entries[a.idx].source, entries[a.idx].position,
-                    &entries[b.idx].source, entries[b.idx].position,
-                ) == Ordering::Less
-            };
-            tree.advance(ei, new_key, &less);
-        }
-
-        self.find_next_non_ghost_with(row_cmp);
+        self.drive_with(row_cmp);
     }
 
-    /// Copy the row at entries[idx] into the public cursor state with an
-    /// explicit emit weight (which can be a per-source weight from the
-    /// single-entry path or a summed net weight from the heap path).
     #[inline]
-    fn commit_row(&mut self, idx: usize, weight: i64) {
-        let e = &self.entries[idx];
-        let pos = e.position;
-        self.valid = true;
-        self.current_key = e.source.get_pk(pos);
-        self.current_weight = weight;
-        self.current_null_word = e.source.get_null_word(pos);
-        self.current_entry_idx = idx;
-        self.current_row = pos;
-    }
-
-    fn find_next_non_ghost(&mut self) {
+    fn drive(&mut self) {
         if self.is_fast {
-            self.find_next_non_ghost_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+            self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
         } else {
-            self.find_next_non_ghost_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+            self.drive_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
         }
     }
 
+    /// Single-source bypass: no heap, no ghost filter.
+    /// `Batch` inputs are pre-consolidated and `ReadCursorEntry::advance`
+    /// already calls `skip_ghosts` for shard sources, so the entry's
+    /// current position is either valid emit-ready or past-end.
     #[inline]
-    fn find_next_non_ghost_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        if self.entries.len() == 1 {
-            if self.entries[0].is_valid() {
-                let w = self.entries[0].source.get_weight(self.entries[0].position);
-                self.commit_row(0, w);
-            } else {
-                self.valid = false;
-            }
-            return;
-        }
-
-        let Some(tree) = self.tree.as_mut() else {
+    fn drive_single(&mut self) {
+        let e = &self.entries[0];
+        if e.is_valid() {
+            let pos = e.position;
+            self.valid = true;
+            self.current_key = e.source.get_pk(pos);
+            self.current_weight = e.source.get_weight(pos);
+            self.current_null_word = e.source.get_null_word(pos);
+            self.current_entry_idx = 0;
+            self.current_row = pos;
+        } else {
             self.valid = false;
-            return;
+        }
+    }
+
+    /// Heap path: emit one consolidated non-ghost group, or invalidate.
+    ///
+    /// Outer loop opens a group from the heap root and folds tied rows by
+    /// repeatedly replacing/popping the root. If the folded group has
+    /// non-zero net weight, commit and return; otherwise it was a ghost
+    /// group — try the next root.
+    ///
+    /// At call boundary the heap root is always either empty or the
+    /// leading row of an unfolded group, so no state crosses calls.
+    #[inline]
+    fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
+        let heap = match &mut self.mode {
+            SourceMode::Empty => { self.valid = false; return; }
+            SourceMode::Single => { self.drive_single(); return; }
+            SourceMode::Multi(heap) => heap,
         };
         let schema = &self.schema;
+        let entries = &mut self.entries;
 
-        while !tree.is_empty() {
-            let entries = &self.entries;
-            let eq_root = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> Ordering {
-                let key_ord = a.key.cmp(&b.key);
-                if key_ord != Ordering::Equal {
-                    return key_ord;
-                }
-                row_cmp(
-                    schema,
-                    &entries[a.idx].source, entries[a.idx].position,
-                    &entries[b.idx].source, entries[b.idx].position,
-                )
-            };
-            let num_min = tree.collect_min_indices(&eq_root);
-            if num_min == 0 {
-                break;
-            }
-
-            let mut net_weight: i64 = 0;
-            for i in 0..num_min {
-                net_weight += self.entries[tree.min_indices[i]].weight();
-            }
-
-            if net_weight != 0 {
-                let exemplar = tree.min_indices[0];
-                self.commit_row(exemplar, net_weight);
+        loop {
+            if heap.is_empty() {
+                self.valid = false;
                 return;
             }
 
-            self.advance_buf.clear();
-            self.advance_buf
-                .extend_from_slice(&tree.min_indices[..num_min]);
-            for &ei in &self.advance_buf {
-                self.entries[ei].advance();
-                let new_key = if self.entries[ei].is_valid() {
-                    Some(self.entries[ei].peek_key())
-                } else {
-                    None
-                };
-                let entries = &self.entries;
-                let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+            let group_src = heap.peek().source_idx;
+            let group_row = entries[group_src].position;
+            let group_key = heap.peek().key;
+            let mut net_weight: i64 = 0;
+
+            // Inner fold: drain every row tied with (group_src, group_row).
+            loop {
+                let cur_src = heap.peek().source_idx;
+                let cur_key = heap.peek().key;
+                let cur_row = entries[cur_src].position;
+
+                if cur_key != group_key
+                    || row_cmp(
+                        schema,
+                        &entries[group_src].source, group_row,
+                        &entries[cur_src].source, cur_row,
+                    ) != Ordering::Equal
+                {
+                    break;
+                }
+
+                net_weight += entries[cur_src].weight();
+                entries[cur_src].advance();
+
+                // `less` is rebuilt each iteration: it captures `entries`
+                // immutably, which conflicts with the `entries[cur_src]
+                // .advance()` above when held across iterations.
+                let entries_ref: &[ReadCursorEntry] = entries;
+                let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
                     if a.key != b.key {
                         return a.key < b.key;
                     }
                     row_cmp(
                         schema,
-                        &entries[a.idx].source, entries[a.idx].position,
-                        &entries[b.idx].source, entries[b.idx].position,
+                        &entries_ref[a.source_idx].source, entries_ref[a.source_idx].position,
+                        &entries_ref[b.source_idx].source, entries_ref[b.source_idx].position,
                     ) == Ordering::Less
                 };
-                tree.advance(ei, new_key, &less);
+                if entries[cur_src].is_valid() {
+                    heap.replace_top_key(entries[cur_src].peek_key(), less);
+                } else {
+                    heap.pop_top(less);
+                    if heap.is_empty() {
+                        break;
+                    }
+                }
             }
-        }
 
-        self.valid = false;
+            if net_weight != 0 {
+                // Saved exemplar (group_src, group_row) is still readable —
+                // both `CursorSource` variants index by row, not by position.
+                let e = &entries[group_src];
+                self.valid = true;
+                self.current_key = group_key;
+                self.current_weight = net_weight;
+                self.current_null_word = e.source.get_null_word(group_row);
+                self.current_entry_idx = group_src;
+                self.current_row = group_row;
+                return;
+            }
+            // Ghost group: outer loop tries the next root.
+        }
     }
 
     /// Approximate the number of rows remaining in this cursor (upper bound).
@@ -740,7 +732,7 @@ impl ReadCursor {
 
         // Advance position past the drained rows
         self.entries[0].position = start + row_count;
-        self.find_next_non_ghost();
+        self.drive();
         Some(batch)
     }
 

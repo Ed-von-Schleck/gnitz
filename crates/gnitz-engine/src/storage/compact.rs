@@ -72,21 +72,12 @@ impl ShardCursor {
     }
 
     fn skip_ghosts(&mut self, shard: &MappedShard) {
-        if !shard.has_ghosts { return; }
-        while self.position < self.count {
-            if shard.get_weight(self.position) != 0 {
-                return;
-            }
-            self.position += 1;
-        }
+        self.position = shard.next_non_ghost(self.position);
     }
 
     fn peek_key(&self, shard: &MappedShard) -> u128 {
-        if self.is_valid() {
-            shard.get_pk(self.position)
-        } else {
-            u128::MAX
-        }
+        debug_assert!(self.is_valid());
+        shard.get_pk(self.position)
     }
 }
 
@@ -176,69 +167,68 @@ fn open_and_merge_inner<RowCmp>(
                 }
                 row_cmp(
                     schema,
-                    &shards[cursors_ref[a.idx].shard_idx], cursors_ref[a.idx].position,
-                    &shards[cursors_ref[b.idx].shard_idx], cursors_ref[b.idx].position,
+                    &shards[cursors_ref[a.source_idx].shard_idx], cursors_ref[a.source_idx].position,
+                    &shards[cursors_ref[b.source_idx].shard_idx], cursors_ref[b.source_idx].position,
                 ) == std::cmp::Ordering::Less
             },
         )
     };
 
-    let mut has_pending = false;
-    let mut pending_shard_idx: usize = 0;
-    let mut pending_row: usize = 0;
-    let mut pending_key: u128 = 0;
-    let mut pending_weight: i64 = 0;
-
     while !tree.is_empty() {
-        let ci = tree.min_idx();
-        let si = cursors[ci].shard_idx;
-        let row = cursors[ci].position;
-        let cur_key = shards[si].get_pk(row);
-        let cur_weight = shards[si].get_weight(row);
+        // Open a new group from the heap root.
+        let group_src = tree.peek().source_idx;
+        let group_shard_idx = cursors[group_src].shard_idx;
+        let group_row = cursors[group_src].position;
+        let group_key = tree.peek().key;
+        let mut net_weight: i64 = 0;
 
-        let same_group = has_pending
-            && cur_key == pending_key
-            && row_cmp(
-                schema,
-                &shards[pending_shard_idx], pending_row,
-                &shards[si], row,
-            ) == std::cmp::Ordering::Equal;
+        // Inner fold: drain every row tied with (group_shard_idx, group_row).
+        loop {
+            let cur_src = tree.peek().source_idx;
+            let cur_key = tree.peek().key;
+            let cur_shard_idx = cursors[cur_src].shard_idx;
+            let cur_row = cursors[cur_src].position;
 
-        if same_group {
-            pending_weight += cur_weight;
-        } else {
-            if has_pending && pending_weight != 0 {
-                emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
+            if cur_key != group_key
+                || row_cmp(
+                    schema,
+                    &shards[group_shard_idx], group_row,
+                    &shards[cur_shard_idx], cur_row,
+                ) != std::cmp::Ordering::Equal
+            {
+                break;
             }
-            pending_shard_idx = si;
-            pending_row = row;
-            pending_key = cur_key;
-            pending_weight = cur_weight;
-            has_pending = true;
+
+            net_weight += shards[cur_shard_idx].get_weight(cur_row);
+            cursors[cur_src].advance(&shards[cur_shard_idx]);
+
+            let cursors_ref: &[ShardCursor] = &cursors;
+            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
+                if a.key != b.key {
+                    return a.key < b.key;
+                }
+                row_cmp(
+                    schema,
+                    &shards[cursors_ref[a.source_idx].shard_idx], cursors_ref[a.source_idx].position,
+                    &shards[cursors_ref[b.source_idx].shard_idx], cursors_ref[b.source_idx].position,
+                ) == std::cmp::Ordering::Less
+            };
+            if cursors[cur_src].is_valid() {
+                tree.replace_top_key(
+                    cursors[cur_src].peek_key(&shards[cur_shard_idx]),
+                    less,
+                );
+            } else {
+                tree.pop_top(less);
+                if tree.is_empty() {
+                    break;
+                }
+            }
         }
 
-        cursors[ci].advance(&shards[si]);
-        let new_key = if cursors[ci].is_valid() {
-            Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
-        } else {
-            None
-        };
-        let cursors_ref: &[ShardCursor] = &cursors;
-        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-            if a.key != b.key {
-                return a.key < b.key;
-            }
-            row_cmp(
-                schema,
-                &shards[cursors_ref[a.idx].shard_idx], cursors_ref[a.idx].position,
-                &shards[cursors_ref[b.idx].shard_idx], cursors_ref[b.idx].position,
-            ) == std::cmp::Ordering::Less
-        };
-        tree.advance(ci, new_key, &less);
-    }
-
-    if has_pending && pending_weight != 0 {
-        emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
+        if net_weight != 0 {
+            emit(group_key, net_weight, &shards[group_shard_idx], group_row);
+        }
     }
 }
 
