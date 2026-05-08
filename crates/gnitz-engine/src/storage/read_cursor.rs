@@ -3,7 +3,7 @@
 //! Produces rows in (PK, payload) order with inline ghost elimination
 //! (net weight=0 rows are skipped).
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering;
 use std::ptr;
 use std::rc::Rc;
@@ -336,7 +336,9 @@ impl ReadCursorEntry {
 
 pub struct ReadCursor {
     entries: Vec<ReadCursorEntry>,
-    unified_sources: Vec<UnifiedSource>,
+    /// Many cursor consumers (point lookups, seeks) never call
+    /// `scatter_drained_into`; build on first use.
+    unified_sources: OnceCell<Vec<UnifiedSource>>,
     tree: Option<MergeHeap>,
     schema: SchemaDescriptor,
     is_fast: bool,
@@ -405,9 +407,6 @@ impl ReadCursor {
     fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
         let is_fast = columnar::schema_is_int_nonnull(&schema);
-        let unified_sources: Vec<UnifiedSource> = entries.iter()
-            .map(|e| e.source.to_unified(&schema))
-            .collect();
         let tree = if n > 1 {
             Some(Self::build_tree(&entries, &schema, is_fast))
         } else {
@@ -415,7 +414,7 @@ impl ReadCursor {
         };
         let mut cursor = ReadCursor {
             entries,
-            unified_sources,
+            unified_sources: OnceCell::new(),
             tree,
             schema,
             is_fast,
@@ -848,7 +847,12 @@ impl ReadCursor {
         writer: &mut super::merge::DirectWriter<'_>,
     ) {
         if rows.is_empty() { return; }
-        super::merge::scatter_unified_sources_with_weights(&self.unified_sources, rows, writer);
+        let unified = self.unified_sources.get_or_init(|| {
+            self.entries.iter()
+                .map(|e| e.source.to_unified(&self.schema))
+                .collect()
+        });
+        super::merge::scatter_unified_sources_with_weights(unified, rows, writer);
     }
 }
 

@@ -126,7 +126,7 @@ impl PartitionedTable {
 
         for table in &mut self.tables {
             table.compact_if_needed()?;
-            all_snapshots.push(table.get_snapshot());
+            all_snapshots.extend(table.snapshot_runs().iter().cloned());
             all_shard_arcs.append(&mut table.all_shard_arcs());
         }
 

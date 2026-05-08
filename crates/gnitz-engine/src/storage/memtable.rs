@@ -1,5 +1,4 @@
-//! MemTable: manages sorted runs, Bloom filter, consolidation cache,
-//! PK lookups, and shard flush.
+//! MemTable: manages sorted runs, Bloom filter, PK lookups, and shard flush.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -43,13 +42,12 @@ fn consolidate_batches(
 
 
 pub struct MemTable {
-    runs: Vec<Batch>,
+    runs: Vec<Rc<Batch>>,
     bloom: BloomFilter,
     schema: SchemaDescriptor,
     max_bytes: usize,
     total_row_count: usize,
     runs_bytes: usize,
-    cached_consolidated: Option<Rc<Batch>>,
     // Last lookup result (set by lookup_pk, read by found_* accessors)
     found_run: usize,
     found_row: usize,
@@ -60,13 +58,12 @@ impl MemTable {
     pub fn new(schema: SchemaDescriptor, max_bytes: usize) -> Self {
         let capacity = (max_bytes / 40).max(16); // rough estimate
         MemTable {
-            runs: Vec::with_capacity(8),
+            runs: Vec::with_capacity(INLINE_CONSOLIDATE_THRESHOLD),
             bloom: BloomFilter::new(capacity as u32),
             schema,
             max_bytes,
             total_row_count: 0,
             runs_bytes: 0,
-            cached_consolidated: None,
             found_run: 0,
             found_row: 0,
             has_found: false,
@@ -85,8 +82,7 @@ impl MemTable {
         }
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();
-        self.runs.push(batch);
-        self.invalidate_cache();
+        self.runs.push(Rc::new(batch));
         self.maybe_inline_consolidate();
         Ok(())
     }
@@ -114,18 +110,41 @@ impl MemTable {
             .collect()
     }
 
-    /// Get a consolidated snapshot.  Caches the merged result of all runs.
-    /// Returns an `Rc<Batch>` — cheap to clone for multiple consumers.
-    pub fn get_snapshot(&mut self) -> Rc<Batch> {
-        if self.cached_consolidated.is_none() && !self.runs.is_empty() {
-            let batches = self.runs_as_sorted();
-            let consolidated = consolidate_batches(&batches, &self.schema);
-            self.cached_consolidated = Some(Rc::new(consolidated));
-        }
+    /// Borrow the current sorted runs. Each run is independently
+    /// sorted+consolidated; cross-run merging is deferred to the consumer
+    /// (typically a `ReadCursor`).
+    pub fn snapshot_runs(&self) -> &[Rc<Batch>] {
+        &self.runs
+    }
 
-        match &self.cached_consolidated {
-            Some(rc) => Rc::clone(rc),
-            None => Rc::new(Batch::empty_with_schema(&self.schema)),
+    /// Collapse runs into one merged run in-place.
+    /// `has_found` is dropped because run/row indices change.
+    fn force_consolidate(&mut self) {
+        if self.runs.len() <= 1 {
+            return;
+        }
+        let batches = self.runs_as_sorted();
+        let merged = consolidate_batches(&batches, &self.schema);
+        // batches borrow from self.runs; release before clear() reborrows mut.
+        drop(batches);
+        self.runs.clear();
+        self.runs_bytes = merged.total_bytes();
+        self.total_row_count = merged.count;
+        if merged.count > 0 {
+            self.runs.push(Rc::new(merged));
+        }
+        self.has_found = false;
+    }
+
+    /// Consolidate runs and return an `Rc<Batch>` of the merged result.
+    /// The memtable retains the merged run until `reset()`, so a failed
+    /// flush IO leaves the data intact for retry.
+    pub fn consolidate_for_flush(&mut self) -> Rc<Batch> {
+        self.force_consolidate();
+        if self.runs.is_empty() {
+            Rc::new(Batch::empty_with_schema(&self.schema))
+        } else {
+            Rc::clone(&self.runs[0])
         }
     }
 
@@ -160,7 +179,7 @@ impl MemTable {
 
     fn found_entry(&self) -> Option<(&Batch, usize)> {
         if self.has_found && self.found_run < self.runs.len() {
-            Some((&self.runs[self.found_run], self.found_row))
+            Some((self.runs[self.found_run].as_ref(), self.found_row))
         } else {
             None
         }
@@ -203,7 +222,7 @@ impl MemTable {
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
                 let ord = columnar::compare_rows(
-                    &self.schema, run, lo, ref_source, ref_row,
+                    &self.schema, run.as_ref(), lo, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
                     total_w += run.get_weight(lo);
@@ -229,7 +248,7 @@ impl MemTable {
             }
             let mut lo = run.find_lower_bound(key);
             while lo < run.count && run.get_pk(lo) == key {
-                let net_w = self.find_weight_for_row(key, run, lo);
+                let net_w = self.find_weight_for_row(key, run.as_ref(), lo);
                 if net_w > 0 {
                     self.found_run = ri;
                     self.found_row = lo;
@@ -243,38 +262,22 @@ impl MemTable {
         false
     }
 
-    /// Clear all runs, bloom filter, and cache.  Ready for reuse.
+    /// Clear all runs and bloom filter.  Ready for reuse.
     pub fn reset(&mut self) {
         self.runs.clear();
         self.runs_bytes = 0;
         self.total_row_count = 0;
-        self.cached_consolidated = None;
         self.has_found = false;
         self.bloom.reset();
     }
 
-
-    fn invalidate_cache(&mut self) {
-        self.cached_consolidated = None;
-    }
-
     /// If the run count has reached the threshold, merge all runs into a
-    /// single consolidated run.  Bounds the cost of `get_snapshot()` and
+    /// single consolidated run.  Bounds the cost of cursor builds and
     /// `lookup_pk()`, and eliminates weight-cancelled rows early.
     fn maybe_inline_consolidate(&mut self) {
-        if self.runs.len() < INLINE_CONSOLIDATE_THRESHOLD {
-            return;
+        if self.runs.len() >= INLINE_CONSOLIDATE_THRESHOLD {
+            self.force_consolidate();
         }
-        let batches = self.runs_as_sorted();
-        let merged = consolidate_batches(&batches, &self.schema);
-        self.runs.clear();
-        self.runs_bytes = merged.total_bytes();
-        self.total_row_count = merged.count;
-        if merged.count > 0 {
-            self.runs.push(merged);
-        }
-        self.has_found = false;
-        self.invalidate_cache();
     }
 
     fn check_capacity(&self) -> Result<(), StorageError> {
@@ -348,31 +351,42 @@ mod tests {
         mt.upsert_sorted_batch(b2).unwrap();
         assert_eq!(mt.total_row_count(), 4);
 
-        // Snapshot should consolidate: PK 30 has +1 -1 = 0 (ghost)
-        let snap = mt.get_snapshot();
+        // consolidate_for_flush should fold the runs: PK 30 has +1 -1 = 0 (ghost)
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 2); // PK 10 and 20 survive
         assert_eq!(snap.get_pk(0), 10);
         assert_eq!(snap.get_pk(1), 20);
     }
 
+    /// Singleton fast path: when only one run is present, `consolidate_for_flush`
+    /// must return an `Rc::clone` of the existing run (no rewrite).  Multi-run
+    /// path produces a fresh allocation.
     #[test]
-    fn memtable_snapshot_caching() {
+    fn consolidate_for_flush_singleton_returns_existing_run() {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
-        let b1 = make_batch(&schema, &[(10, 1, 100)]);
+
+        let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
         mt.upsert_sorted_batch(b1).unwrap();
+        let original = Rc::clone(&mt.snapshot_runs()[0]);
 
-        let s1 = mt.get_snapshot();
-        let s2 = mt.get_snapshot();
-        // Should be the same Rc (cached)
-        assert!(Rc::ptr_eq(&s1, &s2));
+        let snap = mt.consolidate_for_flush();
+        assert_eq!(snap.count, 2);
+        assert!(Rc::ptr_eq(&snap, &original),
+            "singleton path must Rc::clone the existing run");
 
-        // After new upsert, cache is invalidated
-        let b2 = make_batch(&schema, &[(20, 1, 200)]);
+        // Multi-run path: add a second run, drop the singleton handle, then
+        // consolidate. The merged batch must be a fresh allocation distinct
+        // from either pre-existing run.
+        drop(snap);
+        let b2 = make_batch(&schema, &[(30, 1, 300)]);
         mt.upsert_sorted_batch(b2).unwrap();
-        let s3 = mt.get_snapshot();
-        assert!(!Rc::ptr_eq(&s1, &s3));
-        assert_eq!(s3.count, 2);
+        let runs_pre: Vec<Rc<Batch>> = mt.snapshot_runs().to_vec();
+        assert_eq!(runs_pre.len(), 2);
+        let snap2 = mt.consolidate_for_flush();
+        assert_eq!(snap2.count, 3);
+        assert!(!Rc::ptr_eq(&snap2, &runs_pre[0]));
+        assert!(!Rc::ptr_eq(&snap2, &runs_pre[1]));
     }
 
     #[test]
@@ -419,10 +433,12 @@ mod tests {
         assert!(mt.is_empty());
         assert_eq!(mt.total_row_count(), 0);
 
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 0);
     }
 
+    /// An `Rc<Batch>` obtained from `snapshot_runs()` must keep the data
+    /// alive across `reset()`.  This is the cursor-lifetime contract.
     #[test]
     fn snapshot_survives_reset() {
         let schema = make_u64_i64_schema();
@@ -430,11 +446,13 @@ mod tests {
         let b1 = make_batch(&schema, &[(10, 1, 100)]);
         mt.upsert_sorted_batch(b1).unwrap();
 
-        let snap = mt.get_snapshot();
+        let runs = mt.snapshot_runs();
+        assert_eq!(runs.len(), 1);
+        let snap = Rc::clone(&runs[0]);
         assert_eq!(snap.count, 1);
 
         mt.reset();
-        // Snapshot still valid (Arc keeps data alive)
+        // Snapshot still valid (Rc keeps data alive)
         assert_eq!(snap.count, 1);
         assert_eq!(snap.get_pk(0), 10);
     }
@@ -915,7 +933,7 @@ mod tests {
         mt.upsert_sorted_batch(b16).unwrap();
         assert_eq!(mt.runs.len(), 1);
 
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 16);
         assert_eq!(snap.get_pk(0), 1);
         assert_eq!(snap.get_pk(15), 16);
@@ -939,7 +957,7 @@ mod tests {
         mt.upsert_sorted_batch(b16).unwrap();
 
         assert_eq!(mt.runs.len(), 1);
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         // PK 1 cancelled out: 14 - 1 + 1 new = 14 survive
         assert_eq!(snap.count, 14);
         // PK 1 should be gone, first row is PK 2
@@ -966,7 +984,7 @@ mod tests {
         assert!(mt.is_empty());
         assert_eq!(mt.total_row_count(), 0);
 
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 0);
     }
 
@@ -982,7 +1000,7 @@ mod tests {
         // 15 < 16, no consolidation
         assert_eq!(mt.runs.len(), 15);
 
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 15);
     }
 
@@ -1010,7 +1028,7 @@ mod tests {
         mt.upsert_sorted_batch(b31).unwrap();
         assert_eq!(mt.runs.len(), 1);
 
-        let snap = mt.get_snapshot();
+        let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 31);
     }
 

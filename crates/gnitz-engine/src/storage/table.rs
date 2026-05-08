@@ -260,7 +260,7 @@ impl Table {
             return Ok(FlushOutcome::Empty);
         }
 
-        let snapshot = self.memtable.get_snapshot();
+        let snapshot = self.memtable.consolidate_for_flush();
         if snapshot.count == 0 {
             self.memtable.reset();
             return Ok(FlushOutcome::Empty);
@@ -407,14 +407,13 @@ impl Table {
     // Cursor
     // ------------------------------------------------------------------
 
-    /// Create a cursor over all data (memtable snapshot + shards).
+    /// Create a cursor over all data (memtable runs + shards).
     /// Runs compaction if needed.  Returns an opaque CursorHandle.
     pub fn create_cursor(&mut self) -> Result<CursorHandle, StorageError> {
         self.compact_if_needed()?;
-        let snapshot = self.memtable.get_snapshot();
+        let snapshots = self.memtable.snapshot_runs();
         let shard_arcs = self.shard_index.all_shard_arcs();
-        let snapshots = vec![snapshot];
-        let handle = read_cursor::create_cursor_from_snapshots(&snapshots, &shard_arcs, self.schema);
+        let handle = read_cursor::create_cursor_from_snapshots(snapshots, &shard_arcs, self.schema);
         Ok(handle)
     }
 
@@ -431,9 +430,10 @@ impl Table {
         Ok(rc)
     }
 
-    /// Get a memtable snapshot handle (for PartitionedTable cursor gathering).
-    pub fn get_snapshot(&mut self) -> Rc<Batch> {
-        self.memtable.get_snapshot()
+    /// Borrow the current memtable runs (for PartitionedTable cursor
+    /// gathering).  See `MemTable::snapshot_runs` for lifetime rules.
+    pub fn snapshot_runs(&self) -> &[Rc<Batch>] {
+        self.memtable.snapshot_runs()
     }
 
     /// Get all shard Rcs (for PartitionedTable cursor gathering).
