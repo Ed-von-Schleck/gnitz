@@ -323,26 +323,10 @@ impl ReadCursorEntry {
 // ReadCursor
 // ---------------------------------------------------------------------------
 
-/// Dispatch shape for the merge cursor.
-///
-/// `None` covers 0- and 1-entry cursors (no merging needed).  `Two` is the
-/// hot two-pointer fast path for `entries.len() == 2`, which avoids the heap
-/// entirely.  `Heap` is the general N-way merge for `entries.len() >= 3`.
-enum TreeKind {
-    None,
-    Two,
-    Heap(MergeHeap),
-}
-
-// advance_mask bits used by the TreeKind::Two path.
-const MASK_LEFT: u8 = 0b01;
-const MASK_RIGHT: u8 = 0b10;
-const MASK_BOTH: u8 = 0b11;
-
 pub struct ReadCursor {
     entries: Vec<ReadCursorEntry>,
     unified_sources: Vec<UnifiedSource>,
-    tree: TreeKind,
+    tree: Option<MergeHeap>,
     schema: SchemaDescriptor,
     is_fast: bool,
     // Current row state
@@ -352,12 +336,7 @@ pub struct ReadCursor {
     pub current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
-    // Set by find_next_non_ghost (Two path), consumed by next advance().
-    // Mirrors the heap path's min_indices contract: find_next_non_ghost
-    // selects the next row but does not advance entries past it; advance()
-    // does that on the following call.
-    advance_mask: u8,
-    // Reusable buffer for advance indices (heap path only)
+    // Reusable buffer for advance indices
     advance_buf: Vec<usize>,
 }
 
@@ -389,15 +368,10 @@ impl ReadCursor {
         let unified_sources: Vec<UnifiedSource> = entries.iter()
             .map(|e| e.source.to_unified(&schema))
             .collect();
-        let tree = match n {
-            0 | 1 => TreeKind::None,
-            2 => TreeKind::Two,
-            _ => TreeKind::Heap(Self::build_tree(&entries, &schema, is_fast)),
-        };
-        let advance_buf = if matches!(tree, TreeKind::Heap(_)) {
-            Vec::with_capacity(n)
+        let tree = if n > 1 {
+            Some(Self::build_tree(&entries, &schema, is_fast))
         } else {
-            Vec::new()
+            None
         };
         let mut cursor = ReadCursor {
             entries,
@@ -411,8 +385,7 @@ impl ReadCursor {
             current_null_word: 0,
             current_entry_idx: 0,
             current_row: 0,
-            advance_mask: 0,
-            advance_buf,
+            advance_buf: Vec::with_capacity(n),
         };
         cursor.find_next_non_ghost();
         cursor
@@ -422,10 +395,8 @@ impl ReadCursor {
         for e in &mut self.entries {
             e.seek(key);
         }
-        // Two: nothing to rebuild — find_next_non_ghost recomputes from
-        // entry positions every call.  Heap: re-build from seeked positions.
-        if let TreeKind::Heap(_) = self.tree {
-            self.tree = TreeKind::Heap(Self::build_tree(&self.entries, &self.schema, self.is_fast));
+        if self.tree.is_some() {
+            self.tree = Some(Self::build_tree(&self.entries, &self.schema, self.is_fast));
         }
         self.find_next_non_ghost();
     }
@@ -435,144 +406,38 @@ impl ReadCursor {
             return;
         }
 
-        match &mut self.tree {
-            TreeKind::None => {
-                if self.entries.len() == 1 {
-                    self.entries[0].advance();
-                }
-            }
-            TreeKind::Two => {
-                if self.advance_mask & MASK_LEFT != 0 { self.entries[0].advance(); }
-                if self.advance_mask & MASK_RIGHT != 0 { self.entries[1].advance(); }
-            }
-            TreeKind::Heap(tree) => {
-                self.advance_buf.clear();
-                self.advance_buf.extend_from_slice(&tree.min_indices);
-                let is_fast = self.is_fast;
-                for &ei in &self.advance_buf {
-                    self.entries[ei].advance();
-                    let new_key = if self.entries[ei].is_valid() {
-                        Some(self.entries[ei].peek_key())
-                    } else {
-                        None
-                    };
-                    let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
-                        entry_cmp(&self.entries, &self.schema, is_fast, a, b).is_lt()
-                    };
-                    tree.advance(ei, new_key, &less);
-                }
-            }
+        if self.entries.len() == 1 {
+            self.entries[0].advance();
+            self.find_next_non_ghost();
+            return;
+        }
+
+        let Some(tree) = self.tree.as_mut() else {
+            self.find_next_non_ghost();
+            return;
+        };
+        self.advance_buf.clear();
+        self.advance_buf.extend_from_slice(&tree.min_indices);
+        let is_fast = self.is_fast;
+        for &ei in &self.advance_buf {
+            self.entries[ei].advance();
+            let new_key = if self.entries[ei].is_valid() {
+                Some(self.entries[ei].peek_key())
+            } else {
+                None
+            };
+            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+                entry_cmp(&self.entries, &self.schema, is_fast, a, b).is_lt()
+            };
+            tree.advance(ei, new_key, &less);
         }
 
         self.find_next_non_ghost();
     }
 
-    fn find_next_non_ghost(&mut self) {
-        match &mut self.tree {
-            TreeKind::None => {
-                if self.entries.len() == 1 && self.entries[0].is_valid() {
-                    let w = self.entries[0].source.get_weight(self.entries[0].position);
-                    self.commit_row(0, w);
-                } else {
-                    self.valid = false;
-                }
-            }
-            TreeKind::Two => {
-                self.find_next_non_ghost_two();
-            }
-            TreeKind::Heap(_) => {
-                self.find_next_non_ghost_heap();
-            }
-        }
-    }
-
-    /// Two-pointer fast path for entries.len() == 2.  Sets self.advance_mask
-    /// indicating which entries should be bumped on the next advance() call;
-    /// does NOT advance entries on a non-ghost row (mirrors the heap path's
-    /// contract via tree.min_indices).  Ghost rows ARE advanced inline so the
-    /// caller never sees a zero-weight emit.
-    fn find_next_non_ghost_two(&mut self) {
-        loop {
-            let v0 = self.entries[0].is_valid();
-            let v1 = self.entries[1].is_valid();
-            match (v0, v1) {
-                (false, false) => {
-                    self.valid = false;
-                    self.advance_mask = 0;
-                    return;
-                }
-                (true, false) => {
-                    self.commit_two(0, MASK_LEFT);
-                    return;
-                }
-                (false, true) => {
-                    self.commit_two(1, MASK_RIGHT);
-                    return;
-                }
-                (true, true) => {
-                    let ka = self.entries[0].peek_key();
-                    let kb = self.entries[1].peek_key();
-                    if ka != kb {
-                        if ka < kb {
-                            self.commit_two(0, MASK_LEFT);
-                        } else {
-                            self.commit_two(1, MASK_RIGHT);
-                        }
-                        return;
-                    }
-                    // PKs equal — element identity also requires payload
-                    // equality (foundations.md §1).  PK-equal-payload-different
-                    // is two distinct rows in deterministic payload order.
-                    let ord = columnar::compare_rows_dispatch(
-                        &self.schema,
-                        &self.entries[0].source, self.entries[0].position,
-                        &self.entries[1].source, self.entries[1].position,
-                        self.is_fast,
-                    );
-                    match ord {
-                        Ordering::Less => {
-                            self.commit_two(0, MASK_LEFT);
-                            return;
-                        }
-                        Ordering::Greater => {
-                            self.commit_two(1, MASK_RIGHT);
-                            return;
-                        }
-                        Ordering::Equal => {
-                            // Tie group: sum weights, ghost-check.  Only here
-                            // does net-weight summation apply.
-                            let net = self.entries[0].weight() + self.entries[1].weight();
-                            if net != 0 {
-                                // Tied non-ghost — exemplar is entry 0,
-                                // advance both on next advance() call.
-                                self.commit_row(0, net);
-                                self.advance_mask = MASK_BOTH;
-                                return;
-                            }
-                            // Ghost: net weight zero.  Skip both and continue.
-                            self.entries[0].advance();
-                            self.entries[1].advance();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Two-pointer commit: copy entries[pick]'s stored weight as the emitted
-    /// weight and stash the advance bitmask.  The tied-non-ghost case calls
-    /// `commit_row` directly with the summed net weight instead.
-    #[inline]
-    fn commit_two(&mut self, pick: usize, mask: u8) {
-        let weight = self.entries[pick].source.get_weight(self.entries[pick].position);
-        self.commit_row(pick, weight);
-        self.advance_mask = mask;
-    }
-
     /// Copy the row at entries[idx] into the public cursor state with an
-    /// explicit emit weight (which can be a per-source weight or a summed
-    /// net weight, depending on the caller's path).  Shared by the
-    /// two-pointer and heap paths.
+    /// explicit emit weight (which can be a per-source weight from the
+    /// single-entry path or a summed net weight from the heap path).
     #[inline]
     fn commit_row(&mut self, idx: usize, weight: i64) {
         let e = &self.entries[idx];
@@ -585,9 +450,20 @@ impl ReadCursor {
         self.current_row = pos;
     }
 
-    fn find_next_non_ghost_heap(&mut self) {
-        let TreeKind::Heap(ref mut tree) = self.tree else {
-            unreachable!("dispatched from TreeKind::Heap arm")
+    fn find_next_non_ghost(&mut self) {
+        if self.entries.len() == 1 {
+            if self.entries[0].is_valid() {
+                let w = self.entries[0].source.get_weight(self.entries[0].position);
+                self.commit_row(0, w);
+            } else {
+                self.valid = false;
+            }
+            return;
+        }
+
+        let Some(tree) = self.tree.as_mut() else {
+            self.valid = false;
+            return;
         };
         let schema = &self.schema;
         let is_fast = self.is_fast;
@@ -1304,93 +1180,4 @@ mod tests {
         }
     }
 
-    /// Drain a cursor capturing the full per-row state both code paths must
-    /// agree on: PK, net weight, null word, and the i64 payload column.
-    fn drain_with_state(cursor: &mut ReadCursor) -> Vec<(u128, i64, u64, i64)> {
-        let mut out = Vec::new();
-        while cursor.valid {
-            let val_ptr = cursor.col_ptr(1, 8);
-            let val = if val_ptr.is_null() {
-                0
-            } else {
-                i64::from_le_bytes(unsafe { *(val_ptr as *const [u8; 8]) })
-            };
-            out.push((
-                cursor.current_key,
-                cursor.current_weight,
-                cursor.current_null_word,
-                val,
-            ));
-            cursor.advance();
-        }
-        out
-    }
-
-    /// Property test: the n=2 fast path (TreeKind::Two) must emit identical
-    /// rows to the heap path (TreeKind::Heap) for every input shape.  We
-    /// force the heap path by appending a sentinel-empty third entry; its
-    /// `is_valid()` is always false so it never participates in heap
-    /// operations but n>=3 selects TreeKind::Heap.
-    #[test]
-    fn test_n2_path_matches_heap_path() {
-        // (rows_a, rows_b) — both inputs assumed pre-sorted by (PK, payload).
-        let cases: &[(&[(u128, i64, i64)], &[(u128, i64, i64)])] = &[
-            // Distinct PKs interleaved.
-            (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20), (4, 1, 40)]),
-            // Tied (PK, payload) with non-zero net weight (weights sum).
-            (&[(5, 3, 50)], &[(5, 7, 50)]),
-            // Tied (PK, payload) summing to zero — ghost, should be skipped.
-            (&[(5, 1, 50), (10, 1, 100)], &[(5, -1, 50)]),
-            // PK-equal but payload-different on both sides — two distinct rows.
-            (&[(5, 1, 200)], &[(5, 1, 100)]),
-            // One-side exhaustion + remainder on the other.
-            (&[(1, 1, 10)], &[(2, 1, 20), (3, 1, 30), (4, 1, 40)]),
-            // Other-side exhaustion + remainder.
-            (&[(2, 1, 20), (3, 1, 30), (4, 1, 40)], &[(1, 1, 10)]),
-            // Mixed: distinct, tied non-zero, then ghost.
-            (
-                &[(1, 1, 10), (5, 1, 50), (10, 1, 100)],
-                &[(3, 1, 30), (5, 1, 50), (10, -1, 100)],
-            ),
-            // Both sides emit interleaved ghosts: every PK is a tied ghost.
-            (
-                &[(1, 1, 10), (2, 1, 20), (3, 1, 30)],
-                &[(1, -1, 10), (2, -1, 20), (3, -1, 30)],
-            ),
-            // A single side empty.
-            (&[], &[(1, 1, 10), (2, 1, 20)]),
-            (&[(1, 1, 10), (2, 1, 20)], &[]),
-        ];
-
-        for (i, (a, b)) in cases.iter().enumerate() {
-            // Skip cases where both sides are empty (would produce TreeKind::None).
-            if a.is_empty() && b.is_empty() {
-                continue;
-            }
-
-            // n=2 path: include even empty batches so entries.len() == 2.
-            let two_entries: Vec<ReadCursorEntry> = vec![
-                ReadCursorEntry::new_batch(make_batch(a)),
-                ReadCursorEntry::new_batch(make_batch(b)),
-            ];
-            let mut cursor_two = ReadCursor::new(two_entries, make_schema_i64());
-            let drained_two = drain_with_state(&mut cursor_two);
-
-            // Heap path: same two batches plus a sentinel-empty third entry
-            // (is_valid() always false → never enters min_indices).
-            let three_entries: Vec<ReadCursorEntry> = vec![
-                ReadCursorEntry::new_batch(make_batch(a)),
-                ReadCursorEntry::new_batch(make_batch(b)),
-                ReadCursorEntry::new_batch(make_batch(&[])),
-            ];
-            let mut cursor_heap = ReadCursor::new(three_entries, make_schema_i64());
-            let drained_heap = drain_with_state(&mut cursor_heap);
-
-            assert_eq!(
-                drained_two, drained_heap,
-                "case {} mismatch:\n  two={:?}\n  heap={:?}",
-                i, drained_two, drained_heap,
-            );
-        }
-    }
 }
