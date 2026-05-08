@@ -1,8 +1,10 @@
 //! Linear operators: op_filter, op_map, op_negate, op_union.
 //! Also includes PK promotion for reindex (GROUP BY).
 
+use std::cmp::Ordering;
+
 use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
 
@@ -211,6 +213,25 @@ fn op_union_merge(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
+    if schema_is_int_nonnull(schema) {
+        op_union_merge_inner(batch_a, batch_b, schema,
+            |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi))
+    } else {
+        op_union_merge_inner(batch_a, batch_b, schema,
+            |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi))
+    }
+}
+
+#[inline]
+fn op_union_merge_inner<RowCmp>(
+    batch_a: &Batch,
+    batch_b: &Batch,
+    schema: &SchemaDescriptor,
+    row_cmp: RowCmp,
+) -> Batch
+where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+{
     let n_a = batch_a.count;
     let n_b = batch_b.count;
     let mut output = Batch::with_schema(*schema, n_a + n_b);
@@ -278,13 +299,13 @@ fn op_union_merge(
             // `append_batch` has fixed per-call overhead from offset math.
             let (mut ia, mut jb) = (i, j);
             if ia < i_end && jb < j_end {
-                let mut prev_a = crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
-                    != std::cmp::Ordering::Greater;
+                let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb)
+                    != Ordering::Greater;
                 let mut run_start = if prev_a { ia } else { jb };
                 if prev_a { ia += 1; } else { jb += 1; }
                 while ia < i_end && jb < j_end {
-                    let pick_a = crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
-                        != std::cmp::Ordering::Greater;
+                    let pick_a = row_cmp(schema, &mb_a, ia, &mb_b, jb)
+                        != Ordering::Greater;
                     if pick_a != prev_a {
                         if prev_a {
                             output.append_batch(batch_a, run_start, ia);

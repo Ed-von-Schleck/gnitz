@@ -139,6 +139,19 @@ pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
     Ordering::Equal
 }
 
+// ---------------------------------------------------------------------------
+// Sort helpers
+// ---------------------------------------------------------------------------
+
+/// A `(pk, row-index)` pair used by sorting routines in merge and reduce.
+/// Keeps the PK co-located with its index so the comparator reads from the
+/// element being positioned rather than a separate array.
+#[derive(Copy, Clone)]
+pub(crate) struct SortEntry {
+    pub(crate) pk: u128,
+    pub(crate) idx: u32,
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{self, ColumnarSource};
+use super::columnar::{self, ColumnarSource, SortEntry};
 use super::batch::FIXED_REGION_BYTES;
 use crate::schema::{BlobCache, SchemaDescriptor, type_code, MAX_COLUMNS};
 use super::heap::LoserTree;
@@ -507,16 +507,6 @@ fn merge_batches_inner<RowCmp>(
 /// Sort a single batch by (PK, payload) and consolidate: sum weights for
 /// identical (PK, payload) rows, drop ghosts (net weight == 0).
 ///
-/// Uses Rust's stable sort on an index array — no tournament tree needed.
-/// Key-pointer entry: the 16-byte PK travels with the row index so the sort
-/// comparator reads the key from the element being positioned, not from a
-/// separate array at a random offset.
-#[derive(Copy, Clone)]
-struct SortEntry {
-    pk: u128,
-    idx: u32,
-}
-
 pub fn sort_and_consolidate(
     batch: &MemBatch,
     schema: &SchemaDescriptor,

@@ -1,9 +1,12 @@
 //! Reduce operator: accumulator, group key, argsort, AVI, op_reduce, op_gather_reduce.
 
+use std::cmp::Ordering;
+
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::storage::{
     Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor,
     scatter_copy, write_to_batch,
+    compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
 };
 
 /// `clear()` does not re-zero the data buffer, so the scatter variants used
@@ -563,29 +566,38 @@ fn argsort_delta(
 ) -> Vec<u32> {
     let mb = batch.as_mem_batch();
     let n = batch.count;
-    let mut indices: Vec<u32> = (0..n as u32).collect();
     if n <= 1 {
-        return indices;
+        return (0..n as u32).collect();
     }
 
-    // Fast path: single I64 column
     let pki = schema.pk_index as usize;
     if group_by_cols.len() == 1 {
         let ci = group_by_cols[0] as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-        if tc == TypeCode::I64 {
-            let pi = payload_idx(ci, pki);
-            let keys: Vec<i64> = (0..n)
-                .map(|i| {
-                    let ptr = mb.get_col_ptr(i, pi, 8);
-                    i64::from_le_bytes(ptr.try_into().unwrap())
-                })
-                .collect();
-            indices.sort_unstable_by_key(|&i| keys[i as usize]);
-            return indices;
+        let pi = payload_idx(ci, pki);
+        macro_rules! packed_sort {
+            ($T:ty, $stride:expr) => {{
+                let keys: Vec<$T> = (0..n)
+                    .map(|i| {
+                        let ptr = mb.get_col_ptr(i, pi, $stride);
+                        <$T>::from_le_bytes(ptr.try_into().unwrap())
+                    })
+                    .collect();
+                let mut indices: Vec<u32> = (0..n as u32).collect();
+                indices.sort_unstable_by_key(|&i| keys[i as usize]);
+                return indices;
+            }};
+        }
+        match tc {
+            TypeCode::I64 => packed_sort!(i64, 8),
+            TypeCode::U64 => packed_sort!(u64, 8),
+            TypeCode::I32 => packed_sort!(i32, 4),
+            TypeCode::U32 => packed_sort!(u32, 4),
+            _ => {}
         }
     }
 
+    let mut indices: Vec<u32> = (0..n as u32).collect();
     let (sort_descs, len) = build_sort_descs(schema, group_by_cols);
     let descs = &sort_descs[..len];
     indices.sort_unstable_by(|&a, &b| {
@@ -603,18 +615,23 @@ fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     }
 
     let mb = batch.as_mem_batch();
+
     let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
     let mut indices: Vec<u32> = (0..n as u32).collect();
-    indices.sort_unstable_by(|&a, &b| {
-        let ai = a as usize;
-        let bi = b as usize;
-        match pks[ai].cmp(&pks[bi]) {
-            std::cmp::Ordering::Equal => {
-                crate::storage::compare_rows(schema, &mb, ai, &mb, bi)
-            }
+
+    // Standard-library sort is extremely sensitive to comparator inlining;
+    // the fast-path branch is hoisted out of the per-comparison closure.
+    if schema_is_int_nonnull(schema) {
+        indices.sort_unstable_by(|&a, &b| match pks[a as usize].cmp(&pks[b as usize]) {
+            Ordering::Equal => compare_rows_int_nonnull(schema, &mb, a as usize, &mb, b as usize),
             ord => ord,
-        }
-    });
+        });
+    } else {
+        indices.sort_unstable_by(|&a, &b| match pks[a as usize].cmp(&pks[b as usize]) {
+            Ordering::Equal => compare_rows(schema, &mb, a as usize, &mb, b as usize),
+            ord => ord,
+        });
+    }
 
     let blob_cap = mb.blob.len().max(1);
     let mut output = write_to_batch(schema, n, blob_cap, |writer| {

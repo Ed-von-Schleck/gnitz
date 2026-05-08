@@ -1,8 +1,13 @@
 //! Join operators: anti-join, semi-join, inner join, outer join (delta-trace + delta-delta).
 
+use std::cmp::Ordering;
+
 use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy};
+use crate::storage::{
+    write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
+    compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
+};
 
 use super::util::{write_string_from_batch, write_string_from_raw};
 
@@ -546,11 +551,31 @@ fn filter_join_dd_with_payload(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
-    let npc = schema.num_columns as usize - 1;
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
     let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
     let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
+
+    if schema_is_int_nonnull(schema) {
+        filter_join_dd_with_payload_inner(ca, cb, schema,
+            |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi))
+    } else {
+        filter_join_dd_with_payload_inner(ca, cb, schema,
+            |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi))
+    }
+}
+
+#[inline]
+fn filter_join_dd_with_payload_inner<RowCmp>(
+    ca: &Batch,
+    cb: &Batch,
+    schema: &SchemaDescriptor,
+    row_cmp: RowCmp,
+) -> Batch
+where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+{
+    let npc = schema.num_columns as usize - 1;
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -588,8 +613,7 @@ fn filter_join_dd_with_payload(
             let mut matched = false;
             for scan_b in b_group_start..b_group_end {
                 if cb.get_weight(scan_b) > 0
-                    && crate::storage::compare_rows(schema, &mb_a, idx_a, &mb_b, scan_b)
-                        == std::cmp::Ordering::Equal
+                    && row_cmp(schema, &mb_a, idx_a, &mb_b, scan_b) == Ordering::Equal
                 {
                     matched = true;
                     break;
