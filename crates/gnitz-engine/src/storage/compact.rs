@@ -4,7 +4,7 @@ use std::ffi::CStr;
 
 use super::columnar;
 use super::error::StorageError;
-use super::heap::MergeHeap;
+use super::heap::LoserTree;
 use super::batch::Batch;
 use super::merge::BlobCacheGuard;
 use crate::schema::SchemaDescriptor;
@@ -135,9 +135,9 @@ fn open_and_merge(
     Ok(())
 }
 
-/// Inner cursor + heap merge body, monomorphised on the row comparator so
-/// LLVM can inline the fast/generic body across `MergeHeap::build`'s N/2
-/// initial sift_downs and the per-row advance loop alike.
+/// Inner cursor + tree merge body, monomorphised on the row comparator so
+/// LLVM can inline the fast/generic body across `LoserTree::build`'s
+/// initial bottom-up matches and the per-row advance loop alike.
 #[inline]
 fn open_and_merge_inner<RowCmp>(
     shards: &[MappedShard],
@@ -147,12 +147,12 @@ fn open_and_merge_inner<RowCmp>(
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
 {
-    // HeapNode comparator is rebuilt at each heap op so its capture of
+    // HeapNode comparator is rebuilt at each tree op so its capture of
     // `cursors` stays scoped to a single call, leaving `cursors` free to be
     // mutated in between (a factory closure couldn't express the lifetime).
     let mut tree = {
         let cursors_ref: &[ShardCursor] = &cursors;
-        MergeHeap::build(
+        LoserTree::build(
             cursors_ref.len(),
             |i| {
                 if cursors_ref[i].is_valid() {

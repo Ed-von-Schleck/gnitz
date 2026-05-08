@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
-use super::heap::MergeHeap;
+use super::heap::LoserTree;
 use super::merge::{ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
@@ -327,12 +327,12 @@ impl ReadCursorEntry {
 // ---------------------------------------------------------------------------
 
 /// Three-way dispatch on source count, replacing the previous
-/// `tree: Option<MergeHeap>` + parallel `entries.len() == 1` checks.
+/// `tree: Option<LoserTree>` + parallel `entries.len() == 1` checks.
 /// `Empty`/`Single`/`Multi` are exhaustive so each call site dispatches once.
 enum SourceMode {
     Empty,
     Single,
-    Multi(MergeHeap),
+    Multi(LoserTree),
 }
 
 pub struct ReadCursor {
@@ -363,7 +363,7 @@ impl ReadCursor {
         entries: &[ReadCursorEntry],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
-    ) -> MergeHeap {
+    ) -> LoserTree {
         let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
             if a.key != b.key {
                 return a.key < b.key;
@@ -374,7 +374,7 @@ impl ReadCursor {
                 &entries[b.source_idx].source, entries[b.source_idx].position,
             ) == Ordering::Less
         };
-        MergeHeap::build(
+        LoserTree::build(
             entries.len(),
             |i| {
                 if entries[i].is_valid() {
@@ -391,7 +391,7 @@ impl ReadCursor {
         entries: &[ReadCursorEntry],
         schema: &SchemaDescriptor,
         is_fast: bool,
-    ) -> MergeHeap {
+    ) -> LoserTree {
         // Wrap as a non-capturing closure: a direct fn-item reference would
         // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
         if is_fast {

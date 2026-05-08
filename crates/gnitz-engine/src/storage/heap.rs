@@ -1,23 +1,26 @@
-//! Generic min-heap for N-way merge operations.
+//! N-way min-merge tournament: a loser tree.
 //!
 //! Two operations on the root drive every caller:
-//! - `replace_top_key(new_key, less)` — overwrite `heap[0].key` and sift
-//!   down. The fast path used by every emit; `new_key >= old_key` always
-//!   (sources are sorted, advance produces ≥ keys), so sift-up is unreachable.
-//! - `pop_top(less)` — remove `heap[0]`. swap_remove + sift down.
+//! - `replace_top_key(new_key, less)` — overwrite the champion's key and
+//!   walk up. The fast path used by every emit on a still-valid source.
+//! - `pop_top(less)` — remove the champion when its source exhausts.
 //!
-//! `sift_down_hole` is the half-swap form: extract the moving node into a
-//! local, shift the smaller child up into the hole one level at a time
-//! (one write per level), then place the extracted node at the final hole
-//! position. Vs full-swap sift down (three writes per level) this is the
-//! constant-factor win that motivates the custom heap; std `BinaryHeap`
-//! also uses the hole pattern but exposes neither replace-top nor a
-//! min-heap variant without `Reverse` wrappers that obstruct inlining.
+//! Each internal node holds the LOSER of the most recent match between
+//! its two subtrees' current champions; `tree[0]` holds the overall
+//! champion. A walk-up after a leaf change pays ONE compare per level
+//! (vs two for a binary heap's sift-down: pick smaller child, then test
+//! against parent). For typical k=2..16 this halves the comparator cost
+//! on the hot merge path; the inlined payload tie-break inside `less`
+//! sees the same halving.
+//!
+//! Leaves are NOT stored: per-source state lives in the caller's cursor
+//! table, indexed by `source_idx`. Source `i` is pinned to leaf
+//! position `tree.len() + i`, so the walk-up start is always derivable
+//! from `tree[0].source_idx`.
 //!
 //! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
-//! tied rows by repeatedly popping/replacing the root, and merge_batches
-//! and compact peel the root one at a time. The slot-tracking that an
-//! entry-indexed advance would need is therefore pure overhead and is gone.
+//! tied rows by repeatedly popping/replacing the root; merge_batches
+//! and compact peel the root one at a time.
 
 #[derive(Clone, Copy)]
 pub struct HeapNode {
@@ -25,102 +28,171 @@ pub struct HeapNode {
     pub source_idx: usize,
 }
 
-pub struct MergeHeap {
-    pub heap: Vec<HeapNode>,
+/// `usize::MAX` is unambiguously distinct from any real `source_idx`
+/// (bounded by the caller's source-array length). The `key` field is
+/// unused for sentinels — collisions with a real `u128::MAX` PK are
+/// avoided by discriminating on `source_idx` alone.
+const SENTINEL: usize = usize::MAX;
+
+const SENTINEL_NODE: HeapNode = HeapNode { key: 0, source_idx: SENTINEL };
+
+pub struct LoserTree {
+    /// `tree[0]` is the overall champion. `tree[1..tree.len()]` hold the
+    /// loser of each internal node's most recent match. A loser of
+    /// `SENTINEL` means the subtree has no real player on one side
+    /// (padding leaf or exhausted source). `tree.len()` is always
+    /// `n.next_power_of_two().max(1)` and never resizes after build, so
+    /// the walk-up arithmetic uses it directly as `n_pad`.
+    tree: Vec<HeapNode>,
 }
 
-impl MergeHeap {
-    /// Build a heap from `n` entries. `key_fn(i)` returns `Some(pk)` for
-    /// valid entries and `None` for invalid/exhausted ones.
+impl LoserTree {
+    /// Bottom-up tournament build. O(n) compares, with a transient
+    /// `winners` array of `2 * n_pad` HeapNodes that is dropped before
+    /// return. Build cost is one-time and ≪1µs at typical k.
+    ///
+    /// A pure sequential walk-up build (no auxiliary array) is tempting
+    /// for code-sharing with the hot path, but it cannot distinguish
+    /// "sentinel cur travelling up because the padding leaf produced
+    /// nothing" from "sentinel cur travelling up because a real source
+    /// just became a placeholder lower in the tree": both look identical
+    /// to the walk yet require opposite handling at higher internal
+    /// nodes. The bottom-up scheme makes the subtree-winner explicit
+    /// and avoids the ambiguity.
     pub fn build(
         n: usize,
         key_fn: impl Fn(usize) -> Option<u128>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) -> Self {
-        let mut heap = Vec::with_capacity(n);
+        let n_pad = n.next_power_of_two().max(1);
+        let mut tree = vec![SENTINEL_NODE; n_pad];
+
+        // winners[idx] holds the current champion of the subtree rooted
+        // at `idx`. Leaves live at indices `n_pad..2*n_pad`; for `i < n`
+        // with a key, leaf `n_pad + i` carries the source's value.
+        let mut winners = vec![SENTINEL_NODE; 2 * n_pad];
         for i in 0..n {
-            if let Some(k) = key_fn(i) {
-                heap.push(HeapNode { key: k, source_idx: i });
+            if let Some(key) = key_fn(i) {
+                winners[n_pad + i] = HeapNode { key, source_idx: i };
             }
         }
-        let size = heap.len();
-        for i in (0..size / 2).rev() {
-            sift_down_hole(&mut heap, i, &less);
+
+        // Bottom-up: each internal node plays the match between its two
+        // subtree winners. Loser → tree[idx]; winner → winners[idx],
+        // propagated up to the next match.
+        for idx in (1..n_pad).rev() {
+            let a = winners[2 * idx];
+            let b = winners[2 * idx + 1];
+            let (winner, loser) = match (a.source_idx == SENTINEL, b.source_idx == SENTINEL) {
+                (true, _) => (b, a),
+                (_, true) => (a, b),
+                (false, false) => {
+                    if less(&a, &b) { (a, b) } else { (b, a) }
+                }
+            };
+            winners[idx] = winner;
+            tree[idx] = loser;
         }
-        MergeHeap { heap }
+
+        // For n_pad == 1 (n ∈ {0, 1}), the loop above is empty and
+        // winners[1] is the leaf value (or sentinel for n=0).
+        tree[0] = winners[1];
+        Self { tree }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.tree[0].source_idx == SENTINEL
     }
 
     #[inline]
     pub fn peek(&self) -> &HeapNode {
-        &self.heap[0]
+        &self.tree[0]
     }
 
-    /// Overwrite `heap[0].key` and sift the root down.
-    /// Caller must guarantee `new_key >= old_key`.
+    /// Steady-state walk-up. PRECONDITION: `cur.source_idx != SENTINEL`
+    /// OR `idx == 0` (in which case the loop is a no-op and `cur` is
+    /// returned unchanged). The pop_top phase-1/phase-2 split relies on
+    /// the latter case to handle a fully-drained tree: phase 1 leaves
+    /// `idx == 0` with a sentinel cur, and walk_up safely returns it.
+    /// Any other sentinel-cur entry would invoke `less(loser, cur)`,
+    /// which (in two of three callsites) indexes `cursors[cur.source_idx]`
+    /// and panics on `usize::MAX`.
+    ///
+    /// `inline(always)` so the closure flattens into the public-API
+    /// callers; a hot path with one cmp per level cannot afford a call.
+    #[inline(always)]
+    fn walk_up(
+        &mut self,
+        mut cur: HeapNode,
+        mut idx: usize,
+        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+    ) -> HeapNode {
+        while idx > 0 {
+            // SAFETY: idx < tree.len() on entry from every caller
+            // (`(tree.len() + s) >> 1` with `s < n ≤ tree.len()`,
+            // max = tree.len() - 1) and `idx >>= 1` only decreases it.
+            let loser = unsafe { self.tree.get_unchecked_mut(idx) };
+            if loser.source_idx != SENTINEL && less(loser, &cur) {
+                std::mem::swap(&mut cur, loser);
+            }
+            idx >>= 1;
+        }
+        cur
+    }
+
+    /// Overwrite the champion's key and walk up. The new key may be
+    /// larger or smaller than the prior one; the loser tree handles
+    /// either correctly (no monotonicity precondition).
     #[inline]
     pub fn replace_top_key(
         &mut self,
         new_key: u128,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        debug_assert!(new_key >= self.heap[0].key, "replace_top_key: new < old");
-        self.heap[0].key = new_key;
-        sift_down_hole(&mut self.heap, 0, &less);
+        debug_assert!(!self.is_empty(), "replace_top_key on empty tree");
+        let source_idx = self.tree[0].source_idx;
+        let cur = HeapNode { key: new_key, source_idx };
+        let idx = (self.tree.len() + source_idx) >> 1;
+        self.tree[0] = self.walk_up(cur, idx, &less);
     }
 
-    /// Remove `heap[0]`. After return, the new root (if any) is the next-min.
+    /// Remove the champion (its source is exhausted). After return, the
+    /// new champion (if any) is at `tree[0]`; otherwise `is_empty()`
+    /// returns true.
     #[inline]
     pub fn pop_top(
         &mut self,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        debug_assert!(!self.heap.is_empty());
-        let last = self.heap.len() - 1;
-        if last == 0 {
-            self.heap.pop();
-            return;
-        }
-        self.heap[0] = self.heap[last];
-        self.heap.pop();
-        sift_down_hole(&mut self.heap, 0, &less);
-    }
-}
+        debug_assert!(!self.is_empty(), "pop_top on empty tree");
+        let source_idx = self.tree[0].source_idx;
+        let mut cur = SENTINEL_NODE;
+        let mut idx = (self.tree.len() + source_idx) >> 1;
 
-/// Hole-pattern sift down. Extract `heap[hole]` into `saved`, shift the
-/// smaller child up one level at a time (one write per level), then place
-/// `saved` at the final hole position.
-#[inline]
-fn sift_down_hole(
-    heap: &mut [HeapNode],
-    mut hole: usize,
-    less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-) {
-    let len = heap.len();
-    debug_assert!(hole < len);
-    let saved = heap[hole];
-    loop {
-        let left = 2 * hole + 1;
-        if left >= len {
-            break;
+        // Phase 1: fast-forward sentinel cur up the tree, skipping any
+        // sentinel losers (sentinel-vs-sentinel is a no-op compare). At
+        // the first real loser, swap (cur becomes real, slot becomes
+        // sentinel) and exit so phase 2 runs walk_up with a real cur.
+        //
+        // Mandatory, not an optimisation: walk_up requires a real cur.
+        while idx > 0 {
+            // SAFETY: same bound as walk_up — idx is < n_pad on entry
+            // and only decreases via `idx >>= 1`.
+            let loser = unsafe { self.tree.get_unchecked_mut(idx) };
+            if loser.source_idx != SENTINEL {
+                std::mem::swap(&mut cur, loser);
+                idx >>= 1;
+                break;
+            }
+            idx >>= 1;
         }
-        let right = left + 1;
-        let child = if right < len && less(&heap[right], &heap[left]) {
-            right
-        } else {
-            left
-        };
-        if !less(&heap[child], &saved) {
-            break;
-        }
-        heap[hole] = heap[child];
-        hole = child;
+
+        // Phase 2: shared walk-up. If phase 1 found no real loser, idx
+        // is 0 and walk_up is a no-op returning the sentinel; tree[0]
+        // becomes sentinel and is_empty returns true.
+        self.tree[0] = self.walk_up(cur, idx, &less);
     }
-    heap[hole] = saved;
 }
 
 #[cfg(test)]
@@ -128,191 +200,178 @@ mod tests {
     use super::*;
 
     fn less(a: &HeapNode, b: &HeapNode) -> bool {
-        a.key < b.key
-    }
-
-    fn build(keys: &[Option<u128>]) -> MergeHeap {
-        MergeHeap::build(keys.len(), |i| keys[i], less)
-    }
-
-    /// Verify the binary-heap invariant: every parent is `<=` its children
-    /// under `less`. (Equality is allowed.)
-    fn assert_heap_invariant(h: &MergeHeap) {
-        for i in 1..h.heap.len() {
-            let parent = (i - 1) / 2;
-            assert!(
-                !less(&h.heap[i], &h.heap[parent]),
-                "heap invariant violated at index {i}: child key {} < parent key {} (parent idx {parent})",
-                h.heap[i].key,
-                h.heap[parent].key,
-            );
+        if a.key != b.key {
+            return a.key < b.key;
         }
+        a.source_idx < b.source_idx
+    }
+
+    fn build(keys: &[Option<u128>]) -> LoserTree {
+        LoserTree::build(keys.len(), |i| keys[i], less)
+    }
+
+    fn drain_keys(mut t: LoserTree) -> Vec<u128> {
+        let mut out = Vec::new();
+        while !t.is_empty() {
+            out.push(t.peek().key);
+            t.pop_top(less);
+        }
+        out
     }
 
     // --- build ---
 
     #[test]
     fn build_empty() {
-        let h = build(&[]);
-        assert!(h.is_empty());
+        let t = build(&[]);
+        assert!(t.is_empty());
     }
 
     #[test]
     fn build_single() {
-        let h = build(&[Some(42)]);
-        assert!(!h.is_empty());
-        assert_eq!(h.heap.len(), 1);
-        assert_eq!(h.peek().key, 42);
-        assert_eq!(h.peek().source_idx, 0);
+        let t = build(&[Some(42)]);
+        assert!(!t.is_empty());
+        assert_eq!(t.peek().key, 42);
+        assert_eq!(t.peek().source_idx, 0);
     }
 
     #[test]
     fn build_all_exhausted() {
-        let h = build(&[None, None, None]);
-        assert!(h.is_empty());
+        let t = build(&[None, None, None]);
+        assert!(t.is_empty());
     }
 
     #[test]
     fn build_some_exhausted() {
-        // Entries: 0→30, 1→None, 2→10.  Only 0 and 2 are valid.
-        let h = build(&[Some(30), None, Some(10)]);
-        assert_eq!(h.heap.len(), 2);
-        assert_eq!(h.peek().key, 10);
-        assert_eq!(h.peek().source_idx, 2);
-        assert_heap_invariant(&h);
+        // Entries: 0→30, 1→None, 2→10. Only 0 and 2 are valid.
+        let t = build(&[Some(30), None, Some(10)]);
+        assert_eq!(t.peek().key, 10);
+        assert_eq!(t.peek().source_idx, 2);
+        assert_eq!(drain_keys(t), vec![10, 30]);
     }
 
     #[test]
     fn build_min_at_root() {
-        let h = build(&[Some(50), Some(40), Some(30), Some(20), Some(10)]);
-        assert_eq!(h.peek().key, 10);
-        assert_eq!(h.peek().source_idx, 4);
-        assert_heap_invariant(&h);
+        let t = build(&[Some(50), Some(40), Some(30), Some(20), Some(10)]);
+        assert_eq!(t.peek().key, 10);
+        assert_eq!(t.peek().source_idx, 4);
+    }
+
+    /// Regression: a sequential walk-up build mishandles this layout —
+    /// src2 (the actual minimum) sits in the right subtree as a
+    /// placeholder while a stale left-subtree placeholder gets promoted
+    /// to the root. Bottom-up build sets it correctly.
+    #[test]
+    fn build_min_in_right_subtree_padded() {
+        let t = build(&[Some(30), Some(40), Some(10)]);
+        assert_eq!(t.peek().key, 10);
+        assert_eq!(t.peek().source_idx, 2);
+        assert_eq!(drain_keys(t), vec![10, 30, 40]);
     }
 
     // --- replace_top_key ---
 
     #[test]
     fn replace_top_sinks_below_sibling() {
-        // Heap built from keys 10, 20, 30; entry 0 at root (key=10).
-        // Replace root key with 25 — should sink below 20 but stay above 30.
-        let mut h = build(&[Some(10), Some(20), Some(30)]);
-        assert_eq!(h.peek().source_idx, 0);
+        let mut t = build(&[Some(10), Some(20), Some(30)]);
+        assert_eq!(t.peek().source_idx, 0);
 
-        h.replace_top_key(25, less);
+        t.replace_top_key(25, less);
 
-        assert_eq!(h.peek().key, 20);
-        assert_eq!(h.peek().source_idx, 1);
-        assert_heap_invariant(&h);
-        // The advanced source's source_idx is preserved — it's now somewhere
-        // below the root, but still source_idx=0.
-        assert!(h.heap.iter().any(|n| n.source_idx == 0 && n.key == 25));
+        assert_eq!(t.peek().key, 20);
+        assert_eq!(t.peek().source_idx, 1);
     }
 
     #[test]
     fn replace_top_to_max_sinks_to_leaf() {
-        let mut h = build(&[Some(1), Some(2), Some(3)]);
-        h.replace_top_key(1000, less);
-        assert_eq!(h.peek().key, 2);
-        assert_eq!(h.peek().source_idx, 1);
-        assert_heap_invariant(&h);
+        let mut t = build(&[Some(1), Some(2), Some(3)]);
+        t.replace_top_key(1000, less);
+        assert_eq!(t.peek().key, 2);
+        assert_eq!(t.peek().source_idx, 1);
+        assert_eq!(drain_keys(t), vec![2, 3, 1000]);
     }
 
     #[test]
     fn replace_top_already_min_stays_root() {
-        let mut h = build(&[Some(1), Some(5), Some(10)]);
-        h.replace_top_key(3, less);
-        assert_eq!(h.peek().key, 3);
-        assert_eq!(h.peek().source_idx, 0);
-        assert_heap_invariant(&h);
+        let mut t = build(&[Some(1), Some(5), Some(10)]);
+        t.replace_top_key(3, less);
+        assert_eq!(t.peek().key, 3);
+        assert_eq!(t.peek().source_idx, 0);
     }
 
     // --- pop_top ---
 
     #[test]
     fn pop_top_removes_root() {
-        let mut h = build(&[Some(10), Some(20), Some(30)]);
-        h.pop_top(less);
-
-        assert_eq!(h.heap.len(), 2);
-        assert_eq!(h.peek().key, 20);
-        assert_heap_invariant(&h);
+        let mut t = build(&[Some(10), Some(20), Some(30)]);
+        t.pop_top(less);
+        assert_eq!(t.peek().key, 20);
+        assert_eq!(drain_keys(t), vec![20, 30]);
     }
 
     #[test]
     fn pop_top_single_entry_empties() {
-        let mut h = build(&[Some(42)]);
-        h.pop_top(less);
-        assert!(h.is_empty());
+        let mut t = build(&[Some(42)]);
+        t.pop_top(less);
+        assert!(t.is_empty());
     }
 
     #[test]
     fn pop_top_drains_in_sorted_order() {
-        let mut h = build(&[Some(40), Some(10), Some(30), Some(20)]);
-        let mut prev_min = 0u128;
-        let mut n = 4;
-        while !h.is_empty() {
-            let k = h.peek().key;
-            assert!(k >= prev_min, "drain order violated: {k} < {prev_min}");
-            prev_min = k;
-            h.pop_top(less);
-            n -= 1;
-            assert_eq!(h.heap.len(), n);
-            assert_heap_invariant(&h);
-        }
+        let t = build(&[Some(40), Some(10), Some(30), Some(20)]);
+        assert_eq!(drain_keys(t), vec![10, 20, 30, 40]);
     }
 
-    // --- mixed ops: replace, pop, replace ---
+    /// pop_top phase-1 must walk past multiple sentinel losers up the
+    /// tree before finding a real one. With k=8 and only sources 0 and 5
+    /// real, popping src 0 forces phase 1 to traverse two adjacent
+    /// sentinel internal nodes before hitting the real loser at the
+    /// next subtree boundary.
+    #[test]
+    fn pop_top_walks_past_sentinel_losers() {
+        let mut t = build(&[Some(10), None, None, None, None, Some(99), None, None]);
+        assert_eq!(t.peek().key, 10);
+        assert_eq!(t.peek().source_idx, 0);
+        t.pop_top(less);
+        assert_eq!(t.peek().key, 99);
+        assert_eq!(t.peek().source_idx, 5);
+        t.pop_top(less);
+        assert!(t.is_empty());
+    }
+
+    // --- mixed ops ---
 
     #[test]
-    fn mixed_ops_preserve_invariant() {
-        let mut h = build(&[Some(5), Some(15), Some(25), Some(35), Some(45)]);
-        // simulate an N-way merge over 5 sorted streams
-        // step 1: root=5 (src 0), advance to 50
-        h.replace_top_key(50, less);
-        assert_heap_invariant(&h);
-        assert_eq!(h.peek().key, 15);
-        // step 2: root=15 (src 1), advance to 16
-        h.replace_top_key(16, less);
-        assert_heap_invariant(&h);
-        assert_eq!(h.peek().key, 16);
-        // step 3: root=16, exhaust
-        h.pop_top(less);
-        assert_heap_invariant(&h);
-        assert_eq!(h.peek().key, 25);
-        // step 4: drain
-        let mut prev = 0u128;
-        while !h.is_empty() {
-            let k = h.peek().key;
-            assert!(k >= prev);
-            prev = k;
-            h.pop_top(less);
-            assert_heap_invariant(&h);
-        }
+    fn mixed_ops_drain_sorted() {
+        let mut t = build(&[Some(5), Some(15), Some(25), Some(35), Some(45)]);
+        // src 0 advances: 5 → 50.
+        t.replace_top_key(50, less);
+        assert_eq!(t.peek().key, 15);
+        // src 1 advances: 15 → 16.
+        t.replace_top_key(16, less);
+        assert_eq!(t.peek().key, 16);
+        // src 1 exhausts.
+        t.pop_top(less);
+        assert_eq!(t.peek().key, 25);
+        // Drain.
+        assert_eq!(drain_keys(t), vec![25, 35, 45, 50]);
     }
 
-    /// Build a heap from a sequence of keys, then drain it, simulating
-    /// a concurrent k-way merge by repeatedly popping the root. Verify
-    /// the emitted key sequence is non-decreasing (the heap-min property).
+    /// Build then drain: emitted sequence is the sorted input.
     #[test]
     fn drain_emits_sorted() {
         let keys = [97u128, 12, 53, 88, 1, 44, 73, 25, 60, 32, 18, 91];
-        let mut h = MergeHeap::build(keys.len(), |i| Some(keys[i]), less);
+        let t = LoserTree::build(keys.len(), |i| Some(keys[i]), less);
 
-        let mut emitted = Vec::with_capacity(keys.len());
-        while !h.is_empty() {
-            emitted.push(h.peek().key);
-            h.pop_top(less);
-        }
         let mut sorted = keys.to_vec();
         sorted.sort();
-        assert_eq!(emitted, sorted);
+        assert_eq!(drain_keys(t), sorted);
     }
 
-    /// Simulate the read-cursor pattern: many sources, each contributing a
-    /// sorted run; emit by repeatedly replacing root with the next key from
-    /// the winning source and popping when a source exhausts. Output must
-    /// equal the merged-and-sorted concatenation.
+    /// Simulate the read-cursor pattern: many sources, each contributing
+    /// a sorted run; emit by repeatedly replacing root with the next key
+    /// from the winning source and popping when a source exhausts. Output
+    /// must equal the merged-and-sorted concatenation.
     #[test]
     fn k_way_merge_against_reference() {
         let runs: Vec<Vec<u128>> = vec![
@@ -323,27 +382,111 @@ mod tests {
             vec![0, 100, 200],
         ];
         let mut positions = vec![0usize; runs.len()];
-        let mut h = MergeHeap::build(
+        let mut t = LoserTree::build(
             runs.len(),
             |i| runs[i].first().copied(),
             less,
         );
 
         let mut emitted = Vec::new();
-        while !h.is_empty() {
-            let src = h.peek().source_idx;
-            let key = h.peek().key;
-            emitted.push(key);
+        while !t.is_empty() {
+            let src = t.peek().source_idx;
+            emitted.push(t.peek().key);
             positions[src] += 1;
             if positions[src] < runs[src].len() {
-                h.replace_top_key(runs[src][positions[src]], less);
+                t.replace_top_key(runs[src][positions[src]], less);
             } else {
-                h.pop_top(less);
+                t.pop_top(less);
             }
         }
 
         let mut expected: Vec<u128> = runs.iter().flatten().copied().collect();
         expected.sort();
         assert_eq!(emitted, expected);
+    }
+
+    // --- property test: random k-way merges vs sorted reference ---
+    //
+    // Tiny xorshift64* — no rand crate dep, deterministic across hosts.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self { Self(seed | 1) }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn gen_u128(&mut self) -> u128 {
+            ((self.next_u64() as u128) << 64) | (self.next_u64() as u128)
+        }
+        fn gen_range(&mut self, max: u64) -> u64 {
+            self.next_u64() % max
+        }
+    }
+
+    #[test]
+    fn property_kway_merge_random() {
+        for &k in &[2usize, 3, 5, 8, 16, 32] {
+            for seed in 0..16u64 {
+                let mut rng = Rng::new(seed.wrapping_mul(1_000_003) + k as u64 * 7);
+
+                // Per-source sorted run; mix in u128::MAX, ties on small
+                // values, and full-range randoms to exercise the
+                // tie-break and key/sentinel separation.
+                let runs: Vec<Vec<u128>> = (0..k)
+                    .map(|_| {
+                        let len = rng.gen_range(30) as usize;
+                        let mut keys: Vec<u128> = (0..len)
+                            .map(|_| match rng.gen_range(8) {
+                                0 => u128::MAX,
+                                1 => rng.gen_range(5) as u128,
+                                2 => rng.gen_range(20) as u128,
+                                _ => rng.gen_u128(),
+                            })
+                            .collect();
+                        keys.sort();
+                        keys
+                    })
+                    .collect();
+
+                let mut positions = vec![0usize; k];
+                let mut t = LoserTree::build(
+                    k,
+                    |i| runs[i].first().copied(),
+                    less,
+                );
+
+                let mut emitted = Vec::with_capacity(runs.iter().map(|r| r.len()).sum());
+                while !t.is_empty() {
+                    let src = t.peek().source_idx;
+                    emitted.push(t.peek().key);
+                    positions[src] += 1;
+                    if positions[src] < runs[src].len() {
+                        t.replace_top_key(runs[src][positions[src]], less);
+                    } else {
+                        t.pop_top(less);
+                    }
+                }
+
+                let mut expected: Vec<u128> = runs.iter().flatten().copied().collect();
+                expected.sort();
+                assert_eq!(
+                    emitted, expected,
+                    "k={k}, seed={seed}, runs={runs:?}"
+                );
+            }
+        }
+    }
+
+    /// Round-trip a real `u128::MAX` PK to confirm sentinel-vs-value
+    /// separation: the tree must never treat a `u128::MAX` key as
+    /// "exhausted source" — only `source_idx == usize::MAX` does.
+    #[test]
+    fn u128_max_key_is_a_real_value() {
+        let t = build(&[Some(u128::MAX), Some(0), Some(u128::MAX), Some(50)]);
+        assert_eq!(drain_keys(t), vec![0, 50, u128::MAX, u128::MAX]);
     }
 }

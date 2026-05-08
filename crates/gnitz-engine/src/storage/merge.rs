@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use super::columnar::{self, ColumnarSource};
 use super::batch::FIXED_REGION_BYTES;
 use crate::schema::{BlobCache, SchemaDescriptor, type_code, MAX_COLUMNS};
-use super::heap::MergeHeap;
+use super::heap::LoserTree;
 use crate::util::read_u64_le;
 
 use type_code::STRING as TYPE_STRING;
@@ -418,12 +418,12 @@ fn merge_batches_inner<RowCmp>(
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
 {
-    // HeapNode comparator is rebuilt at each heap op so its capture of
+    // HeapNode comparator is rebuilt at each tree op so its capture of
     // `cursors` stays scoped to a single call, leaving `cursors` free to be
     // mutated in between (a factory closure couldn't express the lifetime).
     let mut tree = {
         let cursors_ref: &[MemBatchCursor] = cursors;
-        MergeHeap::build(
+        LoserTree::build(
             cursors_ref.len(),
             |i| {
                 if cursors_ref[i].is_valid() {
