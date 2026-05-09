@@ -1,9 +1,10 @@
 //! N-way min-merge tournament: a loser tree.
 //!
 //! Two operations on the root drive every caller:
-//! - `replace_top_key(new_key, less)` — overwrite the champion's key and
-//!   walk up. The fast path used by every emit on a still-valid source.
-//! - `pop_top(less)` — remove the champion when its source exhausts.
+//! - `replace_top(new_key, new_row, &less)` — overwrite the champion's
+//!   key + row and walk up. The fast path used by every emit on a
+//!   still-valid source.
+//! - `pop_top(&less)` — remove the champion when its source exhausts.
 //!
 //! Each internal node holds the LOSER of the most recent match between
 //! its two subtrees' current champions; `tree[0]` holds the overall
@@ -13,10 +14,11 @@
 //! on the hot merge path; the inlined payload tie-break inside `less`
 //! sees the same halving.
 //!
-//! Leaves are NOT stored: per-source state lives in the caller's cursor
-//! table, indexed by `source_idx`. Source `i` is pinned to leaf
-//! position `tree.len() + i`, so the walk-up start is always derivable
-//! from `tree[0].source_idx`.
+//! Each node carries `(key, source_idx, row)`. Embedding `row` in the
+//! node lets the comparator do payload tie-breaks from the node alone —
+//! no read of caller-side cursor state — so `less` captures only
+//! immutable references and never collides with a `&mut cursors` borrow
+//! held elsewhere in the merge driver.
 //!
 //! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
 //! tied rows by repeatedly popping/replacing the root; merge_batches
@@ -26,15 +28,16 @@
 pub struct HeapNode {
     pub key: u128,
     pub source_idx: usize,
+    pub row: usize,
 }
 
 /// `usize::MAX` is unambiguously distinct from any real `source_idx`
-/// (bounded by the caller's source-array length). The `key` field is
-/// unused for sentinels — collisions with a real `u128::MAX` PK are
-/// avoided by discriminating on `source_idx` alone.
+/// (bounded by the caller's source-array length). The `key` and `row`
+/// fields are unused for sentinels — collisions with a real `u128::MAX`
+/// PK are avoided by discriminating on `source_idx` alone.
 const SENTINEL: usize = usize::MAX;
 
-const SENTINEL_NODE: HeapNode = HeapNode { key: 0, source_idx: SENTINEL };
+const SENTINEL_NODE: HeapNode = HeapNode { key: 0, source_idx: SENTINEL, row: 0 };
 
 pub struct LoserTree {
     /// `tree[0]` is the overall champion. `tree[1..tree.len()]` hold the
@@ -61,7 +64,7 @@ impl LoserTree {
     /// and avoids the ambiguity.
     pub fn build(
         n: usize,
-        key_fn: impl Fn(usize) -> Option<u128>,
+        init_fn: impl Fn(usize) -> Option<(u128, usize)>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) -> Self {
         let n_pad = n.next_power_of_two().max(1);
@@ -72,8 +75,8 @@ impl LoserTree {
         // with a key, leaf `n_pad + i` carries the source's value.
         let mut winners = vec![SENTINEL_NODE; 2 * n_pad];
         for i in 0..n {
-            if let Some(key) = key_fn(i) {
-                winners[n_pad + i] = HeapNode { key, source_idx: i };
+            if let Some((key, row)) = init_fn(i) {
+                winners[n_pad + i] = HeapNode { key, source_idx: i, row };
             }
         }
 
@@ -141,20 +144,21 @@ impl LoserTree {
         cur
     }
 
-    /// Overwrite the champion's key and walk up. The new key may be
-    /// larger or smaller than the prior one; the loser tree handles
+    /// Overwrite the champion's key + row and walk up. The new key may
+    /// be larger or smaller than the prior one; the loser tree handles
     /// either correctly (no monotonicity precondition).
     #[inline]
-    pub fn replace_top_key(
+    pub fn replace_top(
         &mut self,
         new_key: u128,
-        less: impl Fn(&HeapNode, &HeapNode) -> bool,
+        new_row: usize,
+        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        debug_assert!(!self.is_empty(), "replace_top_key on empty tree");
+        debug_assert!(!self.is_empty(), "replace_top on empty tree");
         let source_idx = self.tree[0].source_idx;
-        let cur = HeapNode { key: new_key, source_idx };
+        let cur = HeapNode { key: new_key, source_idx, row: new_row };
         let idx = (self.tree.len() + source_idx) >> 1;
-        self.tree[0] = self.walk_up(cur, idx, &less);
+        self.tree[0] = self.walk_up(cur, idx, less);
     }
 
     /// Remove the champion (its source is exhausted). After return, the
@@ -163,7 +167,7 @@ impl LoserTree {
     #[inline]
     pub fn pop_top(
         &mut self,
-        less: impl Fn(&HeapNode, &HeapNode) -> bool,
+        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
         debug_assert!(!self.is_empty(), "pop_top on empty tree");
         let source_idx = self.tree[0].source_idx;
@@ -191,7 +195,95 @@ impl LoserTree {
         // Phase 2: shared walk-up. If phase 1 found no real loser, idx
         // is 0 and walk_up is a no-op returning the sentinel; tree[0]
         // becomes sentinel and is_empty returns true.
-        self.tree[0] = self.walk_up(cur, idx, &less);
+        self.tree[0] = self.walk_up(cur, idx, less);
+    }
+}
+
+/// Drive an N-way merge to completion.
+///
+/// `less` — compare two `HeapNode`s; uses `a.row` / `b.row` for payload
+///   tie-breaks, NEVER reads cursor state directly. This is what frees
+///   `advance` below to hold the only `&mut cursors` borrow.
+/// `advance(src) -> Option<(key, row)>` — advance source `src`; returns
+///   the cursor's new (key, row) or `None` when exhausted.
+/// `eq_payload(a_src, a_row, b_src, b_row) -> bool` — true when both
+///   positions carry the same payload. Used only for the inner
+///   group-tie test, never inside the heap.
+/// `weight(src, row) -> i64` — weight at `(src, row)`.
+/// `emit(group_src, group_row, group_key, net_weight) -> ControlFlow<()>` —
+///   called for each non-ghost group; `Break` returns immediately.
+///
+/// `#[inline(always)]`: the compact/merge `emit` closures return a
+/// constant `ControlFlow::Continue(())` and read_cursor's returns a
+/// constant `Break(())`. Forced inlining lets LLVM evaluate the branch
+/// at compile time and DCE the unused arm in each monomorphisation.
+#[inline(always)]
+pub fn drive_merge<ADV, EQ, W, EM>(
+    heap: &mut LoserTree,
+    less: impl Fn(&HeapNode, &HeapNode) -> bool,
+    mut advance: ADV,
+    mut eq_payload: EQ,
+    mut weight: W,
+    mut emit: EM,
+)
+where
+    ADV: FnMut(usize) -> Option<(u128, usize)>,
+    EQ: FnMut(usize, usize, usize, usize) -> bool,
+    W: FnMut(usize, usize) -> i64,
+    EM: FnMut(usize, usize, u128, i64) -> std::ops::ControlFlow<()>,
+{
+    // Step the heap root past `(src, row)` into its successor (or pop if
+    // exhausted). Inlined since both call sites share it byte-for-byte.
+    #[inline(always)]
+    fn step(
+        heap: &mut LoserTree,
+        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+        src: usize,
+        advance: &mut impl FnMut(usize) -> Option<(u128, usize)>,
+    ) {
+        if let Some((new_key, new_row)) = advance(src) {
+            heap.replace_top(new_key, new_row, less);
+        } else {
+            heap.pop_top(less);
+        }
+    }
+
+    loop {
+        if heap.is_empty() { return; }
+
+        let (group_src, group_row, group_key) = {
+            let top = heap.peek();
+            (top.source_idx, top.row, top.key)
+        };
+
+        // Open the group: account for the root's weight and step past it.
+        // No `eq_payload` test on the first row — by construction it is
+        // the group exemplar, so the test would be tautologically true and
+        // `eq_payload` walks every payload column (expensive on wide rows).
+        let mut net_weight: i64 = weight(group_src, group_row);
+        step(heap, &less, group_src, &mut advance);
+
+        // Fold tied rows: each iteration peeks the new root, breaks on a
+        // mismatch, otherwise accumulates weight and steps again.
+        while !heap.is_empty() {
+            let (cur_src, cur_row, cur_key) = {
+                let top = heap.peek();
+                (top.source_idx, top.row, top.key)
+            };
+            if cur_key != group_key
+                || !eq_payload(group_src, group_row, cur_src, cur_row)
+            {
+                break;
+            }
+            net_weight += weight(cur_src, cur_row);
+            step(heap, &less, cur_src, &mut advance);
+        }
+
+        if net_weight != 0
+            && emit(group_src, group_row, group_key, net_weight).is_break()
+        {
+            return;
+        }
     }
 }
 
@@ -207,14 +299,14 @@ mod tests {
     }
 
     fn build(keys: &[Option<u128>]) -> LoserTree {
-        LoserTree::build(keys.len(), |i| keys[i], less)
+        LoserTree::build(keys.len(), |i| keys[i].map(|k| (k, 0)), less)
     }
 
     fn drain_keys(mut t: LoserTree) -> Vec<u128> {
         let mut out = Vec::new();
         while !t.is_empty() {
             out.push(t.peek().key);
-            t.pop_top(less);
+            t.pop_top(&less);
         }
         out
     }
@@ -276,7 +368,7 @@ mod tests {
         let mut t = build(&[Some(10), Some(20), Some(30)]);
         assert_eq!(t.peek().source_idx, 0);
 
-        t.replace_top_key(25, less);
+        t.replace_top(25, 0, &less);
 
         assert_eq!(t.peek().key, 20);
         assert_eq!(t.peek().source_idx, 1);
@@ -285,7 +377,7 @@ mod tests {
     #[test]
     fn replace_top_to_max_sinks_to_leaf() {
         let mut t = build(&[Some(1), Some(2), Some(3)]);
-        t.replace_top_key(1000, less);
+        t.replace_top(1000, 0, &less);
         assert_eq!(t.peek().key, 2);
         assert_eq!(t.peek().source_idx, 1);
         assert_eq!(drain_keys(t), vec![2, 3, 1000]);
@@ -294,9 +386,34 @@ mod tests {
     #[test]
     fn replace_top_already_min_stays_root() {
         let mut t = build(&[Some(1), Some(5), Some(10)]);
-        t.replace_top_key(3, less);
+        t.replace_top(3, 0, &less);
         assert_eq!(t.peek().key, 3);
         assert_eq!(t.peek().source_idx, 0);
+    }
+
+    /// `row` is load-bearing for the production drive_merge path: callers
+    /// read it back from `heap.peek().row` to index their source data.
+    /// Verify the field round-trips through both root-mutating ops.
+    #[test]
+    fn row_field_round_trips_through_replace_and_pop() {
+        let mut t = build(&[Some(10), Some(20), Some(30)]);
+        // Replace src 0's leaf with (key=15, row=42), still the new min.
+        t.replace_top(15, 42, &less);
+        assert_eq!(t.peek().key, 15);
+        assert_eq!(t.peek().source_idx, 0);
+        assert_eq!(t.peek().row, 42);
+
+        // Replace again, making src 0 lose to src 1 — promoted node must
+        // carry src 1's row, not the stale 42.
+        t.replace_top(99, 7, &less);
+        assert_eq!(t.peek().key, 20);
+        assert_eq!(t.peek().source_idx, 1);
+        assert_eq!(t.peek().row, 0);
+
+        // Pop src 1; src 2 is promoted with its original row=0.
+        t.pop_top(&less);
+        assert_eq!(t.peek().source_idx, 2);
+        assert_eq!(t.peek().row, 0);
     }
 
     // --- pop_top ---
@@ -304,7 +421,7 @@ mod tests {
     #[test]
     fn pop_top_removes_root() {
         let mut t = build(&[Some(10), Some(20), Some(30)]);
-        t.pop_top(less);
+        t.pop_top(&less);
         assert_eq!(t.peek().key, 20);
         assert_eq!(drain_keys(t), vec![20, 30]);
     }
@@ -312,7 +429,7 @@ mod tests {
     #[test]
     fn pop_top_single_entry_empties() {
         let mut t = build(&[Some(42)]);
-        t.pop_top(less);
+        t.pop_top(&less);
         assert!(t.is_empty());
     }
 
@@ -332,10 +449,10 @@ mod tests {
         let mut t = build(&[Some(10), None, None, None, None, Some(99), None, None]);
         assert_eq!(t.peek().key, 10);
         assert_eq!(t.peek().source_idx, 0);
-        t.pop_top(less);
+        t.pop_top(&less);
         assert_eq!(t.peek().key, 99);
         assert_eq!(t.peek().source_idx, 5);
-        t.pop_top(less);
+        t.pop_top(&less);
         assert!(t.is_empty());
     }
 
@@ -345,13 +462,13 @@ mod tests {
     fn mixed_ops_drain_sorted() {
         let mut t = build(&[Some(5), Some(15), Some(25), Some(35), Some(45)]);
         // src 0 advances: 5 → 50.
-        t.replace_top_key(50, less);
+        t.replace_top(50, 0, &less);
         assert_eq!(t.peek().key, 15);
         // src 1 advances: 15 → 16.
-        t.replace_top_key(16, less);
+        t.replace_top(16, 0, &less);
         assert_eq!(t.peek().key, 16);
         // src 1 exhausts.
-        t.pop_top(less);
+        t.pop_top(&less);
         assert_eq!(t.peek().key, 25);
         // Drain.
         assert_eq!(drain_keys(t), vec![25, 35, 45, 50]);
@@ -361,7 +478,7 @@ mod tests {
     #[test]
     fn drain_emits_sorted() {
         let keys = [97u128, 12, 53, 88, 1, 44, 73, 25, 60, 32, 18, 91];
-        let t = LoserTree::build(keys.len(), |i| Some(keys[i]), less);
+        let t = LoserTree::build(keys.len(), |i| Some((keys[i], 0)), less);
 
         let mut sorted = keys.to_vec();
         sorted.sort();
@@ -384,7 +501,7 @@ mod tests {
         let mut positions = vec![0usize; runs.len()];
         let mut t = LoserTree::build(
             runs.len(),
-            |i| runs[i].first().copied(),
+            |i| runs[i].first().copied().map(|k| (k, 0)),
             less,
         );
 
@@ -394,9 +511,9 @@ mod tests {
             emitted.push(t.peek().key);
             positions[src] += 1;
             if positions[src] < runs[src].len() {
-                t.replace_top_key(runs[src][positions[src]], less);
+                t.replace_top(runs[src][positions[src]], 0, &less);
             } else {
-                t.pop_top(less);
+                t.pop_top(&less);
             }
         }
 
@@ -455,7 +572,7 @@ mod tests {
                 let mut positions = vec![0usize; k];
                 let mut t = LoserTree::build(
                     k,
-                    |i| runs[i].first().copied(),
+                    |i| runs[i].first().copied().map(|k| (k, 0)),
                     less,
                 );
 
@@ -465,9 +582,9 @@ mod tests {
                     emitted.push(t.peek().key);
                     positions[src] += 1;
                     if positions[src] < runs[src].len() {
-                        t.replace_top_key(runs[src][positions[src]], less);
+                        t.replace_top(runs[src][positions[src]], 0, &less);
                     } else {
-                        t.pop_top(less);
+                        t.pop_top(&less);
                     }
                 }
 

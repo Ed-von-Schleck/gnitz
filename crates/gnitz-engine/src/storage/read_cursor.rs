@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
-use super::heap::LoserTree;
+use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
@@ -247,78 +247,42 @@ impl ColumnarSource for CursorSource {
 }
 
 // ---------------------------------------------------------------------------
-// ReadCursorEntry — per-source position tracker
+// CursorState — per-source position tracker (struct-of-arrays pair to
+// `sources`).  Splitting source from state lets the borrow checker see
+// `&self.sources` (immutable) and `&mut self.states` (mutable) as disjoint
+// fields, so the merge driver can hold both at once without dance.
 // ---------------------------------------------------------------------------
 
-struct ReadCursorEntry {
-    source: CursorSource,
+struct CursorState {
     position: usize,
+    /// Cached so `is_valid()` and `estimated_length()` work on
+    /// `&[CursorState]` alone, without a parallel borrow of `&[CursorSource]`.
     count: usize,
 }
 
-impl ReadCursorEntry {
-    fn new_batch(batch: Rc<Batch>) -> Self {
-        let count = batch.count;
-        ReadCursorEntry {
-            source: CursorSource::Batch(batch),
-            position: 0,
-            count,
-        }
-    }
-
-    fn new_shard(shard: Rc<MappedShard>) -> Self {
-        let count = shard.count;
-        let mut entry = ReadCursorEntry {
-            source: CursorSource::Shard(shard),
-            position: 0,
-            count,
-        };
-        entry.skip_ghosts();
-        entry
-    }
-
+impl CursorState {
     #[inline]
     fn is_valid(&self) -> bool {
         self.position < self.count
     }
 
-    fn advance(&mut self) {
+    fn advance(&mut self, src: &CursorSource) {
         if self.is_valid() {
             self.position += 1;
-            self.skip_ghosts();
+            self.skip_ghosts(src);
         }
     }
 
-    fn seek(&mut self, key: u128) {
-        self.position = self.source.find_lower_bound(key);
-        self.skip_ghosts();
+    fn seek(&mut self, src: &CursorSource, key: u128) {
+        self.position = src.find_lower_bound(key);
+        self.skip_ghosts(src);
     }
 
-    fn skip_ghosts(&mut self) {
+    fn skip_ghosts(&mut self, src: &CursorSource) {
         // Batch sources are always consolidated — no ghost rows.
-        if let CursorSource::Shard(s) = &self.source {
+        if let CursorSource::Shard(s) = src {
             self.position = s.next_non_ghost(self.position);
         }
-    }
-
-    #[inline]
-    fn peek_key(&self) -> u128 {
-        debug_assert!(self.is_valid());
-        self.source.get_pk(self.position)
-    }
-
-    #[inline]
-    fn weight(&self) -> i64 {
-        if self.is_valid() {
-            self.source.get_weight(self.position)
-        } else {
-            0
-        }
-    }
-
-    #[inline]
-    fn source_blob_len(&self) -> usize {
-        self.source.blob_slice().len()
     }
 }
 
@@ -336,7 +300,8 @@ enum SourceMode {
 }
 
 pub struct ReadCursor {
-    entries: Vec<ReadCursorEntry>,
+    sources: Vec<CursorSource>,
+    states: Vec<CursorState>,
     /// Many cursor consumers (point lookups, seeks) never call
     /// `scatter_drained_into`; build on first use.
     unified_sources: OnceCell<Vec<UnifiedSource>>,
@@ -360,25 +325,26 @@ impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize,
 impl ReadCursor {
     #[inline]
     fn build_tree_with<RowCmp: RowComparator>(
-        entries: &[ReadCursorEntry],
+        sources: &[CursorSource],
+        states: &[CursorState],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
     ) -> LoserTree {
-        let less = move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
+        let less = move |a: &HeapNode, b: &HeapNode| {
             if a.key != b.key {
                 return a.key < b.key;
             }
             row_cmp(
                 schema,
-                &entries[a.source_idx].source, entries[a.source_idx].position,
-                &entries[b.source_idx].source, entries[b.source_idx].position,
+                &sources[a.source_idx], a.row,
+                &sources[b.source_idx], b.row,
             ) == Ordering::Less
         };
         LoserTree::build(
-            entries.len(),
+            sources.len(),
             |i| {
-                if entries[i].is_valid() {
-                    Some(entries[i].peek_key())
+                if states[i].is_valid() {
+                    Some((sources[i].get_pk(states[i].position), states[i].position))
                 } else {
                     None
                 }
@@ -388,30 +354,33 @@ impl ReadCursor {
     }
 
     fn build_tree(
-        entries: &[ReadCursorEntry],
+        sources: &[CursorSource],
+        states: &[CursorState],
         schema: &SchemaDescriptor,
         is_fast: bool,
     ) -> LoserTree {
         // Wrap as a non-capturing closure: a direct fn-item reference would
         // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
         if is_fast {
-            Self::build_tree_with(entries, schema,
+            Self::build_tree_with(sources, states, schema,
                 |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi))
         } else {
-            Self::build_tree_with(entries, schema,
+            Self::build_tree_with(sources, states, schema,
                 |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi))
         }
     }
 
-    fn new(entries: Vec<ReadCursorEntry>, schema: SchemaDescriptor) -> Self {
+    fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
+        debug_assert_eq!(sources.len(), states.len());
         let is_fast = columnar::schema_is_int_nonnull(&schema);
-        let mode = match entries.len() {
+        let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
-            _ => SourceMode::Multi(Self::build_tree(&entries, &schema, is_fast)),
+            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, is_fast)),
         };
         let mut cursor = ReadCursor {
-            entries,
+            sources,
+            states,
             unified_sources: OnceCell::new(),
             mode,
             schema,
@@ -428,11 +397,13 @@ impl ReadCursor {
     }
 
     pub fn seek(&mut self, key: u128) {
-        for e in &mut self.entries {
-            e.seek(key);
+        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+            state.seek(src, key);
         }
         if let SourceMode::Multi(_) = &self.mode {
-            self.mode = SourceMode::Multi(Self::build_tree(&self.entries, &self.schema, self.is_fast));
+            self.mode = SourceMode::Multi(
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast),
+            );
         }
         self.drive();
     }
@@ -457,7 +428,7 @@ impl ReadCursor {
     #[inline]
     fn advance_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         if matches!(self.mode, SourceMode::Single) {
-            self.entries[0].advance();
+            self.states[0].advance(&self.sources[0]);
         }
         self.drive_with(row_cmp);
     }
@@ -472,18 +443,19 @@ impl ReadCursor {
     }
 
     /// Single-source bypass: no heap, no ghost filter.
-    /// `Batch` inputs are pre-consolidated and `ReadCursorEntry::advance`
-    /// already calls `skip_ghosts` for shard sources, so the entry's
+    /// `Batch` inputs are pre-consolidated and `CursorState::advance`
+    /// already calls `skip_ghosts` for shard sources, so the state's
     /// current position is either valid emit-ready or past-end.
     #[inline]
     fn drive_single(&mut self) {
-        let e = &self.entries[0];
-        if e.is_valid() {
-            let pos = e.position;
+        let state = &self.states[0];
+        if state.is_valid() {
+            let pos = state.position;
+            let src = &self.sources[0];
             self.valid = true;
-            self.current_key = e.source.get_pk(pos);
-            self.current_weight = e.source.get_weight(pos);
-            self.current_null_word = e.source.get_null_word(pos);
+            self.current_key = src.get_pk(pos);
+            self.current_weight = src.get_weight(pos);
+            self.current_null_word = src.get_null_word(pos);
             self.current_entry_idx = 0;
             self.current_row = pos;
         } else {
@@ -493,97 +465,69 @@ impl ReadCursor {
 
     /// Heap path: emit one consolidated non-ghost group, or invalidate.
     ///
-    /// Outer loop opens a group from the heap root and folds tied rows by
-    /// repeatedly replacing/popping the root. If the folded group has
-    /// non-zero net weight, commit and return; otherwise it was a ghost
-    /// group — try the next root.
-    ///
-    /// At call boundary the heap root is always either empty or the
-    /// leading row of an unfolded group, so no state crosses calls.
+    /// `drive_merge` folds tied rows for us; we hand it `Break` from `emit`
+    /// the first time we see a non-ghost group to return immediately.
+    /// Ghost groups (net weight = 0) cause `drive_merge` to skip emit and
+    /// open the next group, so the loop naturally walks past them.
     #[inline]
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         let heap = match &mut self.mode {
-            SourceMode::Empty => { self.valid = false; return; }
+            SourceMode::Empty  => { self.valid = false; return; }
             SourceMode::Single => { self.drive_single(); return; }
-            SourceMode::Multi(heap) => heap,
+            SourceMode::Multi(h) => h,
         };
-        let schema = &self.schema;
-        let entries = &mut self.entries;
+        let schema  = &self.schema;
+        let sources = &self.sources;
+        let states  = &mut self.states;
+        // The closure already borrows `&sources` + `&mut states`; capturing
+        // the five `&mut self.current_*` fields in addition would force
+        // `&mut self` (incompatible with the field-level reborrow above).
+        // Stage into a stack tuple, commit after `drive_merge` returns.
+        // `get_null_word` is fetched after return — no need to evaluate
+        // it inside the emit closure that runs at most once per call.
+        let mut emitted: Option<(u128, i64, usize, usize)> = None;
 
-        loop {
-            if heap.is_empty() {
-                self.valid = false;
-                return;
-            }
-
-            let group_src = heap.peek().source_idx;
-            let group_row = entries[group_src].position;
-            let group_key = heap.peek().key;
-            let mut net_weight: i64 = 0;
-
-            // Inner fold: drain every row tied with (group_src, group_row).
-            loop {
-                let cur_src = heap.peek().source_idx;
-                let cur_key = heap.peek().key;
-                let cur_row = entries[cur_src].position;
-
-                if cur_key != group_key
-                    || row_cmp(
-                        schema,
-                        &entries[group_src].source, group_row,
-                        &entries[cur_src].source, cur_row,
-                    ) != Ordering::Equal
-                {
-                    break;
-                }
-
-                net_weight += entries[cur_src].weight();
-                entries[cur_src].advance();
-
-                // `less` is rebuilt each iteration: it captures `entries`
-                // immutably, which conflicts with the `entries[cur_src]
-                // .advance()` above when held across iterations.
-                let entries_ref: &[ReadCursorEntry] = entries;
-                let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                    if a.key != b.key {
-                        return a.key < b.key;
-                    }
-                    row_cmp(
-                        schema,
-                        &entries_ref[a.source_idx].source, entries_ref[a.source_idx].position,
-                        &entries_ref[b.source_idx].source, entries_ref[b.source_idx].position,
-                    ) == Ordering::Less
-                };
-                if entries[cur_src].is_valid() {
-                    heap.replace_top_key(entries[cur_src].peek_key(), less);
+        let less = |a: &HeapNode, b: &HeapNode| -> bool {
+            if a.key != b.key { return a.key < b.key; }
+            row_cmp(schema, &sources[a.source_idx], a.row,
+                            &sources[b.source_idx], b.row) == Ordering::Less
+        };
+        drive_merge(
+            heap, less,
+            |src| {
+                states[src].advance(&sources[src]);
+                if states[src].is_valid() {
+                    Some((sources[src].get_pk(states[src].position), states[src].position))
                 } else {
-                    heap.pop_top(less);
-                    if heap.is_empty() {
-                        break;
-                    }
+                    None
                 }
-            }
-
-            if net_weight != 0 {
-                // Saved exemplar (group_src, group_row) is still readable —
-                // both `CursorSource` variants index by row, not by position.
-                let e = &entries[group_src];
-                self.valid = true;
-                self.current_key = group_key;
-                self.current_weight = net_weight;
-                self.current_null_word = e.source.get_null_word(group_row);
-                self.current_entry_idx = group_src;
-                self.current_row = group_row;
-                return;
-            }
-            // Ghost group: outer loop tries the next root.
+            },
+            |a_src, a_row, b_src, b_row| {
+                row_cmp(schema, &sources[a_src], a_row,
+                                &sources[b_src], b_row) == Ordering::Equal
+            },
+            |src, row| sources[src].get_weight(row),
+            |gs, gr, gk, nw| {
+                emitted = Some((gk, nw, gs, gr));
+                std::ops::ControlFlow::Break(())
+            },
+        );
+        if let Some((key, weight, idx, row)) = emitted {
+            self.valid = true;
+            self.current_key = key;
+            self.current_weight = weight;
+            self.current_entry_idx = idx;
+            self.current_row = row;
+            self.current_null_word = self.sources[idx].get_null_word(row);
+        } else {
+            self.valid = false;
         }
     }
 
     /// Approximate the number of rows remaining in this cursor (upper bound).
     /// Used by the adaptive-swap heuristic in join/semi-join operators.
     pub fn estimated_length(&self) -> usize {
-        self.entries.iter().map(|e| e.count.saturating_sub(e.position)).sum()
+        self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum()
     }
 
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
@@ -598,11 +542,11 @@ impl ReadCursor {
         if col_idx == self.schema.pk_index as usize {
             return ptr::null();
         }
-        let entry = &self.entries[self.current_entry_idx];
+        let src = &self.sources[self.current_entry_idx];
         let row = self.current_row;
         let pk_index = self.schema.pk_index as usize;
 
-        match &entry.source {
+        match src {
             CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
             CursorSource::Batch(b) => {
                 // Map logical → payload index
@@ -621,7 +565,7 @@ impl ReadCursor {
         if !self.valid {
             return ptr::null();
         }
-        self.entries[self.current_entry_idx].source.blob_ptr()
+        self.sources[self.current_entry_idx].blob_ptr()
     }
 
     /// Blob arena length for the current row's source.
@@ -629,7 +573,7 @@ impl ReadCursor {
         if !self.valid {
             return 0;
         }
-        self.entries[self.current_entry_idx].source.blob_slice().len()
+        self.sources[self.current_entry_idx].blob_slice().len()
     }
 
     /// Copy the current row into `batch` with an explicit weight.
@@ -662,8 +606,8 @@ impl ReadCursor {
     /// Materialize all non-zero-weight rows in merge order into an owned
     /// `Rc<Batch>`.
     pub(crate) fn materialize(mut self) -> Rc<Batch> {
-        if self.entries.len() == 1 && self.entries[0].position == 0 {
-            match &self.entries[0].source {
+        if self.sources.len() == 1 && self.states[0].position == 0 {
+            match &self.sources[0] {
                 CursorSource::Batch(rc) if rc.consolidated => return Rc::clone(rc),
                 CursorSource::Shard(rc) if !rc.has_ghosts => {
                     return Rc::new(rc.to_owned_batch(&self.schema));
@@ -703,16 +647,16 @@ impl ReadCursor {
         &mut self,
         limit: usize,
     ) -> Option<super::batch::Batch> {
-        if !self.valid || self.entries.len() != 1 {
+        if !self.valid || self.sources.len() != 1 {
             return None;
         }
-        let entry = &self.entries[0];
-        let start = entry.position;
-        let remaining = entry.count - start;
+        let state = &self.states[0];
+        let start = state.position;
+        let remaining = state.count - start;
         let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
         let schema = &self.schema;
 
-        let batch = match &entry.source {
+        let batch = match &self.sources[0] {
             CursorSource::Batch(b) => {
                 // Batch sources are always consolidated (no ghosts).
                 let end = start + row_count;
@@ -731,26 +675,25 @@ impl ReadCursor {
         };
 
         // Advance position past the drained rows
-        self.entries[0].position = start + row_count;
+        self.states[0].position = start + row_count;
         self.drive();
         Some(batch)
     }
 
     /// If this cursor is backed by exactly one in-memory `Batch` source,
     /// returns a `MemBatch` view over it and the current row position
-    /// (`entry.position`).  Returns `None` for multi-source or shard-backed
-    /// cursors.
+    /// (`states[0].position`).  Returns `None` for multi-source or
+    /// shard-backed cursors.
     ///
     /// Used by the bulk retraction path in the catalog to avoid per-row
     /// overhead when copying a contiguous range of rows from a single
     /// in-memory source.
     pub(crate) fn single_mem_batch(&self) -> Option<(MemBatch<'_>, usize)> {
-        if !self.valid || self.entries.len() != 1 {
+        if !self.valid || self.sources.len() != 1 {
             return None;
         }
-        let entry = &self.entries[0];
-        match &entry.source {
-            CursorSource::Batch(b) => Some((b.as_mem_batch(), entry.position)),
+        match &self.sources[0] {
+            CursorSource::Batch(b) => Some((b.as_mem_batch(), self.states[0].position)),
             CursorSource::Shard(_) => None,
         }
     }
@@ -759,7 +702,7 @@ impl ReadCursor {
     /// blob bytes a full drain can produce; callers use this to size the
     /// output blob arena.
     pub(crate) fn total_blob_len(&self) -> usize {
-        self.entries.iter().map(|e| e.source_blob_len()).sum()
+        self.sources.iter().map(|s| s.blob_slice().len()).sum()
     }
 
     /// Append the cursor's current `(entry_idx, row, weight)` to `buf` if the
@@ -840,8 +783,8 @@ impl ReadCursor {
     ) {
         if rows.is_empty() { return; }
         let unified = self.unified_sources.get_or_init(|| {
-            self.entries.iter()
-                .map(|e| e.source.to_unified(&self.schema))
+            self.sources.iter()
+                .map(|s| s.to_unified(&self.schema))
                 .collect()
         });
         super::merge::scatter_unified_sources_with_weights(unified, rows, writer);
@@ -857,21 +800,30 @@ pub fn create_read_cursor(
     shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> ReadCursor {
-    let mut entries = Vec::with_capacity(batches.len() + shard_arcs.len());
+    let cap = batches.len() + shard_arcs.len();
+    let mut sources = Vec::with_capacity(cap);
+    let mut states = Vec::with_capacity(cap);
 
     for batch in batches {
         if batch.count > 0 {
-            entries.push(ReadCursorEntry::new_batch(Rc::clone(batch)));
+            let count = batch.count;
+            sources.push(CursorSource::Batch(Rc::clone(batch)));
+            states.push(CursorState { position: 0, count });
         }
     }
 
     for shard in shard_arcs {
         if shard.count > 0 {
-            entries.push(ReadCursorEntry::new_shard(Rc::clone(shard)));
+            let count = shard.count;
+            let src = CursorSource::Shard(Rc::clone(shard));
+            let mut state = CursorState { position: 0, count };
+            state.skip_ghosts(&src);
+            sources.push(src);
+            states.push(state);
         }
     }
 
-    ReadCursor::new(entries, schema)
+    ReadCursor::new(sources, states, schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -987,8 +939,7 @@ mod tests {
     #[test]
     fn test_empty_cursor() {
         let schema = make_schema_i64();
-        let entries: Vec<ReadCursorEntry> = vec![];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[], &[], schema);
         assert!(!cursor.valid);
     }
 
@@ -996,8 +947,7 @@ mod tests {
     fn test_single_batch_scan() {
         let schema = make_schema_i64();
         let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
         let rows = scan_all(&mut cursor);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], (1, 0, 1));
@@ -1010,11 +960,7 @@ mod tests {
         let schema = make_schema_i64();
         let b1 = make_batch(&[(1, 1, 10), (3, 1, 30)]);
         let b2 = make_batch(&[(2, 1, 20), (4, 1, 40)]);
-        let entries = vec![
-            ReadCursorEntry::new_batch(b1),
-            ReadCursorEntry::new_batch(b2),
-        ];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
         let rows = scan_all(&mut cursor);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].0, 1);
@@ -1030,11 +976,7 @@ mod tests {
         let b1 = make_batch(&[(5, 1, 50), (10, 1, 100)]);
         // Batch 2: pk=5 val=50 w=-1 (retraction)
         let b2 = make_batch(&[(5, -1, 50)]);
-        let entries = vec![
-            ReadCursorEntry::new_batch(b1),
-            ReadCursorEntry::new_batch(b2),
-        ];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
         let rows = scan_all(&mut cursor);
         // pk=5 cancelled (w=+1-1=0), only pk=10 survives
         assert_eq!(rows.len(), 1);
@@ -1045,8 +987,7 @@ mod tests {
     fn test_seek() {
         let schema = make_schema_i64();
         let batch = make_batch(&[(1, 1, 10), (5, 1, 50), (10, 1, 100)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
 
         // Seek to pk >= 5
         cursor.seek(5);
@@ -1069,11 +1010,7 @@ mod tests {
         // Two entries with same PK but different payloads
         let b1 = make_batch(&[(5, 1, 200)]);
         let b2 = make_batch(&[(5, 1, 100)]);
-        let entries = vec![
-            ReadCursorEntry::new_batch(b1),
-            ReadCursorEntry::new_batch(b2),
-        ];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
         let rows = scan_all(&mut cursor);
         // Both survive, sorted by payload (100 < 200)
         assert_eq!(rows.len(), 2);
@@ -1087,11 +1024,7 @@ mod tests {
         // Same (PK, payload) in two batches: weights should sum
         let b1 = make_batch(&[(5, 3, 50)]);
         let b2 = make_batch(&[(5, 7, 50)]);
-        let entries = vec![
-            ReadCursorEntry::new_batch(b1),
-            ReadCursorEntry::new_batch(b2),
-        ];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
         let rows = scan_all(&mut cursor);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], (5, 0, 10)); // 3 + 7 = 10
@@ -1101,8 +1034,7 @@ mod tests {
     fn test_drain_single_source_full() {
         let schema = make_schema_i64();
         let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
 
         let result = cursor.drain_single_source(0);
         assert!(result.is_some());
@@ -1117,8 +1049,7 @@ mod tests {
     fn test_drain_single_source_with_limit() {
         let schema = make_schema_i64();
         let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
 
         // Drain first 2
         let out1 = cursor.drain_single_source(2).unwrap();
@@ -1140,11 +1071,7 @@ mod tests {
         let schema = make_schema_i64();
         let b1 = make_batch(&[(1, 1, 10)]);
         let b2 = make_batch(&[(2, 1, 20)]);
-        let entries = vec![
-            ReadCursorEntry::new_batch(b1),
-            ReadCursorEntry::new_batch(b2),
-        ];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
         assert!(cursor.drain_single_source(0).is_none());
     }
 
@@ -1154,8 +1081,7 @@ mod tests {
         // the PK through current_key instead.
         let schema = make_schema_i64();
         let batch = make_batch(&[(42, 1, 99)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
         let pk_index = cursor.schema.pk_index as usize; // 0
         let ptr = cursor.col_ptr(pk_index, 16);
@@ -1168,8 +1094,7 @@ mod tests {
         // the correct value.
         let schema = make_schema_i64();
         let batch = make_batch(&[(7, 1, 1234)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
         let ptr = cursor.col_ptr(1, 8); // logical col 1 = i64 payload
         assert!(!ptr.is_null(), "col_ptr for payload col must not be null");
@@ -1180,8 +1105,7 @@ mod tests {
     #[test]
     fn test_col_ptr_invalid_cursor_returns_null() {
         let schema = make_schema_i64();
-        let entries: Vec<ReadCursorEntry> = vec![];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[], &[], schema);
         assert!(!cursor.valid);
         assert!(cursor.col_ptr(1, 8).is_null());
     }
@@ -1190,8 +1114,7 @@ mod tests {
     fn test_estimated_length_reflects_remaining() {
         let schema = make_schema_i64();
         let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let mut cursor = ReadCursor::new(entries, schema);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
         assert_eq!(cursor.estimated_length(), 3);
         cursor.advance();
         assert_eq!(cursor.estimated_length(), 2);
@@ -1206,8 +1129,7 @@ mod tests {
         let schema = make_schema_i64();
         let expected = (0xBEEFu128 << 64) | 0xDEADu128;
         let batch = make_batch(&[(expected, 1, 0)]);
-        let entries = vec![ReadCursorEntry::new_batch(batch)];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
         assert_eq!(cursor.current_key, expected);
     }
@@ -1241,8 +1163,7 @@ mod tests {
             super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap(),
         );
 
-        let entries = vec![ReadCursorEntry::new_shard(shard)];
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&[], &[shard], schema);
         let result = cursor.materialize();
 
         assert_eq!(result.count, 1);
@@ -1259,10 +1180,7 @@ mod tests {
         let batches: Vec<Rc<super::super::batch::Batch>> = (0..n)
             .map(|i| make_batch(&[(i as u128, 1i64, (i * 100) as i64)]))
             .collect();
-        let entries: Vec<ReadCursorEntry> = batches.iter()
-            .map(|b| ReadCursorEntry::new_batch(Rc::clone(b)))
-            .collect();
-        let cursor = ReadCursor::new(entries, schema);
+        let cursor = create_read_cursor(&batches, &[], schema);
         let result = cursor.materialize();
 
         assert_eq!(result.count, n);

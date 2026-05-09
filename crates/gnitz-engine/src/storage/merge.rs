@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use super::columnar::{self, ColumnarSource, SortEntry};
 use super::batch::FIXED_REGION_BYTES;
 use crate::schema::{BlobCache, SchemaDescriptor, type_code, MAX_COLUMNS};
-use super::heap::LoserTree;
+use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::util::read_u64_le;
 
 use type_code::STRING as TYPE_STRING;
@@ -231,15 +231,13 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 // ---------------------------------------------------------------------------
 
 pub struct MemBatchCursor {
-    pub batch_idx: usize,
     pub position: usize,
     pub count: usize,
 }
 
 impl MemBatchCursor {
-    pub fn new(batch_idx: usize, count: usize) -> Self {
+    pub fn new(count: usize) -> Self {
         MemBatchCursor {
-            batch_idx,
             position: 0,
             count,
         }
@@ -258,9 +256,9 @@ impl MemBatchCursor {
     }
 
     #[inline]
-    pub fn peek_key(&self, batches: &[SortedMemBatch]) -> u128 {
+    pub fn peek_key(&self, batch: &SortedMemBatch) -> u128 {
         debug_assert!(self.is_valid());
-        batches[self.batch_idx].get_pk(self.position)
+        batch.get_pk(self.position)
     }
 }
 
@@ -393,7 +391,7 @@ pub fn merge_batches(
     }
 
     let mut cursors: Vec<MemBatchCursor> = (0..n)
-        .map(|i| MemBatchCursor::new(i, batches[i].count))
+        .map(|i| MemBatchCursor::new(batches[i].count))
         .collect();
 
     // Wrap as a non-capturing closure: a direct fn-item reference would fix
@@ -418,86 +416,46 @@ fn merge_batches_inner<RowCmp>(
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
 {
-    // HeapNode comparator is rebuilt at each tree op so its capture of
-    // `cursors` stays scoped to a single call, leaving `cursors` free to be
-    // mutated in between (a factory closure couldn't express the lifetime).
-    let mut tree = {
-        let cursors_ref: &[MemBatchCursor] = cursors;
-        LoserTree::build(
-            cursors_ref.len(),
-            |i| {
-                if cursors_ref[i].is_valid() {
-                    Some(cursors_ref[i].peek_key(batches))
-                } else {
-                    None
-                }
-            },
-            move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                if a.key != b.key {
-                    return a.key < b.key;
-                }
-                let bi = cursors_ref[a.source_idx].batch_idx;
-                let bj = cursors_ref[b.source_idx].batch_idx;
-                let ri = cursors_ref[a.source_idx].position;
-                let rj = cursors_ref[b.source_idx].position;
-                row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
-            },
-        )
+    // `less` reads `a.row` / `b.row` from the heap node directly — never
+    // touches `cursors` — so it coexists with the `&mut cursors` borrow held
+    // by `advance` below.  `source_idx` doubles as the batch index here.
+    let less = |a: &HeapNode, b: &HeapNode| -> bool {
+        if a.key != b.key { return a.key < b.key; }
+        row_cmp(schema, &batches[a.source_idx].0, a.row,
+                        &batches[b.source_idx].0, b.row) == Ordering::Less
     };
-
-    while !tree.is_empty() {
-        // Open a new group from the heap root.
-        let group_src = tree.peek().source_idx;
-        let group_batch = cursors[group_src].batch_idx;
-        let group_row = cursors[group_src].position;
-        let group_key = tree.peek().key;
-        let mut net_weight: i64 = 0;
-
-        // Inner fold: drain every row tied with (group_batch, group_row).
-        loop {
-            let cur_src = tree.peek().source_idx;
-            let cur_key = tree.peek().key;
-            let cur_batch = cursors[cur_src].batch_idx;
-            let cur_row = cursors[cur_src].position;
-
-            if cur_key != group_key
-                || row_cmp(
-                    schema,
-                    &batches[group_batch].0, group_row,
-                    &batches[cur_batch].0, cur_row,
-                ) != Ordering::Equal
-            {
-                break;
-            }
-
-            net_weight += batches[cur_batch].get_weight(cur_row);
-            cursors[cur_src].advance();
-
-            let cursors_ref: &[MemBatchCursor] = cursors;
-            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                if a.key != b.key {
-                    return a.key < b.key;
-                }
-                let bi = cursors_ref[a.source_idx].batch_idx;
-                let bj = cursors_ref[b.source_idx].batch_idx;
-                let ri = cursors_ref[a.source_idx].position;
-                let rj = cursors_ref[b.source_idx].position;
-                row_cmp(schema, &batches[bi].0, ri, &batches[bj].0, rj) == Ordering::Less
-            };
-            if cursors[cur_src].is_valid() {
-                tree.replace_top_key(cursors[cur_src].peek_key(batches), less);
+    let mut tree = LoserTree::build(
+        cursors.len(),
+        |i| {
+            if cursors[i].is_valid() {
+                Some((cursors[i].peek_key(&batches[i]), cursors[i].position))
             } else {
-                tree.pop_top(less);
-                if tree.is_empty() {
-                    break;
-                }
+                None
             }
-        }
-
-        if net_weight != 0 {
-            writer.write_row(&batches[group_batch], group_row, net_weight);
-        }
-    }
+        },
+        &less,
+    );
+    drive_merge(
+        &mut tree,
+        less,
+        |src| {
+            cursors[src].advance();
+            if cursors[src].is_valid() {
+                Some((cursors[src].peek_key(&batches[src]), cursors[src].position))
+            } else {
+                None
+            }
+        },
+        |a_src, a_row, b_src, b_row| {
+            row_cmp(schema, &batches[a_src].0, a_row,
+                            &batches[b_src].0, b_row) == Ordering::Equal
+        },
+        |src, row| batches[src].get_weight(row),
+        |group_src, group_row, _key, w| {
+            writer.write_row(&batches[group_src], group_row, w);
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

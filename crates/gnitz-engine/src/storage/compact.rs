@@ -4,7 +4,7 @@ use std::ffi::CStr;
 
 use super::columnar;
 use super::error::StorageError;
-use super::heap::LoserTree;
+use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::batch::Batch;
 use super::merge::BlobCacheGuard;
 use crate::schema::SchemaDescriptor;
@@ -44,15 +44,13 @@ impl GuardResult {
 // ---------------------------------------------------------------------------
 
 struct ShardCursor {
-    shard_idx: usize,
     position: usize,
     count: usize,
 }
 
 impl ShardCursor {
-    fn new(shard_idx: usize, shard: &MappedShard) -> Self {
+    fn new(shard: &MappedShard) -> Self {
         let mut c = ShardCursor {
-            shard_idx,
             position: 0,
             count: shard.count,
         };
@@ -60,10 +58,12 @@ impl ShardCursor {
         c
     }
 
+    #[inline]
     fn is_valid(&self) -> bool {
         self.position < self.count
     }
 
+    #[inline]
     fn advance(&mut self, shard: &MappedShard) {
         if self.is_valid() {
             self.position += 1;
@@ -71,10 +71,12 @@ impl ShardCursor {
         }
     }
 
+    #[inline]
     fn skip_ghosts(&mut self, shard: &MappedShard) {
         self.position = shard.next_non_ghost(self.position);
     }
 
+    #[inline]
     fn peek_key(&self, shard: &MappedShard) -> u128 {
         debug_assert!(self.is_valid());
         shard.get_pk(self.position)
@@ -120,7 +122,7 @@ fn open_and_merge(
     }
 
     let cursors: Vec<ShardCursor> = (0..shards.len())
-        .map(|i| ShardCursor::new(i, &shards[i]))
+        .map(|i| ShardCursor::new(&shards[i]))
         .collect();
 
     // Wrap as a non-capturing closure: a direct fn-item reference would fix
@@ -147,89 +149,46 @@ fn open_and_merge_inner<RowCmp>(
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
 {
-    // HeapNode comparator is rebuilt at each tree op so its capture of
-    // `cursors` stays scoped to a single call, leaving `cursors` free to be
-    // mutated in between (a factory closure couldn't express the lifetime).
-    let mut tree = {
-        let cursors_ref: &[ShardCursor] = &cursors;
-        LoserTree::build(
-            cursors_ref.len(),
-            |i| {
-                if cursors_ref[i].is_valid() {
-                    Some(cursors_ref[i].peek_key(&shards[cursors_ref[i].shard_idx]))
-                } else {
-                    None
-                }
-            },
-            move |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                if a.key != b.key {
-                    return a.key < b.key;
-                }
-                row_cmp(
-                    schema,
-                    &shards[cursors_ref[a.source_idx].shard_idx], cursors_ref[a.source_idx].position,
-                    &shards[cursors_ref[b.source_idx].shard_idx], cursors_ref[b.source_idx].position,
-                ) == std::cmp::Ordering::Less
-            },
-        )
+    // `less` reads `a.row` / `b.row` from the heap node directly — never
+    // touches `cursors` — so it coexists with the `&mut cursors` borrow held
+    // by `advance` below.  `source_idx` doubles as the shard index here.
+    let less = |a: &HeapNode, b: &HeapNode| -> bool {
+        if a.key != b.key { return a.key < b.key; }
+        row_cmp(schema, &shards[a.source_idx], a.row,
+                        &shards[b.source_idx], b.row) == std::cmp::Ordering::Less
     };
-
-    while !tree.is_empty() {
-        // Open a new group from the heap root.
-        let group_src = tree.peek().source_idx;
-        let group_shard_idx = cursors[group_src].shard_idx;
-        let group_row = cursors[group_src].position;
-        let group_key = tree.peek().key;
-        let mut net_weight: i64 = 0;
-
-        // Inner fold: drain every row tied with (group_shard_idx, group_row).
-        loop {
-            let cur_src = tree.peek().source_idx;
-            let cur_key = tree.peek().key;
-            let cur_shard_idx = cursors[cur_src].shard_idx;
-            let cur_row = cursors[cur_src].position;
-
-            if cur_key != group_key
-                || row_cmp(
-                    schema,
-                    &shards[group_shard_idx], group_row,
-                    &shards[cur_shard_idx], cur_row,
-                ) != std::cmp::Ordering::Equal
-            {
-                break;
-            }
-
-            net_weight += shards[cur_shard_idx].get_weight(cur_row);
-            cursors[cur_src].advance(&shards[cur_shard_idx]);
-
-            let cursors_ref: &[ShardCursor] = &cursors;
-            let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> bool {
-                if a.key != b.key {
-                    return a.key < b.key;
-                }
-                row_cmp(
-                    schema,
-                    &shards[cursors_ref[a.source_idx].shard_idx], cursors_ref[a.source_idx].position,
-                    &shards[cursors_ref[b.source_idx].shard_idx], cursors_ref[b.source_idx].position,
-                ) == std::cmp::Ordering::Less
-            };
-            if cursors[cur_src].is_valid() {
-                tree.replace_top_key(
-                    cursors[cur_src].peek_key(&shards[cur_shard_idx]),
-                    less,
-                );
+    let mut tree = LoserTree::build(
+        cursors.len(),
+        |i| {
+            if cursors[i].is_valid() {
+                Some((cursors[i].peek_key(&shards[i]), cursors[i].position))
             } else {
-                tree.pop_top(less);
-                if tree.is_empty() {
-                    break;
-                }
+                None
             }
-        }
-
-        if net_weight != 0 {
-            emit(group_key, net_weight, &shards[group_shard_idx], group_row);
-        }
-    }
+        },
+        &less,
+    );
+    drive_merge(
+        &mut tree,
+        less,
+        |src| {
+            cursors[src].advance(&shards[src]);
+            if cursors[src].is_valid() {
+                Some((cursors[src].peek_key(&shards[src]), cursors[src].position))
+            } else {
+                None
+            }
+        },
+        |a_src, a_row, b_src, b_row| {
+            row_cmp(schema, &shards[a_src], a_row,
+                            &shards[b_src], b_row) == std::cmp::Ordering::Equal
+        },
+        |src, row| shards[src].get_weight(row),
+        |group_src, group_row, group_key, w| {
+            emit(group_key, w, &shards[group_src], group_row);
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
