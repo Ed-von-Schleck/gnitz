@@ -3207,20 +3207,30 @@ mod tests {
 
     #[test]
     fn reap_closing_conns_removes_idle_closing_fd() {
+        // `reap_closing_conns` calls `libc::close(fd)` on every reaped fd.
+        // Use real pipe ends so the close lands on something we own —
+        // a magic-number fd would race with parallel test threads that
+        // had been allocated the same fd by the kernel.
         let r = make_reactor();
-        // Insert a conn with no in-flight SQEs and mark it closing manually,
-        // as if handle_recv_cqe had already run.
-        let mut conn = Box::new(io::Conn::new());
-        conn.closing = true;
-        r.inner.conns.borrow_mut().insert(88, conn);
-        r.inner.closing_fds.borrow_mut().insert(88);
+        unsafe {
+            let mut fds = [0i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let (read_end, write_end) = (fds[0], fds[1]);
 
-        r.reap_closing_conns();
+            let mut conn = Box::new(io::Conn::new());
+            conn.closing = true;
+            r.inner.conns.borrow_mut().insert(read_end, conn);
+            r.inner.closing_fds.borrow_mut().insert(read_end);
 
-        assert!(!r.inner.conns.borrow().contains_key(&88),
-            "idle closing conn must be removed from conns");
-        assert!(!r.inner.closing_fds.borrow().contains(&88),
-            "reaped fd must be removed from closing_fds");
+            r.reap_closing_conns();
+
+            assert!(!r.inner.conns.borrow().contains_key(&read_end),
+                "idle closing conn must be removed from conns");
+            assert!(!r.inner.closing_fds.borrow().contains(&read_end),
+                "reaped fd must be removed from closing_fds");
+
+            libc::close(write_end);
+        }
     }
 
     #[test]
