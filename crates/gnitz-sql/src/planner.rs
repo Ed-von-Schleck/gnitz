@@ -52,26 +52,24 @@ pub fn execute_statement(
     }
 }
 
-/// Map a TypeCode to its unsigned key equivalent for FK compatibility.
-fn fk_key_type(tc: TypeCode) -> TypeCode {
-    match tc {
-        TypeCode::I8  => TypeCode::U8,
-        TypeCode::I16 => TypeCode::U16,
-        TypeCode::I32 => TypeCode::U32,
-        TypeCode::I64 => TypeCode::U64,
-        other => other,
-    }
+fn is_integer_type(tc: TypeCode) -> bool {
+    matches!(tc,
+        TypeCode::I8  | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
+        | TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
+        | TypeCode::U128
+    )
 }
 
-/// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx).
-/// Validates that fk_col_type is compatible with the parent PK type.
+/// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx, parent_pk_type).
+/// Validates that fk_col_type is compatible with the parent PK type and
+/// returns the parent PK type so the caller can widen the child column.
 fn resolve_fk_target(
     client:           &mut GnitzClient,
     schema_name:      &str,
     foreign_table:    &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
     fk_col_type:      TypeCode,
-) -> Result<(u64, u64), GnitzSqlError> {
+) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
@@ -86,13 +84,18 @@ fn resolve_fk_target(
         }
     }
     let parent_pk_type = ref_schema.columns[ref_schema.pk_index].type_code;
-    if fk_key_type(fk_col_type) != fk_key_type(parent_pk_type) {
+    let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_pk_type) {
+        true
+    } else {
+        fk_col_type == parent_pk_type
+    };
+    if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
             "FK type mismatch: column type {:?} is not compatible with parent PK type {:?}",
             fk_col_type, parent_pk_type,
         )));
     }
-    Ok((ref_tid, ref_schema.pk_index as u64))
+    Ok((ref_tid, ref_schema.pk_index as u64, parent_pk_type))
 }
 
 fn execute_create_table(
@@ -104,51 +107,67 @@ fn execute_create_table(
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
 
     let sql_cols = &create.columns;
-    let mut pk_idx = 0usize;
-    let mut cols: Vec<ColumnDef> = Vec::new();
+    let mut pk_idx: Option<usize> = None;
 
-    for (i, col) in sql_cols.iter().enumerate() {
-        let tc = sql_type_to_typecode(&col.data_type)?;
-        let is_nullable = !col.options.iter().any(|o| {
-            matches!(o.option, ColumnOption::NotNull)
-        });
+    // Phase 1 — build column defs (name, type, nullability only).
+    let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
+    for col in sql_cols.iter() {
         cols.push(ColumnDef {
             name:        col.name.value.clone(),
-            type_code:   tc,
-            is_nullable,
+            type_code:   sql_type_to_typecode(&col.data_type)?,
+            is_nullable: !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
             fk_table_id: 0,
             fk_col_idx:  0,
         });
-
-        // Detect inline PRIMARY KEY
-        for opt in &col.options {
-            if matches!(opt.option, ColumnOption::Unique { is_primary: true, .. }) {
-                pk_idx = i;
-            }
-        }
-
-        // Detect inline REFERENCES (foreign key)
-        for opt in &col.options {
-            if let ColumnOption::ForeignKey { foreign_table, referred_columns, .. } = &opt.option {
-                let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns, cols[i].type_code)?;
-                cols[i].fk_table_id = tid;
-                cols[i].fk_col_idx  = idx;
-            }
-        }
     }
 
-    // Table-level PRIMARY KEY constraint
+    // Phase 2 — table-level PRIMARY KEY constraints. Done before inline-PK
+    // detection so that an unknown column name in `PRIMARY KEY (...)` raises a
+    // bind error instead of being eclipsed by a duplicate-PK error from a
+    // separate inline `PRIMARY KEY` clause.
     for constraint in &create.constraints {
         if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
-            if let Some(pk_col) = pk_cols.first() {
-                if let Some(i) = sql_cols.iter().position(|c| c.name.value == pk_col.value) {
-                    pk_idx = i;
+            if pk_cols.len() != 1 {
+                return Err(GnitzSqlError::Unsupported(
+                    "PRIMARY KEY must specify exactly one column".into()
+                ));
+            }
+            let idx = sql_cols.iter()
+                .position(|c| c.name.value.eq_ignore_ascii_case(&pk_cols[0].value))
+                .ok_or_else(|| GnitzSqlError::Bind(
+                    format!("PRIMARY KEY column '{}' not found", pk_cols[0].value)
+                ))?;
+            if pk_idx.is_some() {
+                return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+            }
+            pk_idx = Some(idx);
+        }
+    }
+
+    // Phase 3 — inline column PRIMARY KEY + FOREIGN KEY.
+    for (i, col) in sql_cols.iter().enumerate() {
+        for opt in &col.options {
+            match &opt.option {
+                ColumnOption::Unique { is_primary: true, .. } => {
+                    if pk_idx.is_some() {
+                        return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+                    }
+                    pk_idx = Some(i);
                 }
+                ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
+                    let (tid, idx, parent_pk_type) = resolve_fk_target(
+                        client, schema_name, foreign_table, referred_columns, cols[i].type_code,
+                    )?;
+                    cols[i].fk_table_id = tid;
+                    cols[i].fk_col_idx  = idx;
+                    cols[i].type_code   = parent_pk_type;
+                }
+                _ => {}
             }
         }
     }
 
-    // Table-level FOREIGN KEY constraints
+    // Phase 4 — table-level FOREIGN KEY constraints.
     for constraint in &create.constraints {
         if let TableConstraint::ForeignKey { columns, foreign_table, referred_columns, .. } = constraint {
             if columns.len() != 1 {
@@ -157,24 +176,32 @@ fn execute_create_table(
                 ));
             }
             let local_col_name = &columns[0].value;
-            let col_idx = sql_cols.iter().position(|c| c.name.value == *local_col_name)
+            let col_idx = cols.iter()
+                .position(|c| c.name.eq_ignore_ascii_case(local_col_name))
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
                     "FOREIGN KEY column '{}' not found in table definition", local_col_name
                 )))?;
-            let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns, cols[col_idx].type_code)?;
+            let (tid, idx, parent_pk_type) = resolve_fk_target(
+                client, schema_name, foreign_table, referred_columns, cols[col_idx].type_code,
+            )?;
             cols[col_idx].fk_table_id = tid;
             cols[col_idx].fk_col_idx  = idx;
+            cols[col_idx].type_code   = parent_pk_type;
         }
     }
 
-    // Coerce PK column to unsigned (server requires U64 or U128)
+    let pk_idx = pk_idx.ok_or_else(|| GnitzSqlError::Plan(
+        "CREATE TABLE: exactly one PRIMARY KEY must be defined".into()
+    ))?;
+
+    // Coerce PK to a non-nullable U64/U128/UUID — the server's null bitmap
+    // excludes the PK region, so a nullable PK has no place to carry the null.
     cols[pk_idx].type_code = match cols[pk_idx].type_code {
-        TypeCode::I8  => TypeCode::U8,
-        TypeCode::I16 => TypeCode::U16,
-        TypeCode::I32 => TypeCode::U32,
-        TypeCode::I64 => TypeCode::U64,
+        TypeCode::I8  | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
+        | TypeCode::U8 | TypeCode::U16 | TypeCode::U32 => TypeCode::U64,
         tc => tc,
     };
+    cols[pk_idx].is_nullable = false;
 
     let tid = client.create_table(schema_name, &table_name, &cols, pk_idx, true)
         .map_err(GnitzSqlError::Exec)?;
@@ -930,11 +957,16 @@ fn execute_create_group_by_view(
         }
     }
 
-    // 4. Determine reduce output schema layout
-    let use_natural_pk = group_col_indices.len() == 1 && matches!(
-        source_schema.columns[group_col_indices[0]].type_code,
-        TypeCode::U64 | TypeCode::U128
-    );
+    // 4. Determine reduce output schema layout.
+    //    A nullable group column cannot become the natural PK — the PK region
+    //    has no null bitmap, so we fall through to the synthetic _group_pk
+    //    (U128, non-nullable) path which is always safe.
+    let use_natural_pk = group_col_indices.len() == 1
+        && matches!(
+            source_schema.columns[group_col_indices[0]].type_code,
+            TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
+        )
+        && !source_schema.columns[group_col_indices[0]].is_nullable;
 
     // agg_col_offset: index of first aggregate column in reduce output
     let agg_col_offset = if use_natural_pk { 1 } else { 1 + group_col_indices.len() };
@@ -1001,7 +1033,13 @@ fn execute_create_group_by_view(
                 let tc = reduce_schema.columns[reduce_col].type_code;
                 post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
                 out_cols.push(ColumnDef {
-                    name: name.clone(), type_code: tc, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+                    name: name.clone(),
+                    type_code: tc,
+                    // Natural-PK path: source col is non-nullable (asserted by use_natural_pk).
+                    // Synthetic-PK path: propagate source nullability — nothing forces NOT NULL.
+                    is_nullable: source_schema.columns[*src_col].is_nullable,
+                    fk_table_id: 0,
+                    fk_col_idx:  0,
                 });
                 payload_idx += 1;
             }

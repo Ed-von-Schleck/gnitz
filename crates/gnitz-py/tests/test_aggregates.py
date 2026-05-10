@@ -395,3 +395,119 @@ class TestGroupBy:
             client.execute_sql("DROP TABLE orders", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+
+class TestGroupByPkAndNullable:
+    """`GROUP BY` containing the PK column or a nullable column."""
+
+    def test_group_by_pk_and_other_col(self, client):
+        """`GROUP BY pk, other_col` must produce one group per PK (since PKs
+        are unique)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE orders ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  category BIGINT NOT NULL,"
+                "  amount BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS "
+                "SELECT pk, category, COUNT(*) AS cnt "
+                "FROM orders GROUP BY pk, category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 3
+            by_pk = {r["pk"]: r for r in rows}
+            assert by_pk[1]["category"] == 10 and by_pk[1]["cnt"] == 1
+            assert by_pk[2]["category"] == 10 and by_pk[2]["cnt"] == 1
+            assert by_pk[3]["category"] == 20 and by_pk[3]["cnt"] == 1
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_group_by_pk_and_other_col_uuid_pk(self, client):
+        """`GROUP BY pk, other_col` with a 16-byte UUID PK projection."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE items ("
+                "  pk UUID NOT NULL PRIMARY KEY,"
+                "  category BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS "
+                "SELECT pk, category, COUNT(*) AS cnt "
+                "FROM items GROUP BY pk, category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            uuid_a = '550e8400-e29b-41d4-a716-446655440000'
+            uuid_b = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
+            client.execute_sql(
+                f"INSERT INTO items VALUES ('{uuid_a}', 10), ('{uuid_b}', 20)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 2
+            by_pk = {r["pk"]: r for r in rows}
+            assert by_pk[uuid_a]["category"] == 10 and by_pk[uuid_a]["cnt"] == 1
+            assert by_pk[uuid_b]["category"] == 20 and by_pk[uuid_b]["cnt"] == 1
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE items", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_group_by_nullable_int_distinguishes_null_from_zero(self, client):
+        """`GROUP BY nullable_int` must form a distinct group for NULL,
+        not merge it with the integer-zero group (NULL stores as zero bytes)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  grp BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT grp, COUNT(*) AS cnt FROM t GROUP BY grp",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Two rows with grp=NULL, one with grp=0, one with grp=7.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, NULL), (2, 0), (3, NULL), (4, 7)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            # Three distinct groups: NULL, 0, 7
+            assert len(rows) == 3, f"expected 3 groups, got {len(rows)}: {rows}"
+            counts = {r["grp"]: r["cnt"] for r in rows}
+            assert counts.get(None) == 2, f"NULL group must have 2 rows; got {counts}"
+            assert counts.get(0) == 1, f"0-group must have 1 row; got {counts}"
+            assert counts.get(7) == 1, f"7-group must have 1 row; got {counts}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

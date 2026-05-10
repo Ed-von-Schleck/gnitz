@@ -133,8 +133,14 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 // ---------------------------------------------------------------------------
 
 /// Map logical column index to payload column index (skipping the PK column).
+///
+/// Caller must ensure `col_idx != pk_index`. For `col_idx == pk_index == 0`
+/// this would underflow; for the general `col_idx == pk_index` case it
+/// silently returns the wrong slot. Callers handle the PK separately
+/// (e.g. via `SchemaDescriptor::is_pk_col`).
 #[inline]
 pub(super) fn payload_idx(col_idx: usize, pk_index: usize) -> usize {
+    debug_assert!(col_idx != pk_index, "payload_idx: col_idx must not be the pk_index");
     if col_idx < pk_index { col_idx } else { col_idx - 1 }
 }
 
@@ -156,57 +162,107 @@ pub(super) fn extract_group_key(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u128 {
-    let pki = schema.pk_index as usize;
+    // PK single-column: return raw pk directly.
+    if group_by_cols.len() == 1 && schema.is_pk_col(group_by_cols[0] as usize) {
+        return mb.get_pk(row);
+    }
 
     if group_by_cols.len() == 1 {
         let c_idx = group_by_cols[0] as usize;
         let tc = schema.columns[c_idx].type_code;
-        if tc == type_code::U64 || tc == type_code::I64 {
-            let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 8);
-            let v = u64::from_le_bytes(ptr.try_into().unwrap());
-            return v as u128;
-        }
-        if tc == type_code::U128 || tc == type_code::UUID {
-            let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 16);
-            return u128::from_le_bytes(ptr[0..16].try_into().unwrap());
+        // Skip fast path for nullable — hash loop handles NULL distinctly.
+        if schema.columns[c_idx].nullable == 0 {
+            if tc == type_code::U64 || tc == type_code::I64 {
+                let pi = schema.payload_idx(c_idx);
+                let ptr = mb.get_col_ptr(row, pi, 8);
+                let v = u64::from_le_bytes(ptr.try_into().unwrap());
+                return v as u128;
+            }
+            if tc == type_code::U128 || tc == type_code::UUID {
+                let pi = schema.payload_idx(c_idx);
+                let ptr = mb.get_col_ptr(row, pi, 16);
+                return u128::from_le_bytes(ptr[0..16].try_into().unwrap());
+            }
         }
     }
 
+    let null_word = mb.get_null_word(row);
     let mut h: u64 = 0x9E3779B97F4A7C15; // golden ratio seed
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
         let c_idx = c_idx_u32 as usize;
         let tc = schema.columns[c_idx].type_code;
-        let col_hash = if tc == TYPE_STRING {
-            let pi = payload_idx(c_idx, pki);
-            let struct_bytes = mb.get_col_ptr(row, pi, 16);
-            let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-            if length == 0 {
-                0u64
-            } else if length <= SHORT_STRING_THRESHOLD {
-                xxh::checksum(&struct_bytes[4..4 + length])
+        let col_hash = if schema.is_pk_col(c_idx) {
+            let pk = mb.get_pk(row);
+            if tc == type_code::U128 || tc == type_code::UUID {
+                let lo = pk as u64;
+                let hi = (pk >> 64) as u64;
+                mix64(lo ^ mix64(hi))
             } else {
-                let heap_offset =
-                    u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
+                mix64(pk as u64)
             }
-        } else if tc == type_code::U128 || tc == type_code::UUID {
-            let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 16);
-            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
-            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
-            mix64(lo ^ mix64(hi))
         } else {
-            let pi = payload_idx(c_idx, pki);
-            let cs = schema.columns[c_idx].size as usize;
-            let ptr = mb.get_col_ptr(row, pi, cs);
-            let mut buf = [0u8; 8];
-            buf[..cs].copy_from_slice(ptr);
-            mix64(u64::from_le_bytes(buf))
+            let pi = schema.payload_idx(c_idx);
+            if schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0 {
+                // NULL — position-dependent constant keeps (NULL, v) distinct from (v, NULL).
+                h = mix64(h ^ 0xDEAD_BEEF_DEAD_BEEF ^ (i as u64));
+                continue;
+            }
+            if tc == TYPE_STRING {
+                let struct_bytes = mb.get_col_ptr(row, pi, 16);
+                let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+                if length == 0 {
+                    0u64
+                } else if length <= SHORT_STRING_THRESHOLD {
+                    xxh::checksum(&struct_bytes[4..4 + length])
+                } else {
+                    let heap_offset =
+                        u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+                    xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
+                }
+            } else if tc == type_code::U128 || tc == type_code::UUID {
+                let ptr = mb.get_col_ptr(row, pi, 16);
+                let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
+                mix64(lo ^ mix64(hi))
+            } else {
+                let cs = schema.columns[c_idx].size as usize;
+                let ptr = mb.get_col_ptr(row, pi, cs);
+                let mut buf = [0u8; 8];
+                buf[..cs].copy_from_slice(ptr);
+                mix64(u64::from_le_bytes(buf))
+            }
         };
         h = mix64(h ^ col_hash ^ (i as u64));
     }
     let h_hi = mix64(h ^ (group_by_cols.len() as u64));
     ((h_hi as u128) << 64) | (h as u128)
+}
+
+/// Extract 64-bit group key for AVI / GI composite keys.
+///
+/// For single-column non-nullable U128/UUID (including U128/UUID PK), mix
+/// both halves to avoid truncation collisions; `extract_group_key` returns
+/// the raw 128 bits in those cases. All other shapes already encode their
+/// distinguishing information in the low 64 bits.
+pub(super) fn extract_gc_u64(
+    mb: &MemBatch,
+    row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> u64 {
+    let key_u128 = extract_group_key(mb, row, schema, group_by_cols);
+
+    if group_by_cols.len() == 1 {
+        let c_idx = group_by_cols[0] as usize;
+        let tc = schema.columns[c_idx].type_code;
+        if (tc == type_code::U128 || tc == type_code::UUID)
+            && schema.columns[c_idx].nullable == 0
+        {
+            let lo = key_u128 as u64;
+            let hi = (key_u128 >> 64) as u64;
+            return mix64(lo ^ mix64(hi));
+        }
+    }
+
+    key_u128 as u64
 }

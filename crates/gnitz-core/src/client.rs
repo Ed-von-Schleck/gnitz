@@ -404,6 +404,14 @@ impl GnitzClient {
         circuit: Circuit,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
+        // The view's first column is its physical PK — it has no null bitmap,
+        // so a nullable first column is internally inconsistent.
+        if output_columns.is_empty() || output_columns[0].is_nullable {
+            return Err(ClientError::ServerError(
+                "View Primary Key column must not be nullable".into()
+            ));
+        }
+
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))

@@ -4,21 +4,14 @@ use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
 use crate::storage::{Batch, MemBatch};
 
 // ---------------------------------------------------------------------------
-// Helper: payload index
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn payload_idx(col_idx: usize, pk_index: usize) -> usize {
-    if col_idx < pk_index { col_idx } else { col_idx - 1 }
-}
-
-// ---------------------------------------------------------------------------
 // Column promotion helpers
 // ---------------------------------------------------------------------------
 
 /// Promote a column value to u64 for GroupIndex composite keys.
-fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> u64 {
-    let pi = payload_idx(col_idx, pk_index);
+///
+/// Caller is responsible for resolving `pi`; this helper is schema-agnostic
+/// so PK and payload reads can dispatch externally.
+fn promote_col_to_u64(mb: &MemBatch, row: usize, pi: usize, col_type_code: u8) -> u64 {
     let cs = match col_type_code {
         type_code::U8 | type_code::I8 => 1,
         type_code::U16 | type_code::I16 => 2,
@@ -35,13 +28,10 @@ fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize
 fn promote_agg_col_to_u64_ordered(
     mb: &MemBatch,
     row: usize,
-    col_idx: usize,
-    pk_index: usize,
+    pi: usize,
     col_type_code: u8,
     for_max: bool,
 ) -> u64 {
-    let pi = payload_idx(col_idx, pk_index);
-
     if col_type_code == type_code::F32 {
         let ptr = mb.get_col_ptr(row, pi, 4);
         let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
@@ -79,16 +69,6 @@ fn ieee_order_bits(raw_bits: u64) -> u64 {
 
 fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
     (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
-}
-
-/// Extract 64-bit group key for AVI composite keys.
-fn extract_gc_u64(
-    mb: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u64 {
-    super::util::extract_group_key(mb, row, schema, group_by_cols) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +149,6 @@ pub fn op_integrate_with_indexes(
     }
 
     let mb = batch.as_mem_batch();
-    let pki = input_schema.pk_index as usize;
 
     // GroupIndex population
     if let Some(gi_desc) = gi {
@@ -179,17 +158,24 @@ pub fn op_integrate_with_indexes(
         gi_batch.consolidated = false;
 
         let gi_col = gi_desc.col_idx as usize;
-        let gi_pi = payload_idx(gi_col, pki);
+        let gi_is_pk = input_schema.is_pk_col(gi_col);
+        // PK has no payload-index slot; the null-bit probe is skipped below,
+        // so a dummy 0 is safe.
+        let gi_pi = if gi_is_pk { 0 } else { input_schema.payload_idx(gi_col) };
 
         for row in 0..batch.count {
-            // Skip null group column
-            let null_word = mb.get_null_word(row);
-            if (null_word >> gi_pi) & 1 != 0 {
+            // PK is never null (catalog rule: pk-not-null.md), so its dense
+            // bit position is undefined and the null probe is skipped.
+            if !gi_is_pk && (mb.get_null_word(row) >> gi_pi) & 1 != 0 {
                 continue;
             }
 
-            let gc_u64 = promote_col_to_u64(&mb, row, gi_col, pki, gi_desc.col_type_code);
             let source_pk = mb.get_pk(row);
+            let gc_u64 = if gi_is_pk {
+                source_pk as u64
+            } else {
+                promote_col_to_u64(&mb, row, gi_pi, gi_desc.col_type_code)
+            };
             let source_pk_lo = source_pk as u64;
             let source_pk_hi = (source_pk >> 64) as u64;
             let weight = mb.get_weight(row);
@@ -217,20 +203,27 @@ pub fn op_integrate_with_indexes(
         avi_batch.consolidated = false;
 
         let avi_col = avi_desc.agg_col_idx as usize;
-        let avi_pi = payload_idx(avi_col, pki);
+        let avi_is_pk = input_schema.is_pk_col(avi_col);
+        let avi_pi = if avi_is_pk { 0 } else { input_schema.payload_idx(avi_col) };
 
         for row in 0..batch.count {
-            // Skip null agg column
-            let null_word = mb.get_null_word(row);
-            if (null_word >> avi_pi) & 1 != 0 {
+            // PK is never null, so its dense bit position is undefined.
+            if !avi_is_pk && (mb.get_null_word(row) >> avi_pi) & 1 != 0 {
                 continue;
             }
 
-            let gc_u64 = extract_gc_u64(&mb, row, &avi_desc.input_schema, &avi_desc.group_by_cols);
-            let av_u64 = promote_agg_col_to_u64_ordered(
-                &mb, row, avi_col, pki,
-                avi_desc.agg_col_type_code, avi_desc.for_max,
+            let gc_u64 = super::util::extract_gc_u64(
+                &mb, row, &avi_desc.input_schema, &avi_desc.group_by_cols,
             );
+            let av_u64 = if avi_is_pk {
+                let val = mb.get_pk(row) as u64;
+                if avi_desc.for_max { !val } else { val }
+            } else {
+                promote_agg_col_to_u64_ordered(
+                    &mb, row, avi_pi,
+                    avi_desc.agg_col_type_code, avi_desc.for_max,
+                )
+            };
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = av_u64, ck_hi = gc_u64

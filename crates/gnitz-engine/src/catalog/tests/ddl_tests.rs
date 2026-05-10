@@ -333,3 +333,33 @@ fn test_edge_cases_extended() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── test_nullable_pk_rejected ─────────────────────────────────────────
+// The PK region has no null bitmap (foundations.md §6); the catalog must
+// refuse to record a nullable PK regardless of its type.
+
+#[test]
+fn test_nullable_pk_rejected() {
+    let dir = temp_dir("nullable_pk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![
+        ColumnDef {
+            name: "id".into(),
+            type_code: type_code::U64,
+            is_nullable: true,
+            fk_table_id: 0,
+            fk_col_idx:  0,
+        },
+        str_col_def("name"),
+    ];
+    let err = engine.create_table("public.bad_pk_null", &cols, 0, true).unwrap_err();
+    assert!(err.contains("nullable"), "expected nullable-PK error, got: {}", err);
+
+    // Sanity: same shape with is_nullable=false succeeds.
+    let cols_ok = vec![u64_col_def("id"), str_col_def("name")];
+    engine.create_table("public.ok_pk", &cols_ok, 0, true).unwrap();
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

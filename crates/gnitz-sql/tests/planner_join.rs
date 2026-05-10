@@ -12,7 +12,7 @@ fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let sn = format!("s{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
     client.create_schema(&sn).unwrap();
     (client, sn)
 }
@@ -23,8 +23,8 @@ fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
 #[test]
 fn test_join_select_qualified_alias() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (client, sn) = make_planner(&srv);
-    let p = SqlPlanner::new(&client, &sn);
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
 
     p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, v BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, w BIGINT NOT NULL)").unwrap();
@@ -41,8 +41,8 @@ fn test_join_select_qualified_alias() {
 #[test]
 fn test_join_select_unqualified_alias() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (client, sn) = make_planner(&srv);
-    let p = SqlPlanner::new(&client, &sn);
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
 
     p.execute("CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, xv BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, yv BIGINT NOT NULL)").unwrap();
@@ -57,8 +57,8 @@ fn test_join_select_unqualified_alias() {
 #[test]
 fn test_join_select_no_alias() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (client, sn) = make_planner(&srv);
-    let p = SqlPlanner::new(&client, &sn);
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
 
     p.execute("CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE q (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, qv BIGINT NOT NULL)").unwrap();
@@ -71,8 +71,8 @@ fn test_join_select_no_alias() {
 #[test]
 fn test_join_select_wildcard() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (client, sn) = make_planner(&srv);
-    let p = SqlPlanner::new(&client, &sn);
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
 
     p.execute("CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
@@ -85,8 +85,8 @@ fn test_join_select_wildcard() {
 #[test]
 fn test_join_select_mixed_alias_and_bare() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (client, sn) = make_planner(&srv);
-    let p = SqlPlanner::new(&client, &sn);
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
 
     p.execute("CREATE TABLE m (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, mv BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, nv BIGINT NOT NULL)").unwrap();

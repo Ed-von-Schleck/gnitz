@@ -147,6 +147,13 @@ impl CatalogEngine {
             return Err("Primary Key must be TYPE_U64, TYPE_U128, or UUID".into());
         }
 
+        // PK must be non-nullable: the row layout reserves no null bit for the
+        // PK region (foundations.md §6), so a nullable PK is internally
+        // inconsistent regardless of the type.
+        if col_defs[pk_col_idx as usize].is_nullable {
+            return Err("Primary Key column must not be nullable".into());
+        }
+
         let tid = self.allocate_table_id();
         let sid = self.get_schema_id(schema_name);
         let self_pk_type = col_defs[pk_col_idx as usize].type_code;

@@ -72,7 +72,19 @@ impl SchemaDescriptor {
         let pk = self.pk_index as usize;
         if col_idx < pk { col_idx } else { col_idx - 1 }
     }
+
+    /// True iff column `ci` is the PK column.
+    #[inline]
+    pub fn is_pk_col(&self, ci: usize) -> bool {
+        ci == self.pk_index as usize
+    }
 }
+
+/// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`)
+/// that needs to express "this slot refers to the PK, not a payload
+/// column". Using `u8::MAX` (not 0) keeps the sentinel unambiguous
+/// against a real payload index of 0.
+pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {

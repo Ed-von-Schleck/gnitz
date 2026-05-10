@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{
     Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor,
     scatter_copy, write_to_batch,
@@ -38,7 +38,7 @@ fn fill_cleared_batch(
 
 use super::util::{
     write_string_from_batch, payload_idx,
-    extract_group_key,
+    extract_group_key, extract_gc_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -402,35 +402,6 @@ fn pk_as_i64(pk: u128, tc: TypeCode) -> i64 {
 // Group key extraction
 // ---------------------------------------------------------------------------
 
-/// Extract 64-bit group key for AVI composite keys.
-pub(super) fn extract_gc_u64(
-    mb: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u64 {
-    let pki = schema.pk_index as usize;
-    if group_by_cols.len() == 1 {
-        let c_idx = group_by_cols[0] as usize;
-        let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
-        let eligible = match tc {
-            TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
-            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 => true,
-            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob => false,
-        };
-        if eligible {
-            let pi = payload_idx(c_idx, pki);
-            let cs = tc.stride() as usize;
-            let ptr = mb.get_col_ptr(row, pi, cs);
-            let mut buf = [0u8; 8];
-            buf[..cs].copy_from_slice(ptr);
-            return u64::from_le_bytes(buf);
-        }
-    }
-    let key_u128 = extract_group_key(mb, row, schema, group_by_cols);
-    key_u128 as u64
-}
-
 /// Reverse IEEE order-preserving encoding.
 fn ieee_order_bits_reverse(encoded: u64) -> u64 {
     if encoded >> 63 != 0 {
@@ -476,8 +447,32 @@ fn compare_by_group_cols(
     row_b: usize,
     descs: &[SortDesc],
 ) -> std::cmp::Ordering {
+    let a_null_word = mb.get_null_word(row_a);
+    let b_null_word = mb.get_null_word(row_b);
+
     for desc in descs {
+        if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
+            let ord = mb.get_pk(row_a).cmp(&mb.get_pk(row_b));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            continue;
+        }
+
         let pi = desc.pi as usize;
+
+        // NULL is never set on non-nullable columns, so the bit is always 0
+        // there and this branch is harmless. NULLs sort before non-NULLs
+        // (NULLS FIRST), so all NULLs are adjacent and form a single group.
+        let a_is_null = (a_null_word >> pi) & 1 != 0;
+        let b_is_null = (b_null_word >> pi) & 1 != 0;
+        match (a_is_null, b_is_null) {
+            (true, true) => continue,
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {}
+        }
+
         let ord = match desc.tc {
             TypeCode::String => {
                 let a_bytes = mb.get_col_ptr(row_a, pi, 16);
@@ -543,13 +538,16 @@ fn build_sort_descs(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> ([SortDesc; crate::schema::MAX_COLUMNS], usize) {
-    let pki = schema.pk_index as usize;
     let mut arr = [SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0 }; crate::schema::MAX_COLUMNS];
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
         let c_idx = c_idx_u32 as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
         arr[i] = SortDesc {
-            pi: payload_idx(c_idx, pki) as u8,
+            pi: if schema.is_pk_col(c_idx) {
+                PAYLOAD_MAPPING_PK_SENTINEL
+            } else {
+                schema.payload_idx(c_idx) as u8
+            },
             cs: tc.stride(),
             tc,
             c_idx: c_idx as u8,
@@ -570,30 +568,38 @@ fn argsort_delta(
         return (0..n as u32).collect();
     }
 
-    let pki = schema.pk_index as usize;
     if group_by_cols.len() == 1 {
         let ci = group_by_cols[0] as usize;
+        debug_assert!(
+            !schema.is_pk_col(ci),
+            "group_by_pk should have intercepted single-PK group before argsort_delta"
+        );
         let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-        let pi = payload_idx(ci, pki);
-        macro_rules! packed_sort {
-            ($T:ty, $stride:expr) => {{
-                let keys: Vec<$T> = (0..n)
-                    .map(|i| {
-                        let ptr = mb.get_col_ptr(i, pi, $stride);
-                        <$T>::from_le_bytes(ptr.try_into().unwrap())
-                    })
-                    .collect();
-                let mut indices: Vec<u32> = (0..n as u32).collect();
-                indices.sort_unstable_by_key(|&i| keys[i as usize]);
-                return indices;
-            }};
-        }
-        match tc {
-            TypeCode::I64 => packed_sort!(i64, 8),
-            TypeCode::U64 => packed_sort!(u64, 8),
-            TypeCode::I32 => packed_sort!(i32, 4),
-            TypeCode::U32 => packed_sort!(u32, 4),
-            _ => {}
+        let pi = schema.payload_idx(ci);
+        // NULL stores as zero bytes; packed_sort would interleave NULLs with
+        // the integer 0, so it must only run on non-nullable columns. Nullable
+        // single-column falls through to compare_by_group_cols below.
+        if schema.columns[ci].nullable == 0 {
+            macro_rules! packed_sort {
+                ($T:ty, $stride:expr) => {{
+                    let keys: Vec<$T> = (0..n)
+                        .map(|i| {
+                            let ptr = mb.get_col_ptr(i, pi, $stride);
+                            <$T>::from_le_bytes(ptr.try_into().unwrap())
+                        })
+                        .collect();
+                    let mut indices: Vec<u32> = (0..n as u32).collect();
+                    indices.sort_unstable_by_key(|&i| keys[i as usize]);
+                    return indices;
+                }};
+            }
+            match tc {
+                TypeCode::I64 => packed_sort!(i64, 8),
+                TypeCode::U64 => packed_sort!(u64, 8),
+                TypeCode::I32 => packed_sort!(i32, 4),
+                TypeCode::U32 => packed_sort!(u32, 4),
+                _ => {}
+            }
         }
     }
 
@@ -894,14 +900,17 @@ pub fn op_reduce(
                             ti_cursor.advance();
                         }
                     } else if let Some(gi_c) = gi.as_deref_mut() {
-                        let pki = input_schema.pk_index as usize;
                         let gi_ci = gi_col_idx as usize;
-                        let pi = payload_idx(gi_ci, pki);
-                        let cs = input_schema.columns[gi_ci].size as usize;
-                        let ptr = mb.get_col_ptr(group_start_idx, pi, cs);
-                        let mut buf = [0u8; 8];
-                        buf[..cs].copy_from_slice(ptr);
-                        let gc_u64_val = u64::from_le_bytes(buf);
+                        let gc_u64_val = if input_schema.is_pk_col(gi_ci) {
+                            mb.get_pk(group_start_idx) as u64
+                        } else {
+                            let cs = input_schema.columns[gi_ci].size as usize;
+                            let pi = input_schema.payload_idx(gi_ci);
+                            let ptr = mb.get_col_ptr(group_start_idx, pi, cs);
+                            let mut buf = [0u8; 8];
+                            buf[..cs].copy_from_slice(ptr);
+                            u64::from_le_bytes(buf)
+                        };
                         gi_c.seek(crate::util::make_pk(0, gc_u64_val));
                         while gi_c.valid {
                             let gk_hi = (gi_c.current_key >> 64) as u64;
@@ -1022,7 +1031,6 @@ fn emit_reduce_row(
     num_aggs: usize,
 ) {
     let out_pki = output_schema.pk_index as usize;
-    let in_pki = input_schema.pk_index as usize;
     let num_out_cols = output_schema.num_columns as usize;
 
     output.extend_pk(group_key);
@@ -1065,20 +1073,26 @@ fn emit_reduce_row(
             let grp_idx = ci - 1; // skip PK at 0
             if grp_idx < group_by_cols.len() {
                 let src_ci = group_by_cols[grp_idx] as usize;
-                let src_pi = payload_idx(src_ci, in_pki);
-                // Check null from input
-                let in_null = input_mb.get_null_word(exemplar_row);
-                if (in_null >> src_pi) & 1 != 0 {
-                    null_word |= 1u64 << out_pi;
-                    output.fill_col_zero(out_pi, cs);
-                } else if col.type_code == TypeCode::String as u8 {
-                    write_string_from_batch(
-                        output, out_pi,
-                        input_mb, exemplar_row, src_pi,
-                    );
+                if input_schema.is_pk_col(src_ci) {
+                    // PK is never null and lives outside the payload region.
+                    let pk = input_mb.get_pk(exemplar_row);
+                    output.extend_col(out_pi, &pk.to_le_bytes()[..cs]);
                 } else {
-                    let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
-                    output.extend_col(out_pi, src);
+                    let src_pi = input_schema.payload_idx(src_ci);
+                    // Check null from input
+                    let in_null = input_mb.get_null_word(exemplar_row);
+                    if (in_null >> src_pi) & 1 != 0 {
+                        null_word |= 1u64 << out_pi;
+                        output.fill_col_zero(out_pi, cs);
+                    } else if col.type_code == TypeCode::String as u8 {
+                        write_string_from_batch(
+                            output, out_pi,
+                            input_mb, exemplar_row, src_pi,
+                        );
+                    } else {
+                        let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
+                        output.extend_col(out_pi, src);
+                    }
                 }
             } else {
                 output.fill_col_zero(out_pi, cs);
@@ -1136,12 +1150,12 @@ fn emit_finalized_row(
             match out_cols[out_col_idx] {
                 OutputColKind::CopyCol(src_col) => {
                     if src_col == raw_pki {
-                        // Source is the PK column — read from pk_lo
+                        // Source is the PK column — slice from the full 16-byte
+                        // little-endian PK so 8- and 16-byte column sizes both work.
                         let pk = raw_mb.get_pk(raw_row);
-                        let pk_lo = pk as u64;
-                        fin_output.extend_col(fpi, &pk_lo.to_le_bytes()[..cs]);
+                        fin_output.extend_col(fpi, &pk.to_le_bytes()[..cs]);
                     } else {
-                        let src_pi = payload_idx(src_col, raw_pki);
+                        let src_pi = raw_schema.payload_idx(src_col);
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
                             fin_output.fill_col_zero(fpi, cs);
@@ -1189,9 +1203,28 @@ fn cursor_matches_group(
     exemplar_row: usize,
     descs: &[SortDesc],
 ) -> bool {
+    let cursor_null_word = cursor.current_null_word;
+    let exemplar_null_word = exemplar_mb.get_null_word(exemplar_row);
+
     for desc in descs {
+        if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
+            if cursor.current_key != exemplar_mb.get_pk(exemplar_row) {
+                return false;
+            }
+            continue;
+        }
+
         let pi = desc.pi as usize;
         let cs = desc.cs as usize;
+
+        let cursor_is_null = (cursor_null_word >> pi) & 1 != 0;
+        let exemplar_is_null = (exemplar_null_word >> pi) & 1 != 0;
+        if cursor_is_null != exemplar_is_null {
+            return false;
+        }
+        if cursor_is_null {
+            continue;
+        }
 
         let cursor_ptr = cursor.col_ptr(desc.c_idx as usize, cs);
         if cursor_ptr.is_null() {
@@ -2402,5 +2435,311 @@ mod tests {
         assert_eq!(m, 200,
             "MIN(grp=5) must include history row val=200; \
              got {m} — GI group-key over-read produced a garbage gc_u64_val");
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP BY containing the PK column (mixed pk/non-pk group_by_cols).
+    // -----------------------------------------------------------------------
+
+    /// Schema: U64 pk (col 0) | I64 other (col 1). pk_index = 0.
+    fn make_schema_pk0_u64_i64() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        s
+    }
+
+    /// Schema: I64 other (col 0) | U64 pk (col 1). pk_index = 1.
+    fn make_schema_pk1_i64_u64() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 1,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s
+    }
+
+    /// Build a 2-col batch (pk, other) with explicit pk values and `other` payload.
+    /// Works for either pk_index=0 or pk_index=1 since extend_col(pi, ..) addresses
+    /// the dense payload region — the non-PK column always lives at payload index 0.
+    fn build_pk_other(schema: &SchemaDescriptor, rows: &[(u64, i64)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, other) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &other.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_extract_group_key_includes_pk_pki0() {
+        // GROUP BY [pk, other] with pk_index=0: hash loop must dispatch via
+        // is_pk_col, not call payload_idx(0, 0) and underflow.
+        let schema = make_schema_pk0_u64_i64();
+        let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
+        let mb = batch.as_mem_batch();
+
+        let k_pk10_v100 = extract_group_key(&mb, 0, &schema, &[0, 1]);
+        let k_pk20_v100 = extract_group_key(&mb, 1, &schema, &[0, 1]);
+        let k_pk10_v200 = extract_group_key(&mb, 2, &schema, &[0, 1]);
+        let k_pk10_v100_again = extract_group_key(&mb, 0, &schema, &[0, 1]);
+
+        assert_ne!(k_pk10_v100, k_pk20_v100, "different PKs, same other → distinct keys");
+        assert_ne!(k_pk10_v100, k_pk10_v200, "same PK, different other → distinct keys");
+        assert_eq!(k_pk10_v100, k_pk10_v100_again, "same row → same key");
+    }
+
+    #[test]
+    fn test_extract_group_key_includes_pk_pki1() {
+        // GROUP BY [other, pk] with pk_index=1: previously read the wrong
+        // payload column when c_idx == pki for non-zero pk_index.
+        let schema = make_schema_pk1_i64_u64();
+        let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
+        let mb = batch.as_mem_batch();
+
+        // group_by [col 0 = other, col 1 = pk]
+        let k_pk10_v100 = extract_group_key(&mb, 0, &schema, &[0, 1]);
+        let k_pk20_v100 = extract_group_key(&mb, 1, &schema, &[0, 1]);
+        let k_pk10_v200 = extract_group_key(&mb, 2, &schema, &[0, 1]);
+
+        assert_ne!(k_pk10_v100, k_pk20_v100);
+        assert_ne!(k_pk10_v100, k_pk10_v200);
+    }
+
+    #[test]
+    fn test_compare_by_group_cols_includes_pk() {
+        // Sort/compare path must dispatch on the PK sentinel rather than
+        // dereferencing a fake pi for the PK column.
+        let schema = make_schema_pk0_u64_i64();
+        let batch = build_pk_other(&schema, &[(10, 100), (20, 100)]);
+        let mb = batch.as_mem_batch();
+
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[0, 1]);
+        let descs = &descs_arr[..descs_len];
+        // First desc covers PK — must use the sentinel.
+        assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
+
+        assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Less);
+        assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
+        assert_eq!(compare_by_group_cols(&mb, 0, 0, descs), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_argsort_delta_pk_in_group() {
+        // Multi-column group containing PK must reach compare_by_group_cols
+        // and use the sentinel branch — must not panic.
+        let schema = make_schema_pk0_u64_i64();
+        let batch = build_pk_other(&schema, &[
+            (20, 100),
+            (10, 200),
+            (10, 100),
+        ]);
+        let indices = argsort_delta(&batch, &schema, &[0, 1]);
+        assert_eq!(indices.len(), 3);
+        // Sorted by (pk, other): (10,100), (10,200), (20,100)
+        let mb = batch.as_mem_batch();
+        let pks: Vec<u64> = indices.iter().map(|&i| mb.get_pk(i as usize) as u64).collect();
+        assert_eq!(pks, vec![10, 10, 20]);
+        let others: Vec<i64> = indices.iter().map(|&i| {
+            i64::from_le_bytes(mb.get_col_ptr(i as usize, 0, 8).try_into().unwrap())
+        }).collect();
+        assert_eq!(others, vec![100, 200, 100]);
+    }
+
+    // -----------------------------------------------------------------------
+    // NULL group columns must form a distinct group (not merged with 0).
+    // -----------------------------------------------------------------------
+
+    /// Schema: U64 pk | nullable I64.
+    fn make_schema_pk_nullable_i64() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        s
+    }
+
+    /// Build a 2-col batch (pk, nullable_i64). For null rows, payload bytes
+    /// are zero (DirectWriter convention) and the null bit at payload pi=0 is set.
+    fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            let null_word: u64 = if val.is_none() { 1 } else { 0 };
+            b.extend_null_bmp(&null_word.to_le_bytes());
+            // Nulls store as zero bytes — same byte pattern as integer 0.
+            b.extend_col(0, &val.unwrap_or(0).to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_extract_group_key_null_distinct_from_zero() {
+        let schema = make_schema_pk_nullable_i64();
+        let batch = build_pk_null_i64(&schema, &[
+            (1, None),
+            (2, Some(0)),
+            (3, Some(7)),
+            (4, None),
+        ]);
+        let mb = batch.as_mem_batch();
+
+        let k_null = extract_group_key(&mb, 0, &schema, &[1]);
+        let k_zero = extract_group_key(&mb, 1, &schema, &[1]);
+        let k_seven = extract_group_key(&mb, 2, &schema, &[1]);
+        let k_null2 = extract_group_key(&mb, 3, &schema, &[1]);
+
+        assert_ne!(k_null, k_zero, "NULL must form a distinct group from 0");
+        assert_ne!(k_null, k_seven);
+        assert_ne!(k_zero, k_seven);
+        assert_eq!(k_null, k_null2, "two NULL rows must collapse into the same group");
+    }
+
+    #[test]
+    fn test_compare_by_group_cols_nulls_first() {
+        let schema = make_schema_pk_nullable_i64();
+        let batch = build_pk_null_i64(&schema, &[
+            (1, Some(7)),
+            (2, None),
+            (3, None),
+        ]);
+        let mb = batch.as_mem_batch();
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
+        let descs = &descs_arr[..descs_len];
+
+        // NULL < 7 (NULLS FIRST)
+        assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Less);
+        assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Greater);
+        // NULL == NULL → equal (same group)
+        assert_eq!(compare_by_group_cols(&mb, 1, 2, descs), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_argsort_delta_nullable_no_packed_sort() {
+        // Nullable single-column group must skip the packed-sort fast path
+        // (which sorts raw bytes and would interleave NULLs with 0s) and
+        // route through compare_by_group_cols where NULL < non-NULL.
+        let schema = make_schema_pk_nullable_i64();
+        let batch = build_pk_null_i64(&schema, &[
+            (1, Some(0)),
+            (2, None),
+            (3, Some(5)),
+            (4, None),
+        ]);
+        let indices = argsort_delta(&batch, &schema, &[1]);
+        let mb = batch.as_mem_batch();
+        // NULLs must be adjacent (single group), not interleaved with 0s.
+        let null_word_at = |i: u32| mb.get_null_word(i as usize) & 1 != 0;
+        let null_positions: Vec<usize> = indices.iter().enumerate()
+            .filter(|&(_, &i)| null_word_at(i))
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(null_positions.len(), 2, "expected 2 NULL rows");
+        // NULLS FIRST: both nulls at positions 0 and 1.
+        assert_eq!(null_positions, vec![0, 1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // UUID single-column GROUP BY: extract_gc_u64 must mix high+low halves.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_gc_u64_uuid_distinguishes_high_bits() {
+        // Two UUIDs differing only in the high 64 bits previously truncated
+        // to the same low-64 value, colliding in AVI buckets.
+        let schema = make_schema_u64_pk_uuid_payload();
+        let uuid_a: u128 = 0x0000_0000_0000_0001_DEAD_BEEF_CAFE_BABEu128;
+        let uuid_b: u128 = 0xFFFF_FFFF_FFFF_FFFF_DEAD_BEEF_CAFE_BABEu128;
+        // Sanity: low 64 bits identical
+        assert_eq!(uuid_a as u64, uuid_b as u64);
+
+        let batch = build_batch_u64_uuid(&schema, &[(1, uuid_a), (2, uuid_b)]);
+        let mb = batch.as_mem_batch();
+
+        let gc_a = extract_gc_u64(&mb, 0, &schema, &[1]);
+        let gc_b = extract_gc_u64(&mb, 1, &schema, &[1]);
+
+        assert_ne!(gc_a, gc_b,
+            "UUIDs differing only in high 64 bits must produce distinct AVI bucket keys; \
+             pre-fix truncation collided them");
+    }
+
+    // -----------------------------------------------------------------------
+    // emit_finalized_row: U128 PK projected through CopyCol must not panic
+    // when the destination column size is 16 bytes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_finalized_row_u128_pk_copy_col() {
+        use crate::expr::{ExprProgram, EXPR_COPY_COL};
+
+        // Raw output schema: U128 pk | I64 cnt
+        let mut raw_schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        raw_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        raw_schema.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+
+        // Finalized schema: U128 pk_out | U128 pk_copy | I64 cnt
+        let mut fin_schema = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
+        };
+        fin_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        fin_schema.columns[1] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        fin_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+
+        // Two COPY_COL instructions: copy col 0 (PK) and col 1 (cnt).
+        // Layout per instruction: [op, dst, a1=src_col, a2]. classify_output_cols
+        // reads src_col from a1 (instr[base + 2]).
+        let code: Vec<i64> = vec![
+            EXPR_COPY_COL, 0, 0, 0, // copy raw col 0 (PK) → fin col 1
+            EXPR_COPY_COL, 0, 1, 0, // copy raw col 1 (cnt) → fin col 2
+        ];
+        let prog = ExprProgram::new(code, 0, 0, vec![]);
+
+        // Build raw_output with one row: pk = a wide U128, cnt = 42
+        let pk: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
+        let mut raw_output = Batch::with_schema(raw_schema, 1);
+        raw_output.extend_pk(pk);
+        raw_output.extend_weight(&1i64.to_le_bytes());
+        raw_output.extend_null_bmp(&0u64.to_le_bytes());
+        raw_output.extend_col(0, &42i64.to_le_bytes());
+        raw_output.count += 1;
+
+        let mut fin_output = Batch::with_schema(fin_schema, 1);
+        // Must not panic on the 16-byte PK slice. Pre-fix: `pk as u64` produced
+        // 8 bytes and `[..cs]` with cs=16 panicked.
+        emit_finalized_row(
+            &mut fin_output, &raw_output, 0,
+            pk, 1,
+            &prog, &raw_schema, &fin_schema,
+        );
+
+        assert_eq!(fin_output.count, 1);
+        // The PK copy lands in finalized payload column 0 (fin col 1, since fin col 0 is PK).
+        let copied = u128::from_le_bytes(fin_output.col_data(0)[..16].try_into().unwrap());
+        assert_eq!(copied, pk, "U128 PK must round-trip through emit_finalized_row");
     }
 }

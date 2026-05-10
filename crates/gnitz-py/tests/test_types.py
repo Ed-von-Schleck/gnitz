@@ -1371,9 +1371,9 @@ class TestTypeErrors:
 
 class TestPKCoercion:
     """The server accepts only U64 and U128 primary keys.
-    BIGINT is coerced to U64 by the planner. DECIMAL(38,0) maps to U128.
-    Narrower integer types (TINYINT, SMALLINT, INT) are rejected even after
-    the planner coerces them to their unsigned counterparts (U8, U16, U32)."""
+    The planner widens any narrow signed/unsigned integer PK type to U64
+    (TINYINT, SMALLINT, INT, BIGINT, and their UNSIGNED variants).
+    DECIMAL(38,0) maps to U128 directly."""
 
     def _create_table_with_pk(self, client, sn, pk_sql):
         client.create_schema(sn)
@@ -1382,32 +1382,35 @@ class TestPKCoercion:
             schema_name=sn,
         )
 
-    def test_tinyint_pk_rejected(self, client):
-        """TINYINT PK is rejected: server only accepts U64 or U128."""
+    def test_tinyint_pk_widened_to_u64(self, client):
+        """TINYINT PK is widened to U64."""
         sn = "s" + _uid()
         try:
-            with pytest.raises(gnitz.GnitzError):
-                self._create_table_with_pk(client, sn, "TINYINT")
+            self._create_table_with_pk(client, sn, "TINYINT")
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
         finally:
-            _cleanup(client, sn)
+            _cleanup(client, sn, "t")
 
-    def test_smallint_pk_rejected(self, client):
-        """SMALLINT PK is rejected: server only accepts U64 or U128."""
+    def test_smallint_pk_widened_to_u64(self, client):
+        """SMALLINT PK is widened to U64."""
         sn = "s" + _uid()
         try:
-            with pytest.raises(gnitz.GnitzError):
-                self._create_table_with_pk(client, sn, "SMALLINT")
+            self._create_table_with_pk(client, sn, "SMALLINT")
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
         finally:
-            _cleanup(client, sn)
+            _cleanup(client, sn, "t")
 
-    def test_int_pk_rejected(self, client):
-        """INT PK is rejected: server only accepts U64 or U128."""
+    def test_int_pk_widened_to_u64(self, client):
+        """INT PK is widened to U64."""
         sn = "s" + _uid()
         try:
-            with pytest.raises(gnitz.GnitzError):
-                self._create_table_with_pk(client, sn, "INT")
+            self._create_table_with_pk(client, sn, "INT")
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
         finally:
-            _cleanup(client, sn)
+            _cleanup(client, sn, "t")
 
     def test_bigint_pk_coerced_to_u64(self, client):
         """Signed BIGINT PK is coerced to U64 by the planner."""
