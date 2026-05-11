@@ -738,20 +738,11 @@ impl CatalogEngine {
             col_defs.len(),
             col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
         );
-        let mut sd = SchemaDescriptor {
-            num_columns: col_defs.len() as u32,
-            pk_index,
-            columns: [zero_col(); crate::schema::MAX_COLUMNS],
-        };
+        let mut cols = [zero_col(); crate::schema::MAX_COLUMNS];
         for (i, cd) in col_defs.iter().enumerate() {
-            sd.columns[i] = SchemaColumn {
-                type_code: cd.type_code,
-                size: crate::schema::type_size(cd.type_code),
-                nullable: if cd.is_nullable { 1 } else { 0 },
-                _pad: 0,
-            };
+            cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
         }
-        sd
+        SchemaDescriptor::new(&cols[..col_defs.len()], &[pk_index])
     }
 
     // -- FK constraint queries ---------------------------------------------

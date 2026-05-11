@@ -770,16 +770,15 @@ mod tests {
     use super::super::shard_file;
 
     fn test_schema() -> SchemaDescriptor {
-        let mut sd = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS],
-        };
-        // col 0 = PK (U64, size 8)
-        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
-        // col 1 = payload (I64, size 8)
-        sd.columns[1] = SchemaColumn::new(type_code::I64, 0);
-        sd
+        SchemaDescriptor::new(
+            &[
+                // col 0 = PK (U64)
+                SchemaColumn::new(type_code::U64, 0),
+                // col 1 = payload (I64)
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Build and write a shard file with the given PK/value pairs.

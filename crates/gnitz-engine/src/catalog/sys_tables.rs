@@ -106,39 +106,20 @@ pub(super) const fn zero_col() -> SchemaColumn {
 }
 
 pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: cols.len() as u32,
-        pk_index,
-        columns: [zero_col(); crate::schema::MAX_COLUMNS],
-    };
-    let mut i = 0;
-    while i < cols.len() {
-        sd.columns[i] = cols[i];
-        i += 1;
-    }
-    sd
+    SchemaDescriptor::new(cols, &[pk_index])
 }
 
 /// Build a `SchemaDescriptor` from the wire-neutral column slice defined in
 /// `gnitz-wire`. Called at compile time — zero runtime allocation.
 const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u32) -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: cols.len() as u32,
-        pk_index,
-        columns: [zero_col(); crate::schema::MAX_COLUMNS],
-    };
+    let mut buf = [zero_col(); crate::schema::MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
-        let tc = cols[i].type_code;
-        sd.columns[i] = SchemaColumn {
-            type_code: tc,
-            size:     crate::schema::type_size(tc),
-            nullable: if cols[i].nullable { 1 } else { 0 },
-            _pad:     0,
-        };
+        buf[i] = SchemaColumn::new(cols[i].type_code, if cols[i].nullable { 1 } else { 0 });
         i += 1;
     }
-    sd
+    let (head, _) = buf.split_at(cols.len());
+    SchemaDescriptor::new(head, &[pk_index])
 }
 
 // ---------------------------------------------------------------------------

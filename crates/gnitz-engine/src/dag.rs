@@ -238,10 +238,10 @@ impl SysTableRefs {
             edges: std::ptr::null_mut(),
             node_columns: std::ptr::null_mut(),
             dep_tab: std::ptr::null_mut(),
-            nodes_schema: crate::compiler::empty_schema(),
-            edges_schema: crate::compiler::empty_schema(),
-            node_columns_schema: crate::compiler::empty_schema(),
-            dep_tab_schema: crate::compiler::empty_schema(),
+            nodes_schema: SchemaDescriptor::default(),
+            edges_schema: SchemaDescriptor::default(),
+            node_columns_schema: SchemaDescriptor::default(),
+            dep_tab_schema: SchemaDescriptor::default(),
         }
     }
 }
@@ -450,7 +450,7 @@ impl DagEngine {
             self.sys.edges, &self.sys.edges_schema,
             self.sys.node_columns, &self.sys.node_columns_schema,
             view_id as u64,
-            compiler::empty_schema(),
+            SchemaDescriptor::default(),
         ).unwrap_or_else(compiler::LoadedCircuit::empty)
     }
 
@@ -1526,7 +1526,7 @@ mod tests {
     use super::*;
 
     fn make_test_table(name: &str) -> Box<Table> {
-        let schema = compiler::empty_schema();
+        let schema = SchemaDescriptor::default();
         let dir = format!("/tmp/gnitz_dag_test_{}", name);
         let _ = std::fs::remove_dir_all(&dir);
         Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, false).unwrap())
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn test_register_unregister_table() {
         let mut dag = DagEngine::new();
-        let schema = compiler::empty_schema();
+        let schema = SchemaDescriptor::default();
         let tbl = make_test_table("reg_unreg");
         dag.register_table(100, StoreHandle::Single(tbl), schema, 0, false, String::new());
         assert!(dag.tables.contains_key(&100));
@@ -1580,7 +1580,7 @@ mod tests {
     #[test]
     fn test_add_remove_index_circuit() {
         let mut dag = DagEngine::new();
-        let schema = compiler::empty_schema();
+        let schema = SchemaDescriptor::default();
         let tbl = make_test_table("idx_parent");
         dag.register_table(50, StoreHandle::Single(tbl), schema, 0, false, String::new());
         let idx_tbl = make_test_table("idx_child");
@@ -1619,7 +1619,7 @@ mod tests {
     #[test]
     fn test_flush_includes_index_circuits() {
         let mut dag = DagEngine::new();
-        let parent_schema = compiler::empty_schema();
+        let parent_schema = SchemaDescriptor::default();
         let tbl = make_test_table("flush_ic_parent");
         dag.register_table(70, StoreHandle::Single(tbl), parent_schema, 0, false, String::new());
 

@@ -92,32 +92,19 @@ pub struct AviDesc {
 }
 
 /// GI schema: U128 PK + I64 payload (spk_hi).
-fn make_gi_schema() -> SchemaDescriptor {
-    let mut s = SchemaDescriptor {
-        num_columns: 2,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    s.columns[0] = SchemaColumn {
-        type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-    };
-    s.columns[1] = SchemaColumn {
-        type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-    };
-    s
+pub(crate) fn make_gi_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
 }
 
 /// AVI schema: U128 PK only, no payload.
-fn make_avi_schema() -> SchemaDescriptor {
-    let mut s = SchemaDescriptor {
-        num_columns: 1,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    s.columns[0] = SchemaColumn {
-        type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-    };
-    s
+pub(crate) fn make_avi_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0])
 }
 
 // ---------------------------------------------------------------------------

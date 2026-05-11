@@ -1,6 +1,6 @@
 mod distinct;
 mod exchange;
-mod index;
+pub(crate) mod index;
 mod join;
 mod linear;
 mod reduce;

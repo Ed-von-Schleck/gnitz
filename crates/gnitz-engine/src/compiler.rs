@@ -39,7 +39,7 @@ pub(crate) struct LoadedCircuit {
 impl LoadedCircuit {
     pub(crate) fn empty() -> Self {
         LoadedCircuit {
-            out_schema: empty_schema(),
+            out_schema: SchemaDescriptor::default(),
             nodes: HashMap::new(),
             edges: Vec::new(),
             ordered: Vec::new(),
@@ -597,20 +597,6 @@ fn opt_fold_reduce_map(
 // Schema construction helpers
 // ---------------------------------------------------------------------------
 
-pub fn empty_schema() -> SchemaDescriptor {
-    SchemaDescriptor {
-        num_columns: 0,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    }
-}
-
-fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
-    SchemaColumn { type_code: tc, size: sz, nullable: if nullable { 1 } else { 0 }, _pad: 0 }
-}
-
-
-
 fn merge_schemas_for_join_impl(
     left: &SchemaDescriptor,
     right: &SchemaDescriptor,
@@ -620,23 +606,21 @@ fn merge_schemas_for_join_impl(
     assert!(total <= crate::schema::MAX_COLUMNS,
         "join output schema exceeds {}-column limit: {} + payload({}) = {}",
         crate::schema::MAX_COLUMNS, left.num_columns, right.num_payload_cols(), total);
-    let mut out = empty_schema();
-    let mut ci: usize = 0;
-    out.columns[ci] = left.columns[left.pk_index_single() as usize];
-    ci += 1;
-    for (_, _, col) in left.payload_columns() {
-        out.columns[ci] = *col;
-        ci += 1;
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut n = 0;
+    cols[n] = left.columns[left.pk_index_single() as usize];
+    n += 1;
+    for (_, _, c) in left.payload_columns() {
+        cols[n] = *c;
+        n += 1;
     }
-    for (_, _, col) in right.payload_columns() {
-        let mut c = *col;
+    for (_, _, c) in right.payload_columns() {
+        let mut c = *c;
         if right_nullable { c.nullable = 1; }
-        out.columns[ci] = c;
-        ci += 1;
+        cols[n] = c;
+        n += 1;
     }
-    out.num_columns = ci as u32;
-    out.pk_index = 0;
-    out
+    SchemaDescriptor::new(&cols[..n], &[0])
 }
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
@@ -648,20 +632,18 @@ fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescripto
 }
 
 fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
-    let mut out = empty_schema();
-    let mut ci: usize = 0;
-    out.columns[ci] = input.columns[input.pk_index_single() as usize];
-    ci += 1;
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut n = 0;
+    cols[n] = input.columns[input.pk_index_single() as usize];
+    n += 1;
     for &idx in src_indices {
         let i = idx as usize;
         if !input.is_pk_col(i) {
-            out.columns[ci] = input.columns[i];
-            ci += 1;
+            cols[n] = input.columns[i];
+            n += 1;
         }
     }
-    out.num_columns = ci as u32;
-    out.pk_index = 0;
-    out
+    SchemaDescriptor::new(&cols[..n], &[0])
 }
 
 /// Determine the output type for an aggregate function.
@@ -669,17 +651,17 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
 ///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)
-const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> (u8, u8) {
+const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {
-        AggOp::Count | AggOp::CountNonNull => (type_code::I64, 8),
+        AggOp::Count | AggOp::CountNonNull => type_code::I64,
         AggOp::Sum | AggOp::Min | AggOp::Max => {
             if col_type_code.is_float() {
-                (type_code::F64, 8)
+                type_code::F64
             } else {
-                (type_code::I64, 8)
+                type_code::I64
             }
         }
-        AggOp::Null => (type_code::I64, 8),
+        AggOp::Null => type_code::I64,
     }
 }
 
@@ -688,8 +670,8 @@ fn build_reduce_output_schema(
     group_cols: &[i32],
     agg_descs: &[AggDescriptor],
 ) -> SchemaDescriptor {
-    let mut out = empty_schema();
-    let mut ci: usize = 0;
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut n = 0;
 
     let use_natural_pk = if group_cols.len() == 1 {
         let gc_tc = TypeCode::from_validated_u8(input.columns[group_cols[0] as usize].type_code);
@@ -700,50 +682,24 @@ fn build_reduce_output_schema(
 
     if use_natural_pk {
         // Col 0: group column (PK)
-        out.columns[ci] = input.columns[group_cols[0] as usize];
-        ci += 1;
-        // Aggregate results
-        for ad in agg_descs {
-            let (tc, sz) = agg_output_type(ad.agg_op, ad.col_type_code);
-            out.columns[ci] = col(tc, sz, false);
-            ci += 1;
-        }
+        cols[n] = input.columns[group_cols[0] as usize];
+        n += 1;
     } else {
         // Synthetic U128 PK
-        out.columns[ci] = col(type_code::U128, 16, false);
-        ci += 1;
+        cols[n] = SchemaColumn::new(type_code::U128, 0);
+        n += 1;
         // Group columns
         for &gc in group_cols {
-            out.columns[ci] = input.columns[gc as usize];
-            ci += 1;
-        }
-        // Aggregate results
-        for ad in agg_descs {
-            let (tc, sz) = agg_output_type(ad.agg_op, ad.col_type_code);
-            out.columns[ci] = col(tc, sz, false);
-            ci += 1;
+            cols[n] = input.columns[gc as usize];
+            n += 1;
         }
     }
-    out.num_columns = ci as u32;
-    out.pk_index = 0;
-    out
-}
-
-fn make_group_idx_schema() -> SchemaDescriptor {
-    let mut s = empty_schema();
-    s.columns[0] = col(type_code::U128, 16, false); // ck (PK)
-    s.columns[1] = col(type_code::I64, 8, false);   // spk_hi
-    s.num_columns = 2;
-    s.pk_index = 0;
-    s
-}
-
-fn make_agg_value_idx_schema() -> SchemaDescriptor {
-    let mut s = empty_schema();
-    s.columns[0] = col(type_code::U128, 16, false); // ck (PK only)
-    s.num_columns = 1;
-    s.pk_index = 0;
-    s
+    // Aggregate results (same for both branches)
+    for ad in agg_descs {
+        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
+        n += 1;
+    }
+    SchemaDescriptor::new(&cols[..n], &[0])
 }
 
 fn agg_value_idx_eligible(tc: TypeCode) -> bool {
@@ -953,14 +909,13 @@ fn emit_node(
                         let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
                             in_reg_schema.pk_index_single(), &in_reg_schema, owned_expr_progs, owned_funcs);
                         let node_schema = if reindex_col.is_some() {
-                            let mut s = empty_schema();
-                            s.columns[0] = col(type_code::U128, 16, false);
-                            for i in 0..in_reg_schema.num_columns() {
-                                s.columns[i + 1] = in_reg_schema.columns[i];
+                            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+                            cols[0] = SchemaColumn::new(type_code::U128, 0);
+                            let n = in_reg_schema.num_columns();
+                            for i in 0..n {
+                                cols[i + 1] = in_reg_schema.columns[i];
                             }
-                            s.num_columns = in_reg_schema.num_columns + 1;
-                            s.pk_index = 0;
-                            s
+                            SchemaDescriptor::new(&cols[..n + 1], &[0])
                         } else {
                             loaded.out_schema
                         };
@@ -989,10 +944,10 @@ fn emit_node(
                     let fp = create_universal_projection(
                         &[], &[], in_reg_schema.pk_index_single(), owned_funcs,
                     );
-                    let mut s = empty_schema();
-                    s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index_single() as usize];
-                    s.num_columns = 1;
-                    s.pk_index = 0;
+                    let s = SchemaDescriptor::new(
+                        &[in_reg_schema.columns[in_reg_schema.pk_index_single() as usize]],
+                        &[0],
+                    );
                     reg_schemas[reg_id as usize] = s;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, s, -1);
@@ -1161,14 +1116,12 @@ fn emit_node(
                 type_codes.len(),
                 crate::schema::MAX_COLUMNS - 1,
             );
-            let mut right = empty_schema();
-            right.columns[0] = col(type_code::U128, 16, false); // dummy PK
+            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+            cols[0] = SchemaColumn::new(type_code::U128, 0); // dummy PK
             for (i, &tc) in type_codes.iter().enumerate() {
-                let sz = crate::schema::type_size(tc);
-                right.columns[i + 1] = col(tc, sz, true);
+                cols[i + 1] = SchemaColumn::new(tc, 1);
             }
-            right.num_columns = (type_codes.len() + 1) as u32;
-            right.pk_index = 0;
+            let right = SchemaDescriptor::new(&cols[..type_codes.len() + 1], &[0]);
             let out_schema = merge_schemas_for_join_outer(&in_schema, &right);
             reg_schemas[reg_id as usize] = out_schema;
             reg_kinds[reg_id as usize] = 0;
@@ -1358,7 +1311,7 @@ fn emit_reduce(
                 "{}/scratch__reduce_in_{}_{}/_gidx", view_dir, view_id, nid,
             );
             if let Ok(gi_table) = Table::new(
-                &gi_dir, "_gidx", make_group_idx_schema(), 0, 1024 * 1024, false,
+                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(), 0, 1024 * 1024, false,
             ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));
@@ -1382,7 +1335,7 @@ fn emit_reduce(
         avi_group_cols = gcols_u32.clone();
         let avi_child = format!("_avidx_{}_{}", view_id, nid);
         if let Ok(av_table) = create_child_table(
-            view_dir, &avi_child, make_agg_value_idx_schema(), view_table_id,
+            view_dir, &avi_child, crate::ops::index::make_avi_schema(), view_table_id,
         ) {
             let idx = owned_tables.len();
             owned_tables.push(Box::new(av_table));
@@ -1584,7 +1537,7 @@ fn build_plan(
     }
 
     let num_regs = (next_reg + extra_regs) as usize;
-    let mut reg_schemas = vec![empty_schema(); num_regs];
+    let mut reg_schemas = vec![SchemaDescriptor::default(); num_regs];
     let mut reg_kinds = vec![0u8; num_regs];
 
     if let Some((ex_nid, ex_schema)) = exchange_input {
@@ -1836,7 +1789,7 @@ mod tests {
     #[test]
     fn test_topo_sort_simple() {
         let mut loaded = LoadedCircuit {
-            out_schema: empty_schema(),
+            out_schema: SchemaDescriptor::default(),
             nodes: {
                 let mut m = HashMap::new();
                 m.insert(0, gnitz_wire::OpNode::ScanDelta(0));
@@ -1858,7 +1811,7 @@ mod tests {
     #[test]
     fn test_topo_sort_cycle() {
         let mut loaded = LoadedCircuit {
-            out_schema: empty_schema(),
+            out_schema: SchemaDescriptor::default(),
             nodes: {
                 let mut m = HashMap::new();
                 m.insert(0, gnitz_wire::OpNode::Filter(None));
@@ -1877,18 +1830,20 @@ mod tests {
 
     #[test]
     fn test_merge_schemas_for_join() {
-        let mut left = empty_schema();
-        left.columns[0] = col(type_code::U128, 16, false);
-        left.columns[1] = col(type_code::I64, 8, false);
-        left.num_columns = 2;
-        left.pk_index = 0;
-
-        let mut right = empty_schema();
-        right.columns[0] = col(type_code::U128, 16, false);
-        right.columns[1] = col(type_code::STRING, 16, false);
-        right.num_columns = 2;
-        right.pk_index = 0;
-
+        let left = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let right = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
         let joined = merge_schemas_for_join(&left, &right);
         assert_eq!(joined.num_columns, 3); // PK + left_I64 + right_STRING
         assert_eq!(joined.columns[0].type_code, type_code::U128);
@@ -1898,18 +1853,20 @@ mod tests {
 
     #[test]
     fn test_merge_schemas_for_join_outer() {
-        let mut left = empty_schema();
-        left.columns[0] = col(type_code::U128, 16, false);
-        left.columns[1] = col(type_code::I64, 8, false);
-        left.num_columns = 2;
-        left.pk_index = 0;
-
-        let mut right = empty_schema();
-        right.columns[0] = col(type_code::U128, 16, false);
-        right.columns[1] = col(type_code::I64, 8, false);
-        right.num_columns = 2;
-        right.pk_index = 0;
-
+        let left = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let right = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
         let joined = merge_schemas_for_join_outer(&left, &right);
         assert_eq!(joined.num_columns, 3);
         assert_eq!(joined.columns[2].nullable, 1); // right side nullable
@@ -1917,12 +1874,12 @@ mod tests {
 
     #[test]
     fn test_agg_output_type() {
-        assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), (type_code::I64, 8));
-        assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), (type_code::F64, 8));
-        assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), (type_code::I64, 8));
+        assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), type_code::I64);
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), type_code::F64);
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), type_code::I64);
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I64);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), type_code::F64);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
     }
 
     #[test]
@@ -1938,18 +1895,20 @@ mod tests {
 
     #[test]
     fn test_identity_map_detection() {
-        let mut a = empty_schema();
-        a.columns[0] = col(type_code::U128, 16, false);
-        a.columns[1] = col(type_code::I64, 8, false);
-        a.num_columns = 2;
-        a.pk_index = 0;
-
-        let mut b = empty_schema();
-        b.columns[0] = col(type_code::U128, 16, false);
-        b.columns[1] = col(type_code::I64, 8, false);
-        b.num_columns = 2;
-        b.pk_index = 0;
-
+        let a = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let mut b = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
         assert!(schemas_physically_identical(&a, &b));
 
         b.columns[1].type_code = type_code::STRING;
@@ -1958,13 +1917,14 @@ mod tests {
 
     #[test]
     fn test_build_reduce_output_schema_natural_pk() {
-        let mut input = empty_schema();
-        input.columns[0] = col(type_code::U128, 16, false);
-        input.columns[1] = col(type_code::U64, 8, false); // group col
-        input.columns[2] = col(type_code::I64, 8, false); // agg col
-        input.num_columns = 3;
-        input.pk_index = 0;
-
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U64, 0), // group col
+                SchemaColumn::new(type_code::I64, 0), // agg col
+            ],
+            &[0],
+        );
         let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
@@ -1975,13 +1935,14 @@ mod tests {
 
     #[test]
     fn test_build_reduce_output_schema_synthetic_pk() {
-        let mut input = empty_schema();
-        input.columns[0] = col(type_code::U128, 16, false);
-        input.columns[1] = col(type_code::STRING, 16, false); // group col
-        input.columns[2] = col(type_code::I64, 8, false);     // agg col
-        input.num_columns = 3;
-        input.pk_index = 0;
-
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0), // group col
+                SchemaColumn::new(type_code::I64, 0),    // agg col
+            ],
+            &[0],
+        );
         let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
@@ -2028,7 +1989,7 @@ mod tests {
         // Circuit: SCAN(0) → DISTINCT(1) → INTEGRATE(2)
         // An invalid view_dir forces create_child_table to fail inside emit_node.
         let mut loaded = LoadedCircuit {
-            out_schema: empty_schema(),
+            out_schema: SchemaDescriptor::default(),
             nodes: {
                 let mut m = HashMap::new();
                 m.insert(0, gnitz_wire::OpNode::ScanDelta(99));
@@ -2046,12 +2007,10 @@ mod tests {
         topo_sort(&mut loaded).unwrap();
 
         // Provide an external table so ScanDelta finds its schema and sets source_reg_map.
-        let in_schema = {
-            let mut s = empty_schema();
-            s.columns[0] = col(type_code::U64, 8, false);
-            s.num_columns = 1;
-            s
-        };
+        let in_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0)],
+            &[0],
+        );
         let ext_tables = [ExternalTable { table_id: 99, schema: in_schema }];
         let rw = Rewrites {
             skip_nodes:    HashSet::new(),
@@ -2074,14 +2033,12 @@ mod tests {
         use crate::schema::MAX_COLUMNS;
         let half = MAX_COLUMNS / 2 + 2;
         let make = |n: usize| {
-            let mut s = empty_schema();
-            s.columns[0] = col(type_code::U128, 16, false);
+            let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+            cols[0] = SchemaColumn::new(type_code::U128, 0);
             for i in 1..n {
-                s.columns[i] = col(type_code::I64, 8, false);
+                cols[i] = SchemaColumn::new(type_code::I64, 0);
             }
-            s.num_columns = n as u32;
-            s.pk_index = 0;
-            s
+            SchemaDescriptor::new(&cols[..n], &[0])
         };
         merge_schemas_for_join(&make(half), &make(half));
     }
@@ -2089,12 +2046,13 @@ mod tests {
     // ── helpers shared by join tests ─────────────────────────────────────
 
     fn two_col_schema() -> SchemaDescriptor {
-        let mut s = empty_schema();
-        s.columns[0] = col(type_code::U128, 16, false);
-        s.columns[1] = col(type_code::U64, 8, false);
-        s.num_columns = 2;
-        s.pk_index = 0;
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_loaded(
@@ -2102,7 +2060,7 @@ mod tests {
         edges: Vec<(i32, i32, i32)>,
     ) -> LoadedCircuit {
         let mut lc = LoadedCircuit {
-            out_schema: empty_schema(),
+            out_schema: SchemaDescriptor::default(),
             nodes,
             edges,
             ordered: Vec::new(),
@@ -2363,11 +2321,11 @@ mod tests {
     #[test]
     fn test_load_circuit_returns_none_for_null_system_tables() {
         let result = load_circuit(
-            std::ptr::null_mut(), &empty_schema(),
-            std::ptr::null_mut(), &empty_schema(),
-            std::ptr::null_mut(), &empty_schema(),
+            std::ptr::null_mut(), &SchemaDescriptor::default(),
+            std::ptr::null_mut(), &SchemaDescriptor::default(),
+            std::ptr::null_mut(), &SchemaDescriptor::default(),
             0,
-            empty_schema(),
+            SchemaDescriptor::default(),
         );
         assert!(
             result.is_none(),

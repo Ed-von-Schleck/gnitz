@@ -581,15 +581,14 @@ mod tests {
 
     /// Schema matching reduce output: U128 PK (pk_index=0) + I64 group_val + I64 agg_val
     fn make_reduce_schema() -> SchemaDescriptor {
-        let mut sd = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS],
-        };
-        sd.columns[0] = SchemaColumn::new(type_code::U128, 0); // U128 PK
-        sd.columns[1] = SchemaColumn::new(type_code::I64, 0);  // I64 group_val
-        sd.columns[2] = SchemaColumn::new(type_code::I64, 0);  // I64 agg_val
-        sd
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0), // U128 PK
+                SchemaColumn::new(type_code::I64, 0),  // I64 group_val
+                SchemaColumn::new(type_code::I64, 0),  // I64 agg_val
+            ],
+            &[0],
+        )
     }
 
     /// Build a 3-column Batch from (pk_lo, pk_hi, weight, group_val, agg_val) tuples.

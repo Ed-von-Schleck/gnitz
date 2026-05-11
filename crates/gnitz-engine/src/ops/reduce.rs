@@ -1476,30 +1476,26 @@ mod tests {
 
     /// 3-column source schema: U64 pk (pk_index=0), I64 grp, STRING val (nullable).
     fn make_schema_3col_grp_str() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[2] = SchemaColumn {
-            type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0,
-        };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::STRING, 1),
+            ],
+            &[0],
+        )
     }
 
     /// 3-column reduce output schema: U128 pk (pk_index=0), I64 grp, I64 agg (nullable).
     fn make_reduce_str_out_schema() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        )
     }
 
     /// Build a 3-column Batch (U64 pk, I64 grp, STRING val) from tuples.
@@ -1529,25 +1525,9 @@ mod tests {
         ConsolidatedBatch::new_unchecked(b)
     }
 
-    fn make_gi_schema() -> SchemaDescriptor {
-        use crate::schema::SchemaColumn;
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        s.columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
-        s
-    }
-
     /// Build a GI Batch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
     fn make_gi_batch(rows: &[(u64, u64, i64)]) -> ConsolidatedBatch {
-        let gi_schema = make_gi_schema();
+        let gi_schema = crate::ops::index::make_gi_schema();
         let n = rows.len();
         let mut b = Batch::with_schema(gi_schema, n.max(1));
 
@@ -1567,30 +1547,27 @@ mod tests {
     fn test_reduce_sum_retraction() {
         use std::rc::Rc;
         use crate::storage::CursorHandle;
-        use crate::schema::type_code;
+        use crate::schema::{SchemaColumn, type_code};
 
         // Input: pk(U64), grp(I64), val(I64)
-        let mut in_schema = make_schema_u64_i64();
-        in_schema.num_columns = 3;
-        in_schema.columns[2] = crate::schema::SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
 
         // Output: pk(U128), grp(I64), sum(I64)
-        let mut out_schema = crate::schema::SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = crate::schema::SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[1] = crate::schema::SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[2] = crate::schema::SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         // Empty trace_out
         let empty_out = Rc::new(Batch::empty(2, 16));
@@ -1663,17 +1640,13 @@ mod tests {
         let in_schema = make_schema_u64_i64();
 
         // Output: pk(U128), count(I64)
-        let mut out_schema = crate::schema::SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = crate::schema::SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[1] = crate::schema::SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                crate::schema::SchemaColumn::new(type_code::U128, 0),
+                crate::schema::SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
@@ -1707,7 +1680,7 @@ mod tests {
 
         let input_schema = make_schema_3col_grp_str();
         let output_schema = make_reduce_str_out_schema();
-        let gi_schema = make_gi_schema();
+        let gi_schema = crate::ops::index::make_gi_schema();
 
         // trace_in: apple and zebra both at PK=1 (apple sorts first by payload)
         let ti_batch = Rc::new(make_batch_3col_grp_str(
@@ -1786,17 +1759,13 @@ mod tests {
         use crate::schema::type_code;
 
         // Schema: pk(U128), count(I64) — same as partial/output schema
-        let mut schema = crate::schema::SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        schema.columns[0] = crate::schema::SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        schema.columns[1] = crate::schema::SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let schema = SchemaDescriptor::new(
+            &[
+                crate::schema::SchemaColumn::new(type_code::U128, 0),
+                crate::schema::SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
         let empty_out = Rc::new(Batch::empty(1, 16));
@@ -1979,17 +1948,13 @@ mod tests {
         let in_schema = make_schema_with_type(type_code::I32);
 
         // Output: pk(U128), sum(I64)
-        let mut out_schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
@@ -2026,17 +1991,13 @@ mod tests {
 
         let in_schema = make_schema_with_type(type_code::F32);
 
-        let mut out_schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
@@ -2070,17 +2031,13 @@ mod tests {
 
         let in_schema = make_schema_with_type(type_code::I16);
 
-        let mut out_schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        out_schema.columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         let empty_out = Rc::new(Batch::empty(1, 16));
         let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
@@ -2114,17 +2071,13 @@ mod tests {
         use crate::storage::CursorHandle;
 
         // Schema: pk(U128), min_val(I64)
-        let mut schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        schema.columns[0] = SchemaColumn {
-            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
-        };
-        schema.columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
-        };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         // Tick 1: partial MIN=5 from one worker → global MIN=5
         let empty_out = Rc::new(Batch::empty(1, 16));
@@ -2177,27 +2130,25 @@ mod tests {
 
     /// Schema: pk(U64) + uuid_payload(UUID). UUID is at payload index 0.
     fn make_schema_u64_pk_uuid_payload() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::UUID, size: 16, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::UUID, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Schema: pk(U64) + uuid_col(UUID) + i64_col(I64).
     fn make_schema_u64_uuid_i64() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::UUID, size: 16, nullable: 0, _pad: 0 };
-        s.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::UUID, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn build_batch_u64_uuid(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
@@ -2309,26 +2260,26 @@ mod tests {
         use crate::storage::CursorHandle;
 
         // Input: U64 pk | I32 grp (4 bytes) | I64 val (8 bytes)
-        let mut in_schema = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        in_schema.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        in_schema.columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 0, _pad: 0 };
-        in_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
 
         // Output: U128 hash-pk | I32 grp | I64 min (nullable)
-        let mut out_schema = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        out_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        out_schema.columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 0, _pad: 0 };
-        out_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
-        let gi_schema = make_gi_schema();
+        let gi_schema = crate::ops::index::make_gi_schema();
 
         // trace_in: history row for grp=5, val=200, source pk=30
         let ti_batch = Rc::new({
@@ -2425,26 +2376,24 @@ mod tests {
 
     /// Schema: U64 pk (col 0) | I64 other (col 1). pk_index = 0.
     fn make_schema_pk0_u64_i64() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Schema: I64 other (col 0) | U64 pk (col 1). pk_index = 1.
     fn make_schema_pk1_i64_u64() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 1,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1],
+        )
     }
 
     /// Build a 2-col batch (pk, other) with explicit pk values and `other` payload.
@@ -2545,14 +2494,13 @@ mod tests {
 
     /// Schema: U64 pk | nullable I64.
     fn make_schema_pk_nullable_i64() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        )
     }
 
     /// Build a 2-col batch (pk, nullable_i64). For null rows, payload bytes
@@ -2674,23 +2622,23 @@ mod tests {
         use crate::expr::{ExprProgram, EXPR_COPY_COL};
 
         // Raw output schema: U128 pk | I64 cnt
-        let mut raw_schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        raw_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        raw_schema.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        let raw_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         // Finalized schema: U128 pk_out | U128 pk_copy | I64 cnt
-        let mut fin_schema = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        fin_schema.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        fin_schema.columns[1] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        fin_schema.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        let fin_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
 
         // Two COPY_COL instructions: copy col 0 (PK) and col 1 (cnt).
         // Layout per instruction: [op, dst, a1=src_col, a2]. classify_output_cols

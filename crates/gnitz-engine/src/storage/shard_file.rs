@@ -571,31 +571,12 @@ mod tests {
     use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
-        let mut sd = SchemaDescriptor {
-            num_columns: num_cols,
-            pk_index,
-            columns: [SchemaColumn {
-                type_code: 0,
-                size: 0,
-                nullable: 0,
-                _pad: 0,
-            }; MAX_COLUMNS],
-        };
-        sd.columns[0] = SchemaColumn {
-            type_code: 8,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
+        let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+        cols[0] = SchemaColumn::new(8, 0);
         if num_cols > 1 {
-            sd.columns[1] = SchemaColumn {
-                type_code: 9,
-                size: 8,
-                nullable: 0,
-                _pad: 0,
-            };
+            cols[1] = SchemaColumn::new(9, 0);
         }
-        sd
+        SchemaDescriptor::new(&cols[..num_cols as usize], &[pk_index])
     }
 
     #[test]

@@ -39,6 +39,30 @@ pub struct SchemaDescriptor {
 }
 
 impl SchemaDescriptor {
+    /// Construct a SchemaDescriptor from a column list and PK index list.
+    /// Today only single-PK schemas are supported (`pk_indices.len() == 1`);
+    /// the empty case `pk_indices = &[]` is reserved for the placeholder
+    /// produced by `Default::default()` and is structurally invalid for real use.
+    pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
+        debug_assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
+        debug_assert!(
+            pk_indices.len() == 1 || (cols.is_empty() && pk_indices.is_empty()),
+            "new: non-empty schema requires exactly one PK index (compound PK not yet supported)",
+        );
+        let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+        let mut i = 0;
+        while i < cols.len() {
+            columns[i] = cols[i];
+            i += 1;
+        }
+        let pk_index = if pk_indices.is_empty() { 0 } else { pk_indices[0] };
+        SchemaDescriptor {
+            num_columns: cols.len() as u32,
+            pk_index,
+            columns,
+        }
+    }
+
     pub const fn minimal_u64() -> Self {
         let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
@@ -403,6 +427,42 @@ mod tests {
         let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
         assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
         assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
+    }
+
+    #[test]
+    fn test_new_constructs_schema() {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::STRING, 1),
+        ];
+        let s = SchemaDescriptor::new(&cols, &[0]);
+        assert_eq!(s.num_columns(), 3);
+        assert_eq!(s.pk_index_single(), 0);
+        assert_eq!(s.columns[0].type_code, type_code::U64);
+        assert_eq!(s.columns[1].type_code, type_code::I64);
+        assert_eq!(s.columns[2].type_code, type_code::STRING);
+
+        // Trailing slot fill: SchemaColumn::new(0, 0) resolves via wire_stride(0)
+        // → 8 (default arm). Locked in so future regressions in the trailing
+        // representation are caught.
+        assert_eq!(s.columns[3].type_code, 0);
+        assert_eq!(s.columns[3].size, 8);
+        assert_eq!(s.columns[MAX_COLUMNS - 1].size, 8);
+
+        // payload_columns() walks non-PK indices in logical order.
+        let payload: Vec<usize> = s.payload_columns().map(|(_, ci, _)| ci).collect();
+        assert_eq!(payload, vec![1, 2]);
+        assert_eq!(s.payload_idx(1), 0);
+        assert_eq!(s.payload_idx(2), 1);
+
+        // Non-zero pk_index round-trips.
+        let s2 = SchemaDescriptor::new(&cols, &[2]);
+        assert_eq!(s2.pk_index_single(), 2);
+
+        // Empty placeholder (Default-style).
+        let empty = SchemaDescriptor::new(&[], &[]);
+        assert_eq!(empty.num_columns(), 0);
     }
 
     #[test]

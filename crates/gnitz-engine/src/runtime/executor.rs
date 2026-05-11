@@ -1142,12 +1142,13 @@ mod tests {
     use crate::schema::{SchemaColumn, type_code};
 
     fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
-        let mut sd = SchemaDescriptor::default();
-        sd.num_columns = 2;
-        sd.pk_index = 0;
-        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
-        sd.columns[1] = SchemaColumn::new(type_code::I64, col1_nullable);
-        sd
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, col1_nullable),
+            ],
+            &[0],
+        )
     }
 
     #[test]

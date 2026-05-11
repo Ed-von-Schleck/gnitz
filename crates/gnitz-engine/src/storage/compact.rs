@@ -311,14 +311,13 @@ mod tests {
     }
 
     fn make_test_schema() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_I64, 0),
+            ],
+            &[0],
+        )
     }
 
     #[test]
@@ -606,13 +605,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // Schema: u64 PK + STRING payload
-        let mut schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        schema.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
-        schema.columns[1] = SchemaColumn { type_code: TYPE_STRING, size: 16, nullable: 0, _pad: 0 };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_STRING, 0),
+            ],
+            &[0],
+        );
 
         // Build shard with short strings
         let mut batch = Batch::with_schema(schema, 3);
@@ -661,13 +660,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // Schema: u64 PK + nullable i64 payload
-        let mut schema = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        schema.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
-        schema.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 1, _pad: 0 };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_I64, 1),
+            ],
+            &[0],
+        );
 
         // Build shard: key 1 = non-null (42), key 2 = null
         let mut batch = Batch::with_schema(schema, 2);
@@ -713,15 +712,14 @@ mod tests {
     // -- 3-column helpers for reduce-output-pattern tests --------------------
 
     fn make_3col_schema() -> SchemaDescriptor {
-        let mut s = SchemaDescriptor {
-            num_columns: 3,
-            pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-        };
-        s.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 0, _pad: 0 };
-        s.columns[2] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 0, _pad: 0 };
-        s
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_I64, 0),
+                SchemaColumn::new(TYPE_I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).

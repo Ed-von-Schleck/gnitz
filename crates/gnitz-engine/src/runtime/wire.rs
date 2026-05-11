@@ -1,6 +1,6 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
+use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, encode_german_string, decode_german_string};
 use crate::storage::{Batch, MemBatch};
 use crate::util::align8;
 
@@ -38,17 +38,11 @@ const WAL_OFF_NUM_REGIONS: usize = 32;
 // ---------------------------------------------------------------------------
 
 const ZERO_COL: SchemaColumn = SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 };
-const U64_COL: SchemaColumn = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-const STR_COL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+const U64_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+const STR_COL: SchemaColumn = SchemaColumn::new(type_code::STRING, 0);
 
-pub(crate) const META_SCHEMA_DESC: SchemaDescriptor = {
-    let mut sd = SchemaDescriptor { num_columns: 4, pk_index: 0, columns: [ZERO_COL; crate::schema::MAX_COLUMNS] };
-    sd.columns[0] = U64_COL;
-    sd.columns[1] = U64_COL;
-    sd.columns[2] = U64_COL;
-    sd.columns[3] = STR_COL;
-    sd
-};
+pub(crate) const META_SCHEMA_DESC: SchemaDescriptor =
+    SchemaDescriptor::new(&[U64_COL, U64_COL, U64_COL, STR_COL], &[0]);
 
 const _: () = assert!(
     META_SCHEMA_DESC.num_columns == 4,
@@ -56,18 +50,14 @@ const _: () = assert!(
 );
 
 pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
-    let mut sd = SchemaDescriptor {
-        num_columns: gnitz_wire::control::NUM_COLUMNS as u32,
-        pk_index:    gnitz_wire::control::COL_MSG_IDX as u32,
-        columns:     [ZERO_COL; crate::schema::MAX_COLUMNS],
-    };
+    let mut cols = [ZERO_COL; gnitz_wire::control::NUM_COLUMNS];
     let mut i = 0;
     while i < gnitz_wire::control::NUM_COLUMNS {
         let c = &gnitz_wire::control::CONTROL_COLS[i];
-        sd.columns[i] = SchemaColumn::new(c.type_code, c.nullable as u8);
+        cols[i] = SchemaColumn::new(c.type_code, c.nullable as u8);
         i += 1;
     }
-    sd
+    SchemaDescriptor::new(&cols, &[gnitz_wire::control::COL_MSG_IDX as u32])
 };
 
 // ---------------------------------------------------------------------------
@@ -162,12 +152,9 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
 pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
     if batch.count == 0 { return Err("empty schema batch"); }
     if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
-    let mut sd = SchemaDescriptor {
-        num_columns: batch.count as u32,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut names = Vec::with_capacity(batch.count);
+    let mut pk_index: u32 = 0;
     let mut pk_found = false;
     for i in 0..batch.count {
         let off8 = i * 8;
@@ -183,20 +170,15 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         names.push(decode_german_string(&st, &batch.blob));
         let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
-        let col_size = type_size(type_code_val);
-        sd.columns[i] = SchemaColumn {
-            type_code: type_code_val,
-            size: col_size,
-            nullable: if is_nullable { 1 } else { 0 },
-            _pad: 0,
-        };
+        cols[i] = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
         if is_pk {
             if pk_found { return Err("multiple PK columns"); }
-            sd.pk_index = i as u32;
+            pk_index = i as u32;
             pk_found = true;
         }
     }
     if !pk_found { return Err("no PK column"); }
+    let sd = SchemaDescriptor::new(&cols[..batch.count], &[pk_index]);
     Ok((sd, names))
 }
 
@@ -833,11 +815,8 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     let type_data  = &data[tc_off..tc_off + count * 8];
     let flags_data = &data[fl_off..fl_off + count * 8];
 
-    let mut sd = SchemaDescriptor {
-        num_columns: count as u32,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut pk_index: u32 = 0;
     let mut pk_found = false;
 
     for i in 0..count {
@@ -846,20 +825,15 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
         let fl = u64::from_le_bytes(flags_data[off8..off8+8].try_into().unwrap());
         let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
         let is_pk       = (fl & META_FLAG_IS_PK)       != 0;
-        sd.columns[i] = SchemaColumn {
-            type_code: tc,
-            size: type_size(tc),
-            nullable: if is_nullable { 1 } else { 0 },
-            _pad: 0,
-        };
+        cols[i] = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
         if is_pk {
             if pk_found { return Err("multiple PK columns"); }
-            sd.pk_index = i as u32;
+            pk_index = i as u32;
             pk_found = true;
         }
     }
     if !pk_found { return Err("no PK column"); }
-    Ok(sd)
+    Ok(SchemaDescriptor::new(&cols[..count], &[pk_index]))
 }
 
 /// Read just the `(target_id, client_id)` routing tuple from a wire

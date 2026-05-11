@@ -9,26 +9,24 @@ use crate::schema::{SchemaDescriptor, SchemaColumn, type_code, encode_german_str
 use crate::storage::{Batch, ConsolidatedBatch};
 
 fn simple_schema() -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: 2,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    sd
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[0],
+    )
 }
 
 fn string_schema() -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: 3,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    sd.columns[2] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
-    sd
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    )
 }
 
 fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
@@ -399,13 +397,13 @@ fn test_decode_truncated_control_block_returns_err() {
 /// validation against the catalog happens separately in the executor.
 #[test]
 fn test_decode_wire_uses_embedded_schema() {
-    let mut sd = SchemaDescriptor {
-        num_columns: 2,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS],
-    };
-    sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+    let sd = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[0],
+    );
 
     let batch = make_simple_batch(1, 42);
     let names: Vec<&[u8]> = vec![b"id", b"val"];

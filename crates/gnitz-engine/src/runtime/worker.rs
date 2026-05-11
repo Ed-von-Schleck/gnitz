@@ -1396,12 +1396,13 @@ mod tests {
 
     fn test_schema() -> SchemaDescriptor {
         use crate::schema::{SchemaColumn, type_code};
-        let mut sd = SchemaDescriptor::default();
-        sd.num_columns = 2;
-        sd.pk_index = 0;
-        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
-        sd.columns[1] = SchemaColumn::new(type_code::U64, 0);
-        sd
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_handler() -> WorkerExchangeHandler {
@@ -2080,10 +2081,10 @@ mod tests {
     #[test]
     fn test_string_schema_not_wire_safe() {
         use crate::schema::{SchemaColumn, type_code};
-        let mut sd = SchemaDescriptor::default();
-        sd.num_columns = 1;
-        sd.pk_index = 0;
-        sd.columns[0] = SchemaColumn::new(type_code::STRING, 0);
+        let sd = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::STRING, 0)],
+            &[0],
+        );
         assert!(!schema_wire_safe(&sd),
             "STRING-column schema must not be wire-safe (no chunking)");
         assert!(schema_wire_safe(&test_schema()),
