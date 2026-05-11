@@ -1,22 +1,5 @@
 # Structural plan: factor the PK out of "one column" shape
 
-## Status
-
-The reader-side migration described in `pk-list-accessors.md` has
-landed. Every engine reader of `pk_index` now goes through one of the
-four accessors (`pk_indices`, `pk_index_single`, `is_pk_col`,
-`payload_idx`) — plus the `payload_columns()` iterator — on both the
-engine `SchemaDescriptor` and the core `Schema` mirror. The
-single-PK boundary is grep-able as `pk_index_single()`.
-
-What remains is the **constructor-side sweep**: replace the underlying
-`pk_index: u32` field with a list-shaped representation, install O(1)
-mapping arrays, and migrate every direct `SchemaDescriptor { ... }`
-literal to call a new validating constructor. After that lands the
-hot accessors collapse to single-load lookups and the only way to
-build a `SchemaDescriptor` is through a constructor that always
-recomputes the mappings in lock-step with the columns and PK list.
-
 ## Background
 
 `foundations.md` §1: "**Single-column PKs only.** Each table has exactly
@@ -27,14 +10,14 @@ and the system catalog — is built on top of this assumption.
 
 Lifting it is not a single feature change; it touches at least four
 layers (schema, on-disk formats, operator/IPC surfaces, SQL planner).
-This plan tackles the one remaining structural blocker that makes
+This plan tackles the schema-shape structural blocker that makes
 compound PKs a redesign instead of a feature.
 
 ## What's actually blocking compound PKs today
 
-A thorough sweep of the codebase finds five categories of single-PK
-assumption. The reader sweep (done) covered category 1 below; the rest
-remain explicit boundaries marked by `pk_index_single()` calls.
+A sweep of the codebase finds five categories of single-PK assumption.
+This plan targets category 1; the other four remain explicit boundaries
+marked by `pk_index_single()` calls and are out of scope here.
 
 ### 1. The schema field — the chokepoint
 
@@ -49,11 +32,15 @@ pub struct SchemaDescriptor {
 }
 ```
 
-`payload_columns()` and `payload_idx()` are scalar (single-branch)
-helpers sourced from `pk_index_single()`. The mapping-array rewrite
-arrives here in this plan — once the underlying field is a real list
-we have somewhere to anchor the precomputed mappings and removing
-optimizer dependence on `pk_count == 1` actually matters.
+The reader-side accessors (`num_columns`, `pk_indices`,
+`pk_index_single`, `is_pk_col`, `payload_idx`, `payload_columns`,
+`num_payload_cols`) are scalar shims over the single `pk_index: u32`
+field — `pk_indices()` returns a `slice::from_ref(&pk_index)`,
+`is_pk_col` and `payload_idx` reduce to a single equality / branch on
+that one index. The mapping-array rewrite arrives in this plan — once
+the underlying field is a real list we have somewhere to anchor the
+precomputed mappings and removing optimizer dependence on
+`pk_count == 1` actually matters.
 
 ### 2. On-disk and in-memory formats
 
@@ -90,7 +77,7 @@ is all that exists today); a future plan will bump them.
 
 ```rust
 // crates/gnitz-core/src/types.rs
-TABLETAB_COL_PK_COL_IDX = pk_col_idx: U64          // ← one u64 per table
+// table_tab_schema(): one `pk_col_idx: U64` ColumnDef per table row
 
 // crates/gnitz-core/src/protocol/codec.rs
 // Decodes META_FLAG_IS_PK and asserts at most one column has it set
@@ -102,8 +89,8 @@ This plan does not touch the catalog.
 
 ### 4. SQL parser silently degrades compound PK
 
-`PRIMARY KEY (a, b)` is rejected at planner.rs ~140 with
-`GnitzSqlError::Unsupported("PRIMARY KEY must specify exactly one
+`PRIMARY KEY (a, b)` is rejected at `gnitz-sql/src/planner.rs:132`
+with `GnitzSqlError::Unsupported("PRIMARY KEY must specify exactly one
 column")`. Lifting this is a parser change. This plan does not touch
 the parser.
 
@@ -190,18 +177,13 @@ loop (legal in `const fn`). `Default` delegates to `new(&[], &[])` so
 never an all-zero array that would silently make every column look like
 a payload column at index 0.
 
-Two read-side getters replace the privatized field:
-
-```rust
-#[inline] pub fn num_columns(&self)      -> usize { self.num_columns as usize }
-#[inline] pub fn num_payload_cols(&self) -> usize {
-    self.num_columns as usize - self.pk_count as usize
-}
-```
-
-`num_payload_cols()` replaces the `schema.num_columns as usize - 1`
-pattern (linear.rs, join.rs, etc.) which encodes "the single PK gets
-subtracted". Generalises naturally to compound PKs.
+The existing `num_payload_cols()` body changes from
+`self.num_columns() - self.pk_indices().len()` to
+`self.num_columns as usize - self.pk_count as usize` — a one-line
+substitution against the new representation. No new public accessors
+are introduced: `num_columns()`, `pk_indices()`, `pk_index_single()`,
+`is_pk_col()`, `payload_idx()`, `payload_columns()`, and
+`num_payload_cols()` are all already in place.
 
 The reason for privacy is mechanical: a public `payload_mapping` field
 allows any caller (test or otherwise) to construct a `SchemaDescriptor`
@@ -261,7 +243,7 @@ Existing const helpers (`make_schema`, `from_wire_cols`,
 internally; they already accept a single `pk_index: u32` value and
 forward it as `&[pk_index]`.
 
-The four hot accessors collapse to single-load lookups:
+The hot accessors collapse to single-load lookups:
 
 ```rust
 #[inline]
@@ -335,10 +317,11 @@ const fn compute_mappings(
 }
 ```
 
-There is no behaviour change for callers. Every call site already goes
-through `pk_indices()` / `pk_index_single()` / `payload_idx()` /
-`is_pk_col()`, all of which keep working — and `payload_idx` /
-`is_pk_col` / `payload_columns()` get faster.
+There is no behaviour change for callers. The accessor signatures —
+`pk_indices()`, `pk_index_single()`, `payload_idx()`, `is_pk_col()`,
+`payload_columns()`, `num_payload_cols()` — are unchanged; only their
+bodies and the underlying field representation flip. `payload_idx`,
+`is_pk_col`, and `payload_columns` get faster.
 
 ## What this plan deliberately does NOT cover
 
