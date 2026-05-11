@@ -118,11 +118,10 @@ fn read_64bit_region<T: Copy + Default>(
 /// Encode a ZSetBatch into a WAL block `Vec<u8>`.
 ///
 /// Region order: pk (pk_stride bytes each), weight, null, [non-PK cols in schema order], blob.
-/// num_regions = 3 + (ncols - 1) + 1.
+/// num_regions = 3 + num_payload_cols + 1.
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let count = batch.len();
-    let ncols = schema.columns.len();
-    let num_non_pk = if ncols > 0 { ncols - 1 } else { 0 };
+    let num_non_pk = schema.num_payload_cols();
     let num_regions = 3 + num_non_pk + 1;
 
     // --- Pre-build String/U128 column region data (needs blob arena) ---
@@ -301,7 +300,7 @@ pub fn decode_wal_block(
     }
 
     // Validate num_regions
-    let expected_num_regions = 3 + (schema.columns.len() - 1) + 1;
+    let expected_num_regions = 3 + schema.num_payload_cols() + 1;
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
             "WAL block num_regions mismatch: expected {}, got {}",

@@ -43,6 +43,14 @@ impl Schema {
         self.pk_index
     }
 
+    /// Number of non-PK ("payload") columns.
+    /// Today: always `columns.len() - 1`; generalises to `columns.len() - pk_count`
+    /// once compound PKs land.
+    #[inline]
+    pub fn num_payload_cols(&self) -> usize {
+        self.columns.len() - self.pk_indices().len()
+    }
+
     /// True iff column `ci` is the PK column.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
@@ -412,6 +420,31 @@ impl<'a> BatchAppender<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_num_payload_cols() {
+        // 2-column schema → 1 payload column.
+        let s = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        assert_eq!(s.num_payload_cols(), 1);
+
+        // pk_index not at column 0 → same answer (columns.len() - pk_indices().len()).
+        let s = Schema {
+            columns: vec![
+                ColumnDef { name: "a".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "c".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 2,
+        };
+        assert_eq!(s.num_payload_cols(), 3);
+    }
 
     #[test]
     fn test_wire_stride_string() {

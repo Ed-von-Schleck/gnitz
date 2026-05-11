@@ -85,7 +85,7 @@ fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
     let pk_stride = schema.columns[schema.pk_index_single() as usize].size as usize;
-    let num_payload = schema.num_columns as usize - 1;
+    let num_payload = schema.num_payload_cols();
     // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
     let mut sizes = [0u32; 128];

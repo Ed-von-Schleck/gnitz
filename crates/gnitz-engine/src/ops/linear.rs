@@ -24,7 +24,7 @@ pub fn op_filter(
 ) -> Batch {
     let n = batch.count;
     if n == 0 {
-        let npc = schema.num_columns as usize - 1;
+        let npc = schema.num_payload_cols();
         return Batch::empty(npc, 16);
     }
 
@@ -376,8 +376,8 @@ pub fn op_null_extend(
     in_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let in_npc = in_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let in_npc = in_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let out_npc = in_npc + right_npc;
     let n = batch.count;
 

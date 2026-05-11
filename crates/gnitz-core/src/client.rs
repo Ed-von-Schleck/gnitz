@@ -251,7 +251,7 @@ impl GnitzClient {
         let mut batch = ZSetBatch::new(schema);
         {
             let mut a = BatchAppender::new(&mut batch, schema);
-            let non_pk_count = schema.columns.len() - 1;
+            let non_pk_count = schema.num_payload_cols();
             for &pk in pks {
                 a.add_row(pk, -1);
                 for _ in 0..non_pk_count {

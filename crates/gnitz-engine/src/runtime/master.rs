@@ -1796,7 +1796,7 @@ fn build_check_batch(
     keys: &[u128],
     pooled: Option<Batch>,
 ) -> Batch {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let mut batch = match pooled {
         Some(b) if b.schema.as_ref() == Some(schema) => {
             let mut b = b;

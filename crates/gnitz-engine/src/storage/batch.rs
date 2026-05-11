@@ -125,7 +125,7 @@ pub(crate) fn carve_writer_slices<'a>(
     let (weight, rest) = rest.split_at_mut(fixed);
     let (null_bmp, mut rest) = rest.split_at_mut(fixed);
 
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(npc);
     for (_pi, _ci, col) in schema.payload_columns() {
         let col_sz = rows * col.size as usize;
@@ -407,7 +407,7 @@ impl Batch {
         debug_assert_eq!(
             self.num_payload_cols() + 1, s.num_columns as usize,
             "Batch::set_schema: batch has {} payload cols, schema declares {}",
-            self.num_payload_cols(), s.num_columns as usize - 1
+            self.num_payload_cols(), s.num_payload_cols()
         );
         self.schema = Some(s);
     }
@@ -1373,7 +1373,7 @@ impl Batch {
         schema: &SchemaDescriptor,
         verify_checksum: bool,
     ) -> Result<(Self, usize), &'static str> {
-        let npc = schema.num_columns as usize - 1;
+        let npc = schema.num_payload_cols();
         // V4: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + npc payload + blob
         let expected_regions = 3 + npc + 1;
 
@@ -1485,7 +1485,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
 ) -> Result<MemBatch<'a>, &'static str> {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let expected_regions = 3 + npc + 1; // pk, weight, null_bmp, payload…, blob
 
     let mut _lsn = 0u64; let mut _tid = 0u32; let mut count = 0u32;

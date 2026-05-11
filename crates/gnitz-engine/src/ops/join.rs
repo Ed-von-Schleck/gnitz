@@ -22,7 +22,7 @@ pub fn op_anti_join_delta_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> ConsolidatedBatch {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
@@ -84,7 +84,7 @@ pub fn op_semi_join_delta_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> ConsolidatedBatch {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
@@ -151,7 +151,7 @@ fn semi_join_dt_swapped(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> Batch {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let n = consolidated.count;
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
 
@@ -212,8 +212,8 @@ pub fn op_join_delta_trace(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
@@ -244,8 +244,8 @@ fn join_dt_merge_walk(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;
     let n = delta.count;
     if n == 0 {
@@ -341,8 +341,8 @@ pub fn op_join_delta_trace_outer(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
@@ -442,7 +442,7 @@ fn write_join_row(
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_cursor.current_null_word;
 
-    let left_npc = left_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
     let null_word = left_null | (right_null << left_npc);
 
     output.extend_pk(pk);
@@ -498,8 +498,8 @@ fn write_join_row_null_right(
     let pk = left_batch.get_pk(left_row);
     let left_null = left_batch.get_null_word(left_row);
 
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let right_null_bits = if right_npc < 64 {
         (1u64 << right_npc) - 1
     } else {
@@ -575,7 +575,7 @@ fn filter_join_dd_with_payload_inner<RowCmp>(
 where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -648,7 +648,7 @@ fn filter_join_dd(
     schema: &SchemaDescriptor,
     emit_on_match: bool,
 ) -> Batch {
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
     let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
@@ -715,8 +715,8 @@ pub fn op_join_delta_delta(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_columns as usize - 1;
-    let right_npc = right_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;
 
     let cs_a = Batch::consolidate_if_needed(batch_a, left_schema);
@@ -805,7 +805,7 @@ fn write_join_row_from_batches(
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_batch.get_null_word(right_row);
 
-    let left_npc = left_schema.num_columns as usize - 1;
+    let left_npc = left_schema.num_payload_cols();
     let null_word = left_null | (right_null << left_npc);
 
     output.extend_pk(pk);

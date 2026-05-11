@@ -1719,7 +1719,7 @@ mod tests {
         let gi_batch = Rc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
 
         // trace_out: empty (no previous aggregate, no retraction emitted)
-        let to_batch = Rc::new(Batch::empty(output_schema.num_columns as usize - 1, 16));
+        let to_batch = Rc::new(Batch::empty(output_schema.num_payload_cols(), 16));
 
         // delta: retract apple at PK=1
         let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);

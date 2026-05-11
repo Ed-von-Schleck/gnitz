@@ -616,10 +616,10 @@ fn merge_schemas_for_join_impl(
     right: &SchemaDescriptor,
     right_nullable: bool,
 ) -> SchemaDescriptor {
-    let total = left.num_columns as usize + right.num_columns as usize - 1;
+    let total = left.num_columns as usize + right.num_payload_cols();
     assert!(total <= crate::schema::MAX_COLUMNS,
-        "join output schema exceeds {}-column limit: {} + {} - 1 = {}",
-        crate::schema::MAX_COLUMNS, left.num_columns, right.num_columns, total);
+        "join output schema exceeds {}-column limit: {} + payload({}) = {}",
+        crate::schema::MAX_COLUMNS, left.num_columns, right.num_payload_cols(), total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
     out.columns[ci] = left.columns[left.pk_index_single() as usize];

@@ -456,7 +456,7 @@ fn write_scattered_data_block(
     data_slot: &mut [u8],
 ) {
     let pk_stride = schema.columns[schema.pk_index_single() as usize].size as usize;
-    let npc = schema.num_columns as usize - 1;
+    let npc = schema.num_payload_cols();
     let num_regions = 3 + npc + 1;
     let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
     let total_size = data_slot.len();
@@ -685,7 +685,7 @@ impl SalWriter {
 
         if !wire_safe {
             // Fallback: reconstruct per-worker Batches and use existing path.
-            let npc = schema.num_columns as usize - 1;
+            let npc = schema.num_payload_cols();
             let mb = input_batch.as_mem_batch();
             let sub_batches: Vec<Batch> = worker_indices.iter()
                 .map(|indices| {
@@ -720,7 +720,7 @@ impl SalWriter {
         };
         // ctrl block size for the no-error fast path is a compile-time constant.
         let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
-        let npc = schema.num_columns as usize - 1;
+        let npc = schema.num_payload_cols();
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {

@@ -60,6 +60,15 @@ impl SchemaDescriptor {
         self.pk_index
     }
 
+    /// Number of non-PK ("payload") columns.
+    /// Today: always `num_columns - 1`; generalises to `num_columns - pk_count`
+    /// once compound PKs land. Implemented via `pk_indices().len()` so the
+    /// substitution is a one-line change at that point.
+    #[inline]
+    pub const fn num_payload_cols(&self) -> usize {
+        self.num_columns as usize - self.pk_indices().len()
+    }
+
     /// Iterate over the non-PK ("payload") columns.
     ///
     /// Yields `(payload_idx, col_idx, &SchemaColumn)` where:
@@ -398,5 +407,19 @@ mod tests {
         s.pk_index = 1;
         assert_eq!(s.payload_idx(0), 0);
         assert_eq!(s.payload_idx(2), 1);
+    }
+
+    #[test]
+    fn test_num_payload_cols() {
+        // 2-column schema → 1 payload column.
+        let mut s = SchemaDescriptor::minimal_u64();
+        s.num_columns = 2;
+        s.pk_index = 0;
+        assert_eq!(s.num_payload_cols(), 1);
+
+        // pk_index not at column 0 → same answer (num_columns - pk_indices().len()).
+        s.num_columns = 4;
+        s.pk_index = 2;
+        assert_eq!(s.num_payload_cols(), 3);
     }
 }
