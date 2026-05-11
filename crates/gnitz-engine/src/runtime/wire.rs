@@ -819,13 +819,13 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     let mut pk_index: u32 = 0;
     let mut pk_found = false;
 
-    for i in 0..count {
+    for (i, col) in cols[..count].iter_mut().enumerate() {
         let off8 = i * 8;
         let tc = u64::from_le_bytes(type_data[off8..off8+8].try_into().unwrap()) as u8;
         let fl = u64::from_le_bytes(flags_data[off8..off8+8].try_into().unwrap());
         let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
         let is_pk       = (fl & META_FLAG_IS_PK)       != 0;
-        cols[i] = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
+        *col = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
         if is_pk {
             if pk_found { return Err("multiple PK columns"); }
             pk_index = i as u32;

@@ -180,7 +180,7 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     (0..schema.num_columns()).all(|ci| {
         let c = &schema.columns[ci];
-        c.type_code != type_code::STRING && c.size() % 8 == 0
+        c.type_code != type_code::STRING && c.size().is_multiple_of(8)
     })
 }
 

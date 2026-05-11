@@ -895,7 +895,7 @@ impl DagEngine {
         if let Some(d) = delta_opt {
             crate::storage::batch_pool::recycle(d);
         }
-        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
         let mut pending_pos: FxHashMap<(i64, i64), usize> = FxHashMap::default();
         for (i, pe) in pending.iter().enumerate() {
             pending_pos.insert((pe.view_id, pe.source_id), i);
@@ -985,7 +985,7 @@ impl DagEngine {
                         });
                         pending_pos.insert((dep_id, view_id), new_idx);
                         // Re-sort to maintain descending depth order
-                        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+                        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
                         // Rebuild pending_pos
                         pending_pos.clear();
                         for (i, pe) in pending.iter().enumerate() {
@@ -1156,7 +1156,7 @@ impl DagEngine {
                         });
                     }
                     pending_pos.insert((dep_id, view_id), new_idx);
-                    pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+                    pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
                     pending_pos.clear();
                     for (i, pe) in pending.iter().enumerate() {
                         pending_pos.insert((pe.view_id, pe.source_id), i);

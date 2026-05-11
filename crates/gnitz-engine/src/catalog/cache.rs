@@ -198,7 +198,7 @@ impl CatalogEngine {
                 // Unconditional invalidation would produce spurious bumps on no-op updates
                 // and retract-reinsert cycles with an identical PK column.
                 let old = self.caches.pk_col_of.insert(tid, pk_col);
-                if old.map_or(true, |prev| prev != pk_col) {
+                if old != Some(pk_col) {
                     self.caches.invalidate_col_names(tid);
                 }
             } else {

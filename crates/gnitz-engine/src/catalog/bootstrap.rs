@@ -132,6 +132,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(schema);
 
             // Each entry: (name, type_code, is_nullable).
+            #[allow(clippy::type_complexity)]
             let system_cols: &[(i64, &[(& str, u8, u64)])] = &[
                 (SCHEMA_TAB_ID, &[("schema_id", type_code::U64, 0), ("name", type_code::STRING, 0)]),
                 (TABLE_TAB_ID, &[
@@ -340,7 +341,7 @@ impl CatalogEngine {
             .expect("sys_table_mut covers the match arms above");
         let arc = table.full_scan().map_err(|e| format!("scan error: {}", e))?;
         if arc.count > 0 {
-            self.fire_hooks(sys_table_id, &*arc)?;
+            self.fire_hooks(sys_table_id, &arc)?;
         }
         Ok(())
     }

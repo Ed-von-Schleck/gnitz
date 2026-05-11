@@ -140,7 +140,7 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
         let blob_offset = u64::from_le_bytes(unsafe { *(ptr.add(8) as *const [u8; 8]) }) as usize;
         let blob_ptr = cursor.blob_ptr();
         let blob_len = cursor.blob_len();
-        if blob_ptr.is_null() || blob_offset.checked_add(length).map_or(true, |end| end > blob_len) {
+        if blob_ptr.is_null() || blob_offset.checked_add(length).is_none_or(|end| end > blob_len) {
             return Vec::new();
         }
         let mut buf = vec![0u8; length];
@@ -240,6 +240,7 @@ const NODECOL_COL_POSITION: usize = 4;
 const NODECOL_COL_VALUE1:   usize = 5;
 const NODECOL_COL_VALUE2:   usize = 6;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_circuit(
     sys_nodes: *mut Table, sys_nodes_schema: &SchemaDescriptor,
     sys_edges: *mut Table, sys_edges_schema: &SchemaDescriptor,
@@ -303,16 +304,13 @@ pub(crate) fn load_circuit(
                 };
 
                 let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-                match gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
-                    Ok(op) => {
-                        if matches!(op, gnitz_wire::OpNode::GatherReduce) {
-                            if let Some(c) = cols_by_node.get(&node_id) {
-                                gather_reduce_cols.insert(node_id, c.clone());
-                            }
+                if let Ok(op) = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
+                    if matches!(op, gnitz_wire::OpNode::GatherReduce) {
+                        if let Some(c) = cols_by_node.get(&node_id) {
+                            gather_reduce_cols.insert(node_id, c.clone());
                         }
-                        nodes.insert(node_id, op);
                     }
-                    Err(_) => {} // unknown opcode: skip
+                    nodes.insert(node_id, op);
                 }
             }
             ch.cursor.advance();
@@ -910,9 +908,7 @@ fn emit_node(
                             let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
                             cols[0] = SchemaColumn::new(type_code::U128, 0);
                             let n = in_reg_schema.num_columns();
-                            for i in 0..n {
-                                cols[i + 1] = in_reg_schema.columns[i];
-                            }
+                            cols[1..n + 1].copy_from_slice(&in_reg_schema.columns[..n]);
                             SchemaDescriptor::new(&cols[..n + 1], &[0])
                         } else {
                             loaded.out_schema

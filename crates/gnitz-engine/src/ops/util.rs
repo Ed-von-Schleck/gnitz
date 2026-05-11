@@ -19,7 +19,7 @@ pub(super) fn write_string_from_batch(
     payload_col: usize,
 ) {
     let src = batch.get_col_ptr(row, payload_col, 16);
-    let cell = crate::schema::relocate_german_string_vec(src, &batch.blob, &mut output.blob, None);
+    let cell = crate::schema::relocate_german_string_vec(src, batch.blob, &mut output.blob, None);
     output.extend_col(out_pi, &cell);
 }
 

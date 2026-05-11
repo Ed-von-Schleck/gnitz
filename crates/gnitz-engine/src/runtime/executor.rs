@@ -1031,6 +1031,7 @@ fn encode_response_buffer(
     // SAFETY: encode_wire_into_ipc writes every byte [0, sz). The 4-byte frame
     // header is written immediately below. wal::encode zeros inter-region padding
     // (Step 1), so no byte is left uninitialised regardless of column type.
+    #[allow(clippy::uninit_vec)]
     unsafe { inner.set_len(total); }
     inner[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
     let written = ipc::encode_wire_into_ipc(

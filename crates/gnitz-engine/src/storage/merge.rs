@@ -433,7 +433,7 @@ fn merge_batches_inner<RowCmp>(
                 None
             }
         },
-        &less,
+        less,
     );
     drive_merge(
         &mut tree,

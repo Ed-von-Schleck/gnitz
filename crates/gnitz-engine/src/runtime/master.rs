@@ -656,10 +656,10 @@ impl MasterDispatcher {
         for ci in 0..n_idx {
             if let Some((col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
                 if !is_unique { continue; }
-                for w in 0..self.num_workers {
-                    if !worker_indices[w].is_empty() {
+                for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
+                    if !wi.is_empty() {
                         self.router.record_routing_from_source(
-                            source_batch, &worker_indices[w], schema,
+                            source_batch, wi, schema,
                             target_id as u32, col_idx, w as u32,
                         );
                     }

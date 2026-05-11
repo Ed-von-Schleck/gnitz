@@ -361,6 +361,7 @@ impl ReadCursor {
     ) -> LoserTree {
         // Wrap as a non-capturing closure: a direct fn-item reference would
         // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
+        #[allow(clippy::redundant_closure)]
         if is_fast {
             Self::build_tree_with(sources, states, schema,
                 |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi))
@@ -412,6 +413,7 @@ impl ReadCursor {
         if !self.valid {
             return;
         }
+        #[allow(clippy::redundant_closure)]
         if self.is_fast {
             self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
         } else {
@@ -435,6 +437,7 @@ impl ReadCursor {
 
     #[inline]
     fn drive(&mut self) {
+        #[allow(clippy::redundant_closure)]
         if self.is_fast {
             self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
         } else {
@@ -738,6 +741,7 @@ impl ReadCursor {
         limit: usize,
         out: &mut Vec<(u32, u32, i64)>,
     ) {
+        #[allow(clippy::redundant_closure)]
         if self.is_fast {
             self.drain_sorted_into_with(limit, out,
                 |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));

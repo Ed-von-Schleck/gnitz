@@ -114,6 +114,7 @@ pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_
 /// null bitmap, then one slice per payload column. Each region is sized for
 /// `rows * stride`. The caller is responsible for ensuring `data` has at least
 /// that many bytes; any tail is left untouched and discarded.
+#[allow(clippy::type_complexity)]
 pub(crate) fn carve_writer_slices<'a>(
     data: &'a mut [u8],
     schema: &SchemaDescriptor,
@@ -702,9 +703,9 @@ impl Batch {
                     || col.type_code == crate::schema::type_code::BLOB;
             }
         }
-        for pi in 0..npc {
+        for (pi, &is_str) in is_string_at[..npc].iter().enumerate() {
             let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
-            if is_string_at[pi] && cs == 16 {
+            if is_str && cs == 16 {
                 for row in start..end {
                     let src_struct = src.get_col_ptr(row, pi, 16);
                     let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize
@@ -1285,8 +1286,8 @@ impl Batch {
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
         let nr_wire = self.num_regions_total();
         let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..nr_wire {
-            sizes[i] = self.region_size(i) as u32;
+        for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
+            *size = self.region_size(i) as u32;
         }
         super::wal::block_size(nr_wire, &sizes[..nr_wire])
     }
@@ -1298,8 +1299,8 @@ impl Batch {
         let nr_wire = self.num_regions_total();
         let blob_idx = nr_wire - 1;
         let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..blob_idx {
-            sizes[i] = (count * self.strides[i] as usize) as u32;
+        for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
+            *size = (count * self.strides[i] as usize) as u32;
         }
         // blob is always empty for wire-safe schemas
         sizes[blob_idx] = 0;
@@ -1619,8 +1620,8 @@ pub fn wire_byte_size_multi(batches: &[Batch]) -> usize {
     let nr = first.num_regions_total();
     let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
     for batch in batches {
-        for i in 0..nr {
-            sizes[i] += batch.region_size(i) as u32;
+        for (i, size) in sizes[..nr].iter_mut().enumerate() {
+            *size += batch.region_size(i) as u32;
         }
     }
     super::wal::block_size(nr, &sizes[..nr])
@@ -1665,8 +1666,8 @@ pub fn encode_multi_to_wire(
     let mut total_count: u32 = 0;
     for batch in batches {
         total_count += batch.count as u32;
-        for i in 0..nr {
-            sizes[i] += batch.region_size(i) as u32;
+        for (i, size) in sizes[..nr].iter_mut().enumerate() {
+            *size += batch.region_size(i) as u32;
         }
     }
     let total_blob: u64 = sizes[blob_idx] as u64;

@@ -286,10 +286,7 @@ impl ShardIndex {
         };
         let mut entries = vec![ManifestEntryRaw::zeroed(); cap];
         let mut global_lsn = 0u64;
-        let count = match manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
+        let count = manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn)?;
 
         for raw in entries.iter().take(count) {
             if raw.table_id != self.table_id as u64 {

@@ -1035,7 +1035,7 @@ impl Reactor {
                     // exhaustion so reap_closing_conns can free FDs first.
                     let sfd = self.inner.server_fd.get();
                     if sfd >= 0 {
-                        if cqe.res == -(libc::EMFILE as i32) || cqe.res == -(libc::ENFILE as i32) {
+                        if cqe.res == -libc::EMFILE || cqe.res == -libc::ENFILE {
                             if !self.inner.accept_backoff_armed.get() {
                                 self.inner.accept_backoff_armed.set(true);
                                 let inner = Rc::clone(&self.inner);
@@ -1253,7 +1253,7 @@ impl Reactor {
         if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
         if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
         let control = zc.control;
-        drop(mb); // release borrows from slot before dropping the slot
+        let _ = mb; // release borrows from slot before dropping the slot
         drop(slot); // RAII: advance consume_cursor before waking awaiter
         self.route_reply(w, DecodedWire { control, schema, data_batch: Some(owned) });
     }
@@ -1274,7 +1274,7 @@ impl Reactor {
             owned.append_mem_batch_range(&mb, 0, mb.count, None);
             if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
             if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
-            drop(mb); // release borrow from slot bytes before dropping slot
+            let _ = mb; // release borrow from slot bytes before dropping slot
             Some(owned)
         } else {
             None

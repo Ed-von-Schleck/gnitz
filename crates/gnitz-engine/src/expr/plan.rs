@@ -93,9 +93,9 @@ fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
         debug_assert!(
             n * stride <= in_batch.col_data(in_pi).len(),
             "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
-             (batch count={})",
+             (batch count={}, payload cols={})",
             n, stride, n * stride, in_pi, in_batch.col_data(in_pi).len(),
-            in_batch.count,
+            in_batch.count, in_batch.num_payload_cols(),
         );
         output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
@@ -338,10 +338,15 @@ impl Plan {
         );
 
         let compute = if has_compute {
-            let emit_strides: Vec<u8> = emit_payloads.iter().map(|&p| {
-                let out_ci = out_schema.payload_col_idx(p);
-                out_schema.columns[out_ci].size()
-            }).collect();
+            let emit_strides: Vec<u8> = emit_payloads
+                .iter()
+                .map(|&p| {
+                    let out_ci = out_schema.payload_col_idx(p);
+                    out_schema.columns[out_ci].size()
+                })
+                .collect();
+            debug_assert_eq!(emit_strides.len(), emit_regs.len());
+            debug_assert_eq!(emit_strides.len(), emit_payloads.len());
             let no_nulls = prog.is_strictly_non_nullable(in_schema);
             ComputeKernel::Interpreted { prog, emit_payloads, emit_regs, emit_strides, no_nulls }
         } else {

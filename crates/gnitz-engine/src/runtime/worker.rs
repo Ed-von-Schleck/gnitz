@@ -77,6 +77,7 @@ struct DeferredDdl {
 // two call sites.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum DispatchContext {
     /// The worker is draining the SAL from its main run loop.
@@ -89,6 +90,7 @@ enum DispatchContext {
 }
 
 /// Result of a single `dispatch` call.
+#[allow(clippy::large_enum_variant)]
 enum DispatchOutcome {
     /// The dispatcher handled the message; the caller should keep
     /// draining the SAL.
@@ -400,6 +402,7 @@ impl WorkerProcess {
         let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
         let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, prebuilt_opt);
         let per_row = sz_1.saturating_sub(sz_0);
+        #[allow(clippy::manual_checked_ops)]
         let max_rows = if per_row > 0 {
             let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
             (usable / per_row).max(1).min(remaining)
@@ -914,7 +917,7 @@ impl WorkerProcess {
         // with empty column names, corrupting the client's schema cache.
         let schema_for_encode = if prebuilt_rc.is_some() { schema } else { None };
 
-        let is_wire_safe = schema.map(|s| schema_wire_safe(s)).unwrap_or(true);
+        let is_wire_safe = schema.map(schema_wire_safe).unwrap_or(true);
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.

@@ -180,7 +180,7 @@ fn fill_worker_indices(
     if out.len() < num_workers {
         out.resize_with(num_workers, Vec::new);
     }
-    for w in 0..num_workers { out[w].clear(); }
+    out[..num_workers].iter_mut().for_each(Vec::clear);
     for i in 0..batch.count {
         let partition = hash_row_for_partition(&mb, i, col_indices, schema);
         out[w_map[partition]].push(i as u32);
@@ -317,7 +317,7 @@ fn relay_scatter_merge_walk(
     if worker_rows.len() < num_workers {
         worker_rows.resize_with(num_workers, Vec::new);
     }
-    for w in 0..num_workers { worker_rows[w].clear(); }
+    worker_rows[..num_workers].iter_mut().for_each(Vec::clear);
 
     for (si, mb_opt) in mem_batches.iter().enumerate() {
         if let Some(mb) = mb_opt {
@@ -359,6 +359,7 @@ fn relay_scatter_merge_walk(
         let mut best_pos = 0;
         let mut best_pk = pk_cache[active_sources[0] as usize];
         let mut best_si_u8 = active_sources[0];
+        #[allow(clippy::needless_range_loop)]
         for pos in 1..num_active {
             let si = active_sources[pos];
             let pk = pk_cache[si as usize];

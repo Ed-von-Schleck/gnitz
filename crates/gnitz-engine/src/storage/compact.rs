@@ -126,6 +126,7 @@ fn open_and_merge(
 
     // Wrap as a non-capturing closure: a direct fn-item reference would fix
     // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
+    #[allow(clippy::redundant_closure)]
     if columnar::schema_is_int_nonnull(schema) {
         open_and_merge_inner(&shards, cursors, schema, emit,
             |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
@@ -165,7 +166,7 @@ fn open_and_merge_inner<RowCmp>(
                 None
             }
         },
-        &less,
+        less,
     );
     drive_merge(
         &mut tree,

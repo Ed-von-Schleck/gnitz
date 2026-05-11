@@ -133,7 +133,7 @@ pub const fn wire_stride(tc: u8) -> usize {
         3 | 4           => 2,   // U16, I16
         5..=7           => 4,   // U32, I32, F32
         8..=10          => 8,   // U64, I64, F64
-        11 | 12 | 13 | 14 => 16,  // STRING, U128, UUID, BLOB
+        11..=14           => 16,  // STRING, U128, UUID, BLOB
         _                 => 8,
     }
 }
@@ -828,7 +828,8 @@ pub mod control {
 
     const fn payload_index(col_idx: usize) -> usize {
         assert!(col_idx != COL_MSG_IDX, "PK column has no payload index");
-        if col_idx < COL_MSG_IDX { col_idx } else { col_idx - 1 }
+        // COL_MSG_IDX == 0 (first column), so all non-PK indices are > 0
+        col_idx - 1
     }
 
     pub const PAYLOAD_STATUS:       usize = payload_index(COL_STATUS);

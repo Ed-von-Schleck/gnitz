@@ -209,7 +209,7 @@ pub(super) fn pack_gcol_pk(view_id: i64, node_id: i64, col_idx: i64) -> (u64, u6
 pub(super) fn pack_node_col_pk(view_id: i64, node_id: i64, kind: i64, position: i64) -> (u64, u64) {
     debug_assert!((position as u64) <= 0xFFFF, "position {} exceeds 16-bit cap", position);
     debug_assert!((kind as u64) <= 0xFF, "kind {} exceeds 8-bit cap", kind);
-    debug_assert!((node_id as u64) <= 0xFFFF_FFFF_FF, "node_id {} exceeds 40-bit cap", node_id);
+    debug_assert!((node_id as u64) <= 0xFF_FFFF_FFFF, "node_id {} exceeds 40-bit cap", node_id);
     let lo = ((node_id as u64) << 24) | ((kind as u64) << 16) | (position as u64);
     (lo, view_id as u64)
 }

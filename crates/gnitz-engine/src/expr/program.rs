@@ -168,12 +168,11 @@ impl ExprProgram {
                 // IS_NULL / IS_NOT_NULL read null bits from the batch
                 EXPR_IS_NULL | EXPR_IS_NOT_NULL => return false,
                 // Payload load: null if the underlying column is nullable
-                EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
-                    if a1 < schema.num_payload_cols() {
-                        let ci = schema.payload_col_idx(a1);
-                        if schema.columns[ci].nullable != 0 {
-                            return false;
-                        }
+                EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT
+                    if a1 < schema.num_payload_cols() => {
+                    let ci = schema.payload_col_idx(a1);
+                    if schema.columns[ci].nullable != 0 {
+                        return false;
                     }
                 }
                 _ => {}
