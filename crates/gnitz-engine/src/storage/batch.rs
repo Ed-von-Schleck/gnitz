@@ -97,7 +97,7 @@ fn fill_payload_strides(
 
 /// Physical byte stride for the PK region: 8 for U64 PK, 16 for U128 PK.
 pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
-    schema.columns[schema.pk_index_single() as usize].size()
+    schema.pk_stride()
 }
 
 /// Build a strides array from a SchemaDescriptor.

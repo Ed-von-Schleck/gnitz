@@ -396,7 +396,7 @@ pub fn op_null_extend(
         out_columns[ci_out] = *col;
         ci_out += 1;
     }
-    let out_schema = SchemaDescriptor::new(&out_columns[..ci_out], &[in_schema.pk_index_single()]);
+    let out_schema = SchemaDescriptor::new(&out_columns[..ci_out], in_schema.pk_indices());
 
     let mut output = Batch::with_schema(out_schema, n);
     output.count = n;

@@ -1070,7 +1070,7 @@ mod tests {
         let batch = make_batch(&[(42, 1, 99)]);
         let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
-        let pk_index = cursor.schema.pk_index_single() as usize; // 0
+        let pk_index = cursor.schema.pk_indices()[0] as usize; // 0
         let ptr = cursor.col_ptr(pk_index, 16);
         assert!(ptr.is_null(), "col_ptr for PK index must return null");
     }

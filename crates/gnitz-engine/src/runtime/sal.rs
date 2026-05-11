@@ -194,7 +194,7 @@ pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
     if !safe {
         return (false, 0);
     }
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as u32;
+    let pk_stride = schema.pk_stride() as u32;
     let mut stride = pk_stride + 8 + 8;
     for (_pi, _ci, col) in schema.payload_columns() {
         stride += col.size() as u32;
@@ -455,7 +455,7 @@ fn write_scattered_data_block(
     table_id: u32,
     data_slot: &mut [u8],
 ) {
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as usize;
+    let pk_stride = schema.pk_stride() as usize;
     let npc = schema.num_payload_cols();
     let num_regions = 3 + npc + 1;
     let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;

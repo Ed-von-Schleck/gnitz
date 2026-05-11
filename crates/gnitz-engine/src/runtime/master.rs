@@ -1164,7 +1164,7 @@ impl MasterDispatcher {
             let expected_count = keys.len();
             let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
             let check_batch = build_check_batch(&parent_schema, &keys, pooled);
-            let pk_col = &[parent_schema.pk_index_single()];
+            let pk_col = parent_schema.pk_indices();
             let worker_indices = compute_worker_indices(
                 &check_batch, pk_col, &parent_schema, num_workers);
 
@@ -1228,7 +1228,7 @@ impl MasterDispatcher {
             if !keys.is_empty() {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
                 let check_batch = build_check_batch(&source_schema, &keys, pooled);
-                let pk_col = &[source_schema.pk_index_single()];
+                let pk_col = source_schema.pk_indices();
                 let worker_indices = compute_worker_indices(
                     &check_batch, pk_col, &source_schema, num_workers);
                 p1_labels.push(P1Label::UpsertPkId);
@@ -1566,7 +1566,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, schema_block, wire_safe, wire_row_stride) =
             self.cached_schema_block(target_id);
-        let pk_col = &[schema.pk_index_single()];
+        let pk_col = schema.pk_indices();
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);

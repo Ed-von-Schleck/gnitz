@@ -39,10 +39,14 @@ impl SchemaColumn {
 
 /// Sizing cap for the compound-PK column list carried in `SchemaDescriptor`.
 /// Engine-internal: callers materialise `pk_indices` as a stack-resident
-/// fixed array, but only the first `pk_count` entries are valid. Today
-/// every schema has `pk_count == 1`; this constant exists so the
-/// representation is ready for `pk_count > 1` without a re-layout.
-pub const MAX_PK_COLUMNS: usize = 4;
+/// fixed array, but only the first `pk_count` entries are valid.
+///
+/// Set to 5 to cover the user-facing PK cap (4 columns, planner-enforced)
+/// plus one indexed-column prefix used by secondary index schemas — modeled
+/// as `(indexed_col, src_pk_0, …, src_pk_{k-1})`. Today every schema built
+/// from the planner has `pk_count == 1`, but the representation accepts
+/// up to `MAX_PK_COLUMNS` entries.
+pub const MAX_PK_COLUMNS: usize = 5;
 
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
 /// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
@@ -57,6 +61,13 @@ pub struct SchemaDescriptor {
     num_columns: u32,
     pk_count: u32,
     pk_indices: [u32; MAX_PK_COLUMNS],
+    /// Total bytes per row of the PK region — sum of
+    /// `columns[pk_indices[k]].size()` for k in 0..pk_count. Precomputed
+    /// once in `new()` so per-row hot loops never re-run the sum. `u8`
+    /// matches the existing `storage::batch::pk_stride()` helper and the
+    /// cached `pk_stride: u8` fields on `MappedShard`/`DirectWriter`/
+    /// `MemBatch`; today's worst case is 5 × 16 = 80, well under 255.
+    pk_stride: u8,
     /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL.
     /// Same encoding as `SortDesc::pi` in `ops/reduce.rs`: PK columns hold the
     /// sentinel, payload columns hold their dense payload slot. Lets call
@@ -107,9 +118,10 @@ impl SchemaDescriptor {
     /// produced by `Default::default()` and is structurally invalid for real
     /// use. The representation itself accepts up to `MAX_PK_COLUMNS` entries
     /// so the field shape is ready for compound PKs without a re-layout.
+    #[track_caller]
     pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
-        debug_assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
-        debug_assert!(
+        assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
+        assert!(
             pk_indices.len() <= MAX_PK_COLUMNS,
             "new: pk_indices.len() exceeds MAX_PK_COLUMNS",
         );
@@ -120,21 +132,41 @@ impl SchemaDescriptor {
             i += 1;
         }
         let mut pk_arr = [0u32; MAX_PK_COLUMNS];
+        let mut stride_acc: u16 = 0;
         let mut k = 0;
         while k < pk_indices.len() {
-            debug_assert!(
+            assert!(
                 (pk_indices[k] as usize) < cols.len(),
                 "new: pk index out of range",
             );
+            // Duplicate-PK guard: a duplicate would desynchronise
+            // num_payload_cols (counts the dup twice), pk_columns
+            // (yields duplicates), and pk_stride (double-counts).
+            // O(pk_count²) over pk_count ≤ MAX_PK_COLUMNS — negligible.
+            let mut j = 0;
+            while j < k {
+                assert!(
+                    pk_indices[j] != pk_indices[k],
+                    "new: duplicate PK column index",
+                );
+                j += 1;
+            }
             pk_arr[k] = pk_indices[k];
+            stride_acc += cols[pk_indices[k] as usize].size() as u16;
             k += 1;
         }
+        assert!(
+            stride_acc <= u8::MAX as u16,
+            "new: pk_stride exceeds u8 width",
+        );
+        let pk_stride = stride_acc as u8;
         let (payload_mapping, payload_to_ci) =
             compute_mappings(cols.len(), pk_indices);
         SchemaDescriptor {
             num_columns: cols.len() as u32,
             pk_count: pk_indices.len() as u32,
             pk_indices: pk_arr,
+            pk_stride,
             payload_mapping,
             payload_to_ci,
             columns,
@@ -157,12 +189,41 @@ impl SchemaDescriptor {
         &self.pk_indices[..self.pk_count as usize]
     }
 
+    /// Iterate over PK columns in pk-list order. Mirror of
+    /// `payload_columns()`. Yields `(pk_ord, col_idx, &SchemaColumn)`.
+    /// No non-test caller today; introduced preemptively so future
+    /// compound-PK migration sites can drop in `for (ord, ci, col) in
+    /// schema.pk_columns()` without redefining the iterator shape.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn pk_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
+        self.pk_indices().iter().copied().enumerate().map(move |(ord, ci)| {
+            (ord, ci as usize, &self.columns[ci as usize])
+        })
+    }
+
+    /// Total bytes per row of the PK region. Precomputed in `new()`;
+    /// O(1) field load. Returns `u8` to mirror `SchemaColumn::size()`
+    /// and the storage-layer `pk_stride` caches; callers that need
+    /// `usize` for buffer arithmetic cast at the use site.
+    #[inline]
+    pub const fn pk_stride(&self) -> u8 {
+        self.pk_stride
+    }
+
     /// The single PK column index. Use only at boundaries that have not yet
     /// been generalized (format encoders, catalog serialization, SQL parser
     /// path, wire/client BatchAppender). Asserts pk_count == 1.
+    ///
+    /// Hard `assert!` (not `debug_assert!`): this is the release-active
+    /// canary for the day a compound PK reaches a boundary that has not
+    /// yet been generalised — a `debug_assert!` would compile out in
+    /// release and let the silent truncation to the first PK column ship
+    /// to production.
     #[inline]
+    #[track_caller]
     pub const fn pk_index_single(&self) -> u32 {
-        debug_assert!(self.pk_count == 1, "compound PK not yet supported here");
+        assert!(self.pk_count == 1, "compound PK not yet supported here");
         self.pk_indices[0]
     }
 
@@ -605,5 +666,106 @@ mod tests {
             &[0],
         );
         assert_eq!(s.num_columns(), 8);
+    }
+
+    #[test]
+    fn test_pk_columns_single_pk() {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::U128, 0),
+        ];
+        let s = SchemaDescriptor::new(&cols, &[1]);
+        let v: Vec<(usize, usize, u8)> = s
+            .pk_columns()
+            .map(|(ord, ci, c)| (ord, ci, c.type_code))
+            .collect();
+        assert_eq!(v, vec![(0, 1, type_code::I64)]);
+        assert_eq!(s.pk_indices()[0], 1);
+    }
+
+    #[test]
+    fn test_pk_stride_matches_single_pk_size() {
+        for tc in [
+            type_code::U8, type_code::I8, type_code::U16, type_code::I16,
+            type_code::U32, type_code::I32, type_code::F32,
+            type_code::U64, type_code::I64, type_code::F64,
+            type_code::U128, type_code::UUID,
+            type_code::STRING, type_code::BLOB,
+        ] {
+            let cols = [SchemaColumn::new(tc, 0)];
+            let s = SchemaDescriptor::new(&cols, &[0]);
+            assert_eq!(
+                s.pk_stride(),
+                s.columns[s.pk_indices()[0] as usize].size(),
+                "pk_stride mismatch for type_code {}", tc,
+            );
+        }
+    }
+
+    #[test]
+    fn test_pk_stride_compound() {
+        // Synthetic compound schema: [U64, U32] with both columns as PK.
+        // Sum = 8 + 4 = 12.
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ];
+        let s = SchemaDescriptor::new(&cols, &[0, 1]);
+        assert_eq!(s.pk_stride(), 12);
+        let v: Vec<(usize, usize, u8)> = s
+            .pk_columns()
+            .map(|(ord, ci, c)| (ord, ci, c.type_code))
+            .collect();
+        assert_eq!(v, vec![(0, 0, type_code::U64), (1, 1, type_code::U32)]);
+    }
+
+    #[test]
+    fn test_max_pk_columns_boundary() {
+        // Construct exactly MAX_PK_COLUMNS PK columns so a future bump
+        // of the constant keeps exercising the boundary case.
+        let cols = [SchemaColumn::new(type_code::U64, 0); MAX_PK_COLUMNS];
+        let pks: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
+        let s = SchemaDescriptor::new(&cols, &pks);
+        assert_eq!(s.pk_indices().len(), MAX_PK_COLUMNS);
+        let collected: Vec<(usize, usize)> = s
+            .pk_columns()
+            .map(|(ord, ci, _)| (ord, ci))
+            .collect();
+        let expected: Vec<(usize, usize)> =
+            (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
+        assert_eq!(collected, expected);
+        assert_eq!(s.pk_stride() as usize, MAX_PK_COLUMNS * 8);
+    }
+
+    #[test]
+    fn test_default_empty_schema() {
+        let s = SchemaDescriptor::default();
+        assert_eq!(s.pk_columns().count(), 0);
+        assert_eq!(s.pk_stride(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate PK column index")]
+    fn test_duplicate_pk_guard_panics_in_release() {
+        // No cfg(debug_assertions) gate — guard is a hard assert! and
+        // must fire in release too.
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ];
+        let _ = SchemaDescriptor::new(&cols, &[0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "compound PK not yet supported here")]
+    fn test_pk_index_single_panics_on_compound() {
+        // Release-active canary the migration policy depends on.
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ];
+        let s = SchemaDescriptor::new(&cols, &[0, 1]);
+        let _ = s.pk_index_single();
     }
 }

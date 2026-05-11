@@ -74,7 +74,7 @@ fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 }
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as usize;
+    let pk_stride = schema.pk_stride() as usize;
     let num_payload = schema.num_payload_cols();
     // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
@@ -246,7 +246,7 @@ const fn ctrl_region_offset(target_region: usize) -> usize {
     let pk_idx = schema.pk_index_single() as usize;
 
     let mut sizes = [0usize; NUM_REGIONS];
-    sizes[0] = schema.columns[pk_idx].size() as usize;          // pk
+    sizes[0] = schema.pk_stride() as usize;                   // pk
     sizes[1] = 8;                                             // weight
     sizes[2] = 8;                                             // null_bmp
     let mut pi = 0usize;
