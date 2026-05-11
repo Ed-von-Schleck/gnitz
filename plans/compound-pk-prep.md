@@ -26,8 +26,8 @@ marked by `pk_index_single()` calls and are out of scope here.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SchemaDescriptor {
-    pub num_columns: u32,
-    pub pk_index: u32,                              // ← single column
+    num_columns: u32,                                  // private
+    pk_index: u32,                                     // private — single column
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 ```
@@ -37,8 +37,8 @@ The reader-side accessors (`num_columns`, `pk_indices`,
 `num_payload_cols`) are scalar shims over the single `pk_index: u32`
 field — `pk_indices()` returns a `slice::from_ref(&pk_index)`,
 `is_pk_col` and `payload_idx` reduce to a single equality / branch on
-that one index. The mapping-array rewrite arrives in this plan — once
-the underlying field is a real list we have somewhere to anchor the
+that one index. The field rep flip arrives in this plan — once the
+underlying storage is a real list we have somewhere to anchor the
 precomputed mappings and removing optimizer dependence on
 `pk_count == 1` actually matters.
 
@@ -124,43 +124,16 @@ viable:
   order).
   Format change: minimal.
 
-This plan does not pick a direction. The constructor-side rewrite
-below is a precondition for both.
-
-## What's already in place
-
-The schema-constructor refactor landed in commit `1cb1830` and
-established the constructor that this plan hangs the mapping
-computation on:
-
-- `SchemaDescriptor::new(cols: &[SchemaColumn], pk_indices: &[u32])`
-  exists as a `const fn`. The body validates `pk_indices.len() == 1 ||
-  (cols.is_empty() && pk_indices.is_empty())` and writes `pk_index`
-  from `pk_indices[0]`.
-- Every stub-then-mutate site (the `empty_schema()` / direct struct
-  literal / `Default::default()` + field-mutation patterns) routes
-  through `new()`. The `empty_schema()` and `col()` helpers are
-  deleted.
-- The reader-side accessors — `num_columns()`, `pk_indices()`,
-  `pk_index_single()`, `is_pk_col()`, `payload_idx()`,
-  `payload_columns()`, `num_payload_cols()` — are all in place. They
-  read through the existing scalar `pk_index` field today; the bodies
-  flip in this plan.
-- `PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX` exists and is already
-  consumed by `ops::reduce` for `SortDesc::pi`.
-
-What is *not* yet routed through `new()` is the build-then-literal
-pattern: ~30 sites that fill a `[SchemaColumn; MAX_COLUMNS]` array and
-construct the descriptor with one struct literal that names every
-field. These compile today because `num_columns`, `pk_index`, and
-`columns` are still `pub`. They are the surface this plan migrates.
+This plan does not pick a direction. The field-rep flip below is a
+precondition for both.
 
 ## What this plan changes
 
-One commit. A constructor-side refactor.
+One commit. A field-representation flip.
 
-Flip the underlying representation and install O(1) mappings for both
-the payload-vs-PK question and the dense payload iteration:
+Replace the scalar `pk_index: u32` field with a real list and install
+O(1) mappings for both the payload-vs-PK question and the dense payload
+iteration:
 
 ```rust
 pub const MAX_PK_COLUMNS: usize = 4;
@@ -182,10 +155,10 @@ pub struct SchemaDescriptor {
 }
 ```
 
-**Field privacy.** `num_columns`, `pk_count`, `pk_indices`,
-`payload_mapping`, and `payload_to_ci` are private. `columns` stays
-`pub` because external callers index it heavily (`schema.columns[ci]`).
-The struct is constructed exclusively through:
+`num_columns`, `pk_count`, `pk_indices`, `payload_mapping`, and
+`payload_to_ci` are all private. `columns` stays `pub` because external
+callers index it heavily (`schema.columns[ci]`). The struct is
+constructed exclusively through:
 
 ```rust
 impl SchemaDescriptor {
@@ -210,51 +183,11 @@ The existing `num_payload_cols()` body changes from
 `self.num_columns as usize - self.pk_count as usize` — a one-line
 substitution against the new representation.
 
-The reason for privacy is mechanical: a public `payload_mapping` field
-allows any caller (test or otherwise) to construct a `SchemaDescriptor`
-with `..Default::default()` or struct-literal syntax that bypasses the
-recompute, producing a schema where `payload_idx` returns 0 for every
-column. Forcing construction through `new` makes that error
-unrepresentable.
-
-Privatizing `num_columns`, `pk_count`, and `pk_indices` together is what
-makes the "default + mutate" idiom impossible to compile, not a style
-convention to enforce by review. Ten existing test scaffolds today still
-write `let mut s = SchemaDescriptor::default(); s.num_columns = N;
-s.pk_index = K;` (in `schema.rs` tests at L472–501 and `runtime/executor.rs`
-tests at L1163, L1170) — those stop typechecking and migrate to a
-single `SchemaDescriptor::new(&cols, &[K])` call as part of this plan.
-
-### Build-then-literal site migration
-
-The schema-constructor refactor left every site that fills a
-`[SchemaColumn; MAX_COLUMNS]` array and ends with a single struct
-literal in place. These compile today because the fields are `pub`;
-they stop compiling once the fields privatize. Each is a mechanical
-one-line substitution: `SchemaDescriptor { num_columns, pk_index,
-columns }` → `SchemaDescriptor::new(&columns[..num_columns],
-&[pk_index])`.
-
-Audit shows ~30 sites under `rg "SchemaDescriptor\s*\{\s*num_columns"
-crates/`:
-
-- `vm.rs::make_schema`, `runtime/master.rs::{u64_schema, two_col_schema}`
-  and inline literals.
-- `expr/tests/{program_tests, plan_tests, batch_tests}.rs::make_schema*`.
-- `storage/{batch, columnar, partitioned_table, table, read_cursor,
-  shard_reader, merge}.rs::make_*_schema` test helpers (one each).
-- `storage/memtable.rs::{make_u64_i64_schema, make_schema_cols}` plus
-  one inline literal.
-- `storage/columnar.rs` test helpers (4 sites).
-- `ops/{scan, distinct, exchange, join, linear}.rs::make_*_schema` test
-  helpers; one production literal in `ops/linear.rs::op_null_extend`.
-- `ops/reduce.rs::{make_schema_u64_i64, make_schema_u64_f32,
-  make_schema_with_type}` plus the `runtime/wire.rs` snapshots.
-
-None of these touches operator logic, storage code, or the hot path —
-they are all schema-shape mechanics. Existing const-fn helpers
-(`catalog::sys_tables::make_schema`, `from_wire_cols`) already forward
-through `new()` since the constructor refactor; nothing changes there.
+The reason for the precomputed-array fields being private is mechanical:
+a public `payload_mapping` field would let any caller construct a
+`SchemaDescriptor` via struct-literal syntax that bypasses the recompute,
+producing a schema where `payload_idx` returns 0 for every column.
+Forcing construction through `new` makes that error unrepresentable.
 
 The hot accessors collapse to single-load lookups:
 
@@ -388,9 +321,3 @@ bodies and the underlying field representation flip. `payload_idx`,
    faster on `compare_rows`-heavy workloads (sort, distinct, N-way
    merge); confirm no regression > 1% on any benchmark and no
    regression > 0.5% on hot-path comparators.
-5. **Constructor audit**:
-   `rg "SchemaDescriptor\s*\{" crates/` should match only the struct
-   definition itself and the `Default` / `new` / `minimal_u64`
-   implementations. `rg "\.num_columns\s*=" crates/` and
-   `rg "\.pk_index\s*=" crates/` should both return zero matches —
-   field privatization makes those writes impossible to compile.
