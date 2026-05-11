@@ -6,8 +6,14 @@
 use std::cmp::Ordering;
 
 use crate::schema::{
-    compare_german_strings, read_signed, SchemaDescriptor,
-    type_code::{BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128},
+    compare_german_strings, read_signed, read_unsigned, SchemaDescriptor,
+    type_code::{
+        BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64,
+        I8 as TYPE_I8, I16 as TYPE_I16, I32 as TYPE_I32, I64 as TYPE_I64,
+        STRING as TYPE_STRING,
+        U8 as TYPE_U8, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64,
+        U128 as TYPE_U128, UUID as TYPE_UUID,
+    },
 };
 use crate::util::{read_u32_le, read_u64_le};
 
@@ -96,6 +102,73 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
         }
     }
 
+    Ordering::Equal
+}
+
+// ---------------------------------------------------------------------------
+// Column-aware PK byte-region comparator
+// ---------------------------------------------------------------------------
+
+/// Column-aware byte-wise comparator for PK regions.
+///
+/// `a` and `b` are concatenated LE bytes of every PK column in
+/// `schema.pk_indices()` order — the format produced by
+/// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`. The walk
+/// slices each column's `size()` bytes off the front and dispatches
+/// on the column's `type_code`. PK columns are non-nullable, so no
+/// null-bit handling. Unsigned narrow types use `read_unsigned`
+/// (zero-extension); signed narrow types use `read_signed`
+/// (sign-extension).
+///
+/// For `pk_count == 1` this function is unused: existing callers
+/// hold the PK as `u128` and compare directly. It exists to support
+/// `pk_count >= 2` and (eventually) signed single-column PKs.
+#[allow(dead_code)]
+pub fn compare_pk_bytes(
+    schema: &SchemaDescriptor,
+    a: &[u8],
+    b: &[u8],
+) -> Ordering {
+    debug_assert!(
+        !schema.pk_indices().is_empty(),
+        "compare_pk_bytes: schema has no PK columns",
+    );
+    debug_assert_eq!(
+        a.len(), schema.pk_stride() as usize,
+        "compare_pk_bytes: a.len() must equal pk_stride",
+    );
+    debug_assert_eq!(
+        b.len(), schema.pk_stride() as usize,
+        "compare_pk_bytes: b.len() must equal pk_stride",
+    );
+    let mut off = 0usize;
+    for (_ord, _ci, col) in schema.pk_columns() {
+        let cs = col.size() as usize;
+        let ord = match col.type_code {
+            TYPE_U128 | TYPE_UUID => {
+                let va = u128::from_le_bytes(a[off..off + 16].try_into().unwrap());
+                let vb = u128::from_le_bytes(b[off..off + 16].try_into().unwrap());
+                va.cmp(&vb)
+            }
+            TYPE_U64 | TYPE_U32 | TYPE_U16 | TYPE_U8 => {
+                let va = read_unsigned(&a[off..], cs);
+                let vb = read_unsigned(&b[off..], cs);
+                va.cmp(&vb)
+            }
+            TYPE_I64 | TYPE_I32 | TYPE_I16 | TYPE_I8 => {
+                let va = read_signed(&a[off..], cs);
+                let vb = read_signed(&b[off..], cs);
+                va.cmp(&vb)
+            }
+            other => panic!(
+                "compare_pk_bytes: type_code {other} is not PK-eligible",
+            ),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+        off += cs;
+    }
     Ordering::Equal
 }
 
@@ -573,5 +646,249 @@ mod tests {
         assert!(!schema_is_int_nonnull(&make_schema(&[
             (type_code::I64, 0), (type_code::U32, 0),
         ])));
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_pk_bytes
+    // -----------------------------------------------------------------------
+
+    fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
+        let cols: Vec<SchemaColumn> =
+            types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+        let pk: Vec<u32> = (0..types.len() as u32).collect();
+        SchemaDescriptor::new(&cols, &pk)
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_u64() {
+        let s = pk_only_schema(&[type_code::U64]);
+        let vals: [u64; 4] = [1, 2, 256, u64::MAX];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = vals[i].to_le_bytes();
+                let b = vals[j].to_le_bytes();
+                assert_eq!(
+                    compare_pk_bytes(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "U64 mismatch at ({i}, {j})",
+                );
+            }
+        }
+        // Pin the LE-bytes vs lex-bytes regression: 1 < 256.
+        assert_eq!(
+            compare_pk_bytes(&s, &1u64.to_le_bytes(), &256u64.to_le_bytes()),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_u128() {
+        let s = pk_only_schema(&[type_code::U128]);
+        let lo = u64::MAX as u128;
+        let hi = lo + 1;
+        assert_eq!(
+            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            Ordering::Less,
+        );
+        assert_eq!(
+            compare_pk_bytes(&s, &hi.to_le_bytes(), &lo.to_le_bytes()),
+            Ordering::Greater,
+        );
+        assert_eq!(
+            compare_pk_bytes(&s, &lo.to_le_bytes(), &lo.to_le_bytes()),
+            Ordering::Equal,
+        );
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_uuid() {
+        let s = pk_only_schema(&[type_code::UUID]);
+        let low: u128 = 0x0000_0000_0000_0001;
+        let high: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000;
+        // High-bit-set sorts above small value (u128 LE numerical order).
+        assert_eq!(
+            compare_pk_bytes(&s, &low.to_le_bytes(), &high.to_le_bytes()),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_signed_i8() {
+        let s = pk_only_schema(&[type_code::I8]);
+        let vals: [i8; 5] = [i8::MIN, -1, 0, 1, i8::MAX];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = [vals[i] as u8];
+                let b = [vals[j] as u8];
+                assert_eq!(
+                    compare_pk_bytes(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "I8 mismatch at ({i}, {j})",
+                );
+            }
+        }
+        // Sign-extension regression: -1 (0xFF) < 1 (0x01).
+        assert_eq!(compare_pk_bytes(&s, &[0xFF], &[0x01]), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_signed_i16() {
+        let s = pk_only_schema(&[type_code::I16]);
+        let vals: [i16; 5] = [i16::MIN, -1, 0, 1, i16::MAX];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = vals[i].to_le_bytes();
+                let b = vals[j].to_le_bytes();
+                assert_eq!(
+                    compare_pk_bytes(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "I16 mismatch at ({i}, {j})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_signed_i32() {
+        let s = pk_only_schema(&[type_code::I32]);
+        let vals: [i32; 5] = [i32::MIN, -1, 0, 1, i32::MAX];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = vals[i].to_le_bytes();
+                let b = vals[j].to_le_bytes();
+                assert_eq!(
+                    compare_pk_bytes(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "I32 mismatch at ({i}, {j})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_signed_i64() {
+        let s = pk_only_schema(&[type_code::I64]);
+        let vals: [i64; 5] = [i64::MIN, -1, 0, 1, i64::MAX];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = vals[i].to_le_bytes();
+                let b = vals[j].to_le_bytes();
+                assert_eq!(
+                    compare_pk_bytes(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "I64 mismatch at ({i}, {j})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_unsigned_u8() {
+        let s = pk_only_schema(&[type_code::U8]);
+        // High-bit-set vs small: 0xFF > 0x01 numerically as unsigned.
+        assert_eq!(compare_pk_bytes(&s, &[0xFFu8], &[0x01u8]), Ordering::Greater);
+        assert_eq!(compare_pk_bytes(&s, &[0x00u8], &[0xFFu8]), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_unsigned_u16() {
+        let s = pk_only_schema(&[type_code::U16]);
+        let lo: u16 = 0x0001;
+        let hi: u16 = 0xFFFE;
+        // Zero-extension: hi > lo. Sign-extension would invert.
+        assert_eq!(
+            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn compare_pk_bytes_single_unsigned_u32() {
+        let s = pk_only_schema(&[type_code::U32]);
+        let lo: u32 = 1;
+        let hi: u32 = 0xFFFF_FFFE;
+        assert_eq!(
+            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn compare_pk_bytes_compound_u64_u64() {
+        let s = pk_only_schema(&[type_code::U64, type_code::U64]);
+        let mk = |a: u64, b: u64| {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        let r0 = mk(1, 5);
+        let r1 = mk(1, 9);
+        let r2 = mk(2, 1);
+        // Same first column, second column tiebreaks ascending.
+        assert_eq!(compare_pk_bytes(&s, &r0, &r1), Ordering::Less);
+        // First column dominates (would be Greater under a u128 LE compare,
+        // which would treat the second column as the high-order bits).
+        assert_eq!(compare_pk_bytes(&s, &r1, &r2), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_pk_bytes_compound_mixed() {
+        let s = pk_only_schema(&[type_code::U64, type_code::I32]);
+        let mk = |a: u64, b: i32| {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        let neg = mk(1, -5);
+        let zero = mk(1, 0);
+        // Per-column dispatch picks read_signed for col 1 even though col 0
+        // is unsigned: -5 < 0.
+        assert_eq!(compare_pk_bytes(&s, &neg, &zero), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_pk_bytes_pk_indices_order_not_schema_order() {
+        // Schema [U64, U64] with pk_indices = [1, 0]: column 1 is the first
+        // PK column. The byte layout follows pk_indices() order, so the
+        // first 8 bytes correspond to column 1.
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1, 0],
+        );
+        // (col1=1, col0=5) vs (col1=2, col0=0): col1 dominates.
+        let mut a = Vec::with_capacity(16);
+        a.extend_from_slice(&1u64.to_le_bytes()); // col1
+        a.extend_from_slice(&5u64.to_le_bytes()); // col0
+        let mut b = Vec::with_capacity(16);
+        b.extend_from_slice(&2u64.to_le_bytes()); // col1
+        b.extend_from_slice(&0u64.to_le_bytes()); // col0
+        assert_eq!(compare_pk_bytes(&s, &a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_pk_bytes_equal_returns_equal() {
+        for tc in [
+            type_code::U8, type_code::I8, type_code::U16, type_code::I16,
+            type_code::U32, type_code::I32, type_code::U64, type_code::I64,
+            type_code::U128, type_code::UUID,
+        ] {
+            let s = pk_only_schema(&[tc]);
+            let stride = s.pk_stride() as usize;
+            let buf = vec![0xABu8; stride];
+            assert_eq!(
+                compare_pk_bytes(&s, &buf, &buf),
+                Ordering::Equal,
+                "equal-buffer mismatch for type_code {tc}",
+            );
+        }
+        // Compound (U64, U64) equal buffers.
+        let s = pk_only_schema(&[type_code::U64, type_code::U64]);
+        let buf = vec![0x7Fu8; 16];
+        assert_eq!(compare_pk_bytes(&s, &buf, &buf), Ordering::Equal);
     }
 }

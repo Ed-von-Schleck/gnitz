@@ -4,21 +4,21 @@ Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
 to have exactly one PK column. The schema descriptor is already shaped
 for it: `pk_indices: [u32; MAX_PK_COLUMNS=5]`, `pk_count: u32`,
 `payload_mapping` excluding all PK columns, plus `pk_columns()` /
-`pk_stride()` accessors. The storage layer, scatter routines, and
-partition routing already iterate via `pk_indices()` / `pk_stride()`.
-The remaining `pk_index_single()` call sites — catalog,
-`compiler.rs`, `ops/reduce.rs`, `runtime/master::format_pk_value`,
-`gnitz-sql`, `gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi` —
-are the boundaries this plan generalises. Their `pk_index_single()`
-calls each `assert!(pk_count == 1)` in release; the assertion is the
-canary that fires the day a compound PK reaches an unmigrated
-boundary.
+`pk_stride()` / `pk_indices()` accessors, the `Batch` / `MemBatch` /
+`MappedShard` PK-bytes accessors (`get_pk_bytes`, `extend_pk_bytes`,
+`set_pk_at_bytes`), and the column-aware `compare_pk_bytes` comparator.
+The remaining `pk_index_single()` call sites — catalog, `compiler.rs`,
+`ops/reduce.rs`, `runtime/master::format_pk_value`, `gnitz-sql`,
+`gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi` — are the
+boundaries this plan generalises. Their `pk_index_single()` calls each
+`assert!(pk_count == 1)` in release; the assertion is the canary that
+fires the day a compound PK reaches an unmigrated boundary.
 
 **Design choice — Concat.** The PK region in the physical batch / WAL
 block / shard file holds the concatenated raw PK column bytes, one row
 after the next. `pk_stride` grows from `{8, 16}` up to `MAX_PK_BYTES`
 (see Vocabulary). PK columns are *not* duplicated into payload regions
-— the PK region is the PK. Comparison goes through a new column-aware
+— the PK region is the PK. Comparison goes through the column-aware
 `compare_pk_bytes` helper that iterates `pk_columns()` with type
 dispatch, mirroring `compare_rows`'s payload loop.
 
@@ -134,50 +134,28 @@ not panic.
 
 Bytes accessors (`get_pk_bytes` / `extend_pk_bytes` / `set_pk_at_bytes`
 on `Batch`; `get_pk_bytes` on `MemBatch` and `MappedShard`) are already
-in place from `pk-bytes-accessors.md`. New compound-PK code calls those
-directly. Single-PK code keeps calling `get_pk` / `extend_pk` and stays
-bit-identical.
+landed. New compound-PK code calls those directly. Single-PK code
+keeps calling `get_pk` / `extend_pk` and stays bit-identical.
 
-`append_row_from_ptable_found` (`storage/batch.rs:953`) currently
-takes `pk: u128`. It becomes `pk_bytes: &[u8]` and uses the bytes
-extender. `PartitionedTable`'s found-row plumbing
+`Batch::append_row_from_ptable_found` currently takes `pk: u128`. It
+becomes `pk_bytes: &[u8]` and uses the bytes extender.
+`PartitionedTable`'s found-row plumbing
 (`storage/partitioned_table.rs`) follows the same shift: the
 found-row PK is retained as bytes and surfaced via
 `PartitionedTable::found_pk_bytes()`.
 
-`Batch::find_lower_bound(key: u128)` (`storage/batch.rs:827`) stays as a
-narrow-PK helper. New `find_lower_bound_bytes(&[u8])` for compound. The
-shard-reader equivalent (`shard_reader.rs`) gets the same pair. Both
-helpers route through `compare_pk_bytes` from §2.
+`Batch::find_lower_bound(key: u128)` stays as a narrow-PK helper. New
+`find_lower_bound_bytes(&[u8])` for compound. The shard-reader
+equivalent (`shard_reader.rs`) gets the same pair. Both helpers route
+through `compare_pk_bytes` from §2.
 
 ### 2. PK comparison (`storage/columnar.rs`)
 
-Add:
-
-```rust
-pub fn compare_pk_bytes(
-    schema: &SchemaDescriptor,
-    a: &[u8],
-    b: &[u8],
-) -> Ordering;
-```
-
-Callers pass the contiguous PK-region slices returned by
-`Batch::get_pk_bytes` (or any other source that produces concatenated
-LE column bytes). The body walks `schema.pk_columns()`, slicing out
-each column's `size()` bytes in pk-list order with the same type
-dispatch `compare_rows` uses for payload (no null bit — PK columns
-are non-nullable). For `pk_count == 1` the function is unused: the
-existing u128 path handles single-PK comparison directly.
-
-`compare_pk_bytes` is on the seek-binary-search hot path
-(`find_lower_bound_bytes` invokes it log₂(N) times per seek). The
-generic loop is acceptable as a fallback but compound PKs cluster
-on a few shapes — `(U64, U64)`, `(U64, U32)`, `(U64, U64, U64)`,
-`(U64, U64, U64, U64)`. Add a const-generic fast path matched on
-those shapes that loads each column as a typed integer and compares
-with `<` / `cmp`, mirroring the `scatter_*_<PKS>` strategy in §3b.
-Unrecognised shapes fall through to the generic walk.
+`compare_pk_bytes(schema, a, b) -> Ordering` is the column-aware
+comparator. Callers pass contiguous PK-region slices returned by
+`Batch::get_pk_bytes` (or any other source that produces
+concatenated LE column bytes). For `pk_count == 1` the function is
+unused: the existing u128 path handles single-PK comparison directly.
 
 `compare_rows` itself stays *unchanged*. It still iterates only the
 payload columns. The PK comparison happens at the heap level (next
@@ -722,11 +700,6 @@ benefit from; bake it in here.
 - `schema.rs`: `pk_columns()` over schemas with `pk_count` 1..=4,
   including mixed types. Round-trip via `payload_idx` /
   `payload_col_idx`. `pk_stride()` for each.
-- `storage/columnar.rs`: `compare_pk_bytes` on every PK type
-  combination (U64, U128, UUID, mixed). Including the (U64, U64)
-  case — a u128 numerical compare on a (U64, U64) concat sorts by
-  the trailing column; this test pins that compound PK goes through
-  `compare_pk_bytes`, not the u128 path.
 - `storage/batch.rs`: build a compound-PK batch via `with_schema`;
   insert rows with varying PK tuples; verify sort by `(PK bytes,
   payload)`; verify that calling `get_pk` on a wide-region batch
@@ -788,34 +761,32 @@ of the worker that produced the row.
 Order of merging (each step keeps the test suite green; not split
 into phases):
 
-1. **`compare_pk_bytes`.** New helper in `columnar.rs`. Unused for
-   single-PK schemas.
-2. **Widen `pk_stride` domain.** Loosen the `{8, 16}` gate in
+1. **Widen `pk_stride` domain.** Loosen the `{8, 16}` gate in
    `Batch::empty` / `with_schema`, `MemBatch`, `MappedShard`; extend
    the `match stride` blocks in `get_pk`/`extend_pk`/`set_pk_at` and
    the scatter dispatchers (§3b) to cover wider strides via the
    `scatter_*_dynamic` arm.
-3. **Heap dispatch.** `HeapNode` stays 32 B; merge entry points pick
+2. **Heap dispatch.** `HeapNode` stays 32 B; merge entry points pick
    the comparison closure from `pk_count` / `pk_stride` (table in §3).
    Single-PK path is bit-identical to today; wide-PK path indirects
    via the source cursors only when `pk_stride > 16`.
-4. **Catalog encoding.** Pack `pk_count + pk_cols` into TABLE_TAB
+3. **Catalog encoding.** Pack `pk_count + pk_cols` into TABLE_TAB
    per §9.
-5. **SAL/WAL pk_stride.** Region 0 width follows
+4. **SAL/WAL pk_stride.** Region 0 width follows
    `schema.pk_stride()`. For single-PK this is identical to today.
-6. **Manifest format.** Write `pk_min`/`pk_max` as `(len, bytes)`
+5. **Manifest format.** Write `pk_min`/`pk_max` as `(len, bytes)`
    pairs (§6).
-7. **Wire control extension.** Add `seek_pk_extra` (§8).
-8. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`. Drop the
+6. **Wire control extension.** Add `seek_pk_extra` (§8).
+7. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`. Drop the
    I*/U*→U64 PK coercion. From this commit onward, CREATE TABLE
    actually allows compound PK and native signed PK types.
-9. **DML.** `extract_pk_value` returns a tuple;
+8. **DML.** `extract_pk_value` returns a tuple;
    `try_extract_pk_seek` requires full-tuple binding.
-10. **Operators.** Schema builders in `compiler.rs` and
-    `reduce`/`join` adjustments. Index seek becomes prefix-scan.
-11. **FK stricter rule.** Reject single-column FK to a compound-PK
+9. **Operators.** Schema builders in `compiler.rs` and
+   `reduce`/`join` adjustments. Index seek becomes prefix-scan.
+10. **FK stricter rule.** Reject single-column FK to a compound-PK
     parent unless the referenced column has its own UNIQUE index.
-12. **Python/CAPI.** `pk_index` → `pk_indices`.
+11. **Python/CAPI.** `pk_index` → `pk_indices`.
 
 Each step is independently mergeable; the feature only becomes
-user-visible at step 8.
+user-visible at step 7.

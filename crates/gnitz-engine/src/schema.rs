@@ -323,6 +323,18 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
+#[inline(always)]
+pub(crate) fn read_unsigned(bytes: &[u8], size: usize) -> u64 {
+    debug_assert!(bytes.len() >= size, "read_unsigned: buffer too short ({} < {})", bytes.len(), size);
+    match size {
+        1 => bytes[0] as u64,
+        2 => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as u64,
+        4 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64,
+        8 => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        _ => unreachable!("read_unsigned: unexpected size {size}"),
+    }
+}
+
 /// Promote raw column data at `offset` to a u128 key for index lookups.
 #[inline]
 pub(crate) fn promote_to_index_key(
@@ -767,5 +779,34 @@ mod tests {
         ];
         let s = SchemaDescriptor::new(&cols, &[0, 1]);
         let _ = s.pk_index_single();
+    }
+
+    #[test]
+    fn read_unsigned_zero_extends() {
+        // size 1: high-bit-set vs small — must match u8.cmp.
+        assert_eq!(read_unsigned(&[0xFF], 1), 0xFF);
+        assert_eq!(read_unsigned(&[0x01], 1), 0x01);
+        assert!(read_unsigned(&[0xFF], 1) > read_unsigned(&[0x01], 1));
+
+        // size 2: 0xFFFE > 0x0001 as unsigned (sign-extension would invert).
+        assert_eq!(read_unsigned(&0xFFFEu16.to_le_bytes(), 2), 0xFFFE);
+        assert_eq!(read_unsigned(&0x0001u16.to_le_bytes(), 2), 0x0001);
+        assert!(
+            read_unsigned(&0xFFFEu16.to_le_bytes(), 2)
+                > read_unsigned(&0x0001u16.to_le_bytes(), 2),
+        );
+
+        // size 4.
+        let big: u32 = 0xFFFF_FFFE;
+        let small: u32 = 0x0000_0001;
+        assert_eq!(read_unsigned(&big.to_le_bytes(), 4), big as u64);
+        assert!(
+            read_unsigned(&big.to_le_bytes(), 4)
+                > read_unsigned(&small.to_le_bytes(), 4),
+        );
+
+        // size 8: full u64 round-trip.
+        let v: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        assert_eq!(read_unsigned(&v.to_le_bytes(), 8), v);
     }
 }
