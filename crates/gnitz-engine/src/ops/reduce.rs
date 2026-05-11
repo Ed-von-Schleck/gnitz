@@ -543,11 +543,7 @@ fn build_sort_descs(
         let c_idx = c_idx_u32 as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
         arr[i] = SortDesc {
-            pi: if schema.is_pk_col(c_idx) {
-                PAYLOAD_MAPPING_PK_SENTINEL
-            } else {
-                schema.payload_idx(c_idx) as u8
-            },
+            pi: schema.payload_mapping_byte(c_idx),
             cs: tc.stride(),
             tc,
             c_idx: c_idx as u8,

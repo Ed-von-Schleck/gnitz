@@ -37,24 +37,81 @@ impl SchemaColumn {
     }
 }
 
+/// Sizing cap for the compound-PK column list carried in `SchemaDescriptor`.
+/// Engine-internal: callers materialise `pk_indices` as a stack-resident
+/// fixed array, but only the first `pk_count` entries are valid. Today
+/// every schema has `pk_count == 1`; this constant exists so the
+/// representation is ready for `pk_count > 1` without a re-layout.
+pub const MAX_PK_COLUMNS: usize = 4;
+
+/// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
+/// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
+/// "this slot refers to a PK column, not a payload column". Using
+/// `u8::MAX` (not 0) keeps the sentinel unambiguous against a real
+/// payload index of 0.
+pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SchemaDescriptor {
     num_columns: u32,
-    pk_index: u32,
+    pk_count: u32,
+    pk_indices: [u32; MAX_PK_COLUMNS],
+    /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL.
+    /// Same encoding as `SortDesc::pi` in `ops/reduce.rs`: PK columns hold the
+    /// sentinel, payload columns hold their dense payload slot. Lets call
+    /// sites that need this byte read it directly via
+    /// `payload_mapping_byte(ci)` instead of re-deriving it from a branch on
+    /// `is_pk_col` + `payload_idx`.
+    payload_mapping: [u8; MAX_COLUMNS],
+    /// payload_to_ci[pi] = logical column index for dense payload slot `pi`.
+    /// Inverse of `payload_mapping` over the non-PK columns; the trailing
+    /// `num_columns - pk_count`..MAX_COLUMNS slots hold the sentinel.
+    /// Lets `payload_columns()` walk a contiguous `0..num_payload` range
+    /// with one byte load per element, no per-row predicate.
+    payload_to_ci: [u8; MAX_COLUMNS],
     pub columns: [SchemaColumn; MAX_COLUMNS],
+}
+
+const fn compute_mappings(
+    num_columns: usize,
+    pk_indices: &[u32],
+) -> ([u8; MAX_COLUMNS], [u8; MAX_COLUMNS]) {
+    let mut payload_mapping = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
+    let mut payload_to_ci = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
+    let mut pi: u8 = 0;
+    let mut ci: usize = 0;
+    while ci < num_columns {
+        let mut is_pk = false;
+        let mut k = 0;
+        while k < pk_indices.len() {
+            if pk_indices[k] as usize == ci {
+                is_pk = true;
+            }
+            k += 1;
+        }
+        if !is_pk {
+            payload_mapping[ci] = pi;
+            payload_to_ci[pi as usize] = ci as u8;
+            pi += 1;
+        }
+        ci += 1;
+    }
+    (payload_mapping, payload_to_ci)
 }
 
 impl SchemaDescriptor {
     /// Construct a SchemaDescriptor from a column list and PK index list.
-    /// Today only single-PK schemas are supported (`pk_indices.len() == 1`);
+    /// Today only single-PK schemas are supported in practice (`pk_indices.len() == 1`);
     /// the empty case `pk_indices = &[]` is reserved for the placeholder
-    /// produced by `Default::default()` and is structurally invalid for real use.
+    /// produced by `Default::default()` and is structurally invalid for real
+    /// use. The representation itself accepts up to `MAX_PK_COLUMNS` entries
+    /// so the field shape is ready for compound PKs without a re-layout.
     pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
         debug_assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         debug_assert!(
-            pk_indices.len() == 1 || (cols.is_empty() && pk_indices.is_empty()),
-            "new: non-empty schema requires exactly one PK index (compound PK not yet supported)",
+            pk_indices.len() <= MAX_PK_COLUMNS,
+            "new: pk_indices.len() exceeds MAX_PK_COLUMNS",
         );
         let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
         let mut i = 0;
@@ -62,10 +119,24 @@ impl SchemaDescriptor {
             columns[i] = cols[i];
             i += 1;
         }
-        let pk_index = if pk_indices.is_empty() { 0 } else { pk_indices[0] };
+        let mut pk_arr = [0u32; MAX_PK_COLUMNS];
+        let mut k = 0;
+        while k < pk_indices.len() {
+            debug_assert!(
+                (pk_indices[k] as usize) < cols.len(),
+                "new: pk index out of range",
+            );
+            pk_arr[k] = pk_indices[k];
+            k += 1;
+        }
+        let (payload_mapping, payload_to_ci) =
+            compute_mappings(cols.len(), pk_indices);
         SchemaDescriptor {
             num_columns: cols.len() as u32,
-            pk_index,
+            pk_count: pk_indices.len() as u32,
+            pk_indices: pk_arr,
+            payload_mapping,
+            payload_to_ci,
             columns,
         }
     }
@@ -82,26 +153,23 @@ impl SchemaDescriptor {
 
     /// All PK column indices, in compound-key order. Today: always length 1.
     #[inline]
-    pub const fn pk_indices(&self) -> &[u32] {
-        std::slice::from_ref(&self.pk_index)
+    pub fn pk_indices(&self) -> &[u32] {
+        &self.pk_indices[..self.pk_count as usize]
     }
 
     /// The single PK column index. Use only at boundaries that have not yet
     /// been generalized (format encoders, catalog serialization, SQL parser
-    /// path, wire/client BatchAppender). Asserts length-1.
+    /// path, wire/client BatchAppender). Asserts pk_count == 1.
     #[inline]
     pub const fn pk_index_single(&self) -> u32 {
-        debug_assert!(self.pk_indices().len() == 1, "compound PK not yet supported here");
-        self.pk_index
+        debug_assert!(self.pk_count == 1, "compound PK not yet supported here");
+        self.pk_indices[0]
     }
 
     /// Number of non-PK ("payload") columns.
-    /// Today: always `num_columns - 1`; generalises to `num_columns - pk_count`
-    /// once compound PKs land. Implemented via `pk_indices().len()` so the
-    /// substitution is a one-line change at that point.
     #[inline]
     pub const fn num_payload_cols(&self) -> usize {
-        self.num_columns() - self.pk_indices().len()
+        self.num_columns as usize - self.pk_count as usize
     }
 
     /// Iterate over the non-PK ("payload") columns.
@@ -111,39 +179,50 @@ impl SchemaDescriptor {
     ///   regions and null-bitmap bits;
     /// - `col_idx` is the original logical column index in `self.columns`.
     ///
-    /// Replaces the manual `for ci in 0..n { if ci == pk { continue; } ... pi += 1 }`
-    /// pattern; keeps `pi` and `ci` in lockstep so they cannot desync.
+    /// Walks a contiguous `0..num_payload` range with one byte load per
+    /// element via `payload_to_ci` — no per-row predicate.
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
-        let pk = self.pk_index_single() as usize;
-        let n = self.num_columns();
-        (0..n)
-            .filter(move |ci| *ci != pk)
-            .enumerate()
-            .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
+        let num_payload = self.num_payload_cols();
+        (0..num_payload).map(move |pi| {
+            let ci = self.payload_to_ci[pi] as usize;
+            (pi, ci, &self.columns[ci])
+        })
     }
 
     /// Map a logical column index to its dense payload index (batch payload
-    /// region + null-bitmap bit position). Caller must ensure `col_idx != pk_index`.
+    /// region + null-bitmap bit position). Caller must ensure `col_idx` is
+    /// not a PK column.
     #[inline]
     pub fn payload_idx(&self, col_idx: usize) -> usize {
-        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be the pk_index");
-        let pk = self.pk_index_single() as usize;
-        if col_idx < pk { col_idx } else { col_idx - 1 }
+        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be a pk column");
+        self.payload_mapping[col_idx] as usize
     }
 
-    /// True iff column `ci` is the PK column.
+    /// True iff column `ci` is a PK column.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
-        self.pk_indices().iter().any(|&pk| ci == pk as usize)
+        self.payload_mapping[ci] == PAYLOAD_MAPPING_PK_SENTINEL
+    }
+
+    /// Raw `payload_mapping[ci]` byte — equals `PAYLOAD_MAPPING_PK_SENTINEL`
+    /// for PK columns, the dense payload index otherwise. Lets call sites
+    /// that already encode "pk → sentinel else payload_idx as u8" in their
+    /// own slot (e.g. `SortDesc::pi`) read the precomputed byte directly
+    /// without a branch.
+    #[inline]
+    pub fn payload_mapping_byte(&self, ci: usize) -> u8 {
+        self.payload_mapping[ci]
+    }
+
+    /// Inverse of `payload_idx`: dense payload slot → logical column index.
+    /// Caller must ensure `pi < num_payload_cols()`.
+    #[inline]
+    pub fn payload_col_idx(&self, pi: usize) -> usize {
+        debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
+        self.payload_to_ci[pi] as usize
     }
 }
-
-/// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`)
-/// that needs to express "this slot refers to the PK, not a payload
-/// column". Using `u8::MAX` (not 0) keeps the sentinel unambiguous
-/// against a real payload index of 0.
-pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {

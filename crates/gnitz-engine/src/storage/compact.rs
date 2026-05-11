@@ -84,10 +84,9 @@ impl ShardCursor {
 }
 
 #[cfg(test)]
-fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> bool {
+fn is_null(shard: &MappedShard, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> bool {
     let null_word = shard.get_null_word(row);
-    let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-    (null_word >> payload_idx) & 1 != 0
+    (null_word >> schema.payload_idx(col_idx)) & 1 != 0
 }
 
 fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
@@ -699,12 +698,12 @@ mod tests {
         assert_eq!(merged.count, 2);
 
         // Row 0: not null
-        assert!(!is_null(&merged, 0, 1, 0));
+        assert!(!is_null(&merged, 0, 1, &schema));
         let val = read_i64_le(merged.get_col_ptr(0, 0, 8), 0);
         assert_eq!(val, 42);
 
         // Row 1: null
-        assert!(is_null(&merged, 1, 1, 0));
+        assert!(is_null(&merged, 1, 1, &schema));
 
         let _ = fs::remove_dir_all(&dir);
     }

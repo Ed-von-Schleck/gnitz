@@ -1023,13 +1023,10 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema;
-        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index_single() as usize);
         let mut pi = 0;
 
         for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
-            let ci = if pk_index == usize::MAX { ci_raw }
-                     else if ci_raw < pk_index { ci_raw }
-                     else { ci_raw + 1 };
+            let ci = schema.map_or(ci_raw, |s| s.payload_col_idx(ci_raw));
 
             let is_string = schema.map_or(false, |s| {
                 ci < s.num_columns()

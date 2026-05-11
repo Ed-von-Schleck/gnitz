@@ -73,12 +73,6 @@ impl ScalarFuncKind {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a payload index to a schema column index, accounting for the PK gap.
-#[inline]
-fn payload_to_col(payload: usize, pk_index: usize) -> usize {
-    if payload < pk_index { payload } else { payload + 1 }
-}
-
 /// Copy a single column from `in_batch` to `output`.
 fn copy_column(
     in_batch: &Batch,
@@ -89,10 +83,9 @@ fn copy_column(
 ) {
     let n = in_batch.count;
     let in_pki = in_schema.pk_index_single() as usize;
-    let out_pki = out_schema.pk_index_single() as usize;
 
     if cm.src_ci == in_pki {
-        let out_ci = payload_to_col(cm.dst_payload, out_pki);
+        let out_ci = out_schema.payload_col_idx(cm.dst_payload);
         let stride = out_schema.columns[out_ci].size() as usize;
         let dst = output.col_data_mut(cm.dst_payload);
         for row in 0..n {
@@ -101,7 +94,7 @@ fn copy_column(
             dst[row * stride..row * stride + stride].copy_from_slice(&bytes[..stride]);
         }
     } else if cm.type_code == type_code::STRING {
-        let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
+        let in_pi = in_schema.payload_idx(cm.src_ci);
         let stride = in_schema.columns[cm.src_ci].size() as usize;
         let src_col = in_batch.col_data(in_pi);
         output.blob.reserve(in_batch.blob.len());
@@ -113,7 +106,7 @@ fn copy_column(
             output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
         }
     } else {
-        let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
+        let in_pi = in_schema.payload_idx(cm.src_ci);
         let stride = in_schema.columns[cm.src_ci].size() as usize;
         debug_assert!(
             n * stride <= in_batch.col_data(in_pi).len(),
@@ -408,7 +401,6 @@ impl Plan {
             return Batch::empty_with_schema(out_schema);
         }
 
-        let out_pki = out_schema.pk_index_single() as usize;
         let mut output = Batch::with_schema(*out_schema, n);
         output.count = n;
 
@@ -454,7 +446,7 @@ impl Plan {
 
                 // EMIT: write each computed register to its output column
                 for (&out_payload, &reg) in emit_payloads.iter().zip(emit_regs.iter()) {
-                    let out_ci = payload_to_col(out_payload, out_pki);
+                    let out_ci = out_schema.payload_col_idx(out_payload);
                     let stride = out_schema.columns[out_ci].size() as usize;
                     let dst8 = output.col_data_mut(out_payload);
                     let base_r = reg * MORSEL;
