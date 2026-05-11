@@ -405,7 +405,7 @@ impl Batch {
     #[inline]
     pub fn set_schema(&mut self, s: SchemaDescriptor) {
         debug_assert_eq!(
-            self.num_payload_cols() + 1, s.num_columns as usize,
+            self.num_payload_cols() + 1, s.num_columns(),
             "Batch::set_schema: batch has {} payload cols, schema declares {}",
             self.num_payload_cols(), s.num_payload_cols()
         );
@@ -1032,7 +1032,7 @@ impl Batch {
                      else { ci_raw + 1 };
 
             let is_string = schema.map_or(false, |s| {
-                ci < s.num_columns as usize
+                ci < s.num_columns()
                     && (s.columns[ci].type_code == crate::schema::type_code::STRING
                         || s.columns[ci].type_code == crate::schema::type_code::BLOB)
             });

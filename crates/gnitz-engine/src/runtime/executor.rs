@@ -1119,7 +1119,7 @@ fn validate_schema_match(
             expected.pk_indices(), wire.pk_indices(),
         ));
     }
-    for i in 0..wire.num_columns as usize {
+    for i in 0..wire.num_columns() {
         if wire.columns[i].type_code != expected.columns[i].type_code {
             return Err(format!(
                 "Schema mismatch at column {}: expected type {}, got {}",

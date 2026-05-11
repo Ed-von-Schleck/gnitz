@@ -481,7 +481,7 @@ fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> b
     if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() {
         return false;
     }
-    for i in 0..a.num_columns as usize {
+    for i in 0..a.num_columns() {
         if a.columns[i].type_code != b.columns[i].type_code {
             return false;
         }
@@ -616,7 +616,7 @@ fn merge_schemas_for_join_impl(
     right: &SchemaDescriptor,
     right_nullable: bool,
 ) -> SchemaDescriptor {
-    let total = left.num_columns as usize + right.num_payload_cols();
+    let total = left.num_columns() + right.num_payload_cols();
     assert!(total <= crate::schema::MAX_COLUMNS,
         "join output schema exceeds {}-column limit: {} + payload({}) = {}",
         crate::schema::MAX_COLUMNS, left.num_columns, right.num_payload_cols(), total);
@@ -955,7 +955,7 @@ fn emit_node(
                         let node_schema = if reindex_col.is_some() {
                             let mut s = empty_schema();
                             s.columns[0] = col(type_code::U128, 16, false);
-                            for i in 0..in_reg_schema.num_columns as usize {
+                            for i in 0..in_reg_schema.num_columns() {
                                 s.columns[i + 1] = in_reg_schema.columns[i];
                             }
                             s.num_columns = in_reg_schema.num_columns + 1;
@@ -1467,7 +1467,7 @@ fn emit_gather_reduce(
 ) {
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let partial_schema = reg_schemas[in_reg_id as usize];
-    let num_out_cols = partial_schema.num_columns as usize;
+    let num_out_cols = partial_schema.num_columns();
 
     let agg_specs: Vec<(u64, u64)> = raw_cols.iter()
         .filter(|(k, _, _, _)| *k == gnitz_wire::NODE_COL_KIND_AGG_SPEC)

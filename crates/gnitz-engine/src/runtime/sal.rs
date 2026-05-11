@@ -178,7 +178,7 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 /// columns. Batches satisfying this can be scatter-encoded directly into SAL
 /// slots without intermediate per-worker Batch allocations.
 pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
-    (0..schema.num_columns as usize).all(|ci| {
+    (0..schema.num_columns()).all(|ci| {
         let c = &schema.columns[ci];
         c.type_code != type_code::STRING && c.size % 8 == 0
     })

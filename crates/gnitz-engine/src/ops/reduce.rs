@@ -723,7 +723,7 @@ pub fn op_reduce(
     finalize_out_schema: Option<&SchemaDescriptor>,
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
-    let num_out_cols = output_schema.num_columns as usize;
+    let num_out_cols = output_schema.num_columns();
     let in_pki = input_schema.pk_index_single() as usize;
 
 
@@ -1030,7 +1030,7 @@ fn emit_reduce_row(
     use_natural_pk: bool,
     num_aggs: usize,
 ) {
-    let num_out_cols = output_schema.num_columns as usize;
+    let num_out_cols = output_schema.num_columns();
 
     output.extend_pk(group_key);
     output.extend_weight(&weight.to_le_bytes());
@@ -1245,7 +1245,7 @@ pub fn op_gather_reduce(
     agg_descs: &[AggDescriptor],
 ) -> Batch {
     let num_aggs = agg_descs.len();
-    let num_out_cols = partial_schema.num_columns as usize;
+    let num_out_cols = partial_schema.num_columns();
 
     // Sort without consolidation
     let sorted = sort_owned(partial_batch, partial_schema);
@@ -1356,7 +1356,7 @@ fn emit_gather_row(
     schema: &SchemaDescriptor,
     num_aggs: usize,
 ) {
-    let num_cols = schema.num_columns as usize;
+    let num_cols = schema.num_columns();
     let agg_base = num_cols - num_aggs;
 
     output.extend_pk(group_key);

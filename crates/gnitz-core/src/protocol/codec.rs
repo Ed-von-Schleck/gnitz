@@ -5,7 +5,7 @@ use super::types::{ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_fr
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
 pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
-    let ncols = schema.columns.len();
+    let ncols = schema.num_columns();
     let mut pks: Vec<u64> = Vec::with_capacity(ncols);
     let mut weights = Vec::with_capacity(ncols);
     let mut nulls   = Vec::with_capacity(ncols);

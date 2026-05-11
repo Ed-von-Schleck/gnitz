@@ -45,6 +45,12 @@ impl SchemaDescriptor {
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
     }
 
+    /// Number of logical columns in this schema (PK + payload).
+    #[inline]
+    pub const fn num_columns(&self) -> usize {
+        self.num_columns as usize
+    }
+
     /// All PK column indices, in compound-key order. Today: always length 1.
     #[inline]
     pub const fn pk_indices(&self) -> &[u32] {
@@ -66,7 +72,7 @@ impl SchemaDescriptor {
     /// substitution is a one-line change at that point.
     #[inline]
     pub const fn num_payload_cols(&self) -> usize {
-        self.num_columns as usize - self.pk_indices().len()
+        self.num_columns() - self.pk_indices().len()
     }
 
     /// Iterate over the non-PK ("payload") columns.
@@ -81,7 +87,7 @@ impl SchemaDescriptor {
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
         let pk = self.pk_index_single() as usize;
-        let n = self.num_columns as usize;
+        let n = self.num_columns();
         (0..n)
             .filter(move |ci| *ci != pk)
             .enumerate()
@@ -116,7 +122,7 @@ impl PartialEq for SchemaDescriptor {
             return false;
         }
         // Compare only the active columns; _pad is always 0 (SchemaColumn::new enforces it).
-        self.columns[..self.num_columns as usize] == other.columns[..other.num_columns as usize]
+        self.columns[..self.num_columns()] == other.columns[..other.num_columns()]
     }
 }
 
@@ -421,5 +427,18 @@ mod tests {
         s.num_columns = 4;
         s.pk_index = 2;
         assert_eq!(s.num_payload_cols(), 3);
+    }
+
+    #[test]
+    fn test_num_columns() {
+        let mut s = SchemaDescriptor::minimal_u64();
+        s.num_columns = 1;
+        assert_eq!(s.num_columns(), 1);
+
+        s.num_columns = 3;
+        assert_eq!(s.num_columns(), 3);
+
+        s.num_columns = 8;
+        assert_eq!(s.num_columns(), 8);
     }
 }

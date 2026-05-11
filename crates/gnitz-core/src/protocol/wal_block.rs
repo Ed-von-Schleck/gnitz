@@ -378,7 +378,7 @@ pub fn decode_wal_block(
     let blob = if blob_sz > 0 { &data[blob_off..blob_off + blob_sz] } else { &[] };
 
     // Read column regions
-    let mut columns: Vec<ColData> = Vec::with_capacity(schema.columns.len());
+    let mut columns: Vec<ColData> = Vec::with_capacity(schema.num_columns());
 
     for (ci, col) in schema.columns.iter().enumerate() {
         if schema.is_pk_col(ci) {

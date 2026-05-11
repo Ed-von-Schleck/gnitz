@@ -166,7 +166,7 @@ impl ExprProgram {
                     let pi = a1;
                     // Physical payload index pi maps to column index ci
                     let ci = if pi < pki { pi } else { pi + 1 };
-                    if ci < schema.num_columns as usize && schema.columns[ci].nullable != 0 {
+                    if ci < schema.num_columns() && schema.columns[ci].nullable != 0 {
                         return false;
                     }
                 }

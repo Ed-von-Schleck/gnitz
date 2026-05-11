@@ -133,7 +133,7 @@ pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MA
 }
 
 pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> Batch {
-    let ncols = schema.num_columns as usize;
+    let ncols = schema.num_columns();
     let meta = META_SCHEMA_DESC;
     let mut batch = Batch::with_schema(meta, ncols);
 
@@ -269,7 +269,7 @@ const fn ctrl_region_offset(target_region: usize) -> usize {
     sizes[2] = 8;                                             // null_bmp
     let mut pi = 0usize;
     let mut ci = 0usize;
-    while ci < schema.num_columns as usize {
+    while ci < schema.num_columns() {
         if ci == pk_idx { ci += 1; continue; }
         sizes[3 + pi] = schema.columns[ci].size as usize;
         pi += 1;
@@ -393,7 +393,7 @@ pub fn wire_size(
         } else {
             let s = schema.unwrap();
             let names = col_names.unwrap_or(&[]);
-            let ncols = s.num_columns as usize;
+            let ncols = s.num_columns();
             let schema_blob: usize = names.iter().take(ncols)
                 .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
                 .sum();
@@ -523,7 +523,7 @@ pub fn wire_size_range(
             total += prebuilt.len();
         } else {
             let s = schema.unwrap();
-            let ncols = s.num_columns as usize;
+            let ncols = s.num_columns();
             let schema_blob: usize = col_names.unwrap_or(&[]).iter().take(ncols)
                 .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
                 .sum();
@@ -786,7 +786,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 
 fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
     if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() { return false; }
-    for i in 0..a.num_columns as usize {
+    for i in 0..a.num_columns() {
         if a.columns[i].type_code != b.columns[i].type_code
             || a.columns[i].nullable != b.columns[i].nullable
         {

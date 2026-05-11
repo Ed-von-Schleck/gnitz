@@ -35,7 +35,7 @@ pub fn op_filter(
     // 16-byte string structs can be copied verbatim (no per-row relocation).
     // Offsets inside the structs remain valid because both blobs are identical.
     let blob_passthrough = !batch.blob.is_empty()
-        && (0..schema.num_columns as usize)
+        && (0..schema.num_columns())
             .any(|ci| schema.columns[ci].type_code == type_code::STRING);
     if blob_passthrough {
         output.share_blob_from(batch);
@@ -388,7 +388,7 @@ pub fn op_null_extend(
     // Build a merged schema for the output batch.
     let mut out_columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
     let mut ci_out = 0;
-    for ci in 0..in_schema.num_columns as usize {
+    for ci in 0..in_schema.num_columns() {
         out_columns[ci_out] = in_schema.columns[ci];
         ci_out += 1;
     }

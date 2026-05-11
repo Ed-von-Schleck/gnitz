@@ -28,6 +28,12 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// Number of logical columns in this schema (PK + payload).
+    #[inline]
+    pub fn num_columns(&self) -> usize {
+        self.columns.len()
+    }
+
     /// All PK column indices, in compound-key order. Today: always length 1.
     #[inline]
     pub fn pk_indices(&self) -> &[usize] {
@@ -48,7 +54,7 @@ impl Schema {
     /// once compound PKs land.
     #[inline]
     pub fn num_payload_cols(&self) -> usize {
-        self.columns.len() - self.pk_indices().len()
+        self.num_columns() - self.pk_indices().len()
     }
 
     /// True iff column `ci` is the PK column.
@@ -72,7 +78,7 @@ impl Schema {
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
         let pk = self.pk_index_single();
-        let n = self.columns.len();
+        let n = self.num_columns();
         (0..n)
             .filter(move |ci| *ci != pk)
             .enumerate()
@@ -225,10 +231,10 @@ impl ZSetBatch {
         if self.nulls.len() != n {
             return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
         }
-        if self.columns.len() != schema.columns.len() {
+        if self.columns.len() != schema.num_columns() {
             return Err(format!(
                 "column count {} != schema column count {}",
-                self.columns.len(), schema.columns.len()
+                self.columns.len(), schema.num_columns()
             ));
         }
         for (_pi, ci, col_def) in schema.payload_columns() {
@@ -444,6 +450,27 @@ mod tests {
             pk_index: 2,
         };
         assert_eq!(s.num_payload_cols(), 3);
+    }
+
+    #[test]
+    fn test_num_columns() {
+        let s = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        assert_eq!(s.num_columns(), 1);
+
+        let s = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(),  type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_index: 0,
+        };
+        assert_eq!(s.num_columns(), 3);
     }
 
     #[test]

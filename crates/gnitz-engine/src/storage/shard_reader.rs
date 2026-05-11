@@ -140,7 +140,7 @@ impl MappedShard {
         let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
 
-        let num_cols = schema.num_columns as usize;
+        let num_cols = schema.num_columns();
         let pk_stride = schema.columns[schema.pk_index_single() as usize].size; // 8 for U64, 16 for U128/String
         let num_non_pk = num_cols - 1;
         let num_regions = 3 + num_non_pk + 1;
