@@ -2,6 +2,21 @@ use super::super::program::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
+/// Build and resolve an `ExprProgram` in one step. Eval entry points
+/// `debug_assert!(prog.resolved)`, so every test prog must be resolved
+/// before being passed to `eval_predicate`/`eval_with_emit`.
+fn make_prog(
+    schema: &SchemaDescriptor,
+    code: Vec<i64>,
+    num_regs: u32,
+    result_reg: u32,
+    const_strings: Vec<Vec<u8>>,
+) -> ExprProgram {
+    let mut prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
+    prog.resolve_column_indices(schema);
+    prog
+}
+
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
     for (i, &tc) in col_types.iter().enumerate() {
@@ -44,8 +59,8 @@ fn test_int_comparisons() {
         EXPR_LOAD_CONST, 1, 42, 0, // r1 = 42
         EXPR_CMP_EQ, 2, 0, 1, // r2 = (r0 == r1)
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
@@ -55,8 +70,8 @@ fn test_int_comparisons() {
         EXPR_LOAD_CONST, 1, 42, 0,
         EXPR_CMP_NE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // Test GT
@@ -65,8 +80,8 @@ fn test_int_comparisons() {
         EXPR_LOAD_CONST, 1, 10, 0,
         EXPR_CMP_GT, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
 
@@ -82,8 +97,8 @@ fn test_int_arithmetic() {
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_INT_ADD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 13);
 
     // DIV by zero → NULL
@@ -92,8 +107,8 @@ fn test_int_arithmetic() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_INT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // MOD by zero → NULL
@@ -102,8 +117,8 @@ fn test_int_arithmetic() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_INT_MOD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // NEG: -10
@@ -111,8 +126,8 @@ fn test_int_arithmetic() {
         EXPR_LOAD_COL_INT, 0, 1, 0,
         EXPR_INT_NEG, 1, 0, 0,
     ];
-    let prog = ExprProgram::new(code, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -10);
 }
 
@@ -131,8 +146,8 @@ fn test_float_arithmetic_and_comparison() {
         EXPR_LOAD_COL_FLOAT, 1, 2, 0,
         EXPR_FLOAT_ADD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     let result = bits_to_float(val);
     assert!((result - 5.14).abs() < 1e-10);
 
@@ -142,8 +157,8 @@ fn test_float_arithmetic_and_comparison() {
         EXPR_LOAD_CONST, 1, 0, 0, // zero bits
         EXPR_FLOAT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // FCMP_GT: 3.14 > 2.0
@@ -152,8 +167,8 @@ fn test_float_arithmetic_and_comparison() {
         EXPR_LOAD_COL_FLOAT, 1, 2, 0,
         EXPR_FCMP_GT, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
 
@@ -170,8 +185,8 @@ fn test_null_propagation() {
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_INT_ADD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 }
 
@@ -184,22 +199,22 @@ fn test_is_null_is_not_null() {
 
     // IS_NULL(col1) → 1 (always non-null result)
     let code = vec![EXPR_IS_NULL, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
     let code = vec![EXPR_IS_NOT_NULL, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
     assert!(!is_null);
 
     // IS_NULL(col2) → 0
     let code = vec![EXPR_IS_NULL, 0, 2, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -215,8 +230,8 @@ fn test_boolean_combinators() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_BOOL_AND, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // OR(1, 0) → 1
@@ -225,8 +240,8 @@ fn test_boolean_combinators() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_BOOL_OR, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // NOT(1) → 0
@@ -234,8 +249,8 @@ fn test_boolean_combinators() {
         EXPR_LOAD_COL_INT, 0, 1, 0,
         EXPR_BOOL_NOT, 1, 0, 0,
     ];
-    let prog = ExprProgram::new(code, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -248,8 +263,8 @@ fn test_load_const_encoding() {
     // Test large constant: 0x00000001_00000002 = (1 << 32) | 2 = 4294967298
     // a1 = lo 32 bits = 2, a2 = hi 32 bits = 1
     let code = vec![EXPR_LOAD_CONST, 0, 2, 1];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, (1i64 << 32) | 2);
 
@@ -257,8 +272,8 @@ fn test_load_const_encoding() {
     // As i64: a1 = -1 (sign-extended from 32 bits), a2 = -1
     // Reconstruction: (-1 << 32) | (-1 & 0xFFFFFFFF) = 0xFFFFFFFF_FFFFFFFF = -1
     let code = vec![EXPR_LOAD_CONST, 0, -1, -1];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -1);
 }
 
@@ -282,15 +297,15 @@ fn test_string_eq_const() {
 
     // STR_COL_EQ_CONST(col1, "hello") → 1
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"hello".to_vec()]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1);
 
     // STR_COL_EQ_CONST(col1, "world") → 0
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"world".to_vec()]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -304,8 +319,8 @@ fn test_int_to_float() {
         EXPR_LOAD_COL_INT, 0, 1, 0,
         EXPR_INT_TO_FLOAT, 1, 0, 0,
     ];
-    let prog = ExprProgram::new(code, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(bits_to_float(val), 42.0);
 }
 
@@ -322,7 +337,7 @@ fn test_emit_with_targets() {
         EXPR_INT_ADD, 2, 0, 1,
         EXPR_EMIT, 0, 2, 0, // emit r2 to payload col 0
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
 
     let mut out_buf = [0u8; 8];
     let targets = [EmitTarget {
@@ -331,7 +346,7 @@ fn test_emit_with_targets() {
         payload_col: 0,
     }];
     let (val, is_null, mask) =
-        eval_with_emit(&prog, &mb, 0, 0, 0, &targets);
+        eval_with_emit(&prog, &mb, 0, 0, &targets);
     assert_eq!(val, 30); // 10 + 20
     assert!(!is_null);
     assert_eq!(mask, 0);
@@ -353,8 +368,8 @@ fn test_div_by_zero_null_semantics() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_INT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 2. INT_MOD by literal 0 → NULL
@@ -363,8 +378,8 @@ fn test_div_by_zero_null_semantics() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_INT_MOD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 3. FLOAT_DIV by 0.0 bits → NULL
@@ -373,8 +388,8 @@ fn test_div_by_zero_null_semantics() {
         EXPR_LOAD_CONST, 1, 0, 0,
         EXPR_FLOAT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 4. INT_DIV by non-null non-zero → correct quotient, not null
@@ -383,8 +398,8 @@ fn test_div_by_zero_null_semantics() {
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_INT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 3); // 10 / 3 = 3
 
@@ -399,8 +414,8 @@ fn test_div_by_zero_null_semantics() {
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_INT_DIV, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0);
     assert!(is_null);
 
     // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
@@ -410,14 +425,14 @@ fn test_div_by_zero_null_semantics() {
         EXPR_INT_DIV, 2, 0, 1,
         EXPR_EMIT, 0, 2, 0,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
     let mut out_buf = [0xffu8; 8];
     let targets = [EmitTarget {
         base: out_buf.as_mut_ptr(),
         stride: 8,
         payload_col: 0,
     }];
-    let (_, _, mask) = eval_with_emit(&prog, &mb, 0, 0, 0, &targets);
+    let (_, _, mask) = eval_with_emit(&prog, &mb, 0, 0, &targets);
     assert_eq!(mask & 1, 1); // bit 0 set → null
     let written = i64::from_le_bytes(out_buf);
     assert_eq!(written, 0);
@@ -435,8 +450,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 42, 0,
         EXPR_CMP_GE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // GE: 42 >= 43 → 0
@@ -445,8 +460,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 43, 0,
         EXPR_CMP_GE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LT: 42 < 43 → 1
@@ -455,8 +470,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 43, 0,
         EXPR_CMP_LT, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LT: 42 < 42 → 0
@@ -465,8 +480,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 42, 0,
         EXPR_CMP_LT, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LE: 42 <= 42 → 1
@@ -475,8 +490,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 42, 0,
         EXPR_CMP_LE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LE: 42 <= 41 → 0
@@ -485,8 +500,8 @@ fn test_cmp_ge_lt_le() {
         EXPR_LOAD_CONST, 1, 41, 0,
         EXPR_CMP_LE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -504,8 +519,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 1, 0,
         EXPR_FCMP_EQ, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_EQ: 3.14 == 2.0 → 0
@@ -514,8 +529,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 2, 0,
         EXPR_FCMP_EQ, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // FCMP_NE: 3.14 != 2.0 → 1
@@ -524,8 +539,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 2, 0,
         EXPR_FCMP_NE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LT: 2.0 < 3.14 → 1
@@ -534,8 +549,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 1, 0,
         EXPR_FCMP_LT, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LE: 2.0 <= 2.0 → 1
@@ -544,8 +559,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 2, 0,
         EXPR_FCMP_LE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_GE: 2.0 >= 3.14 → 0
@@ -554,8 +569,8 @@ fn test_fcmp_eq_ne_lt_le() {
         EXPR_LOAD_COL_FLOAT, 1, 1, 0,
         EXPR_FCMP_GE, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -576,26 +591,26 @@ fn test_string_lt_le_const() {
 
     // STR_COL_LT_CONST: "hello" < "world" → 1
     let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"world".to_vec()]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LT_CONST: "hello" < "hello" → 0
     let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // STR_COL_LE_CONST: "hello" <= "hello" → 1
     let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LE_CONST: "hello" <= "hella" → 0
     let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"hella".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![b"hella".to_vec()]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
 
@@ -635,12 +650,12 @@ fn test_string_col_eq_col() {
 
     // Row 0: col1 == col2 → 1
     let code = vec![EXPR_STR_COL_EQ_COL, 0, 1, 2];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // Row 1: col1 == col2 → 0
-    let (val, _) = eval_predicate(&prog, &mb, 1, 0);
+    let (val, _) = eval_predicate(&prog, &mb, 1);
     assert_eq!(val, 0);
 }
 
@@ -668,15 +683,15 @@ fn test_complex_predicate() {
         EXPR_CMP_EQ, 9, 7, 8,         // r9 = (42 == 42) = 1
         EXPR_BOOL_OR, 10, 6, 9,       // r10 = (1 OR 1) = 1
     ];
-    let prog = ExprProgram::new(code, 11, 10, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 11, 10, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // Test with a=5 (a>10 false), b=50, c=99 (c==42 false) → false
     let batch2 = make_int_batch(&schema, &[(1, 1, 0, &[5, 50, 99])]);
     let mb2 = batch2.as_mem_batch();
-    let (val, _) = eval_predicate(&prog, &mb2, 0, 0);
+    let (val, _) = eval_predicate(&prog, &mb2, 0);
     assert_eq!(val, 0);
 }
 
@@ -693,7 +708,7 @@ fn test_emit_null_opcode() {
         EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col1
         EXPR_EMIT_NULL, 0, 0, 0,     // emit null — batch-level, no-op here
     ];
-    let prog = ExprProgram::new(code, 1, 0, vec![]);
+    let prog = make_prog(&schema,code, 1, 0, vec![]);
 
     let mut out_buf = [0u8; 8];
     let targets = [EmitTarget {
@@ -701,7 +716,7 @@ fn test_emit_null_opcode() {
         stride: 8,
         payload_col: 0,
     }];
-    let (val, _, mask) = eval_with_emit(&prog, &mb, 0, 0, 0, &targets);
+    let (val, _, mask) = eval_with_emit(&prog, &mb, 0, 0, &targets);
     // EMIT_NULL is a no-op at per-row level (batch-level handles it),
     // so emit_null_mask stays 0 and result reg r0 holds the loaded value.
     assert_eq!(mask, 0);
@@ -717,8 +732,8 @@ fn test_zero_regs_program() {
 
     // One COPY_COL instruction: copy col 1 → payload 0, type I64=9
     let code = vec![EXPR_COPY_COL, 9, 1, 0];
-    let prog = ExprProgram::new(code, 0, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let prog = make_prog(&schema,code, 0, 0, vec![]);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     // With num_regs=0, result should be (0, true) — sentinel
     assert_eq!(val, 0);
     assert!(is_null);
@@ -734,27 +749,27 @@ fn test_resolve_column_indices_pk_at_col0() {
     // LOAD_COL_INT of pk column → LOAD_PK_INT
     let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0]; // col 0 = pk
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(0);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+    let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 42);
     assert!(!is_null);
 
     // LOAD_COL_INT of col1 (logical 1) → LOAD_PAYLOAD_INT, physical 0
     let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(0);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
     assert_eq!(prog.code[2], 0); // physical payload index
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 10);
 
     // LOAD_COL_INT of col2 (logical 2) → LOAD_PAYLOAD_INT, physical 1
     let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(0);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[2], 1);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 20);
 }
 
@@ -769,28 +784,47 @@ fn test_resolve_column_indices_pk_at_middle() {
     // col0 (logical 0, before pk) → physical 0
     let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(1);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
     assert_eq!(prog.code[2], 0);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 5);
 
     // col1 (logical 1 = pk) → LOAD_PK_INT
     let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(1);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 99);
 
     // col2 (logical 2, after pk) → physical 1
     let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(1);
+    prog.resolve_column_indices(&schema);
     assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
     assert_eq!(prog.code[2], 1);
-    let (val, _) = eval_predicate(&prog, &mb, 0, 1);
+    let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 7);
+}
+
+#[test]
+fn test_resolve_column_indices_is_idempotent() {
+    // Schema: pk=col0(U64), col1=I64, col2=STRING
+    let schema = make_schema(0, &[8, 9, 11]);
+    // One opcode of each remapped class so a second pass would corrupt the
+    // bytecode if the resolved flag were not respected.
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,
+        EXPR_IS_NULL, 1, 2, 0,
+        EXPR_COPY_COL, 9, 1, 0,
+        EXPR_STR_COL_EQ_COL, 2, 2, 2,
+    ];
+    let mut prog = ExprProgram::new(code, 3, 0, vec![]);
+    prog.resolve_column_indices(&schema);
+    let first = prog.code.clone();
+    prog.resolve_column_indices(&schema);
+    assert_eq!(prog.code, first, "resolve_column_indices must be idempotent");
 }
 
 /// Build a 16-byte inline German String struct for use in test batches.
@@ -851,8 +885,8 @@ fn test_string_prefix_ordering() {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
         let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-        let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+        let prog = make_prog(&schema,code, 1, 0, vec![const_s.to_vec()]);
+        let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
             val != 0, expected_lt,
             "STR_COL_LT_CONST: {:?} < {:?} expected {}, got {}",
@@ -882,45 +916,45 @@ fn test_bool_and_or_three_valued_logic() {
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_BOOL_AND, 2, 0, 1,
     ];
-    let and_prog = ExprProgram::new(and_code, 3, 2, vec![]);
+    let and_prog = make_prog(&schema,and_code, 3, 2, vec![]);
 
     let or_code = vec![
         EXPR_LOAD_COL_INT, 0, 1, 0,
         EXPR_LOAD_COL_INT, 1, 2, 0,
         EXPR_BOOL_OR, 2, 0, 1,
     ];
-    let or_prog = ExprProgram::new(or_code, 3, 2, vec![]);
+    let or_prog = make_prog(&schema,or_code, 3, 2, vec![]);
 
     // AND cases
-    let (v, n) = eval_predicate(&and_prog, &mb, 0, 0);
+    let (v, n) = eval_predicate(&and_prog, &mb, 0);
     assert_eq!(v, 0, "T AND F = F"); assert!(!n);
-    let (v, n) = eval_predicate(&and_prog, &mb, 1, 0);
+    let (v, n) = eval_predicate(&and_prog, &mb, 1);
     assert_eq!(v, 0, "F AND T = F"); assert!(!n);
-    let (_, n) = eval_predicate(&and_prog, &mb, 2, 0);
+    let (_, n) = eval_predicate(&and_prog, &mb, 2);
     assert!(n, "T AND NULL = NULL");
-    let (v, n) = eval_predicate(&and_prog, &mb, 3, 0);
+    let (v, n) = eval_predicate(&and_prog, &mb, 3);
     assert_eq!(v, 0, "F AND NULL = F"); assert!(!n, "F AND NULL must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&and_prog, &mb, 4, 0);
+    let (_, n) = eval_predicate(&and_prog, &mb, 4);
     assert!(n, "NULL AND T = NULL");
-    let (v, n) = eval_predicate(&and_prog, &mb, 5, 0);
+    let (v, n) = eval_predicate(&and_prog, &mb, 5);
     assert_eq!(v, 0, "NULL AND F = F"); assert!(!n, "NULL AND F must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&and_prog, &mb, 6, 0);
+    let (_, n) = eval_predicate(&and_prog, &mb, 6);
     assert!(n, "NULL AND NULL = NULL");
 
     // OR cases
-    let (v, n) = eval_predicate(&or_prog, &mb, 0, 0);
+    let (v, n) = eval_predicate(&or_prog, &mb, 0);
     assert_eq!(v, 1, "T OR F = T"); assert!(!n);
-    let (v, n) = eval_predicate(&or_prog, &mb, 1, 0);
+    let (v, n) = eval_predicate(&or_prog, &mb, 1);
     assert_eq!(v, 1, "F OR T = T"); assert!(!n);
-    let (v, n) = eval_predicate(&or_prog, &mb, 2, 0);
+    let (v, n) = eval_predicate(&or_prog, &mb, 2);
     assert_eq!(v, 1, "T OR NULL = T"); assert!(!n, "T OR NULL must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&or_prog, &mb, 3, 0);
+    let (_, n) = eval_predicate(&or_prog, &mb, 3);
     assert!(n, "F OR NULL = NULL");
-    let (v, n) = eval_predicate(&or_prog, &mb, 4, 0);
+    let (v, n) = eval_predicate(&or_prog, &mb, 4);
     assert_eq!(v, 1, "NULL OR T = T"); assert!(!n, "NULL OR T must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&or_prog, &mb, 5, 0);
+    let (_, n) = eval_predicate(&or_prog, &mb, 5);
     assert!(n, "NULL OR F = NULL");
-    let (_, n) = eval_predicate(&or_prog, &mb, 6, 0);
+    let (_, n) = eval_predicate(&or_prog, &mb, 6);
     assert!(n, "NULL OR NULL = NULL");
 }
 
@@ -944,8 +978,8 @@ fn test_string_prefix_le_ordering() {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
         let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-        let prog = ExprProgram::new(code, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
+        let prog = make_prog(&schema,code, 1, 0, vec![const_s.to_vec()]);
+        let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
             val != 0, expected_le,
             "STR_COL_LE_CONST: {:?} <= {:?} expected {}, got {}",

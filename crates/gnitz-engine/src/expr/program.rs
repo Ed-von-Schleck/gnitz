@@ -4,6 +4,7 @@
 
 use crate::schema::{
     compare_german_strings, german_string_tail, SchemaDescriptor, type_code as tc,
+    PAYLOAD_MAPPING_PK_SENTINEL,
 };
 use crate::storage::MemBatch;
 use crate::util::read_u32_le;
@@ -89,6 +90,11 @@ pub struct ExprProgram {
     pub payload_col_sizes: Vec<u8>,
     /// Type code of each physical payload column (same indexing as payload_col_sizes).
     pub payload_col_type_codes: Vec<u8>,
+    /// True once `resolve_column_indices` has rewritten every column-bearing
+    /// opcode's operand byte into payload-index-or-SENTINEL form. Eval entry
+    /// points debug-assert this; a Plan-bypass caller that forgets to resolve
+    /// gets a clear assertion rather than silent miscompute.
+    pub(in crate::expr) resolved: bool,
 }
 
 impl ExprProgram {
@@ -134,6 +140,7 @@ impl ExprProgram {
             const_lengths,
             payload_col_sizes: Vec::new(),
             payload_col_type_codes: Vec::new(),
+            resolved: false,
         };
         // SSA assert: binary ALU ops must not alias dst with either source.
         // Hard assert (not debug-only): fires at compile time for compiler bugs.
@@ -152,7 +159,6 @@ impl ExprProgram {
     /// Returns true if no opcode in this program can produce a NULL result.
     /// Used by the batch evaluator to skip null-bit tracking entirely.
     pub fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
-        let pki = schema.pk_index_single() as usize;
         for instr in self.code.chunks_exact(4) {
             let op = instr[0];
             let a1 = instr[2] as usize;
@@ -163,11 +169,11 @@ impl ExprProgram {
                 EXPR_IS_NULL | EXPR_IS_NOT_NULL => return false,
                 // Payload load: null if the underlying column is nullable
                 EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT => {
-                    let pi = a1;
-                    // Physical payload index pi maps to column index ci
-                    let ci = if pi < pki { pi } else { pi + 1 };
-                    if ci < schema.num_columns() && schema.columns[ci].nullable != 0 {
-                        return false;
+                    if a1 < schema.num_payload_cols() {
+                        let ci = schema.payload_col_idx(a1);
+                        if schema.columns[ci].nullable != 0 {
+                            return false;
+                        }
                     }
                 }
                 _ => {}
@@ -224,7 +230,6 @@ impl ExprProgram {
         &self,
         mb: &MemBatch,
         row: usize,
-        pk_index: u32,
         null_word: u64,
     ) -> (Vec<Vec<u8>>, u64) {
         let emit_count = (0..self.num_instrs as usize)
@@ -236,7 +241,7 @@ impl ExprProgram {
         let emit_targets: Vec<EmitTarget> = emit_bufs.iter_mut().enumerate()
             .map(|(i, buf)| EmitTarget { base: buf.as_mut_ptr(), stride: 0, payload_col: i })
             .collect();
-        let (_, _, mask) = eval_with_emit(self, mb, row, pk_index, null_word, &emit_targets);
+        let (_, _, mask) = eval_with_emit(self, mb, row, null_word, &emit_targets);
         (emit_bufs, mask)
     }
 }
@@ -272,39 +277,61 @@ fn compute_prefix(s: &[u8]) -> u32 {
 }
 
 impl ExprProgram {
-    /// Rewrite LOAD_COL_INT/FLOAT bytecode instructions to use physical payload
-    /// indices, eliminating the runtime pk_index branch in the interpreter loop.
+    /// Rewrite every column-bearing opcode's operand byte from a logical
+    /// column index into either a dense payload index (0..N-1) or the
+    /// `PAYLOAD_MAPPING_PK_SENTINEL` byte. After this pass eval handlers
+    /// branch on `a1 == SENTINEL` instead of `ci == pki`, and the
+    /// pk_index/payload arithmetic disappears from the inner loop.
     ///
-    /// - `LOAD_COL_INT` with logical index == pk_index  → `LOAD_PK_INT`
-    /// - `LOAD_COL_INT` with logical index != pk_index  → `LOAD_PAYLOAD_INT` with physical index
-    /// - `LOAD_COL_FLOAT` (PK is never float)           → `LOAD_PAYLOAD_FLOAT` with physical index
+    /// Opcode rewrites:
+    /// - `LOAD_COL_INT` for PK → `LOAD_PK_INT`; otherwise `LOAD_PAYLOAD_INT`
+    /// - `LOAD_COL_FLOAT` → `LOAD_PAYLOAD_FLOAT` (PK is never float)
+    /// - `IS_NULL`, `IS_NOT_NULL`, `COPY_COL`, `STR_COL_{EQ,LT,LE}_CONST`:
+    ///   a1 ← `payload_mapping_byte(ci)` (opcode unchanged)
+    /// - `STR_COL_{EQ,LT,LE}_COL`: a1 AND a2 ← `payload_mapping_byte(ci)`
     ///
-    /// Must be called once per program, before the first call to `eval_predicate`
-    /// or `eval_with_emit`. Called automatically by `Plan::from_predicate` and
-    /// `Plan::from_map`.
-    pub fn resolve_column_indices(&mut self, pk_index: u32) {
-        let pki = pk_index as i64;
+    /// Idempotent: a second call is a no-op (gated by `self.resolved`).
+    /// Must be called once per program, before the first call to
+    /// `eval_predicate` / `eval_with_emit` / `eval_batch`. Called
+    /// automatically by `Plan::from_predicate` and `Plan::from_map`.
+    pub fn resolve_column_indices(&mut self, schema: &SchemaDescriptor) {
+        if self.resolved {
+            return;
+        }
+        let sentinel = PAYLOAD_MAPPING_PK_SENTINEL as i64;
         for instr in self.code.chunks_exact_mut(4) {
             let op = instr[0];
-            let a1 = instr[2];
             match op {
                 EXPR_LOAD_COL_INT => {
-                    if a1 == pki {
+                    let byte = schema.payload_mapping_byte(instr[2] as usize) as i64;
+                    if byte == sentinel {
                         instr[0] = EXPR_LOAD_PK_INT;
                     } else {
-                        let phys = if a1 < pki { a1 } else { a1 - 1 };
                         instr[0] = EXPR_LOAD_PAYLOAD_INT;
-                        instr[2] = phys;
+                        instr[2] = byte;
                     }
                 }
                 EXPR_LOAD_COL_FLOAT => {
-                    let phys = if a1 < pki { a1 } else { a1 - 1 };
+                    let ci = instr[2] as usize;
+                    debug_assert!(
+                        !schema.is_pk_col(ci),
+                        "resolve_column_indices: LOAD_COL_FLOAT references PK column {ci} (PK is never float)",
+                    );
                     instr[0] = EXPR_LOAD_PAYLOAD_FLOAT;
-                    instr[2] = phys;
+                    instr[2] = schema.payload_mapping_byte(ci) as i64;
+                }
+                EXPR_IS_NULL | EXPR_IS_NOT_NULL | EXPR_COPY_COL
+                | EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST => {
+                    instr[2] = schema.payload_mapping_byte(instr[2] as usize) as i64;
+                }
+                EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL => {
+                    instr[2] = schema.payload_mapping_byte(instr[2] as usize) as i64;
+                    instr[3] = schema.payload_mapping_byte(instr[3] as usize) as i64;
                 }
                 _ => {}
             }
         }
+        self.resolved = true;
     }
 
     /// Populate payload column size and type-code tables from a schema.
@@ -338,33 +365,6 @@ pub(in crate::expr) fn bits_to_float(bits: i64) -> f64 {
 // ---------------------------------------------------------------------------
 // Column read helpers
 // ---------------------------------------------------------------------------
-
-/// Read a signed integer column value from a batch row.
-/// Handles PK special-casing and payload index mapping.
-#[inline]
-fn read_col_int(batch: &MemBatch, row: usize, col_idx: usize, pk_index: usize) -> i64 {
-    if col_idx == pk_index {
-        batch.get_pk(row) as i64
-    } else {
-        let pi = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-        // Read as i64 from the payload column (always 8 bytes for int types)
-        let ptr = batch.get_col_ptr(row, pi, 8);
-        i64::from_le_bytes(ptr.try_into().unwrap())
-    }
-}
-
-/// Read a float column value from a batch row, returning as i64 bits.
-#[inline]
-fn read_col_float(batch: &MemBatch, row: usize, col_idx: usize, pk_index: usize) -> i64 {
-    if col_idx == pk_index {
-        float_to_bits(0.0)
-    } else {
-        let pi = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-        let ptr = batch.get_col_ptr(row, pi, 8);
-        // Raw bytes — already in float bit representation
-        i64::from_le_bytes(ptr.try_into().unwrap())
-    }
-}
 
 /// Read a physical payload column value with correct sign/zero extension for narrow types.
 #[inline]
@@ -410,27 +410,31 @@ fn load_payload_float(prog: &ExprProgram, batch: &MemBatch, row: usize, pi: usiz
     }
 }
 
-/// Check if a column is null for a given row.
+/// Check if a column is null for a given row, given a resolved payload byte.
+/// PK columns (encoded as SENTINEL) are always non-null.
 #[inline]
-fn is_col_null(null_word: u64, col_idx: usize, pk_index: usize) -> bool {
-    if col_idx == pk_index {
+fn is_col_null_resolved(null_word: u64, pi_byte: u8) -> bool {
+    if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
         false
     } else {
-        let pi = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-        (null_word >> pi) & 1 != 0
+        (null_word >> (pi_byte as usize)) & 1 != 0
     }
 }
 
-/// Get the German String struct (16 bytes) and blob slice for a string column.
+/// Get the German String struct (16 bytes) and blob slice for a string column,
+/// given a resolved payload byte. PK is never a string, so the SENTINEL case
+/// is unreachable in well-formed programs.
 #[inline]
-fn get_str_struct<'a>(
+fn get_str_struct_resolved<'a>(
     batch: &'a MemBatch,
     row: usize,
-    col_idx: usize,
-    pk_index: usize,
+    pi_byte: u8,
 ) -> (&'a [u8], &'a [u8]) {
-    let pi = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-    let struct_bytes = batch.get_col_ptr(row, pi, 16);
+    debug_assert!(
+        pi_byte != PAYLOAD_MAPPING_PK_SENTINEL,
+        "get_str_struct_resolved: PK column is never a string",
+    );
+    let struct_bytes = batch.get_col_ptr(row, pi_byte as usize, 16);
     (struct_bytes, batch.blob)
 }
 
@@ -495,9 +499,11 @@ pub(in crate::expr) fn eval_predicate(
     prog: &ExprProgram,
     batch: &MemBatch,
     row: usize,
-    pk_index: u32,
 ) -> (i64, bool) {
-    let pki = pk_index as usize;
+    debug_assert!(
+        prog.resolved,
+        "eval_predicate: program must be resolved via resolve_column_indices",
+    );
     let null_word = batch.get_null_word(row);
     let mut regs: [i64; MAX_REGS] = [0; MAX_REGS];
     let mut null_mask: u64 = 0;
@@ -526,17 +532,6 @@ pub(in crate::expr) fn eval_predicate(
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
                 regs[dst] = batch.get_pk(row) as i64;
-            }
-            // Legacy opcodes: used by unresolved programs (e.g. direct tests).
-            EXPR_LOAD_COL_INT => {
-                let ci = a1 as usize;
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
-                regs[dst] = read_col_int(batch, row, ci, pki);
-            }
-            EXPR_LOAD_COL_FLOAT => {
-                let ci = a1 as usize;
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
-                regs[dst] = read_col_float(batch, row, ci, pki);
             }
             EXPR_LOAD_CONST => {
                 null_mask &= !(1u64 << dst);
@@ -707,31 +702,20 @@ pub(in crate::expr) fn eval_predicate(
             }
             EXPR_IS_NULL => {
                 null_mask &= !(1u64 << dst);
-                // a1 is intentionally a logical column index: is_col_null handles
-                // the logical→physical mapping internally. Unlike LOAD_COL_INT, these
-                // opcodes are NOT remapped by resolve_column_indices.
-                regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
-                    1
-                } else {
-                    0
-                };
+                regs[dst] = if is_col_null_resolved(null_word, a1 as u8) { 1 } else { 0 };
             }
             EXPR_IS_NOT_NULL => {
                 null_mask &= !(1u64 << dst);
-                regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
-                    0
-                } else {
-                    1
-                };
+                regs[dst] = if is_col_null_resolved(null_word, a1 as u8) { 0 } else { 1 };
             }
             EXPR_INT_TO_FLOAT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = float_to_bits(regs[a1 as usize] as f64);
             }
             EXPR_STR_COL_EQ_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     regs[dst] = if col_string_equals_const(
                         s,
@@ -749,9 +733,9 @@ pub(in crate::expr) fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LT_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
                         s,
@@ -766,9 +750,9 @@ pub(in crate::expr) fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LE_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
                         s,
@@ -787,12 +771,12 @@ pub(in crate::expr) fn eval_predicate(
                 }
             }
             EXPR_STR_COL_EQ_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         == std::cmp::Ordering::Equal
                     {
@@ -805,12 +789,12 @@ pub(in crate::expr) fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LT_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         == std::cmp::Ordering::Less
                     {
@@ -823,12 +807,12 @@ pub(in crate::expr) fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LE_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         != std::cmp::Ordering::Greater
                     {
@@ -871,11 +855,13 @@ pub(in crate::expr) fn eval_with_emit(
     prog: &ExprProgram,
     batch: &MemBatch,
     row: usize,
-    pk_index: u32,
     null_word: u64,
     emit_targets: &[EmitTarget],
 ) -> (i64, bool, u64) {
-    let pki = pk_index as usize;
+    debug_assert!(
+        prog.resolved,
+        "eval_with_emit: program must be resolved via resolve_column_indices",
+    );
     let mut regs: [i64; MAX_REGS] = [0; MAX_REGS];
     let mut null_mask: u64 = 0;
     let mut emit_null_mask: u64 = 0;
@@ -905,17 +891,6 @@ pub(in crate::expr) fn eval_with_emit(
             EXPR_LOAD_PK_INT => {
                 null_mask &= !(1u64 << dst);
                 regs[dst] = batch.get_pk(row) as i64;
-            }
-            // Legacy opcodes:
-            EXPR_LOAD_COL_INT => {
-                let ci = a1 as usize;
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
-                regs[dst] = read_col_int(batch, row, ci, pki);
-            }
-            EXPR_LOAD_COL_FLOAT => {
-                let ci = a1 as usize;
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
-                regs[dst] = read_col_float(batch, row, ci, pki);
             }
             EXPR_LOAD_CONST => {
                 null_mask &= !(1u64 << dst);
@@ -1086,22 +1061,11 @@ pub(in crate::expr) fn eval_with_emit(
             }
             EXPR_IS_NULL => {
                 null_mask &= !(1u64 << dst);
-                // a1 is intentionally a logical column index: is_col_null handles
-                // the logical→physical mapping internally. Unlike LOAD_COL_INT, these
-                // opcodes are NOT remapped by resolve_column_indices.
-                regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
-                    1
-                } else {
-                    0
-                };
+                regs[dst] = if is_col_null_resolved(null_word, a1 as u8) { 1 } else { 0 };
             }
             EXPR_IS_NOT_NULL => {
                 null_mask &= !(1u64 << dst);
-                regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
-                    0
-                } else {
-                    1
-                };
+                regs[dst] = if is_col_null_resolved(null_word, a1 as u8) { 0 } else { 1 };
             }
             EXPR_INT_TO_FLOAT => {
                 null_mask = prop_null1(null_mask, dst, a1 as usize);
@@ -1132,9 +1096,9 @@ pub(in crate::expr) fn eval_with_emit(
                 emit_idx += 1;
             }
             EXPR_STR_COL_EQ_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     regs[dst] = if col_string_equals_const(
                         s,
@@ -1152,9 +1116,9 @@ pub(in crate::expr) fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LT_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
                         s,
@@ -1169,9 +1133,9 @@ pub(in crate::expr) fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LE_CONST => {
-                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                null_mask = set_null_bit(null_mask, dst, is_col_null_resolved(null_word, a1 as u8));
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
+                    let (s, blob) = get_str_struct_resolved(batch, row, a1 as u8);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
                         s,
@@ -1190,12 +1154,12 @@ pub(in crate::expr) fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_EQ_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         == std::cmp::Ordering::Equal
                     {
@@ -1208,12 +1172,12 @@ pub(in crate::expr) fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LT_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         == std::cmp::Ordering::Less
                     {
@@ -1226,12 +1190,12 @@ pub(in crate::expr) fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LE_COL => {
-                let n_a1 = is_col_null(null_word, a1 as usize, pki);
-                let n_a2 = is_col_null(null_word, a2 as usize, pki);
+                let n_a1 = is_col_null_resolved(null_word, a1 as u8);
+                let n_a2 = is_col_null_resolved(null_word, a2 as u8);
                 null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
                 if (null_mask >> dst) & 1 == 0 {
-                    let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
-                    let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
+                    let (s1, blob1) = get_str_struct_resolved(batch, row, a1 as u8);
+                    let (s2, blob2) = get_str_struct_resolved(batch, row, a2 as u8);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
                         != std::cmp::Ordering::Greater
                     {

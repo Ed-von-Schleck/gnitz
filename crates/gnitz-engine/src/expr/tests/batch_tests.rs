@@ -68,10 +68,11 @@ fn test_eval_batch_add() {
         expr::EXPR_LOAD_PAYLOAD_INT, 1, 0, 0,  // pi=0 (first payload)
         expr::EXPR_INT_ADD, 2, 0, 1,
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
+    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
+    prog.resolve_column_indices(&schema);
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, true, 3);
-    eval_batch(&prog, &mb, 0, 3, 0, &mut scratch);
+    eval_batch(&prog, &mb, 0, 3, &mut scratch);
 
     // row 0: pk=1, val=10, sum=11
     assert_eq!(scratch.regs[2 * MORSEL + 0], 11);
@@ -92,9 +93,8 @@ fn test_eval_batch_matches_eval_predicate() {
         expr::EXPR_LOAD_CONST, 1, 15, 0,        // r1 = 15
         expr::EXPR_CMP_GT, 2, 0, 1,             // r2 = r0 > r1
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let mut resolved = ExprProgram::new(prog.code.clone(), 3, 2, vec![]);
-    resolved.resolve_column_indices(0);
+    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
+    prog.resolve_column_indices(&schema);
 
     let rows: &[(u64, i64, i64)] = &[(1, 1, 5), (2, 1, 15), (3, 1, 25), (4, 1, 0)];
     let batch = make_batch(&schema, rows);
@@ -102,11 +102,11 @@ fn test_eval_batch_matches_eval_predicate() {
 
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, true, 4);
-    eval_batch(&resolved, &mb, 0, 4, 0, &mut scratch);
+    eval_batch(&prog, &mb, 0, 4, &mut scratch);
 
     for (i, &(_, _, val)) in rows.iter().enumerate() {
         let batch_result = scratch.regs[2 * MORSEL + i] != 0;
-        let (row_val, row_null) = eval_predicate(&prog, &mb, i, 0);
+        let (row_val, row_null) = eval_predicate(&prog, &mb, i);
         let row_result = !row_null && row_val != 0;
         assert_eq!(
             batch_result, row_result,

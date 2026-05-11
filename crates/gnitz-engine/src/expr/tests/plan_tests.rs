@@ -43,7 +43,7 @@ fn test_projection_batch() {
     let func = ScalarFuncKind::Plan(Plan::from_projection(
         &[2, 1],
         &[type_code::I64, type_code::I64],
-        in_schema.pk_index_single(),
+        &in_schema,
     ));
     let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
     assert_eq!(result.count, 2);
@@ -72,7 +72,7 @@ fn test_map_copy_and_emit() {
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
 
-    let func = ScalarFuncKind::Plan(Plan::from_map(prog, in_schema.pk_index_single()));
+    let func = ScalarFuncKind::Plan(Plan::from_map(prog, &in_schema));
     let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
     assert_eq!(result.count, 1);
 
@@ -88,7 +88,7 @@ fn test_empty_batch() {
     let batch = Batch::empty(1, 16);
 
     let func = ScalarFuncKind::Plan(Plan::from_projection(
-        &[1], &[type_code::I64], schema.pk_index_single(),
+        &[1], &[type_code::I64], &schema,
     ));
     let result = func.evaluate_map_batch(&batch, &schema, &schema);
     assert_eq!(result.count, 0);
@@ -130,7 +130,7 @@ fn test_filter_batch_matches_per_row() {
         expr::EXPR_CMP_GT, 2, 0, 1,
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
-    let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index_single()));
+    let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
 
     let out = op_filter(&batch, &func, &schema);
     // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

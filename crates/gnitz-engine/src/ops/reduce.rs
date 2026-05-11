@@ -1116,7 +1116,7 @@ fn emit_finalized_row(
 
     let out_cols = prog.classify_output_cols();
     let (emit_bufs, eval_emit_mask) = prog.eval_finalized(
-        &raw_mb, raw_row, raw_schema.pk_index_single(), null_word,
+        &raw_mb, raw_row, null_word,
     );
 
     // Build the finalized output row
@@ -1130,18 +1130,22 @@ fn emit_finalized_row(
 
         if fpi < out_cols.len() {
             match out_cols[fpi] {
-                OutputColKind::CopyCol(src_col) => {
-                    if raw_schema.is_pk_col(src_col) {
+                OutputColKind::CopyCol(src_pi_byte) => {
+                    // After resolve_column_indices, COPY_COL.a1 carries the
+                    // resolved payload byte: SENTINEL for the PK column,
+                    // otherwise the dense payload index.
+                    if src_pi_byte == PAYLOAD_MAPPING_PK_SENTINEL as usize {
                         // Source is the PK column — slice from the full 16-byte
                         // little-endian PK so 8- and 16-byte column sizes both work.
                         let pk = raw_mb.get_pk(raw_row);
                         fin_output.extend_col(fpi, &pk.to_le_bytes()[..cs]);
                     } else {
-                        let src_pi = raw_schema.payload_idx(src_col);
+                        let src_pi = src_pi_byte;
+                        let src_ci = raw_schema.payload_col_idx(src_pi);
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
                             fin_output.fill_col_zero(fpi, cs);
-                        } else if raw_schema.columns[src_col].type_code == TypeCode::String as u8 {
+                        } else if raw_schema.columns[src_ci].type_code == TypeCode::String as u8 {
                             write_string_from_batch(
                                 fin_output, fpi,
                                 &raw_mb, raw_row, src_pi,
@@ -2633,7 +2637,8 @@ mod tests {
             EXPR_COPY_COL, 0, 0, 0, // copy raw col 0 (PK) → fin col 1
             EXPR_COPY_COL, 0, 1, 0, // copy raw col 1 (cnt) → fin col 2
         ];
-        let prog = ExprProgram::new(code, 0, 0, vec![]);
+        let mut prog = ExprProgram::new(code, 0, 0, vec![]);
+        prog.resolve_column_indices(&raw_schema);
 
         // Build raw_output with one row: pk = a wide U128, cnt = 42
         let pk: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;

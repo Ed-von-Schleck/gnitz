@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 
-use crate::schema::{type_code, SchemaDescriptor};
+use crate::schema::{type_code, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use super::program::{self as expr, ExprProgram};
 use crate::storage::{Batch, MemBatch};
 use super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
@@ -73,7 +73,9 @@ impl ScalarFuncKind {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a single column from `in_batch` to `output`.
+/// Copy a single column from `in_batch` to `output`. `cm.src_pi` holds the
+/// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
+/// the dense payload index in the input batch.
 fn copy_column(
     in_batch: &Batch,
     output: &mut Batch,
@@ -82,9 +84,8 @@ fn copy_column(
     out_schema: &SchemaDescriptor,
 ) {
     let n = in_batch.count;
-    let in_pki = in_schema.pk_index_single() as usize;
 
-    if cm.src_ci == in_pki {
+    if cm.src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
         let out_ci = out_schema.payload_col_idx(cm.dst_payload);
         let stride = out_schema.columns[out_ci].size() as usize;
         let dst = output.col_data_mut(cm.dst_payload);
@@ -94,8 +95,9 @@ fn copy_column(
             dst[row * stride..row * stride + stride].copy_from_slice(&bytes[..stride]);
         }
     } else if cm.type_code == type_code::STRING {
-        let in_pi = in_schema.payload_idx(cm.src_ci);
-        let stride = in_schema.columns[cm.src_ci].size() as usize;
+        let in_pi = cm.src_pi as usize;
+        let src_ci = in_schema.payload_col_idx(in_pi);
+        let stride = in_schema.columns[src_ci].size() as usize;
         let src_col = in_batch.col_data(in_pi);
         output.blob.reserve(in_batch.blob.len());
         for row in 0..n {
@@ -106,8 +108,9 @@ fn copy_column(
             output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
         }
     } else {
-        let in_pi = in_schema.payload_idx(cm.src_ci);
-        let stride = in_schema.columns[cm.src_ci].size() as usize;
+        let in_pi = cm.src_pi as usize;
+        let src_ci = in_schema.payload_col_idx(in_pi);
+        let stride = in_schema.columns[src_ci].size() as usize;
         debug_assert!(
             n * stride <= in_batch.col_data(in_pi).len(),
             "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
@@ -130,17 +133,17 @@ struct NullPerm {
 }
 
 impl NullPerm {
-    /// Build from (src_col, dst_payload) pairs, skipping PK columns.
-    fn from_col_pairs(src_cols: &[u32], dst_payloads: &[u32], null_payloads: &[u32], pk_index: u32) -> Self {
-        let pki = pk_index as usize;
+    /// Build from (src_pi_byte, dst_payload) pairs. `src_pi_bytes` holds
+    /// resolved payload bytes — `SENTINEL` for the PK column (skipped here,
+    /// since the PK has no null bit), otherwise the dense payload index.
+    fn from_col_pairs(src_pi_bytes: &[u8], dst_payloads: &[u32], null_payloads: &[u32]) -> Self {
         let mut pairs = Vec::new();
-        for k in 0..src_cols.len() {
-            let src_ci = src_cols[k] as usize;
-            if src_ci == pki {
+        for k in 0..src_pi_bytes.len() {
+            let src = src_pi_bytes[k];
+            if src == PAYLOAD_MAPPING_PK_SENTINEL {
                 continue;
             }
-            let in_pi = if src_ci < pki { src_ci } else { src_ci - 1 };
-            pairs.push((in_pi as u8, dst_payloads[k] as u8));
+            pairs.push((src, dst_payloads[k] as u8));
         }
         let mut constant: u64 = 0;
         for &null_pl in null_payloads {
@@ -149,10 +152,10 @@ impl NullPerm {
         NullPerm { pairs, constant }
     }
 
-    /// Build from a projection: output payload i ← src column index.
-    fn from_projection(src_indices: &[u32], pk_index: u32) -> Self {
-        let dst_payloads: Vec<u32> = (0..src_indices.len() as u32).collect();
-        Self::from_col_pairs(src_indices, &dst_payloads, &[], pk_index)
+    /// Build from a projection: output payload i ← src column at payload byte.
+    fn from_projection(src_pi_bytes: &[u8]) -> Self {
+        let dst_payloads: Vec<u32> = (0..src_pi_bytes.len() as u32).collect();
+        Self::from_col_pairs(src_pi_bytes, &dst_payloads, &[])
     }
 
     #[inline]
@@ -183,7 +186,9 @@ impl NullPerm {
 // ---------------------------------------------------------------------------
 
 struct ColMove {
-    src_ci: usize,
+    /// Resolved payload byte for the source: `SENTINEL` for the PK column,
+    /// otherwise the dense payload index in the input batch.
+    src_pi: u8,
     dst_payload: usize,
     type_code: u8,
 }
@@ -208,59 +213,62 @@ pub(crate) struct Plan {
     col_moves: Vec<ColMove>,
     null_perm: NullPerm,
     compute: ComputeKernel,
-    pk_index: u32,
     scratch: RefCell<EvalScratch>,
 }
 
 /// Empty plan with only a filter kernel set.
-fn filter_only(filter: FilterKernel, pk_index: u32) -> Plan {
+fn filter_only(filter: FilterKernel) -> Plan {
     Plan {
         filter,
         col_moves: Vec::new(),
         null_perm: NullPerm { pairs: Vec::new(), constant: 0 },
         compute: ComputeKernel::None,
-        pk_index,
         scratch: RefCell::new(EvalScratch::new()),
     }
 }
 
 impl Plan {
     /// Filter via interpreted expression (replaces ExprPredicate).
-    pub fn from_predicate(mut prog: ExprProgram, pk_index: u32) -> Self {
-        prog.resolve_column_indices(pk_index);
-        filter_only(FilterKernel::Interpreted(prog), pk_index)
+    pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
+        prog.resolve_column_indices(schema);
+        filter_only(FilterKernel::Interpreted(prog))
     }
 
     /// Projection plan from source indices (replaces UniversalProjection).
-    pub fn from_projection(src_indices: &[u32], src_types: &[u8], pk_index: u32) -> Self {
-        let col_moves: Vec<ColMove> = src_indices
+    pub fn from_projection(src_indices: &[u32], src_types: &[u8], schema: &SchemaDescriptor) -> Self {
+        let src_pi_bytes: Vec<u8> = src_indices
+            .iter()
+            .map(|&ci| schema.payload_mapping_byte(ci as usize))
+            .collect();
+        let col_moves: Vec<ColMove> = src_pi_bytes
             .iter()
             .zip(src_types.iter())
             .enumerate()
-            .map(|(i, (&src_ci, &tc))| ColMove {
-                src_ci: src_ci as usize,
+            .map(|(i, (&src_pi, &tc))| ColMove {
+                src_pi,
                 dst_payload: i,
                 type_code: tc,
             })
             .collect();
-        let null_perm = NullPerm::from_projection(src_indices, pk_index);
+        let null_perm = NullPerm::from_projection(&src_pi_bytes);
         Plan {
             filter: FilterKernel::PassAll,
             col_moves,
             null_perm,
             compute: ComputeKernel::None,
-            pk_index,
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
 
     /// Map plan from ExprProgram bytecode (replaces ExprMap + MapAnalysis).
-    pub fn from_map(mut prog: ExprProgram, pk_index: u32) -> Self {
-        prog.resolve_column_indices(pk_index);
-        let mut copy_src_cols = Vec::new();
-        let mut copy_out_payloads = Vec::new();
-        let mut copy_type_codes = Vec::new();
-        let mut null_payloads = Vec::new();
+    pub fn from_map(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
+        prog.resolve_column_indices(schema);
+        // After resolve_column_indices, EXPR_COPY_COL.a1 already holds the
+        // resolved payload byte (SENTINEL for PK, dense payload index otherwise).
+        let mut copy_src_pi_bytes: Vec<u8> = Vec::new();
+        let mut copy_out_payloads: Vec<u32> = Vec::new();
+        let mut copy_type_codes: Vec<u8> = Vec::new();
+        let mut null_payloads: Vec<u32> = Vec::new();
         let mut emit_payloads = Vec::new();
         let mut emit_regs = Vec::new();
         let mut has_compute = false;
@@ -273,7 +281,7 @@ impl Plan {
             let a2 = prog.code[base + 3];
 
             if op == expr::EXPR_COPY_COL {
-                copy_src_cols.push(a1 as u32);
+                copy_src_pi_bytes.push(a1 as u8);
                 copy_out_payloads.push(a2 as u32);
                 copy_type_codes.push(dst as u8);
             } else if op == expr::EXPR_EMIT_NULL {
@@ -287,22 +295,21 @@ impl Plan {
             }
         }
 
-        let col_moves: Vec<ColMove> = copy_src_cols
+        let col_moves: Vec<ColMove> = copy_src_pi_bytes
             .iter()
             .zip(copy_out_payloads.iter())
             .zip(copy_type_codes.iter())
             .map(|((&src, &dst), &tc)| ColMove {
-                src_ci: src as usize,
+                src_pi: src,
                 dst_payload: dst as usize,
                 type_code: tc,
             })
             .collect();
 
         let null_perm = NullPerm::from_col_pairs(
-            &copy_src_cols,
+            &copy_src_pi_bytes,
             &copy_out_payloads,
             &null_payloads,
-            pk_index,
         );
 
         let compute = if has_compute {
@@ -316,7 +323,6 @@ impl Plan {
             col_moves,
             null_perm,
             compute,
-            pk_index,
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
@@ -326,13 +332,12 @@ impl Plan {
         &self,
         batch: &MemBatch,
         row: usize,
-        schema: &SchemaDescriptor,
+        _schema: &SchemaDescriptor,
     ) -> bool {
         match &self.filter {
             FilterKernel::PassAll => true,
             FilterKernel::Interpreted(prog) => {
-                let (val, is_null) =
-                    expr::eval_predicate(prog, batch, row, schema.pk_index_single());
+                let (val, is_null) = expr::eval_predicate(prog, batch, row);
                 !is_null && val != 0
             }
         }
@@ -358,7 +363,6 @@ impl Plan {
             return bits;
         };
 
-        let pki = self.pk_index as usize;
         let no_nulls = prog.is_strictly_non_nullable(in_schema);
         let num_regs = prog.num_regs as usize;
         let result_reg = prog.result_reg as usize;
@@ -371,7 +375,7 @@ impl Plan {
 
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
-            eval_batch(prog, mb, morsel_start, m, pki, &mut scratch);
+            eval_batch(prog, mb, morsel_start, m, &mut scratch);
 
             // Pack result register into filter_bits
             let base_r = result_reg * MORSEL;
@@ -430,7 +434,6 @@ impl Plan {
 
         // Compute kernel
         if let ComputeKernel::Interpreted { prog, emit_payloads, emit_regs } = &self.compute {
-            let pki = self.pk_index as usize;
             let no_nulls = prog.is_strictly_non_nullable(in_schema);
             let num_regs = prog.num_regs as usize;
 
@@ -442,7 +445,7 @@ impl Plan {
 
             for morsel_start in (0..n).step_by(MORSEL) {
                 let m = MORSEL.min(n - morsel_start);
-                eval_batch(prog, &in_mb, morsel_start, m, pki, &mut scratch);
+                eval_batch(prog, &in_mb, morsel_start, m, &mut scratch);
 
                 // EMIT: write each computed register to its output column
                 for (&out_payload, &reg) in emit_payloads.iter().zip(emit_regs.iter()) {

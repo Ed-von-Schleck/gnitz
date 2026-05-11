@@ -1224,7 +1224,7 @@ mod tests {
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index_single()),
+            crate::expr::Plan::from_predicate(pred_prog, &schema),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -1574,7 +1574,7 @@ mod tests {
 
         // MAP with Plan projection: reorder/select columns.
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_projection(&[2], &[type_code::I64], in_schema.pk_index_single()),
+            crate::expr::Plan::from_projection(&[2], &[type_code::I64], &in_schema),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -2145,7 +2145,7 @@ mod tests {
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index_single()),
+            crate::expr::Plan::from_predicate(pred_prog, &schema),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -2258,20 +2258,10 @@ mod tests {
             EXPR_LOAD_CONST, 1, 25, 0,   // r1 = 25
             EXPR_CMP_GT, 2, 0, 1,        // r2 = (r0 > r1)
         ];
-        let prog = ExprProgram {
-            code,
-            num_regs: 3,
-            result_reg: 2,
-            num_instrs: 3,
-            const_strings: vec![],
-            const_prefixes: vec![],
-            const_lengths: vec![],
-            payload_col_sizes: vec![],
-            payload_col_type_codes: vec![],
-        };
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
 
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(prog, schema.pk_index_single()),
+            crate::expr::Plan::from_predicate(prog, &schema),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 

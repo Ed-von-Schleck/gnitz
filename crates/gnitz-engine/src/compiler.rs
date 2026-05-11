@@ -716,14 +716,13 @@ fn create_expr_predicate(
     num_regs: u32,
     result_reg: u32,
     const_strings: Vec<Vec<u8>>,
-    pk_index: u32,
     schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let mut prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
     prog.set_payload_col_info(schema);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, pk_index)));
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, schema)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -734,14 +733,13 @@ fn create_expr_map(
     code: Vec<i64>,
     num_regs: u32,
     const_strings: Vec<Vec<u8>>,
-    pk_index: u32,
     schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let mut prog = ExprProgram::new(code, num_regs, 0, const_strings);
     prog.set_payload_col_info(schema);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, pk_index)));
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, schema)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -751,12 +749,12 @@ fn create_expr_map(
 fn create_universal_projection(
     src_indices: &[i32],
     src_types: &[u8],
-    pk_index: u32,
+    schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let indices: Vec<u32> = src_indices.iter().map(|&i| i as u32).collect();
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_projection(
-        &indices, src_types, pk_index,
+        &indices, src_types, schema,
     )));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
@@ -870,7 +868,7 @@ fn emit_node(
                 if let Some(dep) = decode_expr_blob(blob) {
                     let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                     create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
-                        in_schema.pk_index_single(), &in_schema, owned_expr_progs, owned_funcs)
+                        &in_schema, owned_expr_progs, owned_funcs)
                 } else {
                     null_func_ptr()
                 }
@@ -907,7 +905,7 @@ fn emit_node(
                     if let Some(dep) = dep {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                         let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
-                            in_reg_schema.pk_index_single(), &in_reg_schema, owned_expr_progs, owned_funcs);
+                            &in_reg_schema, owned_expr_progs, owned_funcs);
                         let node_schema = if reindex_col.is_some() {
                             let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
                             cols[0] = SchemaColumn::new(type_code::U128, 0);
@@ -932,7 +930,7 @@ fn emit_node(
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
                         .collect();
                     let fp = create_universal_projection(
-                        &src_indices, &src_types, in_reg_schema.pk_index_single(), owned_funcs,
+                        &src_indices, &src_types, &in_reg_schema, owned_funcs,
                     );
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
                     reg_schemas[reg_id as usize] = schema;
@@ -942,7 +940,7 @@ fn emit_node(
 
                 gnitz_wire::MapKind::KeyOnly => {
                     let fp = create_universal_projection(
-                        &[], &[], in_reg_schema.pk_index_single(), owned_funcs,
+                        &[], &[], &in_reg_schema, owned_funcs,
                     );
                     let s = SchemaDescriptor::new(
                         &[in_reg_schema.columns[in_reg_schema.pk_index_single() as usize]],
@@ -1354,6 +1352,9 @@ fn emit_reduce(
     }
 
     let fin_prog_ptr: *const ExprProgram = if let Some(idx) = finalize_prog_idx {
+        // Finalize prog reads from the raw reduce output, so resolve its
+        // column operands against reduce_out_schema. Idempotent.
+        owned_expr_progs[idx].resolve_column_indices(&reduce_out_schema);
         &*owned_expr_progs[idx] as *const ExprProgram
     } else {
         std::ptr::null()
