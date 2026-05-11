@@ -492,11 +492,19 @@ impl Batch {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] as usize + row * stride;
-        if stride == 16 {
-            u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
-        } else {
-            u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128
+        match stride {
+            8 => u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128,
+            16 => u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap()),
+            _ => panic!("get_pk: wide region; use get_pk_bytes"),
         }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        let stride = self.strides[REG_PK] as usize;
+        let off = self.offsets[REG_PK] as usize + row * stride;
+        &self.data[off..off + stride]
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -615,17 +623,56 @@ impl Batch {
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
-        debug_assert!(stride == 16 || pk >> 64 == 0, "extend_pk: U64 batch requires high bits == 0");
-        self.extend_region(REG_PK, &pk.to_le_bytes()[..stride]);
+        match stride {
+            8 => {
+                debug_assert!(pk >> 64 == 0, "extend_pk: U64 batch requires high bits == 0");
+                self.extend_region(REG_PK, &pk.to_le_bytes()[..8]);
+            }
+            16 => self.extend_region(REG_PK, &pk.to_le_bytes()),
+            _ => panic!("extend_pk: wide region; use extend_pk_bytes"),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn extend_pk_bytes(&mut self, bytes: &[u8]) {
+        assert_eq!(
+            bytes.len(),
+            self.strides[REG_PK] as usize,
+            "extend_pk_bytes: length must equal pk_stride",
+        );
+        self.extend_region(REG_PK, bytes);
     }
 
     /// Overwrite the PK at `row` with a new 128-bit value.
     #[inline]
     pub fn set_pk_at(&mut self, row: usize, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
-        debug_assert!(stride == 16 || pk >> 64 == 0, "set_pk_at: U64 batch requires high bits == 0");
+        match stride {
+            8 => {
+                debug_assert!(pk >> 64 == 0, "set_pk_at: U64 batch requires high bits == 0");
+                let off = self.offsets[REG_PK] as usize + row * 8;
+                self.data[off..off + 8].copy_from_slice(&pk.to_le_bytes()[..8]);
+            }
+            16 => {
+                let off = self.offsets[REG_PK] as usize + row * 16;
+                self.data[off..off + 16].copy_from_slice(&pk.to_le_bytes());
+            }
+            _ => panic!("set_pk_at: wide region; use set_pk_at_bytes"),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]) {
+        let stride = self.strides[REG_PK] as usize;
+        debug_assert_eq!(
+            bytes.len(),
+            stride,
+            "set_pk_at_bytes: length must equal pk_stride",
+        );
         let off = self.offsets[REG_PK] as usize + row * stride;
-        self.data[off..off + stride].copy_from_slice(&pk.to_le_bytes()[..stride]);
+        self.data[off..off + stride].copy_from_slice(bytes);
     }
 
     /// Iterate PKs as `u128`.
@@ -1894,5 +1941,86 @@ mod tests {
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(1);
         b.extend_pk((u64::MAX as u128) + 1);
+    }
+
+    #[test]
+    fn extend_pk_bytes_then_get_pk_bytes_roundtrip_u64() {
+        let schema = minimal_u64_with_i64_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(4);
+        let pks: [[u8; 8]; 4] = [
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            [0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0xff; 8],
+        ];
+        for pk in &pks {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        for (i, pk) in pks.iter().enumerate() {
+            assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
+            assert_eq!(b.get_pk(i), u64::from_le_bytes(*pk) as u128, "row {i} u128");
+        }
+    }
+
+    #[test]
+    fn extend_pk_bytes_then_get_pk_bytes_roundtrip_u128() {
+        let schema = single_col_u128_pk_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(3);
+        let pks: [[u8; 16]; 3] = [
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            ],
+            [0; 16],
+            [0xff; 16],
+        ];
+        for pk in &pks {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        for (i, pk) in pks.iter().enumerate() {
+            assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
+            assert_eq!(b.get_pk(i), u128::from_le_bytes(*pk), "row {i} u128");
+        }
+    }
+
+    #[test]
+    fn set_pk_at_bytes_overwrites_existing_row() {
+        let schema = single_col_u128_pk_schema();
+        let mut b = Batch::with_schema(schema, 4);
+        for pk in [10u128, 20, 30] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let new_pk_bytes: [u8; 16] = [
+            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce,
+            0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
+        ];
+        b.set_pk_at_bytes(1, &new_pk_bytes);
+        assert_eq!(b.get_pk(0), 10);
+        assert_eq!(b.get_pk_bytes(1), &new_pk_bytes);
+        assert_eq!(b.get_pk(1), u128::from_le_bytes(new_pk_bytes));
+        assert_eq!(b.get_pk(2), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "extend_pk_bytes: length must equal pk_stride")]
+    fn extend_pk_bytes_length_mismatch_panics() {
+        let schema = minimal_u64_with_i64_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(1);
+        b.extend_pk_bytes(&[0u8; 7]);
     }
 }

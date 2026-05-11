@@ -188,11 +188,18 @@ impl<'a> MemBatch<'a> {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
         let off = self.offsets[super::batch::REG_PK] as usize + row * stride;
-        if stride == 16 {
-            u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap())
-        } else {
-            u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128
+        match stride {
+            8 => u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128,
+            16 => u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap()),
+            _ => panic!("get_pk: wide region; use get_pk_bytes"),
         }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
+        let stride = self.pk_stride as usize;
+        &self.pk()[row * stride..(row + 1) * stride]
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -606,10 +613,10 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
 
     // Fused PK + weight + null_bmp gather: one pass over `indices` instead of three.
     // PK stride dispatches to a const-N helper so the inner loop sees a literal width.
-    if writer.pk_stride == 8 {
-        scatter_col_first_fixed::<8>(batch, indices, base, writer);
-    } else {
-        scatter_col_first_fixed::<16>(batch, indices, base, writer);
+    match writer.pk_stride {
+        8 => scatter_col_first_fixed::<8>(batch, indices, base, writer),
+        16 => scatter_col_first_fixed::<16>(batch, indices, base, writer),
+        _ => panic!("scatter_col_first: wide pk_stride not handled in bulk scatter"),
     }
 
     let schema = writer.schema;
@@ -757,10 +764,10 @@ pub fn scatter_multi_source(
     let n = rows.len();
     let base = writer.count;
 
-    if writer.pk_stride == 8 {
-        scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer);
-    } else {
-        scatter_mb_pk_wt_nbm::<16>(sources, rows, base, writer);
+    match writer.pk_stride {
+        8 => scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer),
+        16 => scatter_mb_pk_wt_nbm::<16>(sources, rows, base, writer),
+        _ => panic!("scatter_multi_source: wide pk_stride not handled in bulk scatter"),
     }
 
     // One pass per column keeps destination writes sequential.
@@ -881,10 +888,10 @@ pub(crate) fn scatter_unified_sources_with_weights(
     // Fused PK + weight + null_bmp pass. PK stride dispatches into a const-N
     // helper so the inner loop sees a literal width (8 or 16) — without that,
     // `copy_from_slice` lowers to memcpy.
-    if writer.pk_stride == 8 {
-        scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer);
-    } else {
-        scatter_unified_pk_wt_nbm::<16>(sources, rows, base, writer);
+    match writer.pk_stride {
+        8 => scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer),
+        16 => scatter_unified_pk_wt_nbm::<16>(sources, rows, base, writer),
+        _ => panic!("scatter_unified_sources_with_weights: wide pk_stride not handled in bulk scatter"),
     }
 
     let schema = writer.schema;
@@ -1537,5 +1544,60 @@ mod tests {
         let result = run_scatter(&b, &[1, 0], &[5, -1], &schema);
         assert_eq!(result[0], (2, 0, 5, 20));
         assert_eq!(result[1], (1, 0, -1, 10));
+    }
+
+    fn make_schema_u64_pk() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn mem_batch_get_pk_bytes_matches_get_pk_u128() {
+        let schema = make_schema_i64();
+        let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
+        let mut b = Batch::with_schema(schema, pks.len());
+        for &pk in pks {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let mb = b.as_mem_batch();
+        assert_eq!(mb.pk_stride, 16);
+        for (i, &pk) in pks.iter().enumerate() {
+            let bytes = mb.get_pk_bytes(i);
+            assert_eq!(bytes.len(), 16, "row {i} stride");
+            assert_eq!(bytes, &pk.to_le_bytes()[..16], "row {i} le bytes");
+            assert_eq!(mb.get_pk(i), pk, "row {i} u128");
+        }
+    }
+
+    #[test]
+    fn mem_batch_get_pk_bytes_matches_get_pk_u64() {
+        let schema = make_schema_u64_pk();
+        let pks: &[u64] = &[0, 1, 1 << 32, u64::MAX];
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(pks.len());
+        for &pk in pks {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let mb = b.as_mem_batch();
+        assert_eq!(mb.pk_stride, 8);
+        for (i, &pk) in pks.iter().enumerate() {
+            let bytes = mb.get_pk_bytes(i);
+            assert_eq!(bytes.len(), 8, "row {i} stride");
+            assert_eq!(bytes, &pk.to_le_bytes(), "row {i} le bytes");
+            assert_eq!(mb.get_pk(i), pk as u128, "row {i} u128");
+        }
     }
 }

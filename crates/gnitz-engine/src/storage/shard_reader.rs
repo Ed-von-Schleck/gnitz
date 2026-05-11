@@ -319,13 +319,31 @@ impl MappedShard {
         match &self.pk {
             RegionView::Raw { offset, .. } => {
                 let src = &data[offset + row * stride..offset + row * stride + stride];
-                if stride == 16 {
-                    u128::from_le_bytes(src.try_into().unwrap())
-                } else {
-                    u64::from_le_bytes(src.try_into().unwrap()) as u128
+                match stride {
+                    8 => u64::from_le_bytes(src.try_into().unwrap()) as u128,
+                    16 => u128::from_le_bytes(src.try_into().unwrap()),
+                    _ => panic!("get_pk: wide region; use get_pk_bytes"),
                 }
             }
             RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        let stride = self.pk_stride as usize;
+        let data = self.data();
+        match &self.pk {
+            RegionView::Raw { offset, .. } => {
+                &data[offset + row * stride
+                    ..offset + row * stride + stride]
+            }
+            // value is [u8; 16]; stride <= 16 is guaranteed by the constructor.
+            // When RegionView::Constant is widened to hold larger values,
+            // this arm must be updated alongside it.
+            RegionView::Constant { value, .. } => &value[..stride],
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -1121,6 +1139,98 @@ mod tests {
         assert_eq!(batch.pk_data().len(), 8 * 8, "pk region must be 8B/row for U64 schema");
         for i in 0..8usize {
             assert_eq!(batch.get_pk(i), (i as u128 + 1) * 10, "PK row {i}");
+        }
+    }
+
+    fn u128_pk_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn build_test_shard_u128(dir: &std::path::Path, name: &str, pks: &[u128], vals: &[i64]) -> String {
+        let path = dir.join(name);
+        let count = pks.len() as u32;
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
+        let weights: Vec<i64> = vec![1; pks.len()];
+        let null_bm: Vec<u64> = vec![0; pks.len()];
+        let blob: Vec<u8> = Vec::new();
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), blob.len()),
+        ];
+
+        let image = super::super::shard_file::build_shard_image(0, count, &regions);
+        std::fs::write(&path, &image).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn shard_reader_get_pk_bytes_raw_region_u64() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i * 3, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        assert!(matches!(shard.pk, RegionView::Raw { .. }), "expected Raw PK region");
+        assert_eq!(shard.pk_stride, 8);
+        for i in 0..rows.len() {
+            let bytes = shard.get_pk_bytes(i);
+            assert_eq!(bytes.len(), 8, "row {i} stride");
+            let pk_u128 = shard.get_pk(i);
+            assert_eq!(bytes, &pk_u128.to_le_bytes()[..8], "row {i} le bytes");
+        }
+    }
+
+    #[test]
+    fn shard_reader_get_pk_bytes_raw_region_u128() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let pks: Vec<u128> = vec![1, (u64::MAX as u128) + 1, (u64::MAX as u128) * 2 + 3, u128::MAX];
+        let vals: Vec<i64> = (0..pks.len() as i64).collect();
+        let path = build_test_shard_u128(dir.path(), "u128_raw.db", &pks, &vals);
+        let schema = u128_pk_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert!(matches!(shard.pk, RegionView::Raw { .. }), "expected Raw PK region");
+        assert_eq!(shard.pk_stride, 16);
+        for (i, &pk) in pks.iter().enumerate() {
+            let bytes = shard.get_pk_bytes(i);
+            assert_eq!(bytes.len(), 16, "row {i} stride");
+            assert_eq!(bytes, &pk.to_le_bytes(), "row {i} le bytes");
+            assert_eq!(shard.get_pk(i), pk, "row {i} u128");
+        }
+    }
+
+    #[test]
+    fn shard_reader_get_pk_bytes_constant_region() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        // All PKs identical -> encoding detection picks Constant.
+        let pk_value: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+        let n = 32;
+        let pks: Vec<u128> = vec![pk_value; n];
+        let vals: Vec<i64> = (0..n as i64).collect();
+        let path = build_test_shard_u128(dir.path(), "u128_const.db", &pks, &vals);
+        let schema = u128_pk_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert!(matches!(shard.pk, RegionView::Constant { .. }), "expected Constant PK region");
+        assert_eq!(shard.pk_stride, 16);
+        let expected = pk_value.to_le_bytes();
+        for i in 0..n {
+            assert_eq!(shard.get_pk_bytes(i), &expected, "row {i} bytes");
+            assert_eq!(shard.get_pk(i), pk_value, "row {i} u128");
         }
     }
 }

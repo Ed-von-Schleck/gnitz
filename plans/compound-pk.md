@@ -124,35 +124,19 @@ Out:
 ### 1. Storage batch (`storage/batch.rs`)
 
 `pk_stride` (already `u8`) widens its value range from `{8, 16}` to
-`1..=MAX_PK_BYTES` (80). The type doesn't change.
+`1..=MAX_PK_BYTES` (80). The type doesn't change. The
+`pk_stride == 8 || pk_stride == 16` precondition in `Batch::empty` /
+`with_schema` and the analogous gates in `MemBatch` and `MappedShard`
+loosen to `1..=MAX_PK_BYTES`. Today's `get_pk`/`extend_pk`/`set_pk_at`
+exhaustive `match stride { 8 | 16 => …, _ => panic! }` blocks gain new
+arms (or fall through to the bytes variant) so that wider strides do
+not panic.
 
-New accessors:
-
-```rust
-impl Batch {
-    pub fn get_pk_bytes(&self, row: usize) -> &[u8];       // always valid
-    pub fn extend_pk_bytes(&mut self, bytes: &[u8]);       // always valid
-    pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]);
-}
-```
-
-Existing accessors stay, gated on narrow region:
-
-```rust
-impl Batch {
-    pub fn get_pk(&self, row: usize) -> u128 {
-        debug_assert!(self.strides[REG_PK] as usize <= 16,
-            "get_pk: wide region; use get_pk_bytes");
-        // existing zero-extending body
-    }
-    pub fn extend_pk(&mut self, pk: u128);  // unchanged; same assert
-}
-```
-
-This is the load-bearing co-existence. *Every* existing single-PK code
-path keeps calling `get_pk` and `extend_pk`. New compound-PK code calls
-the bytes variants. The assert catches mis-routing at the first call
-in debug builds.
+Bytes accessors (`get_pk_bytes` / `extend_pk_bytes` / `set_pk_at_bytes`
+on `Batch`; `get_pk_bytes` on `MemBatch` and `MappedShard`) are already
+in place from `pk-bytes-accessors.md`. New compound-PK code calls those
+directly. Single-PK code keeps calling `get_pk` / `extend_pk` and stays
+bit-identical.
 
 `append_row_from_ptable_found` (`storage/batch.rs:953`) currently
 takes `pk: u128`. It becomes `pk_bytes: &[u8]` and uses the bytes
@@ -161,12 +145,10 @@ extender. `PartitionedTable`'s found-row plumbing
 found-row PK is retained as bytes and surfaced via
 `PartitionedTable::found_pk_bytes()`.
 
-Identical extensions for `MemBatch` (storage/merge.rs:148-200): keep
-`get_pk -> u128` narrow-asserted, add `get_pk_bytes -> &[u8]`.
-
 `Batch::find_lower_bound(key: u128)` (`storage/batch.rs:827`) stays as a
 narrow-PK helper. New `find_lower_bound_bytes(&[u8])` for compound. The
-shard-reader equivalent (`shard_reader.rs`) gets the same pair.
+shard-reader equivalent (`shard_reader.rs`) gets the same pair. Both
+helpers route through `compare_pk_bytes` from §2.
 
 ### 2. PK comparison (`storage/columnar.rs`)
 
@@ -248,11 +230,12 @@ source on demand (same indirection as the heap).
 `scatter_unified_sources_with_weights` dispatch on `writer.pk_stride`
 to const-generic helpers (`scatter_col_first_fixed::<PKS>`,
 `scatter_mb_pk_wt_nbm::<PKS>`, `scatter_unified_pk_wt_nbm::<PKS>`).
-Today only `PKS = 8` and `PKS = 16` arms exist; the else branch is
-silently wrong for any other stride. Compound PK strides reach
-24..=80 — every dispatcher must cover them.
+Today's exhaustive `match writer.pk_stride { 8 => ::<8>, 16 => ::<16>,
+_ => panic! }` covers the 8/16 strides but panics on anything wider.
+Compound PK strides reach 24..=80 — every dispatcher must cover them.
 
-Replace each `if pk_stride == 8 ... else ...::<16>` with:
+Replace the panicking arm in each match with a `scatter_*_dynamic`
+call:
 
 ```rust
 match writer.pk_stride {
@@ -746,8 +729,8 @@ benefit from; bake it in here.
   `compare_pk_bytes`, not the u128 path.
 - `storage/batch.rs`: build a compound-PK batch via `with_schema`;
   insert rows with varying PK tuples; verify sort by `(PK bytes,
-  payload)`; verify the `get_pk` narrow-region assert fires when
-  called on a wide-region batch.
+  payload)`; verify that calling `get_pk` on a wide-region batch
+  panics (the `match stride` exhaustive arm).
 - `storage/merge.rs`: 3-way N-way merge on a wide-PK schema. Same-PK
   / different-payload rows consolidate correctly. Cover both the
   `pk_count == 1` u128-cast closure and the compound
@@ -805,11 +788,13 @@ of the worker that produced the row.
 Order of merging (each step keeps the test suite green; not split
 into phases):
 
-1. **Storage accessors.** Add `get_pk_bytes` / `extend_pk_bytes`;
-   keep `get_pk` / `extend_pk` with narrow-PK asserts. No call site
-   moved yet.
-2. **`compare_pk_bytes`.** New helper in `columnar.rs`. Unused for
+1. **`compare_pk_bytes`.** New helper in `columnar.rs`. Unused for
    single-PK schemas.
+2. **Widen `pk_stride` domain.** Loosen the `{8, 16}` gate in
+   `Batch::empty` / `with_schema`, `MemBatch`, `MappedShard`; extend
+   the `match stride` blocks in `get_pk`/`extend_pk`/`set_pk_at` and
+   the scatter dispatchers (§3b) to cover wider strides via the
+   `scatter_*_dynamic` arm.
 3. **Heap dispatch.** `HeapNode` stays 32 B; merge entry points pick
    the comparison closure from `pk_count` / `pk_stride` (table in §3).
    Single-PK path is bit-identical to today; wide-PK path indirects
