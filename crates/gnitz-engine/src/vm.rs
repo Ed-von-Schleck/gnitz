@@ -1574,7 +1574,7 @@ mod tests {
 
         // MAP with Plan projection: reorder/select columns.
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_projection(&[2], &[type_code::I64], &in_schema),
+            crate::expr::Plan::from_projection(&[2], &[type_code::I64], &in_schema, &out_schema),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 

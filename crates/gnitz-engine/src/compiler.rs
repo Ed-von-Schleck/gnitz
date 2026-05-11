@@ -728,18 +728,19 @@ fn create_expr_predicate(
     ptr
 }
 
-#[allow(clippy::vec_box, clippy::ptr_arg)]
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn create_expr_map(
     code: Vec<i64>,
     num_regs: u32,
     const_strings: Vec<Vec<u8>>,
-    schema: &SchemaDescriptor,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let mut prog = ExprProgram::new(code, num_regs, 0, const_strings);
-    prog.set_payload_col_info(schema);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, schema)));
+    prog.set_payload_col_info(in_schema);
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, in_schema, out_schema)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -749,12 +750,13 @@ fn create_expr_map(
 fn create_universal_projection(
     src_indices: &[i32],
     src_types: &[u8],
-    schema: &SchemaDescriptor,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let indices: Vec<u32> = src_indices.iter().map(|&i| i as u32).collect();
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_projection(
-        &indices, src_types, schema,
+        &indices, src_types, in_schema, out_schema,
     )));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
@@ -904,8 +906,6 @@ fn emit_node(
                     }
                     if let Some(dep) = dep {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                        let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
-                            &in_reg_schema, owned_expr_progs, owned_funcs);
                         let node_schema = if reindex_col.is_some() {
                             let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
                             cols[0] = SchemaColumn::new(type_code::U128, 0);
@@ -917,6 +917,8 @@ fn emit_node(
                         } else {
                             loaded.out_schema
                         };
+                        let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
+                            &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
                         reg_schemas[reg_id as usize] = node_schema;
                         reg_kinds[reg_id as usize] = 0;
                         let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
@@ -929,22 +931,22 @@ fn emit_node(
                     let src_types: Vec<u8> = src_indices.iter()
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
                         .collect();
-                    let fp = create_universal_projection(
-                        &src_indices, &src_types, &in_reg_schema, owned_funcs,
-                    );
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
+                    let fp = create_universal_projection(
+                        &src_indices, &src_types, &in_reg_schema, &schema, owned_funcs,
+                    );
                     reg_schemas[reg_id as usize] = schema;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, schema, -1);
                 }
 
                 gnitz_wire::MapKind::KeyOnly => {
-                    let fp = create_universal_projection(
-                        &[], &[], &in_reg_schema, owned_funcs,
-                    );
                     let s = SchemaDescriptor::new(
                         &[in_reg_schema.columns[in_reg_schema.pk_index_single() as usize]],
                         &[0],
+                    );
+                    let fp = create_universal_projection(
+                        &[], &[], &in_reg_schema, &s, owned_funcs,
                     );
                     reg_schemas[reg_id as usize] = s;
                     reg_kinds[reg_id as usize] = 0;

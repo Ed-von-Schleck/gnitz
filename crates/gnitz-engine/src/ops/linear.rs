@@ -50,7 +50,7 @@ pub fn op_filter(
     };
 
     // Batch evaluator path: evaluate all n rows, scan resulting bitmask.
-    if let Some(bits) = func.filter_batch_bits(&mb, n, schema) {
+    if let Some(bits) = func.filter_batch_bits(&mb, n) {
         let mut range_start: isize = -1;
         let words = n.div_ceil(64);
         for (w, &word) in bits[..words].iter().enumerate() {
@@ -86,7 +86,7 @@ pub fn op_filter(
         // Per-row path (small batches or PassAll)
         let mut range_start: isize = -1;
         for i in 0..n {
-            if func.evaluate_predicate(&mb, i, schema) {
+            if func.evaluate_predicate(&mb, i) {
                 if range_start < 0 {
                     range_start = i as isize;
                 }
@@ -128,7 +128,7 @@ pub fn op_map(
 
     if reindex_col < 0 {
         // Batch path
-        let mut result = func.evaluate_map_batch(batch, in_schema, out_schema);
+        let mut result = func.evaluate_map_batch(batch, out_schema);
         result.sorted = batch.sorted;
         gnitz_debug!("op_map: in={} out={} reindex=-1 func={}", batch.count, result.count, func.kind_name());
         return result;
@@ -139,7 +139,7 @@ pub fn op_map(
     let ri_col = reindex_col as usize;
 
     // Evaluate the map batch (without reindex) to get column data
-    let mut output = func.evaluate_map_batch(batch, in_schema, out_schema);
+    let mut output = func.evaluate_map_batch(batch, out_schema);
 
     // Overwrite PK with promoted values from reindex column
     for row in 0..output.count {
@@ -778,7 +778,7 @@ mod tests {
         let empty_batch = Batch::empty(1, 16);
 
         let func = ScalarFuncKind::Plan(Plan::from_projection(
-            &[1], &[type_code::I64], &schema,
+            &[1], &[type_code::I64], &schema, &schema,
         ));
         let out = op_map(&empty_batch, &func, &schema, &schema, -1);
         assert_eq!(out.count, 0);

@@ -28,30 +28,20 @@ impl ScalarFuncKind {
     }
 
     /// Filter predicate: returns true if row passes.
-    pub fn evaluate_predicate(
-        &self,
-        batch: &MemBatch,
-        row: usize,
-        schema: &SchemaDescriptor,
-    ) -> bool {
+    pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let ScalarFuncKind::Plan(p) = self;
-        p.evaluate_predicate(batch, row, schema)
+        p.evaluate_predicate(batch, row)
     }
 
     /// Try to evaluate the filter predicate for all `n` rows using the batch
     /// evaluator.  Returns `Some(bitmask)` when the batch path is used (n ≥ 16
     /// and the kernel is Interpreted), `None` to fall through to per-row.
-    pub fn filter_batch_bits(
-        &self,
-        mb: &MemBatch,
-        n: usize,
-        schema: &SchemaDescriptor,
-    ) -> Option<Vec<u64>> {
+    pub fn filter_batch_bits(&self, mb: &MemBatch, n: usize) -> Option<Vec<u64>> {
         const THRESHOLD: usize = 16;
         let ScalarFuncKind::Plan(plan) = self;
         match &plan.filter {
-            FilterKernel::Interpreted(_) if n >= THRESHOLD => {
-                Some(plan.filter_batch(mb, n, schema))
+            FilterKernel::Interpreted { .. } if n >= THRESHOLD => {
+                Some(plan.filter_batch(mb, n))
             }
             _ => None,
         }
@@ -61,11 +51,10 @@ impl ScalarFuncKind {
     pub fn evaluate_map_batch(
         &self,
         in_batch: &Batch,
-        in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
     ) -> Batch {
         let ScalarFuncKind::Plan(p) = self;
-        p.execute_map(in_batch, in_schema, out_schema)
+        p.execute_map(in_batch, out_schema)
     }
 }
 
@@ -75,19 +64,13 @@ impl ScalarFuncKind {
 
 /// Copy a single column from `in_batch` to `output`. `cm.src_pi` holds the
 /// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
-/// the dense payload index in the input batch.
-fn copy_column(
-    in_batch: &Batch,
-    output: &mut Batch,
-    cm: &ColMove,
-    in_schema: &SchemaDescriptor,
-    out_schema: &SchemaDescriptor,
-) {
+/// the dense payload index in the input batch. `cm.stride` is precomputed at
+/// construction time — the byte width of the destination column.
+fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
     let n = in_batch.count;
+    let stride = cm.stride as usize;
 
     if cm.src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
-        let out_ci = out_schema.payload_col_idx(cm.dst_payload);
-        let stride = out_schema.columns[out_ci].size() as usize;
         let dst = output.col_data_mut(cm.dst_payload);
         for row in 0..n {
             let pk = in_batch.get_pk(row);
@@ -96,8 +79,6 @@ fn copy_column(
         }
     } else if cm.type_code == type_code::STRING {
         let in_pi = cm.src_pi as usize;
-        let src_ci = in_schema.payload_col_idx(in_pi);
-        let stride = in_schema.columns[src_ci].size() as usize;
         let src_col = in_batch.col_data(in_pi);
         output.blob.reserve(in_batch.blob.len());
         for row in 0..n {
@@ -109,14 +90,12 @@ fn copy_column(
         }
     } else {
         let in_pi = cm.src_pi as usize;
-        let src_ci = in_schema.payload_col_idx(in_pi);
-        let stride = in_schema.columns[src_ci].size() as usize;
         debug_assert!(
             n * stride <= in_batch.col_data(in_pi).len(),
             "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
-             (batch count={}, schema cols={}, payload cols={})",
+             (batch count={})",
             n, stride, n * stride, in_pi, in_batch.col_data(in_pi).len(),
-            in_batch.count, in_schema.num_columns(), in_batch.num_payload_cols(),
+            in_batch.count,
         );
         output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
@@ -189,13 +168,24 @@ struct ColMove {
     /// Resolved payload byte for the source: `SENTINEL` for the PK column,
     /// otherwise the dense payload index in the input batch.
     src_pi: u8,
+    /// Dense payload index in the output batch.
     dst_payload: usize,
+    /// Type code of the column (used to dispatch the string path).
     type_code: u8,
+    /// Precomputed byte width of the destination column. For non-PK copies
+    /// this equals the input column's stride (same type). For PK→payload
+    /// copies, the destination may be wider (e.g. U64→U128 reindex), so the
+    /// stride must come from the *output* schema.
+    stride: u8,
 }
 
 enum FilterKernel {
     PassAll,
-    Interpreted(ExprProgram),
+    Interpreted {
+        prog: ExprProgram,
+        /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
+        no_nulls: bool,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -205,6 +195,10 @@ enum ComputeKernel {
         prog: ExprProgram,
         emit_payloads: Vec<usize>,
         emit_regs: Vec<usize>,
+        /// Output byte width per EMIT target, parallel to `emit_payloads`.
+        emit_strides: Vec<u8>,
+        /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
+        no_nulls: bool,
     },
 }
 
@@ -227,18 +221,43 @@ fn filter_only(filter: FilterKernel) -> Plan {
     }
 }
 
+/// Stride for a single ColMove. `src_pi == SENTINEL` is the PK→payload case,
+/// where the destination column's width drives the stride (and may differ
+/// from the source — e.g. U64→U128). For non-PK copies, source and
+/// destination strides are equal (the column is being moved, not reshaped).
+fn col_move_stride(
+    src_pi: u8,
+    dst_payload: usize,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
+) -> u8 {
+    if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
+        let out_ci = out_schema.payload_col_idx(dst_payload);
+        out_schema.columns[out_ci].size()
+    } else {
+        let src_ci = in_schema.payload_col_idx(src_pi as usize);
+        in_schema.columns[src_ci].size()
+    }
+}
+
 impl Plan {
     /// Filter via interpreted expression (replaces ExprPredicate).
     pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
         prog.resolve_column_indices(schema);
-        filter_only(FilterKernel::Interpreted(prog))
+        let no_nulls = prog.is_strictly_non_nullable(schema);
+        filter_only(FilterKernel::Interpreted { prog, no_nulls })
     }
 
     /// Projection plan from source indices (replaces UniversalProjection).
-    pub fn from_projection(src_indices: &[u32], src_types: &[u8], schema: &SchemaDescriptor) -> Self {
+    pub fn from_projection(
+        src_indices: &[u32],
+        src_types: &[u8],
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+    ) -> Self {
         let src_pi_bytes: Vec<u8> = src_indices
             .iter()
-            .map(|&ci| schema.payload_mapping_byte(ci as usize))
+            .map(|&ci| in_schema.payload_mapping_byte(ci as usize))
             .collect();
         let col_moves: Vec<ColMove> = src_pi_bytes
             .iter()
@@ -248,6 +267,7 @@ impl Plan {
                 src_pi,
                 dst_payload: i,
                 type_code: tc,
+                stride: col_move_stride(src_pi, i, in_schema, out_schema),
             })
             .collect();
         let null_perm = NullPerm::from_projection(&src_pi_bytes);
@@ -261,16 +281,20 @@ impl Plan {
     }
 
     /// Map plan from ExprProgram bytecode (replaces ExprMap + MapAnalysis).
-    pub fn from_map(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
-        prog.resolve_column_indices(schema);
+    pub fn from_map(
+        mut prog: ExprProgram,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+    ) -> Self {
+        prog.resolve_column_indices(in_schema);
         // After resolve_column_indices, EXPR_COPY_COL.a1 already holds the
         // resolved payload byte (SENTINEL for PK, dense payload index otherwise).
         let mut copy_src_pi_bytes: Vec<u8> = Vec::new();
         let mut copy_out_payloads: Vec<u32> = Vec::new();
         let mut copy_type_codes: Vec<u8> = Vec::new();
         let mut null_payloads: Vec<u32> = Vec::new();
-        let mut emit_payloads = Vec::new();
-        let mut emit_regs = Vec::new();
+        let mut emit_payloads: Vec<usize> = Vec::new();
+        let mut emit_regs: Vec<usize> = Vec::new();
         let mut has_compute = false;
 
         for i in 0..prog.num_instrs as usize {
@@ -303,6 +327,7 @@ impl Plan {
                 src_pi: src,
                 dst_payload: dst as usize,
                 type_code: tc,
+                stride: col_move_stride(src, dst as usize, in_schema, out_schema),
             })
             .collect();
 
@@ -313,7 +338,12 @@ impl Plan {
         );
 
         let compute = if has_compute {
-            ComputeKernel::Interpreted { prog, emit_payloads, emit_regs }
+            let emit_strides: Vec<u8> = emit_payloads.iter().map(|&p| {
+                let out_ci = out_schema.payload_col_idx(p);
+                out_schema.columns[out_ci].size()
+            }).collect();
+            let no_nulls = prog.is_strictly_non_nullable(in_schema);
+            ComputeKernel::Interpreted { prog, emit_payloads, emit_regs, emit_strides, no_nulls }
         } else {
             ComputeKernel::None
         };
@@ -328,15 +358,10 @@ impl Plan {
     }
 
     /// Evaluate predicate for a single row (per-row fallback).
-    pub fn evaluate_predicate(
-        &self,
-        batch: &MemBatch,
-        row: usize,
-        _schema: &SchemaDescriptor,
-    ) -> bool {
+    pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         match &self.filter {
             FilterKernel::PassAll => true,
-            FilterKernel::Interpreted(prog) => {
+            FilterKernel::Interpreted { prog, .. } => {
                 let (val, is_null) = expr::eval_predicate(prog, batch, row);
                 !is_null && val != 0
             }
@@ -346,13 +371,8 @@ impl Plan {
     /// Batch filter: evaluate predicate for all n rows, return bitmask.
     /// Bit i is set if row i passes the filter (non-null AND non-zero result).
     /// Returns a Vec of `(n+63)/64` words.
-    pub fn filter_batch(
-        &self,
-        mb: &MemBatch,
-        n: usize,
-        in_schema: &SchemaDescriptor,
-    ) -> Vec<u64> {
-        let FilterKernel::Interpreted(prog) = &self.filter else {
+    pub fn filter_batch(&self, mb: &MemBatch, n: usize) -> Vec<u64> {
+        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
             // PassAll: all bits set
             let words = n.div_ceil(64);
             let mut bits = vec![u64::MAX; words];
@@ -363,7 +383,7 @@ impl Plan {
             return bits;
         };
 
-        let no_nulls = prog.is_strictly_non_nullable(in_schema);
+        let no_nulls = *no_nulls;
         let num_regs = prog.num_regs as usize;
         let result_reg = prog.result_reg as usize;
 
@@ -394,12 +414,10 @@ impl Plan {
     }
 
     /// Execute map: system column clone → col_moves → NullPerm → compute.
-    pub fn execute_map(
-        &self,
-        in_batch: &Batch,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Batch {
+    /// `out_schema` is still required here because constructing the output
+    /// batch (`Batch::with_schema`) needs the full schema. All per-column
+    /// stride information is baked into the Plan.
+    pub fn execute_map(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
         let n = in_batch.count;
         if n == 0 {
             return Batch::empty_with_schema(out_schema);
@@ -423,7 +441,7 @@ impl Plan {
 
         // Column moves
         for cm in &self.col_moves {
-            copy_column(in_batch, &mut output, cm, in_schema, out_schema);
+            copy_column(in_batch, &mut output, cm);
         }
 
         // EMIT_NULL columns — already zero-filled by with_schema
@@ -433,8 +451,10 @@ impl Plan {
         output.null_bmp_data_mut().copy_from_slice(&null_bmp_result);
 
         // Compute kernel
-        if let ComputeKernel::Interpreted { prog, emit_payloads, emit_regs } = &self.compute {
-            let no_nulls = prog.is_strictly_non_nullable(in_schema);
+        if let ComputeKernel::Interpreted {
+            prog, emit_payloads, emit_regs, emit_strides, no_nulls,
+        } = &self.compute {
+            let no_nulls = *no_nulls;
             let num_regs = prog.num_regs as usize;
 
             let in_mb = in_batch.as_mem_batch();
@@ -448,9 +468,10 @@ impl Plan {
                 eval_batch(prog, &in_mb, morsel_start, m, &mut scratch);
 
                 // EMIT: write each computed register to its output column
-                for (&out_payload, &reg) in emit_payloads.iter().zip(emit_regs.iter()) {
-                    let out_ci = out_schema.payload_col_idx(out_payload);
-                    let stride = out_schema.columns[out_ci].size() as usize;
+                for ((&out_payload, &reg), &stride_u8) in
+                    emit_payloads.iter().zip(emit_regs.iter()).zip(emit_strides.iter())
+                {
+                    let stride = stride_u8 as usize;
                     let dst8 = output.col_data_mut(out_payload);
                     let base_r = reg * MORSEL;
                     let base_null_r = reg * NULL_WORDS_PER_REG;
