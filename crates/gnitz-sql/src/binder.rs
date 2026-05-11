@@ -159,7 +159,16 @@ impl<'a> Binder<'a> {
                             .ok_or_else(|| GnitzSqlError::Bind(
                                 format!("column '{}' not found", ident.value)
                             ))?;
-                        Ok(BoundExpr::IsNull(idx))
+                        // Fold IS NULL on a NOT NULL column (incl. PK) to the
+                        // constant 0 — the result is never null and never true.
+                        // Eliminating the opcode also lets is_strictly_non_nullable
+                        // skip null-bit tracking in eval_batch for predicates whose
+                        // remaining operands are all non-nullable.
+                        if !schema.columns[idx].is_nullable {
+                            Ok(BoundExpr::LitInt(0))
+                        } else {
+                            Ok(BoundExpr::IsNull(idx))
+                        }
                     }
                     _ => Err(GnitzSqlError::Unsupported("IS NULL on non-column expression".to_string())),
                 }
@@ -171,7 +180,11 @@ impl<'a> Binder<'a> {
                             .ok_or_else(|| GnitzSqlError::Bind(
                                 format!("column '{}' not found", ident.value)
                             ))?;
-                        Ok(BoundExpr::IsNotNull(idx))
+                        if !schema.columns[idx].is_nullable {
+                            Ok(BoundExpr::LitInt(1))
+                        } else {
+                            Ok(BoundExpr::IsNotNull(idx))
+                        }
                     }
                     _ => Err(GnitzSqlError::Unsupported("IS NOT NULL on non-column expression".to_string())),
                 }
