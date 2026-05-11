@@ -89,8 +89,8 @@ This plan does not touch the catalog.
 
 ### 4. SQL parser silently degrades compound PK
 
-`PRIMARY KEY (a, b)` is rejected at `gnitz-sql/src/planner.rs:132`
-with `GnitzSqlError::Unsupported("PRIMARY KEY must specify exactly one
+`PRIMARY KEY (a, b)` is rejected at `gnitz-sql/src/planner.rs` with
+`GnitzSqlError::Unsupported("PRIMARY KEY must specify exactly one
 column")`. Lifting this is a parser change. This plan does not touch
 the parser.
 
@@ -127,6 +127,34 @@ viable:
 This plan does not pick a direction. The constructor-side rewrite
 below is a precondition for both.
 
+## What's already in place
+
+The schema-constructor refactor landed in commit `1cb1830` and
+established the constructor that this plan hangs the mapping
+computation on:
+
+- `SchemaDescriptor::new(cols: &[SchemaColumn], pk_indices: &[u32])`
+  exists as a `const fn`. The body validates `pk_indices.len() == 1 ||
+  (cols.is_empty() && pk_indices.is_empty())` and writes `pk_index`
+  from `pk_indices[0]`.
+- Every stub-then-mutate site (the `empty_schema()` / direct struct
+  literal / `Default::default()` + field-mutation patterns) routes
+  through `new()`. The `empty_schema()` and `col()` helpers are
+  deleted.
+- The reader-side accessors — `num_columns()`, `pk_indices()`,
+  `pk_index_single()`, `is_pk_col()`, `payload_idx()`,
+  `payload_columns()`, `num_payload_cols()` — are all in place. They
+  read through the existing scalar `pk_index` field today; the bodies
+  flip in this plan.
+- `PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX` exists and is already
+  consumed by `ops::reduce` for `SortDesc::pi`.
+
+What is *not* yet routed through `new()` is the build-then-literal
+pattern: ~30 sites that fill a `[SchemaColumn; MAX_COLUMNS]` array and
+construct the descriptor with one struct literal that names every
+field. These compile today because `num_columns`, `pk_index`, and
+`columns` are still `pub`. They are the surface this plan migrates.
+
 ## What this plan changes
 
 One commit. A constructor-side refactor.
@@ -154,10 +182,10 @@ pub struct SchemaDescriptor {
 }
 ```
 
-**Field privacy.** `pk_count`, `pk_indices`, `payload_mapping`, and
-`payload_to_ci` are private. `num_columns` is also private (it must
-match `pk_count + popcount(non-PK cols)`, which `new` guarantees). The
-struct is constructed exclusively through:
+**Field privacy.** `num_columns`, `pk_count`, `pk_indices`,
+`payload_mapping`, and `payload_to_ci` are private. `columns` stays
+`pub` because external callers index it heavily (`schema.columns[ci]`).
+The struct is constructed exclusively through:
 
 ```rust
 impl SchemaDescriptor {
@@ -180,68 +208,53 @@ a payload column at index 0.
 The existing `num_payload_cols()` body changes from
 `self.num_columns() - self.pk_indices().len()` to
 `self.num_columns as usize - self.pk_count as usize` — a one-line
-substitution against the new representation. No new public accessors
-are introduced: `num_columns()`, `pk_indices()`, `pk_index_single()`,
-`is_pk_col()`, `payload_idx()`, `payload_columns()`, and
-`num_payload_cols()` are all already in place.
+substitution against the new representation.
 
 The reason for privacy is mechanical: a public `payload_mapping` field
 allows any caller (test or otherwise) to construct a `SchemaDescriptor`
 with `..Default::default()` or struct-literal syntax that bypasses the
 recompute, producing a schema where `payload_idx` returns 0 for every
 column. Forcing construction through `new` makes that error
-unrepresentable. The migration touches every direct
-`SchemaDescriptor { ... }` literal — see "Validation procedure".
+unrepresentable.
 
 Privatizing `num_columns`, `pk_count`, and `pk_indices` together is what
 makes the "default + mutate" idiom impossible to compile, not a style
-convention to enforce by review. A test that writes
-`let mut s = SchemaDescriptor::default(); s.columns[0] = ...;
-s.num_columns = 1; s.pk_index = 0;` no longer typechecks — the only way
-to reach a populated descriptor is `SchemaDescriptor::new(&cols, &pks)`,
-which always recomputes the mapping arrays in lock-step with the columns
-and PK list.
+convention to enforce by review. Ten existing test scaffolds today still
+write `let mut s = SchemaDescriptor::default(); s.num_columns = N;
+s.pk_index = K;` (in `schema.rs` tests at L472–501 and `runtime/executor.rs`
+tests at L1163, L1170) — those stop typechecking and migrate to a
+single `SchemaDescriptor::new(&cols, &[K])` call as part of this plan.
 
-**`empty_schema()` is removed.** The helper at `compiler.rs` returns
-a stub that is then mutated field-by-field at the call site:
-`out.columns[ci] = ...; out.num_columns = ci as u32; out.pk_index = 0;`.
-This pattern is incompatible with the new representation — a stub-then-mutate
-schema has `payload_mapping` filled with sentinels, so every appended
-column appears to be a PK and `payload_idx` is undefined for all of
-them. The fix is not "ban the field assignment" (the field is private
-anyway) but "rewrite the builders to collect columns and call `new`",
-using the existing `payload_columns()` iterator instead of manual
-"skip the PK index" loops:
+### Build-then-literal site migration
 
-- `compiler.rs::merge_schemas_for_join_impl`: already rebuilds as
-  `[left.pk] + left.payload_columns() + right.payload_columns()` with
-  the right side's `nullable` bit OR-ed in for outer joins. After the
-  rewrite this collects a `Vec<SchemaColumn>` and calls `new(&cols,
-  &[0])`.
-- `compiler.rs::build_map_output_schema`: same shape.
-- `compiler.rs::build_reduce_output_schema`: same shape; natural-vs-
-  synthetic-PK branches both end at one `new` call.
-- `make_group_idx_schema` and the sibling fixed-shape helper: rewrite
-  as straight `new(&[col(...), col(...)], &[0])`.
-- Inline `let mut s = empty_schema(); ...` builders inside the
-  per-instruction lowering loop: same — collect columns, call `new`.
-- `vec![empty_schema(); num_regs]`: replace with
-  `vec![SchemaDescriptor::default(); num_regs]`. The slot is a
-  placeholder — every entry is overwritten by the per-register schema
-  before it is read.
-- `out_schema: empty_schema()` initializers and test scaffolding:
-  replace with `SchemaDescriptor::default()`.
-- The same "empty + mutate" appears in `compiler.rs` test scaffolding
-  (`let mut left = empty_schema(); ...`) and the
-  `test_build_reduce_output_schema_*` cases. Same rewrite.
+The schema-constructor refactor left every site that fills a
+`[SchemaColumn; MAX_COLUMNS]` array and ends with a single struct
+literal in place. These compile today because the fields are `pub`;
+they stop compiling once the fields privatize. Each is a mechanical
+one-line substitution: `SchemaDescriptor { num_columns, pk_index,
+columns }` → `SchemaDescriptor::new(&columns[..num_columns],
+&[pk_index])`.
 
-After this, `empty_schema()` is deleted. There is no helper that
-returns an in-progress, structurally-invalid descriptor.
+Audit shows ~30 sites under `rg "SchemaDescriptor\s*\{\s*num_columns"
+crates/`:
 
-Existing const helpers (`make_schema`, `from_wire_cols`,
-`build_schema_from_col_defs`, the catalog-load path) call `new`
-internally; they already accept a single `pk_index: u32` value and
-forward it as `&[pk_index]`.
+- `vm.rs::make_schema`, `runtime/master.rs::{u64_schema, two_col_schema}`
+  and inline literals.
+- `expr/tests/{program_tests, plan_tests, batch_tests}.rs::make_schema*`.
+- `storage/{batch, columnar, partitioned_table, table, read_cursor,
+  shard_reader, merge}.rs::make_*_schema` test helpers (one each).
+- `storage/memtable.rs::{make_u64_i64_schema, make_schema_cols}` plus
+  one inline literal.
+- `storage/columnar.rs` test helpers (4 sites).
+- `ops/{scan, distinct, exchange, join, linear}.rs::make_*_schema` test
+  helpers; one production literal in `ops/linear.rs::op_null_extend`.
+- `ops/reduce.rs::{make_schema_u64_i64, make_schema_u64_f32,
+  make_schema_with_type}` plus the `runtime/wire.rs` snapshots.
+
+None of these touches operator logic, storage code, or the hot path —
+they are all schema-shape mechanics. Existing const-fn helpers
+(`catalog::sys_tables::make_schema`, `from_wire_cols`) already forward
+through `new()` since the constructor refactor; nothing changes there.
 
 The hot accessors collapse to single-load lookups:
 
@@ -378,11 +391,6 @@ bodies and the underlying field representation flip. `payload_idx`,
 5. **Constructor audit**:
    `rg "SchemaDescriptor\s*\{" crates/` should match only the struct
    definition itself and the `Default` / `new` / `minimal_u64`
-   implementations. Every other construction site (test helpers in
-   `ops/{distinct,exchange,join,reduce,scan}.rs`, `vm.rs`,
-   `storage/shard_file.rs`, `compiler.rs`'s `merge_schemas_*` /
-   `build_map_output_schema` / `build_reduce_output_schema` / inline
-   per-instruction builders, etc.) must go through
-   `SchemaDescriptor::new(...)` so `payload_mapping` and `payload_to_ci`
-   are always populated. `rg "empty_schema" crates/` should return zero
-   matches.
+   implementations. `rg "\.num_columns\s*=" crates/` and
+   `rg "\.pk_index\s*=" crates/` should both return zero matches —
+   field privatization makes those writes impossible to compile.
