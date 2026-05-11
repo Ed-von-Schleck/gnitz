@@ -75,7 +75,7 @@ fn resolve_fk_target(
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
     if !referred_columns.is_empty() {
         let ref_col_name = &referred_columns[0].value;
-        let pk_col_name = &ref_schema.columns[ref_schema.pk_index].name;
+        let pk_col_name = &ref_schema.columns[ref_schema.pk_index_single()].name;
         if ref_col_name != pk_col_name {
             return Err(GnitzSqlError::Bind(format!(
                 "FK must reference the primary key column '{}', got '{}'",
@@ -83,7 +83,7 @@ fn resolve_fk_target(
             )));
         }
     }
-    let parent_pk_type = ref_schema.columns[ref_schema.pk_index].type_code;
+    let parent_pk_type = ref_schema.columns[ref_schema.pk_index_single()].type_code;
     let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_pk_type) {
         true
     } else {
@@ -95,7 +95,7 @@ fn resolve_fk_target(
             fk_col_type, parent_pk_type,
         )));
     }
-    Ok((ref_tid, ref_schema.pk_index as u64, parent_pk_type))
+    Ok((ref_tid, ref_schema.pk_index_single() as u64, parent_pk_type))
 }
 
 fn execute_create_table(
@@ -438,7 +438,7 @@ enum ProjectionItem {
 }
 
 fn is_pk_item(item: &ProjectionItem, schema: &Schema) -> bool {
-    matches!(item, ProjectionItem::PassThrough { src_col } if *src_col == schema.pk_index)
+    matches!(item, ProjectionItem::PassThrough { src_col } if schema.is_pk_col(*src_col))
 }
 
 
@@ -505,7 +505,7 @@ fn build_projection(
     }
 
     // Ensure PK is present (as PassThrough) and first
-    let pk = source_schema.pk_index;
+    let pk = source_schema.pk_index_single();
     let pk_pos = items.iter().position(|i| matches!(i, ProjectionItem::PassThrough { src_col } if *src_col == pk));
 
     match pk_pos {
@@ -1267,7 +1267,7 @@ fn compile_set_op_side(
 
     // Reindex by PK column with all columns as payload
     let prog = build_reindex_program(&source_schema);
-    let reindexed = cb.map_reindex(filtered, source_schema.pk_index, prog);
+    let reindexed = cb.map_reindex(filtered, source_schema.pk_index_single(), prog);
 
     // Determine output columns (from projection)
     let out_cols: Vec<ColumnDef> = source_schema.columns.clone();
@@ -1396,7 +1396,7 @@ fn execute_create_distinct_view(
 
     // Reindex by PK → distinct
     let prog = build_reindex_program(&source_schema);
-    let reindexed = cb.map_reindex(filtered, source_schema.pk_index, prog);
+    let reindexed = cb.map_reindex(filtered, source_schema.pk_index_single(), prog);
     let distinct_node = cb.distinct(reindexed);
 
     cb.sink(distinct_node);

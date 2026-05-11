@@ -153,15 +153,11 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
 
 /// Check if a column is NULL in the current cursor row.
 pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
-    if col_idx == schema.pk_index as usize {
+    if schema.is_pk_col(col_idx) {
         return false; // PK is never null
     }
     // Compute payload index
-    let payload_idx = if col_idx < schema.pk_index as usize {
-        col_idx
-    } else {
-        col_idx - 1
-    };
+    let payload_idx = schema.payload_idx(col_idx);
     (cursor.current_null_word >> payload_idx) & 1 != 0
 }
 
@@ -433,7 +429,7 @@ fn compute_co_partitioned(
     for (&tid, cols) in join_shard_map {
         if cols.len() == 1 {
             if let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) {
-                if cols[0] == ext.schema.pk_index as i32 {
+                if ext.schema.is_pk_col(cols[0] as usize) {
                     co_partitioned.insert(tid);
                 }
             }
@@ -482,7 +478,7 @@ fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> Annotation 
 // ---------------------------------------------------------------------------
 
 fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns != b.num_columns || a.pk_index != b.pk_index {
+    if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() {
         return false;
     }
     for i in 0..a.num_columns as usize {
@@ -626,21 +622,17 @@ fn merge_schemas_for_join_impl(
         crate::schema::MAX_COLUMNS, left.num_columns, right.num_columns, total);
     let mut out = empty_schema();
     let mut ci: usize = 0;
-    out.columns[ci] = left.columns[left.pk_index as usize];
+    out.columns[ci] = left.columns[left.pk_index_single() as usize];
     ci += 1;
-    for i in 0..left.num_columns as usize {
-        if i != left.pk_index as usize {
-            out.columns[ci] = left.columns[i];
-            ci += 1;
-        }
+    for (_, _, col) in left.payload_columns() {
+        out.columns[ci] = *col;
+        ci += 1;
     }
-    for i in 0..right.num_columns as usize {
-        if i != right.pk_index as usize {
-            let mut c = right.columns[i];
-            if right_nullable { c.nullable = 1; }
-            out.columns[ci] = c;
-            ci += 1;
-        }
+    for (_, _, col) in right.payload_columns() {
+        let mut c = *col;
+        if right_nullable { c.nullable = 1; }
+        out.columns[ci] = c;
+        ci += 1;
     }
     out.num_columns = ci as u32;
     out.pk_index = 0;
@@ -658,11 +650,11 @@ fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescripto
 fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
     let mut out = empty_schema();
     let mut ci: usize = 0;
-    out.columns[ci] = input.columns[input.pk_index as usize];
+    out.columns[ci] = input.columns[input.pk_index_single() as usize];
     ci += 1;
     for &idx in src_indices {
         let i = idx as usize;
-        if i != input.pk_index as usize {
+        if !input.is_pk_col(i) {
             out.columns[ci] = input.columns[i];
             ci += 1;
         }
@@ -922,7 +914,7 @@ fn emit_node(
                 if let Some(dep) = decode_expr_blob(blob) {
                     let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                     create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
-                        in_schema.pk_index, &in_schema, owned_expr_progs, owned_funcs)
+                        in_schema.pk_index_single(), &in_schema, owned_expr_progs, owned_funcs)
                 } else {
                     null_func_ptr()
                 }
@@ -959,7 +951,7 @@ fn emit_node(
                     if let Some(dep) = dep {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                         let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
-                            in_reg_schema.pk_index, &in_reg_schema, owned_expr_progs, owned_funcs);
+                            in_reg_schema.pk_index_single(), &in_reg_schema, owned_expr_progs, owned_funcs);
                         let node_schema = if reindex_col.is_some() {
                             let mut s = empty_schema();
                             s.columns[0] = col(type_code::U128, 16, false);
@@ -985,7 +977,7 @@ fn emit_node(
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
                         .collect();
                     let fp = create_universal_projection(
-                        &src_indices, &src_types, in_reg_schema.pk_index, owned_funcs,
+                        &src_indices, &src_types, in_reg_schema.pk_index_single(), owned_funcs,
                     );
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
                     reg_schemas[reg_id as usize] = schema;
@@ -995,10 +987,10 @@ fn emit_node(
 
                 gnitz_wire::MapKind::KeyOnly => {
                     let fp = create_universal_projection(
-                        &[], &[], in_reg_schema.pk_index, owned_funcs,
+                        &[], &[], in_reg_schema.pk_index_single(), owned_funcs,
                     );
                     let mut s = empty_schema();
-                    s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index as usize];
+                    s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index_single() as usize];
                     s.num_columns = 1;
                     s.pk_index = 0;
                     reg_schemas[reg_id as usize] = s;

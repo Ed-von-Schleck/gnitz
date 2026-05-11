@@ -57,7 +57,7 @@ fn validate_conflict_target(
                 ));
             }
             let col_name = cols[0].value.as_str();
-            let pk_name = schema.columns[schema.pk_index].name.as_str();
+            let pk_name = schema.columns[schema.pk_index_single()].name.as_str();
             if !col_name.eq_ignore_ascii_case(pk_name) {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "ON CONFLICT ({}) — only the primary key column '{}' is \
@@ -128,28 +128,18 @@ pub fn execute_insert(
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
-        let mut col_data_idx = 0usize; // index into row (skipping PK col)
-        let mut payload_idx = 0usize;
-        for (ci, col_def) in schema.columns.iter().enumerate() {
-            if ci == schema.pk_index {
-                // pk column: the actual data is in pks, ColData stays empty
-                // we still skip one item from the VALUES row for the PK
-                col_data_idx += 1;
-                continue;
-            }
-            if col_data_idx >= row.len() {
+        for (payload_idx, ci, col_def) in schema.payload_columns() {
+            if ci >= row.len() {
                 return Err(GnitzSqlError::Bind(
                     format!("not enough values in INSERT row (column {})", ci)
                 ));
             }
-            let val_expr = &row[col_data_idx];
-            col_data_idx += 1;
+            let val_expr = &row[ci];
             // Check if this value is NULL and set the null bitmap
             if is_null_expr(val_expr) {
                 null_bits |= 1u64 << payload_idx;
             }
             append_value_to_col(&mut batch.columns[ci], col_def.type_code, val_expr)?;
-            payload_idx += 1;
         }
         batch.nulls.push(null_bits);
     }
@@ -202,7 +192,7 @@ fn bind_do_update_assignments(
             .ok_or_else(|| GnitzSqlError::Bind(format!(
                 "column '{}' not found in ON CONFLICT DO UPDATE SET", col_name
             )))?;
-        if col_idx == schema.pk_index {
+        if schema.is_pk_col(col_idx) {
             return Err(GnitzSqlError::Unsupported(
                 "cannot assign to primary key column in ON CONFLICT DO UPDATE".to_string()
             ));
@@ -341,10 +331,7 @@ fn client_side_merge_do_update(
                 // that resolve to NULL will flip their bit below.
                 let mut null_bits: u64 = existing_batch.nulls[0];
 
-                for (ci, col_def) in schema.columns.iter().enumerate() {
-                    if ci == schema.pk_index { continue; }
-                    let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
-
+                for (payload_idx, ci, col_def) in schema.payload_columns() {
                     if let Some(rhs) = asn_by_col[ci] {
                         let cv = eval_do_update_rhs(
                             rhs, &existing_batch, batch, i, schema,
@@ -441,10 +428,10 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
 
 /// Extract the primary key from a VALUES row, returning a u128.
 fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError> {
-    let pk_expr = row.get(schema.pk_index).ok_or_else(|| {
+    let pk_expr = row.get(schema.pk_index_single()).ok_or_else(|| {
         GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
     })?;
-    let pk_tc = schema.columns[schema.pk_index].type_code;
+    let pk_tc = schema.columns[schema.pk_index_single()].type_code;
     match pk_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Number(n, _) => {
@@ -641,7 +628,7 @@ fn extract_limit(query: &Query) -> Option<usize> {
 /// Returns Some(pk) if the expression is `pk_col = literal`, else None.
 fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<u128> {
     let (col_idx, key) = try_col_eq_literal(expr, schema)?;
-    if col_idx == schema.pk_index { Some(key) } else { None }
+    if schema.is_pk_col(col_idx) { Some(key) } else { None }
 }
 
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
@@ -734,7 +721,7 @@ fn try_extract_index_seek(
 ) -> Result<Option<(usize, u128, Option<BoundExpr>)>, GnitzSqlError> {
     // Case 1: simple `col = literal`
     if let Some((col_idx, key)) = try_col_eq_literal(expr, schema) {
-        if col_idx != schema.pk_index {
+        if !schema.is_pk_col(col_idx) {
             if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
                 if !require_unique || is_unique {
                     return Ok(Some((col_idx, key, None)));
@@ -749,7 +736,7 @@ fn try_extract_index_seek(
             (right.as_ref(), left.as_ref()),
         ] {
             if let Some((col_idx, key)) = try_col_eq_literal(candidate, schema) {
-                if col_idx != schema.pk_index {
+                if !schema.is_pk_col(col_idx) {
                     if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
                         if !require_unique || is_unique {
                             let residual = binder.bind_expr(other, schema)?;
@@ -815,8 +802,8 @@ fn eval_expr(
     match expr {
         BoundExpr::ColRef(c) => {
             // PK is never null. Payload columns must be checked via the null bitmap.
-            if *c != schema.pk_index {
-                let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+            if !schema.is_pk_col(*c) {
+                let payload_idx = schema.payload_idx(*c);
                 if (batch.nulls[i] & (1u64 << payload_idx)) != 0 {
                     return Ok(None);
                 }
@@ -902,18 +889,18 @@ fn eval_expr(
             }))
         }
         BoundExpr::IsNull(c) => {
-            if *c == schema.pk_index {
+            if schema.is_pk_col(*c) {
                 return Ok(Some(0)); // PK is never null → IS NULL is always false
             }
-            let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+            let payload_idx = schema.payload_idx(*c);
             let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
             Ok(Some(is_null as i64))
         }
         BoundExpr::IsNotNull(c) => {
-            if *c == schema.pk_index {
+            if schema.is_pk_col(*c) {
                 return Ok(Some(1)); // PK is never null → IS NOT NULL is always true
             }
-            let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+            let payload_idx = schema.payload_idx(*c);
             let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
             Ok(Some(!is_null as i64))
         }
@@ -927,8 +914,7 @@ fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schem
     dst.pks.push_u128(src.pks.get(i));
     dst.weights.push(src.weights[i]);
     dst.nulls.push(src.nulls[i]);
-    for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index { continue; }
+    for (_pi, ci, col_def) in schema.payload_columns() {
         let stride = col_def.type_code.wire_stride();
         match (&src.columns[ci], &mut dst.columns[ci]) {
             (ColData::Fixed(s), ColData::Fixed(d)) => {
@@ -985,7 +971,7 @@ fn apply_projection(
     let new_cols: Vec<gnitz_core::ColumnDef> = col_indices.iter()
         .map(|&i| schema.columns[i].clone())
         .collect();
-    let new_pk_idx = col_indices.iter().position(|&i| i == schema.pk_index).unwrap_or(0);
+    let new_pk_idx = col_indices.iter().position(|&i| schema.is_pk_col(i)).unwrap_or(0);
     let new_schema = Schema { columns: new_cols, pk_index: new_pk_idx };
 
     // Destructure src_batch so system columns can be moved (not cloned)
@@ -997,7 +983,7 @@ fn apply_projection(
 
     for (new_ci, &old_ci) in col_indices.iter().enumerate() {
         if new_ci == new_pk_idx { continue; }
-        if old_ci == schema.pk_index { continue; }
+        if schema.is_pk_col(old_ci) { continue; }
         match (&src_columns[old_ci], &mut new_batch.columns[new_ci]) {
             (ColData::Fixed(src), ColData::Fixed(dst)) => {
                 dst.extend_from_slice(src);
@@ -1023,8 +1009,7 @@ fn apply_limit(mut batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch
     batch.weights.truncate(limit);
     batch.nulls.truncate(limit);
 
-    for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index { continue; }
+    for (_pi, ci, col_def) in schema.payload_columns() {
         match &mut batch.columns[ci] {
             ColData::Fixed(buf) => {
                 let stride = col_def.type_code.wire_stride();
@@ -1135,9 +1120,7 @@ fn write_set_columns(
     // its own column's bit (set for a NULL result, clear for non-NULL).
     let mut null_bits = current.nulls[row_idx];
 
-    for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index { continue; }
-        let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
+    for (payload_idx, ci, col_def) in schema.payload_columns() {
         if let Some((_, expr)) = assignments.iter().find(|(idx, _)| *idx == ci) {
             let cv = eval_set_expr(expr, current, row_idx, schema)?;
             if matches!(cv, ColumnValue::Null) {
@@ -1169,7 +1152,7 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
             Expr::Identifier(id) => &id.value,
             _ => return None,
         };
-        let pk_col = &schema.columns[schema.pk_index];
+        let pk_col = &schema.columns[schema.pk_index_single()];
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
@@ -1215,7 +1198,7 @@ pub fn execute_update(
             .ok_or_else(|| GnitzSqlError::Bind(
                 format!("column '{}' not found in UPDATE SET", col_name)
             ))?;
-        if col_idx == schema.pk_index {
+        if schema.is_pk_col(col_idx) {
             return Err(GnitzSqlError::Unsupported(
                 "cannot UPDATE primary key column".to_string()
             ));

@@ -842,7 +842,7 @@ impl WorkerProcess {
         let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
             let table_schema_matches = self.cat()
                 .get_schema_desc(tid_key)
-                .map(|t| t.num_columns == s.num_columns && t.pk_index == s.pk_index)
+                .map(|t| t.num_columns == s.num_columns && t.pk_indices() == s.pk_indices())
                 .unwrap_or(false);
             if !table_schema_matches {
                 return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));

@@ -24,7 +24,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
 
         let mut flags: u64 = 0;
         if col.is_nullable        { flags |= META_FLAG_NULLABLE; }
-        if ci == schema.pk_index  { flags |= META_FLAG_IS_PK; }
+        if schema.is_pk_col(ci)   { flags |= META_FLAG_IS_PK; }
         flags_bytes.extend_from_slice(&flags.to_le_bytes());
 
         names.push(Some(col.name.clone()));

@@ -34,15 +34,10 @@ fn make_int_batch(
         batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
-        let mut pi = 0;
-        for ci in 0..schema.num_columns as usize {
-            if ci == schema.pk_index as usize {
-                continue;
-            }
+        for (pi, _ci, _col) in schema.payload_columns() {
             if pi < cols.len() {
                 batch.extend_col(pi, &cols[pi].to_le_bytes());
             }
-            pi += 1;
         }
         batch.count += 1;
     }
@@ -61,7 +56,7 @@ fn test_projection_batch() {
     let func = ScalarFuncKind::Plan(Plan::from_projection(
         &[2, 1],
         &[type_code::I64, type_code::I64],
-        in_schema.pk_index,
+        in_schema.pk_index_single(),
     ));
     let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
     assert_eq!(result.count, 2);
@@ -90,7 +85,7 @@ fn test_map_copy_and_emit() {
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
 
-    let func = ScalarFuncKind::Plan(Plan::from_map(prog, in_schema.pk_index));
+    let func = ScalarFuncKind::Plan(Plan::from_map(prog, in_schema.pk_index_single()));
     let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
     assert_eq!(result.count, 1);
 
@@ -106,7 +101,7 @@ fn test_empty_batch() {
     let batch = Batch::empty(1, 16);
 
     let func = ScalarFuncKind::Plan(Plan::from_projection(
-        &[1], &[type_code::I64], schema.pk_index,
+        &[1], &[type_code::I64], schema.pk_index_single(),
     ));
     let result = func.evaluate_map_batch(&batch, &schema, &schema);
     assert_eq!(result.count, 0);
@@ -148,7 +143,7 @@ fn test_filter_batch_matches_per_row() {
         expr::EXPR_CMP_GT, 2, 0, 1,
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
-    let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
+    let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index_single()));
 
     let out = op_filter(&batch, &func, &schema);
     // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

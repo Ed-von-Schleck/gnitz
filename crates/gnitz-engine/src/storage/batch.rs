@@ -87,11 +87,9 @@ fn fill_payload_strides(
     strides: &mut [u8; MAX_BATCH_REGIONS],
     start: usize,
 ) -> usize {
-    let pk = schema.pk_index as usize;
     let mut idx = start;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk { continue; }
-        strides[idx] = schema.columns[ci].size;
+    for (_, _, col) in schema.payload_columns() {
+        strides[idx] = col.size;
         idx += 1;
     }
     idx
@@ -99,7 +97,7 @@ fn fill_payload_strides(
 
 /// Physical byte stride for the PK region: 8 for U64 PK, 16 for U128 PK.
 pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
-    schema.columns[schema.pk_index as usize].size
+    schema.columns[schema.pk_index_single() as usize].size
 }
 
 /// Build a strides array from a SchemaDescriptor.
@@ -1025,7 +1023,7 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema;
-        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index as usize);
+        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index_single() as usize);
         let mut pi = 0;
 
         for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
@@ -1525,13 +1523,9 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     offsets[REG_WEIGHT]   = validate(REG_WEIGHT,   8)?;
     offsets[REG_NULL_BMP] = validate(REG_NULL_BMP, 8)?;
 
-    let pk_idx = schema.pk_index as usize;
-    let mut pi = 0usize;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_idx { continue; }
-        let stride = schema.columns[ci].size as usize;
+    for (pi, _ci, col) in schema.payload_columns() {
+        let stride = col.size as usize;
         offsets[REG_PAYLOAD_START + pi] = validate(REG_PAYLOAD_START + pi, stride)?;
-        pi += 1;
     }
 
     let blob_r = REG_PAYLOAD_START + npc;

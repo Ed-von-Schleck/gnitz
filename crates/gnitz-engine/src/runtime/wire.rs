@@ -84,8 +84,7 @@ fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 }
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
-    let pk_idx = schema.pk_index as usize;
-    let pk_stride = schema.columns[pk_idx].size as usize;
+    let pk_stride = schema.columns[schema.pk_index_single() as usize].size as usize;
     let num_payload = schema.num_columns as usize - 1;
     // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
@@ -93,13 +92,10 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
     sizes[0] = (pk_stride * row_count) as u32; // pk: pk_stride bytes per row
     sizes[1] = (8 * row_count) as u32; // weight
     sizes[2] = (8 * row_count) as u32; // null_bmp
-    let mut pi = 0;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_idx { continue; }
-        sizes[3 + pi] = (schema.columns[ci].size as usize * row_count) as u32;
-        pi += 1;
+    for (pi, _ci, col) in schema.payload_columns() {
+        sizes[3 + pi] = (col.size as usize * row_count) as u32;
     }
-    sizes[3 + pi] = blob_size as u32;
+    sizes[3 + num_payload] = blob_size as u32;
     wal_block_size(num_regions, &sizes[..num_regions])
 }
 
@@ -145,7 +141,7 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
         let col = &schema.columns[ci];
         let mut flags: u64 = 0;
         if col.nullable != 0 { flags |= META_FLAG_NULLABLE; }
-        if ci == schema.pk_index as usize { flags |= META_FLAG_IS_PK; }
+        if schema.is_pk_col(ci) { flags |= META_FLAG_IS_PK; }
 
         let type_code_val = col.type_code as u64;
         let name = if ci < col_names.len() { col_names[ci] } else { b"" };
@@ -265,7 +261,7 @@ pub(crate) fn encode_ctrl_block_ipc(
 const fn ctrl_region_offset(target_region: usize) -> usize {
     use gnitz_wire::control::NUM_REGIONS;
     let schema = &CONTROL_SCHEMA_DESC;
-    let pk_idx = schema.pk_index as usize;
+    let pk_idx = schema.pk_index_single() as usize;
 
     let mut sizes = [0usize; NUM_REGIONS];
     sizes[0] = schema.columns[pk_idx].size as usize;          // pk
@@ -789,7 +785,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 }
 
 fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns != b.num_columns || a.pk_index != b.pk_index { return false; }
+    if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() { return false; }
     for i in 0..a.num_columns as usize {
         if a.columns[i].type_code != b.columns[i].type_code
             || a.columns[i].nullable != b.columns[i].nullable

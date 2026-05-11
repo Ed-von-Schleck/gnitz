@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key, write_to_batch, scatter_multi_source};
 
-use super::util::{extract_group_key, payload_idx};
+use super::util::extract_group_key;
 
 // ---------------------------------------------------------------------------
 // Exchange repartitioning
@@ -31,11 +31,10 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
 /// Extract the routing key for `col_idx` from row `row` of `mb`.
 /// STRING columns are hashed to u64 (stored as u128); all others use the full value.
 fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
-    let pki = schema.pk_index as usize;
-    if col_idx == pki {
+    if schema.is_pk_col(col_idx) {
         return mb.get_pk(row);
     }
-    let pi = payload_idx(col_idx, pki);
+    let pi = schema.payload_idx(col_idx);
     let col = &schema.columns[col_idx];
     let col_size = col.size as usize;
     if col.type_code == crate::schema::type_code::STRING {
@@ -162,8 +161,7 @@ fn hash_row_for_partition(
     col_indices: &[u32],
     schema: &SchemaDescriptor,
 ) -> usize {
-    let pki = schema.pk_index as usize;
-    if col_indices.len() == 1 && col_indices[0] as usize == pki {
+    if col_indices.len() == 1 && schema.is_pk_col(col_indices[0] as usize) {
         return partition_for_key(mb.get_pk(row));
     }
     let pk = extract_group_key(mb, row, schema, col_indices);
@@ -335,7 +333,7 @@ fn relay_scatter_merge_walk(
     // PK-routing path call partition_for_key(best_pk) directly instead of going
     // through hash_row_for_partition (which would re-read get_pk).
     let is_pk_routing = col_indices.len() == 1
-        && col_indices[0] as usize == schema.pk_index as usize;
+        && schema.is_pk_col(col_indices[0] as usize);
 
     while num_active > 0 {
         if num_active == 1 {
@@ -471,7 +469,6 @@ pub fn op_multi_scatter(
 ) -> Vec<Vec<Batch>> {
     let n = batch.count;
     let n_specs = col_specs.len();
-    let pki = schema.pk_index as usize;
     let mb = batch.as_mem_batch();
     let w_map = build_w_map(num_workers);
     let needed = n_specs * num_workers;
@@ -506,7 +503,7 @@ pub fn op_multi_scatter(
         // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
         for si in 0..n_specs {
             let spec = col_specs[si];
-            if spec.len() == 1 && spec[0] as usize == pki {
+            if spec.len() == 1 && schema.is_pk_col(spec[0] as usize) {
                 if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
                     for w in 0..num_workers {
                         if results[si][w].count > 0 {

@@ -330,7 +330,7 @@ fn test_resolve_table_id() {
     assert_eq!(resolved_tid, tid);
     assert!(resolved_tid >= FIRST_USER_TABLE_ID);
     assert_eq!(schema.columns.len(), 3);
-    assert_eq!(schema.pk_index, 0);
+    assert_eq!(schema.pk_indices(), &[0]);
     assert_eq!(schema.columns[0].name, "id");
     assert_eq!(schema.columns[0].type_code, TypeCode::U64);
     assert_eq!(schema.columns[1].name, "name");

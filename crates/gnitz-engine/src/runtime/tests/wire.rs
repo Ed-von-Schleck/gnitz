@@ -77,7 +77,7 @@ fn test_encode_decode_roundtrip_with_schema() {
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns, 2);
-    assert_eq!(s.pk_index, 0);
+    assert_eq!(s.pk_indices(), &[0]);
     assert_eq!(s.columns[0].type_code, type_code::U64);
     assert_eq!(s.columns[1].type_code, type_code::U64);
     assert!(decoded.data_batch.is_none());
@@ -180,7 +180,7 @@ fn test_schema_roundtrip_with_names() {
     let batch = schema_to_batch(&sd, &names);
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
     assert_eq!(sd2.num_columns, 3);
-    assert_eq!(sd2.pk_index, 0);
+    assert_eq!(sd2.pk_indices(), &[0]);
     assert_eq!(sd2.columns[0].type_code, type_code::U64);
     assert_eq!(sd2.columns[1].type_code, type_code::U64);
     assert_eq!(sd2.columns[2].type_code, type_code::STRING);

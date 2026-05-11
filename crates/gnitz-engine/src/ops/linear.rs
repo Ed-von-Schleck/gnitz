@@ -398,7 +398,7 @@ pub fn op_null_extend(
     }
     let out_schema = SchemaDescriptor {
         num_columns: ci_out as u32,
-        pk_index: in_schema.pk_index,
+        pk_index: in_schema.pk_index_single(),
         columns: out_columns,
     };
 
@@ -410,9 +410,8 @@ pub fn op_null_extend(
     output.weight_data_mut().copy_from_slice(batch.weight_data());
 
     // Copy input payload columns
-    for pi in 0..in_npc {
-        let in_ci = if pi < in_schema.pk_index as usize { pi } else { pi + 1 };
-        let stride = in_schema.columns[in_ci].size as usize;
+    for (pi, _ci, col) in in_schema.payload_columns() {
+        let stride = col.size as usize;
         output.col_data_mut(pi).copy_from_slice(&batch.col_data(pi)[..n * stride]);
     }
 
@@ -461,27 +460,25 @@ pub(super) fn promote_col_to_pk(
     schema: &SchemaDescriptor,
 ) -> u128 {
     let tc = schema.columns[col_idx].type_code;
-    let pki = schema.pk_index as usize;
 
     // If reindexing by the PK column itself, read from the batch's PK.
-    if col_idx == pki {
+    if schema.is_pk_col(col_idx) {
         return batch.get_pk(row);
     }
 
+    let pi = schema.payload_idx(col_idx);
+
     match tc {
         type_code::U128 => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 16);
             u128::from_le_bytes(ptr[0..16].try_into().unwrap())
         }
         type_code::U64 | type_code::I64 => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let val = u64::from_le_bytes(ptr.try_into().unwrap());
             val as u128
         }
         type_code::STRING => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let struct_bytes = batch.get_col_ptr(row, pi, 16);
             let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
             if length == 0 {
@@ -500,25 +497,21 @@ pub(super) fn promote_col_to_pk(
             ((h_hi as u128) << 64) | (h as u128)
         }
         type_code::F64 => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let bits = u64::from_le_bytes(ptr.try_into().unwrap());
             bits as u128
         }
         type_code::F32 => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 4);
             let bits = u32::from_le_bytes(ptr.try_into().unwrap()) as u64;
             bits as u128
         }
         type_code::UUID => {
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 16);
             u128::from_le_bytes(ptr[0..16].try_into().unwrap())
         }
         _ => {
             // U8, U16, U32, I8, I16, I32 — use correct stride from type_size.
-            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let cs = crate::schema::type_size(tc) as usize;
             let ptr = batch.get_col_ptr(row, pi, cs);
             let mut buf = [0u8; 8];
@@ -655,7 +648,7 @@ mod tests {
             17, 2, 0, 1,    // CMP_GT r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index_single()));
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -672,7 +665,7 @@ mod tests {
         ];
         let prog = ExprProgram::new(code, 1, 0, vec![]);
         let schema = make_schema_u64_i64();
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index));
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, schema.pk_index_single()));
 
         let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         batch.consolidated = true;
@@ -786,7 +779,7 @@ mod tests {
         let empty_batch = Batch::empty(1, 16);
 
         let func = ScalarFuncKind::Plan(Plan::from_projection(
-            &[1], &[type_code::I64], schema.pk_index,
+            &[1], &[type_code::I64], schema.pk_index_single(),
         ));
         let out = op_map(&empty_batch, &func, &schema, &schema, -1);
         assert_eq!(out.count, 0);

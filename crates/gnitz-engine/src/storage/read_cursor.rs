@@ -539,18 +539,17 @@ impl ReadCursor {
         if !self.valid {
             return ptr::null();
         }
-        if col_idx == self.schema.pk_index as usize {
+        if self.schema.is_pk_col(col_idx) {
             return ptr::null();
         }
         let src = &self.sources[self.current_entry_idx];
         let row = self.current_row;
-        let pk_index = self.schema.pk_index as usize;
 
         match src {
             CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
             CursorSource::Batch(b) => {
                 // Map logical → payload index
-                let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
+                let payload_idx = self.schema.payload_idx(col_idx);
                 if payload_idx < b.num_payload_cols() {
                     b.get_col_ptr(row, payload_idx, col_size).as_ptr()
                 } else {
@@ -1083,7 +1082,7 @@ mod tests {
         let batch = make_batch(&[(42, 1, 99)]);
         let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
-        let pk_index = cursor.schema.pk_index as usize; // 0
+        let pk_index = cursor.schema.pk_index_single() as usize; // 0
         let ptr = cursor.col_ptr(pk_index, 16);
         assert!(ptr.is_null(), "col_ptr for PK index must return null");
     }

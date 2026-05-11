@@ -147,10 +147,10 @@ fn py_schema_to_rust(py: Python<'_>, s: &PySchema) -> PyResult<Schema> {
 
 fn rust_schema_to_py(py: Python<'_>, s: &Schema) -> PyResult<Py<PySchema>> {
     let py_cols: Vec<PyObject> = s.columns.iter().enumerate()
-        .map(|(i, c)| rust_col_to_py(py, c, i == s.pk_index))
+        .map(|(i, c)| rust_col_to_py(py, c, s.is_pk_col(i)))
         .collect::<PyResult<_>>()?;
     let list = PyList::new(py, py_cols)?;
-    Py::new(py, PySchema { columns: list.unbind(), pk_index: s.pk_index })
+    Py::new(py, PySchema { columns: list.unbind(), pk_index: s.pk_index_single() })
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ pub struct PyZSetBatch {
 /// Private helpers — shared between append_row, append_dict, extend_from_dicts.
 impl PyZSetBatch {
     fn append_pk(&mut self, pk_val: &Bound<'_, PyAny>) -> PyResult<()> {
-        let pk_idx = self.schema.pk_index;
+        let pk_idx = self.schema.pk_index_single();
         if pk_val.is_none() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Missing primary key column {:?}", self.schema.columns[pk_idx].name,
@@ -350,8 +350,7 @@ impl PyZSetBatch {
         weight: i64,
     ) -> PyResult<()> {
         let py = dict.py();
-        let pk_idx = self.schema.pk_index;
-        let n_cols = self.schema.columns.len();
+        let pk_idx = self.schema.pk_index_single();
 
         let pk_val = dict.get_item(self.col_keys[pk_idx].bind(py))?
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!(
@@ -361,9 +360,10 @@ impl PyZSetBatch {
         self.batch.weights.push(weight);
 
         let mut nulls: u64 = 0;
-        for ci in 0..n_cols {
-            if ci == pk_idx { continue; }
-            let payload_idx = if ci < pk_idx { ci } else { ci - 1 };
+        let payload_cols: Vec<(usize, usize)> = self.schema.payload_columns()
+            .map(|(pi, ci, _)| (pi, ci))
+            .collect();
+        for (payload_idx, ci) in payload_cols {
             match dict.get_item(self.col_keys[ci].bind(py))? {
                 Some(val) => self.append_column_value(ci, payload_idx, &val, &mut nulls)?,
                 None => self.append_null_column(ci, payload_idx, &mut nulls)?,
@@ -400,15 +400,16 @@ impl PyZSetBatch {
                 "Expected {} values, got {}", n_cols, values.len(),
             )));
         }
-        let pk_idx = self.schema.pk_index;
+        let pk_idx = self.schema.pk_index_single();
         let pk_item = values.get_item(pk_idx)?;
         self.append_pk(&pk_item)?;
         self.batch.weights.push(weight);
 
         let mut nulls: u64 = 0;
-        for ci in 0..n_cols {
-            if ci == pk_idx { continue; }
-            let payload_idx = if ci < pk_idx { ci } else { ci - 1 };
+        let payload_cols: Vec<(usize, usize)> = self.schema.payload_columns()
+            .map(|(pi, ci, _)| (pi, ci))
+            .collect();
+        for (payload_idx, ci) in payload_cols {
             let val = values.get_item(ci)?;
             self.append_column_value(ci, payload_idx, &val, &mut nulls)?;
         }
@@ -558,12 +559,10 @@ fn build_row_values_into(
     py: Python<'_>, schema: &Schema, batch: &ZSetBatch, row: usize,
     out: &mut Vec<PyObject>,
 ) -> PyResult<()> {
-    let pk_idx = schema.pk_index;
     let null_word = batch.nulls[row];
-    let mut payload_idx = 0usize;
 
     for ci in 0..schema.columns.len() {
-        if ci == pk_idx {
+        if schema.is_pk_col(ci) {
             let pk = batch.pks.get(row);
             match schema.columns[ci].type_code {
                 TypeCode::UUID => {
@@ -577,6 +576,7 @@ fn build_row_values_into(
                 }
             }
         } else {
+            let payload_idx = schema.payload_idx(ci);
             if null_word & (1u64 << payload_idx) != 0 {
                 out.push(py.None().into());
             } else {
@@ -605,7 +605,6 @@ fn build_row_values_into(
                     }
                 }
             }
-            payload_idx += 1;
         }
     }
     Ok(())
@@ -685,7 +684,7 @@ fn rust_batch_columns_to_py(
 ) -> PyResult<Py<PyList>> {
     let mut col_lists: Vec<PyObject> = Vec::with_capacity(schema.columns.len());
     for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index {
+        if schema.is_pk_col(ci) {
             col_lists.push(PyList::empty(py).into_any().unbind());
             continue;
         }
@@ -889,8 +888,7 @@ impl PyScanResult {
         }
 
         // Specialize by column kind to avoid per-row dispatch through read_row_value.
-        let pk_idx = data.schema.pk_index;
-        if col_idx == pk_idx {
+        if data.schema.is_pk_col(col_idx) {
             match data.schema.columns[col_idx].type_code {
                 TypeCode::UUID => {
                     let items: Vec<String> = (0..data.batch.pks.len())
@@ -909,7 +907,7 @@ impl PyScanResult {
             }
         }
 
-        let payload_idx = if col_idx < pk_idx { col_idx } else { col_idx - 1 };
+        let payload_idx = data.schema.payload_idx(col_idx);
         let nulls = &data.batch.nulls;
         let null_bit = 1u64 << payload_idx;
 

@@ -1113,10 +1113,10 @@ fn validate_schema_match(
             expected.num_columns, wire.num_columns,
         ));
     }
-    if wire.pk_index != expected.pk_index {
+    if wire.pk_indices() != expected.pk_indices() {
         return Err(format!(
-            "Schema mismatch: expected pk_index={}, got {}",
-            expected.pk_index, wire.pk_index,
+            "Schema mismatch: expected pk_indices={:?}, got {:?}",
+            expected.pk_indices(), wire.pk_indices(),
         ));
     }
     for i in 0..wire.num_columns as usize {

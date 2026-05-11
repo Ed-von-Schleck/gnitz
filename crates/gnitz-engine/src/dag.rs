@@ -538,7 +538,7 @@ impl DagEngine {
                     if let Some(gnitz_wire::OpNode::ScanTrace(tid)) = loaded.nodes.get(&src_nid) {
                         if *tid > 0 && shard_cols.len() == 1 {
                             if let Some(entry) = self.tables.get(&(*tid as i64)) {
-                                if shard_cols[0] == entry.schema.pk_index as i32 {
+                                if entry.schema.is_pk_col(shard_cols[0] as usize) {
                                     is_co_partitioned = true;
                                 }
                             }
@@ -1429,20 +1429,17 @@ impl DagEngine {
         src_schema: &SchemaDescriptor,
         idx_schema: &SchemaDescriptor,
     ) -> Batch {
-        let src_pk_index = src_schema.pk_index as usize;
         let source_col = source_col_idx as usize;
-        let is_pk_col = source_col == src_pk_index;
+        let is_pk_col = src_schema.is_pk_col(source_col);
 
         let src_payload_idx = if is_pk_col {
             usize::MAX
-        } else if source_col < src_pk_index {
-            source_col
         } else {
-            source_col - 1
+            src_schema.payload_idx(source_col)
         };
 
         let src_col_size = src_schema.columns[source_col].size as usize;
-        let out_payload_col_idx = if idx_schema.pk_index == 0 { 1usize } else { 0usize };
+        let out_payload_col_idx = if idx_schema.is_pk_col(0) { 1usize } else { 0usize };
         let out_payload_size = idx_schema.columns[out_payload_col_idx].size as usize;
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
@@ -1454,7 +1451,7 @@ impl DagEngine {
             // Null check
             if !is_pk_col {
                 let null_word = src.get_null_word(row);
-                let payload_bit = if source_col < src_pk_index { source_col } else { source_col - 1 };
+                let payload_bit = src_schema.payload_idx(source_col);
                 if (null_word >> payload_bit) & 1 != 0 {
                     continue; // NULL column → skip
                 }

@@ -243,7 +243,7 @@ fn append_row_inner(
     b.batch.weights.push(weight);
     b.batch.nulls.push(null_mask);
 
-    let pk_idx = b.schema.pk_index;
+    let pk_idx = b.schema.pk_index_single();
     let mut offset = 0usize;
 
     for (ci, col) in b.batch.columns.iter_mut().enumerate() {
@@ -463,7 +463,7 @@ pub extern "C" fn gnitz_create_table(
     let s = check_ptr!(schema, 0);
     match c.0.create_table(
         cstr(schema_name), cstr(table_name),
-        &s.0.columns, s.0.pk_index, unique_pk != 0,
+        &s.0.columns, s.0.pk_index_single(), unique_pk != 0,
     ) {
         Ok(id) => id, Err(e) => { set_error(e); 0 }
     }

@@ -141,8 +141,7 @@ impl MappedShard {
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
 
         let num_cols = schema.num_columns as usize;
-        let pk_index = schema.pk_index as usize;
-        let pk_stride = schema.columns[pk_index].size; // 8 for U64, 16 for U128/String
+        let pk_stride = schema.columns[schema.pk_index_single() as usize].size; // 8 for U64, 16 for U128/String
         let num_non_pk = num_cols - 1;
         let num_regions = 3 + num_non_pk + 1;
 
@@ -261,7 +260,7 @@ impl MappedShard {
         let mut col_regions = Vec::with_capacity(num_non_pk);
         let mut reg_idx = 3;
         for ci in 0..num_cols {
-            if ci == pk_index {
+            if schema.is_pk_col(ci) {
                 col_to_payload.push(usize::MAX);
             } else {
                 col_to_payload.push(col_regions.len());

@@ -299,7 +299,7 @@ impl CatalogEngine {
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
                 let owner_schema = entry.schema;
                 let source_col_type = owner_schema.columns[source_col_idx as usize].type_code;
-                let source_pk_type = owner_schema.columns[owner_schema.pk_index as usize].type_code;
+                let source_pk_type = owner_schema.columns[owner_schema.pk_index_single() as usize].type_code;
 
                 let index_key_type = get_index_key_type(source_col_type)?;
                 let idx_schema = make_index_schema(index_key_type, source_pk_type);

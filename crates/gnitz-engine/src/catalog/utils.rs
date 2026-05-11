@@ -94,7 +94,7 @@ impl BatchBuilder {
 
     fn physical_col_idx(&self) -> usize {
         // payload col index maps to schema col index (skip PK)
-        let pk_idx = self.schema.pk_index as usize;
+        let pk_idx = self.schema.pk_index_single() as usize;
         if self.curr_col < pk_idx {
             self.curr_col
         } else {

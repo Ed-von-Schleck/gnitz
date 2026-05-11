@@ -88,8 +88,8 @@ fn copy_column(
     out_schema: &SchemaDescriptor,
 ) {
     let n = in_batch.count;
-    let in_pki = in_schema.pk_index as usize;
-    let out_pki = out_schema.pk_index as usize;
+    let in_pki = in_schema.pk_index_single() as usize;
+    let out_pki = out_schema.pk_index_single() as usize;
 
     if cm.src_ci == in_pki {
         let out_ci = payload_to_col(cm.dst_payload, out_pki);
@@ -339,7 +339,7 @@ impl Plan {
             FilterKernel::PassAll => true,
             FilterKernel::Interpreted(prog) => {
                 let (val, is_null) =
-                    expr::eval_predicate(prog, batch, row, schema.pk_index);
+                    expr::eval_predicate(prog, batch, row, schema.pk_index_single());
                 !is_null && val != 0
             }
         }
@@ -408,7 +408,7 @@ impl Plan {
             return Batch::empty_with_schema(out_schema);
         }
 
-        let out_pki = out_schema.pk_index as usize;
+        let out_pki = out_schema.pk_index_single() as usize;
         let mut output = Batch::with_schema(*out_schema, n);
         output.count = n;
 

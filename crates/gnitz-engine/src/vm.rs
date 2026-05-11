@@ -1227,7 +1227,7 @@ mod tests {
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index),
+            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index_single()),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -1580,7 +1580,7 @@ mod tests {
 
         // MAP with Plan projection: reorder/select columns.
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_projection(&[2], &[type_code::I64], in_schema.pk_index),
+            crate::expr::Plan::from_projection(&[2], &[type_code::I64], in_schema.pk_index_single()),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -2163,7 +2163,7 @@ mod tests {
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index),
+            crate::expr::Plan::from_predicate(pred_prog, schema.pk_index_single()),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
@@ -2289,7 +2289,7 @@ mod tests {
         };
 
         let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(prog, schema.pk_index),
+            crate::expr::Plan::from_predicate(prog, schema.pk_index_single()),
         ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 

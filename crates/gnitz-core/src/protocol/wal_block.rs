@@ -137,12 +137,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     }
     let mut col_regions: Vec<ColRegion> = Vec::with_capacity(num_non_pk);
 
-    for (ci, col) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index {
-            continue;
-        }
-        let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
-
+    for (payload_idx, ci, col) in schema.payload_columns() {
         match col.type_code {
             TypeCode::String => {
                 let strings = match &batch.columns[ci] {
@@ -313,7 +308,7 @@ pub fn decode_wal_block(
             expected_num_regions, num_regions
         )));
     }
-    let pk_stride = schema.columns[schema.pk_index].type_code.wire_stride();
+    let pk_stride = schema.columns[schema.pk_index_single()].type_code.wire_stride();
 
     // Parse directory
     let dir_start = WAL_BLOCK_HEADER_SIZE;
@@ -387,12 +382,12 @@ pub fn decode_wal_block(
     let mut columns: Vec<ColData> = Vec::with_capacity(schema.columns.len());
 
     for (ci, col) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index {
+        if schema.is_pk_col(ci) {
             columns.push(ColData::Fixed(vec![]));
             continue;
         }
 
-        let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
+        let payload_idx = schema.payload_idx(ci);
         let (reg_off, reg_sz) = dir[region_idx];
         region_idx += 1;
 

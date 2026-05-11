@@ -41,7 +41,7 @@ fn test_pk_int_widened_to_u64_and_not_nullable() {
         p.execute("CREATE TABLE t1 (id INT PRIMARY KEY)").unwrap();
     }
     let s = schema_after_create(&mut client, &sn, "t1");
-    let pk = &s.columns[s.pk_index];
+    let pk = &s.columns[s.pk_index_single()];
     assert_eq!(pk.type_code, TypeCode::U64);
     assert_eq!(pk.is_nullable, false);
 }
@@ -55,7 +55,7 @@ fn test_pk_smallint_widened_to_u64() {
         p.execute("CREATE TABLE t2 (id SMALLINT PRIMARY KEY)").unwrap();
     }
     let s = schema_after_create(&mut client, &sn, "t2");
-    assert_eq!(s.columns[s.pk_index].type_code, TypeCode::U64);
+    assert_eq!(s.columns[s.pk_index_single()].type_code, TypeCode::U64);
 }
 
 // ── Missing or malformed PK clause ───────────────────────────────────
@@ -140,8 +140,8 @@ fn test_table_level_pk_uppercase_matches_lowercase() {
         p.execute("CREATE TABLE case_pk (id BIGINT, name TEXT, PRIMARY KEY (ID))").unwrap();
     }
     let s = schema_after_create(&mut client, &sn, "case_pk");
-    assert_eq!(s.columns[s.pk_index].name.to_lowercase(), "id");
-    assert_eq!(s.columns[s.pk_index].type_code, TypeCode::U64);
+    assert_eq!(s.columns[s.pk_index_single()].name.to_lowercase(), "id");
+    assert_eq!(s.columns[s.pk_index_single()].type_code, TypeCode::U64);
 }
 
 // ── FK column widening ───────────────────────────────────────────────

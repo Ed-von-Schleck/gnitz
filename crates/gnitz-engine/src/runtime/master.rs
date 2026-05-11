@@ -968,7 +968,6 @@ impl MasterDispatcher {
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(table_id)?;
         let n_circuits = cat.get_index_circuit_count(table_id);
-        let pki = schema.pk_index as usize;
 
         let mut out: Vec<UniqueIndexDesc> = Vec::new();
         for ci in 0..n_circuits {
@@ -977,13 +976,11 @@ impl MasterDispatcher {
             {
                 if !is_unique { continue; }
                 let source_col = col_idx as usize;
-                let is_pk_col = source_col == pki;
+                let is_pk_col = schema.is_pk_col(source_col);
                 let src_payload_idx = if is_pk_col {
                     usize::MAX
-                } else if source_col < pki {
-                    source_col
                 } else {
-                    source_col - 1
+                    schema.payload_idx(source_col)
                 };
                 let col_size = schema.columns[source_col].size as usize;
                 out.push(UniqueIndexDesc {
@@ -1084,7 +1081,7 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        let pki = source_schema.pk_index as usize;
+        let pki = source_schema.pk_index_single() as usize;
 
         // Build PK aggregation using pooled map; release borrow before any `.await`.
         let pk_lo_hi: Option<Vec<u128>> = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
@@ -1144,7 +1141,7 @@ impl MasterDispatcher {
                 (fk_col_idx, parent_table_id, col_type, parent_schema)
             };
 
-            let payload_col = if fk_col_idx < pki { fk_col_idx } else { fk_col_idx - 1 };
+            let payload_col = source_schema.payload_idx(fk_col_idx);
             let col_size = source_schema.columns[fk_col_idx].size as usize;
 
             let mut seen: HashSet<u128> = HashSet::new();
@@ -1167,7 +1164,7 @@ impl MasterDispatcher {
             let expected_count = keys.len();
             let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
             let check_batch = build_check_batch(&parent_schema, &keys, pooled);
-            let pk_col = &[parent_schema.pk_index];
+            let pk_col = &[parent_schema.pk_index_single()];
             let worker_indices = compute_worker_indices(
                 &check_batch, pk_col, &parent_schema, num_workers);
 
@@ -1231,7 +1228,7 @@ impl MasterDispatcher {
             if !keys.is_empty() {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
                 let check_batch = build_check_batch(&source_schema, &keys, pooled);
-                let pk_col = &[source_schema.pk_index];
+                let pk_col = &[source_schema.pk_index_single()];
                 let worker_indices = compute_worker_indices(
                     &check_batch, pk_col, &source_schema, num_workers);
                 p1_labels.push(P1Label::UpsertPkId);
@@ -1333,13 +1330,11 @@ impl MasterDispatcher {
             };
 
             let source_col = col_idx as usize;
-            let is_pk_col = source_col == pki;
+            let is_pk_col = source_schema.is_pk_col(source_col);
             let src_payload_idx = if is_pk_col {
                 usize::MAX
-            } else if source_col < pki {
-                source_col
             } else {
-                source_col - 1
+                source_schema.payload_idx(source_col)
             };
             let col_size = source_schema.columns[source_col].size as usize;
 
@@ -1571,7 +1566,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, schema_block, wire_safe, wire_row_stride) =
             self.cached_schema_block(target_id);
-        let pk_col = &[schema.pk_index];
+        let pk_col = &[schema.pk_index_single()];
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
@@ -1777,7 +1772,7 @@ fn format_uuid_hyphenated(v: u128) -> String {
 
 /// Render a PK u128 as a human-readable string for error messages.
 fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
-    let pk_col = schema.columns[schema.pk_index as usize];
+    let pk_col = schema.columns[schema.pk_index_single() as usize];
     match pk_col.type_code {
         crate::schema::type_code::U128 => format!("{}", pk),
         crate::schema::type_code::UUID => format_uuid_hyphenated(pk),
@@ -1817,9 +1812,8 @@ fn build_check_batch(
         batch.extend_pk(key);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
-        for c in 0..npc {
-            let col_size = schema.columns[if c < schema.pk_index as usize { c } else { c + 1 }].size as usize;
-            batch.fill_col_zero(c, col_size);
+        for (c, _ci, col) in schema.payload_columns() {
+            batch.fill_col_zero(c, col.size as usize);
         }
         batch.count += 1;
     }

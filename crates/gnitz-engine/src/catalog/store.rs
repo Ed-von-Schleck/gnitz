@@ -280,7 +280,7 @@ impl CatalogEngine {
         // Index payload column 0 is the source table PK.
         // Read it and resolve to the source row.
         let idx_schema = &ic.index_schema;
-        let payload_col_idx = if idx_schema.pk_index == 0 { 1usize } else { 0usize };
+        let payload_col_idx = if idx_schema.is_pk_col(0) { 1usize } else { 0usize };
         let pk_size = idx_schema.columns[payload_col_idx].size as usize;
         let ptr = cursor.cursor.col_ptr(payload_col_idx, pk_size);
         if ptr.is_null() { return Ok(None); }

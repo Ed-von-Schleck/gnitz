@@ -27,6 +27,51 @@ pub struct Schema {
     pub pk_index: usize,
 }
 
+impl Schema {
+    /// All PK column indices, in compound-key order. Today: always length 1.
+    #[inline]
+    pub fn pk_indices(&self) -> &[usize] {
+        std::slice::from_ref(&self.pk_index)
+    }
+
+    /// The single PK column index. Use only at boundaries that have not yet
+    /// been generalized (format encoders, catalog serialization, SQL parser
+    /// path, wire/client BatchAppender). Asserts length-1.
+    #[inline]
+    pub fn pk_index_single(&self) -> usize {
+        debug_assert_eq!(self.pk_indices().len(), 1, "compound PK not yet supported here");
+        self.pk_index
+    }
+
+    /// True iff column `ci` is the PK column.
+    #[inline]
+    pub fn is_pk_col(&self, ci: usize) -> bool {
+        self.pk_indices().iter().any(|&pk| ci == pk)
+    }
+
+    /// Map a logical column index to its dense payload index. Caller must
+    /// ensure `col_idx` is not the PK column.
+    #[inline]
+    pub fn payload_idx(&self, col_idx: usize) -> usize {
+        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be the pk_index");
+        let pk = self.pk_index_single();
+        if col_idx < pk { col_idx } else { col_idx - 1 }
+    }
+
+    /// Iterate over the non-PK ("payload") columns.
+    ///
+    /// Yields `(payload_idx, col_idx, &ColumnDef)`.
+    #[inline]
+    pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
+        let pk = self.pk_index_single();
+        let n = self.columns.len();
+        (0..n)
+            .filter(move |ci| *ci != pk)
+            .enumerate()
+            .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
+    }
+}
+
 /// Returns the META_SCHEMA singleton (4 columns: col_idx/U64 pk=0, type_code/U64, flags/U64, name/String).
 pub fn meta_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
@@ -116,7 +161,7 @@ pub struct ZSetBatch {
 impl ZSetBatch {
     pub fn new(schema: &Schema) -> Self {
         let columns = schema.columns.iter().enumerate().map(|(ci, col)| {
-            if ci == schema.pk_index {
+            if schema.is_pk_col(ci) {
                 ColData::Fixed(vec![])
             } else {
                 match col.type_code {
@@ -128,7 +173,7 @@ impl ZSetBatch {
             }
         }).collect();
         ZSetBatch {
-            pks: PkColumn::for_type(schema.columns[schema.pk_index].type_code),
+            pks: PkColumn::for_type(schema.columns[schema.pk_index_single()].type_code),
             weights: vec![],
             nulls: vec![],
             columns,
@@ -178,11 +223,11 @@ impl ZSetBatch {
                 self.columns.len(), schema.columns.len()
             ));
         }
-        for (ci, col) in self.columns.iter().enumerate() {
-            if ci == schema.pk_index { continue; }
+        for (_pi, ci, col_def) in schema.payload_columns() {
+            let col = &self.columns[ci];
             match col {
                 ColData::Fixed(bytes) => {
-                    let expected = n * schema.columns[ci].type_code.wire_stride();
+                    let expected = n * col_def.type_code.wire_stride();
                     if bytes.len() != expected {
                         return Err(format!(
                             "column {} Fixed byte length {} != expected {}",
@@ -352,8 +397,11 @@ impl<'a> BatchAppender<'a> {
     }
 
     /// Map the payload cursor to the actual schema column index, skipping PK.
+    /// Single-PK boundary: BatchAppender's wire/client API is single-PK and
+    /// stays so until the client surface is widened.
     fn col_index(&self) -> usize {
-        if self.cursor < self.schema.pk_index {
+        let pk = self.schema.pk_index_single();
+        if self.cursor < pk {
             self.cursor
         } else {
             self.cursor + 1

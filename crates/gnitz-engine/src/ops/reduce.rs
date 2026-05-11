@@ -37,7 +37,7 @@ fn fill_cleared_batch(
 }
 
 use super::util::{
-    write_string_from_batch, payload_idx,
+    write_string_from_batch,
     extract_group_key, extract_gc_u64,
 };
 
@@ -124,16 +124,16 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn new(desc: &AggDescriptor, pk_index: usize) -> Self {
+    fn new(desc: &AggDescriptor, schema: &SchemaDescriptor) -> Self {
         let col_idx = desc.col_idx as usize;
-        let is_pk_col = col_idx == pk_index;
+        let is_pk_col = schema.is_pk_col(col_idx);
         let tc = desc.col_type_code;
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
             col_type_code: tc,
-            pi: if is_pk_col { 0 } else { payload_idx(col_idx, pk_index) as u8 },
+            pi: if is_pk_col { 0 } else { schema.payload_idx(col_idx) as u8 },
             is_pk_col,
         }
     }
@@ -724,7 +724,7 @@ pub fn op_reduce(
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
     let num_out_cols = output_schema.num_columns as usize;
-    let in_pki = input_schema.pk_index as usize;
+    let in_pki = input_schema.pk_index_single() as usize;
 
 
     // Linearity check
@@ -775,7 +775,7 @@ pub fn op_reduce(
         Batch::with_schema(*fs, 32)
     });
 
-    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, in_pki)).collect();
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
@@ -1030,7 +1030,6 @@ fn emit_reduce_row(
     use_natural_pk: bool,
     num_aggs: usize,
 ) {
-    let out_pki = output_schema.pk_index as usize;
     let num_out_cols = output_schema.num_columns as usize;
 
     output.extend_pk(group_key);
@@ -1038,13 +1037,8 @@ fn emit_reduce_row(
 
     // Build null word and payload columns
     let mut null_word: u64 = 0;
-    let mut out_pi = 0usize;
 
-    for ci in 0..num_out_cols {
-        if ci == out_pki {
-            continue;
-        }
-        let col = &output_schema.columns[ci];
+    for (out_pi, ci, col) in output_schema.payload_columns() {
         let cs = col.size as usize;
 
         // Determine if this is an agg column or a group exemplar column
@@ -1098,7 +1092,6 @@ fn emit_reduce_row(
                 output.fill_col_zero(out_pi, cs);
             }
         }
-        out_pi += 1;
     }
 
     output.extend_null_bmp(&null_word.to_le_bytes());
@@ -1123,13 +1116,11 @@ fn emit_finalized_row(
     use crate::expr::OutputColKind;
 
     let raw_mb = raw_output.as_mem_batch();
-    let raw_pki = raw_schema.pk_index as usize;
-    let fin_pki = fin_schema.pk_index as usize;
     let null_word = raw_mb.get_null_word(raw_row);
 
     let out_cols = prog.classify_output_cols();
     let (emit_bufs, eval_emit_mask) = prog.eval_finalized(
-        &raw_mb, raw_row, raw_schema.pk_index, null_word,
+        &raw_mb, raw_row, raw_schema.pk_index_single(), null_word,
     );
 
     // Build the finalized output row
@@ -1137,19 +1128,14 @@ fn emit_finalized_row(
     fin_output.extend_weight(&weight.to_le_bytes());
 
     let mut fin_null_mask: u64 = 0;
-    let mut fpi = 0usize;
-    let mut out_col_idx = 0usize;
 
-    for ci in 0..fin_schema.num_columns as usize {
-        if ci == fin_pki {
-            continue;
-        }
-        let cs = fin_schema.columns[ci].size as usize;
+    for (fpi, _ci, col) in fin_schema.payload_columns() {
+        let cs = col.size as usize;
 
-        if out_col_idx < out_cols.len() {
-            match out_cols[out_col_idx] {
+        if fpi < out_cols.len() {
+            match out_cols[fpi] {
                 OutputColKind::CopyCol(src_col) => {
-                    if src_col == raw_pki {
+                    if raw_schema.is_pk_col(src_col) {
                         // Source is the PK column — slice from the full 16-byte
                         // little-endian PK so 8- and 16-byte column sizes both work.
                         let pk = raw_mb.get_pk(raw_row);
@@ -1186,9 +1172,6 @@ fn emit_finalized_row(
         } else {
             fin_output.fill_col_zero(fpi, cs);
         }
-
-        fpi += 1;
-        out_col_idx += 1;
     }
 
     fin_output.extend_null_bmp(&fin_null_mask.to_le_bytes());
@@ -1277,9 +1260,8 @@ pub fn op_gather_reduce(
     let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
     let _use_natural_pk_gather = num_group_cols == 0;
 
-    let gather_pki = partial_schema.pk_index as usize;
     let mut output = Batch::with_schema(*partial_schema, n);
-    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, gather_pki)).collect();
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, partial_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
     let smb_pks: Vec<u128> = (0..n).map(|i| smb.get_pk(i)).collect();
@@ -1904,7 +1886,7 @@ mod tests {
         );
         let mb = batch.as_mem_batch();
         let encoded: Vec<u64> = (0..vals.len()).map(|row| {
-            let pi = payload_idx(1, 0); // col_idx=1, pk_index=0
+            let pi = schema.payload_idx(1); // col_idx=1, pk_index=0
             let ptr = mb.get_col_ptr(row, pi, 4);
             let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
             // Replicate promote_agg_col_to_u64_ordered for F32 without for_max

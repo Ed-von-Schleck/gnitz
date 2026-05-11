@@ -45,6 +45,21 @@ impl SchemaDescriptor {
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
     }
 
+    /// All PK column indices, in compound-key order. Today: always length 1.
+    #[inline]
+    pub const fn pk_indices(&self) -> &[u32] {
+        std::slice::from_ref(&self.pk_index)
+    }
+
+    /// The single PK column index. Use only at boundaries that have not yet
+    /// been generalized (format encoders, catalog serialization, SQL parser
+    /// path, wire/client BatchAppender). Asserts length-1.
+    #[inline]
+    pub const fn pk_index_single(&self) -> u32 {
+        debug_assert!(self.pk_indices().len() == 1, "compound PK not yet supported here");
+        self.pk_index
+    }
+
     /// Iterate over the non-PK ("payload") columns.
     ///
     /// Yields `(payload_idx, col_idx, &SchemaColumn)` where:
@@ -56,7 +71,7 @@ impl SchemaDescriptor {
     /// pattern; keeps `pi` and `ci` in lockstep so they cannot desync.
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
-        let pk = self.pk_index as usize;
+        let pk = self.pk_index_single() as usize;
         let n = self.num_columns as usize;
         (0..n)
             .filter(move |ci| *ci != pk)
@@ -68,15 +83,15 @@ impl SchemaDescriptor {
     /// region + null-bitmap bit position). Caller must ensure `col_idx != pk_index`.
     #[inline]
     pub fn payload_idx(&self, col_idx: usize) -> usize {
-        debug_assert!(col_idx != self.pk_index as usize, "payload_idx: col_idx must not be the pk_index");
-        let pk = self.pk_index as usize;
+        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be the pk_index");
+        let pk = self.pk_index_single() as usize;
         if col_idx < pk { col_idx } else { col_idx - 1 }
     }
 
     /// True iff column `ci` is the PK column.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
-        ci == self.pk_index as usize
+        self.pk_indices().iter().any(|&pk| ci == pk as usize)
     }
 }
 
@@ -88,7 +103,7 @@ pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        if self.num_columns != other.num_columns || self.pk_index != other.pk_index {
+        if self.num_columns != other.num_columns || self.pk_indices() != other.pk_indices() {
             return false;
         }
         // Compare only the active columns; _pad is always 0 (SchemaColumn::new enforces it).

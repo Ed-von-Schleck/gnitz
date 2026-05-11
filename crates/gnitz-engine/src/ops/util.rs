@@ -129,20 +129,8 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 }
 
 // ---------------------------------------------------------------------------
-// Payload index and group key helpers (shared by reduce, exchange)
+// Group key helpers (shared by reduce, exchange)
 // ---------------------------------------------------------------------------
-
-/// Map logical column index to payload column index (skipping the PK column).
-///
-/// Caller must ensure `col_idx != pk_index`. For `col_idx == pk_index == 0`
-/// this would underflow; for the general `col_idx == pk_index` case it
-/// silently returns the wrong slot. Callers handle the PK separately
-/// (e.g. via `SchemaDescriptor::is_pk_col`).
-#[inline]
-pub(super) fn payload_idx(col_idx: usize, pk_index: usize) -> usize {
-    debug_assert!(col_idx != pk_index, "payload_idx: col_idx must not be the pk_index");
-    if col_idx < pk_index { col_idx } else { col_idx - 1 }
-}
 
 /// Murmur3 64-bit finalizer.
 #[inline]

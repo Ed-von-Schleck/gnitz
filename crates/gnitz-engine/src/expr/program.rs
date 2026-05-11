@@ -152,7 +152,7 @@ impl ExprProgram {
     /// Returns true if no opcode in this program can produce a NULL result.
     /// Used by the batch evaluator to skip null-bit tracking entirely.
     pub fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
-        let pki = schema.pk_index as usize;
+        let pki = schema.pk_index_single() as usize;
         for instr in self.code.chunks_exact(4) {
             let op = instr[0];
             let a1 = instr[2] as usize;
