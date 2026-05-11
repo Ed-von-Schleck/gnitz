@@ -53,7 +53,7 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
             return Ordering::Greater;
         }
 
-        let col_size = col.size as usize;
+        let col_size = col.size() as usize;
 
         let ord = match col.type_code {
             TYPE_STRING | TYPE_BLOB => {
@@ -130,7 +130,7 @@ pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
         "compare_rows_int_nonnull called on schema with non-signed-integer or nullable columns",
     );
     for (payload_col, _ci, col) in schema.payload_columns() {
-        let col_size = col.size as usize;
+        let col_size = col.size() as usize;
         let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
         let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
         let ord = read_signed(raw_a, col_size).cmp(&read_signed(raw_b, col_size));
@@ -183,11 +183,14 @@ mod tests {
 
     /// Build a 3-column schema: [PK:U64, nullable I64, F64].
     fn make_schema_nullable_float() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::I64, 1);
-        columns[2] = SchemaColumn::new(type_code::F64, 0);
-        SchemaDescriptor { num_columns: 3, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Build a TestBatch with [nullable I64, F64] payload columns.
@@ -276,10 +279,13 @@ mod tests {
     /// Test signed integer comparison: negative < positive via sign extension.
     #[test]
     fn test_compare_rows_signed_int() {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::I64, 0);
-        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
 
         let mut col0 = Vec::new();
         col0.extend_from_slice(&(-42i64).to_le_bytes());
@@ -292,10 +298,13 @@ mod tests {
     /// Test U128 column comparison.
     #[test]
     fn test_compare_rows_u128() {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::U128, 0);
-        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U128, 0),
+            ],
+            &[0],
+        );
 
         let mut col0 = Vec::new();
         // Row 0: u128 = 1 (lo=1, hi=0)
@@ -399,10 +408,13 @@ mod tests {
     /// Test STRING column comparison via compare_rows (short strings).
     #[test]
     fn test_compare_rows_string() {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::STRING, 0);
-        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
 
         let mut col0 = Vec::new();
         // "abc" (len=3)
@@ -432,11 +444,8 @@ mod tests {
         for (i, &(tc, nullable)) in cols.iter().enumerate() {
             columns[i + 1] = SchemaColumn::new(tc, nullable);
         }
-        SchemaDescriptor {
-            num_columns: 1 + cols.len() as u32,
-            pk_index: 0,
-            columns,
-        }
+        let n = 1 + cols.len();
+        SchemaDescriptor::new(&columns[..n], &[0])
     }
 
     /// Verify the fast path agrees with the generic `compare_rows` for I8/I16/I32/I64.

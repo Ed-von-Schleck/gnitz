@@ -98,7 +98,7 @@ pub struct CompileOutput {
 
 /// Read an i64 value from a cursor's current row at the given column index.
 pub fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
-    let col_size = schema.columns[col_idx].size as usize;
+    let col_size = schema.columns[col_idx].size() as usize;
     let ptr = cursor.col_ptr(col_idx, col_size);
     if ptr.is_null() {
         return 0;
@@ -478,7 +478,7 @@ fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> Annotation 
 // ---------------------------------------------------------------------------
 
 fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() {
+    if a.num_columns() != b.num_columns() || a.pk_indices() != b.pk_indices() {
         return false;
     }
     for i in 0..a.num_columns() {
@@ -605,7 +605,7 @@ fn merge_schemas_for_join_impl(
     let total = left.num_columns() + right.num_payload_cols();
     assert!(total <= crate::schema::MAX_COLUMNS,
         "join output schema exceeds {}-column limit: {} + payload({}) = {}",
-        crate::schema::MAX_COLUMNS, left.num_columns, right.num_payload_cols(), total);
+        crate::schema::MAX_COLUMNS, left.num_columns(), right.num_payload_cols(), total);
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut n = 0;
     cols[n] = left.columns[left.pk_index_single() as usize];
@@ -1606,7 +1606,7 @@ fn build_plan(
     if output_node_id.is_none() && sink_reg >= 0 {
         let sink_schema = &reg_schemas[sink_reg as usize];
         let out_schema = &loaded.out_schema;
-        if sink_schema.num_columns > 0 && sink_schema.num_columns != out_schema.num_columns {
+        if sink_schema.num_columns() > 0 && sink_schema.num_columns() != out_schema.num_columns() {
             return None;
         }
     }
@@ -1845,7 +1845,7 @@ mod tests {
             &[0],
         );
         let joined = merge_schemas_for_join(&left, &right);
-        assert_eq!(joined.num_columns, 3); // PK + left_I64 + right_STRING
+        assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
         assert_eq!(joined.columns[0].type_code, type_code::U128);
         assert_eq!(joined.columns[1].type_code, type_code::I64);
         assert_eq!(joined.columns[2].type_code, type_code::STRING);
@@ -1868,7 +1868,7 @@ mod tests {
             &[0],
         );
         let joined = merge_schemas_for_join_outer(&left, &right);
-        assert_eq!(joined.num_columns, 3);
+        assert_eq!(joined.num_columns(), 3);
         assert_eq!(joined.columns[2].nullable, 1); // right side nullable
     }
 
@@ -1902,7 +1902,7 @@ mod tests {
             ],
             &[0],
         );
-        let mut b = SchemaDescriptor::new(
+        let b = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U128, 0),
                 SchemaColumn::new(type_code::I64, 0),
@@ -1911,8 +1911,14 @@ mod tests {
         );
         assert!(schemas_physically_identical(&a, &b));
 
-        b.columns[1].type_code = type_code::STRING;
-        assert!(!schemas_physically_identical(&a, &b));
+        let c = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
+        assert!(!schemas_physically_identical(&a, &c));
     }
 
     #[test]
@@ -1928,7 +1934,7 @@ mod tests {
         let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
-        assert_eq!(out.num_columns, 2);
+        assert_eq!(out.num_columns(), 2);
         assert_eq!(out.columns[0].type_code, type_code::U64);
         assert_eq!(out.columns[1].type_code, type_code::I64);
     }
@@ -1946,7 +1952,7 @@ mod tests {
         let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] }];
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
-        assert_eq!(out.num_columns, 3);
+        assert_eq!(out.num_columns(), 3);
         assert_eq!(out.columns[0].type_code, type_code::U128);
         assert_eq!(out.columns[1].type_code, type_code::STRING);
         assert_eq!(out.columns[2].type_code, type_code::I64);

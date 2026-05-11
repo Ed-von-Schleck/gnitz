@@ -141,7 +141,7 @@ impl MappedShard {
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
 
         let num_cols = schema.num_columns();
-        let pk_stride = schema.columns[schema.pk_index_single() as usize].size; // 8 for U64, 16 for U128/String
+        let pk_stride = schema.columns[schema.pk_index_single() as usize].size(); // 8 for U64, 16 for U128/String
         let num_non_pk = num_cols - 1;
         let num_regions = 3 + num_non_pk + 1;
 
@@ -273,7 +273,7 @@ impl MappedShard {
         for (pi, _ci, col) in schema.payload_columns() {
             match &col_regions[pi] {
                 RegionView::TwoValue { .. } => return Err(StorageError::InvalidShard),
-                RegionView::Raw { size, .. } if *size < count * col.size as usize => {
+                RegionView::Raw { size, .. } if *size < count * col.size() as usize => {
                     return Err(StorageError::InvalidShard);
                 }
                 _ => {}
@@ -535,7 +535,7 @@ impl MappedShard {
         expand_into(&self.null_bmp, 8,  &mut data[offsets[2] as usize..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
-            let stride = col.size as usize;
+            let stride = col.size() as usize;
             let off = offsets[3 + pi] as usize;
             let sz = row_count * stride;
             expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
@@ -593,7 +593,7 @@ impl super::columnar::ColumnarSource for MappedShard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     /// Build a v6 shard via build_shard_image (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
@@ -649,10 +649,13 @@ mod tests {
     }
 
     fn test_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn { type_code: 8, size: 8, nullable: 0, _pad: 0 }; // U64 PK
-        columns[1] = SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 }; // I64
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     #[test]

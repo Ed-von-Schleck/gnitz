@@ -65,7 +65,7 @@ impl CatalogEngine {
 
                 // Promote column value to PK key
                 let col_type = schema.columns[col_idx].type_code;
-                let col_size = schema.columns[col_idx].size as usize;
+                let col_size = schema.columns[col_idx].size() as usize;
                 let col_data = batch.col_data(payload_col);
                 let fk_key = promote_to_index_key(col_data, row * col_size, col_size, col_type);
 
@@ -153,7 +153,7 @@ impl CatalogEngine {
 
             let idx_table = ic.table_mut();
 
-            let col_size = schema.columns[source_col_idx].size as usize;
+            let col_size = schema.columns[source_col_idx].size() as usize;
 
             // Track seen keys for batch-internal duplicate detection
             let mut seen: HashSet<u128> = HashSet::with_capacity(batch.count);
@@ -195,7 +195,7 @@ impl CatalogEngine {
                             // Index schema: PK = index_key (col 0), payload[0] = source_pk.
                             let idx_schema = &ic.index_schema;
                             let pk_payload_col = 0usize;
-                            let pk_size = idx_schema.columns[if idx_schema.is_pk_col(0) { 1 } else { 0 }].size as usize;
+                            let pk_size = idx_schema.columns[if idx_schema.is_pk_col(0) { 1 } else { 0 }].size() as usize;
                             // None means the found_source cursor is in an unexpected state;
                             // treat as a conflict (fail-safe) rather than silently permitting.
                             let src_pk = idx_table.read_found_u128(pk_payload_col, pk_size)

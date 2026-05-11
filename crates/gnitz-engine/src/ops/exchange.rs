@@ -36,7 +36,7 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
     }
     let pi = schema.payload_idx(col_idx);
     let col = &schema.columns[col_idx];
-    let col_size = col.size as usize;
+    let col_size = col.size() as usize;
     if col.type_code == crate::schema::type_code::STRING {
         let struct_bytes = mb.get_col_ptr(row, pi, 16);
         let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
@@ -532,84 +532,36 @@ pub fn op_multi_scatter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code, MAX_COLUMNS};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::I64,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_schema_u128_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U128,
-            size: 16,
-            nullable: 0,
-            _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::I64,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_schema_u64_string() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::STRING,
-            size: 16,
-            nullable: 0,
-            _pad: 0,
-        };
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {

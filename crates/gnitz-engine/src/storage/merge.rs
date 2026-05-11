@@ -328,7 +328,7 @@ impl<'a> DirectWriter<'a> {
 
         let schema = self.schema;
         for (payload_idx, _ci, col) in schema.payload_columns() {
-            let col_size = col.size as usize;
+            let col_size = col.size() as usize;
             let is_null = (null_word >> payload_idx) & 1 != 0;
 
             if is_null {
@@ -614,7 +614,7 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
 
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             // Blob relocation is sequential per-row; no way to batch.
             for (out, &idx) in indices.iter().enumerate() {
@@ -766,7 +766,7 @@ pub fn scatter_multi_source(
     // One pass per column keeps destination writes sequential.
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = sources[si as usize].as_ref().unwrap();
@@ -889,7 +889,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
 
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
@@ -985,25 +985,16 @@ fn gather_unified_col<const N: usize>(
 mod tests {
     use super::*;
     use super::super::batch::Batch;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
 
     fn make_schema_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; MAX_COLUMNS];
-        // col 0 = PK (U128, size 16)
-        columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        // col 1 = I64 value column
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`

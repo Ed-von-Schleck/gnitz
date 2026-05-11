@@ -84,25 +84,25 @@ pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024;          // 256 KB
 // ---------------------------------------------------------------------------
 
 pub(super) const fn u64_col() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 }
+    SchemaColumn::new(type_code::U64, 0)
 }
 pub(super) const fn u64_col_nullable() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::U64, size: 8, nullable: 1, _pad: 0 }
+    SchemaColumn::new(type_code::U64, 1)
 }
 pub(super) const fn u128_col() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 }
+    SchemaColumn::new(type_code::U128, 0)
 }
 pub(super) const fn str_col() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 }
+    SchemaColumn::new(type_code::STRING, 0)
 }
 pub(super) const fn str_col_nullable() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0 }
+    SchemaColumn::new(type_code::STRING, 1)
 }
 pub(super) const fn blob_col_nullable() -> SchemaColumn {
-    SchemaColumn { type_code: type_code::BLOB, size: 16, nullable: 1, _pad: 0 }
+    SchemaColumn::new(type_code::BLOB, 1)
 }
 pub(super) const fn zero_col() -> SchemaColumn {
-    SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }
+    SchemaColumn::new(0, 0)
 }
 
 pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescriptor {

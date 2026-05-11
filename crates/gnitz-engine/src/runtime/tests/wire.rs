@@ -74,7 +74,7 @@ fn test_encode_decode_roundtrip_with_schema() {
     let decoded = decode_wire(&wire).unwrap();
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
-    assert_eq!(s.num_columns, 2);
+    assert_eq!(s.num_columns(), 2);
     assert_eq!(s.pk_indices(), &[0]);
     assert_eq!(s.columns[0].type_code, type_code::U64);
     assert_eq!(s.columns[1].type_code, type_code::U64);
@@ -177,12 +177,12 @@ fn test_schema_roundtrip_with_names() {
     let names: Vec<&[u8]> = vec![b"pk_col", b"int_col", b"name_col"];
     let batch = schema_to_batch(&sd, &names);
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
-    assert_eq!(sd2.num_columns, 3);
+    assert_eq!(sd2.num_columns(), 3);
     assert_eq!(sd2.pk_indices(), &[0]);
     assert_eq!(sd2.columns[0].type_code, type_code::U64);
     assert_eq!(sd2.columns[1].type_code, type_code::U64);
     assert_eq!(sd2.columns[2].type_code, type_code::STRING);
-    assert_eq!(sd2.columns[2].size, 16);
+    assert_eq!(sd2.columns[2].size(), 16);
     assert_eq!(names2[0], b"pk_col");
     assert_eq!(names2[1], b"int_col");
     assert_eq!(names2[2], b"name_col");
@@ -211,7 +211,7 @@ fn test_schema_roundtrip_long_names() {
     let names: Vec<&[u8]> = vec![b"pk", long_name];
     let batch = schema_to_batch(&sd, &names);
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
-    assert_eq!(sd2.num_columns, 2);
+    assert_eq!(sd2.num_columns(), 2);
     assert_eq!(names2[0], b"pk");
     assert_eq!(names2[1], long_name);
 }
@@ -377,7 +377,7 @@ fn prebuilt_schema_block_no_col_names_roundtrips() {
     );
     let decoded = decode_wire(&buf).unwrap();
     assert!(decoded.schema.is_some(), "schema block must be present");
-    assert_eq!(decoded.schema.unwrap().num_columns, sd.num_columns);
+    assert_eq!(decoded.schema.unwrap().num_columns(), sd.num_columns());
 }
 
 #[test]

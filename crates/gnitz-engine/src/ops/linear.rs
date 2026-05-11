@@ -386,7 +386,7 @@ pub fn op_null_extend(
     }
 
     // Build a merged schema for the output batch.
-    let mut out_columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
+    let mut out_columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut ci_out = 0;
     for ci in 0..in_schema.num_columns() {
         out_columns[ci_out] = in_schema.columns[ci];
@@ -396,11 +396,7 @@ pub fn op_null_extend(
         out_columns[ci_out] = *col;
         ci_out += 1;
     }
-    let out_schema = SchemaDescriptor {
-        num_columns: ci_out as u32,
-        pk_index: in_schema.pk_index_single(),
-        columns: out_columns,
-    };
+    let out_schema = SchemaDescriptor::new(&out_columns[..ci_out], &[in_schema.pk_index_single()]);
 
     let mut output = Batch::with_schema(out_schema, n);
     output.count = n;
@@ -411,7 +407,7 @@ pub fn op_null_extend(
 
     // Copy input payload columns
     for (pi, _ci, col) in in_schema.payload_columns() {
-        let stride = col.size as usize;
+        let stride = col.size() as usize;
         output.col_data_mut(pi).copy_from_slice(&batch.col_data(pi)[..n * stride]);
     }
 
@@ -532,16 +528,13 @@ mod tests {
     use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch(
@@ -698,17 +691,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_schema_pk_u64_payload_u32() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::U32, 0);
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_schema_pk_u64_payload_uuid() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::UUID, 0);
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::UUID, 0),
+            ],
+            &[0],
+        )
     }
 
     fn build_batch_u32_payload(schema: &SchemaDescriptor, rows: &[(u64, u32)]) -> Batch {

@@ -265,7 +265,7 @@ fn test_restart_full() {
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
         let schema = engine.get_schema(tid).unwrap();
-        assert_eq!(schema.num_columns, 2);
+        assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, 0, true).unwrap();
         assert!(new_tid > first_tid, "Allocator sequence recovery failed: {} <= {}", new_tid, first_tid);

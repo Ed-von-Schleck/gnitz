@@ -67,7 +67,7 @@ pub(super) fn compare_cursor_payload_to_batch_row(
     };
 
     for (pi, ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
 
         let cursor_null = (cursor.current_null_word >> pi) & 1 != 0;
         let batch_null = (batch.get_null_word(row) >> pi) & 1 != 0;
@@ -213,7 +213,7 @@ pub(super) fn extract_group_key(
                 let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
                 mix64(lo ^ mix64(hi))
             } else {
-                let cs = schema.columns[c_idx].size as usize;
+                let cs = schema.columns[c_idx].size() as usize;
                 let ptr = mb.get_col_ptr(row, pi, cs);
                 let mut buf = [0u8; 8];
                 buf[..cs].copy_from_slice(ptr);

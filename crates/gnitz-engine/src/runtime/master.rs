@@ -982,7 +982,7 @@ impl MasterDispatcher {
                 } else {
                     schema.payload_idx(source_col)
                 };
-                let col_size = schema.columns[source_col].size as usize;
+                let col_size = schema.columns[source_col].size() as usize;
                 out.push(UniqueIndexDesc {
                     col_idx, type_code, is_pk_col, src_payload_idx, col_size,
                 });
@@ -1142,7 +1142,7 @@ impl MasterDispatcher {
             };
 
             let payload_col = source_schema.payload_idx(fk_col_idx);
-            let col_size = source_schema.columns[fk_col_idx].size as usize;
+            let col_size = source_schema.columns[fk_col_idx].size() as usize;
 
             let mut seen: HashSet<u128> = HashSet::new();
             let mut keys: Vec<u128> = Vec::new();
@@ -1336,7 +1336,7 @@ impl MasterDispatcher {
             } else {
                 source_schema.payload_idx(source_col)
             };
-            let col_size = source_schema.columns[source_col].size as usize;
+            let col_size = source_schema.columns[source_col].size() as usize;
 
             let mut upsert_keys: Vec<(u128, u128)> = Vec::new();
             let mut check_keys: Vec<u128> = Vec::new();
@@ -1813,7 +1813,7 @@ fn build_check_batch(
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         for (c, _ci, col) in schema.payload_columns() {
-            batch.fill_col_zero(c, col.size as usize);
+            batch.fill_col_zero(c, col.size() as usize);
         }
         batch.count += 1;
     }
@@ -1847,17 +1847,18 @@ mod unique_filter_tests {
 
     fn u64_schema() -> SchemaDescriptor {
         // Single U64 PK column.
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
+        SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
     }
 
     fn two_col_schema() -> SchemaDescriptor {
         // PK U64 at index 0, payload U64 at index 1.
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::U64, 1);
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 1),
+            ],
+            &[0],
+        )
     }
 
     fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
@@ -1977,9 +1978,7 @@ mod unique_filter_tests {
         // A UUID with non-zero high 64 bits. The lower 64 bits alone would be
         // misread as a different (truncated) value.
         let uuid: u128 = 0x550e8400_e29b_41d4_a716_446655440000u128;
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::UUID, 0);
-        let schema = SchemaDescriptor { num_columns: 1, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
 
         let s = format_pk_value(uuid, &schema);
         // Must not be the lower-64 truncation (11975073520896 or similar).
@@ -1994,9 +1993,7 @@ mod unique_filter_tests {
         // Two UUIDs that differ only in the high 64 bits must produce different strings.
         let uuid_a: u128 = 0x11111111_0000_0000_0000_000000000001u128;
         let uuid_b: u128 = 0x22222222_0000_0000_0000_000000000001u128;
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::UUID, 0);
-        let schema = SchemaDescriptor { num_columns: 1, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
 
         let sa = format_pk_value(uuid_a, &schema);
         let sb = format_pk_value(uuid_b, &schema);

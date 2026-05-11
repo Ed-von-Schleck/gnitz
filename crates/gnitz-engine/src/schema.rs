@@ -19,22 +19,29 @@ pub use gnitz_wire::MAX_COLUMNS;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchemaColumn {
     pub type_code: u8,
-    pub size: u8,
+    size: u8,
     pub nullable: u8,
-    pub _pad: u8,
+    _pad: u8,
 }
 
 impl SchemaColumn {
     pub const fn new(type_code: u8, nullable: u8) -> Self {
         SchemaColumn { type_code, size: type_size(type_code), nullable, _pad: 0 }
     }
+
+    /// On-disk byte width of one cell of this column. Derived from `type_code`
+    /// via `SchemaColumn::new` and never written independently.
+    #[inline]
+    pub const fn size(&self) -> u8 {
+        self.size
+    }
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SchemaDescriptor {
-    pub num_columns: u32,
-    pub pk_index: u32,
+    num_columns: u32,
+    pk_index: u32,
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
@@ -64,9 +71,7 @@ impl SchemaDescriptor {
     }
 
     pub const fn minimal_u64() -> Self {
-        let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
+        Self::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
     }
 
     /// Number of logical columns in this schema (PK + payload).
@@ -142,7 +147,7 @@ pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        if self.num_columns != other.num_columns || self.pk_indices() != other.pk_indices() {
+        if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
             return false;
         }
         // Compare only the active columns; _pad is always 0 (SchemaColumn::new enforces it).
@@ -154,11 +159,7 @@ impl Eq for SchemaDescriptor {}
 
 impl Default for SchemaDescriptor {
     fn default() -> Self {
-        SchemaDescriptor {
-            num_columns: 0,
-            pk_index: 0,
-            columns: [SchemaColumn::new(0, 0); MAX_COLUMNS],
-        }
+        Self::new(&[], &[])
     }
 }
 
@@ -447,8 +448,8 @@ mod tests {
         // → 8 (default arm). Locked in so future regressions in the trailing
         // representation are caught.
         assert_eq!(s.columns[3].type_code, 0);
-        assert_eq!(s.columns[3].size, 8);
-        assert_eq!(s.columns[MAX_COLUMNS - 1].size, 8);
+        assert_eq!(s.columns[3].size(), 8);
+        assert_eq!(s.columns[MAX_COLUMNS - 1].size(), 8);
 
         // payload_columns() walks non-PK indices in logical order.
         let payload: Vec<usize> = s.payload_columns().map(|(_, ci, _)| ci).collect();
@@ -468,9 +469,14 @@ mod tests {
     #[test]
     fn test_payload_idx_around_pk() {
         // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1.
-        let mut s = SchemaDescriptor::minimal_u64();
-        s.num_columns = 3;
-        s.pk_index = 1;
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1],
+        );
         assert_eq!(s.payload_idx(0), 0);
         assert_eq!(s.payload_idx(2), 1);
     }
@@ -478,27 +484,47 @@ mod tests {
     #[test]
     fn test_num_payload_cols() {
         // 2-column schema → 1 payload column.
-        let mut s = SchemaDescriptor::minimal_u64();
-        s.num_columns = 2;
-        s.pk_index = 0;
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        );
         assert_eq!(s.num_payload_cols(), 1);
 
         // pk_index not at column 0 → same answer (num_columns - pk_indices().len()).
-        s.num_columns = 4;
-        s.pk_index = 2;
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[2],
+        );
         assert_eq!(s.num_payload_cols(), 3);
     }
 
     #[test]
     fn test_num_columns() {
-        let mut s = SchemaDescriptor::minimal_u64();
-        s.num_columns = 1;
+        let s = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         assert_eq!(s.num_columns(), 1);
 
-        s.num_columns = 3;
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        );
         assert_eq!(s.num_columns(), 3);
 
-        s.num_columns = 8;
+        let s = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0); 8],
+            &[0],
+        );
         assert_eq!(s.num_columns(), 8);
     }
 }

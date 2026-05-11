@@ -89,7 +89,7 @@ fn fill_payload_strides(
 ) -> usize {
     let mut idx = start;
     for (_, _, col) in schema.payload_columns() {
-        strides[idx] = col.size;
+        strides[idx] = col.size();
         idx += 1;
     }
     idx
@@ -97,7 +97,7 @@ fn fill_payload_strides(
 
 /// Physical byte stride for the PK region: 8 for U64 PK, 16 for U128 PK.
 pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
-    schema.columns[schema.pk_index_single() as usize].size
+    schema.columns[schema.pk_index_single() as usize].size()
 }
 
 /// Build a strides array from a SchemaDescriptor.
@@ -128,7 +128,7 @@ pub(crate) fn carve_writer_slices<'a>(
     let npc = schema.num_payload_cols();
     let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(npc);
     for (_pi, _ci, col) in schema.payload_columns() {
-        let col_sz = rows * col.size as usize;
+        let col_sz = rows * col.size() as usize;
         let (c, new_rest) = rest.split_at_mut(col_sz);
         col_slices.push(c);
         rest = new_rest;
@@ -964,7 +964,7 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         for (pi, _ci, col_desc) in schema.payload_columns() {
-            let cs = col_desc.size as usize;
+            let cs = col_desc.size() as usize;
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
                 self.fill_col_zero(pi, cs);
@@ -1078,7 +1078,7 @@ impl Batch {
         let schema = self.schema.expect("append_row_simple requires schema");
 
         for (pi, _ci, col) in schema.payload_columns() {
-            let col_size = col.size as usize;
+            let col_size = col.size() as usize;
             let is_null = (null_word >> pi) & 1 != 0;
 
             if is_null {
@@ -1203,7 +1203,7 @@ impl Batch {
 
         let src_blob = source.blob_slice();
         for (pi, _ci, col) in schema.payload_columns() {
-            let cs = col.size as usize;
+            let cs = col.size() as usize;
             let is_null = (null_word >> pi) & 1 != 0;
 
             if is_null {
@@ -1524,7 +1524,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     offsets[REG_NULL_BMP] = validate(REG_NULL_BMP, 8)?;
 
     for (pi, _ci, col) in schema.payload_columns() {
-        let stride = col.size as usize;
+        let stride = col.size() as usize;
         offsets[REG_PAYLOAD_START + pi] = validate(REG_PAYLOAD_START + pi, stride)?;
     }
 
@@ -1701,7 +1701,7 @@ pub fn encode_multi_to_wire(
         for (pi, _ci, col) in schema.payload_columns() {
             let is_string_like = col.type_code == crate::schema::type_code::STRING
                 || col.type_code == crate::schema::type_code::BLOB;
-            if is_string_like && col.size == 16 {
+            if is_string_like && col.size() == 16 {
                 is_string[REG_PAYLOAD_START + pi] = true;
             }
         }
@@ -1786,10 +1786,13 @@ mod tests {
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn single_col_u128_pk_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U128, 0);
-        columns[1] = SchemaColumn::new(type_code::I64, 0);
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     #[test]
@@ -1837,10 +1840,13 @@ mod tests {
     }
 
     fn minimal_u64_with_i64_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn::new(type_code::I64, 0);
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     #[test]

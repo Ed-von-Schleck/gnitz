@@ -413,7 +413,7 @@ fn write_left_payload(
     left_schema: &SchemaDescriptor,
 ) {
     for (pi, _ci, col) in left_schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         let is_null = (left_null >> pi) & 1 != 0;
         if is_null {
             output.fill_col_zero(pi, cs);
@@ -454,7 +454,7 @@ fn write_join_row(
     // Right payload columns (from cursor public API)
     let right_blob = right_cursor.blob_ptr();
     for (rpi, ci, col) in right_schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
@@ -515,7 +515,7 @@ fn write_join_row_null_right(
 
     // Right payload columns: all zeros (null)
     for (rpi, _ci, col) in right_schema.payload_columns() {
-        output.fill_col_zero(left_npc + rpi, col.size as usize);
+        output.fill_col_zero(left_npc + rpi, col.size() as usize);
     }
 
     output.count += 1;
@@ -816,7 +816,7 @@ fn write_join_row_from_batches(
 
     // Right payload columns (from right MemBatch)
     for (rpi, _ci, col) in right_schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
@@ -838,33 +838,27 @@ fn write_join_row_from_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD, MAX_COLUMNS};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
     use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_schema_u64_string() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch(

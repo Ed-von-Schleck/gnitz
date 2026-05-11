@@ -73,7 +73,7 @@ impl BatchBuilder {
 
     /// Put a NULL value for the current payload column.
     pub(crate) fn put_null(&mut self) {
-        let col_size = self.schema.columns[self.physical_col_idx()].size as usize;
+        let col_size = self.schema.columns[self.physical_col_idx()].size() as usize;
         self.batch.fill_col_zero(self.curr_col, col_size);
         self.curr_null_word |= 1u64 << self.curr_col;
         self.curr_col += 1;
@@ -155,18 +155,8 @@ pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
 }
 
 pub(crate) fn make_index_schema(index_key_type: u8, source_pk_type: u8) -> SchemaDescriptor {
-    let key_col = SchemaColumn {
-        type_code: index_key_type,
-        size: crate::schema::type_size(index_key_type),
-        nullable: 0,
-        _pad: 0,
-    };
-    let pk_col = SchemaColumn {
-        type_code: source_pk_type,
-        size: crate::schema::type_size(source_pk_type),
-        nullable: 0,
-        _pad: 0,
-    };
+    let key_col = SchemaColumn::new(index_key_type, 0);
+    let pk_col = SchemaColumn::new(source_pk_type, 0);
     make_schema(&[key_col, pk_col], 0)
 }
 

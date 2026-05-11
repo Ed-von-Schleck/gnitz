@@ -294,16 +294,13 @@ mod tests {
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        // Col 0: PK (U64)
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        // Col 1: payload (I64)
-        columns[1] = SchemaColumn::new(type_code::I64, 0);
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Build a consolidated Batch from (pk, weight, payload) triples.
@@ -656,7 +653,7 @@ mod tests {
         for (i, &(tc, nullable)) in cols.iter().enumerate() {
             columns[i] = SchemaColumn::new(tc, nullable);
         }
-        SchemaDescriptor { num_columns: cols.len() as u32, pk_index, columns }
+        SchemaDescriptor::new(&columns[..cols.len()], &[pk_index])
     }
 
     fn decode_str(batch: &Batch, row: usize, payload_col: usize) -> Vec<u8> {
@@ -1118,10 +1115,13 @@ mod tests {
         use crate::schema::{BlobCache, SchemaColumn, type_code};
 
         // Schema: col0 = PK (U64), col1 = STRING
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
-        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
 
         // Build a source Batch with a STRING column containing a bad blob offset.
         let mut src = Batch::with_schema(schema, 1);

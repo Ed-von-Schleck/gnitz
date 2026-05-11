@@ -3,26 +3,13 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, MAX_COLUMNS};
 use crate::storage::Batch;
 use crate::expr;
 
-fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn {
-        type_code: 0,
-        size: 0,
-        nullable: 0,
-        _pad: 0,
-    }; MAX_COLUMNS];
-    for (i, &(tc, sz)) in col_types.iter().enumerate() {
-        columns[i] = SchemaColumn {
-            type_code: tc,
-            size: sz,
-            nullable: if i == pk_index as usize { 0 } else { 1 },
-            _pad: 0,
-        };
+fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
+    let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    for (i, &tc) in col_types.iter().enumerate() {
+        let nullable = if i == pk_index as usize { 0 } else { 1 };
+        columns[i] = SchemaColumn::new(tc, nullable);
     }
-    SchemaDescriptor {
-        num_columns: num_cols,
-        pk_index,
-        columns,
-    }
+    SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
 }
 
 fn make_int_batch(
@@ -46,8 +33,8 @@ fn make_int_batch(
 
 #[test]
 fn test_projection_batch() {
-    let in_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
-    let out_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let in_schema = make_schema(0, &[8, 9, 9]);
+    let out_schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&in_schema, &[
         (1, 1, 0, &[10, 20]),
         (2, 1, 0, &[30, 40]),
@@ -69,8 +56,8 @@ fn test_projection_batch() {
 
 #[test]
 fn test_map_copy_and_emit() {
-    let in_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
-    let out_schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let in_schema = make_schema(0, &[8, 9, 9]);
+    let out_schema = make_schema(0, &[8, 9, 9]);
 
     let batch = make_int_batch(&in_schema, &[
         (1, 1, 0, &[10, 20]),
@@ -97,7 +84,7 @@ fn test_map_copy_and_emit() {
 
 #[test]
 fn test_empty_batch() {
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty(1, 16);
 
     let func = ScalarFuncKind::Plan(Plan::from_projection(
@@ -110,7 +97,7 @@ fn test_empty_batch() {
 #[test]
 fn test_filter_batch_matches_per_row() {
     use crate::ops::op_filter;
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
 
     // 20 rows so n >= THRESHOLD=16 and the batch evaluator path is taken.
     let batch = make_int_batch(&schema, &[

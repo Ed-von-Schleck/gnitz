@@ -180,7 +180,7 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     (0..schema.num_columns()).all(|ci| {
         let c = &schema.columns[ci];
-        c.type_code != type_code::STRING && c.size % 8 == 0
+        c.type_code != type_code::STRING && c.size() % 8 == 0
     })
 }
 
@@ -194,10 +194,10 @@ pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
     if !safe {
         return (false, 0);
     }
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size as u32;
+    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as u32;
     let mut stride = pk_stride + 8 + 8;
     for (_pi, _ci, col) in schema.payload_columns() {
-        stride += col.size as u32;
+        stride += col.size() as u32;
     }
     (true, stride)
 }
@@ -455,7 +455,7 @@ fn write_scattered_data_block(
     table_id: u32,
     data_slot: &mut [u8],
 ) {
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size as usize;
+    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as usize;
     let npc = schema.num_payload_cols();
     let num_regions = 3 + npc + 1;
     let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
@@ -482,7 +482,7 @@ fn write_scattered_data_block(
     write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 20, (8 * count) as u32);
     pos += 8 * count;
     for (pi, _ci, col) in schema.payload_columns() {
-        let stride = col.size as usize;
+        let stride = col.size() as usize;
         let dir_off = gnitz_wire::WAL_HEADER_SIZE + (3 + pi) * 8;
         write_u32_le(data_slot, dir_off,     pos as u32);
         write_u32_le(data_slot, dir_off + 4, (stride * count) as u32);

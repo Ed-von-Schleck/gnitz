@@ -639,7 +639,7 @@ impl RegisterFile {
     pub fn new(metas: &[RegisterMeta]) -> Self {
         let mut registers = Vec::with_capacity(metas.len());
         for m in metas {
-            let batch = if m.schema.num_columns > 0 {
+            let batch = if m.schema.num_columns() > 0 {
                 Batch::with_schema(m.schema, if m.kind == RegisterKind::Delta { 16 } else { 0 })
             } else {
                 Batch::empty(0, 16)
@@ -690,7 +690,7 @@ impl RegisterFile {
     /// Clear delta batches without refreshing cursors.
     pub fn clear_deltas(&mut self) {
         for reg in &mut self.registers {
-            if reg.kind == RegisterKind::Delta && reg.schema.num_columns > 0 {
+            if reg.kind == RegisterKind::Delta && reg.schema.num_columns() > 0 {
                 reg.batch.clear();
             }
         }
@@ -734,7 +734,7 @@ pub fn execute_epoch(
         // that's what the plan's Change 3 was designed to catch.
         if let Some(ref s) = input_batch.schema {
             debug_assert_eq!(
-                s.num_columns, program.reg_meta[input_reg as usize].schema.num_columns,
+                s.num_columns(), program.reg_meta[input_reg as usize].schema.num_columns(),
                 "VM register {} schema/batch column-count mismatch", input_reg,
             );
         }
@@ -1145,23 +1145,20 @@ mod tests {
 
     // ── Test helpers ─────────────────────────────────────────────────────
 
-    fn make_schema(col_types: &[(u8, u8)]) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; crate::schema::MAX_COLUMNS];
+    fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
+        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         // Column 0 is always the U128 PK
-        columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        for (i, &(tc, sz)) in col_types.iter().enumerate() {
-            columns[i + 1] = SchemaColumn { type_code: tc, size: sz, nullable: 0, _pad: 0 };
+        columns[0] = SchemaColumn::new(type_code::U128, 0);
+        for (i, &tc) in col_types.iter().enumerate() {
+            columns[i + 1] = SchemaColumn::new(tc, 0);
         }
-        SchemaDescriptor {
-            num_columns: (col_types.len() + 1) as u32,
-            pk_index: 0,
-            columns,
-        }
+        let n = col_types.len() + 1;
+        SchemaDescriptor::new(&columns[..n], &[0])
     }
 
     /// Create a schema with one I64 payload column.
     fn schema_1i64() -> SchemaDescriptor {
-        make_schema(&[(type_code::I64, 8)])
+        make_schema(&[type_code::I64])
     }
 
     /// Create a batch from (pk, weight, col0_i64) tuples.
@@ -1572,11 +1569,8 @@ mod tests {
     #[test]
     fn test_map_operator() {
         // MAP with Plan projection: reorder/select columns.
-        let in_schema = make_schema(&[
-            (type_code::I64, 8),
-            (type_code::I64, 8),
-        ]);
-        let out_schema = make_schema(&[(type_code::I64, 8)]);
+        let in_schema = make_schema(&[type_code::I64, type_code::I64]);
+        let out_schema = make_schema(&[type_code::I64]);
 
         // MAP with Plan projection: reorder/select columns.
         let func = Box::new(ScalarFuncKind::Plan(
@@ -1686,10 +1680,7 @@ mod tests {
         // Output: pk=10 w=1*1=1, merged payload
         let left_schema = schema_1i64();
         let right_schema = schema_1i64();
-        let join_schema = make_schema(&[
-            (type_code::I64, 8),
-            (type_code::I64, 8),
-        ]);
+        let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_test");
@@ -1739,10 +1730,7 @@ mod tests {
         // JoinDT: 1 delta row × N trace rows → N output rows.
         let left_schema = schema_1i64();
         let right_schema = schema_1i64();
-        let join_schema = make_schema(&[
-            (type_code::I64, 8),
-            (type_code::I64, 8),
-        ]);
+        let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_multi_test");
@@ -1945,15 +1933,12 @@ mod tests {
         // REDUCE with SUM aggregation over a group column.
         // Uses real tables for trace_out and trace_in.
         let in_schema = make_schema(&[
-            (type_code::I64, 8),  // group col (payload col 0)
-            (type_code::I64, 8),  // agg col (payload col 1)
+            type_code::I64,  // group col (payload col 0)
+            type_code::I64,  // agg col (payload col 1)
         ]);
 
         // Output schema: [U128 PK, I64 group_col, I64 sum_col]
-        let out_schema = make_schema(&[
-            (type_code::I64, 8),
-            (type_code::I64, 8),
-        ]);
+        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -2119,10 +2104,7 @@ mod tests {
         // JoinDD: join two delta batches. Use filter(null) to copy input into
         // both reg 1 and reg 2, then join them (self-join on same PK).
         let schema = schema_1i64();
-        let join_schema = make_schema(&[
-            (type_code::I64, 8),
-            (type_code::I64, 8),
-        ]);
+        let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let mut builder = ProgramBuilder::new(4);
         // Copy input (reg 0) into reg 1 and reg 2 via null filters
@@ -2331,8 +2313,8 @@ mod tests {
 
         // Output: pk(U64), count(I64), sum(I64) — GROUP BY pk → natural PK
         let out_schema = make_schema(&[
-            (type_code::I64, 8),  // count
-            (type_code::I64, 8),  // sum
+            type_code::I64,  // count
+            type_code::I64,  // sum
         ]);
 
         let dir = tempfile::tempdir().unwrap();
@@ -2504,7 +2486,7 @@ mod tests {
         // right schema: same shape (one I64 payload col)
         let right_schema = schema_1i64();
         // outer join output: left col + right col (right cols will be null)
-        let out_schema = make_schema(&[(type_code::I64, 8), (type_code::I64, 8)]);
+        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let mut builder = ProgramBuilder::new(3);
         // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
@@ -2534,8 +2516,8 @@ mod tests {
     /// value, not just that output is non-empty.
     #[test]
     fn test_reduce_sum_value() {
-        let in_schema = make_schema(&[(type_code::I64, 8)]);
-        let out_schema = make_schema(&[(type_code::I64, 8)]);
+        let in_schema = make_schema(&[type_code::I64]);
+        let out_schema = make_schema(&[type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
 

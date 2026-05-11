@@ -2,26 +2,13 @@ use super::super::program::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
-fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn {
-        type_code: 0,
-        size: 0,
-        nullable: 0,
-        _pad: 0,
-    }; MAX_COLUMNS];
-    for (i, &(tc, sz)) in col_types.iter().enumerate() {
-        columns[i] = SchemaColumn {
-            type_code: tc,
-            size: sz,
-            nullable: if i == pk_index as usize { 0 } else { 1 },
-            _pad: 0,
-        };
+fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
+    let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    for (i, &tc) in col_types.iter().enumerate() {
+        let nullable = if i == pk_index as usize { 0 } else { 1 };
+        columns[i] = SchemaColumn::new(tc, nullable);
     }
-    SchemaDescriptor {
-        num_columns: num_cols,
-        pk_index,
-        columns,
-    }
+    SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
 }
 
 fn make_int_batch(
@@ -47,7 +34,7 @@ fn make_int_batch(
 #[test]
 fn test_int_comparisons() {
     // Schema: 2 columns, col0=PK(U64), col1=I64
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
     let mb = batch.as_mem_batch();
 
@@ -85,7 +72,7 @@ fn test_int_comparisons() {
 
 #[test]
 fn test_int_arithmetic() {
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 3])]);
     let mb = batch.as_mem_batch();
 
@@ -131,7 +118,7 @@ fn test_int_arithmetic() {
 
 #[test]
 fn test_float_arithmetic_and_comparison() {
-    let schema = make_schema(3, 0, &[(8, 8), (10, 8), (10, 8)]);
+    let schema = make_schema(0, &[8, 10, 10]);
     // Store floats as i64 bits
     let a_bits = float_to_bits(3.14);
     let b_bits = float_to_bits(2.0);
@@ -172,7 +159,7 @@ fn test_float_arithmetic_and_comparison() {
 
 #[test]
 fn test_null_propagation() {
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     // col1 is null (bit 0 set), col2 is not null
     let batch = make_int_batch(&schema, &[(1, 1, 1, &[0, 5])]);
     let mb = batch.as_mem_batch();
@@ -190,7 +177,7 @@ fn test_null_propagation() {
 
 #[test]
 fn test_is_null_is_not_null() {
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     // col1 is null (bit 0 set), col2 is not null
     let batch = make_int_batch(&schema, &[(1, 1, 1, &[0, 5])]);
     let mb = batch.as_mem_batch();
@@ -218,7 +205,7 @@ fn test_is_null_is_not_null() {
 
 #[test]
 fn test_boolean_combinators() {
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[1])]);
     let mb = batch.as_mem_batch();
 
@@ -254,7 +241,7 @@ fn test_boolean_combinators() {
 
 #[test]
 fn test_load_const_encoding() {
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[0])]);
     let mb = batch.as_mem_batch();
 
@@ -277,7 +264,7 @@ fn test_load_const_encoding() {
 
 #[test]
 fn test_string_eq_const() {
-    let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+    let schema = make_schema(0, &[8, 11]);
     // Build a batch with a short string "hello"
     let mut batch = Batch::with_schema(schema, 1);
     batch.count = 0;
@@ -309,7 +296,7 @@ fn test_string_eq_const() {
 
 #[test]
 fn test_int_to_float() {
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
     let mb = batch.as_mem_batch();
 
@@ -324,7 +311,7 @@ fn test_int_to_float() {
 
 #[test]
 fn test_emit_with_targets() {
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 20])]);
     let mb = batch.as_mem_batch();
 
@@ -355,7 +342,7 @@ fn test_emit_with_targets() {
 #[test]
 fn test_div_by_zero_null_semantics() {
     // Schema: pk(u64), col1(i64), col2(i64)
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     // Row: pk=1, col1=10, col2=3; null_word=0 (no nulls)
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 3])]);
     let mb = batch.as_mem_batch();
@@ -438,7 +425,7 @@ fn test_div_by_zero_null_semantics() {
 
 #[test]
 fn test_cmp_ge_lt_le() {
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
     let mb = batch.as_mem_batch();
 
@@ -505,7 +492,7 @@ fn test_cmp_ge_lt_le() {
 
 #[test]
 fn test_fcmp_eq_ne_lt_le() {
-    let schema = make_schema(3, 0, &[(8, 8), (10, 8), (10, 8)]);
+    let schema = make_schema(0, &[8, 10, 10]);
     let a_bits = float_to_bits(3.14);
     let b_bits = float_to_bits(2.0);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[a_bits, b_bits])]);
@@ -574,7 +561,7 @@ fn test_fcmp_eq_ne_lt_le() {
 
 #[test]
 fn test_string_lt_le_const() {
-    let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+    let schema = make_schema(0, &[8, 11]);
     let mut batch = Batch::with_schema(schema, 1);
     batch.count = 0;
     batch.extend_pk(1u128);
@@ -615,7 +602,7 @@ fn test_string_lt_le_const() {
 #[test]
 fn test_string_col_eq_col() {
     // Schema: pk(U64), str_a(STRING), str_b(STRING)
-    let schema = make_schema(3, 0, &[(8, 8), (11, 16), (11, 16)]);
+    let schema = make_schema(0, &[8, 11, 11]);
     let mut batch = Batch::with_schema(schema, 2);
     batch.count = 0;
 
@@ -660,7 +647,7 @@ fn test_string_col_eq_col() {
 #[test]
 fn test_complex_predicate() {
     // Schema: pk(U64), a(I64), b(I64), c(I64)
-    let schema = make_schema(4, 0, &[(8, 8), (9, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9, 9]);
     // Row: a=15, b=50, c=42
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[15, 50, 42])]);
     let mb = batch.as_mem_batch();
@@ -696,7 +683,7 @@ fn test_complex_predicate() {
 #[test]
 fn test_emit_null_opcode() {
     // Schema: pk(U64), val(I64)
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10])]);
     let mb = batch.as_mem_batch();
 
@@ -724,7 +711,7 @@ fn test_emit_null_opcode() {
 #[test]
 fn test_zero_regs_program() {
     // ExprProgram with num_regs=0 (pure COPY_COL) must not crash.
-    let schema = make_schema(2, 0, &[(8, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[100])]);
     let mb = batch.as_mem_batch();
 
@@ -740,7 +727,7 @@ fn test_zero_regs_program() {
 #[test]
 fn test_resolve_column_indices_pk_at_col0() {
     // Schema: pk=col0(U64), col1=I64, col2=I64
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&schema, &[(42, 1, 0, &[10, 20])]);
     let mb = batch.as_mem_batch();
 
@@ -775,7 +762,7 @@ fn test_resolve_column_indices_pk_at_col0() {
 fn test_resolve_column_indices_pk_at_middle() {
     // Schema: col0=I64, pk=col1(U64), col2=I64
     // Physical payload layout: [col0=payload0, col2=payload1]
-    let schema = make_schema(3, 1, &[(9, 8), (8, 8), (9, 8)]);
+    let schema = make_schema(1, &[9, 8, 9]);
     let batch = make_int_batch(&schema, &[(99, 1, 0, &[5, 7])]);
     let mb = batch.as_mem_batch();
 
@@ -835,7 +822,7 @@ fn make_single_string_batch(schema: SchemaDescriptor, s: &[u8]) -> Batch {
 #[test]
 fn test_string_prefix_ordering() {
     // Schema: pk=col0(U64), col1=STRING
-    let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+    let schema = make_schema(0, &[8, 11]);
 
     // (col_string, const_string, expected_lt)
     let cases: &[(&[u8], &[u8], bool)] = &[
@@ -877,7 +864,7 @@ fn test_string_prefix_ordering() {
 #[test]
 fn test_bool_and_or_three_valued_logic() {
     // Schema: pk(U64), col1(I64), col2(I64) — both nullable
-    let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+    let schema = make_schema(0, &[8, 9, 9]);
     // null_word bits: bit 0 = col1 null, bit 1 = col2 null
     let batch = make_int_batch(&schema, &[
         (1, 1, 0, &[1, 0]), // row0: T, F
@@ -940,7 +927,7 @@ fn test_bool_and_or_three_valued_logic() {
 #[test]
 fn test_string_prefix_le_ordering() {
     // Spot-check LE (≤) to cover the equality boundary
-    let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
+    let schema = make_schema(0, &[8, 11]);
 
     let cases: &[(&[u8], &[u8], bool)] = &[
         (b"abc",  b"abc",  true),  // equal → le

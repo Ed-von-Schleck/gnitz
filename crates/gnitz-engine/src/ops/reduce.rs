@@ -904,7 +904,7 @@ pub fn op_reduce(
                         let gc_u64_val = if input_schema.is_pk_col(gi_ci) {
                             mb.get_pk(group_start_idx) as u64
                         } else {
-                            let cs = input_schema.columns[gi_ci].size as usize;
+                            let cs = input_schema.columns[gi_ci].size() as usize;
                             let pi = input_schema.payload_idx(gi_ci);
                             let ptr = mb.get_col_ptr(group_start_idx, pi, cs);
                             let mut buf = [0u8; 8];
@@ -1039,7 +1039,7 @@ fn emit_reduce_row(
     let mut null_word: u64 = 0;
 
     for (out_pi, ci, col) in output_schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
 
         // Determine if this is an agg column or a group exemplar column
         let agg_base = num_out_cols - num_aggs;
@@ -1130,7 +1130,7 @@ fn emit_finalized_row(
     let mut fin_null_mask: u64 = 0;
 
     for (fpi, _ci, col) in fin_schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
 
         if fpi < out_cols.len() {
             match out_cols[fpi] {
@@ -1366,7 +1366,7 @@ fn emit_gather_row(
     let in_null = input_mb.get_null_word(exemplar_row);
 
     for (out_pi, ci, col) in schema.payload_columns() {
-        let cs = col.size as usize;
+        let cs = col.size() as usize;
 
         if ci >= agg_base {
             let agg_idx = ci - agg_base;
@@ -1414,16 +1414,13 @@ mod tests {
     use crate::storage::{Batch, ConsolidatedBatch};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch(
@@ -1446,16 +1443,13 @@ mod tests {
     }
 
     fn make_schema_u64_f32() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: type_code::F32, size: 4, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F32, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> ConsolidatedBatch {
@@ -1895,17 +1889,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_schema_with_type(tc: u8) -> SchemaDescriptor {
-        let cs = crate::schema::type_size(tc);
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; crate::schema::MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: tc, size: cs, nullable: 0, _pad: 0,
-        };
-        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(tc, 0),
+            ],
+            &[0],
+        )
     }
 
     fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> ConsolidatedBatch {

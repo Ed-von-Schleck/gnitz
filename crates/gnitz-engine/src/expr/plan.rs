@@ -93,7 +93,7 @@ fn copy_column(
 
     if cm.src_ci == in_pki {
         let out_ci = payload_to_col(cm.dst_payload, out_pki);
-        let stride = out_schema.columns[out_ci].size as usize;
+        let stride = out_schema.columns[out_ci].size() as usize;
         let dst = output.col_data_mut(cm.dst_payload);
         for row in 0..n {
             let pk = in_batch.get_pk(row);
@@ -102,7 +102,7 @@ fn copy_column(
         }
     } else if cm.type_code == type_code::STRING {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
-        let stride = in_schema.columns[cm.src_ci].size as usize;
+        let stride = in_schema.columns[cm.src_ci].size() as usize;
         let src_col = in_batch.col_data(in_pi);
         output.blob.reserve(in_batch.blob.len());
         for row in 0..n {
@@ -114,13 +114,13 @@ fn copy_column(
         }
     } else {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
-        let stride = in_schema.columns[cm.src_ci].size as usize;
+        let stride = in_schema.columns[cm.src_ci].size() as usize;
         debug_assert!(
             n * stride <= in_batch.col_data(in_pi).len(),
             "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
              (batch count={}, schema cols={}, payload cols={})",
             n, stride, n * stride, in_pi, in_batch.col_data(in_pi).len(),
-            in_batch.count, in_schema.num_columns, in_batch.num_payload_cols(),
+            in_batch.count, in_schema.num_columns(), in_batch.num_payload_cols(),
         );
         output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
@@ -455,7 +455,7 @@ impl Plan {
                 // EMIT: write each computed register to its output column
                 for (&out_payload, &reg) in emit_payloads.iter().zip(emit_regs.iter()) {
                     let out_ci = payload_to_col(out_payload, out_pki);
-                    let stride = out_schema.columns[out_ci].size as usize;
+                    let stride = out_schema.columns[out_ci].size() as usize;
                     let dst8 = output.col_data_mut(out_payload);
                     let base_r = reg * MORSEL;
                     let base_null_r = reg * NULL_WORDS_PER_REG;

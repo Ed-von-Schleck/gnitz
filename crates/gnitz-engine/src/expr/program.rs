@@ -315,7 +315,7 @@ impl ExprProgram {
         self.payload_col_sizes.clear();
         self.payload_col_type_codes.clear();
         for (_, _, col) in schema.payload_columns() {
-            self.payload_col_sizes.push(col.size);
+            self.payload_col_sizes.push(col.size());
             self.payload_col_type_codes.push(col.type_code);
         }
     }

@@ -156,7 +156,7 @@ impl CursorSource {
                     let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi] as usize;
                     cols[pi] = ColPtr {
                         base: unsafe { data_ptr.add(off) },
-                        stride: col.size as usize,
+                        stride: col.size() as usize,
                     };
                 }
                 UnifiedSource {
@@ -205,7 +205,7 @@ impl CursorSource {
                 };
 
                 for (pi, _ci, col) in schema.payload_columns() {
-                    let cs = col.size as usize;
+                    let cs = col.size() as usize;
                     cols[pi] = match &s.col_regions[pi] {
                         RegionView::Raw { offset, .. } => {
                             ColPtr { base: unsafe { data_ptr.add(*offset) }, stride: cs }
@@ -585,7 +585,7 @@ impl ReadCursor {
             unsafe { std::slice::from_raw_parts(blob_ptr, self.blob_len()) }
         };
         for (payload_idx, ci, col) in self.schema.payload_columns() {
-            let col_size = col.size as usize;
+            let col_size = col.size() as usize;
             let ptr = self.col_ptr(ci, col_size);
             if !ptr.is_null() {
                 let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
@@ -876,32 +876,16 @@ pub fn create_cursor_from_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_schema_i64() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; MAX_COLUMNS];
-        columns[0] = SchemaColumn {
-            type_code: crate::schema::type_code::U128,
-            size: 16,
-            nullable: 0,
-            _pad: 0,
-        };
-        columns[1] = SchemaColumn {
-            type_code: crate::schema::type_code::I64,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns,
-        }
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
     }
 
     /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their

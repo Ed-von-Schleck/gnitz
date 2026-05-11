@@ -1107,10 +1107,10 @@ async fn send_alloc(
 fn validate_schema_match(
     wire: &SchemaDescriptor, expected: &SchemaDescriptor,
 ) -> Result<(), String> {
-    if wire.num_columns != expected.num_columns {
+    if wire.num_columns() != expected.num_columns() {
         return Err(format!(
             "Schema mismatch: expected {} columns, got {}",
-            expected.num_columns, wire.num_columns,
+            expected.num_columns(), wire.num_columns(),
         ));
     }
     if wire.pk_indices() != expected.pk_indices() {
@@ -1159,22 +1159,31 @@ mod tests {
 
     #[test]
     fn validate_schema_match_rejects_column_count_mismatch() {
-        let mut wire = two_col_schema(0);
-        wire.num_columns = 1;
+        let wire = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
     }
 
     #[test]
     fn validate_schema_match_rejects_pk_index_mismatch() {
-        let mut wire = two_col_schema(0);
-        wire.pk_index = 1;
+        let wire = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[1],
+        );
         assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
     }
 
     #[test]
     fn validate_schema_match_rejects_type_code_mismatch() {
-        let mut wire = two_col_schema(0);
-        wire.columns[1].type_code = type_code::F64;
+        let wire = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
+            &[0],
+        );
         assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
     }
 

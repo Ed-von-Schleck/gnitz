@@ -37,7 +37,7 @@ const WAL_OFF_NUM_REGIONS: usize = 32;
 // Internal schema descriptors for the wire control and schema blocks
 // ---------------------------------------------------------------------------
 
-const ZERO_COL: SchemaColumn = SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 };
+const ZERO_COL: SchemaColumn = SchemaColumn::new(0, 0);
 const U64_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
 const STR_COL: SchemaColumn = SchemaColumn::new(type_code::STRING, 0);
 
@@ -45,7 +45,7 @@ pub(crate) const META_SCHEMA_DESC: SchemaDescriptor =
     SchemaDescriptor::new(&[U64_COL, U64_COL, U64_COL, STR_COL], &[0]);
 
 const _: () = assert!(
-    META_SCHEMA_DESC.num_columns == 4,
+    META_SCHEMA_DESC.num_columns() == 4,
     "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
 );
 
@@ -74,7 +74,7 @@ fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
 }
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
-    let pk_stride = schema.columns[schema.pk_index_single() as usize].size as usize;
+    let pk_stride = schema.columns[schema.pk_index_single() as usize].size() as usize;
     let num_payload = schema.num_payload_cols();
     // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
@@ -83,7 +83,7 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
     sizes[1] = (8 * row_count) as u32; // weight
     sizes[2] = (8 * row_count) as u32; // null_bmp
     for (pi, _ci, col) in schema.payload_columns() {
-        sizes[3 + pi] = (col.size as usize * row_count) as u32;
+        sizes[3 + pi] = (col.size() as usize * row_count) as u32;
     }
     sizes[3 + num_payload] = blob_size as u32;
     wal_block_size(num_regions, &sizes[..num_regions])
@@ -246,14 +246,14 @@ const fn ctrl_region_offset(target_region: usize) -> usize {
     let pk_idx = schema.pk_index_single() as usize;
 
     let mut sizes = [0usize; NUM_REGIONS];
-    sizes[0] = schema.columns[pk_idx].size as usize;          // pk
+    sizes[0] = schema.columns[pk_idx].size() as usize;          // pk
     sizes[1] = 8;                                             // weight
     sizes[2] = 8;                                             // null_bmp
     let mut pi = 0usize;
     let mut ci = 0usize;
     while ci < schema.num_columns() {
         if ci == pk_idx { ci += 1; continue; }
-        sizes[3 + pi] = schema.columns[ci].size as usize;
+        sizes[3 + pi] = schema.columns[ci].size() as usize;
         pi += 1;
         ci += 1;
     }
@@ -767,7 +767,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
 }
 
 fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns != b.num_columns || a.pk_indices() != b.pk_indices() { return false; }
+    if a.num_columns() != b.num_columns() || a.pk_indices() != b.pk_indices() { return false; }
     for i in 0..a.num_columns() {
         if a.columns[i].type_code != b.columns[i].type_code
             || a.columns[i].nullable != b.columns[i].nullable

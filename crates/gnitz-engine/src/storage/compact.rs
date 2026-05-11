@@ -297,7 +297,7 @@ mod tests {
             batch.extend_null_bmp(&0u64.to_le_bytes());
 
             for (pi, _ci, col) in schema.payload_columns() {
-                let cs = col.size as usize;
+                let cs = col.size() as usize;
                 let mut val_bytes = vec![0u8; cs];
                 let copy_len = cs.min(8);
                 val_bytes[..copy_len].copy_from_slice(&pks[i].to_le_bytes()[..copy_len]);
