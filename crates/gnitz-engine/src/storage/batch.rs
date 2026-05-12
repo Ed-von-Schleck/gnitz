@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use super::shard_file;
-use crate::schema::{BlobCache, SchemaDescriptor};
+use crate::schema::{self, BlobCache, SchemaDescriptor};
 use crate::util::{read_i64_le, read_u64_le};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
@@ -142,7 +142,8 @@ pub(crate) fn carve_writer_slices<'a>(
 ///
 /// Layout of `data`: `[pk | weight | null_bmp | col_0 | ... | col_{N-1}]`
 /// Each region has `capacity * stride` bytes allocated; `count * stride` bytes
-/// contain data.  The PK region uses 16 bytes/row (unified u128 in LE order).
+/// contain data.  The PK region uses pk_stride bytes/row; 8 for U64, 16 for
+/// U128, wider for compound PKs.
 ///
 /// **2 heap allocations** (data + blob) instead of N+7.
 pub struct Batch {
@@ -173,7 +174,12 @@ impl Batch {
     ///
     /// Intended for zero-row return values and swap-placeholder slots.
     pub fn empty(num_payload_cols: usize, pk_stride: u8) -> Self {
-        debug_assert!(pk_stride == 8 || pk_stride == 16, "pk_stride must be 8 or 16, got {pk_stride}");
+        // Zero stride is accepted: `SchemaDescriptor::default()` has no PK
+        // columns and is a legitimate placeholder caller.
+        debug_assert!(
+            pk_stride as usize <= schema::MAX_PK_BYTES,
+            "pk_stride out of range: {pk_stride}",
+        );
         let nr = REG_PAYLOAD_START + num_payload_cols;
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         strides[REG_PK] = pk_stride;
@@ -499,6 +505,11 @@ impl Batch {
         }
     }
 
+    /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Used by tests today;
+    /// activated as a production call site by the pending compound-PK
+    /// migration of `ops/join.rs::write_join_row` and
+    /// `ops/reduce.rs::emit_reduce_row` (`plans/compound-pk.md`), which
+    /// switch `extend_pk(get_pk(...))` to `extend_pk_bytes(get_pk_bytes(...))`.
     #[allow(dead_code)]
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
@@ -1071,12 +1082,12 @@ impl Batch {
         self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema;
-        let mut pi = 0;
 
-        for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
-            let ci = schema.map_or(ci_raw, |s| s.payload_col_idx(ci_raw));
+        // `pi` is the dense payload index; it equals `enumerate`'s counter.
+        for (pi, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
+            let ci = schema.map_or(pi, |s| s.payload_col_idx(pi));
 
-            let is_string = schema.map_or(false, |s| {
+            let is_string = schema.is_some_and(|s| {
                 ci < s.num_columns()
                     && (s.columns[ci].type_code == crate::schema::type_code::STRING
                         || s.columns[ci].type_code == crate::schema::type_code::BLOB)
@@ -1094,7 +1105,6 @@ impl Batch {
                 let src = std::slice::from_raw_parts(*ptr, col_size);
                 self.extend_col(pi, src);
             }
-            pi += 1;
         }
 
         self.count += 1;
@@ -1107,6 +1117,7 @@ impl Batch {
     /// # Safety
     /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn append_row_simple(
         &mut self,
         pk: u128, weight: i64, null_word: u64,
@@ -2022,5 +2033,56 @@ mod tests {
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(1);
         b.extend_pk_bytes(&[0u8; 7]);
+    }
+
+    #[test]
+    fn batch_empty_accepts_wide_strides() {
+        // Pin the loosened assertion: zero stride (the
+        // SchemaDescriptor::default() case) and compound strides up to
+        // MAX_PK_BYTES must construct without panicking.
+        for stride in [0u8, 8, 16, 24, 32, 64, 80] {
+            let b = Batch::empty(2, stride);
+            assert_eq!(b.strides[REG_PK], stride, "stride {stride}");
+            assert_eq!(b.count, 0);
+        }
+    }
+
+    #[test]
+    fn extend_pk_bytes_roundtrip_compound_pk() {
+        // 3-column compound PK (U64 + U64 + U64) — pk_stride = 24, exercising
+        // the wide-stride byte API. extend_pk panics for this stride, so the
+        // test must use extend_pk_bytes / get_pk_bytes throughout.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(3);
+        let pks: [[u8; 24]; 3] = [
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+                0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+            ],
+            [0u8; 24],
+            [0xffu8; 24],
+        ];
+        for pk in &pks {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        assert_eq!(b.pk_data().len(), pks.len() * 24);
+        for (i, pk) in pks.iter().enumerate() {
+            assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
+        }
     }
 }

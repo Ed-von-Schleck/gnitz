@@ -48,6 +48,12 @@ impl SchemaColumn {
 /// up to `MAX_PK_COLUMNS` entries.
 pub const MAX_PK_COLUMNS: usize = 5;
 
+/// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
+/// and the per-column ceiling (16 == max `wire_stride` of any type valid
+/// as a PK column — U128, UUID; STRING and BLOB are rejected by
+/// `SchemaDescriptor::new`). Auto-tracks growth of `MAX_PK_COLUMNS`.
+pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
+
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
 /// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
 /// "this slot refers to a PK column, not a payload column". Using
@@ -151,6 +157,15 @@ impl SchemaDescriptor {
                 );
                 j += 1;
             }
+            // STRING and BLOB store a German-string struct whose heap_offset
+            // points into the batch blob. The PK region is bulk-copied without
+            // blob relocation, so these types would produce dangling pointers.
+            assert!(
+                cols[pk_indices[k] as usize].type_code != type_code::STRING
+                    && cols[pk_indices[k] as usize].type_code != type_code::BLOB,
+                "new: STRING and BLOB columns cannot be PK columns \
+                 (PK region is bulk-copied without blob relocation)",
+            );
             pk_arr[k] = pk_indices[k];
             stride_acc += cols[pk_indices[k] as usize].size() as u16;
             k += 1;
@@ -609,9 +624,9 @@ mod tests {
         assert_eq!(s.payload_idx(1), 0);
         assert_eq!(s.payload_idx(2), 1);
 
-        // Non-zero pk_index round-trips.
-        let s2 = SchemaDescriptor::new(&cols, &[2]);
-        assert_eq!(s2.pk_index_single(), 2);
+        // Non-zero pk_index round-trips (use I64 col at index 1, not STRING).
+        let s2 = SchemaDescriptor::new(&cols, &[1]);
+        assert_eq!(s2.pk_index_single(), 1);
 
         // Empty placeholder (Default-style).
         let empty = SchemaDescriptor::new(&[], &[]);
@@ -703,7 +718,6 @@ mod tests {
             type_code::U32, type_code::I32, type_code::F32,
             type_code::U64, type_code::I64, type_code::F64,
             type_code::U128, type_code::UUID,
-            type_code::STRING, type_code::BLOB,
         ] {
             let cols = [SchemaColumn::new(tc, 0)];
             let s = SchemaDescriptor::new(&cols, &[0]);
@@ -713,6 +727,20 @@ mod tests {
                 "pk_stride mismatch for type_code {}", tc,
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "STRING and BLOB columns cannot be PK columns")]
+    fn test_string_pk_rejected() {
+        let cols = [SchemaColumn::new(type_code::STRING, 0)];
+        SchemaDescriptor::new(&cols, &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "STRING and BLOB columns cannot be PK columns")]
+    fn test_blob_pk_rejected() {
+        let cols = [SchemaColumn::new(type_code::BLOB, 0)];
+        SchemaDescriptor::new(&cols, &[0]);
     }
 
     #[test]

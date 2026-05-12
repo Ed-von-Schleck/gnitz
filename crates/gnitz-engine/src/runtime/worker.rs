@@ -2085,7 +2085,7 @@ mod tests {
     fn test_string_schema_not_wire_safe() {
         use crate::schema::{SchemaColumn, type_code};
         let sd = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::STRING, 0)],
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::STRING, 0)],
             &[0],
         );
         assert!(!schema_wire_safe(&sd),
