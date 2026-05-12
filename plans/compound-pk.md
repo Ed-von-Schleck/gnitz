@@ -123,19 +123,13 @@ Out:
 
 ### 1. Storage batch (`storage/batch.rs`)
 
-`pk_stride` (already `u8`) widens its value range from `{8, 16}` to
-`1..=MAX_PK_BYTES` (80). The type doesn't change. The
-`pk_stride == 8 || pk_stride == 16` precondition in `Batch::empty` /
-`with_schema` and the analogous gates in `MemBatch` and `MappedShard`
-loosen to `1..=MAX_PK_BYTES`. Today's `get_pk`/`extend_pk`/`set_pk_at`
-exhaustive `match stride { 8 | 16 => …, _ => panic! }` blocks gain new
-arms (or fall through to the bytes variant) so that wider strides do
-not panic.
-
-Bytes accessors (`get_pk_bytes` / `extend_pk_bytes` / `set_pk_at_bytes`
-on `Batch`; `get_pk_bytes` on `MemBatch` and `MappedShard`) are already
-landed. New compound-PK code calls those directly. Single-PK code
-keeps calling `get_pk` / `extend_pk` and stays bit-identical.
+`pk_stride` (already `u8`) accepts the full `0..=MAX_PK_BYTES` (80)
+range across `Batch`, `MemBatch`, and `MappedShard`. The narrow-PK
+`get_pk` / `extend_pk` / `set_pk_at` family **keeps** its
+`match stride { 8 | 16 => …, _ => panic! }` shape: those panics guard
+the u128 API against wide-stride misuse, and compound-PK code paths
+must use the bytes accessors (`get_pk_bytes` / `extend_pk_bytes` /
+`set_pk_at_bytes`) instead.
 
 `Batch::append_row_from_ptable_found` currently takes `pk: u128`. It
 becomes `pk_bytes: &[u8]` and uses the bytes extender.
@@ -201,36 +195,6 @@ arithmetic are unchanged.
 For `pk_stride <= 16` it caches the packed concat; for `pk_stride
 > 16` the consumer ignores the cache and fetches bytes from the
 source on demand (same indirection as the heap).
-
-### 3b. Scatter routines (`storage/merge.rs`)
-
-`scatter_col_first`, `scatter_multi_source`, and
-`scatter_unified_sources_with_weights` dispatch on `writer.pk_stride`
-to const-generic helpers (`scatter_col_first_fixed::<PKS>`,
-`scatter_mb_pk_wt_nbm::<PKS>`, `scatter_unified_pk_wt_nbm::<PKS>`).
-Today's exhaustive `match writer.pk_stride { 8 => ::<8>, 16 => ::<16>,
-_ => panic! }` covers the 8/16 strides but panics on anything wider.
-Compound PK strides reach 24..=80 — every dispatcher must cover them.
-
-Replace the panicking arm in each match with a `scatter_*_dynamic`
-call:
-
-```rust
-match writer.pk_stride {
-    8  => scatter_*_<8>(...),
-    16 => scatter_*_<16>(...),
-    s  => scatter_*_dynamic(..., s as usize),
-}
-```
-
-`scatter_*_dynamic` is a sibling that copies `pk_stride` bytes per
-row via `copy_nonoverlapping` against a runtime-sized stride. It
-loses the literal-width store optimisation but stays correct. The
-dispatcher keeps only the two const arms — single-PK is the
-overwhelming majority and benefits from monomorphisation; for
-compound strides the runtime-sized memcpy on 8-aligned data is
-within noise of a literal-width store and not worth the binary
-bloat of six more inner loops.
 
 ### 4. Partition routing (`storage/partitioned_table.rs:partition_for_key`)
 
@@ -303,10 +267,6 @@ shard-overlap test must go through
 `compare_pk_bytes(schema, &pk_min.bytes[..len], &key[..len])` —
 byte-wise lex compare of LE bytes is wrong (e.g. `1` = `[0x01, 0, …]`
 vs `256` = `[0x00, 0x01, 0, …]`).
-
-Range-disjoint-shard-concat (`plans/6-range-disjoint-shard-concat.md`):
-the "is hi_i < lo_j" check uses the same compound-PK comparator. No
-design change needed.
 
 **Manifest on-disk format.** `storage/manifest.rs:17-18` stores
 `pk_min: u128 LE` + `pk_max: u128 LE` at fixed offsets. Replace with
@@ -761,32 +721,29 @@ of the worker that produced the row.
 Order of merging (each step keeps the test suite green; not split
 into phases):
 
-1. **Widen `pk_stride` domain.** Loosen the `{8, 16}` gate in
-   `Batch::empty` / `with_schema`, `MemBatch`, `MappedShard`; extend
-   the `match stride` blocks in `get_pk`/`extend_pk`/`set_pk_at` and
-   the scatter dispatchers (§3b) to cover wider strides via the
-   `scatter_*_dynamic` arm.
-2. **Heap dispatch.** `HeapNode` stays 32 B; merge entry points pick
+1. **Heap dispatch.** `HeapNode` stays 32 B; merge entry points pick
    the comparison closure from `pk_count` / `pk_stride` (table in §3).
    Single-PK path is bit-identical to today; wide-PK path indirects
-   via the source cursors only when `pk_stride > 16`.
-3. **Catalog encoding.** Pack `pk_count + pk_cols` into TABLE_TAB
+   via the source cursors only when `pk_stride > 16`. (Today the merge
+   entry points hard-assert `pk_stride ∈ {8, 16}` — that guard comes
+   off as part of this step.)
+2. **Catalog encoding.** Pack `pk_count + pk_cols` into TABLE_TAB
    per §9.
-4. **SAL/WAL pk_stride.** Region 0 width follows
+3. **SAL/WAL pk_stride.** Region 0 width follows
    `schema.pk_stride()`. For single-PK this is identical to today.
-5. **Manifest format.** Write `pk_min`/`pk_max` as `(len, bytes)`
+4. **Manifest format.** Write `pk_min`/`pk_max` as `(len, bytes)`
    pairs (§6).
-6. **Wire control extension.** Add `seek_pk_extra` (§8).
-7. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`. Drop the
+5. **Wire control extension.** Add `seek_pk_extra` (§8).
+6. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`. Drop the
    I*/U*→U64 PK coercion. From this commit onward, CREATE TABLE
    actually allows compound PK and native signed PK types.
-8. **DML.** `extract_pk_value` returns a tuple;
+7. **DML.** `extract_pk_value` returns a tuple;
    `try_extract_pk_seek` requires full-tuple binding.
-9. **Operators.** Schema builders in `compiler.rs` and
+8. **Operators.** Schema builders in `compiler.rs` and
    `reduce`/`join` adjustments. Index seek becomes prefix-scan.
-10. **FK stricter rule.** Reject single-column FK to a compound-PK
-    parent unless the referenced column has its own UNIQUE index.
-11. **Python/CAPI.** `pk_index` → `pk_indices`.
+9. **FK stricter rule.** Reject single-column FK to a compound-PK
+   parent unless the referenced column has its own UNIQUE index.
+10. **Python/CAPI.** `pk_index` → `pk_indices`.
 
 Each step is independently mergeable; the feature only becomes
-user-visible at step 7.
+user-visible at step 6.
