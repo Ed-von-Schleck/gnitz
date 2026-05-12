@@ -574,7 +574,7 @@ mod recovery_tests {
         ptr: *mut u8, cursor: u64, nw: u32, target_id: u32, lsn: u64,
         epoch: u32, size: u64,
     ) -> u64 {
-        let payload = vec![0u8; 64];
+        let payload = [0u8; 64];
         let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
         let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
         let res = sal_write_group(
@@ -678,7 +678,7 @@ mod recovery_tests {
             let ptr = alloc_mmap(size);
             let nw = 1u32;
 
-            let payload = vec![0u8; 32];
+            let payload = [0u8; 32];
             let ptrs = [payload.as_ptr()];
             let sizes = [payload.len() as u32];
             let res = sal_write_group(

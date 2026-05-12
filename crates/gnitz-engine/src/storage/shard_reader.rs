@@ -959,7 +959,8 @@ mod tests {
         // region is entry index 1 in the directory.
         let mut data = std::fs::read(&path).unwrap();
         let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        let weight_entry_off = dir_off + 1 * DIR_ENTRY_SIZE;
+        // Entry index 1 = weight region.
+        let weight_entry_off = dir_off + DIR_ENTRY_SIZE;
         let orig_size = read_u64_le(&data, weight_entry_off + 8);
         // Only write the two values (16 bytes), drop the bitvec.
         let truncated_size = 16u64;

@@ -15,7 +15,7 @@ fn test_index_creation_and_backfill() {
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
         bb.begin_row(i as u128, 1);
-        bb.put_u64((i * 100) as u64);
+        bb.put_u64(i * 100);
         bb.end_row();
     }
     let batch = bb.finish();

@@ -90,8 +90,8 @@ fn test_sal_unicast_isolation() {
         let nw = 4u32;
 
         let buf = make_test_data(0xDD, 128);
-        let mut ptrs = vec![std::ptr::null(); 4];
-        let mut sizes = vec![0u32; 4];
+        let mut ptrs = [std::ptr::null(); 4];
+        let mut sizes = [0u32; 4];
         ptrs[2] = buf.as_ptr();
         sizes[2] = buf.len() as u32;
 

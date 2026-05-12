@@ -156,7 +156,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
     let mut names = Vec::with_capacity(batch.count);
     let mut pk_index: u32 = 0;
     let mut pk_found = false;
-    for i in 0..batch.count {
+    for (i, col) in cols.iter_mut().enumerate().take(batch.count) {
         let off8 = i * 8;
         let type_code_val = u64::from_le_bytes(
             batch.col_data(0)[off8..off8 + 8].try_into().unwrap()
@@ -170,7 +170,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         names.push(decode_german_string(&st, &batch.blob));
         let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
-        cols[i] = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
+        *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
         if is_pk {
             if pk_found { return Err("multiple PK columns"); }
             pk_index = i as u32;
@@ -391,6 +391,7 @@ pub fn wire_size(
 
 /// Encode a full IPC wire message. Returns heap-allocated Vec<u8>.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_wire(
     target_id: u64,
     client_id: u64,
@@ -1092,6 +1093,7 @@ mod tests {
         use gnitz_core::protocol::header::Header;
         use gnitz_core::protocol::message::encode_control_block;
 
+        #[allow(clippy::type_complexity)]
         let cases: &[(u32, u64, u64, u64, u128, u64, u64, &str)] = &[
             // status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg
             (0, 0, 0, 0, 0, 0, 0, ""),

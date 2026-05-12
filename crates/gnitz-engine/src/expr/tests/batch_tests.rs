@@ -1,3 +1,8 @@
+// `0 * MORSEL`, `1 * MORSEL`, `0 * NULL_WORDS_PER_REG` etc. are deliberate
+// layout-documenting expressions making the register/word index explicit at
+// each access site; collapsing them obscures which register is in use.
+#![allow(clippy::erasing_op, clippy::identity_op)]
+
 use super::super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
 use super::super::program::{ExprProgram, eval_predicate};
 use crate::storage::Batch;

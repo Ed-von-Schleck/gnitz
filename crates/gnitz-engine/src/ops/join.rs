@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!((out.get_pk(1) as u64), 2);
         assert_eq!(get_payload_i64(&out, 1), 20); // left val
         // Right column (payload col 1) should be null
-        let null_word = u64::from_le_bytes(out.null_bmp_data()[1 * 8..2 * 8].try_into().unwrap());
+        let null_word = u64::from_le_bytes(out.null_bmp_data()[8..16].try_into().unwrap());
         assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
     }
 

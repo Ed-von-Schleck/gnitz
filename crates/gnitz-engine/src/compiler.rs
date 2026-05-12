@@ -2040,8 +2040,8 @@ mod tests {
         let make = |n: usize| {
             let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
             cols[0] = SchemaColumn::new(type_code::U128, 0);
-            for i in 1..n {
-                cols[i] = SchemaColumn::new(type_code::I64, 0);
+            for col in cols.iter_mut().take(n).skip(1) {
+                *col = SchemaColumn::new(type_code::I64, 0);
             }
             SchemaDescriptor::new(&cols[..n], &[0])
         };

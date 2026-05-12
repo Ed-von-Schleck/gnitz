@@ -506,16 +506,16 @@ pub fn op_multi_scatter(
             let spec = col_specs[si];
             if spec.len() == 1 && schema.is_pk_col(spec[0] as usize) {
                 if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
-                    for w in 0..num_workers {
-                        if results[si][w].count > 0 {
-                            results[si][w].sorted = true;
-                            results[si][w].consolidated = true;
+                    for batch in results[si].iter_mut().take(num_workers) {
+                        if batch.count > 0 {
+                            batch.sorted = true;
+                            batch.consolidated = true;
                         }
                     }
                 } else if batch.sorted {
-                    for w in 0..num_workers {
-                        if results[si][w].count > 0 {
-                            results[si][w].sorted = true;
+                    for batch in results[si].iter_mut().take(num_workers) {
+                        if batch.count > 0 {
+                            batch.sorted = true;
                         }
                     }
                 }
@@ -650,7 +650,7 @@ mod tests {
         let schema = make_schema_u128_i64();
         let num_workers = 4;
         let pks: &[u128] = &[
-            (1u128 << 64) | 0,
+            1u128 << 64,
             (0xCAFE_BABEu128 << 64) | 0xDEAD_BEEF,
             u128::MAX,
             (7u128 << 64) | 42,
@@ -715,9 +715,9 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), 3);
 
         let mut worker_of_1 = None;
-        for w in 0..num_workers {
-            for r in 0..sub_batches[w].count {
-                if (sub_batches[w].get_pk(r) as u64) == 1 {
+        for (w, batch) in sub_batches.iter().enumerate().take(num_workers) {
+            for r in 0..batch.count {
+                if (batch.get_pk(r) as u64) == 1 {
                     worker_of_1 = Some(w);
                 }
             }
@@ -733,9 +733,9 @@ mod tests {
         assert_eq!(total_rows(&sub2), 2);
 
         let mut worker_of_10 = None;
-        for w in 0..num_workers {
-            for r in 0..sub2[w].count {
-                if (sub2[w].get_pk(r) as u64) == 10 {
+        for (w, batch) in sub2.iter().enumerate().take(num_workers) {
+            for r in 0..batch.count {
+                if (batch.get_pk(r) as u64) == 10 {
                     worker_of_10 = Some(w);
                 }
             }

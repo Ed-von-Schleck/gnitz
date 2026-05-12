@@ -132,7 +132,7 @@ mod tests {
 
         // Empty trace → all positive deltas emit +1
         let empty = Rc::new(Batch::empty(1, 16));
-        let mut ch = CursorHandle::from_owned(&[empty.clone()], schema);
+        let mut ch = CursorHandle::from_owned(std::slice::from_ref(&empty), schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
         let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);

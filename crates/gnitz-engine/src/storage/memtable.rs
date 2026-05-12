@@ -289,6 +289,10 @@ impl MemTable {
 }
 
 #[cfg(test)]
+// 3.14 / 2.718 are deliberate test-fixture values exercising f32/f64 column
+// round-trip; they're not approximations of PI/E meant to be replaced with
+// std::f*::consts.
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};

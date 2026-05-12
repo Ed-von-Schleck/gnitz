@@ -318,6 +318,7 @@ pub(crate) unsafe fn sal_begin_group(
 
 /// Write a message group into the SAL for N workers (test helper).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sal_write_group(
     sal_ptr: *mut u8,
     write_cursor: u64,
@@ -332,7 +333,9 @@ pub(crate) unsafe fn sal_write_group(
 ) -> SalWriteResult {
     let nw = num_workers as usize;
     let mut sizes = [0u32; MAX_WORKERS];
-    for w in 0..nw { sizes[w] = *worker_sizes.add(w); }
+    for (w, slot) in sizes.iter_mut().enumerate().take(nw) {
+        *slot = *worker_sizes.add(w);
+    }
 
     let group = match sal_begin_group(
         sal_ptr, write_cursor as usize, mmap_size as usize,
@@ -343,8 +346,8 @@ pub(crate) unsafe fn sal_write_group(
     };
 
     let mut off = GROUP_HEADER_SIZE;
-    for w in 0..nw {
-        let sz = sizes[w] as usize;
+    for (w, &sz_u32) in sizes.iter().enumerate().take(nw) {
+        let sz = sz_u32 as usize;
         if sz > 0 {
             let p = *worker_ptrs.add(w);
             if !p.is_null() {

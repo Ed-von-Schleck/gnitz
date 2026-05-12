@@ -52,13 +52,13 @@ fn test_w2m_concurrent_publish_consume_ordered() {
             );
             next_expected += 1;
         } else {
-            if done.load(Ordering::Acquire) && next_expected <= N {
-                if receiver.try_read(0).is_none() {
-                    panic!(
-                        "writer done but only {}/{} msgs received",
-                        next_expected - 1, N,
-                    );
-                }
+            if done.load(Ordering::Acquire) && next_expected <= N
+                && receiver.try_read(0).is_none()
+            {
+                panic!(
+                    "writer done but only {}/{} msgs received",
+                    next_expected - 1, N,
+                );
             }
             std::thread::yield_now();
         }

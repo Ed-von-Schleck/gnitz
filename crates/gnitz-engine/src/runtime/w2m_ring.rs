@@ -441,7 +441,7 @@ pub(crate) unsafe fn try_reserve(
 #[cfg(test)]
 pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     assert!(capacity >= W2M_HEADER_SIZE as u64 + 16);
-    assert!(capacity % 8 == 0, "W2M capacity={} must be 8-byte aligned", capacity);
+    assert!(capacity.is_multiple_of(8), "W2M capacity={} must be 8-byte aligned", capacity);
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
@@ -911,14 +911,9 @@ mod tests {
                 }
             }
             // Drain.
-            loop {
-                match try_consume(hdr, ptr, rc) {
-                    Some((_, _, new_rc, _)) => {
-                        hdr.advance_read_cursors(new_rc);
-                        rc = new_rc;
-                    }
-                    None => break,
-                }
+            while let Some((_, _, new_rc, _)) = try_consume(hdr, ptr, rc) {
+                hdr.advance_read_cursors(new_rc);
+                rc = new_rc;
             }
             assert!(
                 hdr.writer_wrap_count() >= 1,
@@ -1001,16 +996,11 @@ mod tests {
             }
 
             // Drain remaining and assert every tag arrived in order.
-            loop {
-                match try_consume(hdr, ptr, rc) {
-                    Some((data_ptr, sz, new_rc, _)) => {
-                        assert_eq!(sz as usize, msg_sz);
-                        received.push(*data_ptr);
-                        hdr.advance_read_cursors(new_rc);
-                        rc = new_rc;
-                    }
-                    None => break,
-                }
+            while let Some((data_ptr, sz, new_rc, _)) = try_consume(hdr, ptr, rc) {
+                assert_eq!(sz as usize, msg_sz);
+                received.push(*data_ptr);
+                hdr.advance_read_cursors(new_rc);
+                rc = new_rc;
             }
             assert_eq!(
                 received,

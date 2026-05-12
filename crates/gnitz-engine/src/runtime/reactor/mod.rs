@@ -1871,9 +1871,7 @@ mod tests {
         let r = make_reactor();
         let polls: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
         let polls2 = polls.clone();
-        r.block_on(async move {
-            DoublyWaking { polls: polls2, polled: 0 }.await
-        });
+        r.block_on(DoublyWaking { polls: polls2, polled: 0 });
         // Doubly waking polls itself N times before completing; the
         // exact value isn't load-bearing, just that we eventually finish.
         assert!(polls.get() >= 1);
@@ -2351,27 +2349,25 @@ mod tests {
     /// Race a timer and a reply future. Sets `flag` to true if the reply
     /// resolved first, leaves it false if the timer won. Polls both each
     /// tick; the first to return Ready wins.
-    fn select_reply_or_timer<'a, T, R>(
+    async fn select_reply_or_timer<'a, T, R>(
         timer: T, reply: R, flag: &'a Rc<StdCell<bool>>,
-    ) -> impl Future<Output = ()> + 'a
+    )
     where
         T: Future<Output = ()> + 'a,
         R: Future<Output = DecodedWire> + 'a,
     {
-        async move {
-            let mut timer = Box::pin(timer);
-            let mut reply = Box::pin(reply);
-            std::future::poll_fn(move |cx| {
-                if timer.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                if reply.as_mut().poll(cx).is_ready() {
-                    flag.set(true);
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            }).await
-        }
+        let mut timer = Box::pin(timer);
+        let mut reply = Box::pin(reply);
+        std::future::poll_fn(move |cx| {
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if reply.as_mut().poll(cx).is_ready() {
+                flag.set(true);
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        }).await
     }
 
     /// Build a minimal `DecodedWire` for tests — only `request_id` is
@@ -2531,8 +2527,7 @@ mod tests {
         r.inject_cqe(KIND_FSYNC, 42, -11);
         r.drain_injected_cqes();
 
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue
-            .iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
         assert!(q.contains(&7),
             "KIND_REPLY dispatch must wake the reply waker for id=42");
         assert!(!r.inner.reply_wakers.borrow().contains_key(&42),
@@ -2567,8 +2562,7 @@ mod tests {
             "KIND_SEND must park the CQE rc verbatim so SendFuture sees it");
         assert!(!r.inner.send_wakers.borrow().contains_key(&55),
             "KIND_SEND must consume the waker entry");
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue
-            .iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
         assert!(q.contains(&11), "KIND_SEND must wake the send future");
     }
 
@@ -2865,12 +2859,12 @@ mod tests {
         //   round B: (view_id=100, source_id=20), workers 0..4
         // Arrival order deliberately mixed; neither round is strictly
         // before the other in wall-clock order.
-        let _ = r.test_route_reply(0, synthetic_exchange_wire_src(100, 10, 100));
-        let _ = r.test_route_reply(0, synthetic_exchange_wire_src(100, 20, 100));
-        let _ = r.test_route_reply(1, synthetic_exchange_wire_src(100, 20, 101));
-        let _ = r.test_route_reply(1, synthetic_exchange_wire_src(100, 10, 101));
-        let _ = r.test_route_reply(2, synthetic_exchange_wire_src(100, 10, 102));
-        let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 10, 103));
+        r.test_route_reply(0, synthetic_exchange_wire_src(100, 10, 100));
+        r.test_route_reply(0, synthetic_exchange_wire_src(100, 20, 100));
+        r.test_route_reply(1, synthetic_exchange_wire_src(100, 20, 101));
+        r.test_route_reply(1, synthetic_exchange_wire_src(100, 10, 101));
+        r.test_route_reply(2, synthetic_exchange_wire_src(100, 10, 102));
+        r.test_route_reply(3, synthetic_exchange_wire_src(100, 10, 103));
         // Round A must now be complete (4 workers reported).
         let ra = rx.try_recv().expect("round A should produce a relay");
         assert_eq!(ra.view_id, 100);
@@ -2879,8 +2873,8 @@ mod tests {
         // Round B still incomplete — worker 2+3 haven't reported for src=20.
         assert!(rx.try_recv().is_none(), "round B must not be ready yet");
 
-        let _ = r.test_route_reply(2, synthetic_exchange_wire_src(100, 20, 102));
-        let _ = r.test_route_reply(3, synthetic_exchange_wire_src(100, 20, 103));
+        r.test_route_reply(2, synthetic_exchange_wire_src(100, 20, 102));
+        r.test_route_reply(3, synthetic_exchange_wire_src(100, 20, 103));
         let rb = rx.try_recv().expect("round B should now produce a relay");
         assert_eq!(rb.view_id, 100);
         assert_eq!(rb.source_id, 20);
@@ -2934,8 +2928,7 @@ mod tests {
         // discarded without waking key=999.
         std::thread::sleep(Duration::from_millis(20));
         for _ in 0..4 { r.tick(false); }
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue
-            .iter().copied().collect();
+        let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
         assert!(!q.contains(&999),
             "cancelled timer must not wake its original waker");
     }
@@ -3586,7 +3579,7 @@ mod tests {
         r.test_route_scan_slot(slot); // park before any poll
 
         let fut = r.await_scan_slot(req_id);
-        let result = r.block_on(async move { fut.await });
+        let result = r.block_on(fut);
         assert_eq!(result.internal_req_id, req_id,
             "first poll must return the pre-parked slot");
 

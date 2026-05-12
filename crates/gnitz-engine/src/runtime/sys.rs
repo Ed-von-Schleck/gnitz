@@ -184,7 +184,7 @@ mod tests {
 
         // Create shared mmap region
         let fd = unsafe {
-            libc::memfd_create(b"test\0".as_ptr() as *const libc::c_char, 0)
+            libc::memfd_create(c"test".as_ptr(), 0)
         };
         assert!(fd >= 0);
         unsafe { libc::ftruncate(fd, 4096); }
@@ -302,7 +302,7 @@ mod tests {
                 .flags(FUTEX2_SIZE_U32),
         ]);
 
-        let entry = opcode::FutexWaitV::new(futexv.as_ptr() as *const types::FutexWaitV, 1)
+        let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1)
             .build()
             .user_data(0xAABBCCDD);
         unsafe {

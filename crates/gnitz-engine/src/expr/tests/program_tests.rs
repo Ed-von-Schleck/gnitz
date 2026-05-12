@@ -1,3 +1,7 @@
+// 3.14 is a deliberate float-bit-pattern test fixture, not an approximation
+// of PI meant to be replaced with std::f64::consts::PI.
+#![allow(clippy::approx_constant)]
+
 use super::super::program::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
