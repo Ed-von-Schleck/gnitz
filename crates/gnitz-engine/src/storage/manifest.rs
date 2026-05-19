@@ -99,18 +99,13 @@ impl PkBuf {
         &self.bytes[..self.len as usize]
     }
 
-    /// Widens a single-PK `PkBuf` to its u128 fast-path key. Mirrors
-    /// the `match stride { 8 | 16 => …, _ => panic }` dispatch of
-    /// `MappedShard::get_pk` / `Batch::get_pk`: panicking (not silently
-    /// zero-extending) on an unexpected width is what catches a
-    /// misrouted compound key reaching this path.
-    #[inline]
+    /// Widens a single-PK `PkBuf` to its u128 fast-path key. Delegates
+    /// to `batch::widen_pk_le`, which panics (not silently
+    /// zero-extends) on an unexpected width so a misrouted compound key
+    /// reaching this path is caught at its source.
+    #[inline(always)]
     pub fn as_u128_single_pk(&self) -> u128 {
-        match self.len {
-            8 => u64::from_le_bytes(self.bytes[..8].try_into().unwrap()) as u128,
-            16 => u128::from_le_bytes(self.bytes[..16].try_into().unwrap()),
-            other => panic!("as_u128_single_pk: unexpected pk width {other}"),
-        }
+        super::batch::widen_pk_le(&self.bytes, self.len as usize)
     }
 }
 

@@ -40,6 +40,28 @@ pub(super) const REG_PAYLOAD_START: usize = 3;
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
+/// LE-widen a single-PK region slice to its u128 fast-path key. Only
+/// widths 8 and 16 are valid; any other width is a wide/compound region
+/// that reached a u128 path — a routing bug, so panic (rather than
+/// silently zero-extend) to surface the misroute at its source.
+///
+/// `stride` is taken explicitly rather than read from `src.len()`
+/// because the fixed-array callers (`PkBuf::as_u128_single_pk`) pass a
+/// constant-length backing array (`&PkBuf::bytes`, len 80) whose length
+/// carries no width information — only `stride` can detect their
+/// misroutes. Contract: `src.len() >= stride`.
+///
+/// Wide-PK siblings: see `merge::pack_pk_le` for the comparator path,
+/// which prefix-truncates instead of panicking.
+#[inline(always)]
+pub(super) fn widen_pk_le(src: &[u8], stride: usize) -> u128 {
+    match stride {
+        8 => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
+        16 => u128::from_le_bytes(src[..16].try_into().unwrap()),
+        n => panic!("widen_pk_le: wide PK region (stride {n}); caller must use get_pk_bytes/pk_bytes instead"),
+    }
+}
+
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
 /// For sizes >= HUGEPAGE_THRESHOLD, calls `calloc` (via `vec!`) which for large
@@ -498,11 +520,7 @@ impl Batch {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] as usize + row * stride;
-        match stride {
-            8 => u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128,
-            16 => u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap()),
-            _ => panic!("get_pk: wide region; use get_pk_bytes"),
-        }
+        widen_pk_le(&self.data[off..off + stride], stride)
     }
 
     /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Used by tests today;
@@ -1849,6 +1867,42 @@ mod tests {
             ],
             &[0],
         )
+    }
+
+    #[test]
+    fn widen_pk_le_width_8_and_16() {
+        let mut src = [0u8; 16];
+        src[..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(widen_pk_le(&src[..8], 8), 0x1122_3344_5566_7788u128);
+
+        let key = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10u128;
+        assert_eq!(widen_pk_le(&key.to_le_bytes(), 16), key);
+    }
+
+    #[test]
+    fn widen_pk_le_wider_than_stride_matches_exact_slice() {
+        // Exercises the PkBuf::as_u128_single_pk calling convention:
+        // a fixed 80-byte backing array with stride < src.len().
+        let mut backing = [0u8; 80];
+        backing[..8].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
+        assert_eq!(
+            widen_pk_le(&backing, 8),
+            widen_pk_le(&backing[..8], 8),
+        );
+
+        let key = 0x1111_2222_3333_4444_5555_6666_7777_8888u128;
+        let mut backing16 = [0u8; 80];
+        backing16[..16].copy_from_slice(&key.to_le_bytes());
+        assert_eq!(
+            widen_pk_le(&backing16, 16),
+            widen_pk_le(&backing16[..16], 16),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "wide PK region")]
+    fn widen_pk_le_rejects_non_8_16_width() {
+        widen_pk_le(&[0u8; 24], 24);
     }
 
     #[test]

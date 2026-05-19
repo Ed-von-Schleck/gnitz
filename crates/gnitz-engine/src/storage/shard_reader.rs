@@ -319,11 +319,7 @@ impl MappedShard {
         match &self.pk {
             RegionView::Raw { offset, .. } => {
                 let src = &data[offset + row * stride..offset + row * stride + stride];
-                match stride {
-                    8 => u64::from_le_bytes(src.try_into().unwrap()) as u128,
-                    16 => u128::from_le_bytes(src.try_into().unwrap()),
-                    _ => panic!("get_pk: wide region; use get_pk_bytes"),
-                }
+                super::batch::widen_pk_le(src, stride)
             }
             RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
             RegionView::TwoValue { .. } => unreachable!(),

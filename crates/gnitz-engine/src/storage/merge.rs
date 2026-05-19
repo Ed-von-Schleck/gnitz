@@ -188,11 +188,7 @@ impl<'a> MemBatch<'a> {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
         let off = self.offsets[super::batch::REG_PK] as usize + row * stride;
-        match stride {
-            8 => u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap()) as u128,
-            16 => u128::from_le_bytes(self.data[off..off + 16].try_into().unwrap()),
-            _ => panic!("get_pk: wide region; use get_pk_bytes"),
-        }
+        super::batch::widen_pk_le(&self.data[off..off + stride], stride)
     }
 
     #[inline]
@@ -389,6 +385,10 @@ impl<'a> DirectWriter<'a> {
 /// The explicit `{16,8,4,2,1}` arms are a hot-path specialisation (stride
 /// is a runtime slice length, not a const, so the generic tail's zero-init
 /// + memcpy would not fold away).
+///
+/// Sibling of `batch::widen_pk_le` (the single-PK fast-path widener):
+/// this one prefix-truncates wide regions for the comparator filter
+/// where that one panics.
 #[inline(always)]
 fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
