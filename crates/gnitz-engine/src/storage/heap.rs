@@ -311,6 +311,17 @@ mod tests {
         out
     }
 
+    // --- layout guard ---
+
+    /// `LoserTree::walk_up` swaps whole `HeapNode`s on the hot merge path of
+    /// every operator. Adding a field (e.g. a wide-PK key) would bloat the
+    /// node and regress every merge; the wide-PK path deliberately keeps the
+    /// `u128` prefix key instead. Fail loudly here if the node grows.
+    #[test]
+    fn heap_node_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<HeapNode>(), 32);
+    }
+
     // --- build ---
 
     #[test]

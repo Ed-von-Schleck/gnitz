@@ -376,13 +376,19 @@ impl<'a> DirectWriter<'a> {
 // Narrow-region PK key packing + ordered-comparison dispatch
 // ---------------------------------------------------------------------------
 
-/// Zero-extend any `≤ 16`-byte PK region into a `u128`, LE bytes in the low
-/// positions. The explicit `{16,8,4,2,1}` arms are a hot-path
-/// specialisation (stride is a runtime slice length, not a const, so the
-/// generic tail's zero-init + memcpy would not fold away). Truncating the
-/// packed key back to the native type (`as i32`, `from_bits`, …) recovers
-/// the exact original value, which is why single-column PKs never enter the
-/// `compare_pk_bytes` column-walk regardless of signedness.
+/// Pack a PK region's low 16 bytes into a `u128`, LE bytes in the low
+/// positions. For `len ≤ 16` this is an exact, zero-extended encoding of
+/// the whole region; truncating the packed key back to the native type
+/// (`as i32`, `from_bits`, …) recovers the exact original value, which is
+/// why single-column narrow PKs never enter the `compare_pk_bytes`
+/// column-walk regardless of signedness. For `len > 16` (wide compound
+/// region) the result is the deterministic low-16-byte LE *prefix* — not a
+/// valid ordered-comparison input, but a cheap O(1) inequality filter:
+/// distinct wide PKs whose low-16 bytes differ are rejected without a
+/// column walk; only a prefix collision falls through to `compare_pk_bytes`.
+/// The explicit `{16,8,4,2,1}` arms are a hot-path specialisation (stride
+/// is a runtime slice length, not a const, so the generic tail's zero-init
+/// + memcpy would not fold away).
 #[inline(always)]
 fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
@@ -392,27 +398,12 @@ fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
         2 => u16::from_le_bytes(pk_bytes.try_into().unwrap()) as u128,
         1 => pk_bytes[0] as u128,
         len => {
-            debug_assert!(len <= 16);
+            let take = len.min(16);
             let mut b = [0u8; 16];
-            b[..len].copy_from_slice(pk_bytes);
+            b[..take].copy_from_slice(&pk_bytes[..take]);
             u128::from_le_bytes(b)
         }
     }
-}
-
-/// Hard canary shared by all three merge entry points. Rejects the
-/// structurally-invalid `pk_stride == 0` placeholder (lower bound) and a
-/// wide compound PK (`pk_stride > 16`, unsupported by the packed-u128 key)
-/// reaching the merge (upper bound).
-macro_rules! assert_narrow_pk_region {
-    ($schema:expr) => {
-        assert!(
-            $schema.pk_stride() > 0 && $schema.pk_stride() <= 16,
-            "merge requires a 1–16 byte PK region; found pk_stride={} \
-             (wide compound PK with pk_stride > 16 is unsupported)",
-            $schema.pk_stride(),
-        );
-    };
 }
 
 /// 2×2 monomorphisation over the two orthogonal axes — PK column
@@ -511,7 +502,6 @@ pub fn merge_batches(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    assert_narrow_pk_region!(schema);
     let n = batches.len();
     if n == 0 {
         return;
@@ -521,13 +511,21 @@ pub fn merge_batches(
         .map(|i| MemBatchCursor::new(batches[i].count))
         .collect();
 
-    dispatch_pk_row!(schema, merge_batches_inner(&mut cursors, batches, schema, writer));
+    // `is_wide` derives from the runtime `&schema`; it only selects which
+    // monomorphised closure set is handed to the single generic driver
+    // `merge_batches_inner` — it is never a term inside the hot loop.
+    if schema.pk_stride() as usize > 16 {
+        merge_run_wide(&mut cursors, batches, schema, writer);
+    } else {
+        dispatch_pk_row!(schema, merge_run_narrow(&mut cursors, batches, schema, writer));
+    }
 }
 
-/// Monomorphised on the row comparator so LLVM emits two specialised copies
-/// of the merge body — fast/generic — with the comparator inlined.
+/// Narrow-region closure builder: `less`/`eq_payload` bit-for-bit as before
+/// this generalisation — packed-`u128` ordered PK compare plus payload
+/// tiebreak, payload-only equality. Monomorphised by `dispatch_pk_row!`.
 #[inline]
-fn merge_batches_inner<RowCmp, PkCmp>(
+fn merge_run_narrow<RowCmp, PkCmp>(
     cursors: &mut [MemBatchCursor],
     batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
@@ -540,7 +538,7 @@ fn merge_batches_inner<RowCmp, PkCmp>(
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
-    // by `advance` below.  `source_idx` doubles as the batch index here.
+    // by `advance`.  `source_idx` doubles as the batch index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
         match pk_cmp(a.key, b.key) {
             Ordering::Less => true,
@@ -550,6 +548,89 @@ fn merge_batches_inner<RowCmp, PkCmp>(
                 == Ordering::Less,
         }
     };
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        row_cmp(schema, &batches[a_src].0, a_row,
+                        &batches[b_src].0, b_row) == Ordering::Equal
+    };
+    merge_batches_inner(cursors, batches, writer, less, eq_payload);
+}
+
+/// Wide-region (`pk_stride > 16`) closure builder. Splits on the payload
+/// row comparator (the only remaining 2-way axis — there is no packed-`u128`
+/// fast/slow PK axis for a wide region) and forwards to the single generic
+/// driver.
+#[inline]
+fn merge_run_wide(
+    cursors: &mut [MemBatchCursor],
+    batches: &[SortedMemBatch],
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+) {
+    if columnar::schema_is_int_nonnull(schema) {
+        merge_run_wide_with(cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+    } else {
+        merge_run_wide_with(cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    }
+}
+
+/// Wide-region `less`/`eq_payload`. `less` ignores `node.key` (the low-16
+/// prefix is not a valid ordered-comparison input for a wide region) and
+/// routes the two rows' raw PK bytes through `compare_pk_bytes`, payload
+/// tiebreak on a PK tie. `eq_payload` adds the column-aware PK equality term
+/// so a prefix collision (distinct wide PKs sharing their low-16 bytes and a
+/// payload) is not folded into one summed group. The `drive_merge`
+/// `cur_key != group_key` prefix reject still fires for the common case;
+/// only a prefix collision pays the `compare_pk_bytes` walk.
+#[inline]
+fn merge_run_wide_with<RowCmp>(
+    cursors: &mut [MemBatchCursor],
+    batches: &[SortedMemBatch],
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+{
+    let less = |a: &HeapNode, b: &HeapNode| -> bool {
+        let ba = &batches[a.source_idx];
+        let bb = &batches[b.source_idx];
+        match columnar::compare_pk_bytes(schema, ba.get_pk_bytes(a.row),
+                                                 bb.get_pk_bytes(b.row)) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => row_cmp(schema, &ba.0, a.row, &bb.0, b.row)
+                == Ordering::Less,
+        }
+    };
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        columnar::compare_pk_bytes(schema, batches[a_src].get_pk_bytes(a_row),
+                                           batches[b_src].get_pk_bytes(b_row))
+            == Ordering::Equal
+        && row_cmp(schema, &batches[a_src].0, a_row,
+                           &batches[b_src].0, b_row) == Ordering::Equal
+    };
+    merge_batches_inner(cursors, batches, writer, less, eq_payload);
+}
+
+/// Single generic N-way merge driver body. Monomorphised on the `less` and
+/// `eq_payload` closure types its caller selects per PK width — each width
+/// compiles to its own branch-free copy of the hot loop with no width term
+/// inside. The `u128` key handed to the heap (via `peek_key`) is the exact
+/// packed PK for narrow and the low-16 prefix for wide; `less` orders
+/// correctly for both (narrow reads `node.key`, wide reads raw PK bytes).
+#[inline]
+fn merge_batches_inner<L, EQ>(
+    cursors: &mut [MemBatchCursor],
+    batches: &[SortedMemBatch],
+    writer: &mut DirectWriter,
+    less: L,
+    eq_payload: EQ,
+) where
+    L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+    EQ: Fn(usize, usize, usize, usize) -> bool,
+{
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| {
@@ -572,10 +653,7 @@ fn merge_batches_inner<RowCmp, PkCmp>(
                 None
             }
         },
-        |a_src, a_row, b_src, b_row| {
-            row_cmp(schema, &batches[a_src].0, a_row,
-                            &batches[b_src].0, b_row) == Ordering::Equal
-        },
+        eq_payload,
         |src, row| batches[src].get_weight(row),
         |group_src, group_row, _key, w| {
             writer.write_row(&batches[group_src], group_row, w);
@@ -596,18 +674,22 @@ pub fn sort_and_consolidate(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    assert_narrow_pk_region!(schema);
     let n = batch.count;
     if n == 0 {
         return;
     }
 
-    dispatch_pk_row!(schema, sort_consolidate_inner(n, batch, schema, writer));
+    if schema.pk_stride() as usize > 16 {
+        sort_consolidate_wide(n, batch, schema, writer);
+    } else {
+        dispatch_pk_row!(schema, sort_consolidate_inner(n, batch, schema, writer));
+    }
 }
 
-/// Shared sort-plus-consolidate body. `pk_cmp` orders the sort; group
-/// detection inside `drain_groups_into` stays u128 equality, which is
-/// byte-order-agnostic so it stays correct on the packed PK region.
+/// Narrow-region sort-plus-consolidate body. `pk_cmp` orders the sort; the
+/// `SortEntry.pk` is the exact packed PK, so the `cur_pk == pending_pk`
+/// reject in `drain_groups_into` is exact and the `pk_eq` term is the
+/// DCE'd `|_, _| true` — group detection is bit-for-bit as before.
 #[inline]
 fn sort_consolidate_inner<RowCmp, PkCmp>(
     n: usize,
@@ -628,7 +710,56 @@ fn sort_consolidate_inner<RowCmp, PkCmp>(
         Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
         ord => ord,
     });
+    drain_groups_into(n, batch, schema, writer, row_cmp, |_, _| true,
+        |pos| (entries[pos].idx as usize, entries[pos].pk));
+}
+
+/// Wide-region (`pk_stride > 16`) sort-plus-consolidate. The sort orders by
+/// `compare_pk_bytes` (the packed low-16 prefix is not a valid ordering),
+/// payload tiebreak on a PK tie. `SortEntry.pk` is still the low-16 prefix
+/// so the `cur_pk == pending_pk` O(1) reject in `drain_groups_into` stays
+/// live; a prefix collision falls through to the `compare_pk_bytes` `pk_eq`
+/// term. Splits only on the payload row comparator.
+#[inline]
+fn sort_consolidate_wide(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+) {
+    if columnar::schema_is_int_nonnull(schema) {
+        sort_consolidate_wide_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+    } else {
+        sort_consolidate_wide_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    }
+}
+
+#[inline]
+fn sort_consolidate_wide_with<RowCmp>(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+{
+    let mut entries: Vec<SortEntry> = (0..n as u32)
+        .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
+        .collect();
+
+    entries.sort_unstable_by(|a, b| {
+        match columnar::compare_pk_bytes(schema, batch.get_pk_bytes(a.idx as usize),
+                                                 batch.get_pk_bytes(b.idx as usize)) {
+            Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
+            ord => ord,
+        }
+    });
     drain_groups_into(n, batch, schema, writer, row_cmp,
+        |p, c| columnar::compare_pk_bytes(schema, batch.get_pk_bytes(p),
+                                                  batch.get_pk_bytes(c)) == Ordering::Equal,
         |pos| (entries[pos].idx as usize, entries[pos].pk));
 }
 
@@ -639,21 +770,45 @@ pub fn fold_sorted(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    assert_narrow_pk_region!(schema);
     let n = batch.count;
     if n == 0 {
         return;
     }
-    // No ordered PK comparison here: input is already sorted and group
-    // detection inside `drain_groups_into` is u128 equality on the packed
-    // region, which is byte-order-agnostic and correct for any narrow stride.
+    // No ordered PK comparison here: input is already sorted. Group
+    // detection in `drain_groups_into` is the `cur_pk == pending_pk` packed
+    // prefix reject plus a width-selected `pk_eq`: the DCE'd `|_, _| true`
+    // for narrow (the prefix is the exact PK), `compare_pk_bytes` for wide
+    // (the prefix is only an O(1) inequality filter).
+    let wide = schema.pk_stride() as usize > 16;
     if columnar::schema_is_int_nonnull(schema) {
-        drain_groups_into(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
+        fold_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), wide);
+    } else {
+        fold_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi), wide);
+    }
+}
+
+/// `fold_sorted` closure dispatcher: selects the width-appropriate `pk_eq`
+/// once (not per row) and forwards to the single generic drain.
+#[inline]
+fn fold_with<RowCmp>(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+    wide: bool,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+{
+    if wide {
+        drain_groups_into(n, batch, schema, writer, row_cmp,
+            |p, c| columnar::compare_pk_bytes(schema, batch.get_pk_bytes(p),
+                                                      batch.get_pk_bytes(c)) == Ordering::Equal,
             |pos| (pos, pack_pk_le(batch.get_pk_bytes(pos))));
     } else {
-        drain_groups_into(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
+        drain_groups_into(n, batch, schema, writer, row_cmp, |_, _| true,
             |pos| (pos, pack_pk_le(batch.get_pk_bytes(pos))));
     }
 }
@@ -663,15 +818,25 @@ pub fn fold_sorted(
 /// `resolve(pos)` maps an iteration position to `(batch_row_idx, pk)`.
 /// For `sort_and_consolidate` this is an indirection through a sorted index array;
 /// for `fold_sorted` the input is already sorted so `pos == batch_row_idx`.
+///
+/// `pk_eq` is the width-selected PK-equality term. `cur_pk == pending_pk`
+/// (the packed prefix) is the O(1) reject for both widths — exact for
+/// narrow, an inequality filter for wide. Narrow callers pass `|_, _| true`
+/// (DCE'd: group detection is then bit-for-bit the historic
+/// `cur_pk == pending_pk && row_cmp == Equal`); wide callers pass a
+/// `compare_pk_bytes` walk that only runs on a prefix collision.
 #[inline]
-fn drain_groups_into<RowCmp>(
+fn drain_groups_into<RowCmp, PkEq>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
+    pk_eq: PkEq,
     resolve: impl Fn(usize) -> (usize, u128),
-) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    PkEq: Fn(usize, usize) -> bool + Copy,
 {
     let (mut pending_idx, mut pending_pk) = resolve(0);
     let mut pending_weight = batch.get_weight(pending_idx);
@@ -679,6 +844,7 @@ fn drain_groups_into<RowCmp>(
     for pos in 1..n {
         let (cur_idx, cur_pk) = resolve(pos);
         let same_group = cur_pk == pending_pk
+            && pk_eq(pending_idx, cur_idx)
             && row_cmp(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
 
         if same_group {
@@ -2431,49 +2597,299 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "merge requires a 1")]
-    fn region_canary_wide_panics() {
-        let schema = make_schema_compound_pk_24();
-        let mut out_pk: Vec<u8> = Vec::new();
-        let mut out_w: Vec<u8> = Vec::new();
-        let mut out_n: Vec<u8> = Vec::new();
-        let mut out_c: Vec<u8> = Vec::new();
-        let mut out_b: Vec<u8> = Vec::new();
-        let mut writer = DirectWriter {
-            pk: &mut out_pk,
-            pk_stride: 24,
-            weight: &mut out_w,
-            null_bmp: &mut out_n,
-            col_bufs: vec![&mut out_c],
-            blob: &mut out_b,
-            blob_cache: BlobCacheGuard::acquire(&schema, 0),
-            count: 0,
-            schema,
-        };
-        merge_batches(&[], &schema, &mut writer);
+    // -----------------------------------------------------------------------
+    // Wide-region merge dispatch (pk_stride > 16): N u64 PK columns. The
+    // packed `u128` key is only the low-16 LE prefix here, so ordered
+    // comparison and group detection rest entirely on `compare_pk_bytes`.
+    // PKs are deliberately constructed so the first two columns (= the low
+    // 16 bytes) collide while a later column differs: the prefix fast-reject
+    // does NOT fire, exercising the `compare_pk_bytes` term directly.
+    // -----------------------------------------------------------------------
+
+    // `MAX_PK_COLUMNS == 5`, so the 64/80-byte strides use U128 PK columns
+    // rather than 8/10 U64 columns.
+    const WIDE_24: &[u8] = &[type_code::U64, type_code::U64, type_code::U64];
+    const WIDE_64: &[u8] =
+        &[type_code::U128, type_code::U128, type_code::U128, type_code::U128];
+    const WIDE_80: &[u8] = &[
+        type_code::U128, type_code::U128, type_code::U128,
+        type_code::U128, type_code::U128,
+    ];
+
+    /// Schema with the given PK column type codes + one I64 payload.
+    fn wide_schema(tcs: &[u8]) -> SchemaDescriptor {
+        let mut cols: Vec<SchemaColumn> =
+            tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
+        cols.push(SchemaColumn::new(type_code::I64, 0));
+        let pk: Vec<u32> = (0..tcs.len() as u32).collect();
+        SchemaDescriptor::new(&cols, &pk)
+    }
+
+    fn col_w(tc: u8) -> usize {
+        match tc {
+            type_code::U64 => 8,
+            type_code::U128 => 16,
+            _ => unreachable!(),
+        }
+    }
+
+    /// PK bytes: col0 = `lead`, last col = `tail`, all middle columns 0.
+    /// The packed low-16 prefix is fully determined by the leading columns
+    /// (col0, plus zeros), so two PKs sharing `lead` but differing in `tail`
+    /// collide in the prefix yet are distinct under `compare_pk_bytes`
+    /// (which orders col0 → … → last). Holds for every stride here.
+    fn wpk(tcs: &[u8], lead: u128, tail: u128) -> Vec<u8> {
+        let last = tcs.len() - 1;
+        let mut v = Vec::new();
+        for (i, &tc) in tcs.iter().enumerate() {
+            let val: u128 = if i == 0 {
+                lead
+            } else if i == last {
+                tail
+            } else {
+                0
+            };
+            v.extend_from_slice(&val.to_le_bytes()[..col_w(tc)]);
+        }
+        v
+    }
+
+    fn wide_writer_run(
+        schema: &SchemaDescriptor,
+        total_rows: usize,
+        run: impl FnOnce(&mut DirectWriter),
+    ) -> Vec<(Vec<u8>, i64, i64)> {
+        let stride = schema.pk_stride() as usize;
+        let rows = total_rows.max(1);
+        let mut out_pk = vec![0u8; rows * stride];
+        let mut out_w = vec![0u8; rows * 8];
+        let mut out_n = vec![0u8; rows * 8];
+        let mut out_c = vec![0u8; rows * 8];
+        let mut out_b: Vec<u8> = Vec::with_capacity(1);
+        let count;
+        {
+            let mut writer = DirectWriter {
+                pk: &mut out_pk,
+                pk_stride: stride as u8,
+                weight: &mut out_w,
+                null_bmp: &mut out_n,
+                col_bufs: vec![&mut out_c],
+                blob: &mut out_b,
+                blob_cache: BlobCacheGuard::acquire(schema, 0),
+                count: 0,
+                schema: *schema,
+            };
+            assert!(writer.pk_stride > 16, "wide test must exceed 16-byte PK");
+            run(&mut writer);
+            count = writer.row_count();
+        }
+        (0..count)
+            .map(|i| {
+                let pk = out_pk[i * stride..(i + 1) * stride].to_vec();
+                let w = i64::from_le_bytes(out_w[i * 8..i * 8 + 8].try_into().unwrap());
+                let v = i64::from_le_bytes(out_c[i * 8..i * 8 + 8].try_into().unwrap());
+                (pk, w, v)
+            })
+            .collect()
+    }
+
+    fn run_merge_wide(
+        batches: &[Batch],
+        schema: &SchemaDescriptor,
+    ) -> Vec<(Vec<u8>, i64, i64)> {
+        let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+        let sorted: Vec<SortedMemBatch> = mem
+            .iter()
+            .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
+            .collect();
+        let total: usize = sorted.iter().map(|b| b.count).sum();
+        wide_writer_run(schema, total, |w| {
+            merge_batches(&sorted, schema, w);
+        })
+    }
+
+    fn run_consolidate_wide(
+        b: &Batch,
+        schema: &SchemaDescriptor,
+    ) -> Vec<(Vec<u8>, i64, i64)> {
+        let mb = b.as_mem_batch();
+        let total = mb.count;
+        wide_writer_run(schema, total, |w| {
+            sort_and_consolidate(&mb, schema, w);
+        })
+    }
+
+    fn run_fold_wide(
+        b: &Batch,
+        schema: &SchemaDescriptor,
+    ) -> Vec<(Vec<u8>, i64, i64)> {
+        let mb = b.as_mem_batch();
+        let total = mb.count;
+        wide_writer_run(schema, total, |w| {
+            fold_sorted(&mb, schema, w);
+        })
     }
 
     #[test]
-    #[should_panic(expected = "merge requires a 1")]
-    fn region_canary_zero_panics() {
-        let schema = SchemaDescriptor::default();
-        assert_eq!(schema.pk_stride(), 0);
-        let mut out_pk: Vec<u8> = Vec::new();
-        let mut out_w: Vec<u8> = Vec::new();
-        let mut out_n: Vec<u8> = Vec::new();
-        let mut out_b: Vec<u8> = Vec::new();
-        let mut writer = DirectWriter {
-            pk: &mut out_pk,
-            pk_stride: 0,
-            weight: &mut out_w,
-            null_bmp: &mut out_n,
-            col_bufs: vec![],
-            blob: &mut out_b,
-            blob_cache: BlobCacheGuard::acquire(&schema, 0),
-            count: 0,
-            schema,
-        };
-        merge_batches(&[], &schema, &mut writer);
+    fn wide_nway_merge_ordering_low16_collision() {
+        for (tcs, want_stride) in
+            [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)]
+        {
+            let s = wide_schema(tcs);
+            assert_eq!(s.pk_stride() as usize, want_stride);
+            // A < B < C < D < E by compare_pk_bytes. B,C,D share col0
+            // (= the low-16 prefix); only the trailing column distinguishes
+            // them, so the packed-prefix reject cannot separate them.
+            let a = wpk(tcs, 0, 0);
+            let b = wpk(tcs, 1, 0);
+            let c = wpk(tcs, 1, 1);
+            let d = wpk(tcs, 1, 2);
+            let e = wpk(tcs, 2, 0);
+            // Three sorted batches, each internally ordered.
+            let b1 = make_batch_bytes(&s, &[(a.clone(), 1, 0), (c.clone(), 1, 2)]);
+            let b2 = make_batch_bytes(&s, &[(b.clone(), 1, 1), (e.clone(), 1, 4)]);
+            let b3 = make_batch_bytes(&s, &[(d.clone(), 1, 3)]);
+            let out = run_merge_wide(&[b1, b2, b3], &s);
+            assert_eq!(out.len(), 5, "stride={want_stride}: distinct low16-colliding PKs must not fold");
+            assert_eq!(
+                out.iter().map(|r| r.2).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3, 4],
+                "stride={want_stride}: payload order tracks compare_pk_bytes order",
+            );
+            let expect_pks = [a, b, c, d, e];
+            for (i, r) in out.iter().enumerate() {
+                assert_eq!(r.0, expect_pks[i], "stride={want_stride}: pk row {i}");
+                assert_eq!(r.1, 1, "stride={want_stride}: weight row {i}");
+            }
+            // Output is fully ordered under the column-aware comparator.
+            for w in out.windows(2) {
+                assert_eq!(
+                    columnar::compare_pk_bytes(&s, &w[0].0, &w[1].0),
+                    Ordering::Less,
+                    "stride={want_stride}: output not strictly ordered by compare_pk_bytes",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_distinct_pk_identical_payload_not_folded() {
+        // Two rows: different wide PKs sharing the 16-byte prefix, identical
+        // (weight-1, val=42) payload. Without the compare_pk_bytes term in
+        // the wide `eq_payload` these would fold into one summed group.
+        let tcs = WIDE_24;
+        let s = wide_schema(tcs);
+        let p1 = wpk(tcs, 7, 0);
+        let p2 = wpk(tcs, 7, 1);
+        let b1 = make_batch_bytes(&s, &[(p1.clone(), 1, 42)]);
+        let b2 = make_batch_bytes(&s, &[(p2.clone(), 1, 42)]);
+        let out = run_merge_wide(&[b1, b2], &s);
+        assert_eq!(out.len(), 2, "prefix-colliding distinct PKs must stay separate");
+        assert_eq!(out[0], (p1, 1, 42));
+        assert_eq!(out[1], (p2, 1, 42));
+    }
+
+    #[test]
+    fn wide_consolidation_sum_ghost_and_payload_order() {
+        let tcs = WIDE_64;
+        let s = wide_schema(tcs);
+        let p = wpk(tcs, 5, 5);
+
+        // Same PK + same payload across two batches → weights sum.
+        let sum = run_merge_wide(
+            &[
+                make_batch_bytes(&s, &[(p.clone(), 1, 9)]),
+                make_batch_bytes(&s, &[(p.clone(), 2, 9)]),
+            ],
+            &s,
+        );
+        assert_eq!(sum, vec![(p.clone(), 3, 9)]);
+
+        // Net-zero (ghost) dropped.
+        let ghost = run_merge_wide(
+            &[
+                make_batch_bytes(&s, &[(p.clone(), 1, 9)]),
+                make_batch_bytes(&s, &[(p.clone(), -1, 9)]),
+            ],
+            &s,
+        );
+        assert_eq!(ghost.len(), 0);
+
+        // Same PK, different payload → two rows in payload order.
+        let two = run_merge_wide(
+            &[
+                make_batch_bytes(&s, &[(p.clone(), 1, 200)]),
+                make_batch_bytes(&s, &[(p.clone(), 1, 100)]),
+            ],
+            &s,
+        );
+        assert_eq!(two.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200]);
+        assert!(two.iter().all(|r| r.0 == p && r.1 == 1));
+    }
+
+    #[test]
+    fn wide_fold_sorted_prefix_collision_and_identical_payload() {
+        let tcs = WIDE_24;
+        let s = wide_schema(tcs);
+        // Pre-sorted: (1,1,0) and (1,1,1) collide in low 16 AND carry an
+        // identical payload (val=0); they must remain two distinct rows.
+        // (1,1,2) is a third distinct PK.
+        let p0 = wpk(tcs, 1, 0);
+        let p1 = wpk(tcs, 1, 1);
+        let p2 = wpk(tcs, 1, 2);
+        let b = make_batch_bytes(
+            &s,
+            &[(p0.clone(), 1, 0), (p1.clone(), 1, 0), (p2.clone(), 1, 5)],
+        );
+        let out = run_fold_wide(&b, &s);
+        assert_eq!(out.len(), 3, "distinct prefix-colliding PKs must not fold");
+        assert_eq!(out[0], (p0, 1, 0));
+        assert_eq!(out[1], (p1, 1, 0));
+        assert_eq!(out[2], (p2, 1, 5));
+
+        // Adjacent same PK + same payload DOES fold; net-zero drops.
+        let q = wpk(tcs, 2, 2);
+        let r = wpk(tcs, 3, 3);
+        let b2 = make_batch_bytes(
+            &s,
+            &[(q.clone(), 1, 7), (q.clone(), 1, 7), (r.clone(), 1, -1), (r.clone(), -1, -1)],
+        );
+        let out2 = run_fold_wide(&b2, &s);
+        assert_eq!(out2, vec![(q, 2, 7)]);
+    }
+
+    #[test]
+    fn wide_sort_and_consolidate_matches_merge() {
+        let tcs = WIDE_24;
+        let s = wide_schema(tcs);
+        // Unsorted rows incl. prefix collisions, a consolidating pair, and a
+        // ghost pair. compare_pk_bytes order: (1,1,0) < (1,1,2) < (4,4,4).
+        let k0 = wpk(tcs, 1, 0);
+        let k1 = wpk(tcs, 1, 2);
+        let k2 = wpk(tcs, 4, 4);
+        let rows: Vec<(Vec<u8>, i64, i64)> = vec![
+            (k2.clone(), 1, 30),
+            (k0.clone(), 1, 10),
+            (k1.clone(), 1, 20),
+            (k0.clone(), 2, 10),       // consolidates with row 1
+            (k2.clone(), -1, 30),      // ghost-cancels row 0
+        ];
+        let out = run_consolidate_wide(&make_batch_bytes(&s, &rows), &s);
+        // (4,4,4) cancels out; (1,1,0) sums to weight 3.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (k0.clone(), 3, 10));
+        assert_eq!(out[1], (k1.clone(), 1, 20));
+
+        // Feeding the same rows through merge_batches as one sorted cursor
+        // (pre-sorted by compare_pk_bytes) yields the identical result.
+        let sorted_rows: Vec<(Vec<u8>, i64, i64)> = vec![
+            (k0.clone(), 1, 10),
+            (k0.clone(), 2, 10),
+            (k1.clone(), 1, 20),
+            (k2.clone(), 1, 30),
+            (k2.clone(), -1, 30),
+        ];
+        let via_merge = run_merge_wide(&[make_batch_bytes(&s, &sorted_rows)], &s);
+        assert_eq!(via_merge, out);
     }
 }
