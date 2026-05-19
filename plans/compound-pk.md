@@ -3,13 +3,15 @@
 Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
 to have exactly one PK column.
 
-The storage and merge layers are already generalised: `pk_stride` accepts
-the full `0..=MAX_PK_BYTES` range, the `Batch` / `MemBatch` / `MappedShard`
-PK-bytes accessors (`get_pk_bytes`, `extend_pk_bytes`, `set_pk_at_bytes`)
-exist, the column-aware `compare_pk_bytes` comparator is live (signed- and
-float-aware), and the in-memory N-way merge / sort+consolidate / weight-fold
-order and consolidate compound PKs of any width via `compare_pk_bytes`
-(narrow regions on the packed-u128 key, wide regions on the raw PK bytes).
+Storage and merge already handle compound and wide PK regions end-to-end:
+`pk_stride` accepts the full `0..=MAX_PK_BYTES` range, the `Batch` /
+`MemBatch` / `MappedShard` PK-bytes accessors (`get_pk_bytes`,
+`extend_pk_bytes`, `set_pk_at_bytes`) exist, the column-aware
+`compare_pk_bytes` comparator is live (signed- and float-aware), the
+in-memory N-way merge / sort+consolidate / weight-fold order and
+consolidate compound PKs of any width via `compare_pk_bytes` (narrow
+regions on the packed-u128 key, wide regions on the raw PK bytes), and
+hash partition routing covers any width through `partition_for_pk_bytes`.
 
 What remains is every boundary that still calls
 `SchemaDescriptor::pk_index_single()` — catalog, `compiler.rs`,
@@ -25,9 +27,9 @@ after the next. PK columns are *not* duplicated into payload regions —
 the PK region is the PK. Ordered comparison goes through the
 column-aware `compare_pk_bytes` helper, which iterates `pk_columns()`
 with type dispatch, mirroring `compare_rows`'s payload loop. The
-single-PK case stays on its u128-keyed fast paths (hash partition
-routing, XOR8 keys, `HeapNode.key`, shard `pk_min`/`pk_max` as u128);
-compound PK adds a parallel slower path with no cost to single-PK.
+single-PK case stays on its u128-keyed fast paths (XOR8 keys,
+`HeapNode.key`, shard `pk_min`/`pk_max` as u128); compound PK adds a
+parallel slower path with no cost to single-PK.
 
 ## Scope
 
@@ -72,10 +74,9 @@ Out:
 - Two orthogonal axes gate the storage dispatch:
   - **Region width** (`pk_stride <= 16` vs `pk_stride > 16`): governs
     which storage path can keep the PK packed in a u128 word. Order-
-    agnostic fast paths — hash partition routing, XOR8 build, the
-    `extend_pk(u128)` writer — work whenever the region fits in 16
-    bytes, regardless of column count, because they treat the region
-    as opaque bytes.
+    agnostic byte paths — XOR8 build, the `extend_pk(u128)` writer —
+    keep the region in a u128 whenever it fits in 16 bytes, regardless
+    of column count, because they treat the region as opaque bytes.
   - **Column count** (`pk_count == 1` vs `pk_count >= 2`): governs
     which comparison path is correct. `pk_count == 1` allows a u128
     numerical compare on the PK region. For `pk_count >= 2`, ordering
@@ -94,44 +95,25 @@ Out:
 
 ### 1. Storage batch (`storage/batch.rs`)
 
-`pk_stride` already accepts the full `0..=MAX_PK_BYTES` range, and the
-narrow-PK `get_pk` / `extend_pk` / `set_pk_at` family already keeps its
-`match stride { 8 | 16 => …, _ => panic! }` shape (those panics guard
-the u128 API against wide-stride misuse; compound-PK code paths use the
-bytes accessors instead). The remaining work here:
+`pk_stride` already accepts the full `0..=MAX_PK_BYTES` range, the
+bytes accessors (`extend_pk_bytes`, `set_pk_at_bytes`, `get_pk_bytes`)
+exist, and the narrow-PK `get_pk` / `extend_pk` / `set_pk_at` family
+keeps its `match stride { 8 | 16 => …, _ => panic! }` shape (those
+panics guard the u128 API against wide-stride misuse; compound-PK code
+paths use the bytes accessors instead). The remaining work here:
 
 - `Batch::append_row_from_ptable_found` takes `pk: u128`; change to
   `pk_bytes: &[u8]` using `extend_pk_bytes`. `PartitionedTable`'s
   found-row plumbing (`storage/partitioned_table.rs`) follows: the
   found-row PK is retained as bytes and surfaced via
-  `PartitionedTable::found_pk_bytes()`.
+  `PartitionedTable::found_pk_bytes()` (alongside the existing
+  `found_null_word` / `found_col_ptr` / `found_blob_ptr`).
 - `Batch::find_lower_bound(key: u128)` stays as the narrow-PK helper.
   Add `find_lower_bound_bytes(&[u8])` for compound, routing through
-  `compare_pk_bytes`. The shard-reader equivalent (`shard_reader.rs`)
-  gets the same pair.
+  `compare_pk_bytes`. The shard-reader and read-cursor equivalents
+  (`shard_reader.rs`, `read_cursor.rs`) get the same pair.
 
-### 2. Partition routing (`storage/partitioned_table.rs`)
-
-```rust
-pub fn partition_for_key(pk: u128) -> usize;          // narrow (exists)
-pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize; // wide (new)
-```
-
-Narrow path keeps the existing multiplicative hash on the u128 value.
-Wide path hashes the bytes via xxh3 → u128, then runs the same
-multiplicative hash. Same 256-bucket output; same hash-route property.
-
-`extract_col_key` and `partition_for_row` in `ops/exchange.rs`
-dispatch on `pk_stride`. The PK-routing fast paths stay for narrow PK;
-compound-PK PK-routing repartition goes through the bytes variant.
-
-`pk_cache: [u128; 256]` in `ops/exchange.rs` stays a u128 array. For
-`pk_stride ≤ 16` it caches the packed concat (as now); for
-`pk_stride > 16` the consumer ignores the cache and fetches bytes from
-the source on demand (the same indirection the wide-region merge path
-already uses).
-
-### 3. XOR8 (`storage/xor8.rs`, `storage/shard_file.rs`)
+### 2. XOR8 (`storage/xor8.rs`, `storage/shard_file.rs`)
 
 XOR8 builds on `&[u128]` keys (`xor8::build(&pks: &[u128])`). Keep
 that API. `build_xor8_from_pk_region` today only handles stride 8 / 16;
@@ -156,7 +138,7 @@ fn build_xor8_from_pk_region(pk_ptr, pk_sz, n) -> Option<Filter> {
 The probe API takes a u128 key; callers compute it the same way build
 does. False-positive rate unchanged.
 
-### 4. Shard `pk_min` / `pk_max` (`storage/shard_index.rs`, `storage/manifest.rs`)
+### 3. Shard `pk_min` / `pk_max` (`storage/shard_index.rs`, `storage/manifest.rs`)
 
 `ShardEntry`, `LevelGuard`, `PendingShard`:
 
@@ -168,7 +150,7 @@ pub struct PkBuf {
 
 struct ShardEntry {
     ...
-    pk_min: PkBuf,   // was: u128
+    pk_min: PkBuf,
     pk_max: PkBuf,
 }
 ```
@@ -189,7 +171,7 @@ vs `256` = `[0x00, 0x01, 0, …]`).
 `pk_max` as `u128 LE` at fixed offsets. Replace with `(len: u8,
 bytes: [u8; MAX_PK_BYTES])` pairs; `ENTRY_SIZE_V*` widens accordingly.
 
-### 5. WAL block (`runtime/sal.rs`, `storage/wal.rs`)
+### 4. WAL block (`runtime/sal.rs`, `storage/wal.rs`)
 
 The WAL block format declares region 0 as "pk", region 1 "weight",
 region 2 "null_bmp", regions 3+ payload, last region blob; per-region
@@ -213,7 +195,7 @@ Touch points:
 The on-disk WAL layout is unchanged conceptually; only region 0's
 contents widen.
 
-### 6. Wire control block (`gnitz-wire/src/lib.rs::control`)
+### 5. Wire control block (`gnitz-wire/src/lib.rs::control`)
 
 `CONTROL_COLS` declares `seek_pk: U128`. For wide PK that's
 insufficient. Add `seek_pk_extra: BLOB nullable` carrying bytes 16..
@@ -221,11 +203,10 @@ for wide PK; empty for `pk_stride ≤ 16`. The fast path
 (`encode_ctrl_block_template_fast`) stays a memcpy of the precomputed
 template plus the patch fields; wide PK falls through to
 `encode_ctrl_block_ipc`, which already handles a blob region for
-`error_msg`.
-
-(Replacing `seek_pk: U128` with `seek_pk: BLOB` is cleaner on paper
-but breaks the template-copy fast path `CTRL_BLOCK_TEMPLATE` in
-`runtime/wire.rs`, which dominates the error-response cost. Rejected.)
+`error_msg`. (Keep `seek_pk: U128` rather than widening it to BLOB:
+a BLOB `seek_pk` would break the template-copy fast path
+`CTRL_BLOCK_TEMPLATE` in `runtime/wire.rs`, which dominates the
+error-response cost.)
 
 `gnitz-engine/src/runtime/wire.rs`:
 
@@ -235,7 +216,7 @@ but breaks the template-copy fast path `CTRL_BLOCK_TEMPLATE` in
   `CTRL_BLOCK_SIZE_NO_BLOB` grows by one region's fixed bytes (0 for a
   blob region, but `align8` may add padding).
 
-### 7. Wire data plane: `ZSetBatch` PK encoding
+### 6. Wire data plane: `ZSetBatch` PK encoding
 
 `gnitz-core::ZSetBatch` carries client-side PK columns as a `PkColumn`
 enum (`gnitz-core/src/protocol/types.rs`) with `U64s(Vec<u64>)` and
@@ -259,7 +240,7 @@ same `stride` from the table's schema. `ZSetBatch::new` replaces
 serialize each extracted PK column into LE bytes in `pk_indices()`
 order and push to the chosen variant.
 
-### 8. Catalog: persist the PK column list
+### 7. Catalog: persist the PK column list
 
 `TABLE_TAB`'s `pk_col_idx: u64` field (`catalog/sys_tables.rs`) is the
 persistence site. Repack it as:
@@ -303,7 +284,7 @@ Touch points:
 System tables stay single-PK; `make_schema(cols, pk_index)` continues
 to wrap a single index.
 
-### 9. SQL planner (`gnitz-sql/src/planner.rs`)
+### 8. SQL planner (`gnitz-sql/src/planner.rs`)
 
 CREATE TABLE:
 
@@ -367,7 +348,7 @@ DML (`gnitz-sql/src/dml.rs`):
 - `try_extract_pk_in`: only single-column IN lists. Compound-PK tables
   → no IN-pushdown for now (correct fallback).
 
-### 10. Python / C API surface
+### 9. Python / C API surface
 
 - `gnitz-py/src/lib.rs`: `PySchema.pk_index` →
   `PySchema.pk_indices: Vec<u32>`. Existing single-PK code paths read
@@ -376,7 +357,7 @@ DML (`gnitz-sql/src/dml.rs`):
   `pk_count: u32` and `pk_cols: *const u32`. Existing single-column
   callers pass `pk_count = 1, &single_idx`.
 
-### 11. Operators
+### 10. Operators
 
 #### map_reindex
 
@@ -451,9 +432,10 @@ row's PK region bytes →
 #### Index / GI / AVI (`ops/index.rs`)
 
 Secondary indexes today hand-pack `(indexed_col_value, source_pk)`
-into a u128 composite key, relying on the source PK fitting in 64 bits
-and the indexed column promoting to a 64-bit order-preserving key.
-With compound source PKs that pack no longer fits; drop the
+into a u128 composite key (`(gc_u64 << 64) | source_pk_lo`, with
+`spk_hi` as an I64 payload), relying on the source PK fitting in 64
+bits and the indexed column promoting to a 64-bit order-preserving
+key. With compound source PKs that pack no longer fits; drop the
 hand-packing and make the secondary-index table itself a compound-PK
 table.
 
@@ -470,6 +452,14 @@ table.
 Ingest at `op_integrate_with_indexes` writes each PK column directly
 (`extend_pk_bytes` over the concatenated bytes), and the storage layer
 sorts via `compare_pk_bytes`.
+
+**Master index-routing cache.** `extract_col_key`'s PK-col branch and
+`PartitionRouter` (`ops/exchange.rs`) — the master-side
+unique-secondary-index unicast cache keyed `(tid, col_idx, u128)` —
+still funnel the key through `get_pk` and a u128 map key, which
+truncates a wide source PK. Generalise the cache key to carry the full
+`(stride, bytes)` PK so a compound source PK routes without collision.
+This is the only PK-routing site that still assumes a ≤16-byte key.
 
 **Lookup is a prefix scan.** A `WHERE indexed = X` query binds only
 the leading PK column — the source PK is what we're finding, not
@@ -500,7 +490,7 @@ Single-PK sources also benefit: the index table becomes
 `(gc_u64 << 64) | spk_lo` u128 trick — cleaner with no extra cost
 since `pk_stride == 16` is on the narrow-region fast path.
 
-### 12. Range / scan operations (`storage/read_cursor.rs`)
+### 11. Range / scan operations (`storage/read_cursor.rs`)
 
 `seek(key: u128)` stays the narrow-PK entry point; add
 `seek_bytes(key: &[u8])` for wide PK. Both call the same

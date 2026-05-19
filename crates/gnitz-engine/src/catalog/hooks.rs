@@ -107,7 +107,7 @@ impl CatalogEngine {
             let tid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64;
             let name = self.read_batch_string(batch, i, 1);
-            let pk_col_idx = self.read_batch_u64(batch, i, 3) as u32;
+            let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
             let flags = self.read_batch_u64(batch, i, 5);
             let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
 
@@ -127,12 +127,7 @@ impl CatalogEngine {
                     ));
                 }
 
-                if (pk_col_idx as usize) < col_defs.len() {
-                    let pk_type = col_defs[pk_col_idx as usize].type_code;
-                    if pk_type != type_code::U64 && pk_type != type_code::U128 && pk_type != type_code::UUID {
-                        return Err(format!("Primary Key must be TYPE_U64, TYPE_U128, or UUID, got type_code={}", pk_type));
-                    }
-                }
+                validate_pk_cols(&col_defs, &pk)?;
 
                 if col_defs.len() > crate::schema::MAX_COLUMNS {
                     return Err(format!(
@@ -145,7 +140,7 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid);
-                let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk_col_idx);
+                let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
 
                 let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);
@@ -223,7 +218,7 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = format!("{}/{}/view_{}_{}", self.base_dir, schema_name, name, vid);
-                let view_schema = self.build_schema_from_col_defs(&col_defs, 0);
+                let view_schema = self.build_schema_from_col_defs(&col_defs, &[0]);
 
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);

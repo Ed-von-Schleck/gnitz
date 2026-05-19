@@ -9,11 +9,11 @@ fn test_fk_lock_set() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Table with no constraints (unique_pk=false): no lock needed, empty set.
-    let plain_tid = engine.create_table("public.plain", &[u64_col_def("id")], 0, false).unwrap();
+    let plain_tid = engine.create_table("public.plain", &[u64_col_def("id")], &[0], false).unwrap();
     assert!(engine.fk_lock_set(plain_tid).is_empty());
 
     // unique_pk=true table, no FK yet: needs a lock for itself, but no peers.
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
     assert_eq!(engine.fk_lock_set(parent_tid), vec![parent_tid]);
 
     // Add a child with FK to parent. Now both tables share a lock neighborhood,
@@ -23,7 +23,7 @@ fn test_fk_lock_set() {
         ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.child", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
     let mut expected = vec![parent_tid, child_tid];
     expected.sort_unstable();
     assert_eq!(engine.fk_lock_set(child_tid), expected, "child sees parent in its lock set");
@@ -35,7 +35,7 @@ fn test_fk_lock_set() {
         ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child2_tid = engine.create_table("public.child2", &child2_cols, 0, true).unwrap();
+    let child2_tid = engine.create_table("public.child2", &child2_cols, &[0], true).unwrap();
     let mut expected3 = vec![parent_tid, child_tid, child2_tid];
     expected3.sort_unstable();
     assert_eq!(engine.fk_lock_set(parent_tid), expected3);
@@ -59,7 +59,7 @@ fn test_fk_referential_integrity() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Parent table
-    let parent_tid = engine.create_table("public.parents", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parents", &[u64_col_def("pid")], &[0], true).unwrap();
 
     // Child table with FK
     let child_cols = vec![
@@ -67,7 +67,7 @@ fn test_fk_referential_integrity() {
         ColumnDef { name: "pid_fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.children", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.children", &child_cols, &[0], true).unwrap();
 
     // Insert valid parent
     let parent_schema = engine.get_schema(parent_tid).unwrap();
@@ -106,13 +106,13 @@ fn test_fk_nullability_and_retractions() {
     let dir = temp_dir("fk_null");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_tid = engine.create_table("public.p", &[u64_col_def("id")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.p", &[u64_col_def("id")], &[0], true).unwrap();
     let child_cols = vec![
         u64_col_def("id"),
         ColumnDef { name: "pid_fk".into(), type_code: type_code::U64, is_nullable: true,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.c", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.c", &child_cols, &[0], true).unwrap();
 
     // NULL FK should be allowed even if parent is empty
     let child_schema = engine.get_schema(child_tid).unwrap();
@@ -142,13 +142,13 @@ fn test_fk_drop_protections() {
     let dir = temp_dir("fk_prot");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "pid_fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    engine.create_table("public.child", &child_cols, 0, true).unwrap();
+    engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Cannot drop parent (referenced by child)
     assert!(engine.drop_table("public.parent").is_err());
@@ -173,7 +173,7 @@ fn test_fk_invalid_targets() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.p",
-        &[u64_col_def("pk"), i64_col_def("other")], 0, true).unwrap();
+        &[u64_col_def("pk"), i64_col_def("other")], &[0], true).unwrap();
 
     // FK targeting non-PK column (col_idx=1) should fail
     let bad_cols = vec![
@@ -181,7 +181,7 @@ fn test_fk_invalid_targets() {
         ColumnDef { name: "fk".into(), type_code: type_code::I64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 1 },
     ];
-    assert!(engine.create_table("public.c_bad", &bad_cols, 0, true).is_err());
+    assert!(engine.create_table("public.c_bad", &bad_cols, &[0], true).is_err());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -201,7 +201,7 @@ fn test_fk_self_reference() {
         ColumnDef { name: "mgr_id".into(), type_code: type_code::U64, is_nullable: true,
                     fk_table_id: next_tid, fk_col_idx: 0 },
     ];
-    let emp_tid = engine.create_table("public.employees", &emp_cols, 0, true).unwrap();
+    let emp_tid = engine.create_table("public.employees", &emp_cols, &[0], true).unwrap();
     assert_eq!(emp_tid, next_tid);
 
     engine.close();
@@ -215,13 +215,13 @@ fn test_fk_parent_restrict_blocks_delete() {
     let dir = temp_dir("fk_restrict");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.child", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Insert parent PK=10
     let ps = engine.get_schema(parent_tid).unwrap();
@@ -274,13 +274,13 @@ fn test_fk_parent_map_cleanup() {
     let dir = temp_dir("fk_pmap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    engine.create_table("public.child", &child_cols, 0, true).unwrap();
+    engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Verify parent_map populated
     assert!(!engine.fk_children_of(parent_tid).is_empty());
@@ -304,7 +304,7 @@ fn test_fk_multiple_children_same_parent() {
     let dir = temp_dir("fk_multi_child");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], 0, true).unwrap();
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
 
     let mk_child = |engine: &mut CatalogEngine, name: &str| -> i64 {
         let cols = vec![
@@ -312,7 +312,7 @@ fn test_fk_multiple_children_same_parent() {
             ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
                         fk_table_id: parent_tid, fk_col_idx: 0 },
         ];
-        engine.create_table(name, &cols, 0, true).unwrap()
+        engine.create_table(name, &cols, &[0], true).unwrap()
     };
     let child1_tid = mk_child(&mut engine, "public.child1");
     let child2_tid = mk_child(&mut engine, "public.child2");
@@ -368,7 +368,7 @@ fn test_fk_u128() {
 
     // U128 parent
     let parent_tid = engine.create_table("public.uparents",
-        &[u128_col_def("uuid")], 0, true).unwrap();
+        &[u128_col_def("uuid")], &[0], true).unwrap();
 
     // U128 FK child
     let child_cols = vec![
@@ -376,7 +376,7 @@ fn test_fk_u128() {
         ColumnDef { name: "ufk".into(), type_code: type_code::U128, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uchildren", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uchildren", &child_cols, &[0], true).unwrap();
 
     // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
     let parent_schema = engine.get_schema(parent_tid).unwrap();

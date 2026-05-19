@@ -114,7 +114,7 @@ fn test_sequence_gap_recovery() {
     // First open: create a table, then inject a table record with high ID 250
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        engine.create_table("public.t1", &cols, 0, true).unwrap();
+        engine.create_table("public.t1", &cols, &[0], true).unwrap();
 
         // Inject table record for tid=250 directly into sys_tables
         let tbl_schema = table_tab_schema();
@@ -154,7 +154,7 @@ fn test_sequence_gap_recovery() {
     // Re-open: sequence should recover to 251
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let new_tid = engine.create_table("public.tnext", &cols, 0, true).unwrap();
+        let new_tid = engine.create_table("public.tnext", &cols, &[0], true).unwrap();
         assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {}", new_tid);
         engine.close();
     }
@@ -169,7 +169,7 @@ fn test_ingest_scan_seek_family() {
     let dir = temp_dir("catalog_ingest_scan_seek");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     // Ingest via CatalogEngine (user table path)
@@ -206,7 +206,7 @@ fn test_ingest_unique_pk_partitioned() {
     let dir = temp_dir("catalog_unique_pk_partitioned");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     // Insert row with PK=1, val=100
@@ -278,7 +278,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     engine.set_ddl_zone_lsn(7);
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let _tid = engine.create_table("z.t", &cols, 0, false).unwrap();
+    let _tid = engine.create_table("z.t", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
     assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5,
@@ -286,7 +286,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
     engine.set_ddl_zone_lsn(9);
-    let _tid2 = engine.create_table("z.t2", &cols, 0, false).unwrap();
+    let _tid2 = engine.create_table("z.t2", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 9);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 9);
 
@@ -310,7 +310,7 @@ fn test_raw_store_ingest() {
     let dir = temp_dir("catalog_raw_store_ingest");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     // Raw ingest (SAL recovery path — no hooks, no unique_pk, no index projection)
@@ -334,7 +334,7 @@ fn test_partition_management() {
     let dir = temp_dir("catalog_partition_mgmt");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let _tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    let _tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     // These should not panic
     engine.set_active_partitions(0, 64);
@@ -353,7 +353,7 @@ fn test_fk_index_metadata_queries() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid = engine.create_table("public.parent", &cols, 0, false).unwrap();
+    let tid = engine.create_table("public.parent", &cols, &[0], false).unwrap();
 
     // Create child table with FK to parent
     let child_cols = vec![
@@ -366,7 +366,7 @@ fn test_fk_index_metadata_queries() {
             fk_col_idx: 0,
         },
     ];
-    let child_tid = engine.create_table("public.child", &child_cols, 0, false).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], false).unwrap();
 
     // FK count
     assert!(engine.get_fk_count(child_tid) > 0);
@@ -396,8 +396,8 @@ fn test_iter_user_table_ids_and_lsn() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid1 = engine.create_table("public.t1", &cols, 0, false).unwrap();
-    let tid2 = engine.create_table("public.t2", &cols, 0, false).unwrap();
+    let tid1 = engine.create_table("public.t1", &cols, &[0], false).unwrap();
+    let tid2 = engine.create_table("public.t2", &cols, &[0], false).unwrap();
 
     let ids = engine.iter_user_table_ids();
     assert!(ids.contains(&tid1));
@@ -421,7 +421,7 @@ fn test_get_column_names_cached() {
         ColumnDef { name: "alpha".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "beta".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     let names1 = engine.get_column_names(tid);
     assert_eq!(names1, vec!["pk", "alpha", "beta"]);

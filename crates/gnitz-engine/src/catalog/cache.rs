@@ -190,7 +190,12 @@ impl CatalogEngine {
 
             if weight > 0 {
                 let pk_col = if is_table {
-                    self.read_batch_u64(batch, i, 3) as u32 // TABLETAB_COL_PK_COL_IDX
+                    // apply_pk_col_of fires before hook_table_register, so a
+                    // crafted flag-set count-0 value reaches here before
+                    // validate_pk_cols rejects it; unwrap_or(0) keeps this
+                    // read panic-free (the row's hook still returns Err).
+                    unpack_pk_cols(self.read_batch_u64(batch, i, 3))
+                        .as_slice().first().copied().unwrap_or(0)
                 } else {
                     0u32 // views always pk_col=0
                 };

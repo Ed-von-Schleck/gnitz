@@ -129,7 +129,7 @@ impl CatalogEngine {
         &mut self,
         qualified_name: &str,
         col_defs: &[ColumnDef],
-        pk_col_idx: u32,
+        pk_cols: &[u32],
         unique_pk: bool,
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
@@ -146,31 +146,24 @@ impl CatalogEngine {
         if col_defs.len() > crate::schema::MAX_COLUMNS {
             return Err(format!("Maximum {} columns supported", crate::schema::MAX_COLUMNS));
         }
-        if pk_col_idx as usize >= col_defs.len() {
-            return Err("Primary Key index out of bounds".into());
-        }
 
-        // Validate PK type (must be U64, U128, or UUID)
-        let pk_type = col_defs[pk_col_idx as usize].type_code;
-        if pk_type != type_code::U64 && pk_type != type_code::U128 && pk_type != type_code::UUID {
-            return Err("Primary Key must be TYPE_U64, TYPE_U128, or UUID".into());
-        }
-
-        // PK must be non-nullable: the row layout reserves no null bit for the
-        // PK region (foundations.md §6), so a nullable PK is internally
-        // inconsistent regardless of the type.
-        if col_defs[pk_col_idx as usize].is_nullable {
-            return Err("Primary Key column must not be nullable".into());
-        }
+        let raw_pk_cols = pack_pk_cols(pk_cols);
+        let pk = unpack_pk_cols(raw_pk_cols);
+        validate_pk_cols(col_defs, &pk)?;
 
         let tid = self.allocate_table_id();
         let sid = self.get_schema_id(schema_name);
-        let self_pk_type = col_defs[pk_col_idx as usize].type_code;
+        // Index the validated copy, not the raw `pk_cols` argument:
+        // `validate_pk_cols` ran against `pk`, so `pk.as_slice()[0]` is
+        // the value proven in-bounds and PK-eligible.
+        let first_pk = pk.as_slice()[0];
+        let self_pk_type = col_defs[first_pk as usize].type_code;
 
-        // Validate FK columns
+        // Validate FK columns. Compound-parent FK resolution is out of
+        // scope; single-PK behaviour is preserved via the first PK column.
         for (col_idx, cd) in col_defs.iter().enumerate() {
             if cd.fk_table_id != 0 {
-                self.validate_fk_column(cd, col_idx, tid, pk_col_idx, self_pk_type)?;
+                self.validate_fk_column(cd, col_idx, tid, first_pk, self_pk_type)?;
             }
         }
 
@@ -188,7 +181,7 @@ impl CatalogEngine {
             bb.put_u64(sid as u64);
             bb.put_string(table_name);
             bb.put_string(&directory);
-            bb.put_u64(pk_col_idx as u64);
+            bb.put_u64(raw_pk_cols);
             bb.put_u64(0); // created_lsn
             bb.put_u64(flags);
             bb.end_row();

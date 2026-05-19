@@ -17,7 +17,7 @@ fn test_uuid_pk_create_and_drop() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let tid = engine.create_table("public.uuid_tab",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
     let s = engine.get_schema(tid).unwrap();
     assert_eq!(s.columns[0].type_code, type_code::UUID);
 
@@ -34,7 +34,7 @@ fn test_uuid_non_pk_column() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![u64_col_def("id"), uuid_col_def("uid")];
-    let tid = engine.create_table("public.uuid_payload", &cols, 0, true).unwrap();
+    let tid = engine.create_table("public.uuid_payload", &cols, &[0], true).unwrap();
     let s = engine.get_schema(tid).unwrap();
     assert_eq!(s.columns[1].type_code, type_code::UUID);
 
@@ -59,7 +59,7 @@ fn test_uuid_secondary_index() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![u64_col_def("id"), uuid_col_def("uid")];
-    let tid = engine.create_table("public.uuid_idxtab", &cols, 0, true).unwrap();
+    let tid = engine.create_table("public.uuid_idxtab", &cols, &[0], true).unwrap();
     let s = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(s);
@@ -86,14 +86,14 @@ fn test_uuid_fk_valid_single() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi", &child_cols, &[0], true).unwrap();
 
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
@@ -121,14 +121,14 @@ fn test_uuid_fk_invalid_single() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par2",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi2", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi2", &child_cols, &[0], true).unwrap();
 
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
@@ -149,14 +149,14 @@ fn test_uuid_fk_multiple_children_same_parent() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par3",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi3", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi3", &child_cols, &[0], true).unwrap();
 
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
@@ -187,14 +187,14 @@ fn test_uuid_fk_multiple_children_mixed() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par4",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi4", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi4", &child_cols, &[0], true).unwrap();
 
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
@@ -225,14 +225,14 @@ fn test_uuid_fk_parent_not_yet_ingested() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par5",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi5", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi5", &child_cols, &[0], true).unwrap();
 
     // No parent rows ingested
     let child_schema = engine.get_schema(child_tid).unwrap();
@@ -254,14 +254,14 @@ fn test_uuid_fk_nullable_column() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par6",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     let child_cols = vec![
         u64_col_def("cid"),
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: true,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    let child_tid = engine.create_table("public.uuid_chi6", &child_cols, 0, true).unwrap();
+    let child_tid = engine.create_table("public.uuid_chi6", &child_cols, &[0], true).unwrap();
 
     // NULL FK should be accepted even with no parent rows
     let child_schema = engine.get_schema(child_tid).unwrap();
@@ -283,7 +283,7 @@ fn test_uuid_fk_u64pk_parent_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.u64par",
-        &[u64_col_def("id")], 0, true).unwrap();
+        &[u64_col_def("id")], &[0], true).unwrap();
 
     // UUID FK child → U64 PK parent should fail DDL
     let child_cols = vec![
@@ -291,7 +291,7 @@ fn test_uuid_fk_u64pk_parent_rejected() {
         ColumnDef { name: "uid_fk".into(), type_code: type_code::UUID, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    assert!(engine.create_table("public.uuid_chi7", &child_cols, 0, true).is_err());
+    assert!(engine.create_table("public.uuid_chi7", &child_cols, &[0], true).is_err());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -305,7 +305,7 @@ fn test_uuid_fk_u128_col_references_uuid_pk() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par8",
-        &[uuid_col_def("id")], 0, true).unwrap();
+        &[uuid_col_def("id")], &[0], true).unwrap();
 
     // U128 FK column → UUID PK parent should fail (different type codes)
     let child_cols = vec![
@@ -313,7 +313,7 @@ fn test_uuid_fk_u128_col_references_uuid_pk() {
         ColumnDef { name: "uid_fk".into(), type_code: type_code::U128, is_nullable: false,
                     fk_table_id: parent_tid, fk_col_idx: 0 },
     ];
-    assert!(engine.create_table("public.uuid_chi8", &child_cols, 0, true).is_err());
+    assert!(engine.create_table("public.uuid_chi8", &child_cols, &[0], true).is_err());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

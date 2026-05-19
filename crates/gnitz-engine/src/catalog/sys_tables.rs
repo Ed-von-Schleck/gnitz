@@ -46,6 +46,91 @@ pub(super) const TABLETAB_COL_CREATED_LSN: usize = 5;
 pub(super) const TABLETAB_COL_FLAGS: usize = 6;
 pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
 
+pub(super) const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
+
+pub(super) struct PkColList {
+    cols: [u32; 4],
+    len: usize,
+}
+
+impl PkColList {
+    /// The count exactly as decoded from the wire. May be 0 or >4 for a
+    /// malformed/crafted packed value — deliberately NOT clamped, because
+    /// `validate_pk_cols` gates on this raw value to reject out-of-range
+    /// counts. Not a safe slice length: iterate `as_slice()` instead.
+    pub(super) fn decoded_count(&self) -> usize { self.len }
+    /// Always in bounds: indexes at most the 4-element backing array even
+    /// when the decoded count is out of range. A crafted wire count of
+    /// 5..=15 must NOT panic here — it has to survive long enough to
+    /// reach `validate_pk_cols` and be returned as `Err`.
+    pub(super) fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(4)] }
+}
+
+pub(super) fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
+    // assert! (not debug_assert!): a violated contract here corrupts the
+    // persisted PK encoding via the `& 0x7f` mask, so it must fail in
+    // release too rather than silently truncate.
+    assert!((1..=4).contains(&pk_cols.len()), "pack_pk_cols: count out of range 1..=4");
+    let mut v = pk_cols.len() as u64;            // bits [0..4)
+    for (i, &c) in pk_cols.iter().enumerate() {
+        assert!(c < 128, "pack_pk_cols: column index {c} exceeds 7-bit field");
+        v |= (c as u64 & 0x7f) << (4 + 7 * i);
+    }
+    v | PK_LIST_PACKED_FLAG
+}
+
+pub(super) fn unpack_pk_cols(packed: u64) -> PkColList {
+    if packed & PK_LIST_PACKED_FLAG == 0 {
+        // Bare single index: an unmodified gnitz-core client, or an
+        // engine-written system-table row (always bare `0`).
+        return PkColList { cols: [packed as u32, 0, 0, 0], len: 1 };
+    }
+    let n = (packed & 0xf) as usize;             // 0..=15, validated later
+    let mut cols = [0u32; 4];
+    for (i, slot) in cols.iter_mut().enumerate().take(n.min(4)) {
+        *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
+    }
+    PkColList { cols, len: n }
+}
+
+/// Hard-validate a decoded PK list against the table's columns. Shared by
+/// the production wire path (`hook_table_register`) and the test-only
+/// `ddl.rs::create_table` so both reject identically rather than falling
+/// through to a `SchemaDescriptor::new` `assert!`. `pk.decoded_count()`
+/// (the raw decoded count, not the clamped slice length) is what gates
+/// 1..=4, so a crafted count of 5..=15 is rejected rather than silently
+/// truncated.
+pub(super) fn validate_pk_cols(
+    col_defs: &[super::types::ColumnDef],
+    pk: &PkColList,
+) -> Result<(), String> {
+    if !(1..=4).contains(&pk.decoded_count()) {
+        return Err(format!(
+            "Primary Key column count {} out of range 1..=4", pk.decoded_count()));
+    }
+    let cols = pk.as_slice();
+    for (j, &c) in cols.iter().enumerate() {
+        if (c as usize) >= col_defs.len() {
+            return Err("Primary Key index out of bounds".into());
+        }
+        let cd = &col_defs[c as usize];
+        if cd.type_code != type_code::U64
+            && cd.type_code != type_code::U128
+            && cd.type_code != type_code::UUID {
+            return Err(format!(
+                "Primary Key must be TYPE_U64, TYPE_U128, or UUID, \
+                 got type_code={}", cd.type_code));
+        }
+        if cd.is_nullable {
+            return Err("Primary Key column must not be nullable".into());
+        }
+        if cols[..j].contains(&c) {
+            return Err("Primary Key has duplicate column".into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) const SCHEMATAB_COL_NAME: usize = 1;
 
 pub(super) const VIEWTAB_COL_SCHEMA_ID: usize = 1;
@@ -250,5 +335,41 @@ pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
         CIRCUIT_EDGES_TAB_ID         => S_CIRCUIT_EDGES,
         CIRCUIT_NODE_COLUMNS_TAB_ID  => S_CIRCUIT_NODE_COLUMNS,
         _ => unreachable!("Unknown system table ID: {}", id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pk_col_packing() {
+        for case in [
+            vec![0u32],
+            vec![7],
+            vec![0, 1],
+            vec![3, 9, 40, 64],
+        ] {
+            let list = unpack_pk_cols(pack_pk_cols(&case));
+            assert_eq!(list.decoded_count(), case.len());
+            assert_eq!(list.as_slice(), case.as_slice());
+        }
+
+        // Reserved bits [32..63) are zero, bit 63 is set on packed values.
+        let packed = pack_pk_cols(&[3, 9, 40, 64]);
+        assert_eq!(packed >> 63, 1);
+        assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0);
+
+        // Bare-index fallback (flag clear → single index).
+        assert_eq!(unpack_pk_cols(0).as_slice(), &[0]);
+        assert_eq!(unpack_pk_cols(0).decoded_count(), 1);
+        assert_eq!(unpack_pk_cols(7).as_slice(), &[7]);
+        assert_eq!(unpack_pk_cols(7).decoded_count(), 1);
+
+        // Malformed flag-set value with an out-of-range count: as_slice
+        // and decoded_count must be panic-free, slice clamped by min(4).
+        let malformed = unpack_pk_cols(PK_LIST_PACKED_FLAG | 15);
+        assert_eq!(malformed.decoded_count(), 15);
+        assert_eq!(malformed.as_slice(), &[0, 0, 0, 0]);
     }
 }

@@ -731,7 +731,7 @@ impl CatalogEngine {
         Ok(defs)
     }
 
-    pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_index: u32) -> SchemaDescriptor {
+    pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_cols: &[u32]) -> SchemaDescriptor {
         assert!(
             col_defs.len() <= crate::schema::MAX_COLUMNS,
             "build_schema_from_col_defs: too many columns ({}) for entity (type_codes: {:?})",
@@ -742,7 +742,7 @@ impl CatalogEngine {
         for (i, cd) in col_defs.iter().enumerate() {
             cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
         }
-        SchemaDescriptor::new(&cols[..col_defs.len()], &[pk_index])
+        SchemaDescriptor::new(&cols[..col_defs.len()], pk_cols)
     }
 
     // -- FK constraint queries ---------------------------------------------
