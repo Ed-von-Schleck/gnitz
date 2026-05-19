@@ -25,7 +25,7 @@ mod error;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 pub use table::{Table, FlushOutcome, FlushWork};
-pub use partitioned_table::{PartitionedTable, partition_for_key, partition_arena_size};
+pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
 pub use read_cursor::CursorHandle;
 pub use batch::{Batch, ConsolidatedBatch, write_to_batch, decode_mem_batch_from_wal_block};
 pub use merge::{MemBatch, scatter_copy, scatter_multi_source};
@@ -33,7 +33,7 @@ pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use read_cursor::{DrainGuard, ReadCursor};
-pub(crate) use columnar::{compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
+pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter};
 pub(crate) use batch::carve_writer_slices;
 

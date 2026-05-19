@@ -514,7 +514,7 @@ pub fn merge_batches(
     // `is_wide` derives from the runtime `&schema`; it only selects which
     // monomorphised closure set is handed to the single generic driver
     // `merge_batches_inner` — it is never a term inside the hot loop.
-    if schema.pk_stride() as usize > 16 {
+    if schema.pk_is_wide() {
         merge_run_wide(&mut cursors, batches, schema, writer);
     } else {
         dispatch_pk_row!(schema, merge_run_narrow(&mut cursors, batches, schema, writer));
@@ -679,7 +679,7 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    if schema.pk_stride() as usize > 16 {
+    if schema.pk_is_wide() {
         sort_consolidate_wide(n, batch, schema, writer);
     } else {
         dispatch_pk_row!(schema, sort_consolidate_inner(n, batch, schema, writer));
@@ -779,7 +779,7 @@ pub fn fold_sorted(
     // prefix reject plus a width-selected `pk_eq`: the DCE'd `|_, _| true`
     // for narrow (the prefix is the exact PK), `compare_pk_bytes` for wide
     // (the prefix is only an O(1) inequality filter).
-    let wide = schema.pk_stride() as usize > 16;
+    let wide = schema.pk_is_wide();
     if columnar::schema_is_int_nonnull(schema) {
         fold_with(n, batch, schema, writer,
             |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), wide);

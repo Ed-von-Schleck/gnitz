@@ -5,7 +5,7 @@
 
 use std::rc::Rc;
 
-use crate::schema::SchemaDescriptor;
+use crate::schema::{NARROW_PK_MAX_BYTES, SchemaDescriptor};
 use super::batch::Batch;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
@@ -82,9 +82,16 @@ impl PartitionedTable {
         for _ in 0..np {
             part_indices.push(Vec::new());
         }
-        for i in 0..mb.count {
-            let p = partition_for_key(mb.get_pk(i));
-            part_indices[p].push(i as u32);
+        if mb.pk_stride as usize > NARROW_PK_MAX_BYTES {
+            for i in 0..mb.count {
+                let p = partition_for_pk_bytes(mb.get_pk_bytes(i));
+                part_indices[p].push(i as u32);
+            }
+        } else {
+            for i in 0..mb.count {
+                let p = partition_for_key(mb.get_pk(i));
+                part_indices[p].push(i as u32);
+            }
         }
 
         let offset = self.part_offset as usize;
@@ -297,17 +304,40 @@ impl Drop for PartitionedTable {
 // Hash routing
 // ---------------------------------------------------------------------------
 
-#[inline]
-pub fn partition_for_key(pk: u128) -> usize {
-    // Multiplicative hash: two Fibonacci multipliers XOR'd together.
-    // ~4 instructions vs ~20 for XXH3-64; distribution across 256 buckets
-    // is sufficient for worker routing. XXH3 is reserved for filters
-    // (xor8, bloom) where collision quality matters.
+// Multiplicative hash: two Fibonacci multipliers XOR'd together.
+// ~4 instructions vs ~20 for XXH3-64; distribution across 256 buckets
+// is sufficient for worker routing. XXH3 is reserved for filters
+// (xor8, bloom) where collision quality matters.
+#[inline(always)]
+fn mix(pk: u128) -> usize {
     let lo = pk as u64;
     let hi = (pk >> 64) as u64;
     let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64)
              ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
     (h >> 56) as usize
+}
+
+#[inline]
+pub fn partition_for_key(pk: u128) -> usize {
+    mix(pk)
+}
+
+/// Route a raw PK region (any width) to a partition. For `len ≤ 16` this
+/// is exactly `partition_for_key` of the same bytes zero-extended to
+/// `u128` — the narrow-PK hash invariance every narrow caller relies on.
+/// For wide regions (`len > 16`) it takes the top 8 bits of xxh3 directly:
+/// xxh3 is already uniformly distributed, so funnelling it back through
+/// `mix` (whose `hi·M2` term is a dead zero for a zero-extended `u64`)
+/// would add an instruction without adding entropy.
+#[inline]
+pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
+    if bytes.len() <= 16 {
+        let mut b = [0u8; 16];
+        b[..bytes.len()].copy_from_slice(bytes);
+        mix(u128::from_le_bytes(b))
+    } else {
+        (crate::xxh::checksum(bytes) >> 56) as usize
+    }
 }
 
 pub fn partition_arena_size(num_partitions: u32) -> u64 {
@@ -433,6 +463,108 @@ mod tests {
 
         let (_, found) = pt.retract_pk(99);
         assert!(!found);
+    }
+
+    fn make_wide_schema() -> SchemaDescriptor {
+        // 3×U64 compound PK → pk_stride = 24 (> 16, wide).
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    #[test]
+    fn partition_for_pk_bytes_narrow_invariance() {
+        // For every narrow width, routing the physically-stored bytes must
+        // equal partition_for_key of the same value zero-extended to u128.
+        let vals: [u128; 9] = [
+            0, 1, 7, 42, 255, 65537, 0x0123_4567_89ab_cdef,
+            u64::MAX as u128, u128::MAX,
+        ];
+        for &v in &vals {
+            for &len in &[1usize, 2, 4, 8, 16] {
+                let full = v.to_le_bytes();
+                let bytes = &full[..len];
+                let mut z = [0u8; 16];
+                z[..len].copy_from_slice(bytes);
+                let zext = u128::from_le_bytes(z);
+                assert_eq!(
+                    partition_for_pk_bytes(bytes),
+                    partition_for_key(zext),
+                    "len={len} v={v:#x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partition_for_pk_bytes_wide_determinism_and_spread() {
+        for &stride in &[24usize, 64, 80] {
+            // Determinism: same bytes → same bucket; always in 0..256.
+            let mut seen = [false; 256];
+            let mut buckets = 0;
+            for k in 0u64..4000 {
+                let mut pk = vec![0u8; stride];
+                pk[..8].copy_from_slice(&k.to_le_bytes());
+                pk[8..16].copy_from_slice(&(k.wrapping_mul(2654435761)).to_le_bytes());
+                let p = partition_for_pk_bytes(&pk);
+                assert!(p < 256, "stride={stride} k={k} p={p}");
+                assert_eq!(p, partition_for_pk_bytes(&pk), "deterministic");
+                if !seen[p] {
+                    seen[p] = true;
+                    buckets += 1;
+                }
+            }
+            assert!(buckets > 64, "stride={stride}: only {buckets}/256 buckets hit");
+        }
+    }
+
+    #[test]
+    fn ingest_owned_batch_wide_routing() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("wide_test");
+        let schema = make_wide_schema();
+        // Only partition 0 is live. Per-partition Table::ingest (and its
+        // memtable upsert, which still calls get_pk and is an out-of-scope
+        // boundary for wide PKs) only runs for rows routed to partition 0.
+        // We feed only PKs that route elsewhere, so this exercises the new
+        // wide *routing* loop end-to-end with no downstream Table ingest.
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 700, 256, false, 0, 1,
+            partition_arena_size(256),
+        ).unwrap();
+
+        let mut batch = Batch::with_schema(schema, 256);
+        let mut n = 0;
+        let mut k = 0u64;
+        while n < 200 {
+            let mut pk = [0u8; 24];
+            pk[..8].copy_from_slice(&(k * 7 + 13).to_le_bytes());
+            pk[8..16].copy_from_slice(&(k * 31 + 5).to_le_bytes());
+            pk[16..24].copy_from_slice(&(k + 1).to_le_bytes());
+            k += 1;
+            if partition_for_pk_bytes(&pk) == 0 {
+                continue; // would hit the out-of-scope memtable boundary
+            }
+            batch.extend_pk_bytes(&pk);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &(n as i64).to_le_bytes());
+            batch.count += 1;
+            n += 1;
+        }
+        batch.sorted = false;
+        batch.consolidated = false;
+        // The wide-PK routing loop must not panic (get_pk would, for
+        // pk_stride > 16). All rows route outside the single live
+        // partition, so no Table::ingest is invoked.
+        pt.ingest_owned_batch(batch).unwrap();
     }
 
     #[test]

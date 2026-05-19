@@ -54,6 +54,12 @@ pub const MAX_PK_COLUMNS: usize = 5;
 /// `SchemaDescriptor::new`). Auto-tracks growth of `MAX_PK_COLUMNS`.
 pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 
+/// Widest PK region that still fits in a packed `u128` word. At or below
+/// this width the order-agnostic byte paths keep the PK in a `u128`
+/// (`get_pk`/`partition_for_key`); above it the region is "wide" and must
+/// be handled via the raw-bytes accessors and `compare_pk_bytes`.
+pub const NARROW_PK_MAX_BYTES: usize = 16;
+
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
 /// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
 /// "this slot refers to a PK column, not a payload column". Using
@@ -229,6 +235,15 @@ impl SchemaDescriptor {
     #[inline]
     pub const fn pk_stride(&self) -> u8 {
         self.pk_stride
+    }
+
+    /// True iff the PK region is too wide to pack into a `u128` word
+    /// (`pk_stride > NARROW_PK_MAX_BYTES`). Wide PKs cannot use the
+    /// `get_pk`/`partition_for_key` fast paths and must go through the
+    /// raw-bytes accessors and `compare_pk_bytes`.
+    #[inline]
+    pub const fn pk_is_wide(&self) -> bool {
+        self.pk_stride as usize > NARROW_PK_MAX_BYTES
     }
 
     /// The single PK column index. Use only at boundaries that have not yet

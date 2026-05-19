@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, partition_for_key, write_to_batch, scatter_multi_source};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_pk_bytes, partition_for_key, partition_for_pk_bytes, write_to_batch, scatter_multi_source};
 
 use super::util::extract_group_key;
 
@@ -155,13 +155,20 @@ impl PartitionRouter {
     }
 }
 
+/// True when the routing columns are exactly the single PK column, so
+/// routing can read the PK directly instead of extracting a group key.
+#[inline]
+fn is_single_pk_col(schema: &SchemaDescriptor, col_indices: &[u32]) -> bool {
+    col_indices.len() == 1 && schema.is_pk_col(col_indices[0] as usize)
+}
+
 fn hash_row_for_partition(
     mb: &MemBatch,
     row: usize,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
 ) -> usize {
-    if col_indices.len() == 1 && schema.is_pk_col(col_indices[0] as usize) {
+    if is_single_pk_col(schema, col_indices) {
         return partition_for_key(mb.get_pk(row));
     }
     let pk = extract_group_key(mb, row, schema, col_indices);
@@ -181,9 +188,21 @@ fn fill_worker_indices(
         out.resize_with(num_workers, Vec::new);
     }
     out[..num_workers].iter_mut().for_each(Vec::clear);
-    for i in 0..batch.count {
-        let partition = hash_row_for_partition(&mb, i, col_indices, schema);
-        out[w_map[partition]].push(i as u32);
+    // Hoist the wide-PK discriminator out of the per-row loop: when the
+    // single routing column is a wide PK, `hash_row_for_partition`'s
+    // `get_pk` fast path would panic, so route the raw PK bytes instead.
+    let is_pk = is_single_pk_col(schema, col_indices);
+    let is_wide = schema.pk_is_wide();
+    if is_pk && is_wide {
+        for i in 0..batch.count {
+            let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+            out[w_map[partition]].push(i as u32);
+        }
+    } else {
+        for i in 0..batch.count {
+            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+            out[w_map[partition]].push(i as u32);
+        }
     }
 }
 
@@ -274,11 +293,20 @@ pub fn op_repartition_batches(
         }
         for w in 0..num_workers { worker_rows[w].clear(); }
 
+        let is_pk = is_single_pk_col(schema, col_indices);
+        let is_wide = schema.pk_is_wide();
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt { Some(m) => m, None => continue };
-            for i in 0..mb.count {
-                let partition = hash_row_for_partition(mb, i, col_indices, schema);
-                worker_rows[w_map[partition]].push((si as u8, i as u32));
+            if is_pk && is_wide {
+                for i in 0..mb.count {
+                    let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+                    worker_rows[w_map[partition]].push((si as u8, i as u32));
+                }
+            } else {
+                for i in 0..mb.count {
+                    let partition = hash_row_for_partition(mb, i, col_indices, schema);
+                    worker_rows[w_map[partition]].push((si as u8, i as u32));
+                }
             }
         }
 
@@ -319,10 +347,18 @@ fn relay_scatter_merge_walk(
     }
     worker_rows[..num_workers].iter_mut().for_each(Vec::clear);
 
+    // A low-16 prefix cannot order a wide PK, so the walk splits into two
+    // explicit bodies. The narrow body is the original code verbatim
+    // (get_pk seed/refill, machine code unchanged — no regression); the
+    // wide body orders by compare_pk_bytes and never touches pk_cache, so
+    // the seed is gated by the same is_wide discriminator.
+    let is_wide = schema.pk_is_wide();
     for (si, mb_opt) in mem_batches.iter().enumerate() {
         if let Some(mb) = mb_opt {
             if mb.count > 0 {
-                pk_cache[si] = mb.get_pk(0);
+                if !is_wide {
+                    pk_cache[si] = mb.get_pk(0);
+                }
                 active_sources[num_active] = si as u8;
                 num_active += 1;
             }
@@ -332,18 +368,83 @@ fn relay_scatter_merge_walk(
     // Lifted outside the loop: avoids re-testing every iteration, and lets the
     // PK-routing path call partition_for_key(best_pk) directly instead of going
     // through hash_row_for_partition (which would re-read get_pk).
-    let is_pk_routing = col_indices.len() == 1
-        && schema.is_pk_col(col_indices[0] as usize);
+    let is_pk_routing = is_single_pk_col(schema, col_indices);
 
+    if !is_wide {
+        while num_active > 0 {
+            if num_active == 1 {
+                // Bulk-drain the sole remaining source without PK comparisons.
+                let si = active_sources[0] as usize;
+                let mb = mem_batches[si].as_ref().unwrap();
+                let cur = cursors[si] as usize;
+                if is_pk_routing {
+                    for i in cur..mb.count {
+                        let partition = partition_for_key(mb.get_pk(i));
+                        worker_rows[w_map[partition]].push((si as u8, i as u32));
+                    }
+                } else {
+                    for i in cur..mb.count {
+                        let partition = hash_row_for_partition(mb, i, col_indices, schema);
+                        worker_rows[w_map[partition]].push((si as u8, i as u32));
+                    }
+                }
+                break;
+            }
+
+            // Scan strictly over active sources only.
+            let mut best_pos = 0;
+            let mut best_pk = pk_cache[active_sources[0] as usize];
+            let mut best_si_u8 = active_sources[0];
+            #[allow(clippy::needless_range_loop)]
+            for pos in 1..num_active {
+                let si = active_sources[pos];
+                let pk = pk_cache[si as usize];
+                // Break ties by source index to keep output deterministic;
+                // swap_remove scrambles active_sources so without this the winner
+                // on equal PKs is eviction-history-dependent.
+                if pk < best_pk || (pk == best_pk && si < best_si_u8) {
+                    best_pk = pk;
+                    best_pos = pos;
+                    best_si_u8 = si;
+                }
+            }
+
+            let best_si = active_sources[best_pos] as usize;
+            let i = cursors[best_si] as usize;
+            cursors[best_si] += 1;
+
+            let mb = mem_batches[best_si].as_ref().unwrap();
+            let partition = if is_pk_routing {
+                partition_for_key(best_pk)
+            } else {
+                hash_row_for_partition(mb, i, col_indices, schema)
+            };
+            worker_rows[w_map[partition]].push((best_si as u8, i as u32));
+
+            let new_cur = cursors[best_si] as usize;
+            if new_cur == mb.count {
+                // Swap-remove the exhausted source in O(1).
+                num_active -= 1;
+                active_sources[best_pos] = active_sources[num_active];
+            } else {
+                pk_cache[best_si] = mb.get_pk(new_cur);
+            }
+        }
+        return;
+    }
+
+    // Wide body: order by the column-aware comparator over raw PK bytes
+    // read straight from the source. pk_cache is left untouched here
+    // (neither seeded nor refilled — both gated by !is_wide); ordering
+    // reads bytes on demand. Route wide PK bytes via partition_for_pk_bytes.
     while num_active > 0 {
         if num_active == 1 {
-            // Bulk-drain the sole remaining source without PK comparisons.
             let si = active_sources[0] as usize;
             let mb = mem_batches[si].as_ref().unwrap();
             let cur = cursors[si] as usize;
             if is_pk_routing {
                 for i in cur..mb.count {
-                    let partition = partition_for_key(mb.get_pk(i));
+                    let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
                 }
             } else {
@@ -355,31 +456,38 @@ fn relay_scatter_merge_walk(
             break;
         }
 
-        // Scan strictly over active sources only.
         let mut best_pos = 0;
-        let mut best_pk = pk_cache[active_sources[0] as usize];
         let mut best_si_u8 = active_sources[0];
+        let mut best_si = best_si_u8 as usize;
+        // Cache the winner's PK slice (mirrors the narrow body caching
+        // `best_pk`): without it the best source is re-`unwrap`'d and
+        // re-sliced on every inner iteration, O(num_active) per emitted row.
+        let mut best_pk_bytes =
+            mem_batches[best_si].as_ref().unwrap().get_pk_bytes(cursors[best_si] as usize);
         #[allow(clippy::needless_range_loop)]
         for pos in 1..num_active {
             let si = active_sources[pos];
-            let pk = pk_cache[si as usize];
-            // Break ties by source index to keep output deterministic;
-            // swap_remove scrambles active_sources so without this the winner
-            // on equal PKs is eviction-history-dependent.
-            if pk < best_pk || (pk == best_pk && si < best_si_u8) {
-                best_pk = pk;
+            let si_idx = si as usize;
+            let pk = mem_batches[si_idx].as_ref().unwrap().get_pk_bytes(cursors[si_idx] as usize);
+            // Source-index tiebreak preserved (same determinism reason as
+            // the narrow body's pk_cache tiebreak).
+            let ord = compare_pk_bytes(schema, pk, best_pk_bytes);
+            if ord == std::cmp::Ordering::Less
+                || (ord == std::cmp::Ordering::Equal && si < best_si_u8)
+            {
                 best_pos = pos;
                 best_si_u8 = si;
+                best_si = si_idx;
+                best_pk_bytes = pk;
             }
         }
 
-        let best_si = active_sources[best_pos] as usize;
         let i = cursors[best_si] as usize;
         cursors[best_si] += 1;
 
         let mb = mem_batches[best_si].as_ref().unwrap();
         let partition = if is_pk_routing {
-            partition_for_key(best_pk)
+            partition_for_pk_bytes(mb.get_pk_bytes(i))
         } else {
             hash_row_for_partition(mb, i, col_indices, schema)
         };
@@ -387,12 +495,10 @@ fn relay_scatter_merge_walk(
 
         let new_cur = cursors[best_si] as usize;
         if new_cur == mb.count {
-            // Swap-remove the exhausted source in O(1).
             num_active -= 1;
             active_sources[best_pos] = active_sources[num_active];
-        } else {
-            pk_cache[best_si] = mb.get_pk(new_cur);
         }
+        // Wide body never reads pk_cache for ordering, so no refill.
     }
 }
 
@@ -481,10 +587,20 @@ pub fn op_multi_scatter(
         }
         for slot in flat_indices[..needed].iter_mut() { slot.clear(); }
 
-        for i in 0..n {
-            for si in 0..n_specs {
-                let partition = hash_row_for_partition(&mb, i, col_specs[si], schema);
-                flat_indices[si * num_workers + w_map[partition]].push(i as u32);
+        let is_wide = schema.pk_is_wide();
+        for si in 0..n_specs {
+            let spec = col_specs[si];
+            let is_pk = is_single_pk_col(schema, spec);
+            if is_pk && is_wide {
+                for i in 0..n {
+                    let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+                    flat_indices[si * num_workers + w_map[partition]].push(i as u32);
+                }
+            } else {
+                for i in 0..n {
+                    let partition = hash_row_for_partition(&mb, i, spec, schema);
+                    flat_indices[si * num_workers + w_map[partition]].push(i as u32);
+                }
             }
         }
 
@@ -504,7 +620,7 @@ pub fn op_multi_scatter(
         // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
         for si in 0..n_specs {
             let spec = col_specs[si];
-            if spec.len() == 1 && schema.is_pk_col(spec[0] as usize) {
+            if is_single_pk_col(schema, spec) {
                 if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
                     for batch in results[si].iter_mut().take(num_workers) {
                         if batch.count > 0 {
@@ -613,6 +729,113 @@ mod tests {
 
     fn total_rows(batches: &[Batch]) -> usize {
         batches.iter().map(|b| b.count).sum()
+    }
+
+    fn make_wide_schema() -> SchemaDescriptor {
+        // 3×U64 compound PK → pk_stride = 24 (wide).
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    fn wide_pk(c0: u64, c1: u64, c2: u64) -> [u8; 24] {
+        let mut pk = [0u8; 24];
+        pk[..8].copy_from_slice(&c0.to_le_bytes());
+        pk[8..16].copy_from_slice(&c1.to_le_bytes());
+        pk[16..24].copy_from_slice(&c2.to_le_bytes());
+        pk
+    }
+
+    /// Build a pre-consolidated wide-PK batch. `rows` must already be
+    /// sorted ascending by (c0,c1,c2) with unique PKs.
+    fn make_wide_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], i64, i64)]) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk_bytes(&pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    #[test]
+    fn test_relay_scatter_wide_pk_order_and_routing() {
+        let schema = make_wide_schema();
+        let num_workers = 4;
+        // 3 sources, interleaved, with a low-16 collision: (1,1,*) appears
+        // in all three with differing c2 — prefix-equal, distinguished only
+        // by compare_pk_bytes' third column walk.
+        let b0 = make_wide_batch(&schema, &[
+            (wide_pk(0, 0, 0), 1, 10),
+            (wide_pk(1, 1, 0), 1, 11),
+            (wide_pk(5, 9, 2), 1, 12),
+        ]);
+        let b1 = make_wide_batch(&schema, &[
+            (wide_pk(1, 1, 1), 1, 20),
+            (wide_pk(2, 2, 2), 1, 21),
+            (wide_pk(9, 9, 9), 1, 22),
+        ]);
+        let b2 = make_wide_batch(&schema, &[
+            (wide_pk(1, 1, 2), 1, 30),
+            (wide_pk(3, 3, 3), 1, 31),
+            (wide_pk(7, 0, 0), 1, 32),
+        ]);
+        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
+        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
+
+        assert_eq!(total_rows(&result), 9);
+        for (w, sb) in result.iter().enumerate() {
+            // (a) Non-decreasing under the column-aware comparator.
+            for r in 1..sb.count {
+                let prev = sb.get_pk_bytes(r - 1);
+                let cur = sb.get_pk_bytes(r);
+                assert_ne!(
+                    compare_pk_bytes(&schema, prev, cur),
+                    std::cmp::Ordering::Greater,
+                    "worker {w} row {r} out of order",
+                );
+            }
+            // (b) Every row routed to partition_for_pk_bytes's worker.
+            for r in 0..sb.count {
+                let pk = sb.get_pk_bytes(r);
+                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                assert_eq!(expected, w, "wide PK routed to wrong worker");
+            }
+        }
+    }
+
+    #[test]
+    fn test_relay_scatter_wide_pk_single_source_bulk_drain() {
+        let schema = make_wide_schema();
+        let num_workers = 4;
+        // Exactly one active source → the num_active == 1 bulk-drain path.
+        let b0 = make_wide_batch(&schema, &[
+            (wide_pk(1, 2, 3), 1, 1),
+            (wide_pk(4, 5, 6), 1, 2),
+            (wide_pk(7, 8, 9), 1, 3),
+            (wide_pk(10, 11, 12), 1, 4),
+        ]);
+        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
+        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
+
+        assert_eq!(total_rows(&result), 4);
+        for (w, sb) in result.iter().enumerate() {
+            for r in 0..sb.count {
+                let pk = sb.get_pk_bytes(r);
+                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                assert_eq!(expected, w, "bulk-drain wide PK routed to wrong worker");
+            }
+        }
     }
 
     #[test]
