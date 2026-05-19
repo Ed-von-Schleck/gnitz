@@ -116,6 +116,15 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------
 
+    /// Test-only in-process shortcut for building a table directly in the
+    /// catalog. **Not** a production code path: every real `CREATE TABLE`
+    /// (SQL planner, C-API, `gnitz-py`) goes through
+    /// `gnitz-core::Client::create_table`, which writes the raw `TABLE_TAB`
+    /// batch client-side and pushes it over the wire; the engine then
+    /// ingests it via `ingest_to_family → fire_hooks → hook_table_register`.
+    /// `#[cfg(test)]` keeps this absent from production builds so it cannot
+    /// be misread as the persisted-PK write path.
+    #[cfg(test)]
     pub(crate) fn create_table(
         &mut self,
         qualified_name: &str,
