@@ -120,10 +120,11 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
 /// (zero-extension); signed narrow types use `read_signed`
 /// (sign-extension).
 ///
-/// For `pk_count == 1` this function is unused: existing callers
-/// hold the PK as `u128` and compare directly. It exists to support
-/// `pk_count >= 2` and (eventually) signed single-column PKs.
-#[allow(dead_code)]
+/// Single-column PKs do not reach this function: the merge entry
+/// points truncate the packed `u128` key back to the native type and
+/// compare directly. It is the column-walk comparator for compound
+/// (`pk_count >= 2`) PKs.
+#[inline]
 pub fn compare_pk_bytes(
     schema: &SchemaDescriptor,
     a: &[u8],
@@ -160,6 +161,12 @@ pub fn compare_pk_bytes(
                 let vb = read_signed(&b[off..], cs);
                 va.cmp(&vb)
             }
+            // Mirror `compare_rows` float ordering so PK and payload
+            // float ordering stay identical (total ordering, NaN-safe).
+            TYPE_F64 => f64::from_le_bytes(a[off..off + 8].try_into().unwrap())
+                .total_cmp(&f64::from_le_bytes(b[off..off + 8].try_into().unwrap())),
+            TYPE_F32 => f32::from_le_bytes(a[off..off + 4].try_into().unwrap())
+                .total_cmp(&f32::from_le_bytes(b[off..off + 4].try_into().unwrap())),
             other => panic!(
                 "compare_pk_bytes: type_code {other} is not PK-eligible",
             ),

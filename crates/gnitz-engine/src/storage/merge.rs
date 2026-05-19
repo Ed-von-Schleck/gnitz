@@ -198,7 +198,8 @@ impl<'a> MemBatch<'a> {
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
         let stride = self.pk_stride as usize;
-        &self.pk()[row * stride..(row + 1) * stride]
+        let off = self.offsets[super::batch::REG_PK] as usize + row * stride;
+        &self.data[off..off + stride]
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -264,7 +265,7 @@ impl MemBatchCursor {
     #[inline]
     pub fn peek_key(&self, batch: &SortedMemBatch) -> u128 {
         debug_assert!(self.is_valid());
-        batch.get_pk(self.position)
+        pack_pk_le(batch.get_pk_bytes(self.position))
     }
 }
 
@@ -372,6 +373,125 @@ impl<'a> DirectWriter<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Narrow-region PK key packing + ordered-comparison dispatch
+// ---------------------------------------------------------------------------
+
+/// Zero-extend any `≤ 16`-byte PK region into a `u128`, LE bytes in the low
+/// positions. The explicit `{16,8,4,2,1}` arms are a hot-path
+/// specialisation (stride is a runtime slice length, not a const, so the
+/// generic tail's zero-init + memcpy would not fold away). Truncating the
+/// packed key back to the native type (`as i32`, `from_bits`, …) recovers
+/// the exact original value, which is why single-column PKs never enter the
+/// `compare_pk_bytes` column-walk regardless of signedness.
+#[inline(always)]
+fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
+    match pk_bytes.len() {
+        16 => u128::from_le_bytes(pk_bytes.try_into().unwrap()),
+        8 => u64::from_le_bytes(pk_bytes.try_into().unwrap()) as u128,
+        4 => u32::from_le_bytes(pk_bytes.try_into().unwrap()) as u128,
+        2 => u16::from_le_bytes(pk_bytes.try_into().unwrap()) as u128,
+        1 => pk_bytes[0] as u128,
+        len => {
+            debug_assert!(len <= 16);
+            let mut b = [0u8; 16];
+            b[..len].copy_from_slice(pk_bytes);
+            u128::from_le_bytes(b)
+        }
+    }
+}
+
+/// Hard canary shared by all three merge entry points. Rejects the
+/// structurally-invalid `pk_stride == 0` placeholder (lower bound) and a
+/// wide compound PK (`pk_stride > 16`, unsupported by the packed-u128 key)
+/// reaching the merge (upper bound).
+macro_rules! assert_narrow_pk_region {
+    ($schema:expr) => {
+        assert!(
+            $schema.pk_stride() > 0 && $schema.pk_stride() <= 16,
+            "merge requires a 1–16 byte PK region; found pk_stride={} \
+             (wide compound PK with pk_stride > 16 is unsupported)",
+            $schema.pk_stride(),
+        );
+    };
+}
+
+/// 2×2 monomorphisation over the two orthogonal axes — PK column
+/// type/signedness (`pk_cmp`) and payload column types (`row_cmp`). Emits
+/// four specialised copies of `$inner` so each comparator is inlined. The
+/// row comparators are wrapped as non-capturing closures: a direct fn-item
+/// reference would fix the source-ref lifetime, conflicting with the
+/// inner's HRTB `Fn` bound.
+macro_rules! dispatch_pk_row {
+    ($schema:expr, $inner:ident ( $($pre:expr),* $(,)? )) => {{
+        let slow = make_slow_pk_cmp($schema);
+        let fast = |a: u128, b: u128| a.cmp(&b);
+        match (columnar::schema_is_int_nonnull($schema), pk_is_fast($schema)) {
+            (true, true) => $inner($($pre),*,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), fast),
+            (true, false) => $inner($($pre),*,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), slow),
+            (false, true) => $inner($($pre),*,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi), fast),
+            (false, false) => $inner($($pre),*,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi), slow),
+        }
+    }};
+}
+
+/// True iff the PK is a single unsigned column — selects the fast
+/// `a_key.cmp(&b_key)` arm (packed u128 order == native unsigned order).
+#[inline]
+fn pk_is_fast(schema: &SchemaDescriptor) -> bool {
+    let pk_cols = schema.pk_indices();
+    pk_cols.len() == 1
+        && matches!(
+            schema.columns[pk_cols[0] as usize].type_code,
+            type_code::U8 | type_code::U16 | type_code::U32
+                | type_code::U64 | type_code::U128 | type_code::UUID,
+        )
+}
+
+/// The slow ordered PK comparator for single-column signed/float PKs and for
+/// compound PKs. All loop-invariants are extracted as owned `Copy` scalars
+/// (or the `Copy` `SchemaDescriptor`) *before* the `move` closure so it stays
+/// `Copy` and captures no slice reference (a captured `pk_indices()` slice
+/// would need a lifetime that cannot outlive the entry-point frame).
+#[inline]
+fn make_slow_pk_cmp(schema: &SchemaDescriptor) -> impl Fn(u128, u128) -> Ordering + Copy {
+    let schema_copy = *schema;
+    let pk_cols = schema.pk_indices();
+    let stride = schema.pk_stride() as usize;
+    let is_compound = pk_cols.len() >= 2;
+    let tc = schema.columns[pk_cols[0] as usize].type_code;
+    move |a: u128, b: u128| -> Ordering {
+        if is_compound {
+            // The `[u8; 16]` temporaries must stay inline in the call: they
+            // live only for the duration of `compare_pk_bytes`. The
+            // `len == pk_stride` debug-assert holds because `a`/`b` were
+            // packed from a `pk_stride`-wide region.
+            columnar::compare_pk_bytes(
+                &schema_copy,
+                &a.to_le_bytes()[..stride],
+                &b.to_le_bytes()[..stride],
+            )
+        } else {
+            match tc {
+                type_code::I64 => (a as i64).cmp(&(b as i64)),
+                type_code::I32 => (a as i32).cmp(&(b as i32)),
+                type_code::I16 => (a as i16).cmp(&(b as i16)),
+                type_code::I8 => (a as i8).cmp(&(b as i8)),
+                type_code::F64 => f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64)),
+                type_code::F32 => f32::from_bits(a as u32).total_cmp(&f32::from_bits(b as u32)),
+                // Single-col unsigned is routed to the `fast` closure by
+                // `pk_is_fast`, so it never reaches here; this arm stays a
+                // correct lossless fallback for any unsigned that does.
+                _ => a.cmp(&b),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // merge_batches: the main entry point
 // ---------------------------------------------------------------------------
 
@@ -391,14 +511,7 @@ pub fn merge_batches(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    // Hard `assert!`: callers downstream of this entry point still use the
-    // u128 PK comparator (`SortEntry::pk`, `peek_key`, `drain_groups_into`).
-    // A wider stride here would silently truncate the comparison key.
-    assert!(
-        schema.pk_stride() == 8 || schema.pk_stride() == 16,
-        "compound-PK merge not yet supported; found pk_stride={}",
-        schema.pk_stride(),
-    );
+    assert_narrow_pk_region!(schema);
     let n = batches.len();
     if n == 0 {
         return;
@@ -408,35 +521,34 @@ pub fn merge_batches(
         .map(|i| MemBatchCursor::new(batches[i].count))
         .collect();
 
-    // Wrap as a non-capturing closure: a direct fn-item reference would fix
-    // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
-    if columnar::schema_is_int_nonnull(schema) {
-        merge_batches_inner(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-    } else {
-        merge_batches_inner(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
-    }
+    dispatch_pk_row!(schema, merge_batches_inner(&mut cursors, batches, schema, writer));
 }
 
 /// Monomorphised on the row comparator so LLVM emits two specialised copies
 /// of the merge body — fast/generic — with the comparator inlined.
 #[inline]
-fn merge_batches_inner<RowCmp>(
+fn merge_batches_inner<RowCmp, PkCmp>(
     cursors: &mut [MemBatchCursor],
     batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
-) where RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy
+    pk_cmp: PkCmp,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    PkCmp: Fn(u128, u128) -> Ordering + Copy,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance` below.  `source_idx` doubles as the batch index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        if a.key != b.key { return a.key < b.key; }
-        row_cmp(schema, &batches[a.source_idx].0, a.row,
-                        &batches[b.source_idx].0, b.row) == Ordering::Less
+        match pk_cmp(a.key, b.key) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => row_cmp(schema, &batches[a.source_idx].0, a.row,
+                                               &batches[b.source_idx].0, b.row)
+                == Ordering::Less,
+        }
     };
     let mut tree = LoserTree::build(
         cursors.len(),
@@ -484,43 +596,40 @@ pub fn sort_and_consolidate(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    assert!(
-        schema.pk_stride() == 8 || schema.pk_stride() == 16,
-        "compound-PK merge not yet supported; found pk_stride={}",
-        schema.pk_stride(),
-    );
+    assert_narrow_pk_region!(schema);
     let n = batch.count;
     if n == 0 {
         return;
     }
 
+    dispatch_pk_row!(schema, sort_consolidate_inner(n, batch, schema, writer));
+}
+
+/// Shared sort-plus-consolidate body. `pk_cmp` orders the sort; group
+/// detection inside `drain_groups_into` stays u128 equality, which is
+/// byte-order-agnostic so it stays correct on the packed PK region.
+#[inline]
+fn sort_consolidate_inner<RowCmp, PkCmp>(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+    pk_cmp: PkCmp,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    PkCmp: Fn(u128, u128) -> Ordering + Copy,
+{
     let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry { pk: batch.get_pk(i as usize), idx: i })
+        .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
         .collect();
 
-    if columnar::schema_is_int_nonnull(schema) {
-        // Standard-library sort is extremely sensitive to comparator inlining;
-        // the fast-path branch is hoisted out of the per-comparison closure.
-        entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-            Ordering::Equal => columnar::compare_rows_int_nonnull(
-                schema, batch, a.idx as usize, batch, b.idx as usize,
-            ),
-            ord => ord,
-        });
-        drain_groups_into(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
-            |pos| (entries[pos].idx as usize, entries[pos].pk));
-    } else {
-        entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-            Ordering::Equal => columnar::compare_rows(
-                schema, batch, a.idx as usize, batch, b.idx as usize,
-            ),
-            ord => ord,
-        });
-        drain_groups_into(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
-            |pos| (entries[pos].idx as usize, entries[pos].pk));
-    }
+    entries.sort_unstable_by(|a, b| match pk_cmp(a.pk, b.pk) {
+        Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
+        ord => ord,
+    });
+    drain_groups_into(n, batch, schema, writer, row_cmp,
+        |pos| (entries[pos].idx as usize, entries[pos].pk));
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -530,23 +639,22 @@ pub fn fold_sorted(
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
 ) {
-    assert!(
-        schema.pk_stride() == 8 || schema.pk_stride() == 16,
-        "compound-PK merge not yet supported; found pk_stride={}",
-        schema.pk_stride(),
-    );
+    assert_narrow_pk_region!(schema);
     let n = batch.count;
     if n == 0 {
         return;
     }
+    // No ordered PK comparison here: input is already sorted and group
+    // detection inside `drain_groups_into` is u128 equality on the packed
+    // region, which is byte-order-agnostic and correct for any narrow stride.
     if columnar::schema_is_int_nonnull(schema) {
         drain_groups_into(n, batch, schema, writer,
             |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
-            |pos| (pos, batch.get_pk(pos)));
+            |pos| (pos, pack_pk_le(batch.get_pk_bytes(pos))));
     } else {
         drain_groups_into(n, batch, schema, writer,
             |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
-            |pos| (pos, batch.get_pk(pos)));
+            |pos| (pos, pack_pk_le(batch.get_pk_bytes(pos))));
     }
 }
 
@@ -1149,8 +1257,8 @@ mod tests {
         Batch::empty_with_schema(&schema)
     }
 
-    fn read_pk_u128(out_pk: &[u8], i: usize) -> u128 {
-        u128::from_le_bytes(out_pk[i * 16..(i + 1) * 16].try_into().unwrap())
+    fn read_pk_packed(out_pk: &[u8], i: usize, stride: usize) -> u128 {
+        pack_pk_le(&out_pk[i * stride..(i + 1) * stride])
     }
 
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
@@ -1161,8 +1269,9 @@ mod tests {
             .collect();
         let total_rows: usize = sorted.iter().map(|b| b.count).sum();
         let total_blob: usize = sorted.iter().map(|b| b.blob.len()).sum();
+        let pk_stride = schema.pk_stride() as usize;
 
-        let mut out_pk = vec![0u8; total_rows * 16];
+        let mut out_pk = vec![0u8; total_rows * pk_stride];
         let mut out_weight = vec![0u8; total_rows * 8];
         let mut out_null = vec![0u8; total_rows * 8];
         let mut out_col0 = vec![0u8; total_rows * 8];
@@ -1172,7 +1281,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
-                pk_stride: 16,
+                pk_stride: pk_stride as u8,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1187,7 +1296,7 @@ mod tests {
             let count = writer.row_count();
             let mut result = Vec::with_capacity(count);
             for i in 0..count {
-                let pk = read_pk_u128(&out_pk, i);
+                let pk = read_pk_packed(&out_pk, i, pk_stride);
                 let lo = pk as u64;
                 let hi = (pk >> 64) as u64;
                 let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1418,8 +1527,9 @@ mod tests {
         let batch = b.as_mem_batch();
         let n = batch.count;
         let total_blob = batch.blob.len();
+        let pk_stride = schema.pk_stride() as usize;
 
-        let mut out_pk = vec![0u8; n * 16];
+        let mut out_pk = vec![0u8; n * pk_stride];
         let mut out_weight = vec![0u8; n * 8];
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
@@ -1430,7 +1540,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
-                pk_stride: 16,
+                pk_stride: pk_stride as u8,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1445,7 +1555,7 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let pk = read_pk_u128(&out_pk, i);
+            let pk = read_pk_packed(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
             let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1594,7 +1704,8 @@ mod tests {
         let batch = b.as_mem_batch();
         let n = indices.len();
         let total_blob = batch.blob.len();
-        let mut out_pk = vec![0u8; n * 16];
+        let pk_stride = schema.pk_stride() as usize;
+        let mut out_pk = vec![0u8; n * pk_stride];
         let mut out_weight = vec![0u8; n * 8];
         let mut out_null = vec![0u8; n * 8];
         let mut out_col0 = vec![0u8; n * 8];
@@ -1605,7 +1716,7 @@ mod tests {
         {
             let mut writer = DirectWriter {
                 pk: &mut out_pk,
-                pk_stride: 16,
+                pk_stride: pk_stride as u8,
                 weight: &mut out_weight,
                 null_bmp: &mut out_null,
                 col_bufs: vec![&mut out_col0],
@@ -1620,7 +1731,7 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let pk = read_pk_u128(&out_pk, i);
+            let pk = read_pk_packed(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
             let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1941,5 +2052,428 @@ mod tests {
             .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
             .collect();
         assert_eq!(vals, vec![9, 7, 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Narrow-region merge dispatch: signed / narrow-unsigned / float / compound
+    // -----------------------------------------------------------------------
+
+    fn make_schema_single(pk_tc: u8) -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[SchemaColumn::new(pk_tc, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        )
+    }
+
+    /// Build a Batch from `(pk_bytes, weight, payload_i64)` rows. `pk_bytes`
+    /// length must equal the schema's pk_stride (asserted by extend_pk_bytes).
+    fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) -> Batch {
+        let mut b = Batch::empty_with_schema(schema);
+        b.reserve_rows(rows.len().max(1));
+        for (pk, w, val) in rows {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    fn run_fold(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
+        let batch = b.as_mem_batch();
+        let n = batch.count;
+        let pk_stride = schema.pk_stride() as usize;
+        let mut out_pk = vec![0u8; n * pk_stride];
+        let mut out_weight = vec![0u8; n * 8];
+        let mut out_null = vec![0u8; n * 8];
+        let mut out_col0 = vec![0u8; n * 8];
+        let mut out_blob: Vec<u8> = Vec::with_capacity(1);
+        let count;
+        {
+            let mut writer = DirectWriter {
+                pk: &mut out_pk,
+                pk_stride: pk_stride as u8,
+                weight: &mut out_weight,
+                null_bmp: &mut out_null,
+                col_bufs: vec![&mut out_col0],
+                blob: &mut out_blob,
+                blob_cache: BlobCacheGuard::acquire(schema, 0),
+                count: 0,
+                schema: *schema,
+            };
+            fold_sorted(&batch, schema, &mut writer);
+            count = writer.row_count();
+        }
+        let mut result = Vec::new();
+        for i in 0..count {
+            let pk = read_pk_packed(&out_pk, i, pk_stride);
+            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
+            let v = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            result.push((pk as u64, (pk >> 64) as u64, w, v));
+        }
+        result
+    }
+
+    fn packed(r: &(u64, u64, i64, i64)) -> u128 {
+        ((r.1 as u128) << 64) | r.0 as u128
+    }
+
+    fn signed_values(stride: usize) -> Vec<i128> {
+        match stride {
+            1 => vec![i8::MIN as i128, -1, 0, 1, i8::MAX as i128],
+            2 => vec![i16::MIN as i128, -1, 0, 1, i16::MAX as i128],
+            4 => vec![i32::MIN as i128, -1, 0, 1, i32::MAX as i128],
+            8 => vec![i64::MIN as i128, -1, 0, 1, i64::MAX as i128],
+            _ => unreachable!(),
+        }
+    }
+
+    fn le_bytes_i(v: i128, stride: usize) -> Vec<u8> {
+        v.to_le_bytes()[..stride].to_vec()
+    }
+
+    fn decode_signed(packed: u128, stride: usize) -> i128 {
+        match stride {
+            1 => packed as u8 as i8 as i128,
+            2 => packed as u16 as i16 as i128,
+            4 => packed as u32 as i32 as i128,
+            8 => packed as u64 as i64 as i128,
+            _ => unreachable!(),
+        }
+    }
+
+    fn check_signed_pk(pk_tc: u8) {
+        let schema = make_schema_single(pk_tc);
+        let stride = schema.pk_stride() as usize;
+        let vals = signed_values(stride); // ascending signed order
+        let n = vals.len();
+        // Permutation of 0..5 so the sort/heap actually has to reorder.
+        let order = [2usize, 0, 4, 1, 3];
+        let expect: Vec<i64> = (0..n as i64).collect();
+
+        // merge_batches: one single-row sorted batch per row.
+        let batches: Vec<Batch> = order
+            .iter()
+            .map(|&idx| make_batch_bytes(&schema, &[(le_bytes_i(vals[idx], stride), 1, idx as i64)]))
+            .collect();
+        let m = run_merge(&batches, &schema);
+        assert_eq!(m.len(), n, "tc={pk_tc} merge len");
+        assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} merge signed order");
+        for (i, r) in m.iter().enumerate() {
+            assert_eq!(decode_signed(packed(r), stride), vals[i], "tc={pk_tc} merge pk decode row {i}");
+        }
+
+        // sort_and_consolidate: one unsorted batch.
+        let unsorted: Vec<(Vec<u8>, i64, i64)> = order
+            .iter()
+            .map(|&idx| (le_bytes_i(vals[idx], stride), 1, idx as i64))
+            .collect();
+        let c = run_consolidate(&make_batch_bytes(&schema, &unsorted), &schema);
+        assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} consolidate");
+
+        // fold_sorted: pre-sorted (ascending signed) batch.
+        let sorted_rows: Vec<(Vec<u8>, i64, i64)> = (0..n)
+            .map(|idx| (le_bytes_i(vals[idx], stride), 1, idx as i64))
+            .collect();
+        let f = run_fold(&make_batch_bytes(&schema, &sorted_rows), &schema);
+        assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} fold");
+    }
+
+    #[test]
+    fn narrow_signed_single_pk_ordering() {
+        check_signed_pk(type_code::I8);
+        check_signed_pk(type_code::I16);
+        check_signed_pk(type_code::I32);
+        check_signed_pk(type_code::I64);
+    }
+
+    #[test]
+    fn narrow_unsigned_single_pk_ordering() {
+        let cases: Vec<(u8, usize, Vec<u128>)> = vec![
+            (type_code::U8, 1, vec![0, 1, 127, 128, 255]),
+            (type_code::U16, 2, vec![0, 1, 256, 32768, 65535]),
+            (type_code::U32, 4, vec![0, 1, 1 << 16, 1 << 31, u32::MAX as u128]),
+        ];
+        for (tc, stride, vals) in cases {
+            let schema = make_schema_single(tc);
+            assert_eq!(schema.pk_stride() as usize, stride, "tc={tc} stride");
+            let n = vals.len();
+            let order = [4usize, 2, 0, 3, 1];
+            let expect: Vec<i64> = (0..n as i64).collect();
+            let le = |idx: usize| vals[idx].to_le_bytes()[..stride].to_vec();
+
+            let batches: Vec<Batch> = order
+                .iter()
+                .map(|&idx| make_batch_bytes(&schema, &[(le(idx), 1, idx as i64)]))
+                .collect();
+            let m = run_merge(&batches, &schema);
+            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} merge");
+            for (i, r) in m.iter().enumerate() {
+                assert_eq!(packed(r), vals[i], "tc={tc} pk decode row {i}");
+            }
+
+            let uns: Vec<(Vec<u8>, i64, i64)> =
+                order.iter().map(|&idx| (le(idx), 1, idx as i64)).collect();
+            let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
+            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} consolidate");
+
+            let srt: Vec<(Vec<u8>, i64, i64)> =
+                (0..n).map(|idx| (le(idx), 1, idx as i64)).collect();
+            let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
+            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} fold");
+        }
+    }
+
+    #[test]
+    fn float_single_pk_ordering() {
+        // total_cmp order: -2.5 < -0.0 < 0.0 < 1.0 < 3.5
+        // F64 (stride 8)
+        {
+            let schema = make_schema_single(type_code::F64);
+            assert_eq!(schema.pk_stride(), 8);
+            let vals: Vec<f64> = vec![-2.5, -0.0, 0.0, 1.0, 3.5];
+            let n = vals.len();
+            let order = [3usize, 0, 4, 2, 1];
+            let expect: Vec<i64> = (0..n as i64).collect();
+            let mk = |idx: usize| (vals[idx].to_bits().to_le_bytes()[..8].to_vec(), 1i64, idx as i64);
+            let batches: Vec<Batch> =
+                order.iter().map(|&i| make_batch_bytes(&schema, &[mk(i)])).collect();
+            let m = run_merge(&batches, &schema);
+            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 merge");
+            let uns: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&i| mk(i)).collect();
+            let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
+            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 consolidate");
+            let srt: Vec<(Vec<u8>, i64, i64)> = (0..n).map(mk).collect();
+            let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
+            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 fold");
+        }
+        // F32 (stride 4)
+        {
+            let schema = make_schema_single(type_code::F32);
+            assert_eq!(schema.pk_stride(), 4);
+            let vals: Vec<f32> = vec![-2.5, -0.0, 0.0, 1.0, 3.5];
+            let n = vals.len();
+            let order = [1usize, 4, 0, 3, 2];
+            let expect: Vec<i64> = (0..n as i64).collect();
+            let mk = |idx: usize| (vals[idx].to_bits().to_le_bytes()[..4].to_vec(), 1i64, idx as i64);
+            let batches: Vec<Batch> =
+                order.iter().map(|&i| make_batch_bytes(&schema, &[mk(i)])).collect();
+            let m = run_merge(&batches, &schema);
+            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 merge");
+            let uns: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&i| mk(i)).collect();
+            let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
+            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 consolidate");
+            let srt: Vec<(Vec<u8>, i64, i64)> = (0..n).map(mk).collect();
+            let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
+            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 fold");
+        }
+    }
+
+    #[test]
+    fn narrow_compound_u64_u64_lexicographic_trap() {
+        // (U64, U64) stride 16. The second PK column lands in the MORE
+        // significant u128 bytes after packing, so a plain u128 numeric
+        // compare orders col1-major and disagrees with the correct
+        // per-column (col0, col1) order. A regression to plain u128 fails.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(schema.pk_stride(), 16);
+        let mkpk = |a: u64, b: u64| {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        // Correct order: (1,256) < (1,257) < (256,1) < (256,2).
+        let rows = vec![
+            (mkpk(256, 1), 1i64, 30i64),
+            (mkpk(1, 257), 1, 20),
+            (mkpk(256, 2), 1, 40),
+            (mkpk(1, 256), 1, 10),
+        ];
+        let c = run_consolidate(&make_batch_bytes(&schema, &rows), &schema);
+        assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), vec![10, 20, 30, 40]);
+
+        // merge_batches across 3 sorted inputs (interleaved tuples).
+        let b1 = make_batch_bytes(&schema, &[(mkpk(1, 256), 1, 10), (mkpk(256, 1), 1, 30)]);
+        let b2 = make_batch_bytes(&schema, &[(mkpk(1, 257), 1, 20)]);
+        let b3 = make_batch_bytes(&schema, &[(mkpk(256, 2), 1, 40)]);
+        let m = run_merge(&[b1, b2, b3], &schema);
+        assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), vec![10, 20, 30, 40]);
+
+        // Same (PK, payload) across cursors consolidate; net-zero dropped.
+        let d1 = make_batch_bytes(&schema, &[(mkpk(5, 7), 1, 99)]);
+        let d2 = make_batch_bytes(&schema, &[(mkpk(5, 7), 2, 99)]);
+        let d3 = make_batch_bytes(&schema, &[(mkpk(5, 7), -3, 99)]);
+        assert_eq!(run_merge(&[d1, d2, d3], &schema).len(), 0);
+
+        // Same PK, different payload → ordered by payload on PK tie.
+        let e = run_consolidate(
+            &make_batch_bytes(&schema, &[(mkpk(9, 9), 1, 200), (mkpk(9, 9), 1, 100)]),
+            &schema,
+        );
+        assert_eq!(e.iter().map(|r| r.3).collect::<Vec<_>>(), vec![100, 200]);
+
+        // fold_sorted on pre-sorted compound input.
+        let f = run_fold(
+            &make_batch_bytes(
+                &schema,
+                &[(mkpk(1, 256), 1, 10), (mkpk(1, 257), 1, 20), (mkpk(256, 1), 1, 30)],
+            ),
+            &schema,
+        );
+        assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn narrow_compound_shapes() {
+        // (U32, U32) stride 8
+        {
+            let s = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1],
+            );
+            assert_eq!(s.pk_stride(), 8);
+            let pk = |a: u32, b: u32| {
+                let mut v = Vec::new();
+                v.extend_from_slice(&a.to_le_bytes());
+                v.extend_from_slice(&b.to_le_bytes());
+                v
+            };
+            // ascending (a,b): (1,9) < (1,10) < (2,0)
+            let c = run_consolidate(
+                &make_batch_bytes(&s, &[(pk(2, 0), 1, 2), (pk(1, 10), 1, 1), (pk(1, 9), 1, 0)]),
+                &s,
+            );
+            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), vec![0, 1, 2]);
+        }
+        // (U64, U16, U8) stride 11
+        {
+            let s = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::U16, 0),
+                    SchemaColumn::new(type_code::U8, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1, 2],
+            );
+            assert_eq!(s.pk_stride(), 11);
+            let pk = |a: u64, b: u16, c: u8| {
+                let mut v = Vec::new();
+                v.extend_from_slice(&a.to_le_bytes());
+                v.extend_from_slice(&b.to_le_bytes());
+                v.push(c);
+                v
+            };
+            let c = run_consolidate(
+                &make_batch_bytes(
+                    &s,
+                    &[
+                        (pk(1, 2, 3), 1, 1),
+                        (pk(1, 2, 2), 1, 0),
+                        (pk(1, 3, 0), 1, 2),
+                        (pk(2, 0, 0), 1, 3),
+                    ],
+                ),
+                &s,
+            );
+            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+            let f = run_fold(
+                &make_batch_bytes(
+                    &s,
+                    &[
+                        (pk(1, 2, 2), 1, 0),
+                        (pk(1, 2, 3), 1, 1),
+                        (pk(1, 3, 0), 1, 2),
+                        (pk(2, 0, 0), 1, 3),
+                    ],
+                ),
+                &s,
+            );
+            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        }
+        // (U64, U32, U32) stride 16
+        {
+            let s = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1, 2],
+            );
+            assert_eq!(s.pk_stride(), 16);
+            let pk = |a: u64, b: u32, c: u32| {
+                let mut v = Vec::new();
+                v.extend_from_slice(&a.to_le_bytes());
+                v.extend_from_slice(&b.to_le_bytes());
+                v.extend_from_slice(&c.to_le_bytes());
+                v
+            };
+            let m1 = make_batch_bytes(&s, &[(pk(1, 0, 5), 1, 0), (pk(1, 0, 6), 1, 1)]);
+            let m2 = make_batch_bytes(&s, &[(pk(1, 1, 0), 1, 2)]);
+            let m3 = make_batch_bytes(&s, &[(pk(2, 0, 0), 1, 3)]);
+            let m = run_merge(&[m1, m2, m3], &s);
+            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "merge requires a 1")]
+    fn region_canary_wide_panics() {
+        let schema = make_schema_compound_pk_24();
+        let mut out_pk: Vec<u8> = Vec::new();
+        let mut out_w: Vec<u8> = Vec::new();
+        let mut out_n: Vec<u8> = Vec::new();
+        let mut out_c: Vec<u8> = Vec::new();
+        let mut out_b: Vec<u8> = Vec::new();
+        let mut writer = DirectWriter {
+            pk: &mut out_pk,
+            pk_stride: 24,
+            weight: &mut out_w,
+            null_bmp: &mut out_n,
+            col_bufs: vec![&mut out_c],
+            blob: &mut out_b,
+            blob_cache: BlobCacheGuard::acquire(&schema, 0),
+            count: 0,
+            schema,
+        };
+        merge_batches(&[], &schema, &mut writer);
+    }
+
+    #[test]
+    #[should_panic(expected = "merge requires a 1")]
+    fn region_canary_zero_panics() {
+        let schema = SchemaDescriptor::default();
+        assert_eq!(schema.pk_stride(), 0);
+        let mut out_pk: Vec<u8> = Vec::new();
+        let mut out_w: Vec<u8> = Vec::new();
+        let mut out_n: Vec<u8> = Vec::new();
+        let mut out_b: Vec<u8> = Vec::new();
+        let mut writer = DirectWriter {
+            pk: &mut out_pk,
+            pk_stride: 0,
+            weight: &mut out_w,
+            null_bmp: &mut out_n,
+            col_bufs: vec![],
+            blob: &mut out_b,
+            blob_cache: BlobCacheGuard::acquire(&schema, 0),
+            count: 0,
+            schema,
+        };
+        merge_batches(&[], &schema, &mut writer);
     }
 }

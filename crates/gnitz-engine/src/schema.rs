@@ -166,6 +166,12 @@ impl SchemaDescriptor {
                 "new: STRING and BLOB columns cannot be PK columns \
                  (PK region is bulk-copied without blob relocation)",
             );
+            // `compare_pk_bytes` reads PK bytes with no null-bit handling; a
+            // nullable PK would silently corrupt the merge comparison.
+            assert!(
+                cols[pk_indices[k] as usize].nullable == 0,
+                "new: PK columns must be non-nullable",
+            );
             pk_arr[k] = pk_indices[k];
             stride_acc += cols[pk_indices[k] as usize].size() as u16;
             k += 1;
@@ -210,7 +216,6 @@ impl SchemaDescriptor {
     /// compound-PK migration sites can drop in `for (ord, ci, col) in
     /// schema.pk_columns()` without redefining the iterator shape.
     #[inline]
-    #[allow(dead_code)]
     pub fn pk_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
         self.pk_indices().iter().copied().enumerate().map(move |(ord, ci)| {
             (ord, ci as usize, &self.columns[ci as usize])
