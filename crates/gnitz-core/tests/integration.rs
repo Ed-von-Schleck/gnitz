@@ -49,7 +49,7 @@ fn test_push_scan_roundtrip() {
             ColumnDef { name: "schema_id".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
 
     // Allocate 5 unique IDs to use as schema record PKs
@@ -184,7 +184,7 @@ fn test_push_and_scan() {
 
     let table_schema = Schema {
         columns: cols,
-        pk_index: 0,
+        pk_cols: vec![0],
     };
 
     // Push 3 rows: (10, 100), (20, 200), (30, 300)
@@ -225,7 +225,7 @@ fn test_delete_rows() {
 
     let table_schema = Schema {
         columns: cols,
-        pk_index: 0,
+        pk_cols: vec![0],
     };
 
     // Push rows with pk 10, 11, 12
@@ -270,7 +270,7 @@ fn test_string_columns() {
     ];
     let tid = client.create_table("s4", "t4", &cols, 0, true).unwrap();
 
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Push 2 rows: (1, "hello", Some("world")) and (2, "foo", None)
     let mut batch = ZSetBatch::new(&table_schema);
@@ -378,7 +378,7 @@ fn test_filter_view() {
     cb.sink(f);
     let circuit = cb.build();
 
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
     client.create_view_with_circuit("sv1", "filter_v", "", circuit, &table_schema.columns).unwrap();
 
     let mut batch = ZSetBatch::new(&table_schema);
@@ -434,7 +434,7 @@ fn test_reduce_view() {
     ];
     client.create_view_with_circuit("sv2", "reduce_v", "", circuit, &out_cols).unwrap();
 
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
     let mut batch = ZSetBatch::new(&table_schema);
     // group=1: vals 10, 20 → sum=30
     // group=2: vals 30, 40 → sum=70
@@ -475,7 +475,7 @@ fn test_join_view() {
         ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
     let tid_a = client.create_table("sv3", "jt3a", &table_schema.columns, 0, true).unwrap();
     let tid_b = client.create_table("sv3", "jt3b", &table_schema.columns, 0, true).unwrap();
 
@@ -536,7 +536,7 @@ fn test_anti_join_view() {
         ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
     let tid_a = client.create_table("sv4", "ajt4a", &table_schema.columns, 0, true).unwrap();
     let tid_b = client.create_table("sv4", "ajt4b", &table_schema.columns, 0, true).unwrap();
 
@@ -592,7 +592,7 @@ fn test_exchange_multi_worker() {
         ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("sv5", "et5", &cols, 0, true).unwrap();
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Push 1000 rows
     let mut batch = ZSetBatch::new(&table_schema);
@@ -630,7 +630,7 @@ fn test_incremental_update() {
             ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let tid = client.create_table("sv6", "iu6", &table_schema.columns, 0, true).unwrap();
 
@@ -706,7 +706,7 @@ fn test_bulk_filter() {
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("bf1", "bft1", &cols, 0, true).unwrap();
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Build filter: val > 50_000
     let mut eb = ExprBuilder::new();
@@ -760,7 +760,7 @@ fn test_bulk_exchange_multi_worker() {
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("bem1", "bemt1", &cols, 0, true).unwrap();
-    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Push 500 000 rows in a single batch
     let mut batch = ZSetBatch::new(&table_schema);
@@ -794,14 +794,14 @@ fn test_left_join_view() {
             ColumnDef { name: "pk".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val_a".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let schema_b = Schema {
         columns: vec![
             ColumnDef { name: "pk".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val_b".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let tid_a = client.create_table("sv7", "lj7a", &schema_a.columns, 0, true).unwrap();
     let tid_b = client.create_table("sv7", "lj7b", &schema_b.columns, 0, true).unwrap();
@@ -879,7 +879,7 @@ fn test_distinct_view() {
             ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let tid = client.create_table("sv8", "dt8", &table_schema.columns, 0, true).unwrap();
 
@@ -930,7 +930,7 @@ fn test_min_max_aggregate_view() {
             ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let tid = client.create_table("sv9", "ma9", &table_schema.columns, 0, true).unwrap();
 

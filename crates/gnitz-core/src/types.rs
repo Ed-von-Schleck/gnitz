@@ -30,7 +30,7 @@ pub fn schema_tab_schema() -> &'static Schema {
             ColumnDef { name: "schema_id".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -46,7 +46,7 @@ pub fn table_tab_schema() -> &'static Schema {
             ColumnDef { name: "created_lsn".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "flags".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -64,7 +64,7 @@ pub fn col_tab_schema() -> &'static Schema {
             ColumnDef { name: "fk_table_id".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "fk_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -79,7 +79,7 @@ pub fn view_tab_schema() -> &'static Schema {
             ColumnDef { name: "cache_directory".into(),  type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "created_lsn".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -92,7 +92,7 @@ pub fn dep_tab_schema() -> &'static Schema {
             ColumnDef { name: "dep_view_id".into(),  type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "dep_table_id".into(), type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -105,7 +105,7 @@ pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u
             fk_table_id: 0,
             fk_col_idx:  0,
         }).collect(),
-        pk_index,
+        pk_cols: vec![pk_index],
     }
 }
 

@@ -142,7 +142,7 @@ fn py_schema_to_rust(py: Python<'_>, s: &PySchema) -> PyResult<Schema> {
         let c: PyRef<'_, PyColumnDef> = item.extract()?;
         cols.push(py_col_to_rust(&c)?);
     }
-    Ok(Schema { columns: cols, pk_index: s.pk_index })
+    Ok(Schema { columns: cols, pk_cols: vec![s.pk_index] })
 }
 
 fn rust_schema_to_py(py: Python<'_>, s: &Schema) -> PyResult<Py<PySchema>> {

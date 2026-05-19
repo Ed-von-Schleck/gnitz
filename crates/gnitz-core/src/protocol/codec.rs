@@ -48,7 +48,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
 pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     let count = batch.len();
     let mut columns: Vec<ColumnDef> = Vec::with_capacity(count);
-    let mut pk_index: Option<usize> = None;
+    let mut pk_cols: Vec<usize> = Vec::new();
 
     let type_code_fixed = match &batch.columns[1] {
         ColData::Fixed(v) => v,
@@ -87,20 +87,17 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         let is_pk       = (flags & META_FLAG_IS_PK)    != 0;
 
         if is_pk {
-            if pk_index.is_some() {
-                return Err(ProtocolError::DecodeError("multiple pk flags in schema batch".into()));
-            }
-            pk_index = Some(i);
+            pk_cols.push(i);
         }
 
         columns.push(ColumnDef { name, type_code: tc, is_nullable, fk_table_id: 0, fk_col_idx: 0 });
     }
 
-    let pk_index = pk_index.ok_or_else(|| {
-        ProtocolError::DecodeError("no PK column found in schema batch".into())
-    })?;
+    if pk_cols.is_empty() {
+        return Err(ProtocolError::DecodeError("no PK column found in schema batch".into()));
+    }
 
-    Ok(Schema { columns, pk_index })
+    Ok(Schema { columns, pk_cols })
 }
 
 #[cfg(test)]
@@ -211,7 +208,7 @@ mod tests {
                 ColumnDef { name: "tag".into(),   type_code: TypeCode::I32,    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "uuid".into(),  type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
 
         let ms = meta_schema();

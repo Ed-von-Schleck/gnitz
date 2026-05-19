@@ -172,7 +172,7 @@ fn two_col() -> Schema {
             ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     }
 }
 
@@ -183,7 +183,7 @@ fn three_col() -> Schema {
             ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     }
 }
 
@@ -204,7 +204,7 @@ fn setup_test_table(sock_path: &str) -> (GnitzClient, u64, Schema) {
     client.create_schema("ipctest").unwrap();
     let cols = three_col().columns;
     let tid  = client.create_table("ipctest", "t1", &cols, 0, true).unwrap();
-    let schema = Schema { columns: cols, pk_index: 0 };
+    let schema = Schema { columns: cols, pk_cols: vec![0] };
     (client, tid, schema)
 }
 
@@ -464,7 +464,7 @@ fn test_schema_mismatch_wrong_column_count_more() {
             ColumnDef { name: "b".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "c".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
@@ -493,7 +493,7 @@ fn test_schema_mismatch_wrong_column_type() {
             ColumnDef { name: "val".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(), type_code: TypeCode::I64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
@@ -519,7 +519,7 @@ fn test_schema_mismatch_wrong_pk_index() {
             ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 1,
+        pk_cols: vec![1],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);

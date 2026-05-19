@@ -972,7 +972,7 @@ fn apply_projection(
         .map(|&i| schema.columns[i].clone())
         .collect();
     let new_pk_idx = col_indices.iter().position(|&i| schema.is_pk_col(i)).unwrap_or(0);
-    let new_schema = Schema { columns: new_cols, pk_index: new_pk_idx };
+    let new_schema = Schema { columns: new_cols, pk_cols: vec![new_pk_idx] };
 
     // Destructure src_batch so system columns can be moved (not cloned)
     let ZSetBatch { pks, weights, nulls, columns: src_columns } = src_batch;
@@ -1402,7 +1402,7 @@ mod tests {
     fn two_col(val_tc: TypeCode) -> Schema {
         Schema {
             columns: vec![col_def("pk", TypeCode::U64, false), col_def("val", val_tc, true)],
-            pk_index: 0,
+            pk_cols: vec![0],
         }
     }
 
@@ -1542,7 +1542,7 @@ mod tests {
                 col_def("a",  TypeCode::I64, true),
                 col_def("b",  TypeCode::I64, true),
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut current = ZSetBatch::new(&schema);
         current.pks.push_u128(1u128);
@@ -1571,7 +1571,7 @@ mod tests {
                 col_def("a",  TypeCode::I64, true),
                 col_def("b",  TypeCode::I64, true),
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut current = ZSetBatch::new(&schema);
         current.pks.push_u128(1u128);
@@ -1615,7 +1615,7 @@ mod tests {
     fn uuid_schema_pk() -> Schema {
         Schema {
             columns: vec![col_def("id", TypeCode::UUID, false)],
-            pk_index: 0,
+            pk_cols: vec![0],
         }
     }
 
@@ -1625,7 +1625,7 @@ mod tests {
                 col_def("pk", TypeCode::U64, false),
                 col_def("uid", TypeCode::UUID, true),
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         }
     }
 
@@ -1710,7 +1710,7 @@ mod tests {
                 col_def("pk",  TypeCode::U64, false),
                 col_def("val", tc, true),
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         }
     }
 

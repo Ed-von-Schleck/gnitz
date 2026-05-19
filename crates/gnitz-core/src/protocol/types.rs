@@ -24,7 +24,8 @@ pub struct ColumnDef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     pub columns:  Vec<ColumnDef>,
-    pub pk_index: usize,
+    /// PK column indices in compound-key order; length >= 1.
+    pub pk_cols:  Vec<usize>,
 }
 
 impl Schema {
@@ -34,10 +35,28 @@ impl Schema {
         self.columns.len()
     }
 
-    /// All PK column indices, in compound-key order. Today: always length 1.
+    /// All PK column indices, in compound-key order.
     #[inline]
     pub fn pk_indices(&self) -> &[usize] {
-        std::slice::from_ref(&self.pk_index)
+        &self.pk_cols
+    }
+
+    /// Number of PK columns (compound-key arity). The wire/storage layer
+    /// represents arity >= 2, but the SQL planner still rejects compound
+    /// PRIMARY KEY, so every planner-constructed schema has count 1.
+    #[inline]
+    pub fn pk_count(&self) -> usize {
+        self.pk_cols.len()
+    }
+
+    /// On-wire PK region stride: sum of each PK column's `wire_stride()`,
+    /// tightly packed (no inter-column padding), mirroring the engine
+    /// `SchemaDescriptor` layout. For a single-PK schema this equals the lone
+    /// PK column's `wire_stride()`, so the PK region is byte-for-byte
+    /// unchanged.
+    #[inline]
+    pub fn pk_stride(&self) -> usize {
+        self.pk_cols.iter().map(|&ci| self.columns[ci].type_code.wire_stride()).sum()
     }
 
     /// The single PK column index. Use only at boundaries that have not yet
@@ -45,13 +64,11 @@ impl Schema {
     /// path, wire/client BatchAppender). Asserts length-1.
     #[inline]
     pub fn pk_index_single(&self) -> usize {
-        debug_assert_eq!(self.pk_indices().len(), 1, "compound PK not yet supported here");
-        self.pk_index
+        debug_assert_eq!(self.pk_cols.len(), 1, "compound PK not yet supported here");
+        self.pk_cols[0]
     }
 
-    /// Number of non-PK ("payload") columns.
-    /// Today: always `columns.len() - 1`; generalises to `columns.len() - pk_count`
-    /// once compound PKs land.
+    /// Number of non-PK ("payload") columns: `columns.len() - pk_count`.
     #[inline]
     pub fn num_payload_cols(&self) -> usize {
         self.num_columns() - self.pk_indices().len()
@@ -67,20 +84,19 @@ impl Schema {
     /// ensure `col_idx` is not the PK column.
     #[inline]
     pub fn payload_idx(&self, col_idx: usize) -> usize {
-        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be the pk_index");
-        let pk = self.pk_index_single();
-        if col_idx < pk { col_idx } else { col_idx - 1 }
+        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be a PK column");
+        col_idx - self.pk_cols.iter().filter(|&&p| p < col_idx).count()
     }
 
     /// Iterate over the non-PK ("payload") columns.
     ///
-    /// Yields `(payload_idx, col_idx, &ColumnDef)`.
+    /// Yields `(payload_idx, col_idx, &ColumnDef)`. The enumerated index is
+    /// the dense payload index (null-bitmap bit position).
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
-        let pk = self.pk_index_single();
         let n = self.num_columns();
         (0..n)
-            .filter(move |ci| *ci != pk)
+            .filter(move |ci| !self.is_pk_col(*ci))
             .enumerate()
             .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
     }
@@ -96,7 +112,7 @@ pub fn meta_schema() -> &'static Schema {
             ColumnDef { name: "flags".into(),     type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -104,6 +120,13 @@ pub fn meta_schema() -> &'static Schema {
 pub enum PkColumn {
     U64s(Vec<u64>),
     U128s(Vec<u128>),
+    /// Wide compound PK (pk_count >= 2): a flat `stride`-byte-per-row buffer
+    /// in on-wire LE layout. Has no scalar u128 projection, so the numeric
+    /// accessors panic. These panics are a real precondition (not dead code):
+    /// the numeric path is reachable from SQL/binding callers, but the SQL
+    /// planner still rejects compound PRIMARY KEY, so no such batch reaches
+    /// them today.
+    Bytes { stride: u8, buf: Vec<u8> },
 }
 
 impl PkColumn {
@@ -111,31 +134,86 @@ impl PkColumn {
         if tc == TypeCode::U128 || tc == TypeCode::UUID { PkColumn::U128s(vec![]) } else { PkColumn::U64s(vec![]) }
     }
     pub fn len(&self) -> usize {
-        match self { PkColumn::U64s(v) => v.len(), PkColumn::U128s(v) => v.len() }
+        match self {
+            PkColumn::U64s(v) => v.len(),
+            PkColumn::U128s(v) => v.len(),
+            PkColumn::Bytes { stride, buf } => buf.len() / *stride as usize,
+        }
     }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     pub fn get(&self, i: usize) -> u128 {
-        match self { PkColumn::U64s(v) => v[i] as u128, PkColumn::U128s(v) => v[i] }
+        match self {
+            PkColumn::U64s(v) => v[i] as u128,
+            PkColumn::U128s(v) => v[i],
+            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
+        }
+    }
+    /// Append one raw PK tuple (already in on-wire LE layout). Wide-PK only.
+    pub fn push_bytes(&mut self, b: &[u8]) {
+        match self {
+            PkColumn::Bytes { stride, buf } => {
+                debug_assert_eq!(b.len(), *stride as usize);
+                buf.extend_from_slice(b);
+            }
+            _ => unreachable!("push_bytes on non-wide PK column"),
+        }
+    }
+    /// Borrow the raw `stride`-byte tuple at row `i`. Wide-PK only.
+    pub fn get_bytes(&self, i: usize) -> &[u8] {
+        match self {
+            PkColumn::Bytes { stride, buf } => {
+                let s = *stride as usize;
+                &buf[i * s..(i + 1) * s]
+            }
+            _ => unreachable!("get_bytes on non-wide PK column"),
+        }
     }
     pub fn push_u128(&mut self, pk: u128) {
-        match self { PkColumn::U64s(v) => v.push(pk as u64), PkColumn::U128s(v) => v.push(pk) }
+        match self {
+            PkColumn::U64s(v) => v.push(pk as u64),
+            PkColumn::U128s(v) => v.push(pk),
+            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
+        }
     }
     pub fn set_u128(&mut self, i: usize, pk: u128) {
-        match self { PkColumn::U64s(v) => v[i] = pk as u64, PkColumn::U128s(v) => v[i] = pk }
+        match self {
+            PkColumn::U64s(v) => v[i] = pk as u64,
+            PkColumn::U128s(v) => v[i] = pk,
+            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
+        }
     }
     pub fn swap(&mut self, i: usize, j: usize) {
-        match self { PkColumn::U64s(v) => v.swap(i, j), PkColumn::U128s(v) => v.swap(i, j) }
+        match self {
+            PkColumn::U64s(v) => v.swap(i, j),
+            PkColumn::U128s(v) => v.swap(i, j),
+            PkColumn::Bytes { stride, buf } => {
+                if i == j { return; }
+                let s = *stride as usize;
+                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+                let (left, right) = buf.split_at_mut(hi * s);
+                left[lo * s..lo * s + s].swap_with_slice(&mut right[..s]);
+            }
+        }
     }
     pub fn clear(&mut self) {
-        match self { PkColumn::U64s(v) => v.clear(), PkColumn::U128s(v) => v.clear() }
+        match self {
+            PkColumn::U64s(v) => v.clear(),
+            PkColumn::U128s(v) => v.clear(),
+            PkColumn::Bytes { buf, .. } => buf.clear(),
+        }
     }
     pub fn truncate(&mut self, len: usize) {
-        match self { PkColumn::U64s(v) => v.truncate(len), PkColumn::U128s(v) => v.truncate(len) }
+        match self {
+            PkColumn::U64s(v) => v.truncate(len),
+            PkColumn::U128s(v) => v.truncate(len),
+            PkColumn::Bytes { stride, buf } => buf.truncate(len * *stride as usize),
+        }
     }
     pub fn to_vec_u128(&self) -> Vec<u128> {
         match self {
             PkColumn::U64s(v) => v.iter().map(|&x| x as u128).collect(),
             PkColumn::U128s(v) => v.clone(),
+            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
         }
     }
 }
@@ -146,6 +224,7 @@ impl PartialEq<Vec<u128>> for PkColumn {
         match self {
             PkColumn::U64s(v) => v.iter().zip(other).all(|(&a, &b)| a as u128 == b),
             PkColumn::U128s(v) => v.as_slice() == other.as_slice(),
+            PkColumn::Bytes { .. } => panic!("cannot compare wide PK against Vec<u128>"),
         }
     }
 }
@@ -207,6 +286,10 @@ impl ZSetBatch {
         match (&mut self.pks, &other.pks) {
             (PkColumn::U64s(a), PkColumn::U64s(b)) => a.extend_from_slice(b),
             (PkColumn::U128s(a), PkColumn::U128s(b)) => a.extend_from_slice(b),
+            (PkColumn::Bytes { stride: sa, buf: a }, PkColumn::Bytes { stride: sb, buf: b }) => {
+                assert_eq!(sa, sb, "extend_from: wide PK stride mismatch");
+                a.extend_from_slice(b);
+            }
             _ => panic!("extend_from: pk column type mismatch"),
         }
         self.weights.extend_from_slice(&other.weights);
@@ -435,7 +518,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         assert_eq!(s.num_payload_cols(), 1);
 
@@ -447,7 +530,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "c".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 2,
+            pk_cols: vec![2],
         };
         assert_eq!(s.num_payload_cols(), 3);
     }
@@ -458,7 +541,7 @@ mod tests {
             columns: vec![
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         assert_eq!(s.num_columns(), 1);
 
@@ -468,7 +551,7 @@ mod tests {
                 ColumnDef { name: "v".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(),  type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         assert_eq!(s.num_columns(), 3);
     }
@@ -504,7 +587,7 @@ mod tests {
                 ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -516,13 +599,13 @@ mod tests {
             columns: vec![
                 ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let b = Schema {
             columns: vec![
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         assert_ne!(a, b);
     }
@@ -534,14 +617,14 @@ mod tests {
                 ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let b = Schema {
             columns: vec![
                 ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 1,
+            pk_cols: vec![1],
         };
         assert_ne!(a, b);
     }
@@ -552,13 +635,13 @@ mod tests {
             columns: vec![
                 ColumnDef { name: "x".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let b = Schema {
             columns: vec![
                 ColumnDef { name: "x".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         assert_ne!(a, b);
     }
@@ -572,7 +655,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let batch = ZSetBatch::new(&schema);
         assert!(batch.validate(&schema).is_ok());
@@ -586,7 +669,7 @@ mod tests {
                 ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         {
@@ -604,7 +687,7 @@ mod tests {
             columns: vec![
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         batch.pks.push_u128(1);
@@ -620,7 +703,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         batch.pks.push_u128(1);
@@ -638,7 +721,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         batch.pks.push_u128(1);
@@ -656,13 +739,13 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let schema1 = Schema {
             columns: vec![
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let batch = ZSetBatch::new(&schema1);
         let err = batch.validate(&schema2).unwrap_err();
@@ -679,7 +762,7 @@ mod tests {
                 ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -704,7 +787,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         {
@@ -732,7 +815,7 @@ mod tests {
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -752,7 +835,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -769,7 +852,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "big".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -791,7 +874,7 @@ mod tests {
                 ColumnDef { name: "c".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "d".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -825,7 +908,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "c".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 2,
+            pk_cols: vec![2],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
@@ -859,7 +942,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u64_val(42);
@@ -873,7 +956,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).i64_val(-7);
@@ -887,7 +970,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_val("oops");
@@ -901,7 +984,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_null();
@@ -915,7 +998,7 @@ mod tests {
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1, 0);
@@ -929,7 +1012,7 @@ mod tests {
                 ColumnDef { name: "v".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
         {

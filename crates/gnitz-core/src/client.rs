@@ -66,7 +66,7 @@ fn idx_tab_schema() -> &'static Schema {
             ColumnDef { name: "is_unique".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_index: 0,
+        pk_cols: vec![0],
     })
 }
 
@@ -572,7 +572,7 @@ impl GnitzClient {
         })?;
 
         let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }))
+        Ok((record.tid, Schema { columns, pk_cols: vec![record.pk_col_idx as usize] }))
     }
 
     pub fn resolve_table_or_view_id(
@@ -597,7 +597,7 @@ impl GnitzClient {
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-                return Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }));
+                return Ok((record.tid, Schema { columns, pk_cols: vec![record.pk_col_idx as usize] }));
             }
         }
 
@@ -611,7 +611,7 @@ impl GnitzClient {
         let record = find_view_record(&view_batch, schema_id, name)?;
         let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
         // View PK is always the U128 hash column at index 0
-        Ok((record.vid, Schema { columns, pk_index: 0 }))
+        Ok((record.vid, Schema { columns, pk_cols: vec![0] }))
     }
 
     // --- Private helpers (delegating to module-level functions) ---

@@ -988,7 +988,7 @@ fn execute_create_group_by_view(
             name: "_agg".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
-    let reduce_schema = Schema { columns: reduce_schema_cols, pk_index: 0 };
+    let reduce_schema = Schema { columns: reduce_schema_cols, pk_cols: vec![0] };
 
     // 5. Build circuit
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
@@ -1079,7 +1079,7 @@ fn execute_create_group_by_view(
     let post_map_prog = post_map_eb.build(0);
     let mapped = cb.map_expr(reduced, post_map_prog);
 
-    let post_map_schema = Schema { columns: out_cols.clone(), pk_index: 0 };
+    let post_map_schema = Schema { columns: out_cols.clone(), pk_cols: vec![0] };
 
     // 7. Optional HAVING filter (applied after MAP so column indices match output)
     let having_input = if let Some(having_expr) = &select.having {

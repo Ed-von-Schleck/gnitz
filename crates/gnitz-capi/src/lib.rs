@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, ZSetBatch};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::SqlPlanner;
 
@@ -149,7 +149,7 @@ pub extern "C" fn gnitz_schema_new(pk_index: u32) -> *mut GnitzSchema {
     clear_error();
     Box::into_raw(Box::new(GnitzSchema(Schema {
         columns:  vec![],
-        pk_index: pk_index as usize,
+        pk_cols:  vec![pk_index as usize],
     })))
 }
 
@@ -937,7 +937,7 @@ pub unsafe extern "C" fn gnitz_seek(
     match c.0.seek(table_id, pk_lo as u128 | (pk_hi as u128) << 64) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
+                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_cols: vec![0] });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
                 *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
             }
@@ -967,7 +967,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
     match c.0.seek_by_index(table_id, col_idx, key_lo as u128 | (key_hi as u128) << 64) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
+                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_cols: vec![0] });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
                 *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
             }
@@ -1032,6 +1032,7 @@ pub extern "C" fn gnitz_free_string(s: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gnitz_core::TypeCode;
     use std::ffi::CString;
 
     #[test]
@@ -1041,7 +1042,7 @@ mod tests {
                 ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let batch = ZSetBatch::new(&schema);
         let b = Box::into_raw(Box::new(GnitzBatch { schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
@@ -1067,7 +1068,7 @@ mod tests {
                 ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let batch = ZSetBatch::new(&schema);
         let b = Box::into_raw(Box::new(GnitzBatch { schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));

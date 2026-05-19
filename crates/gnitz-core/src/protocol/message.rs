@@ -420,7 +420,7 @@ mod tests {
                 ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
 
         let empty_batch = ZSetBatch::new(&schema);
@@ -442,7 +442,7 @@ mod tests {
                 ColumnDef { name: "i64".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "f64".into(), type_code: TypeCode::F64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
 
         let n = 100usize;
@@ -497,7 +497,7 @@ mod tests {
                 ColumnDef { name: "s1".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "s2".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
 
         let n = 50usize;
@@ -616,7 +616,7 @@ mod tests {
                 ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
                 ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
 
         let mut val_bytes = Vec::new();
@@ -651,7 +651,7 @@ mod tests {
             columns: vec![
                 ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
-            pk_index: 0,
+            pk_cols: vec![0],
         };
         let empty = ZSetBatch::new(&schema);
 
