@@ -100,13 +100,31 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
     }
     let stride = pk_sz / n;
     let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-    let pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(|c| {
-        if stride == 16 {
-            u128::from_le_bytes(c.try_into().unwrap())
-        } else {
-            u64::from_le_bytes(c.try_into().unwrap()) as u128
-        }
-    }).collect();
+    let pks: Vec<u128> = if stride > 16 {
+        // Compound PK region wider than a u128: collapse the row's PK
+        // bytes with the same xxh3-64 used by partition_for_pk_bytes's
+        // wide branch. The filter wants the full 64 bits of entropy
+        // zero-extended to u128 (NOT the top-8-bit bucket index that
+        // partition_for_pk_bytes derives from the same checksum).
+        pk_bytes
+            .chunks_exact(stride)
+            .map(|c| crate::xxh::checksum(c) as u128)
+            .collect()
+    } else {
+        // stride <= 16: zero-pad to 16 and read LE as u128 — the same
+        // narrow-key zero-extension as partition_for_pk_bytes. For
+        // stride 8/16 this is bit-identical to a direct u64-as-u128 /
+        // u128 read, so the single-PK fast paths share this arm. Build
+        // runs once per shard flush/compaction, not per row.
+        pk_bytes
+            .chunks_exact(stride)
+            .map(|c| {
+                let mut b = [0u8; 16];
+                b[..stride].copy_from_slice(c);
+                u128::from_le_bytes(b)
+            })
+            .collect()
+    };
     xor8::build(&pks)
 }
 
@@ -828,6 +846,63 @@ mod tests {
         for i in 0..4 {
             assert_eq!(shard.get_pk(i), (i + 1) as u128);
             assert_eq!(shard.get_weight(i), 1);
+        }
+    }
+
+    #[test]
+    fn build_xor8_wide_compound_region() {
+        let stride = 24usize;
+        let rows: Vec<Vec<u8>> = (0u8..5)
+            .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
+            .collect();
+        let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
+        let f =
+            build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+                .expect("wide compound region must build a filter");
+        for row in &rows {
+            assert!(
+                xor8::may_contain(&f, crate::xxh::checksum(row) as u128),
+                "no false negative for wide-region row"
+            );
+        }
+    }
+
+    #[test]
+    fn build_xor8_narrow_compound_region() {
+        let stride = 12usize;
+        let rows: Vec<Vec<u8>> = (0u8..5)
+            .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
+            .collect();
+        let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
+        let f =
+            build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+                .expect("narrow compound region must build a filter");
+        for row in &rows {
+            let mut b = [0u8; 16];
+            b[..stride].copy_from_slice(row);
+            assert!(
+                xor8::may_contain(&f, u128::from_le_bytes(b)),
+                "no false negative for narrow-compound row"
+            );
+        }
+    }
+
+    #[test]
+    fn build_xor8_single_pk_regression() {
+        let pks64: Vec<u64> = vec![10, 20, 30, 40];
+        let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let f64 = build_xor8_from_pk_region(b64.as_ptr(), b64.len(), pks64.len())
+            .expect("8-byte region must build a filter");
+        for p in &pks64 {
+            assert!(xor8::may_contain(&f64, *p as u128));
+        }
+
+        let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
+        let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let f128 = build_xor8_from_pk_region(b128.as_ptr(), b128.len(), pks128.len())
+            .expect("16-byte region must build a filter");
+        for p in &pks128 {
+            assert!(xor8::may_contain(&f128, *p));
         }
     }
 }

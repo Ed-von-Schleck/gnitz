@@ -1,15 +1,34 @@
 //! FLSM Shard Index: manages shard lifecycle, compaction, and manifest I/O.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::rc::Rc;
 
 use super::compact;
+use super::compare_pk_bytes;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::manifest::{self, ManifestEntryRaw, PreparedManifest};
+use super::manifest::{self, ManifestEntryRaw, PkBuf, PreparedManifest};
 use super::shard_reader::MappedShard;
+
+/// Compound-PK (`pk_count >= 2`) range check. Compound-only by
+/// construction: every single-PK site hoists the raw-`u128` compare out,
+/// and the only caller (`probe_pk`'s compound arm) has already gated on
+/// `pk_indices().len() != 1`, so a single-PK arm here would be dead code.
+/// `&[u8]` key so the `sort_by`/probe closures never copy the 81-byte
+/// `PkBuf` by value.
+#[inline]
+fn pk_in_range(
+    schema: &SchemaDescriptor,
+    min: &PkBuf,
+    max: &PkBuf,
+    key: &[u8],
+) -> bool {
+    compare_pk_bytes(schema, min.pk_bytes(), key) != Ordering::Greater
+        && compare_pk_bytes(schema, key, max.pk_bytes()) != Ordering::Greater
+}
 
 /// A shard that has been written and mmap'd at its `.tmp` path but not yet
 /// inserted into the index. Held by `Table::flush_prepare` until the worker
@@ -17,8 +36,8 @@ use super::shard_reader::MappedShard;
 pub struct PendingShard {
     pub(crate) mapped: Rc<MappedShard>,
     pub(crate) final_path: String,
-    pub(crate) pk_min: u128,
-    pub(crate) pk_max: u128,
+    pub(crate) pk_min: PkBuf,
+    pub(crate) pk_max: PkBuf,
     pub(crate) min_lsn: u64,
     pub(crate) max_lsn: u64,
 }
@@ -41,11 +60,21 @@ struct ShardEntry {
     filename: String,
     min_lsn: u64,
     max_lsn: u64,
-    pk_min: u128,
-    pk_max: u128,
+    pk_min: PkBuf,
+    pk_max: PkBuf,
 }
 
 impl ShardEntry {
+    // Derived from shard.count, never serialized. An empty shard must
+    // fail every range check; the old "min > max" (u128::MAX, 0)
+    // sentinel only worked for unsigned byte-lex and breaks under
+    // compare_pk_bytes for signed columns, so probe/sort short-circuit
+    // on this instead.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.shard.count == 0
+    }
+
     fn open(
         path: &str,
         schema: &SchemaDescriptor,
@@ -54,11 +83,17 @@ impl ShardEntry {
     ) -> Result<Self, StorageError> {
         let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
         let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
-        // Empty shard: pk_min > pk_max so range checks always fail
-        let (pk_min, pk_max) = if shard.count > 0 {
-            (shard.get_pk(0), shard.get_pk(shard.count - 1))
+        let is_empty = shard.count == 0;
+        let (pk_min, pk_max) = if !is_empty {
+            (
+                PkBuf::from_bytes(shard.get_pk_bytes(0)),
+                PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1)),
+            )
         } else {
-            (u128::MAX, 0)
+            // Valid in-bounds zero key; get_pk_bytes must not be called
+            // on a count == 0 shard.
+            let e = PkBuf::empty(schema.pk_stride());
+            (e, e)
         };
         Ok(ShardEntry {
             shard,
@@ -70,8 +105,37 @@ impl ShardEntry {
         })
     }
 
-    fn probe_pk(&self, key: u128) -> Option<(Rc<MappedShard>, usize)> {
-        if self.pk_min <= key && key <= self.pk_max {
+    fn probe_pk(
+        &self,
+        key: u128,
+        schema: &SchemaDescriptor,
+    ) -> Option<(Rc<MappedShard>, usize)> {
+        if self.is_empty() {
+            return None;
+        }
+        let in_range = if schema.pk_indices().len() == 1 {
+            // Every table today. Raw u128 range check, behaviourally and
+            // cost-identical to the pre-PkBuf `pk_min <= key <= pk_max`.
+            debug_assert!(schema.pk_stride() == 8 || schema.pk_stride() == 16);
+            self.pk_min.as_u128_single_pk() <= key
+                && key <= self.pk_max.as_u128_single_pk()
+        } else {
+            // Compound (pk_count >= 2): not reachable by a caller in this
+            // layer yet, but exercised by the range-prune test. The u128
+            // entry point can only carry a region that fits in 16 bytes,
+            // so a wider pk_stride here is a routing bug.
+            let stride = schema.pk_stride() as usize;
+            assert!(
+                stride <= 16,
+                "probe_pk: compound PK region wider than 16 bytes reached \
+                 the u128 entry point (routing bug)",
+            );
+            // `key` is the LE concatenation of the compound PK columns;
+            // slice it to the region width.
+            let key_le = key.to_le_bytes();
+            pk_in_range(schema, &self.pk_min, &self.pk_max, &key_le[..stride])
+        };
+        if in_range {
             if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
@@ -198,7 +262,29 @@ impl ShardIndex {
     }
 
     fn sort_l0(&mut self) {
-        self.l0.sort_by_key(|e| e.pk_min);
+        // The single-PK gate is loop-invariant for a given table;
+        // evaluate it once and branch the whole sort call (not a
+        // per-comparison branch).
+        if self.schema.pk_indices().len() == 1 {
+            // Every table today. `false < true` sinks is_empty entries
+            // to the end (matching the old u128::MAX sentinel position);
+            // non-empty numeric order is identical, so L0 ordering is
+            // byte-for-byte unchanged and the cost is today's sort_by_key.
+            self.l0.sort_by_key(|e| {
+                let empty = e.is_empty();
+                (empty, if empty { 0 } else { e.pk_min.as_u128_single_pk() })
+            });
+        } else {
+            let schema = self.schema;
+            self.l0.sort_by(|a, b| match (a.is_empty(), b.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => {
+                    compare_pk_bytes(&schema, a.pk_min.pk_bytes(), b.pk_min.pk_bytes())
+                }
+            });
+        }
     }
 
     fn update_flags(&mut self) {
@@ -217,7 +303,7 @@ impl ShardIndex {
 
     pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         for e in &self.l0 {
-            if let Some((arc, idx)) = e.probe_pk(key) {
+            if let Some((arc, idx)) = e.probe_pk(key, &self.schema) {
                 visitor(arc, idx);
             }
         }
@@ -225,7 +311,7 @@ impl ShardIndex {
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some((arc, idx)) = e.probe_pk(key) {
+                    if let Some((arc, idx)) = e.probe_pk(key, &self.schema) {
                         visitor(arc, idx);
                     }
                 }
@@ -373,9 +459,13 @@ impl ShardIndex {
     ) -> Result<PendingShard, StorageError> {
         let mapped = Rc::new(MappedShard::open(tmp_path, &self.schema, false)?);
         let (pk_min, pk_max) = if mapped.count > 0 {
-            (mapped.get_pk(0), mapped.get_pk(mapped.count - 1))
+            (
+                PkBuf::from_bytes(mapped.get_pk_bytes(0)),
+                PkBuf::from_bytes(mapped.get_pk_bytes(mapped.count - 1)),
+            )
         } else {
-            (u128::MAX, 0)
+            let e = PkBuf::empty(self.schema.pk_stride());
+            (e, e)
         };
         Ok(PendingShard { mapped, final_path, pk_min, pk_max, min_lsn, max_lsn })
     }
@@ -500,10 +590,19 @@ impl ShardIndex {
                 .map(|g| g.guard_key)
                 .collect()
         } else {
+            // Guard-key / routing path stays u128, single-PK only. Skip
+            // empty shards and widen via as_u128_single_pk so
+            // merge_and_route keeps its &[u128] contract; dedup in u128
+            // space (pk_min is now a PkBuf, not comparable to the u128
+            // accumulator).
             let mut keys: Vec<u128> = Vec::new();
             for e in &self.l0 {
-                if keys.is_empty() || keys.last().map(|k| *k != e.pk_min).unwrap_or(true) {
-                    keys.push(e.pk_min);
+                if e.is_empty() {
+                    continue;
+                }
+                let pk = e.pk_min.as_u128_single_pk();
+                if keys.last().copied() != Some(pk) {
+                    keys.push(pk);
                 }
             }
             if keys.is_empty() {
@@ -776,6 +875,63 @@ mod tests {
             ],
             &[0],
         )
+    }
+
+    /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64
+    /// payload. 16-byte PK region, but the column-aware comparison
+    /// differs from a u128 numerical compare of the concatenation.
+    fn compound_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0), // col 0 = PK
+                SchemaColumn::new(type_code::U64, 0), // col 1 = PK
+                SchemaColumn::new(type_code::I64, 0), // col 2 = payload
+            ],
+            &[0, 1],
+        )
+    }
+
+    /// LE concatenation of a (U64, U64) compound key, as the u128 the
+    /// probe_pk entry point carries.
+    fn pack2(a: u64, b: u64) -> u128 {
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&a.to_le_bytes());
+        buf[8..].copy_from_slice(&b.to_le_bytes());
+        u128::from_le_bytes(buf)
+    }
+
+    /// Write a shard whose PK region is the LE concatenation of two
+    /// U64 columns (16 bytes/row), with one I64 payload column. Rows
+    /// must be passed in compound-sorted order.
+    fn write_compound_shard(
+        dir: &std::path::Path,
+        name: &str,
+        pks: &[(u64, u64)],
+        values: &[i64],
+    ) -> String {
+        let n = pks.len();
+        let mut pk_bytes: Vec<u8> = Vec::with_capacity(n * 16);
+        for &(a, b) in pks {
+            pk_bytes.extend_from_slice(&a.to_le_bytes());
+            pk_bytes.extend_from_slice(&b.to_le_bytes());
+        }
+        let weights = vec![1i64; n];
+        let nulls = vec![0u64; n];
+        let blob: Vec<u8> = Vec::new();
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, n * 8),
+            (nulls.as_ptr() as *const u8, n * 8),
+            (values.as_ptr() as *const u8, n * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let image = shard_file::build_shard_image(42, n as u32, &regions);
+        let path = dir.join(name);
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+        path.to_str().unwrap().to_string()
     }
 
     /// Build and write a shard file with the given PK/value pairs.
@@ -1259,5 +1415,119 @@ mod tests {
         let removed = idx.gc_orphans();
         assert_eq!(removed, 1);
         assert!(!stray.exists(), "stray shard must be removed when index is empty");
+    }
+
+    /// Single-PK regression: probe_pk range gate and L0 sort order are
+    /// identical to the pre-PkBuf u128 logic (golden values).
+    #[test]
+    fn test_single_pk_probe_and_sort_golden() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let p_lo = write_test_shard(dir.path(), "lo.db", &[10, 20], &[1, 2]);
+        let p_hi = write_test_shard(dir.path(), "hi.db", &[30, 40], &[3, 4]);
+        let e_lo = ShardEntry::open(&p_lo, &schema, 0, 1).unwrap();
+        let e_hi = ShardEntry::open(&p_hi, &schema, 0, 1).unwrap();
+
+        // Range gate: in-range key passes (and resolves), out-of-range
+        // key is pruned.
+        assert!(e_lo.probe_pk(10, &schema).is_some());
+        assert!(e_lo.probe_pk(20, &schema).is_some());
+        assert!(e_lo.probe_pk(25, &schema).is_none(), "25 outside [10,20]");
+        assert!(e_hi.probe_pk(5, &schema).is_none(), "5 below [30,40]");
+
+        // L0 sort orders by pk_min, empty entries last (golden order).
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let p_empty = write_test_shard(dir.path(), "empty.db", &[], &[]);
+        idx.add_shard(&p_hi, 0, 1).unwrap();
+        idx.add_shard(&p_lo, 0, 1).unwrap();
+        idx.add_shard(&p_empty, 0, 1).unwrap();
+        let order: Vec<bool> = idx.l0.iter().map(|e| e.is_empty()).collect();
+        assert_eq!(
+            idx.l0[0].pk_min.as_u128_single_pk(),
+            10,
+            "lowest pk_min sorts first",
+        );
+        assert_eq!(idx.l0[1].pk_min.as_u128_single_pk(), 30);
+        assert_eq!(order, vec![false, false, true], "empty entry sinks last");
+    }
+
+    /// Empty-shard sentinel: is_empty fails every range check under both
+    /// a single-PK and a synthetic compound schema, without ever calling
+    /// get_pk_bytes on a count == 0 shard.
+    #[test]
+    fn test_empty_shard_sentinel() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+
+        let single = test_schema();
+        let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
+        let e = ShardEntry::open(&p, &single, 0, 0).unwrap();
+        assert!(e.is_empty());
+        assert!(e.probe_pk(0, &single).is_none());
+        assert!(e.probe_pk(u128::MAX, &single).is_none());
+
+        let compound = compound_schema();
+        let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
+        let ec = ShardEntry::open(&pc, &compound, 0, 0).unwrap();
+        assert!(ec.is_empty());
+        assert_eq!(ec.pk_min.len, compound.pk_stride());
+        // Short-circuits before the stride assert / pk_in_range.
+        assert!(ec.probe_pk(pack2(1, 1), &compound).is_none());
+    }
+
+    /// Compound range-prune correctness: pk_min is numerically greater
+    /// than pk_max as a u128 (a naive concatenation compare is wrong),
+    /// but correctly ordered under compare_pk_bytes. Proves the compound
+    /// path is wired into the range-prune predicate.
+    #[test]
+    fn test_compound_range_prune() {
+        let schema = compound_schema();
+        // Rows in compound order: (1,5) < (1,9) < (2,3).
+        let min = PkBuf::from_bytes(&pack2(1, 5).to_le_bytes());
+        let max = PkBuf::from_bytes(&pack2(2, 3).to_le_bytes());
+
+        // Naive u128 compare of the concatenation is inverted here:
+        // pack2(1,5) = 5·2^64 + 1  >  pack2(2,3) = 3·2^64 + 2.
+        assert!(
+            pack2(1, 5) > pack2(2, 3),
+            "test premise: u128 order is inverted vs compound order",
+        );
+
+        let inside = pack2(1, 9).to_le_bytes(); // (1,9): >= (1,5), <= (2,3)
+        let below = pack2(1, 1).to_le_bytes(); // (1,1): col0 == min, col1 < 5
+        let above = pack2(3, 0).to_le_bytes(); // (3,0): col0 > 2
+
+        assert!(
+            pk_in_range(&schema, &min, &max, &inside),
+            "key inside the true compound range must not be pruned",
+        );
+        assert!(
+            !pk_in_range(&schema, &min, &max, &below),
+            "key below the true compound range must be pruned",
+        );
+        assert!(
+            !pk_in_range(&schema, &min, &max, &above),
+            "key above the true compound range must be pruned",
+        );
+
+        // probe_pk's compound arm prunes an out-of-range key (exercises
+        // the stride assert + key_le slice + pk_in_range wiring).
+        let dir = tempfile::tempdir().unwrap();
+        crate::util::raise_fd_limit_for_tests();
+        let p = write_compound_shard(
+            dir.path(),
+            "compound.db",
+            &[(1, 5), (1, 9), (2, 3)],
+            &[10, 20, 30],
+        );
+        let entry = ShardEntry::open(&p, &schema, 0, 1).unwrap();
+        assert_eq!(entry.pk_min.pk_bytes(), &pack2(1, 5).to_le_bytes());
+        assert_eq!(entry.pk_max.pk_bytes(), &pack2(2, 3).to_le_bytes());
+        assert!(
+            entry.probe_pk(pack2(3, 0), &schema).is_none(),
+            "out-of-range compound key must be pruned by probe_pk",
+        );
     }
 }
