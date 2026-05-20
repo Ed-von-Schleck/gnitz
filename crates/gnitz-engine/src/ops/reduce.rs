@@ -770,6 +770,10 @@ pub fn op_reduce(
     let mut fin_output = finalize_out_schema.map(|fs| {
         Batch::with_schema(*fs, 32)
     });
+    // One FinalizeContext per finalize program: hoists EvalScratch sizing,
+    // out_cols classification, EMIT→register map, and the no_nulls flag out
+    // of the (potentially 100k+ iteration) group loop.
+    let mut fin_ctx = finalize_prog.map(|p| crate::expr::FinalizeContext::new(p, output_schema));
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
@@ -851,13 +855,13 @@ pub fn op_reduce(
                 &accs, input_schema, output_schema,
                 group_by_cols, use_natural_pk, num_aggs,
             );
-            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out)) =
-                (finalize_prog, finalize_out_schema, &mut fin_output)
+            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
+                (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
             {
                 emit_finalized_row(
                     fin_out, &raw_output, raw_output.count - 1,
                     group_key, -1,
-                    prog, output_schema, fin_schema,
+                    prog, output_schema, fin_schema, ctx,
                 );
             }
         }
@@ -980,13 +984,13 @@ pub fn op_reduce(
                 &accs, input_schema, output_schema,
                 group_by_cols, use_natural_pk, num_aggs,
             );
-            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out)) =
-                (finalize_prog, finalize_out_schema, &mut fin_output)
+            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
+                (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
             {
                 emit_finalized_row(
                     fin_out, &raw_output, raw_output.count - 1,
                     group_key, 1,
-                    prog, output_schema, fin_schema,
+                    prog, output_schema, fin_schema, ctx,
                 );
             }
         }
@@ -1097,7 +1101,9 @@ fn emit_reduce_row(
 /// Emit a finalized row by evaluating the finalize ExprProgram on the raw output.
 ///
 /// Handles COPY_COL (copy column from raw→finalized), EMIT (computed value),
-/// and EMIT_NULL (null column) instructions by pre-scanning the bytecode.
+/// and EMIT_NULL (null column) instructions. Per-row state (scratch register
+/// file, classification, EMIT→register map, no_nulls) lives in `ctx`, which
+/// the caller builds once before the group loop.
 #[allow(clippy::too_many_arguments)]
 fn emit_finalized_row(
     fin_output: &mut Batch,
@@ -1108,18 +1114,16 @@ fn emit_finalized_row(
     prog: &crate::expr::ExprProgram,
     raw_schema: &SchemaDescriptor,
     fin_schema: &SchemaDescriptor,
+    ctx: &mut crate::expr::FinalizeContext,
 ) {
     use crate::expr::OutputColKind;
 
     let raw_mb = raw_output.as_mem_batch();
     let null_word = raw_mb.get_null_word(raw_row);
 
-    let out_cols = prog.classify_output_cols();
-    let (emit_bufs, eval_emit_mask) = prog.eval_finalized(
-        &raw_mb, raw_row, null_word,
-    );
+    ctx.eval_row(prog, &raw_mb, raw_row);
+    let out_cols = ctx.out_cols();
 
-    // Build the finalized output row
     fin_output.extend_pk(group_key);
     fin_output.extend_weight(&weight.to_le_bytes());
 
@@ -1157,11 +1161,12 @@ fn emit_finalized_row(
                     }
                 }
                 OutputColKind::Emit(eidx) => {
-                    if (eval_emit_mask >> eidx) & 1 != 0 {
+                    let (val, is_null) = ctx.read_emit(eidx);
+                    if is_null {
                         fin_null_mask |= 1u64 << fpi;
                         fin_output.fill_col_zero(fpi, cs);
                     } else {
-                        fin_output.extend_col(fpi, &emit_bufs[eidx][..cs]);
+                        fin_output.extend_col(fpi, &val.to_le_bytes()[..cs]);
                     }
                 }
                 OutputColKind::EmitNull => {
@@ -2652,10 +2657,11 @@ mod tests {
         let mut fin_output = Batch::with_schema(fin_schema, 1);
         // Must not panic on the 16-byte PK slice. Pre-fix: `pk as u64` produced
         // 8 bytes and `[..cs]` with cs=16 panicked.
+        let mut ctx = crate::expr::FinalizeContext::new(&prog, &raw_schema);
         emit_finalized_row(
             &mut fin_output, &raw_output, 0,
             pk, 1,
-            &prog, &raw_schema, &fin_schema,
+            &prog, &raw_schema, &fin_schema, &mut ctx,
         );
 
         assert_eq!(fin_output.count, 1);

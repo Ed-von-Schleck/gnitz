@@ -3,6 +3,10 @@
 #![allow(clippy::approx_constant)]
 
 use super::super::program::*;
+use super::{
+    eval_predicate_via_batch as eval_predicate, eval_with_emit_via_batch,
+    float_to_bits, bits_to_float,
+};
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -343,19 +347,12 @@ fn test_emit_with_targets() {
     ];
     let prog = make_prog(&schema,code, 3, 2, vec![]);
 
-    let mut out_buf = [0u8; 8];
-    let targets = [EmitTarget {
-        base: out_buf.as_mut_ptr(),
-        stride: 8,
-        payload_col: 0,
-    }];
-    let (val, is_null, mask) =
-        eval_with_emit(&prog, &mb, 0, 0, &targets);
+    let (val, is_null, mask, emit_vals) =
+        eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(val, 30); // 10 + 20
     assert!(!is_null);
     assert_eq!(mask, 0);
-    let written = i64::from_le_bytes(out_buf);
-    assert_eq!(written, 30);
+    assert_eq!(emit_vals[0], 30);
 }
 
 #[test]
@@ -430,16 +427,9 @@ fn test_div_by_zero_null_semantics() {
         EXPR_EMIT, 0, 2, 0,
     ];
     let prog = make_prog(&schema,code, 3, 2, vec![]);
-    let mut out_buf = [0xffu8; 8];
-    let targets = [EmitTarget {
-        base: out_buf.as_mut_ptr(),
-        stride: 8,
-        payload_col: 0,
-    }];
-    let (_, _, mask) = eval_with_emit(&prog, &mb, 0, 0, &targets);
+    let (_, _, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(mask & 1, 1); // bit 0 set → null
-    let written = i64::from_le_bytes(out_buf);
-    assert_eq!(written, 0);
+    assert_eq!(emit_vals[0], 0);
 }
 
 #[test]
@@ -706,23 +696,17 @@ fn test_emit_null_opcode() {
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10])]);
     let mb = batch.as_mem_batch();
 
-    // EMIT_NULL is handled at batch level, not per-row eval.
-    // Verify it doesn't crash and is treated as a no-op in eval_with_emit.
+    // EMIT_NULL is handled at batch level, skipped by eval_batch.
+    // Verify the program still evaluates and the result register holds
+    // the loaded value.
     let code = vec![
         EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col1
         EXPR_EMIT_NULL, 0, 0, 0,     // emit null — batch-level, no-op here
     ];
     let prog = make_prog(&schema,code, 1, 0, vec![]);
 
-    let mut out_buf = [0u8; 8];
-    let targets = [EmitTarget {
-        base: out_buf.as_mut_ptr(),
-        stride: 8,
-        payload_col: 0,
-    }];
-    let (val, _, mask) = eval_with_emit(&prog, &mb, 0, 0, &targets);
-    // EMIT_NULL is a no-op at per-row level (batch-level handles it),
-    // so emit_null_mask stays 0 and result reg r0 holds the loaded value.
+    let (val, _, mask, _) = eval_with_emit_via_batch(&prog, &mb, 0);
+    // No EMIT instructions ⇒ empty emit list, no null mask bits set.
     assert_eq!(mask, 0);
     assert_eq!(val, 10);
 }

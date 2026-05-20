@@ -718,8 +718,7 @@ fn create_expr_predicate(
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let mut prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
-    prog.set_payload_col_info(schema);
+    let prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, schema)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
@@ -736,8 +735,7 @@ fn create_expr_map(
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let mut prog = ExprProgram::new(code, num_regs, 0, const_strings);
-    prog.set_payload_col_info(in_schema);
+    let prog = ExprProgram::new(code, num_regs, 0, const_strings);
     let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, in_schema, out_schema)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);

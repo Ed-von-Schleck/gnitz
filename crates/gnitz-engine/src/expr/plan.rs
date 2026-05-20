@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 
 use crate::schema::{type_code, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
-use super::program::{self as expr, ExprProgram};
+use super::program::{self as expr, ExprProgram, OutputColKind};
 use crate::storage::{Batch, MemBatch};
 use super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
 
@@ -27,24 +27,26 @@ impl ScalarFuncKind {
         "plan"
     }
 
-    /// Filter predicate: returns true if row passes.
+    /// Filter predicate: returns true if row passes. Test-only helper used by
+    /// the batch evaluator's regression tests at m=1; the production path
+    /// always goes through `run_filter`.
+    #[cfg(test)]
     pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let ScalarFuncKind::Plan(p) = self;
         p.evaluate_predicate(batch, row)
     }
 
-    /// Try to evaluate the filter predicate for all `n` rows using the batch
-    /// evaluator.  Returns `Some(bitmask)` when the batch path is used (n ≥ 16
-    /// and the kernel is Interpreted), `None` to fall through to per-row.
-    pub fn filter_batch_bits(&self, mb: &MemBatch, n: usize) -> Option<Vec<u64>> {
-        const THRESHOLD: usize = 16;
-        let ScalarFuncKind::Plan(plan) = self;
-        match &plan.filter {
-            FilterKernel::Interpreted { .. } if n >= THRESHOLD => {
-                Some(plan.filter_batch(mb, n))
-            }
-            _ => None,
-        }
+    /// Run the filter over all `n` rows, invoking `append_range(start, end)`
+    /// for each contiguous run of passing rows. The closure must not touch
+    /// the `Plan` (a `RefCell` borrow on `scratch` is held while it runs).
+    pub fn run_filter<F: FnMut(usize, usize)>(
+        &self,
+        mb: &MemBatch,
+        n: usize,
+        append_range: F,
+    ) {
+        let ScalarFuncKind::Plan(p) = self;
+        p.run_filter(mb, n, append_range);
     }
 
     /// Batch-level map: populate output batch from input batch.
@@ -146,17 +148,15 @@ impl NullPerm {
         out
     }
 
-    fn apply_column(&self, in_null_bmp: &[u8], n: usize) -> Vec<u8> {
-        let mut out = vec![0u8; n * 8];
-        let out_arr = out.as_mut_ptr() as *mut u64;
+    /// Write the permuted null bitmap directly into `out` (one u64 per row).
+    /// `out.len()` must be `n * 8`.
+    fn apply_column_into(&self, in_null_bmp: &[u8], out: &mut [u8], n: usize) {
+        debug_assert_eq!(out.len(), n * 8);
         for row in 0..n {
             let off = row * 8;
             let in_null = u64::from_le_bytes(in_null_bmp[off..off + 8].try_into().unwrap());
-            unsafe {
-                *out_arr.add(row) = self.apply(in_null);
-            }
+            out[off..off + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
         }
-        out
     }
 }
 
@@ -210,7 +210,6 @@ pub(crate) struct Plan {
     scratch: RefCell<EvalScratch>,
 }
 
-/// Empty plan with only a filter kernel set.
 fn filter_only(filter: FilterKernel) -> Plan {
     Plan {
         filter,
@@ -241,14 +240,14 @@ fn col_move_stride(
 }
 
 impl Plan {
-    /// Filter via interpreted expression (replaces ExprPredicate).
+    /// Filter via interpreted expression.
     pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
         prog.resolve_column_indices(schema);
         let no_nulls = prog.is_strictly_non_nullable(schema);
         filter_only(FilterKernel::Interpreted { prog, no_nulls })
     }
 
-    /// Projection plan from source indices (replaces UniversalProjection).
+    /// Projection plan from source indices.
     pub fn from_projection(
         src_indices: &[u32],
         src_types: &[u8],
@@ -280,7 +279,7 @@ impl Plan {
         }
     }
 
-    /// Map plan from ExprProgram bytecode (replaces ExprMap + MapAnalysis).
+    /// Map plan from ExprProgram bytecode.
     pub fn from_map(
         mut prog: ExprProgram,
         in_schema: &SchemaDescriptor,
@@ -362,32 +361,39 @@ impl Plan {
         }
     }
 
-    /// Evaluate predicate for a single row (per-row fallback).
+    /// Evaluate predicate for a single row. Thin wrapper over `eval_batch` at
+    /// m=1: the value lives at `regs[r * MORSEL]` and the null bit at
+    /// `null_bits[r * NULL_WORDS_PER_REG] & 1`.
+    #[cfg(test)]
     pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        match &self.filter {
-            FilterKernel::PassAll => true,
-            FilterKernel::Interpreted { prog, .. } => {
-                let (val, is_null) = expr::eval_predicate(prog, batch, row);
-                !is_null && val != 0
-            }
+        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter
+            else { return true };
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.ensure_capacity(prog.num_regs as usize, *no_nulls, 1);
+        eval_batch(prog, batch, row, 1, &mut scratch);
+        if prog.num_regs == 0 {
+            return false;
         }
+        let r = prog.result_reg as usize;
+        let is_null = !*no_nulls
+            && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
+        !is_null && scratch.regs[r * MORSEL] != 0
     }
 
-    /// Batch filter: evaluate predicate for all n rows, return bitmask.
-    /// Bit i is set if row i passes the filter (non-null AND non-zero result).
-    /// Returns a Vec of `(n+63)/64` words.
-    pub fn filter_batch(&self, mb: &MemBatch, n: usize) -> Vec<u64> {
+    /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
+    /// each maximal contiguous run of passing rows. PassAll passes the whole
+    /// range in one call. The bitmap stays inside `scratch` — no per-call
+    /// `Vec<u64>` allocation.
+    pub fn run_filter<F: FnMut(usize, usize)>(
+        &self,
+        mb: &MemBatch,
+        n: usize,
+        mut append_range: F,
+    ) {
         let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
-            // PassAll: all bits set
-            let words = n.div_ceil(64);
-            let mut bits = vec![u64::MAX; words];
-            // Mask out bits beyond n in the last word
-            if !n.is_multiple_of(64) {
-                bits[words - 1] = (1u64 << (n % 64)) - 1;
-            }
-            return bits;
+            if n > 0 { append_range(0, n); }
+            return;
         };
-
         let no_nulls = *no_nulls;
         let num_regs = prog.num_regs as usize;
         let result_reg = prog.result_reg as usize;
@@ -402,20 +408,19 @@ impl Plan {
             let m = MORSEL.min(n - morsel_start);
             eval_batch(prog, mb, morsel_start, m, &mut scratch);
 
-            // Pack result register into filter_bits
             let base_r = result_reg * MORSEL;
             let base_null = result_reg * NULL_WORDS_PER_REG;
             for i in 0..m {
                 let abs = morsel_start + i;
-                let is_null = !no_nulls &&
-                    (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
+                let is_null = !no_nulls
+                    && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
                 if !is_null && scratch.regs[base_r + i] != 0 {
                     scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
                 }
             }
         }
 
-        scratch.filter_bits[..words].to_vec()
+        scan_filter_bits(&scratch.filter_bits[..words], n, &mut append_range);
     }
 
     /// Execute map: system column clone → col_moves → NullPerm → compute.
@@ -451,9 +456,12 @@ impl Plan {
 
         // EMIT_NULL columns — already zero-filled by with_schema
 
-        // Null bitmap (columnar)
-        let null_bmp_result = self.null_perm.apply_column(in_batch.null_bmp_data(), n);
-        output.null_bmp_data_mut().copy_from_slice(&null_bmp_result);
+        // Null bitmap (columnar) — written directly into the output buffer.
+        // Split-borrow: `in_batch` and `output` are distinct allocations.
+        {
+            let in_nb = in_batch.null_bmp_data();
+            self.null_perm.apply_column_into(in_nb, output.null_bmp_data_mut(), n);
+        }
 
         // Compute kernel
         if let ComputeKernel::Interpreted {
@@ -502,5 +510,98 @@ impl Plan {
         output.sorted = false;
         output.consolidated = false;
         output
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FinalizeContext — hoisted state for the per-row finalize evaluator
+// ---------------------------------------------------------------------------
+
+/// Per-program state for the REDUCE finalize expression. One instance is
+/// constructed before the group loop and reused across every emitted row.
+///
+/// Everything that is constant across rows — the scratch register file, the
+/// `no_nulls` flag, the EMIT-instruction → source-register map, and the
+/// instruction-order column classification used by the caller — is computed
+/// once and survives for the lifetime of the context.
+pub(crate) struct FinalizeContext {
+    scratch: EvalScratch,
+    no_nulls: bool,
+    /// One entry per `EXPR_EMIT` instruction (in program order): the source
+    /// register that EMIT reads.
+    emit_regs: Vec<usize>,
+    /// Classification of every output-producing instruction in program order.
+    /// Indexed by destination payload column at the call site.
+    out_cols: Vec<OutputColKind>,
+}
+
+impl FinalizeContext {
+    pub fn new(prog: &ExprProgram, in_schema: &SchemaDescriptor) -> Self {
+        let no_nulls = prog.is_strictly_non_nullable(in_schema);
+        let mut scratch = EvalScratch::new();
+        scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
+        let emit_regs: Vec<usize> = prog
+            .code
+            .chunks_exact(4)
+            .filter(|i| i[0] == expr::EXPR_EMIT)
+            .map(|i| i[2] as usize)
+            .collect();
+        let out_cols = prog.classify_output_cols();
+        FinalizeContext { scratch, no_nulls, emit_regs, out_cols }
+    }
+
+    /// Classification of each output-producing instruction (in program order).
+    pub fn out_cols(&self) -> &[OutputColKind] { &self.out_cols }
+
+    /// Evaluate `prog` over a single row of `mb` into the cached scratch.
+    /// The result of each EMIT can subsequently be read with `read_emit`.
+    pub fn eval_row(&mut self, prog: &ExprProgram, mb: &MemBatch, row: usize) {
+        eval_batch(prog, mb, row, 1, &mut self.scratch);
+    }
+
+    /// Read the value and null flag for the `eidx`-th EMIT instruction.
+    /// Must be called after `eval_row`.
+    pub fn read_emit(&self, eidx: usize) -> (i64, bool) {
+        let reg = self.emit_regs[eidx];
+        let val = self.scratch.regs[reg * MORSEL];
+        let is_null = !self.no_nulls
+            && (self.scratch.null_bits[reg * NULL_WORDS_PER_REG] & 1) != 0;
+        (val, is_null)
+    }
+}
+
+/// Walk `bits` and call `append_range(start, end)` for every maximal run of
+/// set bits. Fast paths: skip all-zero words; emit a whole-word run for
+/// all-ones words. The mixed case bit-scans the word.
+fn scan_filter_bits<F: FnMut(usize, usize)>(bits: &[u64], n: usize, append_range: &mut F) {
+    let mut range_start: isize = -1;
+    for (w, &word) in bits.iter().enumerate() {
+        let row_base = w * 64;
+        let chunk = (row_base + 64).min(n) - row_base;
+
+        if word == 0 {
+            if range_start >= 0 {
+                append_range(range_start as usize, row_base);
+                range_start = -1;
+            }
+        } else if word == u64::MAX || (chunk < 64 && word == (1u64 << chunk) - 1) {
+            if range_start < 0 {
+                range_start = row_base as isize;
+            }
+        } else {
+            for i in 0..chunk {
+                let passes = (word >> i) & 1 != 0;
+                let abs = row_base + i;
+                if passes {
+                    if range_start < 0 { range_start = abs as isize; }
+                } else if range_start >= 0 {
+                    append_range(range_start as usize, abs);
+                    range_start = -1;
+                }
+            }
+        }
+    }
+    if range_start >= 0 {
+        append_range(range_start as usize, n);
     }
 }

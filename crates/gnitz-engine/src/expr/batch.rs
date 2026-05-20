@@ -44,7 +44,6 @@ pub(in crate::expr) struct EvalScratch {
     pub(in crate::expr) no_nulls: bool,
 }
 
-#[allow(dead_code)]
 impl EvalScratch {
     pub(in crate::expr) fn new() -> Self {
         EvalScratch {
@@ -75,10 +74,6 @@ impl EvalScratch {
         }
     }
 
-    pub(in crate::expr) fn reg_slice(&self, reg: usize, m: usize) -> &[i64] {
-        &self.regs[reg * MORSEL..reg * MORSEL + m]
-    }
-
     pub(in crate::expr) fn reg_mut(&mut self, reg: usize, m: usize) -> &mut [i64] {
         &mut self.regs[reg * MORSEL..reg * MORSEL + m]
     }
@@ -96,14 +91,6 @@ impl EvalScratch {
             let rd = std::slice::from_raw_parts_mut(ptr.add(d * MORSEL), m);
             (ra, rb, rd)
         }
-    }
-
-    pub(in crate::expr) fn null_words(&self, reg: usize, words: usize) -> &[u64] {
-        &self.null_bits[reg * NULL_WORDS_PER_REG..reg * NULL_WORDS_PER_REG + words]
-    }
-
-    pub(in crate::expr) fn null_words_mut(&mut self, reg: usize, words: usize) -> &mut [u64] {
-        &mut self.null_bits[reg * NULL_WORDS_PER_REG..reg * NULL_WORDS_PER_REG + words]
     }
 
     /// Split borrows for null bit words.
@@ -197,6 +184,25 @@ fn fill_null_bits_for_resolved(
     fill_null_bits_pi(s, di, null_bmp, morsel_start, m, pi_byte as usize);
 }
 
+/// Walk `dst`'s null mask and zero the matching register entries. Used by
+/// the string-comparison helpers, which compute results unconditionally for
+/// vectorization and then clear null rows in a post-pass.
+fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
+    if scratch.no_nulls { return; }
+    let base_d = dst * MORSEL;
+    let base_null = dst * NULL_WORDS_PER_REG;
+    let words = m.div_ceil(64);
+    for w in 0..words {
+        let mut null_word = scratch.null_bits[base_null + w];
+        let lo = w * 64;
+        while null_word != 0 {
+            let bit = null_word.trailing_zeros() as usize;
+            scratch.regs[base_d + lo + bit] = 0;
+            null_word &= null_word - 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // String comparison helpers — shared by *_CONST and *_COL match arms
 // ---------------------------------------------------------------------------
@@ -233,22 +239,7 @@ fn eval_str_col_vs_const(
         scratch.regs[base_d + i] =
             pred(compare_col_string_vs_const(s, blob, const_bytes, const_prefix, const_len)) as i64;
     }
-    // Zero out results for null rows using the already-computed null mask.
-    if !scratch.no_nulls {
-        let words = m.div_ceil(64);
-        for w in 0..words {
-            let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
-            if null_word != 0 {
-                let lo = w * 64;
-                let hi = (lo + 64).min(m);
-                for bit in 0..(hi - lo) {
-                    if (null_word >> bit) & 1 != 0 {
-                        scratch.regs[base_d + lo + bit] = 0;
-                    }
-                }
-            }
-        }
-    }
+    zero_null_rows(scratch, dst, m);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -295,22 +286,7 @@ fn eval_str_col_vs_col(
         let s2 = &col_b[row * 16..row * 16 + 16];
         scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob, s2, blob)) as i64;
     }
-    // Zero out results for null rows using the already-computed null mask.
-    if !scratch.no_nulls {
-        let words = m.div_ceil(64);
-        for w in 0..words {
-            let null_word = scratch.null_bits[dst * NULL_WORDS_PER_REG + w];
-            if null_word != 0 {
-                let lo = w * 64;
-                let hi = (lo + 64).min(m);
-                for bit in 0..(hi - lo) {
-                    if (null_word >> bit) & 1 != 0 {
-                        scratch.regs[base_d + lo + bit] = 0;
-                    }
-                }
-            }
-        }
-    }
+    zero_null_rows(scratch, dst, m);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +309,84 @@ pub(in crate::expr) fn eval_batch(
         prog.resolved,
         "eval_batch: program must be resolved via resolve_column_indices",
     );
+
+    // Four opcode families share one shape each; these macros collapse them
+    // to one line per opcode. `int_div_like!` covers DIV/MOD/FLOAT_DIV which
+    // additionally merge a zero-divisor mask into the destination null word.
+    macro_rules! bin_int {
+        ($a:expr, $b:expr, $d:expr, $op:ident) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m { rd[i] = ra[i].$op(rb[i]); }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+        }};
+    }
+    macro_rules! cmp_int {
+        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m { rd[i] = (ra[i] $op rb[i]) as i64; }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+        }};
+    }
+    macro_rules! bin_float {
+        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m {
+                    let fa = f64::from_bits(ra[i] as u64);
+                    let fb = f64::from_bits(rb[i] as u64);
+                    rd[i] = f64::to_bits(fa $op fb) as i64;
+                }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+        }};
+    }
+    macro_rules! cmp_float {
+        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m {
+                    let fa = f64::from_bits(ra[i] as u64);
+                    let fb = f64::from_bits(rb[i] as u64);
+                    rd[i] = (fa $op fb) as i64;
+                }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+        }};
+    }
+    // DIV-shaped op: compute per-row, mark divide-by-zero rows null, substitute
+    // a safe divisor so the computed slot holds a defined (irrelevant) value.
+    // `body(a, b)` must return `(result: i64, is_zero: bool)`.
+    macro_rules! div_like {
+        ($a:expr, $b:expr, $d:expr, |$a_i:ident, $b_i:ident| $body:expr) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m {
+                    let $a_i = ra[i];
+                    let $b_i = rb[i];
+                    let (val, is_zero): (i64, bool) = $body;
+                    rd[i] = val;
+                    if is_zero { zero_mask[i / 64] |= 1u64 << (i % 64); }
+                }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+            if !scratch.no_nulls {
+                let base_null_d = $d * NULL_WORDS_PER_REG;
+                let words = m.div_ceil(64);
+                for w in 0..words { scratch.null_bits[base_null_d + w] |= zero_mask[w]; }
+            }
+        }};
+    }
+
     for instr in prog.code.chunks_exact(4) {
         let op  = instr[0];
         let dst = instr[1] as usize;
@@ -350,11 +404,8 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             EXPR_LOAD_PAYLOAD_INT => {
                 let pi = a1 as usize;
-                let (col_size, col_tc) = if prog.payload_col_sizes.is_empty() {
-                    (8usize, crate::schema::type_code::I64)
-                } else {
-                    (prog.payload_col_sizes[pi] as usize, prog.payload_col_type_codes[pi])
-                };
+                let (size_u8, col_tc) = prog.payload_col_info[pi];
+                let col_size = size_u8 as usize;
                 let is_signed = matches!(col_tc,
                     crate::schema::type_code::I8 |
                     crate::schema::type_code::I16 |
@@ -412,11 +463,7 @@ pub(in crate::expr) fn eval_batch(
 
             EXPR_LOAD_PAYLOAD_FLOAT => {
                 let pi = a1 as usize;
-                let col_size = if prog.payload_col_sizes.is_empty() {
-                    8usize
-                } else {
-                    prog.payload_col_sizes[pi] as usize
-                };
+                let col_size = prog.payload_col_info[pi].0 as usize;
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 if col_size == 4 {
@@ -452,79 +499,19 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer arithmetic
             // ----------------------------------------------------------------
-            EXPR_INT_ADD => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = ra[i].wrapping_add(rb[i]); }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_INT_SUB => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = ra[i].wrapping_sub(rb[i]); }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_INT_MUL => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = ra[i].wrapping_mul(rb[i]); }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_INT_DIV => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                let words = m.div_ceil(64);
-                let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        if rb[i] == 0 {
-                            zero_mask[i / 64] |= 1u64 << (i % 64);
-                        }
-                        let divisor = if rb[i] == 0 { 1 } else { rb[i] };
-                        rd[i] = ra[i].wrapping_div(divisor);
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-                if !scratch.no_nulls {
-                    let base_null_d = dst * NULL_WORDS_PER_REG;
-                    for w in 0..words {
-                        scratch.null_bits[base_null_d + w] |= zero_mask[w];
-                    }
-                }
-            }
-            EXPR_INT_MOD => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                let words = m.div_ceil(64);
-                let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        if rb[i] == 0 {
-                            zero_mask[i / 64] |= 1u64 << (i % 64);
-                        }
-                        let divisor = if rb[i] == 0 { 1 } else { rb[i] };
-                        rd[i] = ra[i].wrapping_rem(divisor);
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-                if !scratch.no_nulls {
-                    let base_null_d = dst * NULL_WORDS_PER_REG;
-                    for w in 0..words {
-                        scratch.null_bits[base_null_d + w] |= zero_mask[w];
-                    }
-                }
-            }
+            EXPR_INT_ADD => bin_int!(a1, a2, dst, wrapping_add),
+            EXPR_INT_SUB => bin_int!(a1, a2, dst, wrapping_sub),
+            EXPR_INT_MUL => bin_int!(a1, a2, dst, wrapping_mul),
+            EXPR_INT_DIV => div_like!(a1, a2, dst, |a, b| {
+                let is_zero = b == 0;
+                let d = if is_zero { 1 } else { b };
+                (a.wrapping_div(d), is_zero)
+            }),
+            EXPR_INT_MOD => div_like!(a1, a2, dst, |a, b| {
+                let is_zero = b == 0;
+                let d = if is_zero { 1 } else { b };
+                (a.wrapping_rem(d), is_zero)
+            }),
             EXPR_INT_NEG => {
                 let ai = a1 as usize;
                 let base_a = ai * MORSEL;
@@ -538,70 +525,16 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Float arithmetic
             // ----------------------------------------------------------------
-            EXPR_FLOAT_ADD => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        let fa = f64::from_bits(ra[i] as u64);
-                        let fb = f64::from_bits(rb[i] as u64);
-                        rd[i] = f64::to_bits(fa + fb) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FLOAT_SUB => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        let fa = f64::from_bits(ra[i] as u64);
-                        let fb = f64::from_bits(rb[i] as u64);
-                        rd[i] = f64::to_bits(fa - fb) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FLOAT_MUL => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        let fa = f64::from_bits(ra[i] as u64);
-                        let fb = f64::from_bits(rb[i] as u64);
-                        rd[i] = f64::to_bits(fa * fb) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FLOAT_DIV => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
-                let words = m.div_ceil(64);
-                let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        let fa = f64::from_bits(ra[i] as u64);
-                        let fb = f64::from_bits(rb[i] as u64);
-                        if fb == 0.0 {
-                            zero_mask[i / 64] |= 1u64 << (i % 64);
-                        }
-                        let fb_safe = if fb == 0.0 { 1.0 } else { fb };
-                        rd[i] = f64::to_bits(fa / fb_safe) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-                if !scratch.no_nulls {
-                    let base_null_d = dst * NULL_WORDS_PER_REG;
-                    for w in 0..words {
-                        scratch.null_bits[base_null_d + w] |= zero_mask[w];
-                    }
-                }
-            }
+            EXPR_FLOAT_ADD => bin_float!(a1, a2, dst, +),
+            EXPR_FLOAT_SUB => bin_float!(a1, a2, dst, -),
+            EXPR_FLOAT_MUL => bin_float!(a1, a2, dst, *),
+            EXPR_FLOAT_DIV => div_like!(a1, a2, dst, |a, b| {
+                let fa = f64::from_bits(a as u64);
+                let fb = f64::from_bits(b as u64);
+                let is_zero = fb == 0.0;
+                let fb_safe = if is_zero { 1.0 } else { fb };
+                (f64::to_bits(fa / fb_safe) as i64, is_zero)
+            }),
             EXPR_FLOAT_NEG => {
                 let ai = a1 as usize;
                 let base_a = ai * MORSEL;
@@ -616,118 +549,22 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer comparisons
             // ----------------------------------------------------------------
-            EXPR_CMP_EQ => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] == rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_CMP_NE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] != rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_CMP_GT => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] > rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_CMP_GE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] >= rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_CMP_LT => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] < rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_CMP_LE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m { rd[i] = (ra[i] <= rb[i]) as i64; }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
+            EXPR_CMP_EQ => cmp_int!(a1, a2, dst, ==),
+            EXPR_CMP_NE => cmp_int!(a1, a2, dst, !=),
+            EXPR_CMP_GT => cmp_int!(a1, a2, dst, >),
+            EXPR_CMP_GE => cmp_int!(a1, a2, dst, >=),
+            EXPR_CMP_LT => cmp_int!(a1, a2, dst, <),
+            EXPR_CMP_LE => cmp_int!(a1, a2, dst, <=),
 
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
-            EXPR_FCMP_EQ => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) == f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FCMP_NE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) != f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FCMP_GT => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) > f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FCMP_GE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) >= f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FCMP_LT => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) < f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
-            EXPR_FCMP_LE => {
-                let ai = a1 as usize; let bi = a2 as usize;
-                {
-                    let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
-                    for i in 0..m {
-                        rd[i] = (f64::from_bits(ra[i] as u64) <= f64::from_bits(rb[i] as u64)) as i64;
-                    }
-                }
-                null_or2(scratch, dst, ai, bi, m);
-            }
+            EXPR_FCMP_EQ => cmp_float!(a1, a2, dst, ==),
+            EXPR_FCMP_NE => cmp_float!(a1, a2, dst, !=),
+            EXPR_FCMP_GT => cmp_float!(a1, a2, dst, >),
+            EXPR_FCMP_GE => cmp_float!(a1, a2, dst, >=),
+            EXPR_FCMP_LT => cmp_float!(a1, a2, dst, <),
+            EXPR_FCMP_LE => cmp_float!(a1, a2, dst, <=),
 
             // ----------------------------------------------------------------
             // Boolean 3VL

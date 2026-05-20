@@ -15,8 +15,6 @@ use crate::xxh;
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
-/// For batches of ≥ 16 rows with an Interpreted predicate, evaluates all rows
-/// via the batch evaluator and scans the resulting bitmask.
 pub fn op_filter(
     batch: &Batch,
     func: &ScalarFuncKind,
@@ -41,64 +39,13 @@ pub fn op_filter(
         output.share_blob_from(batch);
     }
 
-    let append_range = |out: &mut Batch, start: usize, end: usize| {
+    func.run_filter(&mb, n, |start, end| {
         if blob_passthrough {
-            out.append_batch_no_blob_reloc(batch, start, end);
+            output.append_batch_no_blob_reloc(batch, start, end);
         } else {
-            out.append_batch(batch, start, end);
+            output.append_batch(batch, start, end);
         }
-    };
-
-    // Batch evaluator path: evaluate all n rows, scan resulting bitmask.
-    if let Some(bits) = func.filter_batch_bits(&mb, n) {
-        let mut range_start: isize = -1;
-        let words = n.div_ceil(64);
-        for (w, &word) in bits[..words].iter().enumerate() {
-            let row_base = w * 64;
-            let chunk = (row_base + 64).min(n) - row_base;
-
-            if word == 0 {
-                if range_start >= 0 {
-                    append_range(&mut output, range_start as usize, row_base);
-                    range_start = -1;
-                }
-            } else if word == u64::MAX || (chunk < 64 && word == (1u64 << chunk) - 1) {
-                if range_start < 0 {
-                    range_start = row_base as isize;
-                }
-            } else {
-                for i in 0..chunk {
-                    let passes = (word >> i) & 1 != 0;
-                    let abs = row_base + i;
-                    if passes {
-                        if range_start < 0 { range_start = abs as isize; }
-                    } else if range_start >= 0 {
-                        append_range(&mut output, range_start as usize, abs);
-                        range_start = -1;
-                    }
-                }
-            }
-        }
-        if range_start >= 0 {
-            append_range(&mut output, range_start as usize, n);
-        }
-    } else {
-        // Per-row path (small batches or PassAll)
-        let mut range_start: isize = -1;
-        for i in 0..n {
-            if func.evaluate_predicate(&mb, i) {
-                if range_start < 0 {
-                    range_start = i as isize;
-                }
-            } else if range_start >= 0 {
-                append_range(&mut output, range_start as usize, i);
-                range_start = -1;
-            }
-        }
-        if range_start >= 0 {
-            append_range(&mut output, range_start as usize, n);
-        }
-    }
+    });
 
     // append_batch resets sorted+consolidated to false; restore them based on input.
     if ConsolidatedBatch::from_batch_ref(batch).is_some() {
@@ -141,9 +88,12 @@ pub fn op_map(
     // Evaluate the map batch (without reindex) to get column data
     let mut output = func.evaluate_map_batch(batch, out_schema);
 
-    // Overwrite PK with promoted values from reindex column
+    // Overwrite PK with promoted values from reindex column. Hoist the
+    // per-row dispatch — column type, payload index, and byte width are
+    // batch-invariants, so the match-on-type-code happens once.
+    let promoter = PkPromoter::new(in_schema, ri_col);
     for row in 0..output.count {
-        let pk = promote_col_to_pk(&in_mb, row, ri_col, in_schema);
+        let pk = promoter.promote(&in_mb, row);
         output.set_pk_at(row, pk);
     }
 
@@ -448,71 +398,68 @@ fn mix64(mut v: u64) -> u64 {
     v
 }
 
-/// Promote a column value to a 128-bit PK for reindexing.
-pub(super) fn promote_col_to_pk(
-    batch: &MemBatch,
-    row: usize,
-    col_idx: usize,
-    schema: &SchemaDescriptor,
-) -> u128 {
-    let tc = schema.columns[col_idx].type_code;
+/// Per-batch dispatch for "read column value, project to 128-bit PK". The
+/// `match` on type code happens once at construction; per-row work is just
+/// the read + the kind-specific decode.
+pub(super) struct PkPromoter {
+    kind: PromoteKind,
+}
 
-    // If reindexing by the PK column itself, read from the batch's PK.
-    if schema.is_pk_col(col_idx) {
-        return batch.get_pk(row);
+enum PromoteKind {
+    Pk,
+    Wide { pi: usize },
+    String { pi: usize },
+    Narrow { pi: usize, cs: usize },
+}
+
+impl PkPromoter {
+    pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
+        if schema.is_pk_col(col_idx) {
+            return PkPromoter { kind: PromoteKind::Pk };
+        }
+        let tc = schema.columns[col_idx].type_code;
+        let pi = schema.payload_idx(col_idx);
+        let kind = match tc {
+            type_code::U128 | type_code::UUID => PromoteKind::Wide { pi },
+            type_code::STRING => PromoteKind::String { pi },
+            // All ≤8-byte integer and float types: zero-extend the little-
+            // endian bytes to u128. Float bit patterns are intentionally
+            // re-used as-is — identical floats hash to identical PKs.
+            _ => PromoteKind::Narrow { pi, cs: crate::schema::type_size(tc) as usize },
+        };
+        PkPromoter { kind }
     }
 
-    let pi = schema.payload_idx(col_idx);
-
-    match tc {
-        type_code::U128 => {
-            let ptr = batch.get_col_ptr(row, pi, 16);
-            u128::from_le_bytes(ptr[0..16].try_into().unwrap())
-        }
-        type_code::U64 | type_code::I64 => {
-            let ptr = batch.get_col_ptr(row, pi, 8);
-            let val = u64::from_le_bytes(ptr.try_into().unwrap());
-            val as u128
-        }
-        type_code::STRING => {
-            let struct_bytes = batch.get_col_ptr(row, pi, 16);
-            let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-            if length == 0 {
-                return 0;
+    #[inline]
+    pub(super) fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
+        match self.kind {
+            PromoteKind::Pk => batch.get_pk(row),
+            PromoteKind::Wide { pi } => {
+                let ptr = batch.get_col_ptr(row, pi, 16);
+                u128::from_le_bytes(ptr[0..16].try_into().unwrap())
             }
-            // Hash the string bytes
-            let h = if length <= SHORT_STRING_THRESHOLD {
-                // Inline: prefix bytes at struct[4..4+length]
-                xxh::checksum(&struct_bytes[4..4 + length])
-            } else {
-                let heap_offset =
-                    u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                xxh::checksum(&batch.blob[heap_offset..heap_offset + length])
-            };
-            let h_hi = mix64(h);
-            ((h_hi as u128) << 64) | (h as u128)
-        }
-        type_code::F64 => {
-            let ptr = batch.get_col_ptr(row, pi, 8);
-            let bits = u64::from_le_bytes(ptr.try_into().unwrap());
-            bits as u128
-        }
-        type_code::F32 => {
-            let ptr = batch.get_col_ptr(row, pi, 4);
-            let bits = u32::from_le_bytes(ptr.try_into().unwrap()) as u64;
-            bits as u128
-        }
-        type_code::UUID => {
-            let ptr = batch.get_col_ptr(row, pi, 16);
-            u128::from_le_bytes(ptr[0..16].try_into().unwrap())
-        }
-        _ => {
-            // U8, U16, U32, I8, I16, I32 — use correct stride from type_size.
-            let cs = crate::schema::type_size(tc) as usize;
-            let ptr = batch.get_col_ptr(row, pi, cs);
-            let mut buf = [0u8; 8];
-            buf[..cs].copy_from_slice(ptr);
-            u64::from_le_bytes(buf) as u128
+            PromoteKind::String { pi } => {
+                let struct_bytes = batch.get_col_ptr(row, pi, 16);
+                let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+                if length == 0 {
+                    return 0;
+                }
+                let h = if length <= SHORT_STRING_THRESHOLD {
+                    xxh::checksum(&struct_bytes[4..4 + length])
+                } else {
+                    let heap_offset =
+                        u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+                    xxh::checksum(&batch.blob[heap_offset..heap_offset + length])
+                };
+                let h_hi = mix64(h);
+                ((h_hi as u128) << 64) | (h as u128)
+            }
+            PromoteKind::Narrow { pi, cs } => {
+                let ptr = batch.get_col_ptr(row, pi, cs);
+                let mut buf = [0u8; 8];
+                buf[..cs].copy_from_slice(ptr);
+                u64::from_le_bytes(buf) as u128
+            }
         }
     }
 }
@@ -741,14 +688,11 @@ mod tests {
         let schema = make_schema_pk_u64_payload_u32();
         let batch = build_batch_u32_payload(&schema, &[(1, 100), (2, 200), (3, 300)]);
         let mb = batch.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
 
-        let pk0 = promote_col_to_pk(&mb, 0, 1, &schema);
-        let pk1 = promote_col_to_pk(&mb, 1, 1, &schema);
-        let pk2 = promote_col_to_pk(&mb, 2, 1, &schema);
-
-        assert_eq!(pk0, 100u128, "row 0 U32 promote");
-        assert_eq!(pk1, 200u128, "row 1 U32 promote — wrong col_size corrupts this");
-        assert_eq!(pk2, 300u128, "row 2 U32 promote");
+        assert_eq!(promoter.promote(&mb, 0), 100u128, "row 0 U32 promote");
+        assert_eq!(promoter.promote(&mb, 1), 200u128, "row 1 U32 promote — wrong col_size corrupts this");
+        assert_eq!(promoter.promote(&mb, 2), 300u128, "row 2 U32 promote");
     }
 
     #[test]
@@ -759,12 +703,10 @@ mod tests {
         let uuid_b: u128 = 0xdeadbeef_cafe_1234_5678_000000000001u128;
         let batch = build_batch_uuid_payload(&schema, &[(1, uuid_a), (2, uuid_b)]);
         let mb = batch.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
 
-        let pk0 = promote_col_to_pk(&mb, 0, 1, &schema);
-        let pk1 = promote_col_to_pk(&mb, 1, 1, &schema);
-
-        assert_eq!(pk0, uuid_a, "row 0 UUID promote must keep all 128 bits");
-        assert_eq!(pk1, uuid_b, "row 1 UUID promote must keep all 128 bits");
+        assert_eq!(promoter.promote(&mb, 0), uuid_a, "row 0 UUID promote must keep all 128 bits");
+        assert_eq!(promoter.promote(&mb, 1), uuid_b, "row 1 UUID promote must keep all 128 bits");
     }
 
     // -----------------------------------------------------------------------

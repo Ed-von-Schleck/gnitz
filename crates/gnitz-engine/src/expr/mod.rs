@@ -9,10 +9,17 @@ mod tests;
 pub use program::ExprProgram;
 pub use plan::ScalarFuncKind;
 
-// Crate-internal — opcodes are used in #[cfg(test)] code in vm.rs/compiler.rs
+pub(crate) use program::OutputColKind;
+pub(crate) use plan::{Plan, FinalizeContext};
+
+// Opcode constants — consumed by hand-written test bytecode in vm.rs,
+// ops/reduce.rs, and ops/linear.rs (all #[cfg(test)]). Per-target test
+// builds (lib vs bin) reference different subsets, so the import is
+// liberally exposed under #[cfg(test)] with an allow for the unreferenced
+// names in each build.
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use program::{
-    OutputColKind,
     EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,
     EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_NEG,
     EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
@@ -25,6 +32,4 @@ pub(crate) use program::{
     EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
     EXPR_EMIT_NULL,
     EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PK_INT,
-    MAX_REGS,
 };
-pub(crate) use plan::Plan;
