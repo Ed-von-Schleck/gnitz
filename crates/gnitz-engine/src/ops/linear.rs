@@ -189,45 +189,54 @@ where
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
 
+    enum RunSrc {
+        None,
+        A { start: usize },
+        B { start: usize },
+    }
+
     let mut i = 0usize;
     let mut j = 0usize;
-    // run_src: 0=batch_a, 1=batch_b, -1=no current run
-    let mut run_src: i32 = -1;
-    let mut run_a_start = 0usize;
-    let mut run_b_start = 0usize;
+    let mut run_src = RunSrc::None;
 
     while i < n_a && j < n_b {
         let a_pk = batch_a.get_pk(i);
         let b_pk = batch_b.get_pk(j);
 
         if a_pk < b_pk {
-            if run_src != 0 {
-                if run_src == 1 {
-                    output.append_batch(batch_b, run_b_start, j);
+            match run_src {
+                RunSrc::A { .. } => {}
+                RunSrc::B { start } => {
+                    output.append_batch(batch_b, start, j);
+                    run_src = RunSrc::A { start: i };
                 }
-                run_src = 0;
-                run_a_start = i;
+                RunSrc::None => {
+                    run_src = RunSrc::A { start: i };
+                }
             }
             i += 1;
         } else if b_pk < a_pk {
-            if run_src != 1 {
-                if run_src == 0 {
-                    output.append_batch(batch_a, run_a_start, i);
+            match run_src {
+                RunSrc::B { .. } => {}
+                RunSrc::A { start } => {
+                    output.append_batch(batch_a, start, i);
+                    run_src = RunSrc::B { start: j };
                 }
-                run_src = 1;
-                run_b_start = j;
+                RunSrc::None => {
+                    run_src = RunSrc::B { start: j };
+                }
             }
             j += 1;
         } else {
             // Equal PKs: flush pending run, then merge-sort the equal-PK
             // sub-ranges from both batches by payload to preserve (PK, payload)
             // sort order.
-            if run_src == 0 {
-                output.append_batch(batch_a, run_a_start, i);
-            } else if run_src == 1 {
-                output.append_batch(batch_b, run_b_start, j);
+            match run_src {
+                RunSrc::A { start } => output.append_batch(batch_a, start, i),
+                RunSrc::B { start } => output.append_batch(batch_b, start, j),
+                RunSrc::None => {}
             }
-            run_src = -1;
+            run_src = RunSrc::None;
 
             // Find the end of the equal-PK run in each batch.
             let mut i_end = i + 1;
@@ -298,10 +307,10 @@ where
     }
 
     // Flush final run
-    if run_src == 0 {
-        output.append_batch(batch_a, run_a_start, i);
-    } else if run_src == 1 {
-        output.append_batch(batch_b, run_b_start, j);
+    match run_src {
+        RunSrc::A { start } => output.append_batch(batch_a, start, i),
+        RunSrc::B { start } => output.append_batch(batch_b, start, j),
+        RunSrc::None => {}
     }
 
     // Remaining

@@ -438,14 +438,13 @@ fn write_join_row(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) {
-    let pk = left_batch.get_pk(left_row);
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_cursor.current_null_word;
 
     let left_npc = left_schema.num_payload_cols();
     let null_word = left_null | (right_null << left_npc);
 
-    output.extend_pk(pk);
+    output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -495,7 +494,6 @@ fn write_join_row_null_right(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) {
-    let pk = left_batch.get_pk(left_row);
     let left_null = left_batch.get_null_word(left_row);
 
     let left_npc = left_schema.num_payload_cols();
@@ -507,7 +505,7 @@ fn write_join_row_null_right(
     };
     let null_word = left_null | (right_null_bits << left_npc);
 
-    output.extend_pk(pk);
+    output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -801,14 +799,13 @@ fn write_join_row_from_batches(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) {
-    let pk = left_batch.get_pk(left_row);
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_batch.get_null_word(right_row);
 
     let left_npc = left_schema.num_payload_cols();
     let null_word = left_null | (right_null << left_npc);
 
-    output.extend_pk(pk);
+    output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -1097,6 +1094,59 @@ mod tests {
         let out = op_join_delta_delta(&a, &b, &ls, &rs);
         // b consolidates to empty (1 + -1 = 0 for same pk+payload) → no match
         assert_eq!(out.count, 0);
+    }
+
+    #[test]
+    fn test_write_join_row_compound_pk_bytes() {
+        // Narrow compound-PK left: 2× U64, pk_stride = 16, no payload.
+        let left_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1],
+        );
+        let right_schema = make_schema_u64_i64();
+
+        // Known 16-byte PK region: pk0 = 0x1122..., pk1 = 0xAABB...
+        let pk0: u64 = 0x1122_3344_5566_7788;
+        let pk1: u64 = 0xAABB_CCDD_EEFF_0011;
+        let mut pk_bytes = [0u8; 16];
+        pk_bytes[0..8].copy_from_slice(&pk0.to_le_bytes());
+        pk_bytes[8..16].copy_from_slice(&pk1.to_le_bytes());
+
+        let mut left = Batch::with_schema(left_schema, 1);
+        left.extend_pk_bytes(&pk_bytes);
+        left.extend_weight(&1i64.to_le_bytes());
+        left.extend_null_bmp(&0u64.to_le_bytes());
+        left.count += 1;
+
+        let right = make_batch(&right_schema, &[(7, 1, 42)]);
+
+        // Output schema: 2 PK cols + right payload (1 I64) = 3 cols.
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        let mut output = Batch::with_schema(out_schema, 1);
+
+        write_join_row_from_batches(
+            &mut output,
+            &left.as_mem_batch(),
+            0,
+            &right.as_mem_batch(),
+            0,
+            1,
+            &left_schema,
+            &right_schema,
+        );
+
+        assert_eq!(output.count, 1);
+        assert_eq!(output.get_pk_bytes(0), &pk_bytes);
     }
 
     // -----------------------------------------------------------------------

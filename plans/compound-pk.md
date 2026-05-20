@@ -4,12 +4,13 @@ Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
 to have exactly one PK column.
 
 What remains is every boundary that still calls
-`SchemaDescriptor::pk_index_single()` — `compiler.rs`, `ops/reduce.rs`,
-`ops/index.rs`, the master index-routing cache, `gnitz-sql`,
-`gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi`, a few catalog FK
-sites. Each `pk_index_single()` call `assert!`s `pk_count == 1` in
-release; that assertion is the canary that fires the day a compound PK
-reaches an unmigrated boundary.
+`SchemaDescriptor::pk_index_single()` — `ops/reduce.rs`, `ops/index.rs`,
+the master index-routing cache + PK-render helper, `gnitz-sql`,
+`gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi`, and the
+`catalog/validation.rs` FK type-resolution site. Each
+`pk_index_single()` call `assert!`s `pk_count == 1` in release; that
+assertion is the canary that fires the day a compound PK reaches an
+unmigrated boundary.
 
 **Design choice — Concat.** The PK region in the physical batch / WAL
 block / shard file holds the concatenated raw PK column bytes, one row
@@ -83,31 +84,15 @@ Out:
 
 ## The change, layer by layer
 
-### 1. Catalog: remaining single-PK consumers
+System tables stay single-PK throughout; `make_schema(cols, pk_index)`
+continues to wrap a single index. The catalog's in-memory cache and
+`BatchBuilder` already carry the full PK column list (`pk_col_of:
+FxHashMap<i64, PkColList>`, `BatchBuilder::physical_col_idx` →
+`schema.payload_col_idx`). The remaining catalog touchpoints —
+`validation.rs:22` and `hooks.rs:297` — are owned by the FK and
+Operators/Index sections below.
 
-The PK column list is already persisted (`TABLE_TAB` packs
-`pk_count + pk_col_idx[..]`; `create_table` takes `pk_cols: &[u32]`;
-`build_schema_from_col_defs` and the table-register hook build
-multi-PK schemas). The consumers that still assume one PK column:
-
-- `catalog/cache.rs`: `pk_col_of: FxHashMap<i64, u32>` stores a single
-  column index. Change to a packed u32 mirroring the on-disk encoding
-  (or `ArrayVec<u32, 4>`); cache invalidates when *any* PK column index
-  changes.
-- `catalog/validation.rs`, `catalog/hooks.rs` (FK type resolution):
-  the FK's `referred_columns` clause names exactly one parent column;
-  the catalog records that resolved index. Type promotion reads
-  `parent_schema.columns[recorded_idx].type_code` — replace the
-  `pk_index_single()` lookups (`validation.rs`'s tuple,
-  `hooks.rs`'s `source_pk_type`) with the recorded index.
-- `catalog/utils.rs` (`BatchBuilder::physical_col_idx`): walk the PK
-  list to compute "number of PK columns with index < col_idx" and
-  subtract. Single-PK is the special case.
-
-System tables stay single-PK; `make_schema(cols, pk_index)` continues
-to wrap a single index.
-
-### 2. SQL planner (`gnitz-sql/src/planner.rs`)
+### 1. SQL planner (`gnitz-sql/src/planner.rs`)
 
 CREATE TABLE:
 
@@ -175,7 +160,7 @@ DML (`gnitz-sql/src/dml.rs`):
   single-column IN lists. Compound-PK tables → no IN-pushdown for
   now (correct fallback).
 
-### 3. Python / C API surface
+### 2. Python / C API surface
 
 - `gnitz-py/src/lib.rs`: `PySchema.pk_index: usize` →
   `PySchema.pk_indices: Vec<u32>`. Existing single-PK code paths read
@@ -185,7 +170,7 @@ DML (`gnitz-sql/src/dml.rs`):
   callers pass `pk_count = 1, &single_idx`. Replace the
   `pk_index_single()` reads in the batch/seek helpers with the PK list.
 
-### 4. Operators
+### 3. Operators
 
 #### map_reindex
 
@@ -193,36 +178,6 @@ Unchanged for this plan. `map_reindex`
 (`gnitz-core/src/circuit.rs`) still rewrites the PK slot from a single
 source column. Multi-column joins are blocked at the planner; a
 compound `map_reindex` would be dead until that restriction lifts.
-
-#### Join
-
-`compiler.rs` (`merge_schemas_for_join_impl`): output schema is
-`[left_PK_col, left_payload..., right_payload...]`. Generalise to
-copy all of `left.pk_columns()`:
-
-```rust
-let mut n = 0;
-let mut pk_idx_list = ArrayVec::<u32, 4>::new();
-for (_, _, c) in left.pk_columns() {
-    cols[n] = *c;
-    pk_idx_list.push(n as u32);
-    n += 1;
-}
-for (_, _, c) in left.payload_columns() { cols[n] = *c; n += 1; }
-for (_, _, c) in right.payload_columns() { /* nullable propagation */ n += 1; }
-SchemaDescriptor::new(&cols[..n], &pk_idx_list[..])
-```
-
-For single-PK left this produces exactly today's
-`SchemaDescriptor::new(&cols[..n], &[0])`; for compound left PK with
-`pk_count = k`, `pk_indices = [0, 1, ..., k-1]`.
-
-`ops/join.rs` (`write_join_row`):
-`output.extend_pk(left_batch.get_pk(left_row))` →
-`output.extend_pk_bytes(left_batch.get_pk_bytes(left_row))`. Narrow-PK
-joins still hit the `extend_pk → u128` path because the bytes form is
-a strict superset for `pk_stride ≤ 16`. The `left_npc` null-bit offset
-is unchanged — left's payload column count doesn't depend on PK width.
 
 #### Reduce
 
@@ -253,9 +208,8 @@ row's PK region bytes →
   PK comparison goes through the heap key path automatically; compound
   PK works once `compare_rows` is invoked on PK tie (as it already
   is). No code change.
-- Linear (`ops/linear.rs`): output schema construction follows
-  `merge_schemas_for_join_impl` — copy all PK columns from input, then
-  payload, then `pk_indices = [0..pk_count]`.
+- Linear (`ops/linear.rs`): already uses `in_schema.pk_indices()`
+  when constructing the output schema; no change needed.
 - Scan (`ops/scan.rs`): no PK assumption in the scan body.
 
 #### Index / GI / AVI (`ops/index.rs`)
@@ -268,7 +222,8 @@ key. With compound source PKs that pack no longer fits; drop the
 hand-packing and make the secondary-index table itself a compound-PK
 table.
 
-`make_gi_schema` / `make_avi_schema` return:
+`make_gi_schema` / `make_avi_schema` (today both no-arg, returning a
+hardcoded U128-PK + I64-payload shape) return:
 
 - GI: PK columns
   `(promoted_indexed: U64, src_pk_col_0: T0, src_pk_col_1: T1, ...)`
@@ -278,6 +233,14 @@ table.
   argument to copy the source PK columns; today they take none.)
 - AVI: same shape, with the for_max negation applied to the first
   column at insert time.
+
+`catalog/utils.rs::make_index_schema` and its caller at
+`catalog/hooks.rs:297` (`source_pk_type = owner_schema.columns[
+owner_schema.pk_index_single()].type_code`) build the *index table*
+schema with the same `(indexed, src_pk)` shape and migrate together —
+the index table's PK becomes the concatenated `(indexed, src_pk_cols…)`,
+so the constructor takes the source `SchemaDescriptor` directly rather
+than a single `source_pk_type: u8`.
 
 Ingest at `op_integrate_with_indexes` writes each PK column directly
 (`extend_pk_bytes` over the concatenated bytes), and the storage layer
@@ -292,6 +255,12 @@ plane already routes any width via `partition_for_pk_bytes`; this cache
 is the only PK-routing site that still assumes a ≤16-byte key.
 Generalise the cache key to carry the full `(stride, bytes)` PK so a
 compound source PK routes without collision.
+
+**PK-render helper.** `format_pk_value(pk: u128, schema)` in
+`runtime/master.rs` types-dispatches on the single PK column for the
+unique-PK violation message. Compound PK needs a `(pk_bytes,
+schema)` variant that walks `pk_columns()` and joins the rendered
+values with `, `.
 
 **Lookup is a prefix scan.** A `WHERE indexed = X` query binds only
 the leading PK column — the source PK is what we're finding, not
@@ -340,6 +309,15 @@ Rule for this plan:
   declared UNIQUE index in `parent`.
 - Multi-column FK (`FOREIGN KEY (a, b) REFERENCES parent (x, y)`): out
   of scope. Error message points at this limitation.
+
+Catalog touchpoint: `catalog/validation.rs:22` (`validate_fk_column`)
+resolves the parent PK type as
+`(entry.schema.pk_index_single(), entry.schema.columns[
+entry.schema.pk_index_single()].type_code)`. With the stricter rule
+above, the resolved column is the FK's recorded `fk_col_idx` (either
+the parent's single PK column, or a parent column carrying its own
+UNIQUE index); read the type directly from
+`parent_schema.columns[fk_col_idx].type_code`.
 
 ---
 
@@ -390,9 +368,9 @@ Order of merging (each step keeps the test suite green):
    user-visible here.
 2. **DML.** `extract_pk_value` returns a byte tuple;
    `try_extract_pk_seek` requires full-tuple binding.
-3. **Operators.** Schema builders in `compiler.rs` and `reduce`/`join`
-   adjustments. Index seek becomes prefix-scan; master index-routing
-   cache key carries the full PK.
+3. **Operators.** `reduce` PK-list adjustments and index/GI/AVI
+   reshape. Index seek becomes prefix-scan; master index-routing cache
+   key carries the full PK.
 4. **FK stricter rule.** Reject single-column FK to a compound-PK
    parent unless the referenced column has its own UNIQUE index;
    migrate the catalog FK type-resolution sites.

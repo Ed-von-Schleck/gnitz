@@ -595,6 +595,24 @@ fn opt_fold_reduce_map(
 // Schema construction helpers
 // ---------------------------------------------------------------------------
 
+/// Copy `schema`'s PK columns to `cols[..pk_count]` and populate `pk_idx`
+/// with `[0, 1, ..., pk_count - 1]`. Returns `pk_count`. PK columns always
+/// occupy the leading positions of the output schema, so the new PK
+/// indices are dense and identical to the loop counter.
+fn copy_pk_columns_into(
+    schema: &SchemaDescriptor,
+    cols: &mut [SchemaColumn],
+    pk_idx: &mut [u32; crate::schema::MAX_PK_COLUMNS],
+) -> usize {
+    let mut k = 0;
+    for (_, _, c) in schema.pk_columns() {
+        cols[k] = *c;
+        pk_idx[k] = k as u32;
+        k += 1;
+    }
+    k
+}
+
 fn merge_schemas_for_join_impl(
     left: &SchemaDescriptor,
     right: &SchemaDescriptor,
@@ -605,9 +623,9 @@ fn merge_schemas_for_join_impl(
         "join output schema exceeds {}-column limit: {} + payload({}) = {}",
         crate::schema::MAX_COLUMNS, left.num_columns(), right.num_payload_cols(), total);
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut n = 0;
-    cols[n] = left.columns[left.pk_index_single() as usize];
-    n += 1;
+    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
+    let pk_len = copy_pk_columns_into(left, &mut cols, &mut pk_idx);
+    let mut n = pk_len;
     for (_, _, c) in left.payload_columns() {
         cols[n] = *c;
         n += 1;
@@ -618,7 +636,7 @@ fn merge_schemas_for_join_impl(
         cols[n] = c;
         n += 1;
     }
-    SchemaDescriptor::new(&cols[..n], &[0])
+    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
@@ -631,9 +649,9 @@ fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescripto
 
 fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut n = 0;
-    cols[n] = input.columns[input.pk_index_single() as usize];
-    n += 1;
+    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
+    let pk_len = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
+    let mut n = pk_len;
     for &idx in src_indices {
         let i = idx as usize;
         if !input.is_pk_col(i) {
@@ -641,7 +659,7 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
             n += 1;
         }
     }
-    SchemaDescriptor::new(&cols[..n], &[0])
+    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
 /// Determine the output type for an aggregate function.
@@ -935,10 +953,10 @@ fn emit_node(
                 }
 
                 gnitz_wire::MapKind::KeyOnly => {
-                    let s = SchemaDescriptor::new(
-                        &[in_reg_schema.columns[in_reg_schema.pk_index_single() as usize]],
-                        &[0],
-                    );
+                    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_PK_COLUMNS];
+                    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
+                    let pk_len = copy_pk_columns_into(&in_reg_schema, &mut cols, &mut pk_idx);
+                    let s = SchemaDescriptor::new(&cols[..pk_len], &pk_idx[..pk_len]);
                     let fp = create_universal_projection(
                         &[], &[], &in_reg_schema, &s, owned_funcs,
                     );
@@ -1867,6 +1885,73 @@ mod tests {
         let joined = merge_schemas_for_join_outer(&left, &right);
         assert_eq!(joined.num_columns(), 3);
         assert_eq!(joined.columns[2].nullable, 1); // right side nullable
+    }
+
+    #[test]
+    fn test_merge_schemas_for_join_compound_pk() {
+        // Compound-PK left: 4 columns [U64, U64, U64, U64], PK = (col1, col2).
+        let left = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1, 2],
+        );
+        let right = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let joined = merge_schemas_for_join_impl(&left, &right, false);
+        // Two PK columns up front, then left payload (2), then right payload (1) = 5.
+        assert_eq!(joined.num_columns(), 5);
+        assert_eq!(joined.pk_indices(), &[0, 1]);
+        assert_eq!(joined.columns[0].type_code, type_code::U64);
+        assert_eq!(joined.columns[1].type_code, type_code::U64);
+
+        // Single-PK left collapses back to pk_indices = [0].
+        let left_single = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let joined_single = merge_schemas_for_join_impl(&left_single, &right, false);
+        assert_eq!(joined_single.pk_indices(), &[0]);
+    }
+
+    #[test]
+    fn test_build_map_output_schema_compound_pk() {
+        // Compound-PK input: 4 columns, PK = (col1, col2). Project [0, 3].
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1, 2],
+        );
+        let out = build_map_output_schema(&input, &[0, 3]);
+        // Two PK columns + two non-PK projected columns = 4 total.
+        assert_eq!(out.num_columns(), 4);
+        assert_eq!(out.pk_indices(), &[0, 1]);
+
+        // Single-PK input collapses back to pk_indices = [0].
+        let input_single = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let out_single = build_map_output_schema(&input_single, &[1]);
+        assert_eq!(out_single.pk_indices(), &[0]);
     }
 
     #[test]
