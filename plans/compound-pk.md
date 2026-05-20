@@ -3,23 +3,11 @@
 Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
 to have exactly one PK column.
 
-The storage and merge layer already operates on raw PK byte regions of any
-width: `pk_stride` spans `0..=MAX_PK_BYTES`, the `Batch` / `MemBatch` /
-`MappedShard` PK-bytes accessors exist, the column-aware `compare_pk_bytes`
-comparator (signed- and float-aware) drives the in-memory N-way merge /
-sort+consolidate / weight-fold order, shard `pk_min`/`pk_max` and the
-on-disk manifest carry a width-tagged `PkBuf`, the WAL block region 0
-follows `schema.pk_stride()`, the wire `PkColumn::Bytes` variant carries
-compound keys, the catalog persists the full PK column list, hash
-partition routing covers any width through `partition_for_pk_bytes`, and
-the shard XOR8 filter builds over a PK region of any `pk_stride`.
-
 What remains is every boundary that still calls
 `SchemaDescriptor::pk_index_single()` — `compiler.rs`, `ops/reduce.rs`,
 `ops/index.rs`, the master index-routing cache, `gnitz-sql`,
 `gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi`, a few catalog FK
-sites — plus the `u128`-keyed batch / cursor / control-block entry
-points. Each `pk_index_single()` call `assert!`s `pk_count == 1` in
+sites. Each `pk_index_single()` call `assert!`s `pk_count == 1` in
 release; that assertion is the canary that fires the day a compound PK
 reaches an unmigrated boundary.
 
@@ -95,48 +83,7 @@ Out:
 
 ## The change, layer by layer
 
-### 1. Storage batch (`storage/batch.rs`)
-
-The narrow-PK `get_pk` / `extend_pk` / `set_pk_at` family keeps its
-`match stride { 8 | 16 => …, _ => panic! }` shape (those panics guard
-the u128 API against wide-stride misuse; compound-PK code paths use the
-bytes accessors `extend_pk_bytes` / `set_pk_at_bytes` / `get_pk_bytes`
-instead). The remaining work here:
-
-- `Batch::append_row_from_ptable_found` takes `pk: u128`; change to
-  `pk_bytes: &[u8]` using `extend_pk_bytes`. `PartitionedTable`'s
-  found-row plumbing (`storage/partitioned_table.rs`) follows: the
-  found-row PK is retained as bytes and surfaced via
-  `PartitionedTable::found_pk_bytes()` (alongside the existing
-  `found_null_word` / `found_col_ptr` / `found_blob_ptr`).
-- `Batch::find_lower_bound(key: u128)` stays as the narrow-PK helper.
-  Add `find_lower_bound_bytes(&[u8])` for compound, routing through
-  `compare_pk_bytes`. The shard-reader and read-cursor equivalents
-  (`shard_reader.rs`, `read_cursor.rs`) get the same pair.
-
-### 2. Wire control block (`gnitz-wire/src/lib.rs::control`)
-
-`CONTROL_COLS` declares `seek_pk: U128`. For wide PK that's
-insufficient. Add `seek_pk_extra: BLOB nullable` carrying bytes 16..
-for wide PK; empty for `pk_stride ≤ 16`. The fast path
-(`encode_ctrl_block_template_fast`) stays a memcpy of the precomputed
-template plus the patch fields; wide PK falls through to
-`encode_ctrl_block_ipc`, which already handles a blob region for
-`error_msg`. (Keep `seek_pk: U128` rather than widening it to BLOB:
-a BLOB `seek_pk` would break the template-copy fast path
-`CTRL_BLOCK_TEMPLATE` in `runtime/wire.rs`, which dominates the
-error-response cost.)
-
-`gnitz-engine/src/runtime/wire.rs`:
-
-- `encode_ctrl_block_ipc`: add `seek_pk_extra: &[u8]` parameter; replace
-  the `pk_index_single()` derivation with `pk_stride()`.
-- `CONTROL_SCHEMA_DESC` / `ctrl_region_offset`: pick up the new column
-  automatically — its region offset is computed from `CONTROL_COLS`.
-  `CTRL_BLOCK_SIZE_NO_BLOB` grows by one region's fixed bytes (0 for a
-  blob region, but `align8` may add padding).
-
-### 3. Catalog: remaining single-PK consumers
+### 1. Catalog: remaining single-PK consumers
 
 The PK column list is already persisted (`TABLE_TAB` packs
 `pk_count + pk_col_idx[..]`; `create_table` takes `pk_cols: &[u32]`;
@@ -160,7 +107,7 @@ multi-PK schemas). The consumers that still assume one PK column:
 System tables stay single-PK; `make_schema(cols, pk_index)` continues
 to wrap a single index.
 
-### 4. SQL planner (`gnitz-sql/src/planner.rs`)
+### 2. SQL planner (`gnitz-sql/src/planner.rs`)
 
 CREATE TABLE:
 
@@ -178,7 +125,8 @@ CREATE TABLE:
   signed numerical order end-to-end. Validation still enforces
   `is_pk_eligible(type_code)` and non-nullable for every PK column.
 - `client.create_table` call: pass `&pk_cols[..]`. Update
-  `gnitz-core/src/client.rs` signature.
+  `gnitz-core/src/client.rs` signature (currently
+  `pk_col_idx: usize`).
 - `build_projection` (view PK): replace `pk_index_single()` with a
   `pk_indices()` walk. View output schema carries the source's PK
   column list verbatim.
@@ -203,38 +151,41 @@ DML (`gnitz-sql/src/dml.rs`):
 
 - ON CONFLICT validation: allow `Columns(cols)` with `len > 1` iff it
   equals the table's PK column set (any order).
-- `extract_pk_value`: return a stack-resident byte buffer of exactly
-  `schema.pk_stride()` bytes, populated by serialising each extracted
-  literal as LE bytes in `schema.pk_indices()` order (not AST or
-  column-name order). The caller splits this into the wire `seek_pk`
-  (first 16 bytes) + `seek_pk_extra` (remainder) pair.
+- `extract_pk_value` (currently returns `u128`): return a stack-
+  resident byte buffer of exactly `schema.pk_stride()` bytes,
+  populated by serialising each extracted literal as LE bytes in
+  `schema.pk_indices()` order (not AST or column-name order). The
+  caller splits this into the wire `seek_pk` (first 16 bytes) +
+  `seek_pk_extra` (remainder) pair.
 - `client_side_filter_do_nothing` / `client_side_merge_do_update`: the
   local-dedup set is `HashSet<u128>`. For compound PK that truncates
   and collides silently. Change to a key carrying the full
   `(stride, [u8; MAX_PK_BYTES])` so the whole compound key
   participates in hash and eq. Single-PK stays correct under the same
   code path.
-- `try_extract_pk_seek`: walk the AND chain in any order, bucketing
-  each `col = literal` predicate into a per-PK-column slot indexed by
-  the PK column's schema position. Reject unless every PK column has
-  exactly one binding. Then serialise the literals into the
-  `pk_stride`-byte buffer in `schema.pk_indices()` order — the on-disk
-  PK byte layout is the only ground truth; AST/binding order is
-  irrelevant. Partial (prefix) bindings fall back to the full scan.
-- `try_extract_pk_in`: only single-column IN lists. Compound-PK tables
-  → no IN-pushdown for now (correct fallback).
+- `try_extract_pk_seek` (currently returns `Option<u128>`): walk the
+  AND chain in any order, bucketing each `col = literal` predicate
+  into a per-PK-column slot indexed by the PK column's schema
+  position. Reject unless every PK column has exactly one binding.
+  Then serialise the literals into the `pk_stride`-byte buffer in
+  `schema.pk_indices()` order — the on-disk PK byte layout is the
+  only ground truth; AST/binding order is irrelevant. Partial
+  (prefix) bindings fall back to the full scan.
+- `try_extract_pk_in` (currently returns `Option<Vec<u128>>`): only
+  single-column IN lists. Compound-PK tables → no IN-pushdown for
+  now (correct fallback).
 
-### 5. Python / C API surface
+### 3. Python / C API surface
 
-- `gnitz-py/src/lib.rs`: `PySchema.pk_index` →
+- `gnitz-py/src/lib.rs`: `PySchema.pk_index: usize` →
   `PySchema.pk_indices: Vec<u32>`. Existing single-PK code paths read
   `pk_indices[0]` after `assert len == 1`.
-- `gnitz-capi/src/lib.rs`: `create_table` C ABI accepts
+- `gnitz-capi/src/lib.rs`: `gnitz_schema_new(pk_index: u32)` accepts
   `pk_count: u32` and `pk_cols: *const u32`. Existing single-column
   callers pass `pk_count = 1, &single_idx`. Replace the
   `pk_index_single()` reads in the batch/seek helpers with the PK list.
 
-### 6. Operators
+### 4. Operators
 
 #### map_reindex
 
@@ -246,7 +197,8 @@ compound `map_reindex` would be dead until that restriction lifts.
 #### Join
 
 `compiler.rs` (`merge_schemas_for_join_impl`): output schema is
-`[left_PK_cols..., left_payload..., right_payload...]`. Generalise:
+`[left_PK_col, left_payload..., right_payload...]`. Generalise to
+copy all of `left.pk_columns()`:
 
 ```rust
 let mut n = 0;
@@ -343,7 +295,8 @@ compound source PK routes without collision.
 
 **Lookup is a prefix scan.** A `WHERE indexed = X` query binds only
 the leading PK column — the source PK is what we're finding, not
-something the caller knows. `seek_by_index` changes shape:
+something the caller knows. `seek_by_index` changes shape from
+`fn seek_by_index(table_id, col_idx, key: u128) -> ...` to:
 
 ```rust
 // catalog/store.rs
@@ -370,19 +323,6 @@ Single-PK sources also benefit: the index table becomes
 `((gc_u64 as u128) << 64) | spk_lo` u128 trick — cleaner with no extra
 cost since `pk_stride == 16` is on the narrow-region fast path.
 
-### 7. Range / scan operations (`storage/read_cursor.rs`)
-
-`seek(key: u128)` stays the narrow-PK entry point; add
-`seek_bytes(key: &[u8])` for wide PK. Both call the same
-merge-tree-positioning logic, parameterised on the PK comparison.
-
-`current_key: u128` stays for narrow PK. For wide-PK cursors, also
-expose `current_pk_bytes(&self) -> &[u8]` reading from the active
-source without copying. Most consumers (DAG, VM bindings) call
-`current_pk_bytes()` and forward to the next operator; the existing
-single-PK call sites (e.g. `reduce` trace_out_cursor seek) stay
-narrow.
-
 ---
 
 ## Foreign keys to compound parent PKs
@@ -404,14 +344,6 @@ Rule for this plan:
 ---
 
 ## Testing
-
-### Rust unit tests
-
-- `storage/batch.rs`: round-trip `append_row_from_ptable_found` /
-  `find_lower_bound_bytes` on a compound-PK batch built via
-  `with_schema`; verify ordering matches `compare_pk_bytes`.
-- `runtime/wire.rs`: CONTROL block encode/decode with `seek_pk_extra`
-  non-empty.
 
 ### Engine integration tests
 
@@ -452,21 +384,19 @@ the producing worker.
 
 Order of merging (each step keeps the test suite green):
 
-1. **Wire control extension.** Add `seek_pk_extra`; storage batch /
-   read-cursor byte entry points.
-2. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`; drop the
+1. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`; drop the
    I*/U*→U64 PK coercion. From this commit, CREATE TABLE allows
    compound PK and native signed PK types — the feature becomes
    user-visible here.
-3. **DML.** `extract_pk_value` returns a tuple; `try_extract_pk_seek`
-   requires full-tuple binding.
-4. **Operators.** Schema builders in `compiler.rs` and `reduce`/`join`
+2. **DML.** `extract_pk_value` returns a byte tuple;
+   `try_extract_pk_seek` requires full-tuple binding.
+3. **Operators.** Schema builders in `compiler.rs` and `reduce`/`join`
    adjustments. Index seek becomes prefix-scan; master index-routing
    cache key carries the full PK.
-5. **FK stricter rule.** Reject single-column FK to a compound-PK
+4. **FK stricter rule.** Reject single-column FK to a compound-PK
    parent unless the referenced column has its own UNIQUE index;
    migrate the catalog FK type-resolution sites.
-6. **Python/CAPI.** `pk_index` → `pk_indices`.
+5. **Python/CAPI.** `pk_index` → `pk_indices`.
 
 Each step is independently mergeable; the feature only becomes
-user-visible at step 2.
+user-visible at step 1.
