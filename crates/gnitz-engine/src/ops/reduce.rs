@@ -38,7 +38,7 @@ fn fill_cleared_batch(
 
 use super::util::{
     write_string_from_batch,
-    extract_group_key, extract_gc_u64,
+    extract_group_key, extract_gc_u64, cmp_typed_le,
 };
 
 // ---------------------------------------------------------------------------
@@ -439,14 +439,17 @@ fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 
 /// Pre-computed per-column sort descriptor to avoid repeated schema lookups.
 ///
-/// Four bytes per entry, no padding (all fields are u8-sized).
-/// A stack array of MAX_COLUMNS = 65 entries is 260 bytes — well within four cache lines.
+/// Five bytes per entry, no padding (all fields are u8-sized).
+/// A stack array of MAX_COLUMNS = 65 entries is 325 bytes — well within five cache lines.
 #[derive(Clone, Copy)]
 struct SortDesc {
     pi: u8,
     cs: u8,
     tc: TypeCode,
     c_idx: u8,
+    /// Byte offset of the addressed PK column within the row's PK region.
+    /// Meaningful only when `pi == PAYLOAD_MAPPING_PK_SENTINEL`; zero otherwise.
+    pk_off: u8,
 }
 
 /// Compare two rows by group columns using pre-computed SortDesc array.
@@ -461,7 +464,15 @@ fn compare_by_group_cols(
 
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            let ord = mb.get_pk(row_a).cmp(&mb.get_pk(row_b));
+            // Isolate the addressed PK column's byte window. Comparing the
+            // whole PK region (the previous `mb.get_pk(row)` widen) splits
+            // compound-PK groups that share the addressed column but differ
+            // in other PK columns.
+            let off = desc.pk_off as usize;
+            let cs = desc.cs as usize;
+            let a = &mb.get_pk_bytes(row_a)[off..off + cs];
+            let b = &mb.get_pk_bytes(row_b)[off..off + cs];
+            let ord = cmp_typed_le(a, b, desc.tc);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -482,57 +493,17 @@ fn compare_by_group_cols(
             (false, false) => {}
         }
 
-        let ord = match desc.tc {
-            TypeCode::String => {
-                let a_bytes = mb.get_col_ptr(row_a, pi, 16);
-                let b_bytes = mb.get_col_ptr(row_b, pi, 16);
-                use crate::schema::compare_german_strings;
-                compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
-            }
-            TypeCode::F64 => {
-                let a_ptr = mb.get_col_ptr(row_a, pi, 8);
-                let b_ptr = mb.get_col_ptr(row_b, pi, 8);
-                let a_f = f64::from_bits(crate::util::read_u64_le(a_ptr, 0));
-                let b_f = f64::from_bits(crate::util::read_u64_le(b_ptr, 0));
-                a_f.total_cmp(&b_f)
-            }
-            TypeCode::F32 => {
-                let a_ptr = mb.get_col_ptr(row_a, pi, 4);
-                let b_ptr = mb.get_col_ptr(row_b, pi, 4);
-                let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
-                let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
-                a_f.total_cmp(&b_f)
-            }
-            TypeCode::U128 | TypeCode::UUID => {
-                let a_ptr = mb.get_col_ptr(row_a, pi, 16);
-                let b_ptr = mb.get_col_ptr(row_b, pi, 16);
-                let a_hi = u64::from_le_bytes(a_ptr[8..16].try_into().unwrap());
-                let b_hi = u64::from_le_bytes(b_ptr[8..16].try_into().unwrap());
-                a_hi.cmp(&b_hi).then_with(|| {
-                    let a_lo = u64::from_le_bytes(a_ptr[0..8].try_into().unwrap());
-                    let b_lo = u64::from_le_bytes(b_ptr[0..8].try_into().unwrap());
-                    a_lo.cmp(&b_lo)
-                })
-            }
-            TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-                let cs = desc.cs as usize;
-                let a_ptr = mb.get_col_ptr(row_a, pi, cs);
-                let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-                let a_v = crate::schema::read_signed(a_ptr, cs);
-                let b_v = crate::schema::read_signed(b_ptr, cs);
-                a_v.cmp(&b_v)
-            }
-            TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
-                let cs = desc.cs as usize;
-                let a_ptr = mb.get_col_ptr(row_a, pi, cs);
-                let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-                let mut a_buf = [0u8; 8];
-                let mut b_buf = [0u8; 8];
-                a_buf[..cs].copy_from_slice(a_ptr);
-                b_buf[..cs].copy_from_slice(b_ptr);
-                u64::from_le_bytes(a_buf).cmp(&u64::from_le_bytes(b_buf))
-            }
-            TypeCode::Blob => unreachable!("BLOB columns are not valid group-by keys"),
+        let ord = if desc.tc == TypeCode::String {
+            let a_bytes = mb.get_col_ptr(row_a, pi, 16);
+            let b_bytes = mb.get_col_ptr(row_b, pi, 16);
+            crate::schema::compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
+        } else if desc.tc == TypeCode::Blob {
+            unreachable!("BLOB columns are not valid group-by keys")
+        } else {
+            let cs = desc.cs as usize;
+            let a = mb.get_col_ptr(row_a, pi, cs);
+            let b = mb.get_col_ptr(row_b, pi, cs);
+            cmp_typed_le(a, b, desc.tc)
         };
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -547,16 +518,19 @@ fn build_sort_descs(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> ([SortDesc; crate::schema::MAX_COLUMNS], usize) {
-    let mut arr = [SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0 }; crate::schema::MAX_COLUMNS];
+    let mut arr = [SortDesc {
+        pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0, pk_off: 0,
+    }; crate::schema::MAX_COLUMNS];
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
         let c_idx = c_idx_u32 as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
-        arr[i] = SortDesc {
-            pi: schema.payload_mapping_byte(c_idx),
-            cs: tc.stride(),
-            tc,
-            c_idx: c_idx as u8,
+        let pi = schema.payload_mapping_byte(c_idx);
+        let pk_off = if pi == PAYLOAD_MAPPING_PK_SENTINEL {
+            schema.pk_byte_offset(c_idx)
+        } else {
+            0
         };
+        arr[i] = SortDesc { pi, cs: tc.stride(), tc, c_idx: c_idx as u8, pk_off };
     }
     (arr, group_by_cols.len())
 }
@@ -573,38 +547,37 @@ fn argsort_delta(
         return (0..n as u32).collect();
     }
 
-    if group_by_cols.len() == 1 {
+    // packed_sort fast path: non-nullable single non-PK col of a packable
+    // int type. Reads via `payload_idx` (PK-invalid) and stores keys in a
+    // dense Vec so the comparator skips the per-call TypeCode dispatch.
+    // NULL stores as zero bytes — would interleave with integer 0, so
+    // nullable falls through to compare_by_group_cols below.
+    if group_by_cols.len() == 1
+        && !schema.is_pk_col(group_by_cols[0] as usize)
+        && schema.columns[group_by_cols[0] as usize].nullable == 0
+    {
         let ci = group_by_cols[0] as usize;
-        debug_assert!(
-            !schema.is_pk_col(ci),
-            "group_by_pk should have intercepted single-PK group before argsort_delta"
-        );
         let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
         let pi = schema.payload_idx(ci);
-        // NULL stores as zero bytes; packed_sort would interleave NULLs with
-        // the integer 0, so it must only run on non-nullable columns. Nullable
-        // single-column falls through to compare_by_group_cols below.
-        if schema.columns[ci].nullable == 0 {
-            macro_rules! packed_sort {
-                ($T:ty, $stride:expr) => {{
-                    let keys: Vec<$T> = (0..n)
-                        .map(|i| {
-                            let ptr = mb.get_col_ptr(i, pi, $stride);
-                            <$T>::from_le_bytes(ptr.try_into().unwrap())
-                        })
-                        .collect();
-                    let mut indices: Vec<u32> = (0..n as u32).collect();
-                    indices.sort_unstable_by_key(|&i| keys[i as usize]);
-                    return indices;
-                }};
-            }
-            match tc {
-                TypeCode::I64 => packed_sort!(i64, 8),
-                TypeCode::U64 => packed_sort!(u64, 8),
-                TypeCode::I32 => packed_sort!(i32, 4),
-                TypeCode::U32 => packed_sort!(u32, 4),
-                _ => {}
-            }
+        macro_rules! packed_sort {
+            ($T:ty, $stride:expr) => {{
+                let keys: Vec<$T> = (0..n)
+                    .map(|i| {
+                        let ptr = mb.get_col_ptr(i, pi, $stride);
+                        <$T>::from_le_bytes(ptr.try_into().unwrap())
+                    })
+                    .collect();
+                let mut indices: Vec<u32> = (0..n as u32).collect();
+                indices.sort_unstable_by_key(|&i| keys[i as usize]);
+                return indices;
+            }};
+        }
+        match tc {
+            TypeCode::I64 => packed_sort!(i64, 8),
+            TypeCode::U64 => packed_sort!(u64, 8),
+            TypeCode::I32 => packed_sort!(i32, 4),
+            TypeCode::U32 => packed_sort!(u32, 4),
+            _ => {}
         }
     }
 
@@ -758,7 +731,8 @@ pub fn op_reduce(
 
     // Pre-compute sort descriptors for group comparisons (non-pk path).
     let (sort_descs, sort_descs_len) = if group_by_pk {
-        ([SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0 }; crate::schema::MAX_COLUMNS], 0)
+        ([SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0, pk_off: 0 };
+          crate::schema::MAX_COLUMNS], 0)
     } else {
         build_sort_descs(input_schema, group_by_cols)
     };
@@ -1209,7 +1183,15 @@ fn cursor_matches_group(
 
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            if cursor.current_key != exemplar_mb.get_pk(exemplar_row) {
+            // Raw byte equality suffices here (no order, no signed/float
+            // dispatch): rows with identical bytes at this PK-column window
+            // are equal regardless of type.
+            let off = desc.pk_off as usize;
+            let cs = desc.cs as usize;
+            let cursor_bytes = &cursor.current_pk_bytes()[off..off + cs];
+            let exemplar_bytes =
+                &exemplar_mb.get_pk_bytes(exemplar_row)[off..off + cs];
+            if cursor_bytes != exemplar_bytes {
                 return false;
             }
             continue;
@@ -1282,19 +1264,20 @@ pub fn op_gather_reduce(
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, partial_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
-    let smb_pks: Vec<u128> = (0..n).map(|i| smb.get_pk(i)).collect();
-
     let mut idx = 0usize;
     while idx < n {
-        let group_pk = smb_pks[idx];
         let exemplar_row = idx;
+        // Borrows of `smb` are all immutable here — `get_pk_bytes` returns a
+        // slice into `smb.data` and coexists freely with `get_pk_bytes(idx)`
+        // and `get_col_ptr(idx, ..)` inside the inner loop.
+        let group_pk_bytes = smb.get_pk_bytes(idx);
 
         for acc in accs.iter_mut() {
             acc.reset();
         }
 
         // Accumulate all partial deltas for this group
-        while idx < n && smb_pks[idx] == group_pk
+        while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes
         {
             let w = smb.get_weight(idx);
             for k in 0..num_aggs {
@@ -1310,6 +1293,11 @@ pub fn op_gather_reduce(
             }
             idx += 1;
         }
+
+        // `trace_out_cursor.seek` still takes a u128 — wide-PK cursor lift
+        // is separate work. `get_pk` panics for pk_stride ∉ {8, 16}; today's
+        // call sites can only reach this with stride 8 or 16.
+        let group_pk: u128 = smb.get_pk(exemplar_row);
 
         // Read old global from trace_out
         trace_out_cursor.seek(group_pk);
@@ -2914,5 +2902,215 @@ mod tests {
             "first emitted row must be (1, 2) in pk_indices order");
         assert_eq!((p1_col0, p1_col1), (2, 1),
             "second emitted row must be (2, 1) in pk_indices order");
+    }
+
+    // -----------------------------------------------------------------------
+    // Compound-PK subset grouping: PK-region access must be per-PK-column
+    // (pre-fix the slow path widened the entire region and split groups
+    // that share the addressed PK column but differ in other PK columns).
+    // -----------------------------------------------------------------------
+
+    /// compare_by_group_cols on the PK-sentinel branch must compare only
+    /// the addressed PK column. Two rows that share `pk_col_0` but differ
+    /// in `pk_col_1` must compare Equal under `GROUP BY pk_col_0`.
+    #[test]
+    fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
+        let schema = make_compound_pk_2xu64_schema();
+        let batch = make_batch_compound_2xu64(&schema, &[
+            (10, 7, 1, 100),
+            (10, 9, 1, 200),
+            (20, 7, 1, 300),
+        ]);
+        let mb = batch.as_mem_batch();
+
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
+        let descs = &descs_arr[..descs_len];
+        assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL,
+            "subset group on PK col 0 must produce a PK-sentinel SortDesc");
+        assert_eq!(descs[0].pk_off, 0, "pk_col_0 byte offset within PK region");
+
+        // Same pk_col_0 (10), different pk_col_1 → Equal under GROUP BY pk_col_0.
+        assert_eq!(
+            compare_by_group_cols(&mb, 0, 1, descs),
+            std::cmp::Ordering::Equal,
+            "rows with same pk_col_0 must form one group regardless of pk_col_1",
+        );
+        // Different pk_col_0 → ordering follows pk_col_0.
+        assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Less);
+        assert_eq!(compare_by_group_cols(&mb, 2, 0, descs), std::cmp::Ordering::Greater);
+    }
+
+    /// compare_by_group_cols on PK-sentinel with `GROUP BY pk_col_1`
+    /// (non-zero PK byte offset) must isolate pk_col_1.
+    #[test]
+    fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
+        let schema = make_compound_pk_2xu64_schema();
+        let batch = make_batch_compound_2xu64(&schema, &[
+            (1, 50, 1, 100),
+            (2, 50, 1, 200),
+            (3, 60, 1, 300),
+        ]);
+        let mb = batch.as_mem_batch();
+
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[1u32]);
+        let descs = &descs_arr[..descs_len];
+        assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
+        assert_eq!(descs[0].pk_off, 8, "pk_col_1 byte offset within PK region");
+
+        // Same pk_col_1 (50), different pk_col_0 → Equal.
+        assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Equal);
+        // Different pk_col_1 → ordering follows pk_col_1.
+        assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Less);
+    }
+
+    /// Single-PK U64 with `GROUP BY pk` must be bit-identical to the prior
+    /// whole-region widen path — pk_off = 0, cs = pk_stride = 8.
+    #[test]
+    fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
+        let schema = make_schema_u64_i64();
+        let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
+        let mb = batch.as_mem_batch();
+
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
+        let descs = &descs_arr[..descs_len];
+        assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
+        assert_eq!(descs[0].pk_off, 0);
+        assert_eq!(descs[0].cs, 8);
+
+        assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Less);
+        assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
+        assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Equal);
+    }
+
+    /// cursor_matches_group on a PK-sentinel SortDesc with compound PK must
+    /// match rows that share the addressed PK column but differ elsewhere.
+    #[test]
+    fn test_cursor_matches_group_pk_sentinel_compound_subset() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_compound_pk_2xu64_schema();
+        // Cursor row: (pk0=10, pk1=99). Exemplar row: (pk0=10, pk1=42).
+        // GROUP BY pk_col_0 → must match (both share pk0=10).
+        let cursor_batch = Rc::new(make_batch_compound_2xu64(&schema, &[
+            (10, 99, 1, 0),
+        ]));
+        let exemplar_batch = make_batch_compound_2xu64(&schema, &[
+            (10, 42, 1, 0),
+            (20, 42, 1, 0),
+        ]);
+        let exemplar_mb = exemplar_batch.as_mem_batch();
+
+        let mut cursor_handle = CursorHandle::from_owned(&[cursor_batch], schema);
+        let cursor = cursor_handle.cursor_mut();
+        cursor.seek(0u128);
+        assert!(cursor.valid, "cursor must be positioned on the single row");
+
+        let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
+        let descs = &descs_arr[..descs_len];
+
+        // Row 0 (pk0=10) shares pk_col_0 with the cursor → match.
+        assert!(cursor_matches_group(cursor, &exemplar_mb, 0, descs),
+            "exemplar (10,42) and cursor (10,99) share pk_col_0=10");
+        // Row 1 (pk0=20) differs from the cursor's pk_col_0=10 → no match.
+        assert!(!cursor_matches_group(cursor, &exemplar_mb, 1, descs),
+            "exemplar (20,42) differs from cursor (10,99) in pk_col_0");
+    }
+
+    /// extract_group_key on `GROUP BY pk_col_0` (single PK column of a
+    /// compound PK) must return the same u128 for two rows that share
+    /// pk_col_0 — distinct pk_col_1 values must not collide them into
+    /// different groups.
+    #[test]
+    fn test_extract_group_key_single_pk_col_compound_subset() {
+        let schema = make_compound_pk_2xu64_schema();
+        let batch = make_batch_compound_2xu64(&schema, &[
+            (10, 50, 1, 0),
+            (10, 99, 1, 0),
+            (20, 50, 1, 0),
+        ]);
+        let mb = batch.as_mem_batch();
+
+        let k0 = extract_group_key(&mb, 0, &schema, &[0u32]);
+        let k1 = extract_group_key(&mb, 1, &schema, &[0u32]);
+        let k2 = extract_group_key(&mb, 2, &schema, &[0u32]);
+
+        assert_eq!(k0, 10u128, "key must equal pk_col_0 value (10), not whole PK region");
+        assert_eq!(k0, k1, "rows sharing pk_col_0 must hash to the same group key");
+        assert_eq!(k2, 20u128);
+        assert_ne!(k0, k2);
+    }
+
+    /// Pair-test on single-PK U64: extract_group_key must still return
+    /// the full PK region (bit-identical to the prior whole-region widen).
+    #[test]
+    fn test_extract_group_key_single_pk_col_single_pk_bit_identical() {
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[(42, 1, 100), (99, 1, 200)]);
+        let mb = batch.as_mem_batch();
+
+        let k0 = extract_group_key(&mb, 0, &schema, &[0u32]);
+        let k1 = extract_group_key(&mb, 1, &schema, &[0u32]);
+        assert_eq!(k0, 42u128, "single PK widens to the same value as before");
+        assert_eq!(k1, 99u128);
+    }
+
+    /// End-to-end op_reduce: GROUP BY pk_col_0 (a strict subset of a
+    /// compound PK) with COUNT(*). Pre-fix the slow path widened the
+    /// whole PK region and split every (pk_col_0, pk_col_1) pair into
+    /// its own group; the fix collapses rows sharing pk_col_0.
+    #[test]
+    fn test_op_reduce_compound_pk_group_by_subset_count() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_compound_pk_2xu64_schema();
+        // GROUP BY a single U64 column → use_natural_pk via
+        // is_single_col_natural_pk. Output: U64 pk + I64 count.
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+
+        let empty_out = Rc::new(Batch::empty(1, 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // PK-sorted (pk0, pk1): (1,10), (1,20), (2,10).
+        let delta = make_batch_compound_2xu64(&in_schema, &[
+            (1, 10, 1, 0),
+            (1, 20, 1, 0),
+            (2, 10, 1, 0),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        // Two groups: pk_col_0=1 (count=2), pk_col_0=2 (count=1).
+        // Pre-fix the count would be 3 (one row per (pk0, pk1) pair).
+        assert_eq!(out.count, 2, "GROUP BY pk_col_0 collapses (1,10) and (1,20) into one group");
+
+        // Output rows in pk_col_0 ascending order (slow path argsorts).
+        let mut entries: Vec<(u64, i64)> = (0..out.count)
+            .map(|i| {
+                let pk_bytes = out.get_pk_bytes(i);
+                let pk = u64::from_le_bytes(pk_bytes.try_into().unwrap());
+                let cnt = crate::util::read_i64_le(out.col_data(0), i * 8);
+                (pk, cnt)
+            })
+            .collect();
+        entries.sort_by_key(|&(pk, _)| pk);
+        assert_eq!(entries, vec![(1, 2), (2, 1)]);
     }
 }

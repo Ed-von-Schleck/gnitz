@@ -4,9 +4,9 @@ Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
 to have exactly one PK column.
 
 What remains is every boundary that still calls
-`SchemaDescriptor::pk_index_single()` — `ops/reduce.rs`, `ops/index.rs`,
-the master index-routing cache + PK-render helper, `gnitz-sql`,
-`gnitz-core`'s wire `Schema`, `gnitz-py`, `gnitz-capi`, and the
+`SchemaDescriptor::pk_index_single()` — `ops/index.rs`, the master
+index-routing cache + PK-render helper, `gnitz-sql`, `gnitz-core`'s
+wire `Schema`, `gnitz-py`, `gnitz-capi`, and the
 `catalog/validation.rs` FK type-resolution site. Each
 `pk_index_single()` call `assert!`s `pk_count == 1` in release; that
 assertion is the canary that fires the day a compound PK reaches an
@@ -49,6 +49,12 @@ Out:
 - Compound PK with String/Blob columns (variable-width PK columns
   would force the PK region to vary per row, not just per schema).
 - Partial-tuple ON CONFLICT (`ON CONFLICT (a)` when PK is `(a, b)`).
+- Wide-stride (`pk_stride > 16`) compound PK reduce. The reduce
+  slow-path cursors (`trace_out`, `trace_in`, AVI/GI) still use
+  `ReadCursor::seek(u128)`; lifting them to `seek_bytes` is a
+  follow-on. The planner caps reduce/GROUP BY on compound PK at
+  `pk_stride ∈ {8, 16}`; point lookups, scans, and DML on wider
+  compound PKs are not subject to this cap.
 
 ## Vocabulary
 
@@ -132,6 +138,16 @@ JOIN / GROUP BY reindex: `cb.map_reindex(filtered, single_pk_idx,
 prog)` is unchanged — multi-column joins remain rejected at the
 planner, so `map_reindex` is still called with a single column.
 
+Compound-PK admission rule: CREATE TABLE accepts compound PKs at any
+storage-supported stride. Reduce/GROUP BY on a compound-PK input is
+admitted iff `pk_stride ∈ {8, 16}`; reject wider strides with a clear
+error until the reduce slow-path cursors are lifted to `seek_bytes`.
+Any GROUP BY shape (full PK set, subset, single PK column, non-PK
+columns) is admissible at the supported stride — the reduce slow path
+handles compound PK correctly there. Point lookups, scans, and
+INSERT/UPDATE/DELETE on compound PKs work at any stride and aren't
+subject to this rule.
+
 DML (`gnitz-sql/src/dml.rs`):
 
 - ON CONFLICT validation: allow `Columns(cols)` with `len > 1` iff it
@@ -178,29 +194,6 @@ Unchanged for this plan. `map_reindex`
 (`gnitz-core/src/circuit.rs`) still rewrites the PK slot from a single
 source column. Multi-column joins are blocked at the planner; a
 compound `map_reindex` would be dead until that restriction lifts.
-
-#### Reduce
-
-`ops/reduce.rs`: `in_pki = pk_index_single()` becomes `pk_indices`.
-`group_by_pk` detection fires when `sorted(group_by_cols) ==
-sorted(input_schema.pk_indices())`; the fast path treats the entire PK
-region as the group key.
-
-`compiler.rs` (`build_reduce_output_schema`): the `use_natural_pk`
-rule today fires when `group_cols.len() == 1` and that column's type
-is `U64`/`U128`/`UUID` (any PK-eligible scalar promotes to the
-output's natural PK). Preserve that verbatim. *Additionally* fire when
-the group-column set, as an unordered set, equals
-`schema.pk_indices()` — then the output's PK region is the group
-columns concatenated in `pk_indices()` order, mirroring the source's
-PK shape. Both rules can be true at once (single PK, group by it) and
-produce the same output. Falling through neither keeps the existing
-synthetic U128 PK.
-
-`emit_reduce_row`: `output.extend_pk(group_key)` for synthetic-PK
-output is unchanged; for natural-PK output the group_key *is* the
-row's PK region bytes →
-`output.extend_pk_bytes(source_mb.get_pk_bytes(exemplar_row))`.
 
 #### Distinct, Linear, Scan
 
@@ -339,8 +332,10 @@ UNIQUE index); read the type directly from
   path. WHERE on a PK prefix falls back to full delta scan, still
   correct.
 - JOIN with compound-PK left side. Verify output schema shape and rows.
-- GROUP BY all PK columns → `group_by_pk` fast path. GROUP BY a prefix
-  → general reduce path.
+- GROUP BY all PK columns → `group_by_pk` fast path. GROUP BY a PK
+  prefix or a single PK column → reduce slow path, correct at
+  `pk_stride ∈ {8, 16}`. `pk_stride > 16` GROUP BY rejected at plan
+  build until the cursor-seek lift lands.
 - FK to a compound-PK parent: (a) wrong column → rejected with the new
   error; (b) a column with its own UNIQUE index → accepted.
 - Multi-worker (`GNITZ_WORKERS=4`): partition routing by compound PK
@@ -363,14 +358,16 @@ the producing worker.
 Order of merging (each step keeps the test suite green):
 
 1. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`; drop the
-   I*/U*→U64 PK coercion. From this commit, CREATE TABLE allows
+   I*/U*→U64 PK coercion; enforce the compound-PK admission rule at
+   plan build (reduce/GROUP BY on compound PK requires
+   `pk_stride ∈ {8, 16}`). From this commit, CREATE TABLE allows
    compound PK and native signed PK types — the feature becomes
    user-visible here.
 2. **DML.** `extract_pk_value` returns a byte tuple;
    `try_extract_pk_seek` requires full-tuple binding.
-3. **Operators.** `reduce` PK-list adjustments and index/GI/AVI
-   reshape. Index seek becomes prefix-scan; master index-routing cache
-   key carries the full PK.
+3. **Operators.** Index/GI/AVI reshape (secondary-index table becomes
+   a compound-PK table); index seek becomes prefix-scan; master
+   index-routing cache key carries the full PK.
 4. **FK stricter rule.** Reject single-column FK to a compound-PK
    parent unless the referenced column has its own UNIQUE index;
    migrate the catalog FK type-resolution sites.

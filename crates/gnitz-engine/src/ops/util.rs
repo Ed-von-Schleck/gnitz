@@ -1,9 +1,38 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, TypeCode, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use crate::xxh;
+
+/// Compare two equal-length LE byte windows of a fixed-width column under
+/// the given `TypeCode`. Unifies the per-TypeCode dispatch used by reduce's
+/// PK-sentinel and payload arms and by `compare_cursor_payload_to_batch_row`.
+/// String and Blob are not handled here — callers requiring them must
+/// dispatch on String before delegating.
+#[inline]
+pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Ordering {
+    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
+    match tc {
+        TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(a.try_into().unwrap())
+            .cmp(&u128::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::F64 => f64::from_le_bytes(a.try_into().unwrap())
+            .total_cmp(&f64::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::F32 => f32::from_le_bytes(a.try_into().unwrap())
+            .total_cmp(&f32::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+            crate::schema::read_signed(a, a.len())
+                .cmp(&crate::schema::read_signed(b, b.len()))
+        }
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
+            crate::schema::read_unsigned(a, a.len())
+                .cmp(&crate::schema::read_unsigned(b, b.len()))
+        }
+        TypeCode::String | TypeCode::Blob => {
+            unreachable!("cmp_typed_le: caller must dispatch String/Blob separately")
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // String relocation helpers
@@ -88,35 +117,11 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                         b_bytes,
                         batch.blob,
                     )
-                } else if col.type_code == type_code::U128 || col.type_code == type_code::UUID {
-                    let c_lo = u64::from_le_bytes(c_bytes[0..8].try_into().unwrap());
-                    let c_hi = u64::from_le_bytes(c_bytes[8..16].try_into().unwrap());
-                    let b_lo = u64::from_le_bytes(b_bytes[0..8].try_into().unwrap());
-                    let b_hi = u64::from_le_bytes(b_bytes[8..16].try_into().unwrap());
-                    (c_hi, c_lo).cmp(&(b_hi, b_lo))
-                } else if col.type_code == type_code::F64 {
-                    let c_f = f64::from_bits(u64::from_le_bytes(c_bytes[0..8].try_into().unwrap()));
-                    let b_f = f64::from_bits(u64::from_le_bytes(b_bytes[0..8].try_into().unwrap()));
-                    c_f.total_cmp(&b_f)
-                } else if col.type_code == type_code::F32 {
-                    let c_f = f32::from_bits(u32::from_le_bytes(c_bytes[0..4].try_into().unwrap()));
-                    let b_f = f32::from_bits(u32::from_le_bytes(b_bytes[0..4].try_into().unwrap()));
-                    c_f.total_cmp(&b_f)
-                } else if col.type_code == type_code::I64
-                    || col.type_code == type_code::I32
-                    || col.type_code == type_code::I16
-                    || col.type_code == type_code::I8
-                {
-                    let c_v = crate::schema::read_signed(c_bytes, cs);
-                    let b_v = crate::schema::read_signed(b_bytes, cs);
-                    c_v.cmp(&b_v)
                 } else {
-                    // Unsigned: zero-extend to u64 for any column width (1/2/4/8 bytes).
-                    let mut c_buf = [0u8; 8];
-                    let mut b_buf = [0u8; 8];
-                    c_buf[..cs].copy_from_slice(c_bytes);
-                    b_buf[..cs].copy_from_slice(b_bytes);
-                    u64::from_le_bytes(c_buf).cmp(&u64::from_le_bytes(b_buf))
+                    cmp_typed_le(
+                        c_bytes, b_bytes,
+                        TypeCode::from_validated_u8(col.type_code),
+                    )
                 }
             }
         };
@@ -150,9 +155,16 @@ pub(super) fn extract_group_key(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u128 {
-    // PK single-column: return raw pk directly.
+    // Single PK group column: isolate the addressed column's bytes from
+    // neighbouring PK columns. For single-PK schemas this equals
+    // `mb.get_pk(row)` bit-for-bit (off == 0, cs == pk_stride).
     if group_by_cols.len() == 1 && schema.is_pk_col(group_by_cols[0] as usize) {
-        return mb.get_pk(row);
+        let c_idx = group_by_cols[0] as usize;
+        let off = schema.pk_byte_offset(c_idx) as usize;
+        let col = &schema.columns[c_idx];
+        return crate::schema::promote_to_index_key(
+            mb.get_pk_bytes(row), off, col.size() as usize, col.type_code,
+        );
     }
 
     if group_by_cols.len() == 1 {
@@ -180,13 +192,21 @@ pub(super) fn extract_group_key(
         let c_idx = c_idx_u32 as usize;
         let tc = schema.columns[c_idx].type_code;
         let col_hash = if schema.is_pk_col(c_idx) {
-            let pk = mb.get_pk(row);
+            // Hash only the addressed PK column's bytes. The previous
+            // `mb.get_pk(row)` widen mixed the whole PK region, colliding
+            // distinct compound PKs whose addressed column shared bytes.
+            let off = schema.pk_byte_offset(c_idx) as usize;
+            let cs = schema.columns[c_idx].size() as usize;
+            let pk_bytes = mb.get_pk_bytes(row);
+            let col_bytes = &pk_bytes[off..off + cs];
             if tc == type_code::U128 || tc == type_code::UUID {
-                let lo = pk as u64;
-                let hi = (pk >> 64) as u64;
+                let lo = u64::from_le_bytes(col_bytes[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(col_bytes[8..16].try_into().unwrap());
                 mix64(lo ^ mix64(hi))
             } else {
-                mix64(pk as u64)
+                let mut buf = [0u8; 8];
+                buf[..cs].copy_from_slice(col_bytes);
+                mix64(u64::from_le_bytes(buf))
             }
         } else {
             let pi = schema.payload_idx(c_idx);
