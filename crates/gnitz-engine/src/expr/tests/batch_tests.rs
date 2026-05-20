@@ -119,3 +119,64 @@ fn test_eval_batch_matches_eval_predicate() {
         );
     }
 }
+
+/// Regression: `is_strictly_non_nullable` formerly ignored STR_COL_*_CONST,
+/// so a `WHERE str_col = 'foo'` against a nullable string column would set
+/// `no_nulls=true` on the batch path and let null rows leak through as
+/// definite-true / definite-false results. Verify the batch path matches the
+/// per-row interpreter row-for-row on mixed null/non-null inputs.
+#[test]
+fn test_str_col_eq_const_nullable_column_matches_per_row() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_STR_COL_EQ_CONST};
+
+    // Schema: pk(U64) + nullable STRING.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 1),
+        ],
+        &[0],
+    );
+
+    // 20 rows: alternating null/non-null, with the non-null rows alternating
+    // between "foo" (matches the predicate) and "bar" (does not).
+    let n = 20usize;
+    let mut batch = Batch::with_schema(schema, n);
+    batch.count = 0;
+    for row in 0..n {
+        batch.extend_pk(row as u128 + 1);
+        batch.extend_weight(&1i64.to_le_bytes());
+        let is_null = row % 2 == 0;
+        let null_word: u64 = if is_null { 1 } else { 0 };  // bit 0 = col1
+        batch.extend_null_bmp(&null_word.to_le_bytes());
+        let s: &[u8] = if row % 4 == 1 { b"foo" } else { b"bar" };
+        let mut gs = [0u8; 16];
+        gs[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+        gs[4..4 + s.len()].copy_from_slice(s);
+        batch.extend_col(0, &gs);
+        batch.count += 1;
+    }
+    let mb = batch.as_mem_batch();
+
+    // Predicate: col1 = 'foo'. result_reg = 0.
+    let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
+    let prog = ExprProgram::new(code, 1, 0, vec![b"foo".to_vec()]);
+    let plan = Plan::from_predicate(prog, &schema);
+    let kind = ScalarFuncKind::Plan(plan);
+
+    // n=20 ≥ 16 ⇒ batch path engaged.
+    let bits = kind.filter_batch_bits(&mb, n).expect("batch path must engage");
+    for row in 0..n {
+        let batch_pass = (bits[row / 64] >> (row % 64)) & 1 != 0;
+        let row_pass = kind.evaluate_predicate(&mb, row);
+        assert_eq!(
+            batch_pass, row_pass,
+            "row {row}: batch={batch_pass} per-row={row_pass}",
+        );
+        // Stronger invariant: a null column value can never satisfy `=`.
+        let null_word = mb.get_null_word(row);
+        if (null_word >> 0) & 1 != 0 {
+            assert!(!batch_pass, "row {row} is null but batch said pass");
+        }
+    }
+}

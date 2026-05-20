@@ -813,6 +813,59 @@ fn test_resolve_column_indices_pk_at_middle() {
 }
 
 #[test]
+fn test_is_strictly_non_nullable_str_col() {
+    // STR_COL_*_CONST and STR_COL_*_COL must flip no_nulls off when any
+    // operand column is nullable; without that, the batch path skips null-bit
+    // tracking and null rows leak through string predicates as definite results.
+    let nullable_schema = {
+        let cols = [
+            SchemaColumn::new(crate::schema::type_code::U64, 0),
+            SchemaColumn::new(crate::schema::type_code::STRING, 1),
+            SchemaColumn::new(crate::schema::type_code::STRING, 1),
+        ];
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    let nonnull_schema = {
+        let cols = [
+            SchemaColumn::new(crate::schema::type_code::U64, 0),
+            SchemaColumn::new(crate::schema::type_code::STRING, 0),
+            SchemaColumn::new(crate::schema::type_code::STRING, 0),
+        ];
+        SchemaDescriptor::new(&cols, &[0])
+    };
+
+    // STR_COL_EQ_CONST on col1
+    for (op, _name) in &[
+        (EXPR_STR_COL_EQ_CONST, "EQ_CONST"),
+        (EXPR_STR_COL_LT_CONST, "LT_CONST"),
+        (EXPR_STR_COL_LE_CONST, "LE_CONST"),
+    ] {
+        let code = vec![*op, 0, 1, 0];
+        let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![b"x".to_vec()]);
+        assert!(!prog.is_strictly_non_nullable(&nullable_schema),
+            "{_name}: nullable col1 must yield no_nulls=false");
+        let prog = make_prog(&nonnull_schema, code, 1, 0, vec![b"x".to_vec()]);
+        assert!(prog.is_strictly_non_nullable(&nonnull_schema),
+            "{_name}: non-nullable col1 must yield no_nulls=true");
+    }
+
+    // STR_COL_EQ_COL — both operands matter
+    for (op, _name) in &[
+        (EXPR_STR_COL_EQ_COL, "EQ_COL"),
+        (EXPR_STR_COL_LT_COL, "LT_COL"),
+        (EXPR_STR_COL_LE_COL, "LE_COL"),
+    ] {
+        let code = vec![*op, 0, 1, 2];
+        let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![]);
+        assert!(!prog.is_strictly_non_nullable(&nullable_schema),
+            "{_name}: nullable operands must yield no_nulls=false");
+        let prog = make_prog(&nonnull_schema, code, 1, 0, vec![]);
+        assert!(prog.is_strictly_non_nullable(&nonnull_schema),
+            "{_name}: non-nullable operands must yield no_nulls=true");
+    }
+}
+
+#[test]
 fn test_resolve_column_indices_is_idempotent() {
     // Schema: pk=col0(U64), col1=I64, col2=STRING
     let schema = make_schema(0, &[8, 9, 11]);

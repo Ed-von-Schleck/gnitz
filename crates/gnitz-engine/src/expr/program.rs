@@ -158,23 +158,32 @@ impl ExprProgram {
 
     /// Returns true if no opcode in this program can produce a NULL result.
     /// Used by the batch evaluator to skip null-bit tracking entirely.
+    ///
+    /// Must be called after `resolve_column_indices`: column-bearing operands
+    /// are read as resolved payload bytes (SENTINEL → PK, never nullable;
+    /// otherwise dense payload index 0..N-1).
     pub fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
+        let nullable_payload = |a: usize| -> bool {
+            a < schema.num_payload_cols()
+                && schema.columns[schema.payload_col_idx(a)].nullable != 0
+        };
         for instr in self.code.chunks_exact(4) {
             let op = instr[0];
             let a1 = instr[2] as usize;
+            let a2 = instr[3] as usize;
             match op {
                 // Division/modulo produce NULL on zero divisor
                 EXPR_INT_DIV | EXPR_INT_MOD | EXPR_FLOAT_DIV => return false,
                 // IS_NULL / IS_NOT_NULL read null bits from the batch
                 EXPR_IS_NULL | EXPR_IS_NOT_NULL => return false,
-                // Payload load: null if the underlying column is nullable
+                // Column reads: null if the underlying column is nullable.
+                // STR_COL_*_CONST and one-side of STR_COL_*_COL use a1 as the
+                // resolved payload byte; STR_COL_*_COL also uses a2.
                 EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT
-                    if a1 < schema.num_payload_cols() => {
-                    let ci = schema.payload_col_idx(a1);
-                    if schema.columns[ci].nullable != 0 {
-                        return false;
-                    }
-                }
+                | EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST
+                    if nullable_payload(a1) => return false,
+                EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL
+                    if nullable_payload(a1) || nullable_payload(a2) => return false,
                 _ => {}
             }
         }
