@@ -46,7 +46,10 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
     let cs = control_schema();
 
     let has_error = !error_msg.is_empty();
-    let nulls_val: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
+    // No wide-PK send path exists yet, so seek_pk_extra is always empty here;
+    // OR its null bit so client/server null bitmaps stay byte-identical.
+    let nulls_val: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
+        | ctrl::NULL_BIT_SEEK_PK_EXTRA;
 
     let mut columns: [Option<ColData>; ctrl::NUM_COLUMNS] = std::array::from_fn(|_| None);
     columns[ctrl::COL_MSG_IDX]      = Some(ColData::Fixed(vec![]));
@@ -60,6 +63,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
     columns[ctrl::COL_ERROR_MSG]    = Some(ColData::Strings(vec![
         if has_error { Some(error_msg.to_string()) } else { None }
     ]));
+    columns[ctrl::COL_SEEK_PK_EXTRA] = Some(ColData::Bytes(vec![None]));
     let columns: Vec<ColData> = columns.into_iter().map(|c| c.unwrap()).collect();
 
     let batch = ZSetBatch {

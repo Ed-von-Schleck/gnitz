@@ -1385,7 +1385,7 @@ impl DagEngine {
                 if found && !store_retracted.contains(&pk) {
                     // Emit retraction of existing stored row so downstream views
                     // see the removal of the old payload — exactly once per PK.
-                    effective.append_row_from_ptable_found(ptable, pk, -1);
+                    effective.append_row_from_ptable_found(ptable, batch.get_pk_bytes(row), -1);
                     store_retracted.insert(pk);
                 }
 
@@ -1403,7 +1403,7 @@ impl DagEngine {
                 let store_hit = found && !store_retracted.contains(&pk);
                 if store_hit {
                     // Emit retraction using stored payload (the actual column data)
-                    effective.append_row_from_ptable_found(ptable, pk, -1);
+                    effective.append_row_from_ptable_found(ptable, batch.get_pk_bytes(row), -1);
                     store_retracted.insert(pk);
                 }
 

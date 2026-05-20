@@ -914,6 +914,41 @@ impl Batch {
         lo
     }
 
+    /// Byte-addressed sibling of [`find_lower_bound`]. Runs the same binary
+    /// search but orders rows with the column-aware [`compare_pk_bytes`]
+    /// against the batch's own schema, so it is correct for compound and
+    /// wide (`pk_stride > 16`) PKs as well as single-column ones.
+    ///
+    /// `key` must be exactly `pk_stride` bytes — identical width to the
+    /// stored regions it is compared against. In a release build the length
+    /// contract is unchecked; a wrong-length slice silently misreads or
+    /// panics with no diagnostic. Uphold it at the call site; do not rely
+    /// on the debug assert in `compare_pk_bytes`.
+    ///
+    /// Single-column PKs should keep using [`find_lower_bound`] — its single
+    /// `u128` compare is strictly faster than the per-probe column walk here
+    /// for a bit-identical result.
+    ///
+    /// No production caller exists yet; activated by later compound-PK work.
+    #[allow(dead_code)]
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+        let schema = self.schema.as_ref()
+            .expect("find_lower_bound_bytes requires schema");
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if super::columnar::compare_pk_bytes(schema, self.get_pk_bytes(mid), key)
+                == std::cmp::Ordering::Less
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Bulk-copy rows [start, end) from another Batch (same schema).
     ///
     /// `self` must have strides pre-set (see `empty_with_schema` / `with_schema`).
@@ -1026,17 +1061,23 @@ impl Batch {
     }
 
     /// Copy the found row from a PartitionedTable into this batch.
+    ///
+    /// `pk_bytes` must be exactly `pk_stride` bytes — the stored PK region
+    /// for the row, identical width to this batch's PK regions. For a narrow
+    /// PK these are the same LE bytes `extend_pk` would have written, so
+    /// single-PK callers are byte-for-byte unaffected. `extend_pk_bytes`
+    /// asserts `pk_bytes.len() == pk_stride`.
     pub fn append_row_from_ptable_found(
         &mut self,
         ptable: &super::partitioned_table::PartitionedTable,
-        pk: u128,
+        pk_bytes: &[u8],
         weight: i64,
     ) {
         self.ensure_row_capacity();
         let schema = self.schema.expect("append_row_from_ptable_found requires schema");
         let null_word = ptable.found_null_word();
 
-        self.extend_pk(pk);
+        self.extend_pk_bytes(pk_bytes);
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
@@ -2099,6 +2140,133 @@ mod tests {
             assert_eq!(b.strides[REG_PK], stride, "stride {stride}");
             assert_eq!(b.count, 0);
         }
+    }
+
+    #[test]
+    fn find_lower_bound_bytes_narrow_matches_find_lower_bound() {
+        // Narrow single-PK equivalence: find_lower_bound (u128) and
+        // find_lower_bound_bytes must land on the same row. Single-column
+        // PKs keep the u128 fast path in prod (compare_pk_bytes is strictly
+        // slower for a bit-identical result); this guards equivalence.
+        let schema = minimal_u64_with_i64_schema();
+        let mut b = Batch::empty_with_schema(&schema);
+        let pks: [u64; 5] = [10, 20, 30, 40, 50];
+        b.reserve_rows(pks.len());
+        for &pk in &pks {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 50, 51, u64::MAX] {
+            let key_bytes = probe.to_le_bytes();
+            let by_u128 = b.find_lower_bound(probe as u128);
+            let by_bytes = b.find_lower_bound_bytes(&key_bytes);
+            assert_eq!(by_u128, by_bytes, "probe={probe}");
+        }
+    }
+
+    #[test]
+    fn find_lower_bound_bytes_compound_pk_matches_compare_pk_bytes() {
+        // Compound PK (3xU64, stride 24): exercises the column-walk path.
+        // The result of find_lower_bound_bytes must equal the first index
+        // where compare_pk_bytes(row, key) is not Less, for every probe.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+        let mut b = Batch::empty_with_schema(&schema);
+        let pks: [[u8; 24]; 5] = [
+            // Sorted in compare_pk_bytes order (lexicographic over the
+            // u64 columns: column 0 high priority, then 1, then 2).
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
+            [2,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        ];
+        b.reserve_rows(pks.len());
+        for pk in &pks {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let probes: &[[u8; 24]] = &[
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  1,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  10,0,0,0,0,0,0,0],
+            [3,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        ];
+        for key in probes {
+            // Expected: first row where compare_pk_bytes(row, key) is not Less.
+            let expected = (0..b.count).find(|&i| {
+                super::super::columnar::compare_pk_bytes(&schema, b.get_pk_bytes(i), key)
+                    != std::cmp::Ordering::Less
+            }).unwrap_or(b.count);
+            let got = b.find_lower_bound_bytes(key);
+            assert_eq!(got, expected, "probe={key:?}");
+        }
+    }
+
+    #[test]
+    fn append_row_from_ptable_found_narrow_byte_roundtrip() {
+        // Narrow single-PK round-trip through the new byte-typed
+        // append_row_from_ptable_found. The §3 signature change must
+        // preserve byte-for-byte equivalence with the old extend_pk(pk)
+        // path: the stored PK region bytes are the same LE bytes
+        // extend_pk would have written.
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("appendrow_byte_test");
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let mut pt = crate::storage::PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1, false, 0, 1,
+            crate::storage::partition_arena_size(1),
+        ).unwrap();
+
+        // Ingest one row so retract_pk can set a found-row.
+        let mut src = Batch::with_schema(schema, 1);
+        let pk_val: u64 = 0xDEAD_BEEFu64;
+        src.extend_pk(pk_val as u128);
+        src.extend_weight(&1i64.to_le_bytes());
+        src.extend_null_bmp(&0u64.to_le_bytes());
+        src.extend_col(0, &0x4242i64.to_le_bytes());
+        src.count += 1;
+        pt.ingest_owned_batch(src).unwrap();
+
+        // retract_pk arms `last_found_partition`; append_row_from_ptable_found
+        // then reads the found row.
+        let (_w, found) = pt.retract_pk(pk_val as u128);
+        assert!(found);
+
+        let mut dst = Batch::with_schema(schema, 1);
+        let pk_bytes = pk_val.to_le_bytes();
+        dst.append_row_from_ptable_found(&pt, &pk_bytes, -1);
+        assert_eq!(dst.count, 1);
+        assert_eq!(dst.get_pk_bytes(0), &pk_bytes);
+        assert_eq!(dst.get_pk(0), pk_val as u128);
+        assert_eq!(dst.get_weight(0), -1);
+        // Payload (column 0, I64) preserved from ptable.
+        let payload = dst.get_col_ptr(0, 0, 8);
+        assert_eq!(i64::from_le_bytes(payload.try_into().unwrap()), 0x4242i64);
     }
 
     #[test]

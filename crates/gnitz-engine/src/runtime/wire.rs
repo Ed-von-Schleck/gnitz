@@ -203,13 +203,16 @@ pub(crate) fn encode_ctrl_block_ipc(
     request_id: u64,
     status: u32,
     error_msg: &[u8],
+    seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
     use gnitz_wire::control as ctrl;
     let cs = CONTROL_SCHEMA_DESC;
     let mut b = Batch::with_schema(cs, 1);
     let has_error = !error_msg.is_empty();
-    let null_word: u64 = if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG };
+    let has_seek_extra = !seek_pk_extra.is_empty();
+    let null_word: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
+        | (if has_seek_extra { 0 } else { ctrl::NULL_BIT_SEEK_PK_EXTRA });
     b.extend_pk(0u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&null_word.to_le_bytes());
@@ -226,6 +229,12 @@ pub(crate) fn encode_ctrl_block_ipc(
         [0u8; 16]
     };
     b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
+    let seek_extra_st = if has_seek_extra {
+        encode_german_string(seek_pk_extra, &mut b.blob)
+    } else {
+        [0u8; 16]
+    };
+    b.extend_col(ctrl::PAYLOAD_SEEK_PK_EXTRA, &seek_extra_st);
     b.count = 1;
     b.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum)
 }
@@ -284,7 +293,7 @@ const OFF_REQUEST_ID:   usize = ctrl_region_offset(gnitz_wire::control::REGION_R
 static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> =
     std::sync::LazyLock::new(|| {
         let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
-        let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", false);
+        let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", b"", false);
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB,
             "ctrl block template size mismatch");
         arr
@@ -314,7 +323,7 @@ pub(crate) fn encode_ctrl_block_direct(
     if !error_msg.is_empty() {
         return encode_ctrl_block_ipc(
             out, offset, target_id, client_id, wire_flags,
-            seek_pk, seek_col_idx, request_id, status, error_msg, checksum,
+            seek_pk, seek_col_idx, request_id, status, error_msg, &[], checksum,
         );
     }
     let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
@@ -648,6 +657,11 @@ pub struct DecodedControl {
     pub seek_col_idx: u64,
     pub request_id: u64,
     pub error_msg: Vec<u8>,
+    /// PK region bytes `16..` for a wide PK; empty for `pk_stride <= 16`
+    /// (the universal case until a wide-PK send path exists).
+    /// No production reader exists yet; activated by later compound-PK work.
+    #[allow(dead_code)]
+    pub seek_pk_extra: Vec<u8>,
     /// Total byte length of this control WAL block (read from the WAL size
     /// field at offset WAL_OFF_SIZE). Callers that need to advance past the
     /// ctrl block to find the schema/data blocks use this directly instead of
@@ -741,6 +755,24 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     let request_id   = read_u64(ctrl::REGION_REQUEST_ID)?;
 
     let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
+    let seek_extra_is_null = (null_bmp & ctrl::NULL_BIT_SEEK_PK_EXTRA) != 0;
+
+    // error_msg and seek_pk_extra each own a 16-byte German-string struct in
+    // their own fixed region but spill overflow (>12B) into the shared blob
+    // region. Resolve that directory entry once, and only if at least one is
+    // non-null. When both are null (the universal case until a wide-PK send
+    // path exists) skip the lookup entirely, preserving the hot-path fast case.
+    let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
+        let (blob_off, blob_sz) = wal_dir_entry(data, ctrl::REGION_BLOB);
+        if blob_sz > 0 && blob_off + blob_sz <= data.len() {
+            &data[blob_off..blob_off + blob_sz]
+        } else {
+            &[]
+        }
+    } else {
+        &[]
+    };
+
     let error_msg = if error_is_null {
         Vec::new()
     } else {
@@ -750,12 +782,18 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[err_off..err_off + 16]);
-        let (blob_off, blob_sz) = wal_dir_entry(data, ctrl::REGION_BLOB);
-        let blob = if blob_sz > 0 && blob_off + blob_sz <= data.len() {
-            &data[blob_off..blob_off + blob_sz]
-        } else {
-            &[]
-        };
+        decode_german_string(&st, blob)
+    };
+
+    let seek_pk_extra = if seek_extra_is_null {
+        Vec::new()
+    } else {
+        let (sx_off, sx_sz) = wal_dir_entry(data, ctrl::REGION_SEEK_PK_EXTRA);
+        if sx_sz < 16 || sx_off + 16 > data.len() {
+            return Err("seek_pk_extra region out of bounds");
+        }
+        let mut st = [0u8; 16];
+        st.copy_from_slice(&data[sx_off..sx_off + 16]);
         decode_german_string(&st, blob)
     };
 
@@ -763,6 +801,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     Ok(DecodedControl {
         status, client_id, target_id, flags,
         seek_pk, seek_col_idx, request_id, error_msg,
+        seek_pk_extra,
         block_size,
     })
 }
@@ -1112,7 +1151,7 @@ mod tests {
                 &mut engine_buf, 0,
                 target_id, client_id, flags,
                 seek_pk, seek_col_idx, request_id,
-                status, error_msg.as_bytes(),
+                status, error_msg.as_bytes(), b"",
                 true, // checksum, matching encode_wal_block's unconditional checksum
             );
 

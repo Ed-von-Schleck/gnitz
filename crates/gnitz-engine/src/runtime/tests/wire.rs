@@ -3,6 +3,7 @@ use crate::runtime::wire::{
     wire_size, schema_to_batch, batch_to_schema, peek_routing_header,
     build_schema_wire_block,
     encode_ctrl_block_ipc, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
+    peek_control_block,
     STATUS_OK, STATUS_ERROR,
 };
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code, encode_german_string, decode_german_string};
@@ -558,7 +559,7 @@ fn encode_ctrl_block_direct_matches_ipc() {
             &mut buf_ipc, OFFSET,
             target_id, client_id, wire_flags,
             seek_pk, seek_col_idx, request_id,
-            status, b"", checksum,
+            status, b"", b"", checksum,
         );
 
         assert_eq!(n_direct, n_ipc,
@@ -697,8 +698,58 @@ fn encode_ctrl_block_direct_error_path_matches_ipc() {
     );
     let n_ipc = encode_ctrl_block_ipc(
         &mut buf_ipc, OFFSET,
-        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, true,
+        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, b"", true,
     );
     assert_eq!(n_direct, n_ipc);
     assert_eq!(buf_direct[..OFFSET + n_direct], buf_ipc[..OFFSET + n_ipc]);
+}
+
+/// Round-trip the new `seek_pk_extra` blob through encode + decode.
+///
+/// Exercises three cases: empty (the universal hot path), short
+/// (≤ German-string inline threshold, no blob spill), and long (spills
+/// into the shared blob region alongside `error_msg`). The decoder must
+/// resolve a single shared blob slice and feed it to both German-string
+/// decodes, so the combined case is the load-bearing one.
+#[test]
+fn ctrl_block_seek_pk_extra_roundtrip() {
+    // Case 1: both empty — the empty seek_pk_extra path the direct/IPC
+    // equivalence test already covers, asserted here from the decoder side.
+    let mut buf = vec![0u8; 1024];
+    let n = encode_ctrl_block_ipc(
+        &mut buf, 0,
+        /*target*/ 1, /*client*/ 2, /*flags*/ 3,
+        /*seek_pk*/ 4u128, /*seek_col_idx*/ 5, /*request_id*/ 6,
+        STATUS_OK, b"", b"", true,
+    );
+    let dec = peek_control_block(&buf[..n]).expect("decode empty");
+    assert_eq!(dec.error_msg, Vec::<u8>::new());
+    assert_eq!(dec.seek_pk_extra, Vec::<u8>::new());
+    assert_eq!(dec.seek_pk, 4u128);
+
+    // Case 2: seek_pk_extra short (≤12 bytes, inline; no blob spill).
+    let short = b"abcd"; // 4 bytes, fits inline
+    let mut buf = vec![0u8; 1024];
+    let n = encode_ctrl_block_ipc(
+        &mut buf, 0, 1, 2, 3, 4u128, 5, 6,
+        STATUS_OK, b"", short, true,
+    );
+    let dec = peek_control_block(&buf[..n]).expect("decode short");
+    assert_eq!(dec.error_msg, Vec::<u8>::new());
+    assert_eq!(dec.seek_pk_extra, short);
+
+    // Case 3: both non-empty, both long enough to spill into the shared
+    // blob region. The decoder must resolve REGION_BLOB once and pass the
+    // same slice to both German-string decodes.
+    let err = b"this error message is definitely longer than twelve bytes";
+    let extra = b"and so is this wide-pk-extra blob payload past 12B";
+    let mut buf = vec![0u8; 1024];
+    let n = encode_ctrl_block_ipc(
+        &mut buf, 0, 1, 2, 3, 4u128, 5, 6,
+        STATUS_ERROR, err, extra, true,
+    );
+    let dec = peek_control_block(&buf[..n]).expect("decode long");
+    assert_eq!(dec.error_msg, err);
+    assert_eq!(dec.seek_pk_extra, extra);
+    assert_eq!(dec.status, STATUS_ERROR);
 }

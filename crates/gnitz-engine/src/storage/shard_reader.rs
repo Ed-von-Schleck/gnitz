@@ -478,6 +478,42 @@ impl MappedShard {
         lo
     }
 
+    /// Byte-addressed sibling of [`find_lower_bound`]. Runs the same binary
+    /// search but orders rows with the column-aware `compare_pk_bytes`, so it
+    /// is correct for compound and wide (`pk_stride > 16`) PKs. `MappedShard`
+    /// stores only `pk_stride`, not a `SchemaDescriptor`, so the schema is
+    /// passed explicitly by the caller.
+    ///
+    /// `key` must be exactly `pk_stride` bytes — identical width to the stored
+    /// PK regions. In a release build the length contract is unchecked; a
+    /// wrong-length slice silently misreads or panics with no diagnostic.
+    /// Uphold it at the call site.
+    ///
+    /// Single-column PKs should keep using [`find_lower_bound`] — its single
+    /// `u128` compare is strictly faster than the per-probe column walk.
+    ///
+    /// No production caller exists yet; activated by later compound-PK work.
+    #[allow(dead_code)]
+    pub fn find_lower_bound_bytes(
+        &self,
+        key: &[u8],
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if super::columnar::compare_pk_bytes(schema, self.get_pk_bytes(mid), key)
+                == std::cmp::Ordering::Less
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Binary search for an exact PK match. Returns the row index, or `None`
     /// if `key` is not present.
     pub fn find_row_index(&self, key: u128) -> Option<usize> {
@@ -1228,6 +1264,97 @@ mod tests {
         for i in 0..n {
             assert_eq!(shard.get_pk_bytes(i), &expected, "row {i} bytes");
             assert_eq!(shard.get_pk(i), pk_value, "row {i} u128");
+        }
+    }
+
+    #[test]
+    fn find_lower_bound_bytes_narrow_matches_find_lower_bound() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300), (40, 400)];
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 41, u64::MAX] {
+            let by_u128 = shard.find_lower_bound(probe as u128);
+            let by_bytes = shard.find_lower_bound_bytes(&probe.to_le_bytes(), &schema);
+            assert_eq!(by_u128, by_bytes, "probe={probe}");
+        }
+    }
+
+    #[test]
+    fn find_lower_bound_bytes_wide_pk_distinct() {
+        // Wide PK (3xU64 all-PK, stride 24). Distinct PKs keep the shard PK
+        // region as Raw (RegionView::Constant's get_pk_bytes returns
+        // &value[..stride] from a 16-byte buffer and would panic for stride
+        // 24 — see §6 caveat).
+        //
+        // Schema is all-PK (num_payload = 0) so MappedShard::open's payload
+        // validation loop is empty. The shard image must still carry the
+        // (3 + (num_cols - 1) + 1) = 6 regions open() reads from the
+        // directory; the trailing slots beyond pk/weight/null/blob are
+        // never accessed via the byte path.
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+
+        // Five rows, sorted in compare_pk_bytes order (col0, then col1, col2).
+        let pks: [[u8; 24]; 5] = [
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
+            [2,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        ];
+        let count = pks.len() as u32;
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|r| r.iter().copied()).collect();
+        let weights: Vec<i64> = vec![1; count as usize];
+        let null_bm: Vec<u64> = vec![0; count as usize];
+        let empty: Vec<u8> = Vec::new();
+
+        // 6 regions: pk, weight, null_bmp, two "phantom non-pk" slots
+        // (num_non_pk = num_cols - 1 = 2), blob.
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
+            (empty.as_ptr(), 0),
+            (empty.as_ptr(), 0),
+            (empty.as_ptr(), 0),
+        ];
+        let image = super::super::shard_file::build_shard_image(0, count, &regions);
+        let path = dir.path().join("wide_pk.db");
+        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        assert_eq!(shard.pk_stride, 24);
+        assert!(matches!(shard.pk, RegionView::Raw { .. }),
+            "distinct PKs must keep PK region Raw");
+
+        // Probe keys covering before, between, and after each row.
+        let probes: &[[u8; 24]] = &[
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  1,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  10,0,0,0,0,0,0,0],
+            [3,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        ];
+        for key in probes {
+            let expected = (0..shard.count).find(|&i| {
+                super::super::columnar::compare_pk_bytes(&schema, shard.get_pk_bytes(i), key)
+                    != std::cmp::Ordering::Less
+            }).unwrap_or(shard.count);
+            let got = shard.find_lower_bound_bytes(key, &schema);
+            assert_eq!(got, expected, "probe={key:?}");
         }
     }
 }

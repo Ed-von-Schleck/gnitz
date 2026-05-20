@@ -137,6 +137,28 @@ impl CursorSource {
         }
     }
 
+    /// Byte-addressed sibling of [`find_lower_bound`]. The `Batch` arm
+    /// compares against the batch's own schema and ignores `schema`; the
+    /// `Shard` arm forwards `schema` (a `MappedShard` has no
+    /// `SchemaDescriptor`, only `pk_stride`). `key` must be exactly
+    /// `pk_stride` bytes.
+    #[allow(dead_code)]
+    fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
+        match self {
+            CursorSource::Batch(b) => b.find_lower_bound_bytes(key),
+            CursorSource::Shard(s) => s.find_lower_bound_bytes(key, schema),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        match self {
+            CursorSource::Batch(b) => b.get_pk_bytes(row),
+            CursorSource::Shard(s) => s.get_pk_bytes(row),
+        }
+    }
+
     /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
     /// buffer (always Raw regions) or a `MappedShard`'s mmap (Raw or Constant
     /// regions, indexed by payload position).
@@ -278,6 +300,15 @@ impl CursorState {
         self.skip_ghosts(src);
     }
 
+    /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
+    /// bytes; `schema` is forwarded to the `Shard` arm of
+    /// [`CursorSource::find_lower_bound_bytes`].
+    #[allow(dead_code)]
+    fn seek_bytes(&mut self, src: &CursorSource, key: &[u8], schema: &SchemaDescriptor) {
+        self.position = src.find_lower_bound_bytes(key, schema);
+        self.skip_ghosts(src);
+    }
+
     fn skip_ghosts(&mut self, src: &CursorSource) {
         // Batch sources are always consolidated — no ghost rows.
         if let CursorSource::Shard(s) = src {
@@ -407,6 +438,32 @@ impl ReadCursor {
             );
         }
         self.drive();
+    }
+
+    /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
+    /// bytes. Narrow PK only: `drive`/`build_tree` unconditionally widen the
+    /// PK via `widen_pk_le`, which panics for `pk_stride ∉ {8, 16}`. Wide-PK
+    /// exercise of the byte path happens at the source level
+    /// (`Batch`/`MappedShard::find_lower_bound_bytes`), never through the
+    /// cursor.
+    #[allow(dead_code)]
+    pub fn seek_bytes(&mut self, key: &[u8]) {
+        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+            state.seek_bytes(src, key, &self.schema);
+        }
+        if let SourceMode::Multi(_) = &self.mode {
+            self.mode = SourceMode::Multi(
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast),
+            );
+        }
+        self.drive();
+    }
+
+    /// PK region of the current row as raw bytes, without copying. Byte-addressed
+    /// sibling of the `current_key` field; correct for compound/wide PKs.
+    #[allow(dead_code)]
+    pub fn current_pk_bytes(&self) -> &[u8] {
+        self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
     pub fn advance(&mut self) {
@@ -1160,6 +1217,34 @@ mod tests {
     /// Cursor with more than 16 entries (formerly above `MAX_INLINE_BATCH_SOURCES`)
     /// previously fell through to the row-major scatter.  Now the column-major
     /// path handles any number of sources.
+    #[test]
+    fn seek_bytes_matches_seek_narrow() {
+        // Narrow single-PK (U128, stride 16): seek_bytes and seek must land
+        // on the same row. seek_bytes is correct for compound/wide PKs but
+        // narrow inputs must remain bit-identical with the u128 fast path.
+        let schema = make_schema_i64();
+        let batch = make_batch(&[(10u128, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]);
+        let probes: &[u128] = &[0u128, 5, 10, 15, 20, 25, 30, 35, 40, 41];
+        for &key in probes {
+            let mut c_u128 = create_read_cursor(&[Rc::clone(&batch)], &[], schema);
+            c_u128.seek(key);
+
+            let mut c_bytes = create_read_cursor(&[Rc::clone(&batch)], &[], schema);
+            c_bytes.seek_bytes(&key.to_le_bytes());
+
+            assert_eq!(c_u128.valid, c_bytes.valid, "key={key}");
+            if c_u128.valid {
+                assert_eq!(c_u128.current_key, c_bytes.current_key, "key={key}");
+                // current_pk_bytes mirrors current_key for narrow PKs.
+                assert_eq!(
+                    c_bytes.current_pk_bytes(),
+                    &c_bytes.current_key.to_le_bytes()[..],
+                    "key={key}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_scatter_many_sources_beyond_old_cap() {
         let schema = make_schema_i64();

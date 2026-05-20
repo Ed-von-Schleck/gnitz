@@ -106,6 +106,7 @@ mod tests {
                 seek_col_idx: 0,
                 request_id: 0,
                 error_msg: Vec::new(),
+                seek_pk_extra: Vec::new(),
                 block_size: 0,
             },
             schema: if with_schema { Some(SchemaDescriptor::minimal_u64()) } else { None },
