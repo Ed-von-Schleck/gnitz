@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Expr, BinaryOperator, UnaryOperator, Value,
     FunctionArguments, FunctionArg, FunctionArgExpr,
 };
-use gnitz_core::Schema;
+use gnitz_core::{Schema, TypeCode};
 use gnitz_core::GnitzClient;
 use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp, AggFunc};
@@ -241,6 +241,26 @@ impl<'a> Binder<'a> {
                             if list.args.len() == 1 {
                                 if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
                                     let bound = self.bind_expr(inner, schema)?;
+                                    // MIN/MAX have no correct accumulator path for
+                                    // wide (U128/UUID) types — the i64 slot cannot
+                                    // hold them — Blob has no ordering, and the
+                                    // String comparator in `decode_signed` reads
+                                    // the prefix as LE signed i64, which orders
+                                    // by neither bytes nor signedness. Reject
+                                    // here so the operator only sees types it
+                                    // can compare correctly.
+                                    if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
+                                        let arg_ty = bound.infer_type(schema);
+                                        if matches!(arg_ty,
+                                            TypeCode::U128 | TypeCode::UUID
+                                            | TypeCode::Blob | TypeCode::String)
+                                        {
+                                            return Err(GnitzSqlError::Unsupported(
+                                                format!("{}: not supported on {:?} columns",
+                                                    name.to_uppercase(), arg_ty)
+                                            ));
+                                        }
+                                    }
                                     return Ok(BoundExpr::AggCall {
                                         func: agg_func,
                                         arg: Some(Box::new(bound)),
@@ -260,6 +280,86 @@ impl<'a> Binder<'a> {
             _ => Err(GnitzSqlError::Unsupported(
                 format!("expression type not supported: {:?}", expr)
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnitz_core::{ColumnDef, Schema, TypeCode};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn col(name: &str, tc: TypeCode) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            type_code: tc,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        }
+    }
+
+    fn schema_with_val(val_tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![col("pk", TypeCode::U64), col("c", val_tc)],
+            pk_cols: vec![0],
+        }
+    }
+
+    fn parse(src: &str) -> Expr {
+        let dialect = GenericDialect {};
+        Parser::new(&dialect)
+            .try_with_sql(src)
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    }
+
+    fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
+        match r {
+            Err(GnitzSqlError::Unsupported(msg)) => {
+                assert!(msg.contains(want_substr),
+                    "got Unsupported({:?}), expected to contain {:?}", msg, want_substr);
+            }
+            Err(e) => panic!("expected Unsupported, got {:?}", e),
+            Ok(_)  => panic!("expected Unsupported, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_binder_rejects_min_max_unsupported_types() {
+        let binder = Binder::new("s");
+        for &tc in &[TypeCode::U128, TypeCode::UUID, TypeCode::Blob, TypeCode::String] {
+            let schema = schema_with_val(tc);
+            for fname in &["MIN", "MAX"] {
+                let expr = parse(&format!("{}(c)", fname));
+                let r = binder.bind_expr(&expr, &schema);
+                assert_unsupported(r, fname);
+            }
+        }
+    }
+
+    #[test]
+    fn test_binder_accepts_min_max_orderable_types() {
+        let binder = Binder::new("s");
+        // Types the operator can compare correctly:
+        // narrow unsigned + zero-extend, signed, U64 (with the unsigned fix),
+        // and floats.
+        let accepted = [
+            TypeCode::U8, TypeCode::U16, TypeCode::U32, TypeCode::U64,
+            TypeCode::I8, TypeCode::I16, TypeCode::I32, TypeCode::I64,
+            TypeCode::F32, TypeCode::F64,
+        ];
+        for &tc in &accepted {
+            let schema = schema_with_val(tc);
+            for fname in &["MIN", "MAX"] {
+                let expr = parse(&format!("{}(c)", fname));
+                let r = binder.bind_expr(&expr, &schema);
+                assert!(r.is_ok(),
+                    "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());
+            }
         }
     }
 }

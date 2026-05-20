@@ -230,7 +230,15 @@ impl Accumulator {
                     }
                 } else {
                     let v = decode_signed(bytes, tc);
-                    if first || v < self.acc {
+                    // U64 comparison must be unsigned: `decode_signed`
+                    // returns the bit pattern verbatim, so high-bit-set
+                    // values look negative under signed `<`.
+                    let replaces = if tc == TypeCode::U64 {
+                        (v as u64) < (self.acc as u64)
+                    } else {
+                        v < self.acc
+                    };
+                    if first || replaces {
                         self.acc = v;
                     }
                 }
@@ -243,7 +251,12 @@ impl Accumulator {
                     }
                 } else {
                     let v = decode_signed(bytes, tc);
-                    if first || v > self.acc {
+                    let replaces = if tc == TypeCode::U64 {
+                        (v as u64) > (self.acc as u64)
+                    } else {
+                        v > self.acc
+                    };
+                    if first || replaces {
                         self.acc = v;
                     }
                 }
@@ -316,7 +329,12 @@ impl Accumulator {
                     }
                 } else {
                     let other_v = other_bits as i64;
-                    if first || other_v < self.acc {
+                    let replaces = if self.col_type_code == TypeCode::U64 {
+                        (other_v as u64) < (self.acc as u64)
+                    } else {
+                        other_v < self.acc
+                    };
+                    if first || replaces {
                         self.acc = other_v;
                     }
                 }
@@ -331,7 +349,12 @@ impl Accumulator {
                     }
                 } else {
                     let other_v = other_bits as i64;
-                    if first || other_v > self.acc {
+                    let replaces = if self.col_type_code == TypeCode::U64 {
+                        (other_v as u64) > (self.acc as u64)
+                    } else {
+                        other_v > self.acc
+                    };
+                    if first || replaces {
                         self.acc = other_v;
                     }
                 }
@@ -341,9 +364,23 @@ impl Accumulator {
     }
 }
 
-/// Decode a column's bytes as a sign-extended i64. STRING columns use the
-/// first 8 bytes of the 16-byte German String struct as the compare key
-/// (caller passes the full 16-byte slice for the row).
+/// Decode a column's bytes into an `i64`-shaped accumulator slot.
+///
+/// For sub-64-bit unsigned types (`U8`/`U16`/`U32`) the value is
+/// zero-extended into the i64, so signed comparison still orders
+/// correctly. Signed types are sign-extended as expected.
+///
+/// **U64 caveat:** the return value is the U64 bit pattern reinterpreted
+/// as `i64` — *not* a sign-extended signed value. Callers comparing the
+/// result for MIN/MAX ordering on a `U64` column must cast back to `u64`
+/// before comparing, otherwise values with the high bit set order
+/// incorrectly. SUM treats the slot as a bit container; wrap-around is
+/// unaffected by signedness.
+///
+/// STRING columns use the first 8 bytes of the 16-byte German String
+/// struct as the compare key (caller passes the full 16-byte slice for
+/// the row). This produces wrong orderings — the binder must reject
+/// MIN/MAX on String before the operator sees it.
 #[inline]
 fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
     match tc {
@@ -3112,5 +3149,538 @@ mod tests {
             .collect();
         entries.sort_by_key(|&(pk, _)| pk);
         assert_eq!(entries, vec![(1, 2), (2, 1)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // U64 MIN/MAX: unsigned ordering for values with the high bit set.
+    //
+    // `decode_signed` returns the U64 bit pattern reinterpreted as `i64`;
+    // signed `<`/`>` flips for values >= 2^63. The fix dispatches on
+    // TypeCode::U64 in the MIN/MAX comparison sites.
+    // -----------------------------------------------------------------------
+
+    /// 3-col schema: U64 pk, I64 grp, U64 val. All values aggregated by grp
+    /// fall into a single group when `grp` is held constant.
+    fn make_schema_u64pk_i64grp_u64val() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_batch_u64pk_i64grp_u64val(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, i64, u64)], // (pk, weight, grp, u64_val)
+    ) -> ConsolidatedBatch {
+        let n = rows.len();
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for &(pk, w, grp, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes());
+            b.extend_col(1, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    fn make_schema_u64pk_i64grp_i64val() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_batch_u64pk_i64grp_i64val(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, i64, i64)], // (pk, weight, grp, i64_val)
+    ) -> ConsolidatedBatch {
+        let n = rows.len();
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for &(pk, w, grp, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes());
+            b.extend_col(1, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    /// Group-by-grp output schema: synthetic U128 PK, I64 grp, U64 agg.
+    fn make_out_schema_grp_u64agg() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_out_schema_grp_i64agg() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn test_reduce_min_u64_high_bit_set() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64pk_i64grp_u64val();
+        let out_schema = make_out_schema_grp_u64agg();
+
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // One group (grp=7). val=1, u64::MAX, and 2^63 — the unsigned MIN is 1.
+        // Pre-fix signed comparison treats u64::MAX as -1 (smallest signed),
+        // so the bug reports u64::MAX as the MIN.
+        let delta = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, u64::MAX),
+            (2, 1, 7, 10),
+            (3, 1, 7, 1u64 << 63),
+            (4, 1, 7, 1),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out.count, 1);
+        let min_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(min_bits, 1u64, "MIN(u64) must use unsigned ordering");
+    }
+
+    #[test]
+    fn test_reduce_max_u64_high_bit_set() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64pk_i64grp_u64val();
+        let out_schema = make_out_schema_grp_u64agg();
+
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Same input as MIN test. Unsigned MAX is u64::MAX. Pre-fix signed
+        // comparison treats 10 (positive i64) as larger than u64::MAX (=-1).
+        let delta = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, u64::MAX),
+            (2, 1, 7, 10),
+            (3, 1, 7, 1u64 << 63),
+            (4, 1, 7, 1),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Max, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out.count, 1);
+        let max_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(max_bits, u64::MAX, "MAX(u64) must use unsigned ordering");
+    }
+
+    #[test]
+    fn test_reduce_min_u64_incremental() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64pk_i64grp_u64val();
+        let out_schema = make_out_schema_grp_u64agg();
+
+        // Tick 1: one row with val=1u64<<60 → MIN = 1u64<<60.
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, 1u64 << 60),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+        let mut ti_ch = CursorHandle::from_owned(&[empty_ti], in_schema);
+
+        let (out1, _) = op_reduce(
+            &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out1.count, 1);
+        let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(min1, 1u64 << 60);
+
+        // Tick 2: delta adds a row with val=1u64<<63. Replay re-steps over
+        // (trace_in: tick-1 row) + (delta: tick-2 row).
+        //
+        // MIN(1u64<<60, 1u64<<63) is unchanged at 1u64<<60 under unsigned;
+        // under buggy signed compare it would flip to 1u64<<63 = i64::MIN.
+        // op_reduce emits retract+new even when the value didn't change, so
+        // we get 2 rows; we assert the new emitted value is the unsigned MIN.
+        let prev_out = Rc::new(out1);
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+
+        let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, 1u64 << 60),
+        ]).into_inner());
+        let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
+
+        let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (2, 1, 7, 1u64 << 63),
+        ]);
+
+        let (out2, _) = op_reduce(
+            &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out2.count, 2, "retract old MIN + emit new MIN");
+        let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
+        let new_min = u64::from_le_bytes(out2.col_data(1)[8..16].try_into().unwrap());
+        assert_eq!(retracted, 1u64 << 60);
+        assert_eq!(out2.get_weight(0), -1);
+        assert_eq!(new_min, 1u64 << 60,
+            "MIN unchanged under unsigned ordering; bug would flip it to 1u64<<63");
+        assert_eq!(out2.get_weight(1), 1);
+    }
+
+    #[test]
+    fn test_reduce_max_u64_incremental() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64pk_i64grp_u64val();
+        let out_schema = make_out_schema_grp_u64agg();
+
+        // Tick 1: MAX over a single low value → MAX = 10.
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, 10),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Max, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+        let mut ti_ch = CursorHandle::from_owned(&[empty_ti], in_schema);
+
+        let (out1, _) = op_reduce(
+            &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out1.count, 1);
+        let max1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(max1, 10);
+
+        // Tick 2: delta adds val=u64::MAX. Replay re-steps over both.
+        // Pre-fix signed MAX would treat u64::MAX as -1, keeping MAX=10.
+        let prev_out = Rc::new(out1);
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+
+        let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, 10),
+        ]).into_inner());
+        let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
+
+        let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (2, 1, 7, u64::MAX),
+        ]);
+
+        let (out2, _) = op_reduce(
+            &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        // Expect: retract old MAX (10) + emit new MAX (u64::MAX).
+        assert_eq!(out2.count, 2);
+        let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(retracted, 10);
+        assert_eq!(out2.get_weight(0), -1);
+        let new_max = u64::from_le_bytes(out2.col_data(1)[8..16].try_into().unwrap());
+        assert_eq!(new_max, u64::MAX, "new MAX must be unsigned-max u64::MAX");
+        assert_eq!(out2.get_weight(1), 1);
+    }
+
+    #[test]
+    fn test_avi_seed_u64_high_bit() {
+        // The AVI fast path seeds an Accumulator with a U64 bit pattern via
+        // `seed_from_raw_bits`, then folds in delta rows via `step_from_batch`.
+        // Validates that the U64 bit pattern preserved by the AVI seed
+        // compares correctly under unsigned semantics against incoming
+        // delta rows.
+        let in_schema = make_schema_with_type(type_code::U64);
+
+        let desc = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+        let mut acc = Accumulator::new(&desc, &in_schema);
+
+        // AVI seeds the accumulator with 1u64<<63 (high bit set).
+        acc.seed_from_raw_bits(1u64 << 63);
+        assert_eq!(acc.acc as u64, 1u64 << 63);
+
+        // Build a batch with a single row val=10u64, pk=1.
+        let batch = {
+            let mut b = Batch::with_schema(in_schema, 1);
+            b.extend_pk(1u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &10u64.to_le_bytes());
+            b.count += 1;
+            b.sorted = true;
+            b.consolidated = true;
+            ConsolidatedBatch::new_unchecked(b)
+        };
+        let mb = batch.as_mem_batch();
+        acc.step_from_batch(&mb, 0, 1);
+
+        // 10u64 < (1u64<<63) under unsigned: MIN updates to 10.
+        // Under buggy signed comparison: 10i64 > i64::MIN, MIN stays at i64::MIN.
+        assert_eq!(acc.acc as u64, 10u64,
+            "unsigned MIN against AVI-seeded U64 high-bit value");
+    }
+
+    #[test]
+    fn test_reduce_min_u64_replay_via_trace_in() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        // Exercise the replay path (step_from_batch over trace_in rows + delta
+        // rows) with U64 values that span both halves of the unsigned range.
+        // Pre-fix the signed comparator treats high-bit-set values as the
+        // most-negative; unsigned MIN flips silently.
+        let in_schema = make_schema_u64pk_i64grp_u64val();
+        let out_schema = make_out_schema_grp_u64agg();
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        // Tick 1: single insertion. trace_in empty. MIN = u64::MAX.
+        let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+        let mut ti_ch = CursorHandle::from_owned(&[empty_ti], in_schema);
+        let empty_to = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_to], out_schema);
+
+        let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (1, 1, 7, u64::MAX),
+        ]);
+
+        let (out1, _) = op_reduce(
+            &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        assert_eq!(out1.count, 1);
+        let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(min1, u64::MAX);
+
+        // Tick 2: trace_in = tick-1 row (pk=1, val=u64::MAX). Delta inserts
+        // pk=2 with val=5. Replay re-steps over both via step_from_batch.
+        //
+        // Unsigned MIN(u64::MAX, 5) = 5; the smaller value replaces the seed.
+        // Pre-fix signed: 5i64 > -1i64 (=u64::MAX as i64), so MIN stays at
+        // u64::MAX and no MIN change is observed.
+        let ti2 = Rc::new(delta1.into_inner());
+        let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
+        let prev_out = Rc::new(out1);
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+
+        let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[
+            (2, 1, 7, 5u64),
+        ]);
+
+        let (out2, _) = op_reduce(
+            &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        );
+        // Retract old MIN (u64::MAX) + emit new MIN (5).
+        assert_eq!(out2.count, 2);
+        let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
+        assert_eq!(retracted, u64::MAX);
+        assert_eq!(out2.get_weight(0), -1);
+        let new_min = u64::from_le_bytes(out2.col_data(1)[8..16].try_into().unwrap());
+        assert_eq!(new_min, 5u64,
+            "replay over trace_in + delta must use unsigned MIN");
+        assert_eq!(out2.get_weight(1), 1);
+    }
+
+    #[test]
+    fn test_reduce_min_max_i64_boundary() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        // Guard that the TypeCode::U64 branch does not leak into I64 paths:
+        // MIN of {i64::MIN, -1, 0, i64::MAX} = i64::MIN,
+        // MAX = i64::MAX.
+        let in_schema = make_schema_u64pk_i64grp_i64val();
+        let out_schema = make_out_schema_grp_i64agg();
+
+        // MIN test.
+        {
+            let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+            let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+            let delta = make_batch_u64pk_i64grp_i64val(&in_schema, &[
+                (1, 1, 7, i64::MIN),
+                (2, 1, 7, -1),
+                (3, 1, 7, 0),
+                (4, 1, 7, i64::MAX),
+            ]);
+
+            let agg = AggDescriptor {
+                col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+            };
+
+            let (out, _) = op_reduce(
+                &delta, None, to_ch.cursor_mut(),
+                &in_schema, &out_schema, &[1u32], &[agg],
+                None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+            );
+            assert_eq!(out.count, 1);
+            let min = crate::util::read_i64_le(out.col_data(1), 0);
+            assert_eq!(min, i64::MIN, "MIN(I64) signed ordering preserved");
+        }
+
+        // MAX test.
+        {
+            let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+            let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+            let delta = make_batch_u64pk_i64grp_i64val(&in_schema, &[
+                (1, 1, 7, i64::MIN),
+                (2, 1, 7, -1),
+                (3, 1, 7, 0),
+                (4, 1, 7, i64::MAX),
+            ]);
+
+            let agg = AggDescriptor {
+                col_idx: 2, agg_op: AggOp::Max, col_type_code: TypeCode::I64, _pad: [0; 2],
+            };
+
+            let (out, _) = op_reduce(
+                &delta, None, to_ch.cursor_mut(),
+                &in_schema, &out_schema, &[1u32], &[agg],
+                None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+            );
+            assert_eq!(out.count, 1);
+            let max = crate::util::read_i64_le(out.col_data(1), 0);
+            assert_eq!(max, i64::MAX, "MAX(I64) signed ordering preserved");
+        }
+    }
+
+    #[test]
+    fn test_gather_reduce_min_u64() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        // Schema for op_gather_reduce: U128 pk + U64 min_val (no group cols).
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U64, 1),
+            ],
+            &[0],
+        );
+
+        // Tick 1: two partial MINs from different workers, both for the same
+        // group pk=1. One has a small value (3), one is high-bit-set
+        // (1u64<<63). Unsigned MIN across both = 3.
+        // Pre-fix signed comparator treats 1u64<<63 as i64::MIN < 3, so it
+        // would report 1u64<<63 as the merged MIN.
+        let empty_out = Rc::new(Batch::empty(1, 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
+
+        let mut partial1 = Batch::with_schema(schema, 2);
+
+        partial1.extend_pk(1u128);
+        partial1.extend_weight(&1i64.to_le_bytes());
+        partial1.extend_null_bmp(&0u64.to_le_bytes());
+        partial1.extend_col(0, &3u64.to_le_bytes());
+        partial1.count += 1;
+
+        partial1.extend_pk(1u128);
+        partial1.extend_weight(&1i64.to_le_bytes());
+        partial1.extend_null_bmp(&0u64.to_le_bytes());
+        partial1.extend_col(0, &(1u64 << 63).to_le_bytes());
+        partial1.count += 1;
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
+        assert_eq!(out1.count, 1);
+        let min1 = u64::from_le_bytes(out1.col_data(0)[0..8].try_into().unwrap());
+        assert_eq!(min1, 3u64, "gather-reduce MIN across partials must be unsigned");
+
+        // Tick 2: old global = 3 (from tick 1). New partial has u64::MAX.
+        // op_gather_reduce folds the old global in via merge_accumulated →
+        // combine, then merges the new partial via combine. Under unsigned
+        // ordering, MIN stays at 3 (3 < u64::MAX). Under signed comparison,
+        // u64::MAX → -1 wins, MIN flips to u64::MAX.
+        //
+        // op_gather_reduce always emits retract+new when has_old (no
+        // skip-if-equal), so 2 rows are emitted; we check the new value.
+        let prev_out = Rc::new(out1);
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
+
+        let mut partial2 = Batch::with_schema(schema, 1);
+
+        partial2.extend_pk(1u128);
+        partial2.extend_weight(&1i64.to_le_bytes());
+        partial2.extend_null_bmp(&0u64.to_le_bytes());
+        partial2.extend_col(0, &u64::MAX.to_le_bytes());
+        partial2.count += 1;
+
+        let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
+        assert_eq!(out2.count, 2, "retract old + emit new (unchanged) MIN");
+        let retracted = u64::from_le_bytes(out2.col_data(0)[0..8].try_into().unwrap());
+        assert_eq!(retracted, 3u64);
+        assert_eq!(out2.get_weight(0), -1);
+        let new_min = u64::from_le_bytes(out2.col_data(0)[8..16].try_into().unwrap());
+        assert_eq!(new_min, 3u64,
+            "fold-old + combine-new under unsigned ordering keeps MIN at 3");
+        assert_eq!(out2.get_weight(1), 1);
     }
 }
