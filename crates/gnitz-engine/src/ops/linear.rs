@@ -725,4 +725,143 @@ mod tests {
         let out = op_map(&empty_batch, &func, &schema, &schema, -1);
         assert_eq!(out.count, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // PkPromoter — gap-coverage for STRING hashing and PK-column reindex
+    // -----------------------------------------------------------------------
+
+    fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn test_pk_promoter_string_short_and_long_hash() {
+        // Two rows: one short ("foo", inline) and one long string (> 12 bytes,
+        // stored in blob). Both PromoteKind::String code paths execute, and
+        // distinct strings hash to distinct PKs.
+        let schema = make_schema_pk_u64_payload_string();
+        let mut b = Batch::with_schema(schema, 2);
+
+        // Row 0: short string "foo" (3 bytes, inline).
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        let mut gs0 = [0u8; 16];
+        gs0[0..4].copy_from_slice(&3u32.to_le_bytes());
+        gs0[4..7].copy_from_slice(b"foo");
+        b.extend_col(0, &gs0);
+        b.count += 1;
+
+        // Row 1: long string (15 bytes > SHORT_STRING_THRESHOLD=12), heap-allocated.
+        let long_str: &[u8] = b"hello-world-xyz";
+        let heap_off = b.blob.len() as u64;
+        b.blob.extend_from_slice(long_str);
+        b.extend_pk(2u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        let mut gs1 = [0u8; 16];
+        gs1[0..4].copy_from_slice(&(long_str.len() as u32).to_le_bytes());
+        gs1[4..8].copy_from_slice(&long_str[..4]); // prefix
+        gs1[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        b.extend_col(0, &gs1);
+        b.count += 1;
+
+        let mb = b.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
+
+        let pk_short = promoter.promote(&mb, 0);
+        let pk_long = promoter.promote(&mb, 1);
+
+        // Hashed via xxh + mix64 — exact value is deterministic but we don't
+        // pin it. The load-bearing invariants are: (1) both produce a
+        // non-zero PK for non-empty strings, (2) different strings hash to
+        // different PKs, (3) the high 64 bits are populated (mix64 lifts
+        // collisions out of the low half).
+        assert_ne!(pk_short, 0);
+        assert_ne!(pk_long, 0);
+        assert_ne!(pk_short, pk_long);
+        assert_ne!(pk_short >> 64, 0, "short string PK must populate high half via mix64");
+        assert_ne!(pk_long >> 64, 0, "long string PK must populate high half via mix64");
+    }
+
+    #[test]
+    fn test_pk_promoter_empty_string_hashes_to_zero() {
+        // PromoteKind::String early-returns 0 for length==0 — assert this is
+        // the contract, not an accidental side-effect of xxh on empty input.
+        let schema = make_schema_pk_u64_payload_string();
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        // 16-byte German string struct, length=0.
+        let gs = [0u8; 16];
+        b.extend_col(0, &gs);
+        b.count += 1;
+
+        let mb = b.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
+        assert_eq!(promoter.promote(&mb, 0), 0);
+    }
+
+    #[test]
+    fn test_pk_promoter_pk_column_passthrough() {
+        // PromoteKind::Pk: reindexing on the PK column itself reads the PK
+        // value verbatim, no hashing, no type dispatch.
+        let schema = make_schema_pk_u64_payload_u32();
+        let batch = build_batch_u32_payload(&schema, &[(7, 100), (42, 200), (1234567890, 300)]);
+        let mb = batch.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 0); // col_idx 0 == PK
+
+        assert_eq!(promoter.promote(&mb, 0), 7u128);
+        assert_eq!(promoter.promote(&mb, 1), 42u128);
+        assert_eq!(promoter.promote(&mb, 2), 1234567890u128);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_map reindex — end-to-end exercise of the PkPromoter via op_map
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_map_with_reindex_promotes_payload_to_pk() {
+        // op_map with reindex_col >= 0 rewrites the output PK by reading the
+        // referenced column through PkPromoter. Verifies (1) every row's
+        // output PK matches the source column value, (2) the resulting
+        // batch is correctly marked unsorted/unconsolidated (sort order on
+        // the new PK is not preserved by the row-by-row promote).
+        use crate::expr::Plan;
+
+        // Input: PK u64, payload i64. Reindex on the payload (col 1) — the
+        // new output PK is each row's payload value.
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[
+            (1, 1, 200),
+            (2, 1, 100),
+            (3, 1, 300),
+        ]);
+
+        // Projection plan: output keeps the same single payload column.
+        let func = ScalarFuncKind::Plan(Plan::from_projection(
+            &[1], &[type_code::I64], &schema, &schema,
+        ));
+
+        let out = op_map(&batch, &func, &schema, &schema, /* reindex_col = */ 1);
+        assert_eq!(out.count, 3);
+        // Each output row's PK equals its source payload value.
+        assert_eq!(out.get_pk(0) as u64, 200);
+        assert_eq!(out.get_pk(1) as u64, 100);
+        assert_eq!(out.get_pk(2) as u64, 300);
+        // Payload itself is unchanged by the projection.
+        assert_eq!(get_payload_i64(&out, 0), 200);
+        assert_eq!(get_payload_i64(&out, 1), 100);
+        assert_eq!(get_payload_i64(&out, 2), 300);
+        // Reindex destroys PK order — output must be marked accordingly.
+        assert!(!out.sorted, "reindex output must not be marked sorted");
+        assert!(!out.consolidated, "reindex output must not be marked consolidated");
+    }
 }
