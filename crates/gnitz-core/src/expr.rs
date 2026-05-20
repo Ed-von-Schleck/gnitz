@@ -75,7 +75,7 @@ impl ExprProgram {
     /// ..  S × { 4-byte length L, L bytes UTF-8 }
     /// ```
     pub fn encode(&self) -> Vec<u8> {
-        debug_assert!(self.code.len() % 4 == 0, "code length {} not 4-aligned", self.code.len());
+        debug_assert!(self.code.len().is_multiple_of(4), "code length {} not 4-aligned", self.code.len());
         let mut buf = Vec::with_capacity(
             EXPR_BLOB_HEADER_SIZE + self.code.len() * 4 + 4
                 + self.const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
@@ -152,6 +152,12 @@ pub struct ExprBuilder {
     code:          Vec<u32>,
     next_reg:      u32,
     const_strings: Vec<String>,
+}
+
+impl Default for ExprBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExprBuilder {

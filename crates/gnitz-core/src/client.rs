@@ -200,8 +200,8 @@ impl GnitzClient {
         let index_id = self.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();
-        let mut batch = ZSetBatch::new(&idx_schema);
-        BatchAppender::new(&mut batch, &idx_schema)
+        let mut batch = ZSetBatch::new(idx_schema);
+        BatchAppender::new(&mut batch, idx_schema)
             .add_row(index_id as u128, 1)
             .u64_val(table_id)
             .u64_val(0)
@@ -210,7 +210,7 @@ impl GnitzClient {
             .u64_val(is_unique as u64)
             .str_val("");
 
-        self.push(IDX_TAB, &idx_schema, &batch)?;
+        self.push(IDX_TAB, idx_schema, &batch)?;
         Ok(index_id)
     }
 
@@ -232,8 +232,8 @@ impl GnitzClient {
             let cache_dir  = col_str(&idx_batch.columns[6], i)?.unwrap_or("").to_string();
 
             let idx_schema = idx_tab_schema();
-            let mut batch = ZSetBatch::new(&idx_schema);
-            BatchAppender::new(&mut batch, &idx_schema)
+            let mut batch = ZSetBatch::new(idx_schema);
+            BatchAppender::new(&mut batch, idx_schema)
                 .add_row(index_id as u128, -1)
                 .u64_val(owner_id)
                 .u64_val(owner_kind)
@@ -241,7 +241,7 @@ impl GnitzClient {
                 .str_val(index_name)
                 .u64_val(is_unique)
                 .str_val(&cache_dir);
-            self.push(IDX_TAB, &idx_schema, &batch)?;
+            self.push(IDX_TAB, idx_schema, &batch)?;
             return Ok(());
         }
         Err(ClientError::ServerError(format!("index '{}' not found", index_name)))
@@ -268,11 +268,11 @@ impl GnitzClient {
     pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
         let new_sid = self.conn.alloc_schema_id()?;
         let schema = schema_tab_schema();
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema)
+        let mut batch = ZSetBatch::new(schema);
+        BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, &schema, &batch, &mut self.schema_cache)?;
+        self.conn.push(SCHEMA_TAB, schema, &batch, &mut self.schema_cache)?;
         Ok(new_sid)
     }
 
@@ -284,11 +284,11 @@ impl GnitzClient {
         let schema_id = find_schema_id(&data, name)?;
 
         let schema = schema_tab_schema();
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema)
+        let mut batch = ZSetBatch::new(schema);
+        BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, &schema, &batch, &mut self.schema_cache)?;
+        self.conn.push(SCHEMA_TAB, schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }
 
@@ -313,8 +313,8 @@ impl GnitzClient {
 
         // TABLE_TAB last
         let tbl_schema = table_tab_schema();
-        let mut tb = ZSetBatch::new(&tbl_schema);
-        BatchAppender::new(&mut tb, &tbl_schema)
+        let mut tb = ZSetBatch::new(tbl_schema);
+        BatchAppender::new(&mut tb, tbl_schema)
             .add_row(new_tid as u128, 1)
             .u64_val(schema_id)
             .str_val(table_name)
@@ -322,7 +322,7 @@ impl GnitzClient {
             .u64_val(pk_col_idx as u64)
             .u64_val(0)
             .u64_val(unique_pk as u64);
-        self.conn.push(TABLE_TAB, &tbl_schema, &tb, &mut self.schema_cache)?;
+        self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(new_tid)
     }
@@ -341,8 +341,8 @@ impl GnitzClient {
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
         let tbl_schema = table_tab_schema();
-        let mut tb = ZSetBatch::new(&tbl_schema);
-        BatchAppender::new(&mut tb, &tbl_schema)
+        let mut tb = ZSetBatch::new(tbl_schema);
+        BatchAppender::new(&mut tb, tbl_schema)
             .add_row(record.tid as u128, -1)
             .u64_val(record.schema_id)
             .str_val(&record.name)
@@ -350,7 +350,7 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        self.conn.push(TABLE_TAB, &tbl_schema, &tb, &mut self.schema_cache)?;
+        self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(())
     }
@@ -425,9 +425,9 @@ impl GnitzClient {
         let deps = circuit.dependencies();
         if !deps.is_empty() {
             let dep_s = dep_tab_schema();
-            let mut dep = ZSetBatch::new(&dep_s);
+            let mut dep = ZSetBatch::new(dep_s);
             {
-                let mut a = BatchAppender::new(&mut dep, &dep_s);
+                let mut a = BatchAppender::new(&mut dep, dep_s);
                 for &dep_tid in &deps {
                     a.add_row(dep_tid as u128 | (vid as u128) << 64, 1)
                         .u64_val(vid)
@@ -435,7 +435,7 @@ impl GnitzClient {
                         .u64_val(dep_tid);
                 }
             }
-            self.conn.push(DEP_TAB, &dep_s, &dep, &mut self.schema_cache)?;
+            self.conn.push(DEP_TAB, dep_s, &dep, &mut self.schema_cache)?;
         }
 
         // Materialise the typed circuit into the three-table row bundle.
@@ -444,9 +444,9 @@ impl GnitzClient {
         // 3. CircuitNodes
         if !rows.nodes.is_empty() {
             let nodes_s = circuit_nodes_schema();
-            let mut nodes = ZSetBatch::new(&nodes_s);
+            let mut nodes = ZSetBatch::new(nodes_s);
             {
-                let mut a = BatchAppender::new(&mut nodes, &nodes_s);
+                let mut a = BatchAppender::new(&mut nodes, nodes_s);
                 for (node_id, opcode, src_tab, reindex, expr_blob) in &rows.nodes {
                     let pk = *node_id as u128 | (vid as u128) << 64;
                     let mut null_mask: u64 = 0;
@@ -467,15 +467,15 @@ impl GnitzClient {
                     }
                 }
             }
-            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes, &mut self.schema_cache)?;
+            self.conn.push(CIRCUIT_NODES_TAB, nodes_s, &nodes, &mut self.schema_cache)?;
         }
 
         // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
         if !rows.edges.is_empty() {
             let edges_s = circuit_edges_schema();
-            let mut edges = ZSetBatch::new(&edges_s);
+            let mut edges = ZSetBatch::new(edges_s);
             {
-                let mut a = BatchAppender::new(&mut edges, &edges_s);
+                let mut a = BatchAppender::new(&mut edges, edges_s);
                 for (dst_node, dst_port, src_node) in &rows.edges {
                     debug_assert!(*dst_node < (1u64 << 40), "dst_node {} exceeds 40-bit cap", dst_node);
                     let pk_lo = ((*dst_node as u128) << 8) | (*dst_port as u128);
@@ -487,19 +487,19 @@ impl GnitzClient {
                         .u64_val(*src_node);
                 }
             }
-            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges, &mut self.schema_cache)?;
+            self.conn.push(CIRCUIT_EDGES_TAB, edges_s, &edges, &mut self.schema_cache)?;
         }
 
         // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
         if !rows.node_columns.is_empty() {
             let s = circuit_node_columns_schema();
-            let mut nc = ZSetBatch::new(&s);
+            let mut nc = ZSetBatch::new(s);
             {
-                let mut a = BatchAppender::new(&mut nc, &s);
+                let mut a = BatchAppender::new(&mut nc, s);
                 for (node_id, kind, position, v1, v2) in &rows.node_columns {
                     debug_assert!((*position as u64) <= 0xFFFF);
                     debug_assert!((*kind) <= 0xFF);
-                    debug_assert!((*node_id) <= 0xFFFF_FFFF_FF);
+                    debug_assert!((*node_id) <= 0x00FF_FFFF_FFFF);
                     let pk_lo = ((*node_id as u128) << 24)
                         | ((*kind as u128) << 16)
                         | (*position as u128);
@@ -513,7 +513,7 @@ impl GnitzClient {
                         .u64_val(*v2);
                 }
             }
-            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, &s, &nc, &mut self.schema_cache)?;
+            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, s, &nc, &mut self.schema_cache)?;
         }
 
         // 6. View record — must be last (triggers server-side hook + circuit compilation).
@@ -536,15 +536,15 @@ impl GnitzClient {
         let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
         let view_s = view_tab_schema();
-        let mut vb = ZSetBatch::new(&view_s);
-        BatchAppender::new(&mut vb, &view_s)
+        let mut vb = ZSetBatch::new(view_s);
+        BatchAppender::new(&mut vb, view_s)
             .add_row(vr.vid as u128, -1)
             .u64_val(vr.schema_id)
             .str_val(&vr.name)
             .str_val(&vr.sql_definition)
             .str_val(&vr.cache_directory)
             .u64_val(vr.created_lsn);
-        self.conn.push(VIEW_TAB, &view_s, &vb, &mut self.schema_cache)?;
+        self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
 
         Ok(())
     }
@@ -705,36 +705,36 @@ impl GnitzClient {
         columns: &[ColumnDef],
     ) -> Result<(), ClientError> {
         let schema = col_tab_schema();
-        let mut batch = ZSetBatch::new(&schema);
+        let mut batch = ZSetBatch::new(schema);
         {
-            let mut a = BatchAppender::new(&mut batch, &schema);
-            for i in 0..columns.len() {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            for (i, col) in columns.iter().enumerate() {
                 a.add_row(pack_col_id(owner_id, i)? as u128, 1)
                     .u64_val(owner_id)
                     .u64_val(owner_kind)
                     .u64_val(i as u64)
-                    .str_val(&columns[i].name)
-                    .u64_val(columns[i].type_code as u64)
-                    .u64_val(if columns[i].is_nullable { 1 } else { 0 })
-                    .u64_val(columns[i].fk_table_id)
-                    .u64_val(columns[i].fk_col_idx);
+                    .str_val(&col.name)
+                    .u64_val(col.type_code as u64)
+                    .u64_val(if col.is_nullable { 1 } else { 0 })
+                    .u64_val(col.fk_table_id)
+                    .u64_val(col.fk_col_idx);
             }
         }
-        self.conn.push(COL_TAB, &schema, &batch, &mut self.schema_cache)?;
+        self.conn.push(COL_TAB, schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }
 
     fn push_view_record(&mut self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
-        let mut vb = ZSetBatch::new(&view_s);
-        BatchAppender::new(&mut vb, &view_s)
+        let mut vb = ZSetBatch::new(view_s);
+        BatchAppender::new(&mut vb, view_s)
             .add_row(vid as u128, 1)
             .u64_val(schema_id)
             .str_val(view_name)
             .str_val(sql_text)
             .str_val("")
             .u64_val(0);
-        self.conn.push(VIEW_TAB, &view_s, &vb, &mut self.schema_cache)?;
+        self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
         Ok(())
     }
 }

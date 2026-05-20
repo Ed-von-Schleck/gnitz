@@ -379,9 +379,10 @@ fn eval_do_update_rhs(
 }
 
 
-fn extract_insert_parts(
-    stmt: &Statement,
-) -> Result<(String, &[Vec<Expr>], Option<&OnInsert>), GnitzSqlError> {
+/// `(table_name, rows, on_clause)` — return type of [`extract_insert_parts`].
+type InsertParts<'a> = (String, &'a [Vec<Expr>], Option<&'a OnInsert>);
+
+fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlError> {
     match stmt {
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
@@ -536,7 +537,7 @@ fn append_value_to_col(
                     ColData::Bytes(v) => { v.push(None); }
                     ColData::Fixed(buf) => {
                         let stride = tc.wire_stride();
-                        buf.extend(std::iter::repeat(0u8).take(stride));
+                        buf.extend(std::iter::repeat_n(0u8, stride));
                     }
                     ColData::U128s(v) => { v.push(0u128); }
                 }
@@ -658,7 +659,7 @@ pub fn execute_select(
 
     // Apply projection
     let (proj_schema, proj_batch) = apply_projection(
-        &select.projection, &actual_schema, batch_opt, &binder
+        &select.projection, &actual_schema, batch_opt, binder
     )?;
 
     // Apply LIMIT
@@ -824,7 +825,7 @@ fn eval_pred_row(
     schema: &Schema,
 ) -> Result<bool, GnitzSqlError> {
     // SQL NULL in a predicate position is UNKNOWN → treated as false (row excluded).
-    Ok(eval_expr(pred, batch, i, schema)?.map_or(false, |v| v != 0))
+    Ok(eval_expr(pred, batch, i, schema)?.is_some_and(|v| v != 0))
 }
 
 /// Evaluate a bound expression against a single row.
@@ -1120,7 +1121,7 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
     match cv {
         ColumnValue::Null => {
             match col {
-                ColData::Fixed(buf) => buf.extend(std::iter::repeat(0u8).take(tc.wire_stride())),
+                ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
                 ColData::Strings(v) => v.push(None),
                 ColData::Bytes(v)   => v.push(None),
                 ColData::U128s(v)   => v.push(0u128),
@@ -1402,7 +1403,7 @@ pub fn execute_delete(
             if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
                 let (schema_opt, batch_opt, _) = client.seek(table_id, pk)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
-                let exists = batch_opt.map_or(false, |b| !b.pks.is_empty());
+                let exists = batch_opt.is_some_and(|b| !b.pks.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
                 client.delete(table_id, actual_schema, &[pk])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });

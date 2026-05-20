@@ -335,7 +335,7 @@ impl PyZSetBatch {
         match &mut self.batch.columns[ci] {
             ColData::Fixed(buf) => {
                 let stride = self.schema.columns[ci].type_code.wire_stride();
-                buf.extend(std::iter::repeat(0u8).take(stride));
+                buf.extend(std::iter::repeat_n(0u8, stride));
             }
             ColData::Strings(v) => v.push(None),
             ColData::Bytes(v) => v.push(None),
@@ -582,7 +582,7 @@ fn build_row_values_into(
         } else {
             let payload_idx = schema.payload_idx(ci);
             if null_word & (1u64 << payload_idx) != 0 {
-                out.push(py.None().into());
+                out.push(py.None());
             } else {
                 match &batch.columns[ci] {
                     ColData::Fixed(buf) => {
@@ -594,11 +594,11 @@ fn build_row_values_into(
                     }
                     ColData::Strings(v) => match &v[row] {
                         Some(s) => out.push(s.into_pyobject(py)?.into_any().unbind()),
-                        None    => out.push(py.None().into()),
+                        None    => out.push(py.None()),
                     },
                     ColData::Bytes(v) => match &v[row] {
                         Some(b) => out.push(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
-                        None    => out.push(py.None().into()),
+                        None    => out.push(py.None()),
                     },
                     ColData::U128s(v) => {
                         if schema.columns[ci].type_code == TypeCode::UUID {
@@ -704,7 +704,7 @@ fn rust_batch_columns_to_py(
                 let items: Vec<PyObject> = v.iter()
                     .map(|s| match s {
                         Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
-                        None    => Ok(py.None().into()),
+                        None    => Ok(py.None()),
                     })
                     .collect::<PyResult<_>>()?;
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
@@ -713,7 +713,7 @@ fn rust_batch_columns_to_py(
                 let items: Vec<PyObject> = v.iter()
                     .map(|b| match b {
                         Some(b) => Ok(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
-                        None    => Ok(py.None().into()),
+                        None    => Ok(py.None()),
                     })
                     .collect::<PyResult<_>>()?;
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
@@ -757,7 +757,7 @@ impl PyScanResult {
             return Ok(cached.clone_ref(py));
         }
         let obj = match &self.data {
-            None => py.None().into(),
+            None => py.None(),
             Some(d) => rust_schema_to_py(py, &d.schema)?.into_any(),
         };
         self.cached_schema = Some(obj.clone_ref(py));
@@ -770,7 +770,7 @@ impl PyScanResult {
             return Ok(cached.clone_ref(py));
         }
         let obj = match &self.data {
-            None => py.None().into(),
+            None => py.None(),
             Some(d) => {
                 let rb = Py::new(py, PyRustBatch {
                     data: Arc::clone(d),
@@ -815,7 +815,7 @@ impl PyScanResult {
         let mut iter = self.__iter__(py)?;
         match iter.__next__(py)? {
             Some(row) => Ok(row),
-            None => Ok(py.None().into()),
+            None => Ok(py.None()),
         }
     }
 
@@ -840,7 +840,7 @@ impl PyScanResult {
         let mut iter = self.__iter__(py)?;
         match iter.__next__(py)? {
             Some(row) => Ok(row),
-            None => Ok(py.None().into()),
+            None => Ok(py.None()),
         }
     }
 
@@ -922,7 +922,7 @@ impl PyScanResult {
                 let items: Vec<PyObject> = (0..n)
                     .map(|i| {
                         if nulls[i] & null_bit != 0 {
-                            py.None().into()
+                            py.None()
                         } else {
                             read_fixed_le(py, tc, &buf[i * stride..(i + 1) * stride])
                         }
@@ -934,11 +934,11 @@ impl PyScanResult {
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, s)| {
                         if nulls[i] & null_bit != 0 {
-                            return Ok(py.None().into());
+                            return Ok(py.None());
                         }
                         match s {
                             Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
-                            None    => Ok(py.None().into()),
+                            None    => Ok(py.None()),
                         }
                     })
                     .collect::<PyResult<_>>()?;
@@ -948,11 +948,11 @@ impl PyScanResult {
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, b)| {
                         if nulls[i] & null_bit != 0 {
-                            return Ok::<PyObject, PyErr>(py.None().into());
+                            return Ok::<PyObject, PyErr>(py.None());
                         }
                         match b {
                             Some(b) => Ok(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
-                            None    => Ok(py.None().into()),
+                            None    => Ok(py.None()),
                         }
                     })
                     .collect::<PyResult<_>>()?;
@@ -962,7 +962,7 @@ impl PyScanResult {
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, &x)| {
                         if nulls[i] & null_bit != 0 {
-                            return Ok(py.None().into());
+                            return Ok(py.None());
                         }
                         Ok(x.into_pyobject(py)?.into_any().unbind())
                     })
@@ -1315,6 +1315,10 @@ pub struct PyExprBuilder {
     inner: Option<ExprBuilder>,
 }
 
+impl Default for PyExprBuilder {
+    fn default() -> Self { Self::new() }
+}
+
 #[pymethods]
 impl PyExprBuilder {
     #[new]
@@ -1534,7 +1538,7 @@ impl PyAsyncTransport {
             future: fut.clone_ref(py),
             kind,
         }).map_err(|_| GnitzError::new_err("I/O thread exited"))?;
-        Ok(fut.into())
+        Ok(fut)
     }
 }
 
@@ -1565,9 +1569,9 @@ impl PyAsyncTransport {
         let client_id = std::process::id() as u64;
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let loop_ref: Py<PyAny> = event_loop.clone_ref(py).into();
-        let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py).into();
-        let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py).into();
+        let loop_ref: Py<PyAny> = event_loop.clone_ref(py);
+        let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py);
+        let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py);
 
         let handle = std::thread::spawn(move || {
             async_io_loop(sock_fd, max_payload_len, rx, loop_ref, sr_fn, se_fn);
@@ -1575,11 +1579,11 @@ impl PyAsyncTransport {
 
         Ok(PyAsyncTransport {
             tx:               Some(tx),
-            event_loop:       event_loop.into(),
+            event_loop,
             client_id,
             thread:           Some(handle),
-            set_result_fn:    set_result_fn.into(),
-            set_exception_fn: set_exception_fn.into(),
+            set_result_fn,
+            set_exception_fn,
         })
     }
 

@@ -34,7 +34,7 @@ pub fn resolve_unqualified_column(
     tables: &HashMap<String, (u64, Schema, usize)>,
 ) -> Result<usize, GnitzSqlError> {
     let mut found: Option<usize> = None;
-    for (_alias, (_, schema, offset)) in tables {
+    for (_, schema, offset) in tables.values() {
         if let Some(idx) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name)) {
             if found.is_some() {
                 return Err(GnitzSqlError::Bind(

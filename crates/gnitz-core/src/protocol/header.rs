@@ -20,7 +20,7 @@ pub const FLAG_ALLOCATE_INDEX_ID:  u64 = 512;
 ///
 /// Fields align with CONTROL_SCHEMA column indices defined in
 /// `gnitz_wire::control`; no wire-format struct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Header {
     pub status:     u32,
     pub target_id:  u64,
@@ -43,11 +43,3 @@ impl Header {
     }
 }
 
-impl Default for Header {
-    fn default() -> Self {
-        Header {
-            status: 0, target_id: 0, client_id: 0, flags: 0,
-            seek_pk: 0, seek_col_idx: 0, request_id: 0,
-        }
-    }
-}

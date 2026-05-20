@@ -436,8 +436,8 @@ pub fn decode_wal_block(
                     )));
                 }
                 let mut vals: Vec<Option<String>> = Vec::with_capacity(count);
-                for row in 0..count {
-                    let is_null = (nulls[row] & (1u64 << payload_idx)) != 0;
+                for (row, &null_word) in nulls.iter().enumerate().take(count) {
+                    let is_null = (null_word & (1u64 << payload_idx)) != 0;
                     if is_null {
                         vals.push(None);
                         continue;
@@ -463,8 +463,8 @@ pub fn decode_wal_block(
                     )));
                 }
                 let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
-                for row in 0..count {
-                    let is_null = (nulls[row] & (1u64 << payload_idx)) != 0;
+                for (row, &null_word) in nulls.iter().enumerate().take(count) {
+                    let is_null = (null_word & (1u64 << payload_idx)) != 0;
                     if is_null {
                         vals.push(None);
                         continue;
@@ -536,7 +536,7 @@ pub fn decode_wal_block(
 
 /// Recompute and write the WAL block checksum in-place.
 /// Used by tests that need to corrupt block content and fix the checksum.
-pub fn recompute_block_checksum(block: &mut Vec<u8>) {
+pub fn recompute_block_checksum(block: &mut [u8]) {
     if block.len() <= WAL_BLOCK_HEADER_SIZE {
         return;
     }
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_header_roundtrip() {
-        let mut buf = vec![0u8; WAL_BLOCK_HEADER_SIZE];
+        let mut buf = [0u8; WAL_BLOCK_HEADER_SIZE];
         buf[0..8].copy_from_slice(&123u64.to_le_bytes());
         buf[8..12].copy_from_slice(&456u32.to_le_bytes());
         buf[12..16].copy_from_slice(&10u32.to_le_bytes());
@@ -919,7 +919,7 @@ mod tests {
         // Body bytes captured from a live Python server FLAG_ALLOCATE_SCHEMA_ID response.
         // Python computes checksum 0x741C9E0BA1D8A9FD using XXH3_64bits (gnitz_xxh3_64 C FFI).
         // This test verifies Rust twox_hash::xxh3 produces the same value.
-        let body_hex = concat!(
+        let _body_hex = concat!(
             "9800000008000000a000000008000000a800000008000000",
             "b000000008000000b800000008000000c000000008000000",
             "c800000008000000d000000008000000d800000008000000",

@@ -77,7 +77,7 @@ impl Schema {
     /// True iff column `ci` is the PK column.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
-        self.pk_indices().iter().any(|&pk| ci == pk)
+        self.pk_indices().contains(&ci)
     }
 
     /// Map a logical column index to its dense payload index. Caller must
@@ -500,7 +500,7 @@ impl<'a> BatchAppender<'a> {
         match &mut self.batch.columns[ci] {
             ColData::Fixed(buf) => {
                 let stride = tc.wire_stride();
-                buf.extend(std::iter::repeat(0u8).take(stride));
+                buf.extend(std::iter::repeat_n(0u8, stride));
             }
             ColData::Strings(v) => {
                 v.push(Some(std::string::String::new()));

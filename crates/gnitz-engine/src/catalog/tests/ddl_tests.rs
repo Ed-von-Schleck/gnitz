@@ -398,8 +398,11 @@ fn test_hook_table_register_rejects_malformed_pk() {
     assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4");     // count 15
     // Out-of-bounds index (index 5, only 3 columns).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (5 << 4), "out of bounds");
-    // Duplicate index [0, 0].
-    assert_rejects(PK_LIST_PACKED_FLAG | 2 | (0 << 4) | (0 << 11), "duplicate column");
+    // Duplicate index [0, 0]. The `(0 << N)` forms document the slot layout
+    // (count=2, idx0@bit4=0, idx1@bit11=0) even though they evaluate to 0.
+    #[allow(clippy::identity_op)]
+    let packed = PK_LIST_PACKED_FLAG | 2 | (0u64 << 4) | (0u64 << 11);
+    assert_rejects(packed, "duplicate column");
     // Non-numeric PK column (c1 is STRING).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be a numeric scalar type");
     // Nullable PK column (c2 is nullable).

@@ -729,8 +729,8 @@ fn execute_create_join_view(
                     proj.push(idx + 1);
                 }
                 SelectItem::Wildcard(_) => {
-                    for i in 1..out_cols.len() {
-                        cols.push(out_cols[i].clone());
+                    for (i, col) in out_cols.iter().enumerate().skip(1) {
+                        cols.push(col.clone());
                         proj.push(i);
                     }
                 }
@@ -763,11 +763,9 @@ fn execute_create_join_view(
 /// Build a reindex ExprProgram that copies all columns as payload.
 fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
     let mut eb = ExprBuilder::new();
-    let mut payload_idx = 0u32;
     for (ci, col) in schema.columns.iter().enumerate() {
         let tc = col.type_code as u32;
-        eb.copy_col(tc, ci as u32, payload_idx);
-        payload_idx += 1;
+        eb.copy_col(tc, ci as u32, ci as u32);
     }
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
@@ -1101,7 +1099,7 @@ fn execute_create_group_by_view(
     let having_input = if let Some(having_expr) = &select.having {
         let bound = bind_having_expr(
             having_expr, &post_map_schema, &source_schema,
-            &group_col_indices, &agg_mappings, &select_items, use_natural_pk,
+            &agg_mappings, &select_items,
         )?;
         let mut heb = ExprBuilder::new();
         let (result_reg, _) = compile_bound_expr(&bound, &post_map_schema, &mut heb)?;
@@ -1127,10 +1125,8 @@ fn bind_having_expr(
     expr:             &Expr,
     post_map_schema:  &Schema,
     source_schema:    &Schema,
-    group_col_indices: &[usize],
     agg_mappings:     &[AggMapping],
     select_items:     &[GroupBySelectItem],
-    use_natural_pk:   bool,
 ) -> Result<BoundExpr, GnitzSqlError> {
     match expr {
         Expr::Identifier(ident) => {
@@ -1185,9 +1181,9 @@ fn bind_having_expr(
         }
         Expr::BinaryOp { left, op, right } => {
             let l = bind_having_expr(left, post_map_schema, source_schema,
-                group_col_indices, agg_mappings, select_items, use_natural_pk)?;
+                agg_mappings, select_items)?;
             let r = bind_having_expr(right, post_map_schema, source_schema,
-                group_col_indices, agg_mappings, select_items, use_natural_pk)?;
+                agg_mappings, select_items)?;
             let bop = match op {
                 sqlparser::ast::BinaryOperator::Plus  => BinOp::Add,
                 sqlparser::ast::BinaryOperator::Minus => BinOp::Sub,
@@ -1221,7 +1217,7 @@ fn bind_having_expr(
         }
         Expr::Nested(inner) => bind_having_expr(
             inner, post_map_schema, source_schema,
-            group_col_indices, agg_mappings, select_items, use_natural_pk,
+            agg_mappings, select_items,
         ),
         _ => Err(GnitzSqlError::Unsupported(
             format!("HAVING: unsupported expression {:?}", expr)
@@ -1290,6 +1286,7 @@ fn compile_set_op_side(
     Ok((reindexed, out_cols))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_create_set_op_view(
     client:          &mut GnitzClient,
     schema_name:     &str,

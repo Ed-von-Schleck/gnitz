@@ -196,6 +196,7 @@ pub fn encode_message(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn send_message(
     sock_fd:      RawFd,
     target_id:    u64,

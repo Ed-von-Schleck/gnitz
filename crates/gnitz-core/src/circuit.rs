@@ -14,15 +14,26 @@ pub struct Circuit {
     pub edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
 
+/// `(opcode, source_table, reindex_col, expr_program_blob)` — the fields of
+/// a `nodes` system-table row excluding the node id (which is added by the
+/// caller). Reused by both `CircuitRows::nodes` and `encode_op_node`.
+pub type NodeFields = (u64, Option<TableId>, Option<u16>, Option<Vec<u8>>);
+
+/// One full row of the `nodes` system table: node id + [`NodeFields`].
+pub type NodeRow = (NodeId, u64, Option<TableId>, Option<u16>, Option<Vec<u8>>);
+
+/// One row of the `node_columns` system table:
+/// `(kind, position, value1, value2)` — the node_id is prepended by the caller.
+pub type NodeColumnPayload = (u64, u16, u64, u64);
+
 /// Three-table row bundle materialised from a `Circuit` for a single catalog
 /// write. Each `Vec` is one logical row in the corresponding system table.
 #[derive(Clone, Debug, Default)]
 pub struct CircuitRows {
-    /// `(node_id, opcode, source_table, reindex_col, expr_program_blob)`.
     /// `source_table` is `None` for nodes that don't carry one;
     /// `reindex_col` is `None` outside `MapKind::Expression { reindex_col: Some(_) }`;
     /// `expr_program` is `None` outside `Filter`/`MapKind::Expression`.
-    pub nodes:        Vec<(NodeId, u64, Option<TableId>, Option<u16>, Option<Vec<u8>>)>,
+    pub nodes:        Vec<NodeRow>,
     /// `(dst_node, dst_port, src_node)`. View id is implicit at the call site.
     pub edges:        Vec<(NodeId, Port, NodeId)>,
     /// `(node_id, kind, position, value1, value2)`.
@@ -47,7 +58,7 @@ impl Circuit {
     pub fn into_rows(self) -> CircuitRows {
         let mut rows = CircuitRows::default();
         for (nid, op) in self.nodes {
-            let (opcode, src_tab, reindex, expr_blob, kind_rows) = encode_op_node(op);
+            let ((opcode, src_tab, reindex, expr_blob), kind_rows) = encode_op_node(op);
             rows.nodes.push((nid, opcode, src_tab, reindex, expr_blob));
             for (kind, pos, v1, v2) in kind_rows {
                 rows.node_columns.push((nid, kind, pos, v1, v2));
@@ -100,25 +111,23 @@ where
         .collect()
 }
 
-fn encode_op_node(
-    op: OpNode,
-) -> (u64, Option<TableId>, Option<u16>, Option<Vec<u8>>, Vec<(u64, u16, u64, u64)>) {
+fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     use gnitz_wire::*;
     match op {
-        OpNode::ScanDelta(tid) => (OPCODE_SCAN_DELTA, Some(tid), None, None, Vec::new()),
-        OpNode::ScanTrace(tid) => (OPCODE_SCAN_TRACE_TABLE, Some(tid), None, None, Vec::new()),
-        OpNode::Filter(blob)   => (OPCODE_FILTER, None, None, blob, Vec::new()),
+        OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None, None), Vec::new()),
+        OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None, None), Vec::new()),
+        OpNode::Filter(blob)   => ((OPCODE_FILTER, None, None, blob), Vec::new()),
         OpNode::Map(MapKind::Projection(cols)) => {
-            (OPCODE_MAP_PROJ, None, None, None, encode_col_list(NODE_COL_KIND_PROJ, cols))
+            ((OPCODE_MAP_PROJ, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
         }
         OpNode::Map(MapKind::Expression { program, reindex_col }) => {
-            (OPCODE_MAP_EXPR, None, reindex_col, Some(program), Vec::new())
+            ((OPCODE_MAP_EXPR, None, reindex_col, Some(program)), Vec::new())
         }
-        OpNode::Map(MapKind::KeyOnly) => (OPCODE_MAP_KEY_ONLY, None, None, None, Vec::new()),
-        OpNode::Negate         => (OPCODE_NEGATE, None, None, None, Vec::new()),
-        OpNode::Union          => (OPCODE_UNION, None, None, None, Vec::new()),
-        OpNode::Delay          => (OPCODE_DELAY, None, None, None, Vec::new()),
-        OpNode::Distinct       => (OPCODE_DISTINCT, None, None, None, Vec::new()),
+        OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
+        OpNode::Negate         => ((OPCODE_NEGATE, None, None, None), Vec::new()),
+        OpNode::Union          => ((OPCODE_UNION, None, None, None), Vec::new()),
+        OpNode::Delay          => ((OPCODE_DELAY, None, None, None), Vec::new()),
+        OpNode::Distinct       => ((OPCODE_DISTINCT, None, None, None), Vec::new()),
         OpNode::Reduce { group_cols, agg } => {
             let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
             for (i, c) in group_cols.iter().enumerate() {
@@ -129,29 +138,29 @@ fn encode_op_node(
                     kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
                 }
             }
-            (OPCODE_REDUCE, None, None, None, kind_rows)
+            ((OPCODE_REDUCE, None, None, None), kind_rows)
         }
-        OpNode::Join(JoinKind::DeltaTrace)         => (OPCODE_JOIN_DELTA_TRACE, None, None, None, Vec::new()),
-        OpNode::Join(JoinKind::DeltaTraceOuter)    => (OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None, Vec::new()),
-        OpNode::Join(JoinKind::DeltaDelta)         => (OPCODE_JOIN_DELTA_DELTA, None, None, None, Vec::new()),
-        OpNode::AntiJoin(JoinKind::DeltaTrace)      => (OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None, Vec::new()),
+        OpNode::Join(JoinKind::DeltaTrace)         => ((OPCODE_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTraceOuter)    => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaDelta)         => ((OPCODE_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTrace)      => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
         OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for anti-join outer; no builder creates this variant"),
-        OpNode::AntiJoin(JoinKind::DeltaDelta)      => (OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None, Vec::new()),
-        OpNode::SemiJoin(JoinKind::DeltaTrace)      => (OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None, Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaDelta)      => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaTrace)      => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
         OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for semi-join outer; no builder creates this variant"),
-        OpNode::SemiJoin(JoinKind::DeltaDelta)      => (OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None, Vec::new()),
-        OpNode::IntegrateSink  => (OPCODE_INTEGRATE, None, None, None, Vec::new()),
-        OpNode::IntegrateTrace => (OPCODE_INTEGRATE_TRACE, None, None, None, Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaDelta)      => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::IntegrateSink  => ((OPCODE_INTEGRATE, None, None, None), Vec::new()),
+        OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => {
-            (OPCODE_EXCHANGE_SHARD, None, None, None, encode_col_list(NODE_COL_KIND_SHARD, shard_cols))
+            ((OPCODE_EXCHANGE_SHARD, None, None, None), encode_col_list(NODE_COL_KIND_SHARD, shard_cols))
         }
-        OpNode::ExchangeGather => (OPCODE_EXCHANGE_GATHER, None, None, None, Vec::new()),
+        OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None, None), Vec::new()),
         OpNode::NullExtend { type_codes } => {
-            (OPCODE_NULL_EXTEND, None, None, None, encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes))
+            ((OPCODE_NULL_EXTEND, None, None, None), encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes))
         }
-        OpNode::GatherReduce  => (OPCODE_GATHER_REDUCE, None, None, None, Vec::new()),
-        OpNode::SeekTrace     => (OPCODE_SEEK_TRACE, None, None, None, Vec::new()),
-        OpNode::ClearDeltas   => (OPCODE_CLEAR_DELTAS, None, None, None, Vec::new()),
+        OpNode::GatherReduce  => ((OPCODE_GATHER_REDUCE, None, None, None), Vec::new()),
+        OpNode::SeekTrace     => ((OPCODE_SEEK_TRACE, None, None, None), Vec::new()),
+        OpNode::ClearDeltas   => ((OPCODE_CLEAR_DELTAS, None, None, None), Vec::new()),
     }
 }
 

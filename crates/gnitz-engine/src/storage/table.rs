@@ -30,7 +30,8 @@ pub enum FlushOutcome {
     /// Non-durable shard written and committed inline; no deferred work.
     DoneInline,
     /// Durable: .tmp files written, fdatasync + rename pending.
-    Pending(FlushWork),
+    /// Boxed because `FlushWork` is ~300B and dwarfs the unit variants.
+    Pending(Box<FlushWork>),
 }
 
 /// Open file descriptors and rename targets pending for one durable flush.
@@ -332,7 +333,7 @@ impl Table {
             .prepare_manifest_with_pending(&manifest_c, &pending)?);
         work.pending_shard = Some(pending);
 
-        Ok(FlushOutcome::Pending(work))
+        Ok(FlushOutcome::Pending(Box::new(work)))
     }
 
     /// Phase 3: rename shard then manifest into final names; insert
@@ -390,7 +391,7 @@ impl Table {
                     }
                 }
                 work.close_fds();
-                let dirfd = self.flush_commit(work)?;
+                let dirfd = self.flush_commit(*work)?;
                 if sync_dir {
                     if let Some(fd) = dirfd {
                         if unsafe { libc::fsync(fd) } < 0 {

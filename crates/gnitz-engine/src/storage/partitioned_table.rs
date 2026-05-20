@@ -227,7 +227,7 @@ impl PartitionedTable {
         for (i, table) in self.tables.iter_mut().enumerate() {
             match table.flush_prepare(true)? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => {}
-                FlushOutcome::Pending(w) => works.push((i, w)),
+                FlushOutcome::Pending(w) => works.push((i, *w)),
             }
         }
         Ok(works)

@@ -169,10 +169,9 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
     // the m=1 wrapper.
     let mut passing = vec![false; n];
     kind.run_filter(&mb, n, |start, end| {
-        for r in start..end { passing[r] = true; }
+        passing[start..end].fill(true);
     });
-    for row in 0..n {
-        let batch_pass = passing[row];
+    for (row, &batch_pass) in passing.iter().enumerate() {
         let row_pass = kind.evaluate_predicate(&mb, row);
         assert_eq!(
             batch_pass, row_pass,
@@ -180,7 +179,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
         );
         // Stronger invariant: a null column value can never satisfy `=`.
         let null_word = mb.get_null_word(row);
-        if (null_word >> 0) & 1 != 0 {
+        if null_word & 1 != 0 {
             assert!(!batch_pass, "row {row} is null but batch said pass");
         }
     }
@@ -276,8 +275,8 @@ fn golden_float_div_zero_divisor_single_row() {
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
-    // 3.14 as F64 bits
-    let bits = f64::to_bits(3.14) as i64;
+    // arbitrary non-zero F64 bits
+    let bits = f64::to_bits(2.5) as i64;
     b.extend_col(0, &bits.to_le_bytes());
     b.count = 1;
     let mb = b.as_mem_batch();
@@ -592,11 +591,11 @@ fn bit_only_three_and_chain_boundary_sweep() {
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
-            for r in s..e { passed[r] = true; }
+            passed[s..e].fill(true);
         });
 
-        for row in 0..n {
-            let v0 = ((row + 0) as i64) % 4;
+        for (row, &got) in passed.iter().enumerate() {
+            let v0 = (row as i64) % 4;
             let v1 = ((row + 1) as i64) % 4;
             let v2 = ((row + 2) as i64) % 4;
             let n0 = row % 5 == 0;
@@ -610,10 +609,9 @@ fn bit_only_three_and_chain_boundary_sweep() {
             let (v_all, n_all) = ref_and(combined, b2);
             let expected = !n_all && v_all;
             assert_eq!(
-                passed[row], expected,
+                got, expected,
                 "n={n} row={row} v0={v0}(null={n0}) v1={v1}(null={n1}) v2={v2}(null={n2}) \
-                 batch={} expected={}",
-                passed[row], expected,
+                 batch={got} expected={expected}",
             );
         }
     }
@@ -756,7 +754,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     let mb = b.as_mem_batch();
 
     let mut passed = vec![false; 4];
-    kind.run_filter(&mb, 4, |s, e| { for r in s..e { passed[r] = true; } });
+    kind.run_filter(&mb, 4, |s, e| { passed[s..e].fill(true); });
     // val=1 → pass, val=0 → fail, null → fail, val=-5 → pass.
     assert_eq!(passed, vec![true, false, false, true],
         "filter on non-bool result_reg must use scalar fallback");
@@ -798,7 +796,7 @@ fn bit_only_all_null_word_and() {
     let kind = ScalarFuncKind::Plan(plan);
 
     let mut passed = vec![false; n];
-    kind.run_filter(&mb, n, |s, e| { for r in s..e { passed[r] = true; } });
+    kind.run_filter(&mb, n, |s, e| { passed[s..e].fill(true); });
     assert!(passed.iter().all(|&p| !p), "all-null AND must reject every row");
 }
 
@@ -841,15 +839,14 @@ fn bit_only_is_not_null_tail_mask() {
     let kind = ScalarFuncKind::Plan(plan);
 
     let mut passed = vec![false; n];
-    kind.run_filter(&mb, n, |s, e| { for r in s..e { passed[r] = true; } });
-    for row in 0..n {
+    kind.run_filter(&mb, n, |s, e| { passed[s..e].fill(true); });
+    for (row, &got) in passed.iter().enumerate() {
         let nn1 = row % 2 != 0;
         let nn2 = row % 3 != 0;
         let expected = nn1 && nn2;
         assert_eq!(
-            passed[row], expected,
-            "row {row}: nn1={nn1} nn2={nn2} expected={expected} got={}",
-            passed[row],
+            got, expected,
+            "row {row}: nn1={nn1} nn2={nn2} expected={expected} got={got}",
         );
     }
 }

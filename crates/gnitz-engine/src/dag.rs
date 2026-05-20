@@ -130,11 +130,11 @@ impl StoreHandle {
         match self {
             StoreHandle::Single(t) => match t.flush_prepare(true)? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-                FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
+                FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
             },
             StoreHandle::Borrowed(ptr) => match unsafe { &mut **ptr }.flush_prepare(true)? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-                FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
+                FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
             },
             StoreHandle::Partitioned(pt) => pt.flush_prepare(),
         }
