@@ -243,6 +243,7 @@ impl Plan {
     /// Filter via interpreted expression.
     pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
         prog.resolve_column_indices(schema);
+        prog.classify(true);
         let no_nulls = prog.is_strictly_non_nullable(schema);
         filter_only(FilterKernel::Interpreted { prog, no_nulls })
     }
@@ -362,8 +363,9 @@ impl Plan {
     }
 
     /// Evaluate predicate for a single row. Thin wrapper over `eval_batch` at
-    /// m=1: the value lives at `regs[r * MORSEL]` and the null bit at
-    /// `null_bits[r * NULL_WORDS_PER_REG] & 1`.
+    /// m=1: the value lives at `regs[r * MORSEL]` (or, when `result_reg` is
+    /// bit_only and nullable, at bit 0 of `bool_bits[r * NULL_WORDS_PER_REG]`,
+    /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
     pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let FilterKernel::Interpreted { prog, no_nulls } = &self.filter
@@ -377,7 +379,12 @@ impl Plan {
         let r = prog.result_reg as usize;
         let is_null = !*no_nulls
             && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
-        !is_null && scratch.regs[r * MORSEL] != 0
+        if is_null { return false; }
+        if !*no_nulls && prog.is_bit_only(r) {
+            (scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0
+        } else {
+            scratch.regs[r * MORSEL] != 0
+        }
     }
 
     /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
@@ -402,20 +409,60 @@ impl Plan {
         scratch.ensure_capacity(num_regs, no_nulls, n);
 
         let words = n.div_ceil(64);
-        scratch.filter_bits[..words].fill(0);
+
+        // Fast-path gate: result_reg must be bit_only (i.e. produced by a
+        // boolean op so `bool_bits[result_reg]` is fresh) AND we must be on
+        // the nullable arm (in `no_nulls` mode bool_bits is unallocated).
+        // Predicates like `WHERE int_col` produce result_reg from
+        // LOAD_PAYLOAD_INT — not a bool producer — so the per-row scan over
+        // `regs` is the only correct path for them.
+        let use_fast_path = !no_nulls && prog.is_bit_only(result_reg);
+
+        // Slow path uses `|=` and needs zeroed words; fast path overwrites
+        // every word, so the fill is a wasted pass there.
+        if !use_fast_path {
+            scratch.filter_bits[..words].fill(0);
+        }
 
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
             eval_batch(prog, mb, morsel_start, m, &mut scratch);
 
-            let base_r = result_reg * MORSEL;
-            let base_null = result_reg * NULL_WORDS_PER_REG;
-            for i in 0..m {
-                let abs = morsel_start + i;
-                let is_null = !no_nulls
-                    && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
-                if !is_null && scratch.regs[base_r + i] != 0 {
-                    scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
+            if use_fast_path {
+                // Word-level merge: filter bit = truthy & !null. morsel_start
+                // is 64-aligned (MORSEL=256), so each morsel maps onto a
+                // contiguous run of `filter_bits` words.
+                let base = result_reg * NULL_WORDS_PER_REG;
+                let words_m = m.div_ceil(64);
+                let filter_word_base = morsel_start / 64;
+                let tail_bits = m % 64;
+                let full_words = if tail_bits != 0 { words_m - 1 } else { words_m };
+                for w in 0..full_words {
+                    let vw = scratch.bool_bits[base + w];
+                    let nw = scratch.null_bits[base + w];
+                    scratch.filter_bits[filter_word_base + w] = vw & !nw;
+                }
+                if tail_bits != 0 {
+                    // Mask the dirty tail: ops like IS_NOT_NULL leave 1s
+                    // beyond `m % 64` (`bool_bits = !null_word`); without
+                    // this mask those phantom bits become false-positive
+                    // passing rows in `filter_bits`.
+                    let w = words_m - 1;
+                    let vw = scratch.bool_bits[base + w];
+                    let nw = scratch.null_bits[base + w];
+                    let mask = (1u64 << tail_bits) - 1;
+                    scratch.filter_bits[filter_word_base + w] = (vw & !nw) & mask;
+                }
+            } else {
+                let base_r = result_reg * MORSEL;
+                let base_null = result_reg * NULL_WORDS_PER_REG;
+                for i in 0..m {
+                    let abs = morsel_start + i;
+                    let is_null = !no_nulls
+                        && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
+                    if !is_null && scratch.regs[base_r + i] != 0 {
+                        scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
+                    }
                 }
             }
         }

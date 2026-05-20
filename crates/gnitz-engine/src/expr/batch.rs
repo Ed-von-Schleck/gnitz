@@ -39,6 +39,10 @@ pub(in crate::expr) struct EvalScratch {
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
     pub(in crate::expr) null_bits: Vec<u64>,
+    /// Packed truthy bits, register-major; bridges boolean producers and
+    /// consumers on the nullable arm without per-row repack from `regs`.
+    /// Empty (capacity 0) when `no_nulls` is true.
+    pub(in crate::expr) bool_bits: Vec<u64>,
     /// Per-row filter bitmask; set by filter_batch, ignored by execute_map.
     pub(in crate::expr) filter_bits: Vec<u64>,
     pub(in crate::expr) no_nulls: bool,
@@ -49,6 +53,7 @@ impl EvalScratch {
         EvalScratch {
             regs: Vec::new(),
             null_bits: Vec::new(),
+            bool_bits: Vec::new(),
             filter_bits: Vec::new(),
             no_nulls: false,
         }
@@ -66,6 +71,9 @@ impl EvalScratch {
             let null_cap = num_regs * NULL_WORDS_PER_REG;
             if self.null_bits.len() < null_cap {
                 self.null_bits.resize(null_cap, 0);
+            }
+            if self.bool_bits.len() < null_cap {
+                self.bool_bits.resize(null_cap, 0);
             }
         }
         let filter_words = n.div_ceil(64);
@@ -184,6 +192,87 @@ fn fill_null_bits_for_resolved(
     fill_null_bits_pi(s, di, null_bmp, morsel_start, m, pi_byte as usize);
 }
 
+/// Shared BOOL_AND / BOOL_OR word-level 3VL kernel (nullable arm).
+/// `va`/`vb` come from `bool_bits`; `na`/`nb` from `null_bits`.
+/// Writes `bool_bits[dst]` and `null_bits[dst]` at word granularity.
+fn bool_and_or_word_loop(
+    scratch: &mut EvalScratch,
+    dst: usize,
+    ai: usize,
+    bi: usize,
+    m: usize,
+    is_or: bool,
+) {
+    let words = m.div_ceil(64);
+    let base_a_n = ai * NULL_WORDS_PER_REG;
+    let base_b_n = bi * NULL_WORDS_PER_REG;
+    let base_d_n = dst * NULL_WORDS_PER_REG;
+    for w in 0..words {
+        let va = scratch.bool_bits[base_a_n + w];
+        let vb = scratch.bool_bits[base_b_n + w];
+        let na = scratch.null_bits[base_a_n + w];
+        let nb = scratch.null_bits[base_b_n + w];
+        let (result_bits, nd) = if is_or {
+            // SQL 3VL OR: definite_true wherever a non-null side is true;
+            // result-null only when neither side is definitely-true and at
+            // least one side is null.
+            let definite_true = (!na & va) | (!nb & vb);
+            let nd = !definite_true & (na | nb);
+            (definite_true, nd)
+        } else {
+            let definite_false = (!na & !va) | (!nb & !vb);
+            let nd = !definite_false & (na | nb);
+            let result_bits = !nd & va & vb;
+            (result_bits, nd)
+        };
+        scratch.bool_bits[base_d_n + w] = result_bits;
+        scratch.null_bits[base_d_n + w] = nd;
+    }
+}
+
+/// Unpack `bool_bits[dst]` into `regs[dst]` as 0/1 i64 per row.
+fn unpack_bool_to_regs(scratch: &mut EvalScratch, dst: usize, m: usize) {
+    let words = m.div_ceil(64);
+    let base_r = dst * MORSEL;
+    let base_b = dst * NULL_WORDS_PER_REG;
+    for w in 0..words {
+        let lo = w * 64;
+        let hi = (lo + 64).min(m);
+        let bits = scratch.bool_bits[base_b + w];
+        for i in lo..hi {
+            scratch.regs[base_r + i] = ((bits >> (i - lo)) & 1) as i64;
+        }
+    }
+}
+
+/// Pack one register's i64 truthy bits into `bool_bits[dst]`.
+#[inline]
+fn pack_to_bool_bits(scratch: &mut EvalScratch, dst: usize, m: usize) {
+    let words = m.div_ceil(64);
+    let base_r = dst * MORSEL;
+    let base_b = dst * NULL_WORDS_PER_REG;
+    for w in 0..words {
+        let lo = w * 64;
+        let hi = (lo + 64).min(m);
+        let mut bits: u64 = 0;
+        for i in lo..hi {
+            bits |= ((scratch.regs[base_r + i] != 0) as u64) << (i - lo);
+        }
+        scratch.bool_bits[base_b + w] = bits;
+    }
+}
+
+/// Bridge for producers that wrote `regs[dst]` and may have a downstream BOOL
+/// consumer (or, for filters, a bit_only result_reg). Non-bool producers reach
+/// a BOOL consumer through this path without restructuring their inner loop.
+#[inline]
+fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ExprProgram, dst: usize, m: usize) {
+    if scratch.no_nulls { return; }
+    if prog.needs_bool_pack(dst) {
+        pack_to_bool_bits(scratch, dst, m);
+    }
+}
+
 /// Walk `dst`'s null mask and zero the matching register entries. Used by
 /// the string-comparison helpers, which compute results unconditionally for
 /// vectorization and then clear null rows in a post-pass.
@@ -240,12 +329,14 @@ fn eval_str_col_vs_const(
             pred(compare_col_string_vs_const(s, blob, const_bytes, const_prefix, const_len)) as i64;
     }
     zero_null_rows(scratch, dst, m);
+    maybe_pack_bool_bits(scratch, prog, dst, m);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn eval_str_col_vs_col(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
+    prog: &ExprProgram,
     dst: usize,
     morsel_start: usize,
     m: usize,
@@ -287,6 +378,7 @@ fn eval_str_col_vs_col(
         scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob, s2, blob)) as i64;
     }
     zero_null_rows(scratch, dst, m);
+    maybe_pack_bool_bits(scratch, prog, dst, m);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +413,7 @@ pub(in crate::expr) fn eval_batch(
                 for i in 0..m { rd[i] = ra[i].$op(rb[i]); }
             }
             null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
     macro_rules! cmp_int {
@@ -331,6 +424,7 @@ pub(in crate::expr) fn eval_batch(
                 for i in 0..m { rd[i] = (ra[i] $op rb[i]) as i64; }
             }
             null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
     macro_rules! bin_float {
@@ -345,6 +439,7 @@ pub(in crate::expr) fn eval_batch(
                 }
             }
             null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
     macro_rules! cmp_float {
@@ -359,6 +454,7 @@ pub(in crate::expr) fn eval_batch(
                 }
             }
             null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
     // DIV-shaped op: compute per-row, mark divide-by-zero rows null, substitute
@@ -384,6 +480,7 @@ pub(in crate::expr) fn eval_batch(
                 let words = m.div_ceil(64);
                 for w in 0..words { scratch.null_bits[base_null_d + w] |= zero_mask[w]; }
             }
+            maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
 
@@ -459,6 +556,7 @@ pub(in crate::expr) fn eval_batch(
                     _ => {}
                 }
                 fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             EXPR_LOAD_PAYLOAD_FLOAT => {
@@ -479,6 +577,7 @@ pub(in crate::expr) fn eval_batch(
                     }
                 }
                 fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             EXPR_LOAD_PK_INT => {
@@ -487,6 +586,7 @@ pub(in crate::expr) fn eval_batch(
                     scratch.regs[base_d + i] = mb.get_pk(morsel_start + i) as i64;
                 }
                 scratch.clear_null_reg(dst, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             EXPR_LOAD_CONST => {
@@ -494,6 +594,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_d = dst * MORSEL;
                 for i in 0..m { scratch.regs[base_d + i] = val; }
                 scratch.clear_null_reg(dst, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -520,6 +621,7 @@ pub(in crate::expr) fn eval_batch(
                     scratch.regs[base_d + i] = scratch.regs[base_a + i].wrapping_neg();
                 }
                 null_or1(scratch, dst, ai, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -544,6 +646,7 @@ pub(in crate::expr) fn eval_batch(
                     scratch.regs[base_d + i] = f64::to_bits(-fa) as i64;
                 }
                 null_or1(scratch, dst, ai, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -572,7 +675,6 @@ pub(in crate::expr) fn eval_batch(
             EXPR_BOOL_AND => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = m.div_ceil(64);
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;
@@ -582,31 +684,19 @@ pub(in crate::expr) fn eval_batch(
                             ((scratch.regs[base_a + i] != 0) && (scratch.regs[base_b + i] != 0)) as i64;
                     }
                 } else {
-                    for w in 0..words {
-                        let base = w * 64;
-                        let chunk_m = (base + 64).min(m) - base;
-                        let mut va: u64 = 0;
-                        let mut vb: u64 = 0;
-                        for i in 0..chunk_m {
-                            if scratch.regs[ai * MORSEL + base + i] != 0 { va |= 1u64 << i; }
-                            if scratch.regs[bi * MORSEL + base + i] != 0 { vb |= 1u64 << i; }
-                        }
-                        let na = scratch.null_bits[ai * NULL_WORDS_PER_REG + w];
-                        let nb = scratch.null_bits[bi * NULL_WORDS_PER_REG + w];
-                        let definite_false = (!na & !va) | (!nb & !vb);
-                        let nd = !definite_false & (na | nb);
-                        let result_bits = !nd & va & vb;
-                        scratch.null_bits[dst * NULL_WORDS_PER_REG + w] = nd;
-                        for i in 0..chunk_m {
-                            scratch.regs[dst * MORSEL + base + i] = ((result_bits >> i) & 1) as i64;
-                        }
+                    // Nullable arm: word-level u64 3VL on packed truthy bits.
+                    // Upstream producers populate `bool_bits` via
+                    // `needs_bool_pack`; the unpack to `regs[dst]` is skipped
+                    // for bit_only destinations whose only readers are BOOL.
+                    bool_and_or_word_loop(scratch, dst, ai, bi, m, /* is_or = */ false);
+                    if !prog.is_bit_only(dst) {
+                        unpack_bool_to_regs(scratch, dst, m);
                     }
                 }
             }
             EXPR_BOOL_OR => {
                 let ai = a1 as usize;
                 let bi = a2 as usize;
-                let words = m.div_ceil(64);
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;
@@ -616,35 +706,37 @@ pub(in crate::expr) fn eval_batch(
                             ((scratch.regs[base_a + i] != 0) || (scratch.regs[base_b + i] != 0)) as i64;
                     }
                 } else {
-                    for w in 0..words {
-                        let base = w * 64;
-                        let chunk_m = (base + 64).min(m) - base;
-                        let mut va: u64 = 0;
-                        let mut vb: u64 = 0;
-                        for i in 0..chunk_m {
-                            if scratch.regs[ai * MORSEL + base + i] != 0 { va |= 1u64 << i; }
-                            if scratch.regs[bi * MORSEL + base + i] != 0 { vb |= 1u64 << i; }
-                        }
-                        let na = scratch.null_bits[ai * NULL_WORDS_PER_REG + w];
-                        let nb = scratch.null_bits[bi * NULL_WORDS_PER_REG + w];
-                        let definite_true = (!na & va) | (!nb & vb);
-                        let nd = !definite_true & (na | nb);
-                        let result_bits = definite_true;
-                        scratch.null_bits[dst * NULL_WORDS_PER_REG + w] = nd;
-                        for i in 0..chunk_m {
-                            scratch.regs[dst * MORSEL + base + i] = ((result_bits >> i) & 1) as i64;
-                        }
+                    bool_and_or_word_loop(scratch, dst, ai, bi, m, /* is_or = */ true);
+                    if !prog.is_bit_only(dst) {
+                        unpack_bool_to_regs(scratch, dst, m);
                     }
                 }
             }
             EXPR_BOOL_NOT => {
                 let ai = a1 as usize;
-                let base_a = ai * MORSEL;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = (scratch.regs[base_a + i] == 0) as i64;
+                if scratch.no_nulls {
+                    let base_a = ai * MORSEL;
+                    let base_d = dst * MORSEL;
+                    for i in 0..m {
+                        scratch.regs[base_d + i] = (scratch.regs[base_a + i] == 0) as i64;
+                    }
+                    null_or1(scratch, dst, ai, m);
+                } else {
+                    let words = m.div_ceil(64);
+                    let base_a = ai * NULL_WORDS_PER_REG;
+                    let base_d = dst * NULL_WORDS_PER_REG;
+                    for w in 0..words {
+                        let va = scratch.bool_bits[base_a + w];
+                        let na = scratch.null_bits[base_a + w];
+                        // 3VL: NOT NULL = NULL. Result truthy = !va & !na (cleared
+                        // in null positions); null-bits unchanged.
+                        scratch.bool_bits[base_d + w] = !va & !na;
+                        scratch.null_bits[base_d + w] = na;
+                    }
+                    if !prog.is_bit_only(dst) {
+                        unpack_bool_to_regs(scratch, dst, m);
+                    }
                 }
-                null_or1(scratch, dst, ai, m);
             }
 
             // ----------------------------------------------------------------
@@ -664,6 +756,7 @@ pub(in crate::expr) fn eval_batch(
                         scratch.regs[base_d + i] = ((row_null >> pi) & 1) as i64;
                     }
                 }
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
             EXPR_IS_NOT_NULL => {
                 let pi_byte = a1 as u8;
@@ -679,6 +772,7 @@ pub(in crate::expr) fn eval_batch(
                         scratch.regs[base_d + i] = (((row_null >> pi) & 1) ^ 1) as i64;
                     }
                 }
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -693,6 +787,7 @@ pub(in crate::expr) fn eval_batch(
                         f64::to_bits(scratch.regs[base_a + i] as f64) as i64;
                 }
                 null_or1(scratch, dst, ai, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -715,15 +810,15 @@ pub(in crate::expr) fn eval_batch(
             // String comparisons (column vs column)
             // ----------------------------------------------------------------
             EXPR_STR_COL_EQ_COL => eval_str_col_vs_col(
-                scratch, mb, dst, morsel_start, m,
+                scratch, mb, prog, dst, morsel_start, m,
                 a1 as u8, a2 as u8, |o| o == Ordering::Equal,
             ),
             EXPR_STR_COL_LT_COL => eval_str_col_vs_col(
-                scratch, mb, dst, morsel_start, m,
+                scratch, mb, prog, dst, morsel_start, m,
                 a1 as u8, a2 as u8, |o| o == Ordering::Less,
             ),
             EXPR_STR_COL_LE_COL => eval_str_col_vs_col(
-                scratch, mb, dst, morsel_start, m,
+                scratch, mb, prog, dst, morsel_start, m,
                 a1 as u8, a2 as u8, |o| o != Ordering::Greater,
             ),
 

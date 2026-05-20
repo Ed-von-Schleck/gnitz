@@ -43,6 +43,14 @@ pub struct ExprProgram {
     /// points debug-assert this; a Plan-bypass caller that forgets to resolve
     /// gets a clear assertion rather than silent miscompute.
     pub(in crate::expr) resolved: bool,
+    /// Bit `r` set iff register `r` is only consumed by boolean ops, so
+    /// producers can skip the i64 unpack into `regs[r]` and downstream BOOL
+    /// reads `bool_bits[r]` directly. Default 0 means no demotion — behaves
+    /// like the pre-mask code path.
+    pub(in crate::expr) bit_only_mask: u64,
+    /// Bit `r` set iff register `r` is read by a boolean consumer; the
+    /// producer must populate `bool_bits[r]`.
+    pub(in crate::expr) bool_input_mask: u64,
 }
 
 impl ExprProgram {
@@ -89,6 +97,8 @@ impl ExprProgram {
             const_lengths,
             payload_col_info: Vec::new(),
             resolved: false,
+            bit_only_mask: 0,
+            bool_input_mask: 0,
         };
         // SSA assert: binary ALU ops must not alias dst with either source.
         // Hard assert (not debug-only): fires at compile time for compiler bugs.
@@ -259,7 +269,120 @@ impl ExprProgram {
             schema.payload_columns().map(|(_, _, col)| (col.size(), col.type_code))
         );
         self.resolved = true;
+        // Default to map-context masks. The bool-bits reads in the BOOL_AND/OR
+        // nullable arms require `bool_input_mask` to be populated by the
+        // producers of their source registers, so classification is mandatory
+        // for any program that may execute on the nullable path.
+        // `Plan::from_predicate` overrides with `is_filter = true` to keep
+        // `result_reg` eligible for bit_only.
+        self.classify(false);
     }
+
+    /// Populate `bit_only_mask` / `bool_input_mask` from the resolved bytecode.
+    pub(in crate::expr) fn classify(&mut self, is_filter: bool) {
+        let (bit_only, bool_input) = self.classify_registers(is_filter);
+        self.bit_only_mask = bit_only;
+        self.bool_input_mask = bool_input;
+    }
+
+    #[inline]
+    pub(in crate::expr) fn is_bit_only(&self, reg: usize) -> bool {
+        (self.bit_only_mask >> reg) & 1 != 0
+    }
+
+    /// True iff `reg`'s producer must write `bool_bits[reg]` — either because
+    /// a downstream BOOL consumer reads it, or because `reg` is bit_only and
+    /// run_filter reads `bool_bits[result_reg]` directly.
+    #[inline]
+    pub(in crate::expr) fn needs_bool_pack(&self, reg: usize) -> bool {
+        ((self.bit_only_mask | self.bool_input_mask) >> reg) & 1 != 0
+    }
+
+    /// Classify each register's role on the nullable-arm hot path. Returns
+    /// `(bit_only_mask, bool_input_mask)`.
+    ///
+    /// `is_filter = true` keeps `result_reg` eligible for `bit_only` (the
+    /// `run_filter` fast path reads `bool_bits[result_reg]` directly). For
+    /// maps, `result_reg` is demoted: EMIT already drags its source register
+    /// through `is_unary_reg_reader`, but `result_reg` carries no map-side
+    /// semantics and demoting it keeps any stray `regs[result_reg]` read live.
+    ///
+    /// Operand-shape note: `a1`/`a2` are register indices only for opcodes
+    /// in `is_*_reg_reader` / `is_bool_consumer`; other opcodes pack constant
+    /// bits, payload byte indices, or type codes into those slots, so the
+    /// classifier enumerates opcode shapes rather than blindly indexing.
+    pub(in crate::expr) fn classify_registers(&self, is_filter: bool) -> (u64, u64) {
+        let mut bool_produced: u64 = 0;
+        let mut non_bool_read: u64 = 0;
+        let mut bool_input: u64 = 0;
+
+        for instr in self.code.chunks_exact(4) {
+            let op = instr[0];
+            let dst = instr[1] as usize;
+            let a1 = instr[2] as usize;
+            let a2 = instr[3] as usize;
+
+            if is_bool_producer(op) {
+                debug_assert!(dst < 64, "classify_registers: dst {dst} ≥ 64");
+                bool_produced |= 1u64 << dst;
+            }
+            if is_bool_consumer(op) {
+                debug_assert!(a1 < 64, "classify_registers: BOOL src a1={a1} ≥ 64");
+                bool_input |= 1u64 << a1;
+                if is_binary_bool_consumer(op) {
+                    debug_assert!(a2 < 64, "classify_registers: BOOL src a2={a2} ≥ 64");
+                    bool_input |= 1u64 << a2;
+                }
+                continue;
+            }
+            if is_binary_reg_reader(op) {
+                non_bool_read |= (1u64 << a1) | (1u64 << a2);
+            } else if is_unary_reg_reader(op) {
+                non_bool_read |= 1u64 << a1;
+            }
+        }
+
+        let mut bit_only = bool_produced & !non_bool_read;
+        if !is_filter && self.num_regs > 0 {
+            bit_only &= !(1u64 << self.result_reg as usize);
+        }
+        (bit_only, bool_input)
+    }
+}
+
+#[inline]
+fn is_bool_producer(op: i64) -> bool {
+    matches!(op,
+        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
+        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE |
+        EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST |
+        EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL |
+        EXPR_IS_NULL | EXPR_IS_NOT_NULL |
+        EXPR_BOOL_AND | EXPR_BOOL_OR | EXPR_BOOL_NOT)
+}
+
+#[inline]
+fn is_bool_consumer(op: i64) -> bool {
+    matches!(op, EXPR_BOOL_AND | EXPR_BOOL_OR | EXPR_BOOL_NOT)
+}
+
+#[inline]
+fn is_binary_bool_consumer(op: i64) -> bool {
+    matches!(op, EXPR_BOOL_AND | EXPR_BOOL_OR)
+}
+
+#[inline]
+fn is_binary_reg_reader(op: i64) -> bool {
+    matches!(op,
+        EXPR_INT_ADD | EXPR_INT_SUB | EXPR_INT_MUL | EXPR_INT_DIV | EXPR_INT_MOD |
+        EXPR_FLOAT_ADD | EXPR_FLOAT_SUB | EXPR_FLOAT_MUL | EXPR_FLOAT_DIV |
+        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
+        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE)
+}
+
+#[inline]
+fn is_unary_reg_reader(op: i64) -> bool {
+    matches!(op, EXPR_INT_NEG | EXPR_FLOAT_NEG | EXPR_INT_TO_FLOAT | EXPR_EMIT)
 }
 
 // ---------------------------------------------------------------------------

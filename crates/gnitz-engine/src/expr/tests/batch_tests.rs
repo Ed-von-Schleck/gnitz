@@ -490,3 +490,366 @@ fn golden_is_null_and_is_not_null_single_row() {
     ));
     assert!(kind.evaluate_predicate(&mb, 0));
 }
+
+// ---------------------------------------------------------------------------
+// Bit-only / bool_bits vectorization tests
+// ---------------------------------------------------------------------------
+
+/// Schema with 3 nullable I64 columns + U64 PK.
+fn schema_pk_three_ints_nullable() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// Build a batch with `n` rows. For each row, the value of each of the three
+/// I64 payload columns is `f(row, col_idx)`. The null bit for each column is
+/// set when `null_pred(row, col_idx)` returns true.
+fn build_three_col_batch(
+    schema: &SchemaDescriptor,
+    n: usize,
+    f: impl Fn(usize, usize) -> i64,
+    null_pred: impl Fn(usize, usize) -> bool,
+) -> Batch {
+    let mut b = Batch::with_schema(*schema, n.max(1));
+    for row in 0..n {
+        b.extend_pk((row + 1) as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        let mut null_word: u64 = 0;
+        for col in 0..3 {
+            if null_pred(row, col) {
+                null_word |= 1u64 << col;
+            }
+        }
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        for col in 0..3 {
+            b.extend_col(col, &f(row, col).to_le_bytes());
+        }
+        b.count += 1;
+    }
+    b
+}
+
+/// Reference 3VL: returns (truthy, is_null) for `a AND b`.
+fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => (false, false),
+        (Some(true), Some(true)) => (true, false),
+        _ => (false, true), // NULL
+    }
+}
+
+/// Differential test: 3-clause AND over nullable columns. For every morsel
+/// boundary in 1..=MORSEL+1, verify run_filter agrees with a per-row 3VL
+/// reference computed from the column values.
+#[test]
+fn bit_only_three_and_chain_boundary_sweep() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
+                       EXPR_CMP_GT, EXPR_BOOL_AND};
+
+    let schema = schema_pk_three_ints_nullable();
+
+    // (col0 > 1) AND (col1 > 1) AND (col2 > 1)
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,        // r0 = col0
+        EXPR_LOAD_CONST,   1, 1, 0,        // r1 = 1
+        EXPR_CMP_GT,       2, 0, 1,        // r2 = r0 > 1
+        EXPR_LOAD_COL_INT, 3, 2, 0,        // r3 = col1
+        EXPR_CMP_GT,       4, 3, 1,        // r4 = r3 > 1
+        EXPR_BOOL_AND,     5, 2, 4,        // r5 = r2 AND r4
+        EXPR_LOAD_COL_INT, 6, 3, 0,        // r6 = col2
+        EXPR_CMP_GT,       7, 6, 1,        // r7 = r6 > 1
+        EXPR_BOOL_AND,     8, 5, 7,        // r8 = r5 AND r7  (result_reg)
+    ];
+
+    // Test sizes that cover: m < 64, m = 64 exactly, m crossing 64, the full
+    // MORSEL=256, and the multi-morsel case (MORSEL + 1).
+    for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
+        let batch = build_three_col_batch(
+            &schema, n,
+            // value cycles 0..4 to mix matching/non-matching rows
+            |row, col| ((row + col) as i64) % 4,
+            // null every 5th row in col0, every 7th in col1, every 11th in col2
+            |row, col| match col {
+                0 => row % 5 == 0,
+                1 => row % 7 == 0,
+                _ => row % 11 == 0,
+            },
+        );
+        let mb = batch.as_mem_batch();
+
+        let plan = Plan::from_predicate(
+            ExprProgram::new(code.clone(), 9, 8, vec![]),
+            &schema,
+        );
+        let kind = ScalarFuncKind::Plan(plan);
+
+        let mut passed = vec![false; n];
+        kind.run_filter(&mb, n, |s, e| {
+            for r in s..e { passed[r] = true; }
+        });
+
+        for row in 0..n {
+            let v0 = ((row + 0) as i64) % 4;
+            let v1 = ((row + 1) as i64) % 4;
+            let v2 = ((row + 2) as i64) % 4;
+            let n0 = row % 5 == 0;
+            let n1 = row % 7 == 0;
+            let n2 = row % 11 == 0;
+            let b0 = if n0 { None } else { Some(v0 > 1) };
+            let b1 = if n1 { None } else { Some(v1 > 1) };
+            let b2 = if n2 { None } else { Some(v2 > 1) };
+            let (v01, n01) = ref_and(b0, b1);
+            let combined = if n01 { None } else { Some(v01) };
+            let (v_all, n_all) = ref_and(combined, b2);
+            let expected = !n_all && v_all;
+            assert_eq!(
+                passed[row], expected,
+                "n={n} row={row} v0={v0}(null={n0}) v1={v1}(null={n1}) v2={v2}(null={n2}) \
+                 batch={} expected={}",
+                passed[row], expected,
+            );
+        }
+    }
+}
+
+/// `NOT` over `bool(col)` against every {TRUE, FALSE, NULL} input. Exercises
+/// the bit_only filter path: result_reg is the NOT output, so run_filter
+/// reads `bool_bits[result_reg]` and must honor 3VL (NOT NULL = NULL = fail).
+#[test]
+fn bit_only_not_3vl_truth_table() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
+                       EXPR_CMP_NE, EXPR_BOOL_NOT};
+
+    let schema = schema_pk_int_nullable();
+
+    // (TRUE, FALSE, NULL) — col1 value, null bit
+    let cases: &[(i64, bool, Option<bool>)] = &[
+        (1, false, Some(true)),
+        (0, false, Some(false)),
+        (0, true,  None),
+    ];
+
+    for &(val, null, src_truthy) in cases {
+        let batch = make_int_row(&schema, val, null);
+        let mb = batch.as_mem_batch();
+
+        // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,    // r0 = col1
+            EXPR_LOAD_CONST,   1, 0, 0,    // r1 = 0
+            EXPR_CMP_NE,       2, 0, 1,    // r2 = bool(col1)
+            EXPR_BOOL_NOT,     3, 2, 0,    // r3 = NOT r2
+        ];
+        let plan = Plan::from_predicate(
+            ExprProgram::new(code, 4, 3, vec![]),
+            &schema,
+        );
+        let kind = ScalarFuncKind::Plan(plan);
+        let mut passed = false;
+        kind.run_filter(&mb, 1, |_, _| { passed = true; });
+        // NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL (filter fails on NULL)
+        let expected = matches!(src_truthy, Some(false));
+        assert_eq!(passed, expected,
+            "NOT 3VL: src={src_truthy:?} val={val} null={null} expected={expected} got={passed}");
+    }
+}
+
+/// Boolean register consumed by an arithmetic opcode forces it OUT of
+/// bit_only. The AND result must still appear correctly in `regs` for the
+/// downstream add.
+#[test]
+fn bit_only_demotion_when_bool_feeds_arithmetic() {
+    use crate::expr::{EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_GT,
+                       EXPR_BOOL_AND, EXPR_INT_ADD};
+
+    let schema = schema_pk_two_ints_nullable();
+    // col1=2, col2=3, no nulls. Both > 1, so AND = 1. Add 0 → result = 1.
+    let batch = make_two_int_row(&schema, 2, 3, 0);
+    let mb = batch.as_mem_batch();
+
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,    // r0 = col1
+        EXPR_LOAD_CONST,   1, 1, 0,    // r1 = 1
+        EXPR_CMP_GT,       2, 0, 1,    // r2 = col1 > 1
+        EXPR_LOAD_COL_INT, 3, 2, 0,    // r3 = col2
+        EXPR_CMP_GT,       4, 3, 1,    // r4 = col2 > 1
+        EXPR_BOOL_AND,     5, 2, 4,    // r5 = r2 AND r4    (consumed by ADD → not bit_only)
+        EXPR_LOAD_CONST,   6, 0, 0,    // r6 = 0
+        EXPR_INT_ADD,      7, 5, 6,    // r7 = r5 + 0 = bool-as-int
+    ];
+    let mut prog = ExprProgram::new(code, 8, 7, vec![]);
+    prog.resolve_column_indices(&schema);
+    // r5 is bool-produced but consumed by INT_ADD (non-bool). Must be demoted.
+    assert!(
+        (prog.bit_only_mask & (1u64 << 5)) == 0,
+        "bool reg fed into arithmetic must NOT be bit_only",
+    );
+
+    let mut scratch = EvalScratch::new();
+    scratch.ensure_capacity(8, false, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
+    assert_eq!(scratch.regs[5 * MORSEL], 1, "AND result must land in regs when !bit_only");
+    assert_eq!(scratch.regs[7 * MORSEL], 1, "downstream arithmetic reads bool as i64");
+}
+
+/// Classifier: every CMP and every AND in a pure conjunction is bit_only
+/// (with `is_filter=true`); result_reg stays bit_only.
+#[test]
+fn classifier_pure_conjunction_filter() {
+    use crate::expr::{EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_GT, EXPR_BOOL_AND};
+
+    let schema = schema_pk_two_ints_nullable();
+    let mut prog = ExprProgram::new(vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,
+        EXPR_LOAD_CONST,   1, 1, 0,
+        EXPR_CMP_GT,       2, 0, 1,
+        EXPR_LOAD_COL_INT, 3, 2, 0,
+        EXPR_CMP_GT,       4, 3, 1,
+        EXPR_BOOL_AND,     5, 2, 4,
+    ], 6, 5, vec![]);
+    prog.resolve_column_indices(&schema);
+    let (bit_only, bool_input) = prog.classify_registers(true);
+    // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
+    // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
+    // never qualify for bit_only. r2/r4 are read only by BOOL_AND, and r5
+    // (result_reg) stays bit_only under is_filter=true.
+    let expected_bit_only = (1u64 << 2) | (1u64 << 4) | (1u64 << 5);
+    assert_eq!(bit_only, expected_bit_only,
+        "expected r2/r4/r5 bit_only; got mask {bit_only:#010b}");
+    // r2 and r4 are read by BOOL_AND.
+    assert_eq!(bool_input, (1 << 2) | (1 << 4));
+}
+
+/// Classifier: a filter whose `result_reg` is produced by LOAD_PAYLOAD_INT
+/// (not a bool producer) must NOT be in `bit_only_mask`. The fast-path
+/// must therefore fall back to the per-row scan over `regs`.
+#[test]
+fn classifier_filter_result_reg_non_bool_falls_back() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_LOAD_COL_INT};
+    let schema = schema_pk_int_nullable();
+    // Predicate: WHERE col1 (treat int as truthy).
+    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
+    let plan = Plan::from_predicate(
+        ExprProgram::new(code, 1, 0, vec![]),
+        &schema,
+    );
+    let kind = ScalarFuncKind::Plan(plan);
+
+    // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
+    let mut b = Batch::with_schema(schema, 4);
+    let rows: &[(i64, bool)] = &[(1, false), (0, false), (0, true), (-5, false)];
+    for &(v, n) in rows {
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(if n { 1u64 } else { 0 }).to_le_bytes());
+        b.extend_col(0, &v.to_le_bytes());
+        b.count += 1;
+    }
+    let mb = b.as_mem_batch();
+
+    let mut passed = vec![false; 4];
+    kind.run_filter(&mb, 4, |s, e| { for r in s..e { passed[r] = true; } });
+    // val=1 → pass, val=0 → fail, null → fail, val=-5 → pass.
+    assert_eq!(passed, vec![true, false, false, true],
+        "filter on non-bool result_reg must use scalar fallback");
+}
+
+/// All-null word: 64 consecutive null rows on each side of an AND. Both
+/// nullable arms (no `bit_only` and `bit_only`) must yield null in every
+/// row, matching the historical 3VL behavior.
+#[test]
+fn bit_only_all_null_word_and() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
+                       EXPR_CMP_NE, EXPR_BOOL_AND};
+    let schema = schema_pk_two_ints_nullable();
+
+    let n = 64;
+    let mut b = Batch::with_schema(schema, n);
+    for _ in 0..n {
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0b11u64.to_le_bytes()); // both cols null
+        b.extend_col(0, &0i64.to_le_bytes());
+        b.extend_col(1, &0i64.to_le_bytes());
+        b.count += 1;
+    }
+    let mb = b.as_mem_batch();
+
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,
+        EXPR_LOAD_CONST,   1, 0, 0,
+        EXPR_CMP_NE,       2, 0, 1,    // r2 = bool(col1)
+        EXPR_LOAD_COL_INT, 3, 2, 0,
+        EXPR_CMP_NE,       4, 3, 1,    // r4 = bool(col2)
+        EXPR_BOOL_AND,     5, 2, 4,
+    ];
+    let plan = Plan::from_predicate(
+        ExprProgram::new(code, 6, 5, vec![]),
+        &schema,
+    );
+    let kind = ScalarFuncKind::Plan(plan);
+
+    let mut passed = vec![false; n];
+    kind.run_filter(&mb, n, |s, e| { for r in s..e { passed[r] = true; } });
+    assert!(passed.iter().all(|&p| !p), "all-null AND must reject every row");
+}
+
+/// IS_NOT_NULL feeds into BOOL_AND. Tests the tail-mask in the filter
+/// fast-path: IS_NOT_NULL writes `bool_bits[dst] = !null_word`, leaving 1s
+/// above bit `m % 64` of the last word. Without the tail mask those phantom
+/// bits become false-positive passing rows.
+#[test]
+fn bit_only_is_not_null_tail_mask() {
+    use crate::expr::{Plan, ScalarFuncKind, EXPR_IS_NOT_NULL, EXPR_BOOL_AND};
+
+    let schema = schema_pk_two_ints_nullable();
+    // 65 rows — straddles the 64-bit word boundary so tail handling matters.
+    let n = 65;
+    let mut b = Batch::with_schema(schema, n);
+    for row in 0..n {
+        b.extend_pk((row + 1) as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        // null every other row in col1, every third in col2
+        let mut nw = 0u64;
+        if row % 2 == 0 { nw |= 1; }
+        if row % 3 == 0 { nw |= 2; }
+        b.extend_null_bmp(&nw.to_le_bytes());
+        b.extend_col(0, &0i64.to_le_bytes());
+        b.extend_col(1, &0i64.to_le_bytes());
+        b.count += 1;
+    }
+    let mb = b.as_mem_batch();
+
+    // WHERE col1 IS NOT NULL AND col2 IS NOT NULL
+    let code = vec![
+        EXPR_IS_NOT_NULL, 0, 1, 0,
+        EXPR_IS_NOT_NULL, 1, 2, 0,
+        EXPR_BOOL_AND,    2, 0, 1,
+    ];
+    let plan = Plan::from_predicate(
+        ExprProgram::new(code, 3, 2, vec![]),
+        &schema,
+    );
+    let kind = ScalarFuncKind::Plan(plan);
+
+    let mut passed = vec![false; n];
+    kind.run_filter(&mb, n, |s, e| { for r in s..e { passed[r] = true; } });
+    for row in 0..n {
+        let nn1 = row % 2 != 0;
+        let nn2 = row % 3 != 0;
+        let expected = nn1 && nn2;
+        assert_eq!(
+            passed[row], expected,
+            "row {row}: nn1={nn1} nn2={nn2} expected={expected} got={}",
+            passed[row],
+        );
+    }
+}
