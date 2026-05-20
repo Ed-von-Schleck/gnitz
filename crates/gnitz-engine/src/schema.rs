@@ -318,6 +318,28 @@ impl SchemaDescriptor {
         debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
         self.payload_to_ci[pi] as usize
     }
+
+    /// True iff `cols` is a permutation of `pk_indices()` (same set,
+    /// any order). Used by reduce to detect `GROUP BY pk` even when the
+    /// SQL lists PK columns in an order that differs from the schema's
+    /// pk-list order.
+    pub fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
+        let pk = self.pk_indices();
+        cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
+    }
+
+    /// Byte offset of `col_idx` within the row's PK region. Walks
+    /// `pk_columns()` in pk-list order; caller must ensure `col_idx` is
+    /// a PK column.
+    pub fn pk_byte_offset(&self, col_idx: usize) -> u8 {
+        debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
+        let mut off: u16 = 0;
+        for (_, pk_ci, c) in self.pk_columns() {
+            if pk_ci == col_idx { return off as u8; }
+            off += c.size() as u16;
+        }
+        unreachable!("pk_byte_offset: col_idx is a pk column but not found in pk_columns()");
+    }
 }
 
 impl PartialEq for SchemaDescriptor {

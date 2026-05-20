@@ -118,7 +118,11 @@ struct Accumulator {
     acc: i64,
     col_type_code: TypeCode,
     agg_op: AggOp,
-    pi: u8,
+    /// Payload index when `!is_pk_col`; byte offset within the PK region
+    /// when `is_pk_col`. The fields are disjoint by `is_pk_col`, so a
+    /// single byte slot covers both.
+    pi_or_pk_off: u8,
+    col_size: u8,
     is_pk_col: bool,
     has_value: bool,
 }
@@ -128,12 +132,18 @@ impl Accumulator {
         let col_idx = desc.col_idx as usize;
         let is_pk_col = schema.is_pk_col(col_idx);
         let tc = desc.col_type_code;
+        let pi_or_pk_off = if is_pk_col {
+            schema.pk_byte_offset(col_idx)
+        } else {
+            schema.payload_idx(col_idx) as u8
+        };
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
             col_type_code: tc,
-            pi: if is_pk_col { 0 } else { schema.payload_idx(col_idx) as u8 },
+            pi_or_pk_off,
+            col_size: tc.stride(),
             is_pk_col,
         }
     }
@@ -171,16 +181,24 @@ impl Accumulator {
         row: usize,
         weight: i64,
     ) {
-        let pi = self.pi as usize;
         let tc = self.col_type_code;
+        let cs = self.col_size as usize;
 
-        // COUNT ignores nulls entirely; PK column is never null.
-        if self.agg_op != AggOp::Count && !self.is_pk_col {
-            let null_word = mb.get_null_word(row);
-            if (null_word >> pi) & 1 != 0 {
-                return; // null value — skip
+        // PK columns are never null, so the null check is gated on
+        // !is_pk_col. COUNT skips the null check entirely because it
+        // counts rows regardless of value-column nullness.
+        let slot = self.pi_or_pk_off as usize;
+        let bytes: &[u8] = if self.is_pk_col {
+            &mb.get_pk_bytes(row)[slot..slot + cs]
+        } else {
+            if self.agg_op != AggOp::Count {
+                let null_word = mb.get_null_word(row);
+                if (null_word >> slot) & 1 != 0 {
+                    return;
+                }
             }
-        }
+            mb.get_col_ptr(row, slot, cs)
+        };
 
         let first = !self.has_value;
         self.has_value = true;
@@ -195,31 +213,23 @@ impl Accumulator {
             }
             AggOp::Sum => {
                 if is_f {
-                    let val_f = read_col_value_f64(mb, row, pi, tc);
+                    let val_f = decode_float(bytes, tc);
                     let cur_f = f64::from_bits(self.acc as u64);
                     let w_f = weight as f64;
                     self.acc = f64::to_bits(cur_f + val_f * w_f) as i64;
                 } else {
-                    let val = if self.is_pk_col {
-                        pk_as_i64(mb.get_pk(row), tc)
-                    } else {
-                        read_col_value(mb, row, pi, tc)
-                    };
+                    let val = decode_signed(bytes, tc);
                     self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
                 }
             }
             AggOp::Min => {
                 if is_f {
-                    let v = read_col_value_f64(mb, row, pi, tc);
+                    let v = decode_float(bytes, tc);
                     if first || v < f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = if self.is_pk_col {
-                        pk_as_i64(mb.get_pk(row), tc)
-                    } else {
-                        read_col_value(mb, row, pi, tc)
-                    };
+                    let v = decode_signed(bytes, tc);
                     if first || v < self.acc {
                         self.acc = v;
                     }
@@ -227,16 +237,12 @@ impl Accumulator {
             }
             AggOp::Max => {
                 if is_f {
-                    let v = read_col_value_f64(mb, row, pi, tc);
+                    let v = decode_float(bytes, tc);
                     if first || v > f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = if self.is_pk_col {
-                        pk_as_i64(mb.get_pk(row), tc)
-                    } else {
-                        read_col_value(mb, row, pi, tc)
-                    };
+                    let v = decode_signed(bytes, tc);
                     if first || v > self.acc {
                         self.acc = v;
                     }
@@ -335,66 +341,69 @@ impl Accumulator {
     }
 }
 
-/// Read a column value as sign-extended i64 using pre-hoisted payload index and TypeCode.
-/// STRING columns: reads first 8 bytes of the 16-byte German String struct (compare key).
+/// Decode a column's bytes as a sign-extended i64. STRING columns use the
+/// first 8 bytes of the 16-byte German String struct as the compare key
+/// (caller passes the full 16-byte slice for the row).
 #[inline]
-fn read_col_value(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> i64 {
+fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
     match tc {
-        TypeCode::I8  => mb.get_col_ptr(row, pi, 1)[0] as i8 as i64,
-        TypeCode::U8  => mb.get_col_ptr(row, pi, 1)[0] as i64,
-        TypeCode::I16 => i16::from_le_bytes(mb.get_col_ptr(row, pi, 2).try_into().unwrap()) as i64,
-        TypeCode::U16 => u16::from_le_bytes(mb.get_col_ptr(row, pi, 2).try_into().unwrap()) as i64,
-        TypeCode::I32 => i32::from_le_bytes(mb.get_col_ptr(row, pi, 4).try_into().unwrap()) as i64,
-        TypeCode::U32 => u32::from_le_bytes(mb.get_col_ptr(row, pi, 4).try_into().unwrap()) as i64,
+        TypeCode::I8  => bytes[0] as i8 as i64,
+        TypeCode::U8  => bytes[0] as i64,
+        TypeCode::I16 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
+        TypeCode::U16 => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
+        TypeCode::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
+        TypeCode::U32 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
         TypeCode::I64 | TypeCode::U64 =>
-            i64::from_le_bytes(mb.get_col_ptr(row, pi, 8).try_into().unwrap()),
+            i64::from_le_bytes(bytes[..8].try_into().unwrap()),
         TypeCode::String =>
-            // STRING agg: compare key is first 8 bytes of 16-byte German String struct.
-            // Must use stride=16 so get_col_ptr computes the correct row base address;
-            // passing stride=8 gives the right offset only for row=0.
-            i64::from_le_bytes(mb.get_col_ptr(row, pi, 16)[..8].try_into().unwrap()),
+            i64::from_le_bytes(bytes[..8].try_into().unwrap()),
         TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob =>
-            unreachable!("read_col_value: non-integer/string type"),
+            unreachable!("decode_signed: non-integer/string type"),
     }
 }
 
-/// Read a float column value as f64, with proper F32→F64 promotion.
+/// Decode a column's bytes as f64, with proper F32→F64 promotion.
 #[inline]
-fn read_col_value_f64(mb: &MemBatch, row: usize, pi: usize, tc: TypeCode) -> f64 {
+fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
     match tc {
-        TypeCode::F32 => {
-            let ptr = mb.get_col_ptr(row, pi, 4);
-            f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
-        }
-        TypeCode::F64 => {
-            let ptr = mb.get_col_ptr(row, pi, 8);
-            f64::from_bits(u64::from_le_bytes(ptr.try_into().unwrap()))
-        }
+        TypeCode::F32 =>
+            f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
+        TypeCode::F64 =>
+            f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
         TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
         TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
         TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob =>
-            unreachable!("read_col_value_f64: non-float type"),
+            unreachable!("decode_float: non-float type"),
     }
 }
 
-/// Extract a PK value (zero/sign-extended into u128) as i64 for accumulation.
-/// Narrow integer PKs are zero-extended in the 128-bit PK slot, so we must
-/// sign-extend here for signed types.
+/// True iff `group_cols` is a single column whose type permits using
+/// the source column directly as the output PK (vs. a synthetic U128).
+/// Shared between `compiler::build_reduce_output_schema` and
+/// `op_reduce` to keep schema construction and execution in lockstep.
+pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[u32]) -> bool {
+    group_cols.len() == 1
+        && matches!(
+            TypeCode::from_validated_u8(schema.columns[group_cols[0] as usize].type_code),
+            TypeCode::U64 | TypeCode::U128 | TypeCode::UUID,
+        )
+}
+
+/// Write the row's PK to `output`. For arity-1 PKs the synthetic u128
+/// `group_key` is sufficient; compound PKs must copy the source row's
+/// PK bytes verbatim because the u128 cannot carry a >16-byte PK region
+/// nor reorder columns to match the output's pk_indices layout.
 #[inline]
-fn pk_as_i64(pk: u128, tc: TypeCode) -> i64 {
-    match tc {
-        TypeCode::I8  => (pk as u8)  as i8  as i64,
-        TypeCode::I16 => (pk as u16) as i16 as i64,
-        TypeCode::I32 => (pk as u32) as i32 as i64,
-        TypeCode::I64 => pk as u64 as i64,
-        TypeCode::U8  => (pk as u8)  as i64,
-        TypeCode::U16 => (pk as u16) as i64,
-        TypeCode::U32 => (pk as u32) as i64,
-        TypeCode::U64 => pk as u64 as i64,
-        TypeCode::F32 => f32::from_bits(pk as u32) as f64 as i64,
-        TypeCode::F64 => f64::from_bits(pk as u64) as i64,
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob =>
-            unreachable!("pk_as_i64: non-numeric PK type"),
+fn emit_pk(
+    output: &mut Batch,
+    output_schema: &SchemaDescriptor,
+    src_pk_bytes: &[u8],
+    group_key: u128,
+) {
+    if output_schema.pk_indices().len() > 1 {
+        output.extend_pk_bytes(src_pk_bytes);
+    } else {
+        output.extend_pk(group_key);
     }
 }
 
@@ -720,8 +729,6 @@ pub fn op_reduce(
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
     let num_out_cols = output_schema.num_columns();
-    let in_pki = input_schema.pk_index_single() as usize;
-
 
     // Linearity check
     let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
@@ -737,9 +744,17 @@ pub fn op_reduce(
         return (Batch::empty_with_schema(output_schema), empty_fin);
     }
 
-    // group_by_pk detection
-    let group_by_pk = group_by_cols.len() == 1
-        && group_by_cols[0] as usize == in_pki;
+    // group_set_eq_pk: GROUP BY is a permutation of the source PK columns.
+    // group_by_pk additionally requires stride ∈ {8, 16} because the fast
+    // path widens PK regions via widen_pk_le on each row; wider compound
+    // PKs cannot use the u128 comparator and must take the slow path.
+    // Skipping the sort under group_by_pk is load-bearing for output
+    // ordering — the input is already PK-sorted from consolidation, and
+    // the output's pk_indices is in source pk-list order regardless of
+    // group_by_cols permutation.
+    let group_set_eq_pk = input_schema.group_cols_eq_pk(group_by_cols);
+    let group_by_pk = group_set_eq_pk
+        && matches!(input_schema.pk_stride(), 8 | 16);
 
     // Pre-compute sort descriptors for group comparisons (non-pk path).
     let (sort_descs, sort_descs_len) = if group_by_pk {
@@ -758,13 +773,11 @@ pub fn op_reduce(
 
     let mb = working.as_mem_batch();
 
-    // Determine output mapping: use_natural_pk
-    let use_natural_pk = if group_by_cols.len() == 1 {
-        let grp_tc = TypeCode::from_validated_u8(input_schema.columns[group_by_cols[0] as usize].type_code);
-        matches!(grp_tc, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
-    } else {
-        false
-    };
+    // Output mapping: matches build_reduce_output_schema's logic — must
+    // stay in sync. Independent of the stride-gated fast-path eligibility
+    // above (compound natural-PK at stride > 16 still emits natural PKs).
+    let use_natural_pk = group_set_eq_pk
+        || is_single_col_natural_pk(input_schema, group_by_cols);
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
     let mut fin_output = finalize_out_schema.map(|fs| {
@@ -1032,7 +1045,7 @@ fn emit_reduce_row(
 ) {
     let num_out_cols = output_schema.num_columns();
 
-    output.extend_pk(group_key);
+    emit_pk(output, output_schema, input_mb.get_pk_bytes(exemplar_row), group_key);
     output.extend_weight(&weight.to_le_bytes());
 
     // Build null word and payload columns
@@ -1124,7 +1137,7 @@ fn emit_finalized_row(
     ctx.eval_row(prog, &raw_mb, raw_row);
     let out_cols = ctx.out_cols();
 
-    fin_output.extend_pk(group_key);
+    emit_pk(fin_output, fin_schema, raw_mb.get_pk_bytes(raw_row), group_key);
     fin_output.extend_weight(&weight.to_le_bytes());
 
     let mut fin_null_mask: u64 = 0;
@@ -1364,7 +1377,7 @@ fn emit_gather_row(
     let num_cols = schema.num_columns();
     let agg_base = num_cols - num_aggs;
 
-    output.extend_pk(group_key);
+    emit_pk(output, schema, input_mb.get_pk_bytes(exemplar_row), group_key);
     output.extend_weight(&weight.to_le_bytes());
 
     let mut null_word: u64 = 0;
@@ -2668,5 +2681,238 @@ mod tests {
         // The PK copy lands in finalized payload column 0 (fin col 1, since fin col 0 is PK).
         let copied = u128::from_le_bytes(fin_output.col_data(0)[..16].try_into().unwrap());
         assert_eq!(copied, pk, "U128 PK must round-trip through emit_finalized_row");
+    }
+
+    // -----------------------------------------------------------------------
+    // Compound-PK reduce: byte-form emit + Accumulator PK-column read + order
+    // -----------------------------------------------------------------------
+
+    /// 2×U64 compound-PK input schema. pk_indices = [0, 1]; payload col is I64.
+    fn make_compound_pk_2xu64_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        )
+    }
+
+    /// Build a 2×U64 compound-PK batch. Rows: (pk0, pk1, weight, val).
+    fn make_batch_compound_2xu64(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, i64, i64)],
+    ) -> Batch {
+        let n = rows.len();
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for &(pk0, pk1, w, val) in rows {
+            let mut pk_bytes = [0u8; 16];
+            pk_bytes[0..8].copy_from_slice(&pk0.to_le_bytes());
+            pk_bytes[8..16].copy_from_slice(&pk1.to_le_bytes());
+            b.extend_pk_bytes(&pk_bytes);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// emit_reduce_row natural-PK byte path on a 2×U64 compound PK: PK bytes
+    /// must be copied verbatim from the source row, not packed from group_key.
+    #[test]
+    fn test_emit_reduce_row_compound_pk_bytes() {
+        let in_schema = make_compound_pk_2xu64_schema();
+
+        // Output schema matches what build_reduce_output_schema would produce
+        // for group_set_eq_pk on this input with a COUNT aggregate:
+        // 2 PK cols (U64,U64) followed by I64 count.
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+
+        let pk0: u64 = 0xAAAA_BBBB_CCCC_DDDDu64;
+        let pk1: u64 = 0x1111_2222_3333_4444u64;
+        let input = make_batch_compound_2xu64(&in_schema, &[(pk0, pk1, 1, 99)]);
+        let mb = input.as_mem_batch();
+
+        let mut output = Batch::with_schema(out_schema, 1);
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+        let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, &in_schema)];
+        // Synthetic group_key is irrelevant on the byte path; pass arbitrary value.
+        emit_reduce_row(
+            &mut output, &mb, 0,
+            0u128, 1,
+            &[0u64], false,
+            &accs, &in_schema, &out_schema,
+            &[0u32, 1u32], true /* use_natural_pk */, 1,
+        );
+
+        assert_eq!(output.count, 1);
+        let mut expected = [0u8; 16];
+        expected[0..8].copy_from_slice(&pk0.to_le_bytes());
+        expected[8..16].copy_from_slice(&pk1.to_le_bytes());
+        assert_eq!(output.get_pk_bytes(0), &expected[..],
+            "compound natural-PK output must copy source row's PK bytes verbatim");
+    }
+
+    /// Accumulator MIN on the SECOND PK column of a 2×U64 compound PK.
+    /// Regression: the second PK column must be decoded by walking its
+    /// byte offset within the PK region, not by widening the whole
+    /// region to u128 (which would yield column 0).
+    #[test]
+    fn test_reduce_min_pk_col_compound_pk() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_compound_pk_2xu64_schema();
+
+        // Output: full natural compound PK + I64 agg, matching the
+        // build_reduce_output_schema layout for group_set_eq_pk.
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0, 1],
+        );
+
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Two distinct compound PKs whose pk_col_0 and pk_col_1 disagree
+        // about ordering: pk_col_1 values are 7 and 3 → MIN must be 3.
+        let delta = make_batch_compound_2xu64(&in_schema, &[
+            (10, 7, 1, 100),
+            (20, 3, 1, 200),
+        ]);
+
+        // MIN over the SECOND PK column (col_idx=1).
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32, 1u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+        // group_by_pk: each (pk0, pk1) is its own group, so we get one row
+        // per input row; MIN within each group equals the row's pk_col_1.
+        assert_eq!(out.count, 2);
+        let mins: Vec<i64> = (0..out.count)
+            .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+            .collect();
+        // Output is in pk_indices order = [0, 1] ascending, so (10,7) precedes (20,3).
+        assert_eq!(mins, vec![7, 3],
+            "MIN(pk_col_1) per single-row group must equal that row's pk_col_1");
+    }
+
+    /// Single-PK U64 MIN(pk_col) — sanity check that the byte-offset
+    /// PK-read path produces the same result as the prior u128 path.
+    #[test]
+    fn test_reduce_min_pk_col_single_pk_u64() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64_i64();
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+
+        let empty_out = Rc::new(Batch::empty(1, 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Input is PK-sorted from consolidation; the group_by_pk fast path
+        // passes that order straight through.
+        let delta = make_batch(&in_schema, &[(7, 1, 0), (42, 1, 0), (99, 1, 0)]);
+
+        let agg = AggDescriptor {
+            col_idx: 0, agg_op: AggOp::Min, col_type_code: TypeCode::U64, _pad: [0; 2],
+        };
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+        // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
+        assert_eq!(out.count, 3);
+        let mins: Vec<i64> = (0..out.count)
+            .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+            .collect();
+        assert_eq!(mins, vec![7, 42, 99]);
+    }
+
+    /// Permuted group_by_cols on a compound PK must still emit rows in
+    /// pk_indices order (the input is PK-sorted from consolidation; the
+    /// fast path skips the sort and passes row order through).
+    #[test]
+    fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_compound_pk_2xu64_schema();
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0, 1],
+        );
+
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Two PKs whose [0,1] and [1,0] orderings disagree: (1,2) vs (2,1).
+        // PK-sorted (pk_indices=[0,1]) order: (1,2) then (2,1).
+        let delta = make_batch_compound_2xu64(&in_schema, &[
+            (1, 2, 1, 10),
+            (2, 1, 1, 20),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        // group_by_cols permuted to [1, 0] — a valid set permutation of pk_indices.
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[1u32, 0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        assert_eq!(out.count, 2);
+        let row0_pk = out.get_pk_bytes(0);
+        let row1_pk = out.get_pk_bytes(1);
+        let p0_col0 = u64::from_le_bytes(row0_pk[0..8].try_into().unwrap());
+        let p0_col1 = u64::from_le_bytes(row0_pk[8..16].try_into().unwrap());
+        let p1_col0 = u64::from_le_bytes(row1_pk[0..8].try_into().unwrap());
+        let p1_col1 = u64::from_le_bytes(row1_pk[8..16].try_into().unwrap());
+        assert_eq!((p0_col0, p0_col1), (1, 2),
+            "first emitted row must be (1, 2) in pk_indices order");
+        assert_eq!((p1_col0, p1_col1), (2, 1),
+            "second emitted row must be (2, 1) in pk_indices order");
     }
 }

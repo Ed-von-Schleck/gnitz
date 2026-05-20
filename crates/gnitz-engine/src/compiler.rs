@@ -688,21 +688,38 @@ fn build_reduce_output_schema(
 ) -> SchemaDescriptor {
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut n = 0;
+    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
+    let mut pk_len = 0usize;
 
-    let use_natural_pk = if group_cols.len() == 1 {
-        let gc_tc = TypeCode::from_validated_u8(input.columns[group_cols[0] as usize].type_code);
-        matches!(gc_tc, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
-    } else {
-        false
-    };
+    let group_cols_u32: Vec<u32> = group_cols.iter().map(|&i| i as u32).collect();
+    let group_set_eq_pk = input.group_cols_eq_pk(&group_cols_u32);
+    let use_natural_pk = group_set_eq_pk
+        || crate::ops::is_single_col_natural_pk(input, &group_cols_u32);
 
     if use_natural_pk {
-        // Col 0: group column (PK)
-        cols[n] = input.columns[group_cols[0] as usize];
-        n += 1;
+        // Output PK region mirrors the source's PK byte layout: walk
+        // `pk_columns()` in pk-list order rather than `group_cols` order.
+        // For single-column natural PK on a non-PK column (e.g. GROUP BY
+        // a U64 payload column), `pk_columns()` would name the wrong
+        // column, so fall back to copying that one group column.
+        if group_set_eq_pk {
+            for (_, _, c) in input.pk_columns() {
+                cols[n] = *c;
+                pk_idx[pk_len] = n as u32;
+                pk_len += 1;
+                n += 1;
+            }
+        } else {
+            cols[n] = input.columns[group_cols[0] as usize];
+            pk_idx[pk_len] = n as u32;
+            pk_len += 1;
+            n += 1;
+        }
     } else {
         // Synthetic U128 PK
         cols[n] = SchemaColumn::new(type_code::U128, 0);
+        pk_idx[pk_len] = n as u32;
+        pk_len += 1;
         n += 1;
         // Group columns
         for &gc in group_cols {
@@ -715,7 +732,7 @@ fn build_reduce_output_schema(
         cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
         n += 1;
     }
-    SchemaDescriptor::new(&cols[..n], &[0])
+    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
 fn agg_value_idx_eligible(tc: TypeCode) -> bool {
@@ -2017,6 +2034,51 @@ mod tests {
         let out = build_reduce_output_schema(&input, &[1], &aggs);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
         assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.columns[0].type_code, type_code::U64);
+        assert_eq!(out.columns[1].type_code, type_code::I64);
+    }
+
+    #[test]
+    fn test_build_reduce_output_schema_compound_natural_pk() {
+        // Input: pk_indices = [0, 1] (compound 2×U64), payload I64.
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        let aggs = vec![AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        }];
+        // group_cols = [1, 0] — permuted; the set still equals pk_indices.
+        let out = build_reduce_output_schema(&input, &[1, 0], &aggs);
+        // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
+        assert_eq!(out.num_columns(), 3);
+        assert_eq!(out.pk_indices(), &[0, 1]);
+        assert_eq!(out.columns[0].type_code, type_code::U64);
+        assert_eq!(out.columns[1].type_code, type_code::U64);
+        assert_eq!(out.columns[2].type_code, type_code::I64);
+    }
+
+    #[test]
+    fn test_build_reduce_output_schema_single_pk_group_by_pk() {
+        // Single-PK input grouped by its PK must collapse to the single-column
+        // natural-PK shape (one PK col + agg).
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let aggs = vec![AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        }];
+        let out = build_reduce_output_schema(&input, &[0], &aggs);
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.pk_indices(), &[0]);
         assert_eq!(out.columns[0].type_code, type_code::U64);
         assert_eq!(out.columns[1].type_code, type_code::I64);
     }
