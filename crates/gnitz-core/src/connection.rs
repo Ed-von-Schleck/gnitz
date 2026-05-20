@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use lru::LruCache;
 use crate::protocol::{
-    Message, Schema, ZSetBatch,
+    Message, Schema, ZSetBatch, PkTuple,
     STATUS_ERROR, STATUS_SCHEMA_MISMATCH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
     FLAG_CONTINUATION, WireConflictMode,
@@ -121,7 +121,7 @@ impl Connection {
         let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, None, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, &[], 0, None, None)?;
         let mut schema: Option<Schema> = None;
         let mut data:   Option<ZSetBatch> = None;
         let lsn: u64 = loop {
@@ -144,7 +144,7 @@ impl Connection {
     pub fn seek(
         &mut self,
         target_id: u64,
-        pk:        u128,
+        pk:        &PkTuple,
         cache:     &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
         let msg = self.roundtrip_seek(target_id, pk, cache)?;
@@ -190,7 +190,7 @@ impl Connection {
         schema:    Option<&Schema>,
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, 0, schema, data)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, &[], 0, schema, data)?;
         // Alloc roundtrips carry no schema blocks; recv_message without a hint is sufficient.
         let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
@@ -216,13 +216,13 @@ impl Connection {
             send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
         } else {
             // Cold path: include schema block, version = 0.
-            send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, 0, Some(schema), Some(batch))?;
+            send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, &[], 0, Some(schema), Some(batch))?;
         }
         let ack = match check_response(self.recv_message_cached_inner(target_id, cache)?) {
             Err(ClientError::SchemaMismatch) => {
                 // Stale cache: evict and retry with full schema.
                 cache.pop(&target_id);
-                send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, 0, Some(schema), Some(batch))?;
+                send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, &[], 0, Some(schema), Some(batch))?;
                 check_response(self.recv_message_cached_inner(target_id, cache)?)?
             }
             Ok(msg) => msg,
@@ -243,7 +243,7 @@ impl Connection {
         key:      u128,
         cache:    &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, col_idx, None, None)?;
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, &[], col_idx, None, None)?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }
@@ -251,10 +251,11 @@ impl Connection {
     fn roundtrip_seek(
         &mut self,
         target_id: u64,
-        pk:        u128,
+        pk:        &PkTuple,
         cache:     &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, pk, 0, None, None)?;
+        let (low_16, extra) = pk.split_wire();
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, low_16, extra, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
     }

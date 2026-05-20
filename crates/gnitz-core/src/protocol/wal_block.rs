@@ -383,14 +383,21 @@ pub fn decode_wal_block(
         let mut b = Vec::with_capacity(pk_sz);
         b.extend_from_slice(&data[pk_off .. pk_off + pk_sz]);
         PkColumn::Bytes { stride: pk_stride as u8, buf: b }
-    } else if pk_stride == 8 {
+    } else if pk_stride <= 8 {
+        // Narrow PK (1/2/4/8 bytes): match the encoder's `U64s` variant so
+        // narrow types round-trip without variant drift. The low `pk_stride`
+        // bytes carry the column's native LE value; high bytes stay zero
+        // (pk_buf is reset to zero on init, then `[..pk_stride]` is the only
+        // overwritten range — pk_stride is invariant across rows).
         let mut v = Vec::with_capacity(count);
+        let mut pk_buf = [0u8; 8];
         for i in 0..count {
-            let base = pk_off + i * 8;
-            if base + 8 > total_size {
+            let base = pk_off + i * pk_stride;
+            if base + pk_stride > total_size {
                 return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
             }
-            v.push(u64::from_le_bytes(data[base..base+8].try_into().unwrap()));
+            pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
+            v.push(u64::from_le_bytes(pk_buf));
         }
         PkColumn::U64s(v)
     } else {
@@ -901,7 +908,7 @@ mod tests {
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
             for &pk in &pks {
-                a.add_row(pk, 1).u128_val(pk as u64, (pk >> 64) as u64);
+                a.add_row(pk, 1).u128_val(pk);
             }
         }
         let encoded = encode_wal_block(&schema, 9, &batch);

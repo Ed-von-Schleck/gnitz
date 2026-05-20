@@ -570,10 +570,12 @@ pub unsafe extern "C" fn gnitz_delete(
     if pks_lo.is_null() || pks_hi.is_null() { set_error("null pk arrays"); return -1; }
     let lo = unsafe { std::slice::from_raw_parts(pks_lo, n_rows) };
     let hi = unsafe { std::slice::from_raw_parts(pks_hi, n_rows) };
-    let pks: Vec<u128> = lo.iter().copied().zip(hi.iter().copied())
-        .map(|(lo, hi)| lo as u128 | (hi as u128) << 64)
-        .collect();
-    match c.0.delete(table_id, &s.0, &pks) {
+    // C ABI is single-PK only; build the matching variant from the U128s.
+    let mut pk_col = gnitz_core::PkColumn::empty_for_schema(&s.0);
+    for (lo, hi) in lo.iter().copied().zip(hi.iter().copied()) {
+        pk_col.push_u128(lo as u128 | (hi as u128) << 64);
+    }
+    match c.0.delete(table_id, &s.0, pk_col) {
         Ok(()) => 0, Err(e) => { set_error(e); -1 }
     }
 }
@@ -951,7 +953,8 @@ pub unsafe extern "C" fn gnitz_seek(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    match c.0.seek(table_id, pk_lo as u128 | (pk_hi as u128) << 64) {
+    let pk_tuple = gnitz_core::PkTuple::from_u128_narrow(pk_lo as u128 | (pk_hi as u128) << 64);
+    match c.0.seek(table_id, &pk_tuple) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_cols: vec![0] });

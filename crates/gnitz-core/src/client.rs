@@ -1,5 +1,5 @@
 use lru::LruCache;
-use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
+use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, PkColumn, PkTuple, WireConflictMode};
 use crate::protocol::types::type_code_from_u64;
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
@@ -158,7 +158,7 @@ impl GnitzClient {
     pub fn seek(
         &mut self,
         table_id: u64,
-        pk:       u128,
+        pk:       &PkTuple,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
         self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
@@ -247,18 +247,37 @@ impl GnitzClient {
         Err(ClientError::ServerError(format!("index '{}' not found", index_name)))
     }
 
-    pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: &[u128]) -> Result<(), ClientError> {
-        let mut batch = ZSetBatch::new(schema);
-        {
-            let mut a = BatchAppender::new(&mut batch, schema);
-            let non_pk_count = schema.num_payload_cols();
-            for &pk in pks {
-                a.add_row(pk, -1);
-                for _ in 0..non_pk_count {
-                    a.zero_val();
+    pub fn delete(
+        &mut self,
+        table_id: u64,
+        schema:   &Schema,
+        pks:      PkColumn,
+    ) -> Result<(), ClientError> {
+        let count = pks.len();
+        if count == 0 { return Ok(()); }
+        // Bulk-fill payload columns directly. BatchAppender is single-PK only
+        // (its cursor mapping calls `pk_index_single`), so the delete path
+        // bypasses it. The server's `retract_pk` matches by PK alone, so the
+        // payload bytes are inert filler.
+        let columns: Vec<ColData> = schema.columns.iter().enumerate().map(|(ci, col)| {
+            if schema.is_pk_col(ci) {
+                ColData::Fixed(vec![])
+            } else {
+                match col.type_code {
+                    TypeCode::String                => ColData::Strings(vec![Some(String::new()); count]),
+                    TypeCode::Blob                  => ColData::Bytes  (vec![Some(Vec::new());     count]),
+                    TypeCode::U128 | TypeCode::UUID => ColData::U128s  (vec![0u128;                count]),
+                    _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
                 }
             }
-        }
+        }).collect();
+
+        let batch = ZSetBatch {
+            pks,
+            weights: vec![-1; count],
+            nulls:   vec![0;  count],
+            columns,
+        };
         self.conn.push(table_id, schema, &batch, &mut self.schema_cache)?;
         Ok(())
     }

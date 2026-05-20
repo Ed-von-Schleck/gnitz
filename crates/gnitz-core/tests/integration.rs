@@ -241,7 +241,9 @@ fn test_delete_rows() {
     client.push(tid, &table_schema, &batch).unwrap();
 
     // Delete middle row (pk=11)
-    client.delete(tid, &table_schema, &[11u128]).unwrap();
+    let mut del_pks = gnitz_core::PkColumn::empty_for_schema(&table_schema);
+    del_pks.push_u128(11u128);
+    client.delete(tid, &table_schema, del_pks).unwrap();
 
     let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
@@ -674,7 +676,9 @@ fn test_incremental_update() {
     assert_eq!(g2, 70, "tick1 group2 should be 70; got {}", g2);
 
     // Tick 2: retract pk=1 (group=1, val=10)
-    client.delete(tid, &table_schema, &[1u128]).unwrap();
+    let mut del_pks = gnitz_core::PkColumn::empty_for_schema(&table_schema);
+    del_pks.push_u128(1u128);
+    client.delete(tid, &table_schema, del_pks).unwrap();
 
     // Verify tick 2: group1=20, group2=70 (unchanged)
     let (_, data2, _) = client.scan(vid).unwrap();

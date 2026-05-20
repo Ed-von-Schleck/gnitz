@@ -1161,7 +1161,10 @@ impl PyGnitzClient {
         pks: Vec<u128>,
     ) -> PyResult<()> {
         let rust_schema = py_schema_to_rust(py, &schema)?;
-        client!(self).delete(target_id, &rust_schema, &pks)
+        // Python API is single-PK only; build the matching PkColumn from u128.
+        let mut pk_col = gnitz_core::PkColumn::empty_for_schema(&rust_schema);
+        for v in pks { pk_col.push_u128(v); }
+        client!(self).delete(target_id, &rust_schema, pk_col)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -1228,7 +1231,8 @@ impl PyGnitzClient {
 
     /// seek(table_id, pk) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek(&mut self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<PyObject> {
-        response_to_py_tuple(py, client!(self).seek(table_id, pk))
+        let pk_tuple = gnitz_core::PkTuple::from_u128_narrow(pk);
+        response_to_py_tuple(py, client!(self).seek(table_id, &pk_tuple))
     }
 
     // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
@@ -1240,7 +1244,8 @@ impl PyGnitzClient {
 
     /// seek_lazy(table_id, pk) -> ScanResult (native)
     pub fn seek_lazy(&mut self, py: Python<'_>, table_id: u64, pk: u128) -> PyResult<Py<PyScanResult>> {
-        response_to_lazy(py, client!(self).seek(table_id, pk))
+        let pk_tuple = gnitz_core::PkTuple::from_u128_narrow(pk);
+        response_to_lazy(py, client!(self).seek(table_id, &pk_tuple))
     }
 
     /// seek_by_index_lazy(table_id, col_idx, key) -> ScanResult (native)
@@ -1480,20 +1485,20 @@ impl PyCircuit {
 fn encode_push_payload(
     client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0u128, 0, Some(schema), Some(batch))
+    gnitz_core::encode_message(target_id, client_id, 0, 0u128, &[], 0, Some(schema), Some(batch))
 }
 
 fn encode_scan_payload(
     client_id: u64, target_id: u64,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0u128, 0, None, None)
+    gnitz_core::encode_message(target_id, client_id, 0, 0u128, &[], 0, None, None)
 }
 
 fn encode_seek_payload(
     client_id: u64, target_id: u64, pk: u128,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
     gnitz_core::encode_message(
-        target_id, client_id, gnitz_core::FLAG_SEEK, pk, 0, None, None,
+        target_id, client_id, gnitz_core::FLAG_SEEK, pk, &[], 0, None, None,
     )
 }
 

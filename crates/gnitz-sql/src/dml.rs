@@ -4,7 +4,7 @@ use sqlparser::ast::{
     FromTable, Assignment, AssignmentTarget,
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
-use gnitz_core::{Schema, ZSetBatch, ColData, TypeCode, WireConflictMode};
+use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::Binder;
@@ -124,7 +124,7 @@ pub fn execute_insert(
 
     for row in rows {
         let pk = extract_pk_value(row, &schema)?;
-        batch.pks.push_u128(pk);
+        batch.pks.push_tuple(&pk);
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
@@ -259,15 +259,16 @@ fn client_side_filter_do_nothing(
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(ZSetBatch, usize), GnitzSqlError> {
-    let mut seen_pks: std::collections::HashSet<u128> = std::collections::HashSet::new();
+    let stride = schema.pk_stride() as u8;
+    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks.get(i);
+        let pk = batch.pks.get_tuple(i, stride);
         // Intra-batch duplicate: drop everything after the first.
         if !seen_pks.insert(pk) { continue; }
         // Existing-store check.
-        let (_sch, found, _lsn) = client.seek(tid, pk)?;
+        let (_sch, found, _lsn) = client.seek(tid, &pk)?;
         let exists = matches!(found, Some(b) if !b.pks.is_empty());
         if exists { continue; }
         surviving_indices.push(i);
@@ -304,11 +305,12 @@ fn client_side_merge_do_update(
         asn_by_col[*ci] = Some(rhs);
     }
 
-    let mut seen_pks: std::collections::HashSet<u128> = std::collections::HashSet::new();
+    let stride = schema.pk_stride() as u8;
+    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut out = ZSetBatch::new(schema);
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks.get(i);
+        let pk = batch.pks.get_tuple(i, stride);
         if !seen_pks.insert(pk) {
             return Err(GnitzSqlError::Bind(
                 "ON CONFLICT DO UPDATE cannot affect row a second time \
@@ -316,7 +318,7 @@ fn client_side_merge_do_update(
             ));
         }
 
-        let (_sch, existing_opt, _lsn) = client.seek(tid, pk)?;
+        let (_sch, existing_opt, _lsn) = client.seek(tid, &pk)?;
         let existing = existing_opt.filter(|b| !b.pks.is_empty());
 
         match existing {
@@ -324,7 +326,7 @@ fn client_side_merge_do_update(
                 copy_batch_row(batch, i, &mut out, schema);
             }
             Some(existing_batch) => {
-                out.pks.push_u128(pk);
+                out.pks.push_from(&batch.pks, i);
                 out.weights.push(1);
 
                 // Start with the existing row's null bits; assignments
@@ -469,48 +471,78 @@ fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u
     }
 }
 
-/// Extract the primary key from a VALUES row, returning a u128.
-fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError> {
-    let pk_idx = schema.pk_index_single();
-    let pk_expr = row.get(pk_idx).ok_or_else(|| {
-        GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
-    })?;
-    let pk_tc = schema.columns[pk_idx].type_code;
-
+/// Parse one PK column literal at `pk_expr` into its packed u128 form.
+/// Routes through `parse_pk_literal_packed` (numerics) or `parse_uuid_str`
+/// (UUID); the returned u128's low `wire_stride` bytes carry the column's
+/// native LE bytes.
+fn parse_one_pk_literal(
+    pk_expr: &Expr,
+    tc: TypeCode,
+    col_name: &str,
+) -> Result<u128, GnitzSqlError> {
     let (pk_expr, negated) = match pk_expr {
         Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
         e => (e, false),
     };
-
     match pk_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Number(n, _) => {
-                parse_pk_literal_packed(pk_tc, n, negated).ok_or_else(|| {
-                    if negated && matches!(pk_tc,
+                parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
+                    if negated && matches!(tc,
                         TypeCode::U8 | TypeCode::U16 | TypeCode::U32
                         | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
                     ) {
                         GnitzSqlError::Bind(format!(
-                            "PK type {:?} does not accept negative literals", pk_tc))
+                            "PK column '{}' of type {:?} does not accept negative literals",
+                            col_name, tc))
                     } else {
                         let s_disp = if negated { format!("-{}", n) } else { n.clone() };
                         GnitzSqlError::Bind(format!(
-                            "PK value is not a valid {:?}: {}", pk_tc, s_disp))
+                            "PK column '{}' value is not a valid {:?}: {}",
+                            col_name, tc, s_disp))
                     }
                 })
             }
-            Value::SingleQuotedString(s) if pk_tc == TypeCode::UUID => {
+            Value::SingleQuotedString(s) if tc == TypeCode::UUID => {
                 if negated {
-                    return Err(GnitzSqlError::Bind(
-                        "PK type UUID does not accept negative literals".into()
-                    ));
+                    return Err(GnitzSqlError::Bind(format!(
+                        "PK column '{}' of type UUID does not accept negative literals",
+                        col_name
+                    )));
                 }
                 parse_uuid_str(s)
             }
-            _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
+            _ => Err(GnitzSqlError::Bind(format!(
+                "PK column '{}' value must be a numeric literal", col_name
+            ))),
         },
-        _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
+        _ => Err(GnitzSqlError::Bind(format!(
+            "PK column '{}' value must be a numeric literal", col_name
+        ))),
     }
+}
+
+/// Extract the primary key from a VALUES row as a `PkTuple`. Walks the PK
+/// columns in pk-list order, dispatches each through `parse_one_pk_literal`,
+/// and copies the column's native LE bytes into the tuple buffer.
+fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkTuple, GnitzSqlError> {
+    let stride = schema.pk_stride() as u8;
+    let mut tuple = PkTuple::new(stride);
+    let mut off = 0usize;
+    for &pi in schema.pk_indices() {
+        let pk_expr = row.get(pi).ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "PK column '{}' missing from INSERT row", schema.columns[pi].name
+            ))
+        })?;
+        let tc = schema.columns[pi].type_code;
+        let v = parse_one_pk_literal(pk_expr, tc, &schema.columns[pi].name)?;
+        let w = tc.wire_stride();
+        tuple.buf[off..off + w].copy_from_slice(&v.to_le_bytes()[..w]);
+        off += w;
+    }
+    debug_assert_eq!(off, stride as usize);
+    Ok(tuple)
 }
 
 fn is_null_expr(expr: &Expr) -> bool {
@@ -637,7 +669,7 @@ pub fn execute_select(
     // Check WHERE clause
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
         if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
-            client.seek(tid, pk)?
+            client.seek(tid, &pk)?
         } else if let Some((col_idx, key, residual)) =
             try_extract_index_seek(client, where_expr, &schema, binder, tid, false)?
         {
@@ -685,10 +717,51 @@ fn extract_limit(query: &Query) -> Option<usize> {
     }
 }
 
-/// Returns Some(pk) if the expression is `pk_col = literal`, else None.
-fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<u128> {
-    let (col_idx, key) = try_col_eq_literal(expr, schema)?;
-    if schema.is_pk_col(col_idx) { Some(key) } else { None }
+/// Returns `Some(PkTuple)` when `expr` binds every PK column of `schema`
+/// to a literal via an `AND`-chain (or a single equality for a single-PK
+/// schema). Returns `None` otherwise. The AND-walk binds each PK column at
+/// most once and only when no non-PK column appears in the chain.
+fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<PkTuple> {
+    let stride = schema.pk_stride() as u8;
+    let mut tuple = PkTuple::new(stride);
+    let mut slot_set = [false; gnitz_core::MAX_PK_COLUMNS];
+    let mut bound = 0usize;
+
+    let ok = walk_and_tree(expr, schema, &mut |col_idx, val| -> bool {
+        // Single scan over pk_indices: locate pk_pos and sum preceding strides
+        // for the byte offset in one pass (vs. position() + pk_byte_offset()).
+        let mut pk_pos: Option<usize> = None;
+        let mut off = 0usize;
+        for (i, &pi) in schema.pk_indices().iter().enumerate() {
+            if pi == col_idx { pk_pos = Some(i); break; }
+            off += schema.columns[pi].type_code.wire_stride();
+        }
+        let pk_pos = match pk_pos { Some(p) => p, None => return false };
+        if slot_set[pk_pos] { return false; }
+        slot_set[pk_pos] = true;
+        bound += 1;
+        let stride = schema.columns[col_idx].type_code.wire_stride();
+        tuple.buf[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
+        true
+    });
+
+    if ok && bound == schema.pk_count() { Some(tuple) } else { None }
+}
+
+fn walk_and_tree(
+    expr:   &Expr,
+    schema: &Schema,
+    f:      &mut impl FnMut(usize, u128) -> bool,
+) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            walk_and_tree(left, schema, f) && walk_and_tree(right, schema, f)
+        }
+        _ => match try_col_eq_literal(expr, schema) {
+            Some((col_idx, val)) => f(col_idx, val),
+            None                 => false,
+        },
+    }
 }
 
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
@@ -818,6 +891,25 @@ fn apply_residual_filter(
 
 enum ColumnValue { Int(i64), #[allow(dead_code)] Float(f64), Str(String), Null }
 
+/// Decode the native LE bytes of a PK column into an i64. F32/F64/U128/UUID
+/// don't fit through the i64 return shape and are rejected.
+fn decode_pk_bytes_to_i64(tc: TypeCode, slice: &[u8]) -> Result<i64, GnitzSqlError> {
+    Ok(match tc {
+        TypeCode::I8  => slice[0] as i8 as i64,
+        TypeCode::U8  => slice[0] as i64,
+        TypeCode::I16 => i16::from_le_bytes(slice[..2].try_into().unwrap()) as i64,
+        TypeCode::U16 => u16::from_le_bytes(slice[..2].try_into().unwrap()) as i64,
+        TypeCode::I32 => i32::from_le_bytes(slice[..4].try_into().unwrap()) as i64,
+        TypeCode::U32 => u32::from_le_bytes(slice[..4].try_into().unwrap()) as i64,
+        TypeCode::I64 => i64::from_le_bytes(slice[..8].try_into().unwrap()),
+        TypeCode::U64 => u64::from_le_bytes(slice[..8].try_into().unwrap()) as i64,
+        _ => return Err(GnitzSqlError::Unsupported(format!(
+            "residual filter on PK column of type {:?} not supported; \
+             use `pk = literal` to seek instead", tc
+        ))),
+    })
+}
+
 fn eval_pred_row(
     pred:   &BoundExpr,
     batch:  &ZSetBatch,
@@ -845,29 +937,24 @@ fn eval_expr(
             let col_def = &schema.columns[*c];
             // The PK column's slot in `batch.columns` is `Fixed(vec![])`
             // (placeholder set by ZSetBatch::new). The PK value lives in
-            // `batch.pks` as u128 regardless of stride; decode it under the
-            // column's declared signedness so a residual filter like
-            // `WHERE id > 5` against a signed PK reads the right sign.
-            // F32/F64/U128/UUID don't fit through the i64 return shape —
-            // reject explicitly rather than reinterpret bits.
+            // `batch.pks`; decode the bytes for column `*c` under the
+            // column's declared signedness. F32/F64/U128/UUID don't fit
+            // through the i64 return shape — reject explicitly.
             if schema.is_pk_col(*c) {
-                let pk = batch.pks.get(i);
-                let v: i64 = match col_def.type_code {
-                    TypeCode::I8  => pk as i8  as i64,
-                    TypeCode::I16 => pk as i16 as i64,
-                    TypeCode::I32 => pk as i32 as i64,
-                    TypeCode::I64 => pk as i64,
-                    TypeCode::U8  => pk as u8  as i64,
-                    TypeCode::U16 => pk as u16 as i64,
-                    TypeCode::U32 => pk as u32 as i64,
-                    TypeCode::U64 => pk as u64 as i64,
-                    _ => return Err(GnitzSqlError::Unsupported(format!(
-                        "residual filter on PK column of type {:?} not supported; \
-                         use `pk = literal` to seek instead",
-                        col_def.type_code
-                    ))),
-                };
-                return Ok(Some(v));
+                let stride = col_def.type_code.wire_stride();
+                match &batch.pks {
+                    PkColumn::Bytes { stride: s, buf } => {
+                        let s   = *s as usize;
+                        let off = schema.pk_byte_offset(*c);
+                        let slice = &buf[i * s + off .. i * s + off + stride];
+                        return decode_pk_bytes_to_i64(col_def.type_code, slice).map(Some);
+                    }
+                    _ => {
+                        let bytes = batch.pks.get(i).to_le_bytes();
+                        return decode_pk_bytes_to_i64(col_def.type_code, &bytes[..stride])
+                            .map(Some);
+                    }
+                }
             }
             // Payload column: check the null bitmap first.
             let payload_idx = schema.payload_idx(*c);
@@ -976,7 +1063,7 @@ fn eval_expr(
 }
 
 fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
-    dst.pks.push_u128(src.pks.get(i));
+    dst.pks.push_from(&src.pks, i);
     dst.weights.push(src.weights[i]);
     dst.nulls.push(src.nulls[i]);
     for (_pi, ci, col_def) in schema.payload_columns() {
@@ -1179,7 +1266,7 @@ fn write_set_columns(
     schema:      &Schema,
     dst:         &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    dst.pks.push_u128(current.pks.get(row_idx));
+    dst.pks.push_from(&current.pks, row_idx);
     dst.weights.push(1);
     // Start with the existing row's null bits; each assignment updates only
     // its own column's bit (set for a NULL result, clear for non-NULL).
@@ -1211,13 +1298,15 @@ fn write_set_columns(
 }
 
 fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
+    // Compound PK has no IN-list fast path; fall back to a full delta scan.
+    if schema.pk_count() != 1 { return None; }
     if let Expr::InList { expr: col_expr, list, negated, .. } = expr {
         if *negated { return None; }
         let col_name = match col_expr.as_ref() {
             Expr::Identifier(id) => &id.value,
             _ => return None,
         };
-        let pk_col = &schema.columns[schema.pk_index_single()];
+        let pk_col = &schema.columns[schema.pk_indices()[0]];
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
@@ -1282,8 +1371,8 @@ pub fn execute_update(
 
     if let Some(where_expr) = selection {
         // Path 1: PK equality
-        if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
-            let (schema_opt, batch_opt, _) = client.seek(table_id, pk)?;
+        if let Some(pk_tuple) = try_extract_pk_seek(where_expr, &schema) {
+            let (schema_opt, batch_opt, _) = client.seek(table_id, &pk_tuple)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -1395,24 +1484,30 @@ pub fn execute_delete(
             };
             let n = batch.pks.len();
             if n == 0 { return Ok(SqlResult::RowsAffected { count: 0 }); }
-            client.delete(table_id, actual_schema, &batch.pks.to_vec_u128())?;
+            client.delete(table_id, actual_schema, batch.pks)?;
             Ok(SqlResult::RowsAffected { count: n })
         }
         Some(where_expr) => {
             // Path 1: PK equality — seek first for accurate count
             if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
-                let (schema_opt, batch_opt, _) = client.seek(table_id, pk)?;
+                let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let exists = batch_opt.is_some_and(|b| !b.pks.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
-                client.delete(table_id, actual_schema, &[pk])?;
+                let pks = PkColumn::one_row(actual_schema, &pk);
+                client.delete(table_id, actual_schema, pks)?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
-            // Path 2: PK IN list
+            // Path 2: PK IN list (single-PK only; try_extract_pk_in returns
+            // None for compound PK, so we never reach the push_u128 path).
             if let Some(pks) = try_extract_pk_in(where_expr, &schema) {
                 let n = pks.len();
-                if n > 0 { client.delete(table_id, &schema, &pks)?; }
+                if n > 0 {
+                    let mut pk_col = PkColumn::empty_for_schema(&schema);
+                    for v in pks { pk_col.push_u128(v); }
+                    client.delete(table_id, &schema, pk_col)?;
+                }
                 return Ok(SqlResult::RowsAffected { count: n });
             }
 
@@ -1433,7 +1528,9 @@ pub fn execute_delete(
                         return Ok(SqlResult::RowsAffected { count: 0 });
                     }
                 }
-                client.delete(table_id, actual_schema, &[batch.pks.get(0)])?;
+                let mut one_pk = PkColumn::empty_for_schema(actual_schema);
+                one_pk.push_from(&batch.pks, 0);
+                client.delete(table_id, actual_schema, one_pk)?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
@@ -1441,16 +1538,17 @@ pub fn execute_delete(
             let pred = binder.bind_expr(where_expr, &schema)?;
             let (schema_opt, batch_opt, _) = client.scan(table_id)?;
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
-            let mut pks: Vec<u128> = Vec::new();
+            let mut out_pks = PkColumn::empty_for_schema(actual_schema);
+            let mut n = 0usize;
             if let Some(ref scan_batch) = batch_opt {
                 for i in 0..scan_batch.pks.len() {
                     if eval_pred_row(&pred, scan_batch, i, actual_schema)? {
-                        pks.push(scan_batch.pks.get(i));
+                        out_pks.push_from(&scan_batch.pks, i);
+                        n += 1;
                     }
                 }
             }
-            let n = pks.len();
-            if n > 0 { client.delete(table_id, actual_schema, &pks)?; }
+            if n > 0 { client.delete(table_id, actual_schema, out_pks)?; }
             Ok(SqlResult::RowsAffected { count: n })
         }
     }
@@ -1721,7 +1819,8 @@ mod tests {
         let schema = uuid_schema_pk();
         let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
         let pk = super::extract_pk_value(&row, &schema).unwrap();
-        assert_eq!(pk, 0x550e8400_e29b_41d4_a716_446655440000_u128);
+        // UUID PK has stride 16; the parsed u128 lives in the low 16 bytes.
+        assert_eq!(pk.to_u128_narrow(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
     }
 
     #[test]
@@ -1894,7 +1993,7 @@ mod tests {
         let row = vec![literal.clone(), num_expr("0")];
         let got_insert = super::extract_pk_value(&row, &schema)
             .unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-        assert_eq!(got_insert, expected, "extract_pk_value");
+        assert_eq!(got_insert.to_u128_narrow(), expected, "extract_pk_value");
 
         // 2. try_col_eq_literal (WHERE pk = literal).
         let where_expr = eq_expr("id", literal.clone());
@@ -2047,5 +2146,192 @@ mod tests {
         let err = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema)
             .expect_err("F64 PK must return Unsupported");
         assert!(err.to_string().contains("residual filter on PK"), "error: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Compound PK — every per-row byte path on a pk_count >= 2 schema.
+    // ------------------------------------------------------------------
+
+    fn compound_schema_u64_u64() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("a", TypeCode::U64, false),
+                col_def("b", TypeCode::U64, false),
+                col_def("v", TypeCode::I64, true),
+            ],
+            pk_cols: vec![0, 1],
+        }
+    }
+
+    fn compound_schema_u64_u64_u128() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("a", TypeCode::U64,  false),
+                col_def("b", TypeCode::U64,  false),
+                col_def("c", TypeCode::U128, false),
+                col_def("v", TypeCode::I64,  true),
+            ],
+            pk_cols: vec![0, 1, 2],
+        }
+    }
+
+    #[test]
+    fn compound_pk_extract_pk_value_packs_le_bytes() {
+        let schema = compound_schema_u64_u64();
+        let row = vec![num_expr("1"), num_expr("2"), num_expr("99")];
+        let pk = super::extract_pk_value(&row, &schema).unwrap();
+        assert_eq!(pk.stride, 16);
+        let mut expect = [0u8; 16];
+        expect[0..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_extract_pk_value_wide_region() {
+        let schema = compound_schema_u64_u64_u128();
+        let row = vec![num_expr("1"), num_expr("2"), num_expr("3"), num_expr("99")];
+        let pk = super::extract_pk_value(&row, &schema).unwrap();
+        // pk_stride = 8 + 8 + 16 = 32 → wide-region path.
+        assert_eq!(pk.stride, 32);
+        let mut expect = [0u8; 32];
+        expect[0..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        expect[16..32].copy_from_slice(&3u128.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_full_binding() {
+        let schema = compound_schema_u64_u64();
+        // (a = 1) AND (b = 2) → full bind
+        let expr = Expr::BinaryOp {
+            left: Box::new(eq_expr("a", num_expr("1"))),
+            op:   BinaryOperator::And,
+            right: Box::new(eq_expr("b", num_expr("2"))),
+        };
+        let pk = super::try_extract_pk_seek(&expr, &schema).expect("must bind");
+        assert_eq!(pk.stride, 16);
+        let mut expect = [0u8; 16];
+        expect[..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_reordered_and_tree() {
+        let schema = compound_schema_u64_u64();
+        // (b = 2) AND (a = 1) — order swapped; tuple must still pack in
+        // pk-list order, not source order.
+        let expr = Expr::BinaryOp {
+            left:  Box::new(eq_expr("b", num_expr("2"))),
+            op:    BinaryOperator::And,
+            right: Box::new(eq_expr("a", num_expr("1"))),
+        };
+        let pk = super::try_extract_pk_seek(&expr, &schema).expect("must bind");
+        let mut expect = [0u8; 16];
+        expect[..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_partial_returns_none() {
+        let schema = compound_schema_u64_u64();
+        let expr = eq_expr("a", num_expr("1"));   // only one of two PK cols
+        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_non_pk_in_chain_returns_none() {
+        let schema = compound_schema_u64_u64();
+        // (a = 1) AND (v = 9) — `v` is a payload column.
+        let expr = Expr::BinaryOp {
+            left: Box::new(eq_expr("a", num_expr("1"))),
+            op:   BinaryOperator::And,
+            right: Box::new(eq_expr("v", num_expr("9"))),
+        };
+        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_duplicate_binding_returns_none() {
+        let schema = compound_schema_u64_u64();
+        // (a = 1) AND (a = 2) — duplicate binding of column 0.
+        let expr = Expr::BinaryOp {
+            left: Box::new(eq_expr("a", num_expr("1"))),
+            op:   BinaryOperator::And,
+            right: Box::new(eq_expr("a", num_expr("2"))),
+        };
+        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_in_returns_none() {
+        let schema = compound_schema_u64_u64();
+        let expr = in_list_expr("a", vec![num_expr("1"), num_expr("2")]);
+        assert!(super::try_extract_pk_in(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_zset_batch_new_uses_bytes_variant() {
+        let schema = compound_schema_u64_u64();
+        let batch = ZSetBatch::new(&schema);
+        match &batch.pks {
+            gnitz_core::PkColumn::Bytes { stride, buf } => {
+                assert_eq!(*stride, 16);
+                assert!(buf.is_empty());
+            }
+            other => panic!("expected PkColumn::Bytes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compound_pk_eval_expr_pk_colref_reads_byte_region() {
+        let schema = compound_schema_u64_u64();
+        // Build a one-row Bytes batch: pk = (a=7, b=9), v = 42.
+        let mut batch = ZSetBatch::new(&schema);
+        let mut pk_bytes = [0u8; 16];
+        pk_bytes[..8].copy_from_slice(&7u64.to_le_bytes());
+        pk_bytes[8..16].copy_from_slice(&9u64.to_le_bytes());
+        batch.pks.push_bytes(&pk_bytes);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[2] {
+            buf.extend_from_slice(&42i64.to_le_bytes());
+        }
+        // Read column 0 (a) and column 1 (b) through eval_expr.
+        let a = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(a, Some(7));
+        let b = super::eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap();
+        assert_eq!(b, Some(9));
+        // Payload column still works.
+        let v = super::eval_expr(&BoundExpr::ColRef(2), &batch, 0, &schema).unwrap();
+        assert_eq!(v, Some(42));
+    }
+
+    #[test]
+    fn compound_pk_copy_batch_row_preserves_compound_pk() {
+        let schema = compound_schema_u64_u64();
+        let mut src = ZSetBatch::new(&schema);
+        let mut pk_bytes = [0u8; 16];
+        pk_bytes[..8].copy_from_slice(&11u64.to_le_bytes());
+        pk_bytes[8..16].copy_from_slice(&22u64.to_le_bytes());
+        src.pks.push_bytes(&pk_bytes);
+        src.weights.push(1);
+        src.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut src.columns[2] {
+            buf.extend_from_slice(&5i64.to_le_bytes());
+        }
+
+        let mut dst = ZSetBatch::new(&schema);
+        super::copy_batch_row(&src, 0, &mut dst, &schema);
+        assert_eq!(dst.pks.len(), 1);
+        match &dst.pks {
+            gnitz_core::PkColumn::Bytes { stride: 16, buf } => {
+                assert_eq!(buf, &pk_bytes.to_vec());
+            }
+            _ => panic!("expected Bytes variant after copy"),
+        }
     }
 }

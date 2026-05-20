@@ -1143,7 +1143,7 @@ mod tests {
 
         for &(status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg) in cases {
             let header = Header { status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id };
-            let client_bytes = encode_control_block(&header, error_msg)
+            let client_bytes = encode_control_block(&header, error_msg, &[])
                 .expect("encode_control_block failed");
 
             let mut engine_buf = vec![0u8; client_bytes.len() + 64];

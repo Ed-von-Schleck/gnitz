@@ -736,6 +736,19 @@ pub const META_FLAG_IS_PK:    u64 = 2;
 /// with one bit per nullable payload column, so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
 
+/// Sizing cap for the compound-PK column list.
+///
+/// Set to 5 to cover the user-facing PK cap (4 columns, planner-enforced)
+/// plus one indexed-column prefix used by secondary index schemas — modeled
+/// as `(indexed_col, src_pk_0, …, src_pk_{k-1})`.
+pub const MAX_PK_COLUMNS: usize = 5;
+
+/// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
+/// and the per-column ceiling (16 == max wire stride of any type valid as a
+/// PK column — U128, UUID; STRING and BLOB are rejected by schema
+/// validation). Auto-tracks growth of `MAX_PK_COLUMNS`.
+pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
+
 // ---------------------------------------------------------------------------
 // WAL header constants
 // ---------------------------------------------------------------------------

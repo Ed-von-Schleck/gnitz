@@ -7,7 +7,8 @@ pub mod message;
 pub mod wal_block;
 
 pub use error::ProtocolError;
-pub use types::{TypeCode, ColumnDef, PkColumn, Schema, ColData, ZSetBatch, BatchAppender, meta_schema};
+pub use types::{TypeCode, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
+    MAX_PK_BYTES, MAX_PK_COLUMNS};
 pub use header::{
     Header,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,

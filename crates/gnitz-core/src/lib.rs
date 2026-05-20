@@ -18,7 +18,8 @@ pub use connection::{
 pub use client::GnitzClient;
 pub use protocol::{
     ProtocolError,
-    TypeCode, ColumnDef, PkColumn, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
+    TypeCode, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
+    MAX_PK_BYTES, MAX_PK_COLUMNS,
     Header,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,
     FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK, FLAG_SEEK,

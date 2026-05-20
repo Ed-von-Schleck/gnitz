@@ -1,16 +1,20 @@
 # Compound primary keys
 
-Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today every table is required
-to have exactly one PK column.
+Enable `PRIMARY KEY (a, b, ...)` in GnitzDB. Today the SQL planner still
+rejects every multi-column PK; the storage, wire-protocol, schema, and
+reduce slow paths already accept compound PKs end-to-end (see
+`pk_stride`, `pk_indices`, `pk_columns`, `compare_pk_bytes`,
+`PkColumn::Bytes`).
 
-What remains is every boundary that still calls
-`SchemaDescriptor::pk_index_single()` — `ops/index.rs`, the master
-index-routing cache + PK-render helper, `gnitz-sql`, `gnitz-core`'s
-wire `Schema`, `gnitz-py`, `gnitz-capi`, and the
-`catalog/validation.rs` FK type-resolution site. Each
-`pk_index_single()` call `assert!`s `pk_count == 1` in release; that
-assertion is the canary that fires the day a compound PK reaches an
-unmigrated boundary.
+What remains is every SQL- and boundary-layer site that still calls
+`SchemaDescriptor::pk_index_single()` — `gnitz-sql` (`planner.rs`,
+`dml.rs`), `gnitz-core`'s wire `Schema` (`ZSetBatch::new`, control-block
+encoder), `gnitz-py`, `gnitz-capi`, `ops/index.rs`, the master
+index-routing cache + PK-render helper, and the
+`catalog/validation.rs:22` / `catalog/hooks.rs:297` FK / secondary-index
+sites. Each `pk_index_single()` call `assert!`s `pk_count == 1` in
+release; that assertion is the canary that fires the day a compound PK
+reaches an unmigrated boundary.
 
 **Design choice — Concat.** The PK region in the physical batch / WAL
 block / shard file holds the concatenated raw PK column bytes, one row
@@ -29,10 +33,10 @@ In:
 - `PRIMARY KEY (a, b, ...)` in CREATE TABLE, up to 4 columns
   (planner-enforced; the internal `MAX_PK_COLUMNS = 5` slot is
   reserved for secondary-index tables — see Vocabulary).
-- PK columns of any currently-allowed PK type (U64, U128, UUID). Mixed
-  types within one compound PK allowed. Total `pk_stride ≤ 64` for
-  user tables (`≤ MAX_PK_BYTES = 80` once secondary-index tables are
-  factored in).
+- PK columns of any currently-allowed PK type (any native unsigned or
+  signed scalar, F32/F64, U128, UUID). Mixed types within one compound
+  PK allowed. Total `pk_stride ≤ 64` for user tables
+  (`≤ MAX_PK_BYTES = 80` once secondary-index tables are factored in).
 - INSERT, ON CONFLICT, UPDATE/DELETE point lookups extended to bind
   the full PK tuple.
 - FOREIGN KEY: a single-column FK referencing one column of a compound
@@ -52,9 +56,10 @@ Out:
 - Wide-stride (`pk_stride > 16`) compound PK reduce. The reduce
   slow-path cursors (`trace_out`, `trace_in`, AVI/GI) still use
   `ReadCursor::seek(u128)`; lifting them to `seek_bytes` is a
-  follow-on. The planner caps reduce/GROUP BY on compound PK at
-  `pk_stride ∈ {8, 16}`; point lookups, scans, and DML on wider
-  compound PKs are not subject to this cap.
+  follow-on (see `plans/wide-pk-trace-cursor.md`). The planner caps
+  reduce/GROUP BY on compound PK at `pk_stride ∈ {8, 16}`; point
+  lookups, scans, and DML on wider compound PKs are not subject to
+  this cap.
 
 ## Vocabulary
 
@@ -88,15 +93,11 @@ Out:
 
 ---
 
-## The change, layer by layer
+## What remains, layer by layer
 
 System tables stay single-PK throughout; `make_schema(cols, pk_index)`
 continues to wrap a single index. The catalog's in-memory cache and
-`BatchBuilder` already carry the full PK column list (`pk_col_of:
-FxHashMap<i64, PkColList>`, `BatchBuilder::physical_col_idx` →
-`schema.payload_col_idx`). The remaining catalog touchpoints —
-`validation.rs:22` and `hooks.rs:297` — are owned by the FK and
-Operators/Index sections below.
+`BatchBuilder` already carry the full PK column list.
 
 ### 1. SQL planner (`gnitz-sql/src/planner.rs`)
 
@@ -108,13 +109,6 @@ CREATE TABLE:
   with a table-level `PRIMARY KEY (...)` (generalise the existing
   multi-PK message).
 - Inline single-column PK: unchanged.
-- PK type coercion: drop the I*/U*→U64 coercion entirely. Each PK
-  column retains its declared scalar type; `compare_pk_bytes` reads
-  each column's `type_code` and runs the right signed/unsigned/float
-  compare. With the comparator already signed-aware, dropping the
-  coercion is what makes native signed PKs (I8/I16/I32/I64) sort in
-  signed numerical order end-to-end. Validation still enforces
-  `is_pk_eligible(type_code)` and non-nullable for every PK column.
 - `client.create_table` call: pass `&pk_cols[..]`. Update
   `gnitz-core/src/client.rs` signature (currently
   `pk_col_idx: usize`).
@@ -122,7 +116,7 @@ CREATE TABLE:
   `pk_indices()` walk. View output schema carries the source's PK
   column list verbatim.
 
-FK:
+FK (the loose end on a compound-PK *parent*):
 
 - `resolve_fk_target` currently returns `(tid, pk_index, pk_type)` for
   the parent's single PK. For compound-PK parents, resolve the FK's
@@ -342,36 +336,38 @@ UNIQUE index); read the type directly from
   is consistent across workers (regression test for the
   `hash_row_by_columns` invariant in dev-guide.md).
 
-### Native signed PK
-
-Drop-the-coercion regression: tables with `I8`/`I16`/`I32`/`I64` PK
-columns, mixed positive and negative values, scan, verify ascending
-order matches signed numerical order (`-128 < -1 < 0 < 127`).
-Single-column and compound. Multi-worker — partition routing on a
-signed value must hash identically to its `as i64` form regardless of
-the producing worker.
-
 ---
 
 ## Rollout
 
 Order of merging (each step keeps the test suite green):
 
-1. **SQL planner.** Accept `PRIMARY KEY (a, b, ...)`; drop the
-   I*/U*→U64 PK coercion; enforce the compound-PK admission rule at
-   plan build (reduce/GROUP BY on compound PK requires
-   `pk_stride ∈ {8, 16}`). From this commit, CREATE TABLE allows
-   compound PK and native signed PK types — the feature becomes
-   user-visible here.
-2. **DML.** `extract_pk_value` returns a byte tuple;
-   `try_extract_pk_seek` requires full-tuple binding.
+1. **DML compound-PK byte paths.** `extract_pk_value` /
+   `try_extract_pk_seek` / `try_col_eq_literal` return PK byte
+   tuples; `client_side_*` dedup sets carry the full key; ZSetBatch
+   construction routes to `PkColumn::Bytes` for `pk_count >= 2`;
+   client-side wire `encode_control_block` and `client.seek` thread
+   `seek_pk_extra` through to the server. No user-visible feature —
+   planner still rejects compound PK — but the engine can now drive
+   INSERT, ON CONFLICT, and point-lookup end-to-end against a
+   hypothetical compound-PK table.
+2. **SQL planner gate flip.** Accept `PRIMARY KEY (a, b, ...)` in
+   CREATE TABLE; enforce the compound-PK admission rule at plan build
+   (reduce/GROUP BY on compound PK requires `pk_stride ∈ {8, 16}`);
+   reject CREATE INDEX on a compound-PK table and FK with a
+   compound-PK parent (covered by steps 3 and 4 below). From this
+   commit, CREATE TABLE allows compound PK — the feature becomes
+   user-visible.
 3. **Operators.** Index/GI/AVI reshape (secondary-index table becomes
    a compound-PK table); index seek becomes prefix-scan; master
-   index-routing cache key carries the full PK.
+   index-routing cache key carries the full PK. Lift the planner
+   rejection of CREATE INDEX on a compound-PK table.
 4. **FK stricter rule.** Reject single-column FK to a compound-PK
    parent unless the referenced column has its own UNIQUE index;
-   migrate the catalog FK type-resolution sites.
+   migrate `catalog/validation.rs:22` and the planner's FK
+   type-resolution sites. Lift the planner rejection of FK to a
+   compound-PK parent.
 5. **Python/CAPI.** `pk_index` → `pk_indices`.
 
-Each step is independently mergeable; the feature only becomes
-user-visible at step 1.
+Each step is independently mergeable; the feature becomes user-visible
+at step 2.

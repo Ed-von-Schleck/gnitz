@@ -10,6 +10,7 @@ pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::TypeCode;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub use gnitz_wire::MAX_COLUMNS;
+pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 // ---------------------------------------------------------------------------
 // Schema descriptor
@@ -36,23 +37,6 @@ impl SchemaColumn {
         self.size
     }
 }
-
-/// Sizing cap for the compound-PK column list carried in `SchemaDescriptor`.
-/// Engine-internal: callers materialise `pk_indices` as a stack-resident
-/// fixed array, but only the first `pk_count` entries are valid.
-///
-/// Set to 5 to cover the user-facing PK cap (4 columns, planner-enforced)
-/// plus one indexed-column prefix used by secondary index schemas — modeled
-/// as `(indexed_col, src_pk_0, …, src_pk_{k-1})`. Today every schema built
-/// from the planner has `pk_count == 1`, but the representation accepts
-/// up to `MAX_PK_COLUMNS` entries.
-pub const MAX_PK_COLUMNS: usize = 5;
-
-/// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
-/// and the per-column ceiling (16 == max `wire_stride` of any type valid
-/// as a PK column — U128, UUID; STRING and BLOB are rejected by
-/// `SchemaDescriptor::new`). Auto-tracks growth of `MAX_PK_COLUMNS`.
-pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 
 /// Widest PK region that still fits in a packed `u128` word. At or below
 /// this width the order-agnostic byte paths keep the PK in a `u128`

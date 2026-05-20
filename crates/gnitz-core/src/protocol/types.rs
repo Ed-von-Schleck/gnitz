@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 use super::error::ProtocolError;
 
 pub use gnitz_wire::TypeCode;
+pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
 /// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
@@ -78,6 +79,18 @@ impl Schema {
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
         self.pk_indices().contains(&ci)
+    }
+
+    /// Byte offset of PK column `col_idx` within the packed PK region.
+    /// Mirrors the engine `SchemaDescriptor::pk_byte_offset` helper.
+    #[inline]
+    pub fn pk_byte_offset(&self, col_idx: usize) -> usize {
+        debug_assert!(self.is_pk_col(col_idx));
+        self.pk_cols
+            .iter()
+            .take_while(|&&pi| pi != col_idx)
+            .map(|&pi| self.columns[pi].type_code.wire_stride())
+            .sum()
     }
 
     /// Map a logical column index to its dense payload index. Caller must
@@ -239,6 +252,165 @@ impl PkColumn {
             PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
         }
     }
+
+    /// Empty `PkColumn` matching `schema`'s PK layout. Single source of
+    /// truth for the variant choice; `ZSetBatch::new`, `GnitzClient::delete`,
+    /// and the SQL DML helpers all route through this.
+    pub fn empty_for_schema(schema: &Schema) -> Self {
+        if schema.pk_count() >= 2 {
+            PkColumn::Bytes { stride: schema.pk_stride() as u8, buf: vec![] }
+        } else {
+            PkColumn::for_type(schema.columns[schema.pk_indices()[0]].type_code)
+        }
+    }
+
+    /// Read row `i` into a `PkTuple`.
+    pub fn get_tuple(&self, i: usize, stride: u8) -> PkTuple {
+        let mut t = PkTuple::new(stride);
+        match self {
+            PkColumn::U64s(v) => t.buf[..8].copy_from_slice(&v[i].to_le_bytes()),
+            PkColumn::U128s(v) => t.buf[..16].copy_from_slice(&v[i].to_le_bytes()),
+            PkColumn::Bytes { stride: s, buf } => {
+                let s = *s as usize;
+                debug_assert_eq!(s, stride as usize);
+                t.buf[..s].copy_from_slice(&buf[i * s..(i + 1) * s]);
+            }
+        }
+        t
+    }
+
+    /// Append the row at `src[i]` to `self`. Variants must match.
+    pub fn push_from(&mut self, src: &PkColumn, i: usize) {
+        match (self, src) {
+            (PkColumn::U64s(d), PkColumn::U64s(s)) => d.push(s[i]),
+            (PkColumn::U128s(d), PkColumn::U128s(s)) => d.push(s[i]),
+            (
+                PkColumn::Bytes { stride: sd, buf: d },
+                PkColumn::Bytes { stride: ss, buf: s },
+            ) => {
+                debug_assert_eq!(*sd, *ss);
+                let w = *sd as usize;
+                d.extend_from_slice(&s[i * w..(i + 1) * w]);
+            }
+            _ => unreachable!("push_from: pk variant mismatch"),
+        }
+    }
+
+    /// Append `pk`'s bytes to `self`, dispatching on variant. Hides the
+    /// `Bytes`-vs-scalar choice from DML callers.
+    pub fn push_tuple(&mut self, pk: &PkTuple) {
+        let s = pk.stride as usize;
+        match self {
+            PkColumn::U64s(v) => {
+                debug_assert!(s <= 8);
+                let mut b = [0u8; 8];
+                b[..s].copy_from_slice(&pk.buf[..s]);
+                v.push(u64::from_le_bytes(b));
+            }
+            PkColumn::U128s(v) => {
+                debug_assert!(s <= 16);
+                let mut b = [0u8; 16];
+                b[..s].copy_from_slice(&pk.buf[..s]);
+                v.push(u128::from_le_bytes(b));
+            }
+            PkColumn::Bytes { stride, buf } => {
+                debug_assert_eq!(*stride as usize, s);
+                buf.extend_from_slice(&pk.buf[..s]);
+            }
+        }
+    }
+
+    /// One-row column matching `schema`'s PK layout, initialized with
+    /// `pk`'s bytes.
+    pub fn one_row(schema: &Schema, pk: &PkTuple) -> Self {
+        let mut col = Self::empty_for_schema(schema);
+        col.push_tuple(pk);
+        col
+    }
+}
+
+/// SQL→client carrier for one row's PK. Carries `(stride, bytes)` so callers
+/// above the wire codec do not need to handle the `(seek_pk: u128 +
+/// seek_pk_extra: BLOB)` wire-level split.
+#[derive(Clone, Copy)]
+pub struct PkTuple {
+    pub stride: u8,
+    pub buf:    [u8; MAX_PK_BYTES],
+}
+
+impl PkTuple {
+    pub fn new(stride: u8) -> Self {
+        debug_assert!(stride as usize <= MAX_PK_BYTES);
+        Self { stride, buf: [0u8; MAX_PK_BYTES] }
+    }
+
+    /// Construct from a u128 whose low `stride` bytes carry the column's
+    /// native LE bytes (as produced by `parse_pk_literal_packed`). Copies
+    /// only `stride` bytes so callers cannot pollute the high padding.
+    pub fn from_u128(stride: u8, v: u128) -> Self {
+        debug_assert!(stride as usize <= 16);
+        let s = stride as usize;
+        let mut t = Self::new(stride);
+        t.buf[..s].copy_from_slice(&v.to_le_bytes()[..s]);
+        t
+    }
+
+    /// FFI-boundary constructor: build a tuple from a u128 with the full
+    /// 16-byte narrow stride, without a schema lookup. The server reads
+    /// only the column's actual stride; the high padding bytes (if any)
+    /// are inert. Used by C and Python seek shims.
+    pub fn from_u128_narrow(v: u128) -> Self {
+        Self::from_u128(16, v)
+    }
+
+    /// On-wire PK region bytes 0..stride.
+    pub fn as_bytes(&self) -> &[u8] { &self.buf[..self.stride as usize] }
+
+    /// Reconstruct a u128 from the low `stride` bytes. Wide PKs (stride > 16)
+    /// have no scalar projection; debug-asserts. Used at the narrow-PK
+    /// fast path that still routes through `PkColumn::push_u128`.
+    pub fn to_u128_narrow(&self) -> u128 {
+        debug_assert!(self.stride as usize <= 16);
+        let mut b = [0u8; 16];
+        b[..self.stride as usize].copy_from_slice(self.as_bytes());
+        u128::from_le_bytes(b)
+    }
+
+    /// Split the tuple into the wire form `(seek_pk: u128, seek_pk_extra: &[u8])`.
+    /// For narrow PKs (stride ≤ 16) `extra` is empty and the frame is byte-
+    /// identical to the pre-compound-PK path.
+    pub fn split_wire(&self) -> (u128, &[u8]) {
+        let stride = self.stride as usize;
+        let n = stride.min(16);
+        let mut lo = [0u8; 16];
+        lo[..n].copy_from_slice(&self.buf[..n]);
+        let low_16 = u128::from_le_bytes(lo);
+        let extra: &[u8] = if stride > 16 { &self.buf[16..stride] } else { &[] };
+        (low_16, extra)
+    }
+}
+
+impl PartialEq for PkTuple {
+    fn eq(&self, other: &Self) -> bool {
+        self.stride == other.stride && self.as_bytes() == other.as_bytes()
+    }
+}
+impl Eq for PkTuple {}
+
+impl std::hash::Hash for PkTuple {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.stride.hash(state);
+        self.as_bytes().hash(state);
+    }
+}
+
+impl std::fmt::Debug for PkTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PkTuple")
+            .field("stride", &self.stride)
+            .field("bytes", &self.as_bytes())
+            .finish()
+    }
 }
 
 impl PartialEq<Vec<u128>> for PkColumn {
@@ -289,7 +461,7 @@ impl ZSetBatch {
             }
         }).collect();
         ZSetBatch {
-            pks: PkColumn::for_type(schema.columns[schema.pk_index_single()].type_code),
+            pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
             nulls: vec![],
             columns,
@@ -482,11 +654,11 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a u128 value (split as lo/hi) to the next U128s column.
-    pub fn u128_val(&mut self, lo: u64, hi: u64) -> &mut Self {
+    /// Append a u128 value to the next U128s column.
+    pub fn u128_val(&mut self, v: u128) -> &mut Self {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
-            ColData::U128s(v) => v.push(((hi as u128) << 64) | lo as u128),
+            ColData::U128s(vec) => vec.push(v),
             _ => panic!("BatchAppender: u128_val called on non-U128s column at schema index {}", ci),
         }
         self.cursor += 1;
@@ -880,7 +1052,7 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(1u128, 1)
-            .u128_val(0xDEAD, 0xBEEF);
+            .u128_val(((0xBEEF_u128) << 64) | 0xDEAD);
         if let ColData::U128s(v) = &batch.columns[1] {
             assert_eq!(v[0], ((0xBEEF_u128) << 64) | 0xDEAD);
         } else { panic!("expected U128s"); }
@@ -1024,7 +1196,7 @@ mod tests {
             pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1, 0);
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1);
     }
 
     #[test]
