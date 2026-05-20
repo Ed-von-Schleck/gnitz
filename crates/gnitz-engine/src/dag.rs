@@ -1439,7 +1439,7 @@ impl DagEngine {
         };
 
         let src_col_size = src_schema.columns[source_col].size() as usize;
-        let out_payload_col_idx = if idx_schema.is_pk_col(0) { 1usize } else { 0usize };
+        let out_payload_col_idx = idx_schema.payload_col_idx(0);
         let out_payload_size = idx_schema.columns[out_payload_col_idx].size() as usize;
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));

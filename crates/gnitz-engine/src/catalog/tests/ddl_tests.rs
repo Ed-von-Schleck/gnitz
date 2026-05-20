@@ -386,16 +386,7 @@ fn test_hook_table_register_rejects_malformed_pk() {
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
-        let mut bb = BatchBuilder::new(table_tab_schema());
-        bb.begin_row(tid as u128, 1);
-        bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-        bb.put_string("bad_table");
-        bb.put_string(&format!("{}/public/bad", dir));
-        bb.put_u64(raw_pk_cols);
-        bb.put_u64(0); // created_lsn
-        bb.put_u64(0); // flags
-        bb.end_row();
-        let batch = bb.finish();
+        let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "bad_table");
         let res = engine.ingest_to_family(TABLE_TAB_ID, &batch);
         let err = res.expect_err(&format!("expected Err containing '{}', got Ok", snippet));
         assert!(err.contains(snippet), "expected '{}', got: {}", snippet, err);
@@ -437,16 +428,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     assert!(engine.caches.col_names.contains_key(&tid));
 
     let ingest_pk = |engine: &mut CatalogEngine, raw_pk_cols: u64| {
-        let mut bb = BatchBuilder::new(table_tab_schema());
-        bb.begin_row(tid as u128, 1);
-        bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-        bb.put_string("t");
-        bb.put_string(&format!("{}/public/t", dir));
-        bb.put_u64(raw_pk_cols);
-        bb.put_u64(0);
-        bb.put_u64(0);
-        bb.end_row();
-        let batch = bb.finish();
+        let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "t");
         engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
     };
 
@@ -470,6 +452,43 @@ fn test_pk_change_invalidates_col_name_cache() {
     let tid2 = engine.create_table("public.t", &cols, &[1], true).unwrap();
     let schema = engine.get_schema(tid2).unwrap();
     assert_eq!(schema.pk_indices(), &[1]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── test_apply_pk_col_of_round_trips_compound_list ──────────────────
+
+// `apply_pk_col_of` must store the full PK column list in the cache,
+// not just the first element.
+#[test]
+fn test_apply_pk_col_of_round_trips_compound_list() {
+    let dir = temp_dir("pk_col_of_roundtrip");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Single-column PK: cache entry equals PkColList::single(idx).
+    let single_tid: i64 = 9001;
+    let batch_single = build_table_tab_row(&dir, single_tid, pack_pk_cols(&[2]), "t");
+    engine.apply_pk_col_of(TABLE_TAB_ID, &batch_single).unwrap();
+    assert_eq!(
+        engine.caches.pk_col_of.get(&single_tid).copied(),
+        Some(PkColList::single(2)),
+    );
+
+    // Compound PK lists 2..=4 round-trip element-for-element.
+    for (tid_offset, pk_cols) in [
+        (0i64, vec![0u32, 1]),
+        (1,    vec![0u32, 3, 5]),
+        (2,    vec![1u32, 2, 7, 11]),
+    ] {
+        let tid: i64 = 9100 + tid_offset;
+        let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&pk_cols), "t");
+        engine.apply_pk_col_of(TABLE_TAB_ID, &batch).unwrap();
+        let stored = engine.caches.pk_col_of.get(&tid)
+            .copied().expect("pk_col_of entry must exist after apply");
+        assert_eq!(stored.as_slice(), pk_cols.as_slice(),
+            "compound PK list must round-trip in full (input={:?})", pk_cols);
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

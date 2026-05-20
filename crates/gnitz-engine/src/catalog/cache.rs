@@ -15,7 +15,7 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) schema_of:        FxHashMap<i64, i64>,
     pub(crate) tables_by_schema: FxHashMap<i64, FxHashSet<i64>>,
     pub(crate) views_by_schema:  FxHashMap<i64, FxHashSet<i64>>,
-    pub(crate) pk_col_of:        FxHashMap<i64, u32>,
+    pub(crate) pk_col_of:        FxHashMap<i64, PkColList>,
     pub(crate) col_names:        FxHashMap<i64, Vec<String>>,
     pub(crate) col_names_bytes:  FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
     /// Cached schema wire data per table: (encoded block, wire_safe, wire_row_fixed_stride).
@@ -189,21 +189,20 @@ impl CatalogEngine {
             let tid = batch.get_pk(i) as i64;
 
             if weight > 0 {
-                let pk_col = if is_table {
-                    // apply_pk_col_of fires before hook_table_register, so a
-                    // crafted flag-set count-0 value reaches here before
-                    // validate_pk_cols rejects it; unwrap_or(0) keeps this
-                    // read panic-free (the row's hook still returns Err).
+                // Malformed wire values (count 0 or 5..=15) are NOT defended
+                // here: hook_table_register fires immediately after this
+                // applier in the same call, retracts the row via the matching
+                // -1 weight, and removes the entry before any other code can
+                // observe it. `PkColList::as_slice` is panic-free regardless.
+                let pk_list = if is_table {
                     unpack_pk_cols(self.read_batch_u64(batch, i, 3))
-                        .as_slice().first().copied().unwrap_or(0)
                 } else {
-                    0u32 // views always pk_col=0
+                    PkColList::single(0) // views always pk_col=0
                 };
-                // Only invalidate schema cache when the PK column assignment changes.
-                // Unconditional invalidation would produce spurious bumps on no-op updates
-                // and retract-reinsert cycles with an identical PK column.
-                let old = self.caches.pk_col_of.insert(tid, pk_col);
-                if old != Some(pk_col) {
+                // Invalidate only on a real change: retract-reinsert with an
+                // identical PK list would otherwise spuriously bump the version.
+                let old = self.caches.pk_col_of.insert(tid, pk_list);
+                if old != Some(pk_list) {
                     self.caches.invalidate_col_names(tid);
                 }
             } else {

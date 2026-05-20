@@ -290,7 +290,7 @@ impl CatalogEngine {
             self.caches.entity_by_qname.insert(qualified, info.id);
             self.caches.entity_by_id.insert(info.id, ("_system".into(), info.name.into()));
             self.caches.schema_of.insert(info.id, SYSTEM_SCHEMA_ID);
-            self.caches.pk_col_of.insert(info.id, 0);
+            self.caches.pk_col_of.insert(info.id, PkColList::single(0));
             let schema = sys_tab_schema(info.id);
             self.dag.register_table(
                 info.id,

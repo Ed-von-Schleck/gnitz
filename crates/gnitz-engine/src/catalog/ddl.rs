@@ -408,13 +408,17 @@ impl CatalogEngine {
 
     pub(crate) fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
         let col_defs = self.read_column_defs(table_id)?;
-        let pk_idx = self.caches.pk_col_of.get(&table_id).copied().unwrap_or(0) as usize;
+        let pk_list = self.caches.pk_col_of.get(&table_id)
+            .copied().unwrap_or_else(|| PkColList::single(0));
 
         let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id)
             .cloned().unwrap_or_default();
 
         for (col_idx, cd) in col_defs.iter().enumerate() {
-            if cd.fk_table_id == 0 || col_idx == pk_idx { continue; }
+            if cd.fk_table_id == 0 { continue; }
+            // Skip every PK column: the PK region already stores them, so an
+            // FK whose column is part of the PK needs no separate auto-index.
+            if pk_list.as_slice().contains(&(col_idx as u32)) { continue; }
             let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);
             if self.caches.index_by_name.contains_key(&index_name) { continue; }
 

@@ -50,3 +50,19 @@ fn count_records(table: &mut Table) -> usize {
     count
 }
 
+/// Build a raw TABLE_TAB row for tests that drive the catalog applier or
+/// hook layer directly (bypassing `create_table`). `dir` only feeds the
+/// stored directory string — the path is never actually created on disk.
+fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
+    let mut bb = BatchBuilder::new(table_tab_schema());
+    bb.begin_row(tid as u128, 1);
+    bb.put_u64(PUBLIC_SCHEMA_ID as u64);
+    bb.put_string(table_name);
+    bb.put_string(&format!("{}/public/{}", dir, table_name));
+    bb.put_u64(raw_pk_cols);
+    bb.put_u64(0); // created_lsn
+    bb.put_u64(0); // flags
+    bb.end_row();
+    bb.finish()
+}
+

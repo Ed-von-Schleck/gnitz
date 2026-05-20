@@ -48,12 +48,17 @@ pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
 
 pub(super) const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-pub(super) struct PkColList {
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct PkColList {
     cols: [u32; 4],
     len: usize,
 }
 
 impl PkColList {
+    /// Single-column PK with `len = 1`.
+    pub(super) fn single(idx: u32) -> Self {
+        PkColList { cols: [idx, 0, 0, 0], len: 1 }
+    }
     /// The count exactly as decoded from the wire. May be 0 or >4 for a
     /// malformed/crafted packed value — deliberately NOT clamped, because
     /// `validate_pk_cols` gates on this raw value to reject out-of-range

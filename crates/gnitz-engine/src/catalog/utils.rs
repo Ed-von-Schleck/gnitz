@@ -93,13 +93,7 @@ impl BatchBuilder {
     }
 
     fn physical_col_idx(&self) -> usize {
-        // payload col index maps to schema col index (skip PK)
-        let pk_idx = self.schema.pk_index_single() as usize;
-        if self.curr_col < pk_idx {
-            self.curr_col
-        } else {
-            self.curr_col + 1
-        }
+        self.schema.payload_col_idx(self.curr_col)
     }
 }
 
@@ -368,5 +362,31 @@ pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor
         cursor.cursor.advance();
     }
     batch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compound-PK regression guard for the precomputed payload→logical
+    // mapping. 4-column schema with pk_indices=[1, 2]: payload slot 0
+    // must map to logical column 0, slot 1 to logical column 3 — never
+    // 0 and 1 (the bug the previous single-PK reimplementation would
+    // have introduced for any non-leading compound PK).
+    #[test]
+    fn batch_builder_physical_col_idx_compound_pk() {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ];
+        let schema = SchemaDescriptor::new(&cols, &[1, 2]);
+        let mut bb = BatchBuilder::new(schema);
+        assert_eq!(bb.curr_col, 0);
+        assert_eq!(bb.physical_col_idx(), 0);
+        bb.curr_col = 1;
+        assert_eq!(bb.physical_col_idx(), 3);
+    }
 }
 
