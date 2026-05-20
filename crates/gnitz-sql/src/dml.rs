@@ -426,27 +426,86 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
         .map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {:?}", s)))
 }
 
+/// Parse a numeric SQL literal into its packed-u128 PK form. The returned
+/// u128 holds the on-disk LE bytes in its low `pk_stride` bytes: signed
+/// types pass through `(v as iN as uN) as u128` so the low `stride` bytes
+/// match the column's native LE encoding (e.g. `-1_i8` → `0xFF`, not
+/// `0xFFFF_FFFF_FFFF_FFFF`). Floats use `f{32,64}::to_bits()` so
+/// `total_cmp` ordering at the comparator agrees with the partition rule
+/// here.
+///
+/// `negated` is true when the literal sits under `Expr::UnaryOp(Minus, _)`;
+/// the prepend-`-`-then-parse rule accepts `i64::MIN`'s digit string
+/// (which would overflow a plain `i64::parse` followed by `checked_neg`).
+///
+/// This helper is the single source of truth for INSERT/SEEK PK routing —
+/// `extract_pk_value`, `try_col_eq_literal`, and `try_extract_pk_in` all
+/// dispatch through it so the master cannot send INSERT and DELETE for the
+/// same key to different workers.
+fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
+    let s_owned;
+    let s: &str = if negated { s_owned = format!("-{}", n_str); &s_owned } else { n_str };
+    match tc {
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+            let v = s.parse::<i64>().ok()?;
+            Some(match tc {
+                TypeCode::I8  => (v as i8  as u8)  as u128,
+                TypeCode::I16 => (v as i16 as u16) as u128,
+                TypeCode::I32 => (v as i32 as u32) as u128,
+                _             => (v as u64) as u128,
+            })
+        }
+        TypeCode::F64 => Some(s.parse::<f64>().ok()?.to_bits() as u128),
+        TypeCode::F32 => Some(s.parse::<f32>().ok()?.to_bits() as u128),
+        TypeCode::U128 | TypeCode::UUID => {
+            if negated { return None; }
+            s.parse::<u128>().ok()
+        }
+        _ => {
+            if negated { return None; }
+            s.parse::<u64>().ok().map(|v| v as u128)
+        }
+    }
+}
+
 /// Extract the primary key from a VALUES row, returning a u128.
 fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u128, GnitzSqlError> {
-    let pk_expr = row.get(schema.pk_index_single()).ok_or_else(|| {
+    let pk_idx = schema.pk_index_single();
+    let pk_expr = row.get(pk_idx).ok_or_else(|| {
         GnitzSqlError::Bind("PK column missing from INSERT row".to_string())
     })?;
-    let pk_tc = schema.columns[schema.pk_index_single()].type_code;
+    let pk_tc = schema.columns[pk_idx].type_code;
+
+    let (pk_expr, negated) = match pk_expr {
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
+        e => (e, false),
+    };
+
     match pk_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Number(n, _) => {
-                if pk_tc == TypeCode::U128 || pk_tc == TypeCode::UUID {
-                    n.parse::<u128>().map_err(|_| {
-                        GnitzSqlError::Bind(format!("PK value is not a valid u128: {}", n))
-                    })
-                } else {
-                    let val = n.parse::<u64>().map_err(|_| {
-                        GnitzSqlError::Bind(format!("PK value is not a valid u64: {}", n))
-                    })?;
-                    Ok(val as u128)
-                }
+                parse_pk_literal_packed(pk_tc, n, negated).ok_or_else(|| {
+                    if negated && matches!(pk_tc,
+                        TypeCode::U8 | TypeCode::U16 | TypeCode::U32
+                        | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
+                    ) {
+                        GnitzSqlError::Bind(format!(
+                            "PK type {:?} does not accept negative literals", pk_tc))
+                    } else {
+                        let s_disp = if negated { format!("-{}", n) } else { n.clone() };
+                        GnitzSqlError::Bind(format!(
+                            "PK value is not a valid {:?}: {}", pk_tc, s_disp))
+                    }
+                })
             }
-            Value::SingleQuotedString(s) if pk_tc == TypeCode::UUID => parse_uuid_str(s),
+            Value::SingleQuotedString(s) if pk_tc == TypeCode::UUID => {
+                if negated {
+                    return Err(GnitzSqlError::Bind(
+                        "PK type UUID does not accept negative literals".into()
+                    ));
+                }
+                parse_uuid_str(s)
+            }
             _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
         },
         _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
@@ -678,32 +737,13 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
                 }
                 _ => return None,
             };
-            if col_tc == TypeCode::U128 {
-                if negated { return None; }
-                let val = n_str.parse::<u128>().ok()?;
-                Some((col_idx, val))
-            } else {
-                // Secondary indexes store column values as zero-extended LE bytes cast to u64.
-                // For signed types, we must produce the same bit pattern by casting through
-                // the type's unsigned equivalent (not sign-extending to 64 bits).
-                let key = match col_tc {
-                    TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-                        let v = n_str.parse::<i64>().ok()?;
-                        let v = if negated { v.checked_neg()? } else { v };
-                        match col_tc {
-                            TypeCode::I8  => (v as i8  as u8)  as u128,
-                            TypeCode::I16 => (v as i16 as u16) as u128,
-                            TypeCode::I32 => (v as i32 as u32) as u128,
-                            _             => v as u64 as u128,
-                        }
-                    }
-                    _ => {
-                        if negated { return None; }
-                        n_str.parse::<u64>().ok()? as u128
-                    }
-                };
-                Some((col_idx, key))
-            }
+            // Secondary indexes store column values as zero-extended LE bytes
+            // cast to u64; for signed types we produce the same bit pattern by
+            // casting through the type's unsigned equivalent. Delegated to
+            // parse_pk_literal_packed so the three SEEK/INSERT parse sites
+            // cannot drift.
+            let key = parse_pk_literal_packed(col_tc, n_str, negated)?;
+            Some((col_idx, key))
         }
         _ => None,
     }
@@ -801,14 +841,38 @@ fn eval_expr(
     use crate::logical_plan::BinOp;
     match expr {
         BoundExpr::ColRef(c) => {
-            // PK is never null. Payload columns must be checked via the null bitmap.
-            if !schema.is_pk_col(*c) {
-                let payload_idx = schema.payload_idx(*c);
-                if (batch.nulls[i] & (1u64 << payload_idx)) != 0 {
-                    return Ok(None);
-                }
-            }
             let col_def = &schema.columns[*c];
+            // The PK column's slot in `batch.columns` is `Fixed(vec![])`
+            // (placeholder set by ZSetBatch::new). The PK value lives in
+            // `batch.pks` as u128 regardless of stride; decode it under the
+            // column's declared signedness so a residual filter like
+            // `WHERE id > 5` against a signed PK reads the right sign.
+            // F32/F64/U128/UUID don't fit through the i64 return shape —
+            // reject explicitly rather than reinterpret bits.
+            if schema.is_pk_col(*c) {
+                let pk = batch.pks.get(i);
+                let v: i64 = match col_def.type_code {
+                    TypeCode::I8  => pk as i8  as i64,
+                    TypeCode::I16 => pk as i16 as i64,
+                    TypeCode::I32 => pk as i32 as i64,
+                    TypeCode::I64 => pk as i64,
+                    TypeCode::U8  => pk as u8  as i64,
+                    TypeCode::U16 => pk as u16 as i64,
+                    TypeCode::U32 => pk as u32 as i64,
+                    TypeCode::U64 => pk as u64 as i64,
+                    _ => return Err(GnitzSqlError::Unsupported(format!(
+                        "residual filter on PK column of type {:?} not supported; \
+                         use `pk = literal` to seek instead",
+                        col_def.type_code
+                    ))),
+                };
+                return Ok(Some(v));
+            }
+            // Payload column: check the null bitmap first.
+            let payload_idx = schema.payload_idx(*c);
+            if (batch.nulls[i] & (1u64 << payload_idx)) != 0 {
+                return Ok(None);
+            }
             match &batch.columns[*c] {
                 ColData::Fixed(buf) => {
                     let stride = col_def.type_code.wire_stride();
@@ -1156,13 +1220,21 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
-            if let Expr::Value(vws) = item {
-                if let Value::Number(n, _) = &vws.value {
-                    pks.push(n.parse::<u64>().ok()? as u128);
-                    continue;
-                }
-            }
-            return None;
+            // Unwrap UnaryOp(Minus, Number) so signed/float PK lists like
+            // `IN (-1, -2)` can match the fast path; without this they
+            // fall through to the slow scan.
+            let (val_expr, negated) = match item {
+                Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
+                e => (e, false),
+            };
+            let n = match val_expr {
+                Expr::Value(vws) => match &vws.value {
+                    Value::Number(n, _) => n.as_str(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            pks.push(parse_pk_literal_packed(pk_col.type_code, n, negated)?);
         }
         Some(pks)
     } else {
@@ -1784,5 +1856,195 @@ mod tests {
         let expr = eq_expr("val", neg_num_expr("1"));
         let result = super::try_col_eq_literal(&expr, &schema);
         assert_eq!(result, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Native-PK literal parsing: extract_pk_value / try_col_eq_literal
+    // / try_extract_pk_in must produce the SAME u128 for the same
+    // (type, literal) pair. Master partition routing depends on this.
+    // ------------------------------------------------------------------
+
+    fn pk_schema(pk_tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![
+                col_def("id", pk_tc, false),
+                col_def("v",  TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
+        Expr::InList {
+            expr: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(col))),
+            list: items,
+            negated: false,
+        }
+    }
+
+    /// All three parser entry points must agree byte-for-byte on the u128
+    /// produced by a given (PK type, literal) pair. Master routes SEEK via
+    /// `partition_for_key(pk)`; drift between any pair sends INSERT and
+    /// DELETE to different workers.
+    fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
+        let schema = pk_schema(pk_tc);
+
+        // 1. extract_pk_value (INSERT row).
+        let row = vec![literal.clone(), num_expr("0")];
+        let got_insert = super::extract_pk_value(&row, &schema)
+            .unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
+        assert_eq!(got_insert, expected, "extract_pk_value");
+
+        // 2. try_col_eq_literal (WHERE pk = literal).
+        let where_expr = eq_expr("id", literal.clone());
+        let got_eq = super::try_col_eq_literal(&where_expr, &schema)
+            .expect("try_col_eq_literal returned None");
+        assert_eq!(got_eq, (0, expected), "try_col_eq_literal");
+
+        // 3. try_extract_pk_in (WHERE pk IN (literal)).
+        let in_expr = in_list_expr("id", vec![literal]);
+        let got_in = super::try_extract_pk_in(&in_expr, &schema)
+            .expect("try_extract_pk_in returned None");
+        assert_eq!(got_in, vec![expected], "try_extract_pk_in");
+    }
+
+    #[test]
+    fn pk_parity_i8_neg1() {
+        check_pk_parity(TypeCode::I8, neg_num_expr("1"), (-1i8 as u8) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i16_neg1() {
+        check_pk_parity(TypeCode::I16, neg_num_expr("1"), (-1i16 as u16) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i32_neg1() {
+        check_pk_parity(TypeCode::I32, neg_num_expr("1"), (-1i32 as u32) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i64_neg1() {
+        check_pk_parity(TypeCode::I64, neg_num_expr("1"), ((-1i64) as u64) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i64_min() {
+        // Regression for the prepend-`-` parse rule: `(i64::MIN as u64) as u128`.
+        check_pk_parity(
+            TypeCode::I64,
+            neg_num_expr("9223372036854775808"),
+            (i64::MIN as u64) as u128,
+        );
+    }
+
+    #[test]
+    fn pk_parity_u16_max() {
+        check_pk_parity(TypeCode::U16, num_expr("65535"), 65535u128);
+    }
+
+    #[test]
+    fn pk_parity_u32_max() {
+        check_pk_parity(TypeCode::U32, num_expr("4294967295"), 4294967295u128);
+    }
+
+    #[test]
+    fn pk_parity_f64_neg_zero() {
+        check_pk_parity(TypeCode::F64, neg_num_expr("0.0"), (-0.0_f64).to_bits() as u128);
+    }
+
+    #[test]
+    fn pk_parity_f64_one_integer_literal() {
+        // Integer literal for an F64 PK column → 1.0_f64.to_bits().
+        check_pk_parity(TypeCode::F64, num_expr("1"), (1.0_f64).to_bits() as u128);
+    }
+
+    #[test]
+    fn pk_parity_f32_neg_one_point_five() {
+        check_pk_parity(TypeCode::F32, neg_num_expr("1.5"), (-1.5_f32).to_bits() as u128);
+    }
+
+    #[test]
+    fn extract_pk_value_u64_rejects_negative() {
+        let schema = pk_schema(TypeCode::U64);
+        let row = vec![neg_num_expr("1"), num_expr("0")];
+        let err = super::extract_pk_value(&row, &schema)
+            .expect_err("U64 PK must reject negative literal");
+        assert!(err.to_string().contains("negative"), "error: {err}");
+    }
+
+    #[test]
+    fn extract_pk_value_u128_rejects_negative() {
+        let schema = pk_schema(TypeCode::U128);
+        let row = vec![neg_num_expr("1"), num_expr("0")];
+        assert!(super::extract_pk_value(&row, &schema).is_err());
+    }
+
+    #[test]
+    fn try_extract_pk_in_negative_i32_list() {
+        // Today's u64-only body returned None for negative items, falling
+        // through to the slow full-scan path. Native-PK fast path must hit.
+        let schema = pk_schema(TypeCode::I32);
+        let expr = in_list_expr("id", vec![neg_num_expr("1"), neg_num_expr("2")]);
+        let got = super::try_extract_pk_in(&expr, &schema).expect("should match fast path");
+        assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
+    }
+
+    #[test]
+    fn try_extract_pk_in_f64_list() {
+        let schema = pk_schema(TypeCode::F64);
+        let expr = in_list_expr("id", vec![num_expr("1.5"), neg_num_expr("0.5")]);
+        let got = super::try_extract_pk_in(&expr, &schema).expect("should match fast path");
+        assert_eq!(got, vec![1.5_f64.to_bits() as u128, (-0.5_f64).to_bits() as u128]);
+    }
+
+    // ------------------------------------------------------------------
+    // eval_expr: residual filter on PK column reads from batch.pks
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn eval_expr_pk_i64_negative() {
+        let schema = pk_schema(TypeCode::I64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(((-1i64) as u64) as u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let got = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(-1i64));
+    }
+
+    #[test]
+    fn eval_expr_pk_u32_max() {
+        // U32 PK = u32::MAX; zero-extended into u128 by extract_pk_value.
+        let schema = pk_schema(TypeCode::U32);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(u32::MAX as u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let got = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(u32::MAX as i64));
+    }
+
+    #[test]
+    fn eval_expr_pk_f64_unsupported() {
+        // F64 PK doesn't fit through eval_expr's i64 projection; must error,
+        // not panic.
+        let schema = pk_schema(TypeCode::F64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1.5_f64.to_bits() as u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let err = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema)
+            .expect_err("F64 PK must return Unsupported");
+        assert!(err.to_string().contains("residual filter on PK"), "error: {err}");
     }
 }

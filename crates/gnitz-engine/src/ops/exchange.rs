@@ -4,8 +4,10 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
+use std::cmp::Ordering;
+
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_pk_bytes, partition_for_key, partition_for_pk_bytes, write_to_batch, scatter_multi_source};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_pk_bytes, make_slow_pk_cmp, partition_for_key, partition_for_pk_bytes, write_to_batch, scatter_multi_source};
 
 use super::util::extract_group_key;
 
@@ -371,6 +373,13 @@ fn relay_scatter_merge_walk(
     let is_pk_routing = is_single_pk_col(schema, col_indices);
 
     if !is_wide {
+        // Signed/float PKs need make_slow_pk_cmp; raw u128 ordering would
+        // sort `-1_i64` (packed as `0xFFFF…`) AFTER `+1` and break signed
+        // order. The closure captures only Copy scalars, so the unconditional
+        // construction costs nothing on the fast branch.
+        let pk_fast = schema.pk_is_fast();
+        let slow_cmp = make_slow_pk_cmp(schema);
+
         while num_active > 0 {
             if num_active == 1 {
                 // Bulk-drain the sole remaining source without PK comparisons.
@@ -402,7 +411,12 @@ fn relay_scatter_merge_walk(
                 // Break ties by source index to keep output deterministic;
                 // swap_remove scrambles active_sources so without this the winner
                 // on equal PKs is eviction-history-dependent.
-                if pk < best_pk || (pk == best_pk && si < best_si_u8) {
+                let is_less = if pk_fast {
+                    pk < best_pk
+                } else {
+                    slow_cmp(pk, best_pk) == Ordering::Less
+                };
+                if is_less || (pk == best_pk && si < best_si_u8) {
                     best_pk = pk;
                     best_pos = pos;
                     best_si_u8 = si;
@@ -810,6 +824,70 @@ mod tests {
                 let pk = sb.get_pk_bytes(r);
                 let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
                 assert_eq!(expected, w, "wide PK routed to wrong worker");
+            }
+        }
+    }
+
+    fn make_schema_i64_i64() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            // I64 PK stored as u64 bit pattern in u128 low bytes; mirrors
+            // extract_pk_value's `(v as u64) as u128` for I64.
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    #[test]
+    fn test_relay_scatter_i64_pk_signed_ordering() {
+        // Native I64 PK with negative values. Each output batch must be
+        // sorted under `make_slow_pk_cmp`'s signed arm — raw u128 ordering
+        // would put -1 (0xFFFF...) after +1 and break the
+        // `sorted = true` invariant set by op_relay_scatter_consolidated.
+        let schema = make_schema_i64_i64();
+        let num_workers = 4;
+        // Each source sorted ascending under signed I64 order.
+        let b0 = make_i64_batch(&schema, &[
+            (-100, 1, 10),
+            (-1,   1, 11),
+            (5,    1, 12),
+        ]);
+        let b1 = make_i64_batch(&schema, &[
+            (-50,  1, 20),
+            (0,    1, 21),
+            (100,  1, 22),
+        ]);
+        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
+
+        assert_eq!(total_rows(&result), 6);
+        let slow_cmp = make_slow_pk_cmp(&schema);
+        for (w, sb) in result.iter().enumerate() {
+            assert!(sb.sorted, "worker {w} output not marked sorted");
+            for r in 1..sb.count {
+                let prev = sb.get_pk(r - 1);
+                let cur  = sb.get_pk(r);
+                assert_ne!(
+                    slow_cmp(prev, cur),
+                    Ordering::Greater,
+                    "worker {w} row {r}: signed pks out of order (prev={prev:#x} cur={cur:#x})",
+                );
             }
         }
     }

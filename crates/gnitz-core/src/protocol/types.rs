@@ -100,6 +100,29 @@ impl Schema {
             .enumerate()
             .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
     }
+
+    /// True iff `cols` is a permutation of `pk_indices()`. Mirrors
+    /// `engine::SchemaDescriptor::group_cols_eq_pk`; planner and engine must
+    /// agree on this predicate or the reduce output schema will not match
+    /// the circuit's actual output.
+    #[inline]
+    pub fn group_cols_eq_pk(&self, cols: &[usize]) -> bool {
+        cols.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| cols.contains(p))
+    }
+
+    /// True iff `cols` is a single non-nullable column whose type permits
+    /// using the source column directly as the reduce output PK (vs. a
+    /// synthetic U128). Mirrors `engine::ops::is_single_col_natural_pk`;
+    /// narrow signed/unsigned and floats stay on the synthetic path.
+    #[inline]
+    pub fn is_single_col_natural_pk(&self, cols: &[usize]) -> bool {
+        cols.len() == 1
+            && matches!(
+                self.columns[cols[0]].type_code,
+                TypeCode::U64 | TypeCode::U128 | TypeCode::UUID,
+            )
+            && !self.columns[cols[0]].is_nullable
+    }
 }
 
 /// Returns the META_SCHEMA singleton (4 columns: col_idx/U64 pk=0, type_code/U64, flags/U64, name/String).

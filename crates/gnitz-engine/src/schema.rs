@@ -246,6 +246,24 @@ impl SchemaDescriptor {
         self.pk_stride as usize > NARROW_PK_MAX_BYTES
     }
 
+    /// True iff the PK is a single unsigned column — selects the fast
+    /// `a_key.cmp(&b_key)` arm (packed u128 order == native unsigned order).
+    /// Signed integers and floats need the `make_slow_pk_cmp` arm; compound
+    /// PKs route through the column-walk byte comparator.
+    #[inline]
+    pub const fn pk_is_fast(&self) -> bool {
+        if self.pk_count != 1 {
+            return false;
+        }
+        let pk_col_idx = self.pk_indices[0] as usize;
+        let tc = self.columns[pk_col_idx].type_code;
+        matches!(
+            tc,
+            type_code::U8 | type_code::U16 | type_code::U32
+                | type_code::U64 | type_code::U128 | type_code::UUID,
+        )
+    }
+
     /// The single PK column index. Use only at boundaries that have not yet
     /// been generalized (format encoders, catalog serialization, SQL parser
     /// path, wire/client BatchAppender). Asserts pk_count == 1.

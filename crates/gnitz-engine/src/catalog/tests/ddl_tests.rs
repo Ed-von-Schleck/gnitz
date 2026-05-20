@@ -400,8 +400,8 @@ fn test_hook_table_register_rejects_malformed_pk() {
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (5 << 4), "out of bounds");
     // Duplicate index [0, 0].
     assert_rejects(PK_LIST_PACKED_FLAG | 2 | (0 << 4) | (0 << 11), "duplicate column");
-    // Non-U64/U128/UUID PK column (c1 is STRING).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be TYPE_U64");
+    // Non-numeric PK column (c1 is STRING).
+    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be a numeric scalar type");
     // Nullable PK column (c2 is nullable).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (2 << 4), "must not be nullable");
 

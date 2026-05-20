@@ -564,15 +564,19 @@ fn build_row_values_into(
     for ci in 0..schema.columns.len() {
         if schema.is_pk_col(ci) {
             let pk = batch.pks.get(row);
-            match schema.columns[ci].type_code {
-                TypeCode::UUID => {
-                    out.push(format_uuid(pk).into_pyobject(py)?.into_any().unbind());
-                }
-                TypeCode::U128 => {
-                    out.push(pk.into_pyobject(py)?.into_any().unbind());
-                }
+            let tc = schema.columns[ci].type_code;
+            // UUID / U128 don't fit through read_fixed_le's i64/u64/f64 shape;
+            // route them through the dedicated formatters.
+            match tc {
+                TypeCode::UUID => out.push(format_uuid(pk).into_pyobject(py)?.into_any().unbind()),
+                TypeCode::U128 => out.push(pk.into_pyobject(py)?.into_any().unbind()),
                 _ => {
-                    out.push((pk as u64).into_pyobject(py)?.into_any().unbind());
+                    // pk is the packed-LE u128 from extract_pk_value; the low
+                    // `wire_stride()` bytes carry the column's native LE
+                    // encoding, which is exactly what read_fixed_le decodes.
+                    let bytes = pk.to_le_bytes();
+                    let stride = tc.wire_stride();
+                    out.push(read_fixed_le(py, tc, &bytes[..stride]));
                 }
             }
         } else {

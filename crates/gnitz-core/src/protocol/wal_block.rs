@@ -41,17 +41,33 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// Serialize a `PkColumn` into `buf` at 8-byte alignment via bulk memcpy.
-/// U64 variant writes 8 bytes/row; U128 variant writes 16 bytes/row.
-/// Correct on little-endian (x86_64) — native layout matches to_le_bytes() output.
-fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn) -> (u32, u32) {
+/// Serialize a `PkColumn` into `buf` at 8-byte alignment.
+/// The U64 variant writes `pk_stride` bytes/row (1/2/4/8) — narrow single-PK
+/// types (I8/I16/I32/U8/U16/U32/F32) store the value in u64 but the wire
+/// region carries only `pk_stride` low bytes per row to match the
+/// decoder's `count * pk_stride` expectation. U128 variant writes
+/// 16 bytes/row; wide compound PK writes the pre-packed buffer verbatim.
+/// Correct on little-endian (x86_64).
+fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize) -> (u32, u32) {
     match pks {
         PkColumn::U64s(v) => {
-            // SAFETY: u64 is 8 bytes; native LE layout matches to_le_bytes() on x86_64.
-            let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
-            append_region(buf, src)
+            if pk_stride == 8 {
+                // SAFETY: u64 is 8 bytes; native LE layout matches to_le_bytes() on x86_64.
+                let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
+                append_region(buf, src)
+            } else {
+                debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
+                let aligned = align8(buf.len());
+                buf.resize(aligned, 0);
+                buf.reserve(v.len() * pk_stride);
+                for &x in v {
+                    buf.extend_from_slice(&x.to_le_bytes()[..pk_stride]);
+                }
+                (aligned as u32, (v.len() * pk_stride) as u32)
+            }
         }
         PkColumn::U128s(v) => {
+            debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
             // SAFETY: u128 is 16 bytes; native LE layout matches to_le_bytes() on x86_64.
             let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 16) };
             append_region(buf, src)
@@ -208,7 +224,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_pk_region(&mut buf, &batch.pks));
+    dir_entries.push(append_pk_region(&mut buf, &batch.pks, schema.pk_stride()));
     dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
     dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 

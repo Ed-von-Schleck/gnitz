@@ -416,7 +416,7 @@ macro_rules! dispatch_pk_row {
     ($schema:expr, $inner:ident ( $($pre:expr),* $(,)? )) => {{
         let slow = make_slow_pk_cmp($schema);
         let fast = |a: u128, b: u128| a.cmp(&b);
-        match (columnar::schema_is_int_nonnull($schema), pk_is_fast($schema)) {
+        match (columnar::schema_is_int_nonnull($schema), $schema.pk_is_fast()) {
             (true, true) => $inner($($pre),*,
                 |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), fast),
             (true, false) => $inner($($pre),*,
@@ -429,26 +429,13 @@ macro_rules! dispatch_pk_row {
     }};
 }
 
-/// True iff the PK is a single unsigned column — selects the fast
-/// `a_key.cmp(&b_key)` arm (packed u128 order == native unsigned order).
-#[inline]
-fn pk_is_fast(schema: &SchemaDescriptor) -> bool {
-    let pk_cols = schema.pk_indices();
-    pk_cols.len() == 1
-        && matches!(
-            schema.columns[pk_cols[0] as usize].type_code,
-            type_code::U8 | type_code::U16 | type_code::U32
-                | type_code::U64 | type_code::U128 | type_code::UUID,
-        )
-}
-
 /// The slow ordered PK comparator for single-column signed/float PKs and for
 /// compound PKs. All loop-invariants are extracted as owned `Copy` scalars
 /// (or the `Copy` `SchemaDescriptor`) *before* the `move` closure so it stays
 /// `Copy` and captures no slice reference (a captured `pk_indices()` slice
 /// would need a lifetime that cannot outlive the entry-point frame).
 #[inline]
-fn make_slow_pk_cmp(schema: &SchemaDescriptor) -> impl Fn(u128, u128) -> Ordering + Copy {
+pub(crate) fn make_slow_pk_cmp(schema: &SchemaDescriptor) -> impl Fn(u128, u128) -> Ordering + Copy {
     let schema_copy = *schema;
     let pk_cols = schema.pk_indices();
     let stride = schema.pk_stride() as usize;
@@ -907,9 +894,12 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     // Wider/compound strides fall through to a runtime-stride helper that trades
     // the literal-width store for a memcpy per row.
     match writer.pk_stride {
-        8 => scatter_col_first_fixed::<8>(batch, indices, base, writer),
+        1  => scatter_col_first_fixed::<1>(batch, indices, base, writer),
+        2  => scatter_col_first_fixed::<2>(batch, indices, base, writer),
+        4  => scatter_col_first_fixed::<4>(batch, indices, base, writer),
+        8  => scatter_col_first_fixed::<8>(batch, indices, base, writer),
         16 => scatter_col_first_fixed::<16>(batch, indices, base, writer),
-        _ => scatter_col_first_dynamic(batch, indices, base, writer),
+        _  => scatter_col_first_dynamic(batch, indices, base, writer),
     }
 
     let schema = writer.schema;
@@ -1106,9 +1096,12 @@ pub fn scatter_multi_source(
     let base = writer.count;
 
     match writer.pk_stride {
-        8 => scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer),
+        1  => scatter_mb_pk_wt_nbm::<1>(sources, rows, base, writer),
+        2  => scatter_mb_pk_wt_nbm::<2>(sources, rows, base, writer),
+        4  => scatter_mb_pk_wt_nbm::<4>(sources, rows, base, writer),
+        8  => scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer),
         16 => scatter_mb_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_mb_pk_dynamic(sources, rows, base, writer),
+        _  => scatter_mb_pk_dynamic(sources, rows, base, writer),
     }
 
     // One pass per column keeps destination writes sequential.
@@ -1259,9 +1252,12 @@ pub(crate) fn scatter_unified_sources_with_weights(
     // helper so the inner loop sees a literal width (8 or 16) — without that,
     // `copy_from_slice` lowers to memcpy.
     match writer.pk_stride {
-        8 => scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer),
+        1  => scatter_unified_pk_wt_nbm::<1>(sources, rows, base, writer),
+        2  => scatter_unified_pk_wt_nbm::<2>(sources, rows, base, writer),
+        4  => scatter_unified_pk_wt_nbm::<4>(sources, rows, base, writer),
+        8  => scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer),
         16 => scatter_unified_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_unified_pk_dynamic(sources, rows, base, writer),
+        _  => scatter_unified_pk_dynamic(sources, rows, base, writer),
     }
 
     let schema = writer.schema;

@@ -168,7 +168,8 @@ def _filler_schema(client, sock_path):
     )
     filler_tid, _ = client.resolve_table(sn, "filler")
     cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+        # BIGINT maps to I64 (native PK types: planner no longer coerces).
+        gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True),
         gnitz.ColumnDef("val", gnitz.TypeCode.I64),
     ]
     schema = gnitz.Schema(cols)

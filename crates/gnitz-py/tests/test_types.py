@@ -1366,14 +1366,13 @@ class TestTypeErrors:
 
 
 # ---------------------------------------------------------------------------
-# TestPKCoercion — PK type rules: only BIGINT (→U64) and DECIMAL(38,0) (→U128)
+# TestPKNativeTypes — PK columns keep their declared type (no coercion).
 # ---------------------------------------------------------------------------
 
-class TestPKCoercion:
-    """The server accepts only U64 and U128 primary keys.
-    The planner widens any narrow signed/unsigned integer PK type to U64
-    (TINYINT, SMALLINT, INT, BIGINT, and their UNSIGNED variants).
-    DECIMAL(38,0) maps to U128 directly."""
+class TestPKNativeTypes:
+    """The planner preserves each PK column's declared type. Every PK-eligible
+    numeric scalar — signed integer, unsigned integer, float, U128/UUID — is
+    accepted as a primary key and stored at its native stride."""
 
     def _create_table_with_pk(self, client, sn, pk_sql):
         client.create_schema(sn)
@@ -1382,48 +1381,53 @@ class TestPKCoercion:
             schema_name=sn,
         )
 
-    def test_tinyint_pk_widened_to_u64(self, client):
-        """TINYINT PK is widened to U64."""
+    def test_tinyint_pk_stays_i8(self, client):
         sn = "s" + _uid()
         try:
             self._create_table_with_pk(client, sn, "TINYINT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I8
         finally:
             _cleanup(client, sn, "t")
 
-    def test_smallint_pk_widened_to_u64(self, client):
-        """SMALLINT PK is widened to U64."""
+    def test_smallint_pk_stays_i16(self, client):
         sn = "s" + _uid()
         try:
             self._create_table_with_pk(client, sn, "SMALLINT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I16
         finally:
             _cleanup(client, sn, "t")
 
-    def test_int_pk_widened_to_u64(self, client):
-        """INT PK is widened to U64."""
+    def test_int_pk_stays_i32(self, client):
         sn = "s" + _uid()
         try:
             self._create_table_with_pk(client, sn, "INT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I32
         finally:
             _cleanup(client, sn, "t")
 
-    def test_bigint_pk_coerced_to_u64(self, client):
-        """Signed BIGINT PK is coerced to U64 by the planner."""
+    def test_bigint_pk_stays_i64(self, client):
         sn = "s" + _uid()
         try:
             self._create_table_with_pk(client, sn, "BIGINT")
+            _, schema = client.resolve_table(sn, "t")
+            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I64
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_bigint_unsigned_pk_stays_u64(self, client):
+        sn = "s" + _uid()
+        try:
+            self._create_table_with_pk(client, sn, "BIGINT UNSIGNED")
             _, schema = client.resolve_table(sn, "t")
             assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
         finally:
             _cleanup(client, sn, "t")
 
     def test_decimal_38_0_pk_stays_u128(self, client):
-        """DECIMAL(38,0) PK maps to U128 (already unsigned, no coercion needed)."""
+        """DECIMAL(38,0) PK maps to U128 (no coercion needed; widest scalar)."""
         sn = "s" + _uid()
         try:
             self._create_table_with_pk(client, sn, "DECIMAL(38,0)")

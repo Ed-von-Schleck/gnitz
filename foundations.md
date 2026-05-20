@@ -32,20 +32,36 @@ weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 4.5/4.6 (distinct-elimination) require positive inputs.
 
 **Single-column PKs only.** Each table has exactly one PK column
-(enforced by schema validation). The 128-bit API surface holds one column
-value: `(lo, hi)` for U128, `(value, 0)` for narrower types.
+(enforced by schema validation). PK types are unsigned scalars (U8/U16/U32/
+U64/U128/UUID), signed scalars (I8/I16/I32/I64), or floats (F32/F64). The
+128-bit API surface holds one column value: `(lo, hi)` for U128, `(value, 0)`
+for narrower types (with the column's native LE bytes in the low `pk_stride`
+bytes and zeros above).
 
 **Physical stride narrowing.** Shard files, WAL blocks, and wire batches
-store only `pk_stride` bytes per PK row: 8 bytes for U64, 16 bytes for U128.
-The in-engine `ArenaZSetBatch` uses a 128-bit PK slot (pk_lo + pk_hi u64s)
-regardless of schema type. All boundary code zero-extends when crossing
-between the narrow physical representation and the 128-bit in-engine slot.
+store only `pk_stride` bytes per PK row: 1/2/4/8 bytes for narrow scalars,
+16 bytes for U128. The in-engine `ArenaZSetBatch` uses a 128-bit PK slot
+(pk_lo + pk_hi u64s) regardless of schema type. Boundary code packs the
+column's native LE bytes into the low `pk_stride` bytes and zeros the rest;
+the wire/shard layer truncates back to `pk_stride` bytes on emit.
 
-**Zero-extension invariant.** `get_pk()` always returns u128; sort order,
-comparison, and partition routing all zero-extend narrow PK values before
-operating. A U64 value `v` stored as 8 bytes compares and hashes identically
-to `v as u128`: `hash_u128(v as u128) == hash_u128(v)`. XOR8 filter probes
-and exchange routing both depend on this invariant.
+**PK ordering is type-aware.** Unsigned PKs (U8/U16/U32/U64/U128/UUID)
+sort by their packed u128 — `a.cmp(&b)` agrees with the column's native
+unsigned order (the "fast" comparator arm, selected by `SchemaDescriptor::
+pk_is_fast`). Signed PKs (I8/I16/I32/I64) and floats (F32/F64) require
+the "slow" comparator (`storage::make_slow_pk_cmp`) which interprets the
+low `pk_stride` bytes as the column's native type and applies signed or
+`total_cmp` ordering. Raw u128 ordering of `-1_i64`'s packed bytes
+(`0xFFFF…`) would sort it AFTER `+1`, inverting the signed order. The
+sort-merge, scatter-merge-walk, and reduce code paths all branch on
+`pk_is_fast` to pick the correct comparator.
+
+**Hash invariant.** `hash_u128(v as u128) == hash_u128(v)` for all narrow
+PK types (after the native-LE pack-and-zero-extend described above). XOR8
+filter probes and partition routing both depend on this invariant — the
+hash sees the full 128-bit slot, but unused high bytes are zero, so a
+value stored at any stride hashes identically regardless of how it
+crossed the wire boundary.
 
 **Physical representation.** `ArenaZSetBatch`: columnar buffers where each
 row is (pk_lo, pk_hi, weight, null_word, col_0, col_1, ...). Multiple
@@ -267,10 +283,12 @@ inputs, including NaN.
 
 Column buffers are stored as flat (pointer, size) pairs in canonical order.
 This layout applies to WAL blocks (WAL_FORMAT_VERSION ≥ 4) and shard files
-(SHARD_VERSION ≥ 6). `pk_stride = 8` for U64 PKs, `pk_stride = 16` for U128 PKs.
+(SHARD_VERSION ≥ 6). `pk_stride` is the sum of each PK column's `wire_stride()`,
+tightly packed: 1/2/4/8 bytes for single narrow scalar PKs, 16 bytes for U128,
+or the compound sum for multi-column PKs.
 
 ```
-region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {8, 16})
+region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {1, 2, 4, 8, 16, …})
 region[1] = weight     (count × 8 bytes, i64 LE)
 region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
 region[3..3+P-1] = payload columns (non-PK, schema order)
@@ -279,8 +297,12 @@ region[3+P] = blob     (variable-length string heap)
 
 The in-engine `ArenaZSetBatch` uses separate pk_lo (u64) and pk_hi (u64)
 fields in its columnar layout regardless of schema type. Boundary code
-(WAL encode/decode, shard read/write) zero-extends or truncates when
-converting between the narrow on-disk layout and the in-engine 128-bit slot.
+(WAL encode/decode, shard read/write) packs the column's native LE bytes
+into the low `pk_stride` bytes of the 128-bit slot and truncates back to
+`pk_stride` on emit. Signed integers and floats use their native bit
+patterns (`(v as iN as uN) as u128`, `to_bits()`), not sign-extension —
+the type-aware comparator (§1 "PK ordering is type-aware") restores the
+ordering semantics.
 
 PK columns are not included in the payload region pointers.
 

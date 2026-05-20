@@ -56,7 +56,10 @@ pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 #[inline(always)]
 pub(super) fn widen_pk_le(src: &[u8], stride: usize) -> u128 {
     match stride {
-        8 => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
+        1  => src[0] as u128,
+        2  => u16::from_le_bytes(src[..2].try_into().unwrap()) as u128,
+        4  => u32::from_le_bytes(src[..4].try_into().unwrap()) as u128,
+        8  => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
         16 => u128::from_le_bytes(src[..16].try_into().unwrap()),
         n => panic!("widen_pk_le: wide PK region (stride {n}); caller must use get_pk_bytes/pk_bytes instead"),
     }
@@ -649,10 +652,22 @@ impl Batch {
     pub fn extend_col(&mut self, pi: usize, d: &[u8]) { self.extend_region(REG_PAYLOAD_START + pi, d); }
 
     /// Append a 128-bit primary key at the current row position.
+    ///
+    /// Narrow strides (1/2/4) write the low `stride` bytes of the `pk`
+    /// argument verbatim. The contract is that the *caller* placed the
+    /// on-disk LE bytes in the low `stride` bytes — `extract_pk_value`,
+    /// `try_col_eq_literal`, and `try_extract_pk_in` all follow this rule
+    /// (signed integers via `(v as iN as uN) as u128`, floats via
+    /// `to_bits()`, narrow unsigned via zero-extension). The high
+    /// `16 - stride` bytes are dropped on truncation, which is correct
+    /// under that contract for every PK type GnitzDB allows.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
         match stride {
+            1 => self.extend_region(REG_PK, &pk.to_le_bytes()[..1]),
+            2 => self.extend_region(REG_PK, &pk.to_le_bytes()[..2]),
+            4 => self.extend_region(REG_PK, &pk.to_le_bytes()[..4]),
             8 => {
                 debug_assert!(pk >> 64 == 0, "extend_pk: U64 batch requires high bits == 0");
                 self.extend_region(REG_PK, &pk.to_le_bytes()[..8]);
@@ -673,11 +688,16 @@ impl Batch {
         self.extend_region(REG_PK, bytes);
     }
 
-    /// Overwrite the PK at `row` with a new 128-bit value.
+    /// Overwrite the PK at `row` with a new 128-bit value. Narrow-stride
+    /// truncation mirrors `extend_pk`'s low-bytes contract.
     #[inline]
     pub fn set_pk_at(&mut self, row: usize, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
         match stride {
+            1 | 2 | 4 => {
+                let off = self.offsets[REG_PK] as usize + row * stride;
+                self.data[off..off + stride].copy_from_slice(&pk.to_le_bytes()[..stride]);
+            }
             8 => {
                 debug_assert!(pk >> 64 == 0, "set_pk_at: U64 batch requires high bits == 0");
                 let off = self.offsets[REG_PK] as usize + row * 8;
@@ -1900,10 +1920,10 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
-    fn single_col_u128_pk_schema() -> SchemaDescriptor {
+    fn single_col_pk_schema(tc: u8) -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(tc, 0),
                 SchemaColumn::new(type_code::I64, 0),
             ],
             &[0],
@@ -1947,8 +1967,59 @@ mod tests {
     }
 
     #[test]
+    fn widen_pk_le_narrow_strides_round_trip() {
+        // Stride 1: read the single byte verbatim.
+        assert_eq!(widen_pk_le(&[0xFFu8], 1), 0xFFu128);
+        assert_eq!(widen_pk_le(&[0x01u8], 1), 0x01u128);
+        // Stride 2/4: LE bytes widen via from_le_bytes.
+        assert_eq!(widen_pk_le(&0xFFFEu16.to_le_bytes(), 2), 0xFFFEu128);
+        assert_eq!(widen_pk_le(&0xCAFE_BABEu32.to_le_bytes(), 4), 0xCAFE_BABEu128);
+        // The slice may be longer than `stride` — only the first `stride`
+        // bytes are read. Mirrors the PkBuf::as_u128_single_pk convention.
+        let mut backing = [0u8; 80];
+        backing[..2].copy_from_slice(&0x1234u16.to_le_bytes());
+        assert_eq!(widen_pk_le(&backing, 2), 0x1234u128);
+    }
+
+    #[test]
+    fn extend_pk_narrow_strides_round_trip() {
+        // For each narrow stride, extend_pk writes the low `stride` bytes of
+        // the u128 argument verbatim; get_pk reads them back via widen_pk_le.
+        // The (type, value, expected u128) triples mirror what
+        // extract_pk_value writes for the corresponding PK type.
+        let cases: &[(u8, u128)] = &[
+            // I8 PK = -1: extract_pk_value writes (-1i8 as u8) as u128 = 0xFF
+            (type_code::I8,  0xFFu128),
+            // U8 PK = 200
+            (type_code::U8,  200u128),
+            // I16 PK = -1: low 2 bytes = 0xFFFF
+            (type_code::I16, 0xFFFFu128),
+            // U16 PK = u16::MAX
+            (type_code::U16, u16::MAX as u128),
+            // I32 PK = -1: low 4 bytes = 0xFFFF_FFFF
+            (type_code::I32, 0xFFFF_FFFFu128),
+            // U32 PK = u32::MAX
+            (type_code::U32, u32::MAX as u128),
+            // F32 PK = -1.5: to_bits()
+            (type_code::F32, (-1.5_f32).to_bits() as u128),
+        ];
+        for &(tc, pk) in cases {
+            let schema = single_col_pk_schema(tc);
+            let mut b = Batch::empty_with_schema(&schema);
+            b.reserve_rows(1);
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+            assert_eq!(b.get_pk(0), pk,
+                "type_code {} narrow-stride round-trip", tc);
+        }
+    }
+
+    #[test]
     fn extend_pk_roundtrip_across_u64_boundary() {
-        let schema = single_col_u128_pk_schema();
+        let schema = single_col_pk_schema(type_code::U128);
         let mut b = Batch::with_schema(schema, 8);
         let keys: [u128; 5] = [
             0,
@@ -1973,7 +2044,7 @@ mod tests {
 
     #[test]
     fn set_pk_at_overwrites_existing_row() {
-        let schema = single_col_u128_pk_schema();
+        let schema = single_col_pk_schema(type_code::U128);
         let mut b = Batch::with_schema(schema, 4);
         for pk in [10u128, 20, 30, 40] {
             b.extend_pk(pk);
@@ -2021,7 +2092,7 @@ mod tests {
 
     #[test]
     fn pk_stride_u128_roundtrip() {
-        let schema = single_col_u128_pk_schema();
+        let schema = single_col_pk_schema(type_code::U128);
         let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(pks.len());
@@ -2075,7 +2146,7 @@ mod tests {
 
     #[test]
     fn extend_pk_bytes_then_get_pk_bytes_roundtrip_u128() {
-        let schema = single_col_u128_pk_schema();
+        let schema = single_col_pk_schema(type_code::U128);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(3);
         let pks: [[u8; 16]; 3] = [
@@ -2101,7 +2172,7 @@ mod tests {
 
     #[test]
     fn set_pk_at_bytes_overwrites_existing_row() {
-        let schema = single_col_u128_pk_schema();
+        let schema = single_col_pk_schema(type_code::U128);
         let mut b = Batch::with_schema(schema, 4);
         for pk in [10u128, 20, 30] {
             b.extend_pk(pk);

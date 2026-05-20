@@ -194,13 +194,9 @@ fn execute_create_table(
         "CREATE TABLE: exactly one PRIMARY KEY must be defined".into()
     ))?;
 
-    // Coerce PK to a non-nullable U64/U128/UUID — the server's null bitmap
-    // excludes the PK region, so a nullable PK has no place to carry the null.
-    cols[pk_idx].type_code = match cols[pk_idx].type_code {
-        TypeCode::I8  | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
-        | TypeCode::U8 | TypeCode::U16 | TypeCode::U32 => TypeCode::U64,
-        tc => tc,
-    };
+    // PK columns keep their declared type. The null bitmap excludes the PK
+    // region, so a nullable PK has no place to carry the null — enforce
+    // non-nullable here regardless of type.
     cols[pk_idx].is_nullable = false;
 
     let tid = client.create_table(schema_name, &table_name, &cols, pk_idx, true)
@@ -961,21 +957,33 @@ fn execute_create_group_by_view(
     //    A nullable group column cannot become the natural PK — the PK region
     //    has no null bitmap, so we fall through to the synthetic _group_pk
     //    (U128, non-nullable) path which is always safe.
-    let use_natural_pk = group_col_indices.len() == 1
-        && matches!(
-            source_schema.columns[group_col_indices[0]].type_code,
-            TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
-        )
-        && !source_schema.columns[group_col_indices[0]].is_nullable;
+    //
+    //    The two natural-PK cases must mirror the compiler's
+    //    `build_reduce_output_schema` decision (compiler.rs:695-697):
+    //      (a) `group_set_eq_pk`: group cols are a permutation of the source
+    //          PK cols, regardless of PK type — even native I64/F64.
+    //      (b) `is_single_col_natural_pk`: a single non-nullable U64/U128/UUID
+    //          group col. Narrow unsigned/signed/floats still take the
+    //          synthetic path because the engine helper rejects them.
+    //    A divergence between planner and compiler here scrambles the view's
+    //    output column positions silently.
+    let group_set_eq_pk = source_schema.group_cols_eq_pk(&group_col_indices);
+    let single_col_natural_pk = source_schema.is_single_col_natural_pk(&group_col_indices);
+    let use_natural_pk = group_set_eq_pk || single_col_natural_pk;
 
-    // agg_col_offset: index of first aggregate column in reduce output
-    let agg_col_offset = if use_natural_pk { 1 } else { 1 + group_col_indices.len() };
-
-    // Build the reduce output schema (mirrors server's _build_reduce_output_schema)
+    // Build the reduce output schema (mirrors server's _build_reduce_output_schema).
     let mut reduce_schema_cols: Vec<ColumnDef> = Vec::new();
-    if use_natural_pk {
+    let mut reduce_pk_cols: Vec<usize> = Vec::new();
+    if group_set_eq_pk {
+        for &pi in &source_schema.pk_cols {
+            reduce_pk_cols.push(reduce_schema_cols.len());
+            reduce_schema_cols.push(source_schema.columns[pi].clone());
+        }
+    } else if single_col_natural_pk {
+        reduce_pk_cols.push(0);
         reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
     } else {
+        reduce_pk_cols.push(0);
         reduce_schema_cols.push(ColumnDef {
             name: "_group_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
@@ -983,12 +991,20 @@ fn execute_create_group_by_view(
             reduce_schema_cols.push(source_schema.columns[gi].clone());
         }
     }
+    // First aggregate column lives immediately after the PK + (synthetic)
+    // group cols — the synthetic path adds the group cols as payload, the
+    // natural paths don't.
+    let agg_col_offset = if use_natural_pk {
+        reduce_schema_cols.len()
+    } else {
+        1 + group_col_indices.len()
+    };
     for _ in 0..agg_specs.len() {
         reduce_schema_cols.push(ColumnDef {
             name: "_agg".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
-    let reduce_schema = Schema { columns: reduce_schema_cols, pk_cols: vec![0] };
+    let reduce_schema = Schema { columns: reduce_schema_cols, pk_cols: reduce_pk_cols };
 
     // 5. Build circuit
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
