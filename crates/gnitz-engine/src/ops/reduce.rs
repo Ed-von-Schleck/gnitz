@@ -627,6 +627,52 @@ fn argsort_delta(
     indices
 }
 
+/// Argsort indices into canonical PK order — `pk_indices` order as defined
+/// by `compare_pk_bytes`. Routes through `make_slow_pk_cmp` for signed
+/// single-col PKs, float single-col PKs, and compound PKs; `pk_is_fast`
+/// schemas (single-col unsigned U8..U64/U128/UUID) collapse to a tight
+/// `u128.cmp` on the widened PK. Caller must ensure `pk_stride ∈ {8, 16}`
+/// (so `mb.get_pk` is well-defined).
+fn argsort_pk_canonical(mb: &MemBatch, schema: &SchemaDescriptor) -> Vec<u32> {
+    let n = mb.count;
+    // Materialise the u128 PK keys once: get_pk widens via widen_pk_le on
+    // every call (stride match + bounds-checked sub-slice), so caching the
+    // keys avoids that overhead inside the sort comparator. 16n bytes is
+    // bounded (1.6 MB at n=100k) and lives only for the duration of this
+    // argsort.
+    let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    if schema.pk_is_fast() {
+        // Single-col unsigned PK: u128 ascending == canonical unsigned
+        // ascending. No dispatch needed.
+        idx.sort_unstable_by_key(|&i| pks[i as usize]);
+    } else {
+        // Signed / float / compound: route via the typed comparator. The
+        // closure is `Copy` so it inlines cleanly through sort_unstable_by.
+        let pk_cmp = crate::storage::make_slow_pk_cmp(schema);
+        idx.sort_unstable_by(|&a, &b| pk_cmp(pks[a as usize], pks[b as usize]));
+    }
+    idx
+}
+
+/// Sort `indices` by `pk_cmp(pks[i], pks[j])`, tie-breaking on `row_cmp`.
+/// Generic over both closure types so the comparator monomorphises and
+/// inlines through `sort_unstable_by` — load-bearing for sort speed.
+fn sort_indices_by_pk_then_row<PkCmp, RowCmp>(
+    indices: &mut [u32],
+    pks: &[u128],
+    pk_cmp: PkCmp,
+    row_cmp: RowCmp,
+) where
+    PkCmp: Fn(u128, u128) -> Ordering + Copy,
+    RowCmp: Fn(usize, usize) -> Ordering + Copy,
+{
+    indices.sort_unstable_by(|&a, &b| match pk_cmp(pks[a as usize], pks[b as usize]) {
+        Ordering::Equal => row_cmp(a as usize, b as usize),
+        ord => ord,
+    });
+}
+
 /// Sort batch by (PK, payload) without consolidation.
 /// Used by op_gather_reduce where we need to see each partial separately.
 fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
@@ -640,18 +686,21 @@ fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
     let mut indices: Vec<u32> = (0..n as u32).collect();
 
-    // Standard-library sort is extremely sensitive to comparator inlining;
-    // the fast-path branch is hoisted out of the per-comparison closure.
-    if schema_is_int_nonnull(schema) {
-        indices.sort_unstable_by(|&a, &b| match pks[a as usize].cmp(&pks[b as usize]) {
-            Ordering::Equal => compare_rows_int_nonnull(schema, &mb, a as usize, &mb, b as usize),
-            ord => ord,
-        });
-    } else {
-        indices.sort_unstable_by(|&a, &b| match pks[a as usize].cmp(&pks[b as usize]) {
-            Ordering::Equal => compare_rows(schema, &mb, a as usize, &mb, b as usize),
-            ord => ord,
-        });
+    // Direct `u128.cmp` on the widened PK is sound only for `pk_is_fast`
+    // schemas (single-col unsigned). Signed / float / compound PKs must
+    // dispatch through `make_slow_pk_cmp` — otherwise negatives sort after
+    // positives (signed), total_cmp ordering is skipped (float), and the
+    // low-priority PK column dominates (compound), all of which make the
+    // `output.sorted = true` mark below a lie.
+    let slow_pk_cmp = crate::storage::make_slow_pk_cmp(schema);
+    let fast_pk_cmp = |a: u128, b: u128| a.cmp(&b);
+    let row_int = |a: usize, b: usize| compare_rows_int_nonnull(schema, &mb, a, &mb, b);
+    let row_full = |a: usize, b: usize| compare_rows(schema, &mb, a, &mb, b);
+    match (schema_is_int_nonnull(schema), schema.pk_is_fast()) {
+        (true, true)   => sort_indices_by_pk_then_row(&mut indices, &pks, fast_pk_cmp, row_int),
+        (true, false)  => sort_indices_by_pk_then_row(&mut indices, &pks, slow_pk_cmp, row_int),
+        (false, true)  => sort_indices_by_pk_then_row(&mut indices, &pks, fast_pk_cmp, row_full),
+        (false, false) => sort_indices_by_pk_then_row(&mut indices, &pks, slow_pk_cmp, row_full),
     }
 
     let blob_cap = mb.blob.len().max(1);
@@ -758,10 +807,13 @@ pub fn op_reduce(
     // group_by_pk additionally requires stride ∈ {8, 16} because the fast
     // path widens PK regions via widen_pk_le on each row; wider compound
     // PKs cannot use the u128 comparator and must take the slow path.
-    // Skipping the sort under group_by_pk is load-bearing for output
-    // ordering — the input is already PK-sorted from consolidation, and
-    // the output's pk_indices is in source pk-list order regardless of
-    // group_by_cols permutation.
+    // The fast path's group-detection loop walks rows in iteration order
+    // and breaks on PK mismatch — sound iff iteration order is canonical
+    // PK order. When `working.sorted` is set the input is already in that
+    // order (consolidation, integrated trace, sorted union); otherwise we
+    // must argsort by canonical PK order to avoid splitting one PK into
+    // multiple groups. Output's pk_indices is in source pk-list order
+    // regardless of group_by_cols permutation.
     let group_set_eq_pk = input_schema.group_cols_eq_pk(group_by_cols);
     let group_by_pk = group_set_eq_pk
         && matches!(input_schema.pk_stride(), 8 | 16);
@@ -775,14 +827,18 @@ pub fn op_reduce(
     };
     let group_descs = &sort_descs[..sort_descs_len];
 
-    // Argsort
-    let sorted_indices = if group_by_pk {
+    let mb = working.as_mem_batch();
+
+    // Argsort. group_by_pk keeps `group_key = mb.get_pk(...)` and the
+    // sorted/consolidated output mark; only the iteration order changes
+    // when the input is unsorted.
+    let sorted_indices: Vec<u32> = if group_by_pk && working.sorted {
         (0..n as u32).collect()
+    } else if group_by_pk {
+        argsort_pk_canonical(&mb, input_schema)
     } else {
         argsort_delta(working, input_schema, group_by_cols)
     };
-
-    let mb = working.as_mem_batch();
 
     // Output mapping: matches build_reduce_output_schema's logic — must
     // stay in sync. Independent of the stride-gated fast-path eligibility
@@ -3682,5 +3738,525 @@ mod tests {
         assert_eq!(new_min, 3u64,
             "fold-old + combine-new under unsigned ordering keeps MIN at 3");
         assert_eq!(out2.get_weight(1), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // group_by_pk fast path on unsorted input
+    //
+    // op_reduce's group_by_pk fast path walks rows in physical order and
+    // treats consecutive same-PK rows as one group. That assumption only
+    // holds when `working.sorted` is true; an unsorted delta (e.g. from
+    // `map_reindex` upstream) splits one PK into multiple groups and
+    // produces duplicate PK rows / double-retractions.
+    // -----------------------------------------------------------------------
+
+    /// Build a raw `Batch` (`sorted = false`, `consolidated = false`) with
+    /// one I64 payload column. `pk_encode` maps the row's PK type to the
+    /// u128 that `extend_pk` expects (e.g. `|pk: i64| (pk as u64) as u128`
+    /// for signed, `|pk: f64| pk.to_bits() as u128` for float).
+    fn make_batch_raw_pk<T: Copy>(
+        schema: &SchemaDescriptor,
+        rows: &[(T, i64, i64)],
+        pk_encode: impl Fn(T) -> u128,
+    ) -> Batch {
+        let n = rows.len();
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk(pk_encode(pk));
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = false;
+        b.consolidated = false;
+        b
+    }
+
+    /// I64 pk + I64 payload schema (signed-PK exercise of make_slow_pk_cmp).
+    fn make_schema_i64pk_i64val() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// F64 pk + I64 payload schema (float-PK exercise of make_slow_pk_cmp).
+    fn make_schema_f64pk_i64val() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::F64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// Common output schema for SUM aggregates over a single-col PK:
+    /// `U128 pk, I64 sum (nullable)`.
+    fn make_pk_sum_out_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64_i64();
+        let out_schema = make_pk_sum_out_schema();
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Unsorted: pk=5 appears twice, separated by pk=3. The fast path
+        // pre-fix walked physical order and split into 3 groups → emitting
+        // two distinct pk=5 rows.
+        let delta = make_batch_raw_pk(&in_schema, &[
+            (5, 1, 10),
+            (3, 1, 20),
+            (5, 1, 30),
+        ], |pk: u64| pk as u128);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        assert_eq!(out.count, 2, "one row per distinct PK");
+        let pk0 = out.get_pk_bytes(0);
+        let pk1 = out.get_pk_bytes(1);
+        let pk0_val = u128::from_le_bytes(pk0.try_into().unwrap());
+        let pk1_val = u128::from_le_bytes(pk1.try_into().unwrap());
+        assert_eq!(pk0_val, 3, "PK-sorted: 3 precedes 5");
+        assert_eq!(pk1_val, 5);
+        let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
+        let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
+        assert_eq!(sum0, 20, "SUM for pk=3");
+        assert_eq!(sum1, 40, "SUM for pk=5 (10+30) — pre-fix produced two split rows");
+        assert!(out.sorted, "output is PK-sorted by the fast path");
+        assert!(out.consolidated, "output is consolidated by the fast path");
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_input_count() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64_i64();
+        let out_schema = make_pk_sum_out_schema(); // pk + I64 agg
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        let delta = make_batch_raw_pk(&in_schema, &[
+            (5, 1, 10),
+            (3, 1, 20),
+            (5, 1, 30),
+        ], |pk: u64| pk as u128);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        assert_eq!(out.count, 2);
+        let pk0 = u128::from_le_bytes(out.get_pk_bytes(0).try_into().unwrap());
+        let pk1 = u128::from_le_bytes(out.get_pk_bytes(1).try_into().unwrap());
+        assert_eq!((pk0, pk1), (3, 5));
+        let c0 = crate::util::read_i64_le(out.col_data(0), 0);
+        let c1 = crate::util::read_i64_le(out.col_data(0), 8);
+        assert_eq!((c0, c1), (1, 2), "pk=3 → 1, pk=5 → 2");
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64_i64();
+        let out_schema = make_pk_sum_out_schema();
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Same data as the unsorted-sum test but pre-sorted. The
+        // `working.sorted` branch must produce identical output.
+        let mut delta = make_batch_raw_pk(&in_schema, &[
+            (3, 1, 20),
+            (5, 1, 10),
+            (5, 1, 30),
+        ], |pk: u64| pk as u128);
+        delta.sorted = true;
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        assert_eq!(out.count, 2);
+        let pk0 = u128::from_le_bytes(out.get_pk_bytes(0).try_into().unwrap());
+        let pk1 = u128::from_le_bytes(out.get_pk_bytes(1).try_into().unwrap());
+        assert_eq!((pk0, pk1), (3, 5));
+        let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
+        let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
+        assert_eq!((sum0, sum1), (20, 40));
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_compound_pk_2xu64_schema();
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0, 1],
+        );
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Unsorted compound-PK delta: physical order is (2,1) then (1,2).
+        // Canonical pk_indices order should emit (1,2) first.
+        let mut delta = make_batch_compound_2xu64(&in_schema, &[
+            (2, 1, 1, 20),
+            (1, 2, 1, 10),
+        ]);
+        delta.sorted = false;
+        delta.consolidated = false;
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        // Permuted GROUP BY: [1, 0]. group_set_eq_pk still holds.
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[1u32, 0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        assert_eq!(out.count, 2);
+        let pk0 = out.get_pk_bytes(0);
+        let pk1 = out.get_pk_bytes(1);
+        let p0_col0 = u64::from_le_bytes(pk0[0..8].try_into().unwrap());
+        let p0_col1 = u64::from_le_bytes(pk0[8..16].try_into().unwrap());
+        let p1_col0 = u64::from_le_bytes(pk1[0..8].try_into().unwrap());
+        let p1_col1 = u64::from_le_bytes(pk1[8..16].try_into().unwrap());
+        // Canonical pk_indices order is [col0, col1] ascending — (1,2) first.
+        // A u128.cmp on the widened PK region would put (2,1) first because
+        // col1 dominates the high bytes.
+        assert_eq!((p0_col0, p0_col1), (1, 2),
+            "compound-PK canonical sort: pk_indices priority, not u128 priority");
+        assert_eq!((p1_col0, p1_col1), (2, 1));
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_signed_pk() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_i64pk_i64val();
+        // Output PK is naturally U128 here too (extends signed encoding via
+        // emit_pk on a single-col PK; we only check ordering of payload).
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // Unsorted signed-PK delta. A u128.cmp on the widened (zero-extended)
+        // i64-as-u64 bit pattern would put negatives at the TOP (they widen
+        // to large u64 values), so emit order would start with pk=2.
+        let delta = make_batch_raw_pk(&in_schema, &[
+            (-1, 1, 10),
+            (2, 1, 20),
+            (-3, 1, 30),
+        ], |pk: i64| (pk as u64) as u128);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::I64, &[], None,
+            None, 0, TypeCode::I64, None, None,
+        );
+
+        assert_eq!(out.count, 3, "one row per distinct signed PK");
+        let pks: Vec<i64> = (0..out.count)
+            .map(|i| {
+                let bytes = out.get_pk_bytes(i);
+                let low = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                low as i64
+            })
+            .collect();
+        let sums: Vec<i64> = (0..out.count)
+            .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+            .collect();
+        // Canonical signed order: -3, -1, 2.
+        assert_eq!(pks, vec![-3, -1, 2],
+            "signed PK must sort via i64 order, not u128-of-bits order");
+        assert_eq!(sums, vec![30, 10, 20]);
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_float_pk() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_f64pk_i64val();
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+        // total_cmp order: -1.5, -0.0, 1.5. u128-of-bits would interleave
+        // negatives with positives (sign bit flips the natural order).
+        let delta = make_batch_raw_pk(&in_schema, &[
+            (-0.0, 1, 1),
+            (1.5,  1, 2),
+            (-1.5, 1, 3),
+        ], |pk: f64| pk.to_bits() as u128);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::F64, &[], None,
+            None, 0, TypeCode::F64, None, None,
+        );
+
+        assert_eq!(out.count, 3);
+        let pks: Vec<f64> = (0..out.count)
+            .map(|i| {
+                let bytes = out.get_pk_bytes(i);
+                let low = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                f64::from_bits(low)
+            })
+            .collect();
+        let sums: Vec<i64> = (0..out.count)
+            .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+            .collect();
+        // total_cmp ascending.
+        let expected_pks = [-1.5_f64, -0.0_f64, 1.5_f64];
+        for (got, exp) in pks.iter().zip(expected_pks.iter()) {
+            assert_eq!(
+                got.total_cmp(exp), std::cmp::Ordering::Equal,
+                "F64 PK must sort by total_cmp (got {:?}, want {:?})", pks, expected_pks,
+            );
+        }
+        assert_eq!(sums, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn test_reduce_group_by_pk_unsorted_with_retraction() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let in_schema = make_schema_u64_i64();
+        let out_schema = make_pk_sum_out_schema();
+
+        // Build a pre-populated trace_out carrying (pk=5, SUM=100).
+        let mut prev = Batch::with_schema(out_schema, 1);
+        prev.extend_pk(5u128);
+        prev.extend_weight(&1i64.to_le_bytes());
+        prev.extend_null_bmp(&0u64.to_le_bytes());
+        prev.extend_col(0, &100i64.to_le_bytes());
+        prev.count += 1;
+        prev.sorted = true;
+        prev.consolidated = true;
+        let prev_rc = Rc::new(prev);
+        let mut to_ch = CursorHandle::from_owned(&[prev_rc], out_schema);
+
+        // Unsorted delta with pk=5 split across the batch. Pre-fix: emits
+        // TWO `(pk=5, w=-1, SUM=100)` retractions plus split partials.
+        let delta = make_batch_raw_pk(&in_schema, &[
+            (5, 1, 10),
+            (3, 1, 20),
+            (5, 1, 30),
+        ], |pk: u64| pk as u128);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, to_ch.cursor_mut(),
+            &in_schema, &out_schema,
+            &[0u32], &[agg],
+            None, false, TypeCode::U64, &[], None,
+            None, 0, TypeCode::U64, None, None,
+        );
+
+        // Expected: one retract (pk=5, w=-1, SUM=100), one emit (pk=5,
+        // w=+1, SUM=140), one emit (pk=3, w=+1, SUM=20). Order is canonical:
+        // pk=3 first, then pk=5 (retract+emit).
+        assert_eq!(out.count, 3, "exactly one retract + one new emit for pk=5 plus pk=3 emit");
+
+        let mut by_pk_w: Vec<(u128, i64, i64)> = (0..out.count)
+            .map(|i| {
+                let pk = u128::from_le_bytes(out.get_pk_bytes(i).try_into().unwrap());
+                let w = out.get_weight(i);
+                let sum = crate::util::read_i64_le(out.col_data(0), i * 8);
+                (pk, w, sum)
+            })
+            .collect();
+        by_pk_w.sort_by_key(|&(pk, w, _)| (pk, w));
+
+        assert_eq!(by_pk_w, vec![
+            (3, 1, 20),
+            (5, -1, 100),
+            (5, 1, 140),
+        ], "single retract+emit for pk=5 (sum 10+30+100=140), single emit for pk=3");
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_owned / op_gather_reduce canonical PK order
+    //
+    // sort_owned (used by op_gather_reduce) sorts indices by `pks[a].cmp(...)`
+    // on a u128 widen, which violates canonical order for signed/float
+    // single-col PKs and for compound PKs (where pk_indices priority is
+    // reversed by u128 LE byte layout).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sort_owned_signed_pk_canonical_order() {
+        let schema = make_schema_i64pk_i64val();
+        let batch = make_batch_raw_pk(&schema, &[
+            (-1, 1, 10),
+            (2, 1, 20),
+            (-3, 1, 30),
+        ], |pk: i64| (pk as u64) as u128);
+        let sorted = sort_owned(&batch, &schema);
+
+        assert!(sorted.sorted, "sort_owned must set the sorted flag");
+        assert_eq!(sorted.count, 3);
+        let pks: Vec<i64> = (0..sorted.count)
+            .map(|i| {
+                let b = sorted.get_pk_bytes(i);
+                u64::from_le_bytes(b[0..8].try_into().unwrap()) as i64
+            })
+            .collect();
+        assert_eq!(pks, vec![-3, -1, 2],
+            "signed PK rows must come out in signed-ascending order");
+    }
+
+    #[test]
+    fn test_sort_owned_compound_pk_canonical_order() {
+        let schema = make_compound_pk_2xu64_schema();
+        let mut batch = make_batch_compound_2xu64(&schema, &[
+            (2, 1, 1, 20),
+            (1, 2, 1, 10),
+        ]);
+        batch.sorted = false;
+        let sorted = sort_owned(&batch, &schema);
+
+        assert!(sorted.sorted);
+        assert_eq!(sorted.count, 2);
+        let p0 = sorted.get_pk_bytes(0);
+        let p1 = sorted.get_pk_bytes(1);
+        let p0_c0 = u64::from_le_bytes(p0[0..8].try_into().unwrap());
+        let p0_c1 = u64::from_le_bytes(p0[8..16].try_into().unwrap());
+        let p1_c0 = u64::from_le_bytes(p1[0..8].try_into().unwrap());
+        let p1_c1 = u64::from_le_bytes(p1[8..16].try_into().unwrap());
+        assert_eq!((p0_c0, p0_c1), (1, 2),
+            "compound-PK canonical sort follows pk_indices order, not u128 LE byte order");
+        assert_eq!((p1_c0, p1_c1), (2, 1));
+    }
+
+    #[test]
+    fn test_gather_reduce_signed_pk_output_sorted_flag() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        // op_gather_reduce's partial schema = output schema. Use a signed PK
+        // so the sort_owned path inside must route through make_slow_pk_cmp.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+        let empty_out = Rc::new(Batch::empty(schema.num_payload_cols(), 16));
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
+
+        // Unsorted partial-reduce input with negative PKs interleaved.
+        let mut partial = Batch::with_schema(schema, 3);
+        for &(pk, sum) in &[(-1i64, 10i64), (2i64, 20i64), (-3i64, 30i64)] {
+            partial.extend_pk((pk as u64) as u128);
+            partial.extend_weight(&1i64.to_le_bytes());
+            partial.extend_null_bmp(&0u64.to_le_bytes());
+            partial.extend_col(0, &sum.to_le_bytes());
+            partial.count += 1;
+        }
+        partial.sorted = false;
+        partial.consolidated = false;
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+
+        let out = op_gather_reduce(&partial, to_ch.cursor_mut(), &schema, &[agg]);
+
+        assert_eq!(out.count, 3);
+        let pks: Vec<i64> = (0..out.count)
+            .map(|i| {
+                let b = out.get_pk_bytes(i);
+                u64::from_le_bytes(b[0..8].try_into().unwrap()) as i64
+            })
+            .collect();
+        assert_eq!(pks, vec![-3, -1, 2],
+            "gather-reduce output must be in canonical signed-PK order for output.sorted=true to be truthful");
     }
 }
