@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
     CHECK(sid != 0, "gnitz_create_schema", conn);
 
     /* 3. Build table schema: col 0 = id:U64 (pk), col 1 = val:I64 */
-    GnitzSchema *sch = gnitz_schema_new(0 /* pk_index */);
+    uint32_t pk_cols[1] = { 0 };
+    GnitzSchema *sch = gnitz_schema_new(1 /* pk_count */, pk_cols);
     CHECK(sch != NULL, "gnitz_schema_new", conn);
     CHECK(gnitz_schema_add_col(sch, "id",  GNITZ_TYPE_U64, 0) == 0,
           "add col id",  conn);
@@ -73,14 +74,15 @@ int main(int argc, char **argv) {
     GnitzBatch *push_batch = gnitz_batch_new(sch);
     CHECK(push_batch != NULL, "gnitz_batch_new", conn);
 
+    /* PK stride for a single U64 column is 8 bytes; gnitz expects LE on the wire. */
     for (uint64_t i = 1; i <= 10; i++) {
         int64_t val = (int64_t)i * 10;
+        uint64_t pk_le = i;
         CHECK(gnitz_batch_append_row(push_batch,
-                                     i,           /* pk_lo */
-                                     0,           /* pk_hi */
-                                     1,           /* weight */
-                                     0,           /* null_mask */
-                                     &val,        /* col_data (non-pk cols) */
+                                     (const uint8_t*)&pk_le, /* pk_bytes */
+                                     1,                      /* weight */
+                                     0,                      /* null_mask */
+                                     &val,                   /* col_data */
                                      sizeof(val)) == 0,
               "batch_append_row", conn);
     }
@@ -101,8 +103,14 @@ int main(int argc, char **argv) {
     /* Collect (pk, val) pairs and sort to handle any server ordering. */
     uint64_t got_pk[10];
     int64_t  got_val[10];
+    size_t pk_stride = gnitz_batch_pk_stride(result);
+    CHECKEQ((long long)pk_stride, 8LL, "pk_stride", conn);
     for (size_t r = 0; r < n; r++) {
-        got_pk[r]  = gnitz_batch_get_pk_lo(result, r);
+        uint64_t pk_le = 0;
+        CHECK(gnitz_batch_get_pk_bytes(result, r,
+                                       (uint8_t*)&pk_le, sizeof(pk_le)) == 0,
+              "get_pk_bytes", conn);
+        got_pk[r]  = pk_le;
         got_val[r] = gnitz_batch_get_i64(result, 1 /* col_idx */, r);
         CHECK(gnitz_last_error() == NULL, "get_i64 error", conn);
     }

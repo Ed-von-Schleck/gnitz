@@ -20,7 +20,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
-use gnitz_core::{ColData, ColumnDef, Schema, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::SqlPlanner;
 
@@ -40,6 +40,8 @@ pub const GNITZ_TYPE_I64: u32    = 9;
 pub const GNITZ_TYPE_F64: u32    = 10;
 pub const GNITZ_TYPE_STRING: u32 = 11;
 pub const GNITZ_TYPE_U128: u32   = 12;
+pub const GNITZ_TYPE_UUID: u32   = 13;
+pub const GNITZ_TYPE_BLOB: u32   = 14;
 
 // ---------------------------------------------------------------------------
 // Opaque handle types
@@ -159,15 +161,45 @@ pub unsafe extern "C" fn gnitz_disconnect(conn: *mut GnitzConn) {
 // Schema
 // ---------------------------------------------------------------------------
 
-/// Create a new empty schema. pk_index is the 0-based index of the PK column
-/// (must equal the index of the column that will be added for the primary key).
+/// Create a new empty schema with one or more PK columns.
+///
+/// `pk_cols[0..pk_count]` are 0-based column indices listed in compound-key
+/// **sort order** — that is, `pk_cols=[2, 1]` means "sort by column 2 first,
+/// then column 1". Single-PK callers pass `pk_count = 1` and a pointer to the
+/// one PK index.
+///
+/// In-bounds validation (each index must reference an existing column) is
+/// deferred until `gnitz_batch_new`, because columns are added *after* schema
+/// creation. Duplicates and `pk_count` out of range are caught here.
+///
+/// Returns NULL on error.
 #[no_mangle]
-pub unsafe extern "C" fn gnitz_schema_new(pk_index: u32) -> *mut GnitzSchema {
+pub unsafe extern "C" fn gnitz_schema_new(
+    pk_count: u32,
+    pk_cols:  *const u32,
+) -> *mut GnitzSchema {
     clear_error();
-    Box::into_raw(Box::new(GnitzSchema(Schema {
-        columns:  vec![],
-        pk_cols:  vec![pk_index as usize],
-    })))
+    if pk_cols.is_null() || pk_count == 0 || pk_count as usize > gnitz_core::MAX_PK_COLUMNS {
+        set_error("gnitz_schema_new: invalid pk_count or null pk_cols");
+        return std::ptr::null_mut();
+    }
+    let cols = unsafe { std::slice::from_raw_parts(pk_cols, pk_count as usize) };
+    let pk_cols: Vec<usize> = cols.iter().map(|&c| c as usize).collect();
+    // Defer ncols check to gnitz_batch_new (columns are added after this
+    // returns); validate non-empty / arity / duplicates now.
+    if let Err(e) = Schema::validate_pk_cols(&pk_cols, usize::MAX) {
+        set_error(format!("gnitz_schema_new: {e}"));
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(GnitzSchema(Schema { columns: vec![], pk_cols })))
+}
+
+/// Returns the packed PK stride of the schema in bytes (sum of each PK
+/// column's wire stride). Returns 0 if `schema` is null.
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_schema_pk_stride(schema: *const GnitzSchema) -> usize {
+    if schema.is_null() { return 0; }
+    unsafe { (*schema).0.pk_stride() }
 }
 
 /// Append a column to the schema. type_code must be a GNITZ_TYPE_* constant.
@@ -216,33 +248,65 @@ pub unsafe extern "C" fn gnitz_schema_free(schema: *mut GnitzSchema) {
 pub unsafe extern "C" fn gnitz_batch_new(schema: *const GnitzSchema) -> *mut GnitzBatch {
     clear_error();
     let s = check_ptr!(schema, std::ptr::null_mut());
+    let ncols = s.0.columns.len();
+    if let Err(e) = Schema::validate_pk_cols(&s.0.pk_cols, ncols) {
+        set_error(format!("gnitz_batch_new: {e}"));
+        return std::ptr::null_mut();
+    }
+    let payload_count = ncols - s.0.pk_cols.len();
+    if payload_count > 64 {
+        set_error("gnitz_batch_new: null bitmap supports at most 64 payload columns");
+        return std::ptr::null_mut();
+    }
     let schema_clone = s.0.clone();
     let batch = ZSetBatch::new(&schema_clone);
     Box::into_raw(Box::new(GnitzBatch { schema: schema_clone, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }))
 }
 
-/// Append one row. col_data is a flat buffer of all non-PK column values in
-/// schema order, packed as little-endian bytes (stride = TypeCode::wire_stride).
-/// String and U128 columns are NOT supported here; use gnitz_batch_set_string.
+/// Returns the packed PK stride of the batch's underlying schema in bytes.
+/// Returns 0 if `batch` is null.
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_batch_pk_stride(batch: *const GnitzBatch) -> usize {
+    if batch.is_null() { return 0; }
+    unsafe { (*batch).schema.pk_stride() }
+}
+
+/// Append one row.
+///
+/// - `pk_bytes` must point to exactly `gnitz_schema_pk_stride(schema)` bytes
+///   of packed PK column values in compound-key order.
+/// - `col_data` is a flat buffer of all non-PK fixed-width column values in
+///   schema order, packed as little-endian bytes
+///   (stride = `TypeCode::wire_stride`).
+/// - String columns are NOT supported here; use `gnitz_batch_set_string` (and
+///   `gnitz_batch_rollback_last_row` to recover if a subsequent set_string
+///   call fails).
+/// - `null_mask` bits map to **payload column indices** (dense, 0-based,
+///   skipping all PK columns).
+///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_append_row(
     batch:        *mut GnitzBatch,
-    pk_lo:        u64,
-    pk_hi:        u64,
+    pk_bytes:     *const u8,
     weight:       i64,
     null_mask:    u64,
     col_data:     *const c_void,
     col_data_len: usize,
 ) -> c_int {
     let b = check_ptr_mut!(batch, -1);
+    if pk_bytes.is_null() { set_error("pk_bytes is null"); return -1; }
+    let pk_stride = b.schema.pk_stride();
+    let pk_slice  = unsafe { std::slice::from_raw_parts(pk_bytes, pk_stride) };
+    let t         = gnitz_core::PkTuple::from_bytes(pk_slice);
+
     let col_data_slice: &[u8] = if col_data_len == 0 {
         &[]
     } else {
         if col_data.is_null() { set_error("col_data is null"); return -1; }
         unsafe { std::slice::from_raw_parts(col_data as *const u8, col_data_len) }
     };
-    match append_row_inner(b, pk_lo, pk_hi, weight, null_mask, col_data_slice) {
+    match append_row_inner(b, t, weight, null_mask, col_data_slice) {
         Ok(())  => 0,
         Err(e)  => { set_error(e); -1 }
     }
@@ -250,24 +314,22 @@ pub unsafe extern "C" fn gnitz_batch_append_row(
 
 fn append_row_inner(
     b:         &mut GnitzBatch,
-    pk_lo:     u64,
-    pk_hi:     u64,
+    pk:        gnitz_core::PkTuple,
     weight:    i64,
     null_mask: u64,
     col_data:  &[u8],
 ) -> Result<(), String> {
-    b.batch.pks.push_u128(pk_lo as u128 | (pk_hi as u128) << 64);
+    b.batch.pks.push_tuple(&pk);
     b.batch.weights.push(weight);
     b.batch.nulls.push(null_mask);
 
-    let pk_idx = b.schema.pk_index_single();
     let mut offset = 0usize;
 
-    for (ci, col) in b.batch.columns.iter_mut().enumerate() {
-        if ci == pk_idx { continue; }
+    for ci in 0..b.batch.columns.len() {
+        if b.schema.is_pk_col(ci) { continue; }
         let tc     = b.schema.columns[ci].type_code;
         let stride = tc.wire_stride();
-        match col {
+        match &mut b.batch.columns[ci] {
             ColData::Fixed(buf) => {
                 if offset + stride > col_data.len() {
                     return Err(format!(
@@ -297,6 +359,19 @@ fn append_row_inner(
         }
     }
     Ok(())
+}
+
+/// Truncate the last partially-written row from a batch. Call this when a
+/// follow-up `gnitz_batch_set_string` fails after `gnitz_batch_append_row`
+/// succeeded, so the batch is left at a consistent row count and may be
+/// reused or retried.
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_batch_rollback_last_row(batch: *mut GnitzBatch) {
+    if batch.is_null() { return; }
+    let b = unsafe { &mut *batch };
+    let n = b.batch.pks.len();
+    if n == 0 { return; }
+    b.batch.truncate(n - 1, &b.schema);
 }
 
 /// Set a String column value for the last appended row.
@@ -346,18 +421,25 @@ pub unsafe extern "C" fn gnitz_batch_len(batch: *const GnitzBatch) -> usize {
     check_ptr!(batch, 0).batch.len()
 }
 
-/// pk_lo (lower 64 bits of the 128-bit PK) for row i. Returns 0 on out-of-range.
+/// Copy the raw packed PK bytes for `row` into `buf[0..pk_stride]`.
+///
+/// Returns 0 on success, -1 on error (`buf` null, `buf_len` < `pk_stride`,
+/// or `row` out of range). Query `pk_stride` with `gnitz_batch_pk_stride`.
 #[no_mangle]
-pub unsafe extern "C" fn gnitz_batch_get_pk_lo(batch: *const GnitzBatch, row: usize) -> u64 {
-    let b = check_ptr!(batch, 0);
-    if row < b.batch.pks.len() { b.batch.pks.get(row) as u64 } else { 0 }
-}
-
-/// pk_hi (upper 64 bits of the 128-bit PK) for row i. Returns 0 on out-of-range.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_batch_get_pk_hi(batch: *const GnitzBatch, row: usize) -> u64 {
-    let b = check_ptr!(batch, 0);
-    if row < b.batch.pks.len() { (b.batch.pks.get(row) >> 64) as u64 } else { 0 }
+pub unsafe extern "C" fn gnitz_batch_get_pk_bytes(
+    batch:   *const GnitzBatch,
+    row:     usize,
+    buf:     *mut u8,
+    buf_len: usize,
+) -> c_int {
+    let b = check_ptr!(batch, -1);
+    if row >= b.batch.pks.len() { set_error("row out of range"); return -1; }
+    if buf.is_null() { set_error("null buffer"); return -1; }
+    let pk_stride = b.schema.pk_stride();
+    if buf_len < pk_stride { set_error("buffer too small for PK stride"); return -1; }
+    let t = b.batch.pks.get_tuple(row, pk_stride as u8);
+    unsafe { std::ptr::copy_nonoverlapping(t.buf.as_ptr(), buf, pk_stride); }
+    0
 }
 
 /// Weight for row i.
@@ -369,6 +451,9 @@ pub unsafe extern "C" fn gnitz_batch_get_weight(batch: *const GnitzBatch, row: u
 
 /// Read an integer column value as i64 (works for all Fixed integer columns).
 /// Returns 0 and sets last_error on type mismatch or out-of-bounds.
+///
+/// Dispatches on `TypeCode` so unsigned values keep their full range
+/// (a U8 of 200 returns 200, not -56).
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_get_i64(
     batch:   *const GnitzBatch,
@@ -376,18 +461,26 @@ pub unsafe extern "C" fn gnitz_batch_get_i64(
     row:     usize,
 ) -> i64 {
     let b = check_ptr!(batch, 0);
+    if col_idx >= b.batch.columns.len() {
+        set_error("column index out of range");
+        return 0;
+    }
     match b.batch.columns.get(col_idx) {
         Some(ColData::Fixed(buf)) => {
-            let stride = b.schema.columns[col_idx].type_code.wire_stride();
+            let tc     = b.schema.columns[col_idx].type_code;
+            let stride = tc.wire_stride();
             let start  = row * stride;
             if start + stride > buf.len() { set_error("row out of range"); return 0; }
             let slice = &buf[start..start + stride];
-            match stride {
-                1 => slice[0] as i8  as i64,
-                2 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
-                4 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
-                8 => i64::from_le_bytes(slice.try_into().unwrap()),
-                _ => { set_error("unexpected stride"); 0 }
+            match tc {
+                TypeCode::U8  => slice[0] as u64 as i64,
+                TypeCode::I8  => slice[0] as i8 as i64,
+                TypeCode::U16 => u16::from_le_bytes(slice.try_into().unwrap()) as u64 as i64,
+                TypeCode::I16 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
+                TypeCode::U32 => u32::from_le_bytes(slice.try_into().unwrap()) as u64 as i64,
+                TypeCode::I32 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
+                TypeCode::U64 | TypeCode::I64 => i64::from_le_bytes(slice.try_into().unwrap()),
+                _ => { set_error("unsupported integer column type"); 0 }
             }
         }
         _ => { set_error("column is not a Fixed integer column"); 0 }
@@ -404,6 +497,10 @@ pub unsafe extern "C" fn gnitz_batch_get_string(
     row:     usize,
 ) -> *const c_char {
     let b = check_ptr!(batch, std::ptr::null());
+    if col_idx >= b.batch.columns.len() {
+        set_error("column index out of range");
+        return std::ptr::null();
+    }
     match b.batch.columns.get(col_idx) {
         Some(ColData::Strings(v)) => match v.get(row) {
             Some(Some(s)) => {
@@ -478,10 +575,7 @@ pub unsafe extern "C" fn gnitz_create_table(
     clear_error();
     let c = check_ptr_mut!(conn, 0);
     let s = check_ptr!(schema, 0);
-    // C API surface is single-PK; pass a one-element slice to satisfy the
-    // shared compound-PK signature. `pk_index_single()` asserts the schema
-    // has exactly one PK column, which the C API contract already requires.
-    let pk_slice = [s.0.pk_index_single() as u32];
+    let pk_slice: Vec<u32> = s.0.pk_cols.iter().map(|&c| c as u32).collect();
     match c.0.create_table(
         cstr(schema_name), cstr(table_name),
         &s.0.columns, &pk_slice, unique_pk != 0,
@@ -557,27 +651,40 @@ pub unsafe extern "C" fn gnitz_scan(
     }
 }
 
-/// Delete rows by primary key. pks_lo and pks_hi must each contain n_rows entries.
+/// Delete rows by primary key.
+///
+/// `pks_bytes` is a flat buffer of `n_rows * gnitz_schema_pk_stride(schema)`
+/// bytes containing packed PK values for each row.
+///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_delete(
-    conn:     *mut GnitzConn,
-    table_id: u64,
-    schema:   *const GnitzSchema,
-    pks_lo:   *const u64,
-    pks_hi:   *const u64,
-    n_rows:   usize,
+    conn:      *mut GnitzConn,
+    table_id:  u64,
+    schema:    *const GnitzSchema,
+    pks_bytes: *const u8,
+    n_rows:    usize,
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
     let s = check_ptr!(schema, -1);
-    if pks_lo.is_null() || pks_hi.is_null() { set_error("null pk arrays"); return -1; }
-    let lo = unsafe { std::slice::from_raw_parts(pks_lo, n_rows) };
-    let hi = unsafe { std::slice::from_raw_parts(pks_hi, n_rows) };
-    // C ABI is single-PK only; build the matching variant from the U128s.
+    let stride = s.0.pk_stride();
+    if n_rows > 0 && pks_bytes.is_null() {
+        set_error("pks_bytes is null");
+        return -1;
+    }
+    let flat = if n_rows > 0 {
+        let Some(total_bytes) = n_rows.checked_mul(stride) else {
+            set_error("gnitz_delete: n_rows * stride overflows usize");
+            return -1;
+        };
+        unsafe { std::slice::from_raw_parts(pks_bytes, total_bytes) }
+    } else {
+        &[]
+    };
     let mut pk_col = gnitz_core::PkColumn::empty_for_schema(&s.0);
-    for (lo, hi) in lo.iter().copied().zip(hi.iter().copied()) {
-        pk_col.push_u128(lo as u128 | (hi as u128) << 64);
+    for chunk in flat.chunks_exact(stride) {
+        pk_col.push_tuple(&gnitz_core::PkTuple::from_bytes(chunk));
     }
     match c.0.delete(table_id, &s.0, pk_col) {
         Ok(()) => 0, Err(e) => { set_error(e); -1 }
@@ -944,31 +1051,50 @@ pub unsafe extern "C" fn gnitz_circuit_free(c: *mut GnitzCircuit) {
 // Seek (point lookup)
 // ---------------------------------------------------------------------------
 
-/// Point lookup by primary key. Returns a GnitzBatch with 0 or 1 rows.
-/// Returns NULL on error (check gnitz_last_error).
-/// Caller must free with gnitz_batch_free.
+/// Point lookup by primary key. Returns a GnitzBatch with 0 or 1 rows via
+/// `out_batch` (caller must free with `gnitz_batch_free`).
+///
+/// `pk_bytes` must point to `pk_len` bytes (`1 <= pk_len <= MAX_PK_BYTES`)
+/// containing the packed PK in compound-key order. Returns 0 on success, -1
+/// on error (check `gnitz_last_error`).
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_seek(
     conn:      *mut GnitzConn,
     table_id:  u64,
-    pk_lo:     u64,
-    pk_hi:     u64,
+    pk_bytes:  *const u8,
+    pk_len:    usize,
     out_batch: *mut *mut GnitzBatch,
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    let pk_tuple = gnitz_core::PkTuple::from_u128_narrow(pk_lo as u128 | (pk_hi as u128) << 64);
-    match c.0.seek(table_id, &pk_tuple) {
+    if pk_bytes.is_null() || pk_len == 0 || pk_len > gnitz_core::MAX_PK_BYTES {
+        set_error("gnitz_seek: invalid pk_bytes or pk_len");
+        return -1;
+    }
+    let pk_slice = unsafe { std::slice::from_raw_parts(pk_bytes, pk_len) };
+    let t        = gnitz_core::PkTuple::from_bytes(pk_slice);
+    match c.0.seek(table_id, &t) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_cols: vec![0] });
+                let used_schema = server_schema.unwrap_or_else(empty_schema_sentinel);
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
-                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
+                *out_batch = Box::into_raw(Box::new(GnitzBatch {
+                    schema: used_schema, batch,
+                    cstring_cache: std::cell::RefCell::new(Vec::new()),
+                }));
             }
             0
         }
         Err(e) => { set_error(e); -1 }
     }
+}
+
+/// Placeholder schema returned to C callers when the server omits the schema
+/// in a seek/seek_by_index response (today: no row matched). `pk_cols` is
+/// empty so `pk_stride()` returns 0 instead of panicking on the unindexed
+/// `self.columns[0]`.
+fn empty_schema_sentinel() -> Schema {
+    Schema { columns: vec![], pk_cols: vec![] }
 }
 
 /// Low-level seek on secondary index.
@@ -991,7 +1117,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
     match c.0.seek_by_index(table_id, col_idx, key_lo as u128 | (key_hi as u128) << 64) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_cols: vec![0] });
+                let used_schema = server_schema.unwrap_or_else(empty_schema_sentinel);
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
                 *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
             }
@@ -1132,5 +1258,273 @@ mod tests {
         let bytes: [u8; 2] = [0xFF, 0x00];
         let ptr = bytes.as_ptr() as *const c_char;
         assert!(cstr_checked(ptr).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Compound-PK / pk_bytes API surface
+    // -----------------------------------------------------------------
+
+    /// Helper: drive `gnitz_schema_new` + `gnitz_schema_add_col` to build a
+    /// schema the way C callers would (so tests exercise the FFI, not just
+    /// the internal `Schema` struct).
+    unsafe fn build_schema(pk_cols: &[u32], cols: &[(&str, u32, bool)]) -> *mut GnitzSchema {
+        let sch = gnitz_schema_new(pk_cols.len() as u32, pk_cols.as_ptr());
+        assert!(!sch.is_null(), "gnitz_schema_new returned NULL");
+        for (name, tc, nullable) in cols {
+            let cname = CString::new(*name).unwrap();
+            assert_eq!(
+                gnitz_schema_add_col(sch, cname.as_ptr(), *tc as c_int,
+                                     if *nullable { 1 } else { 0 }),
+                0,
+                "gnitz_schema_add_col failed for {}", name,
+            );
+        }
+        sch
+    }
+
+    #[test]
+    fn schema_new_rejects_zero_pk_count() {
+        let cols: [u32; 1] = [0];
+        let sch = unsafe { gnitz_schema_new(0, cols.as_ptr()) };
+        assert!(sch.is_null());
+    }
+
+    #[test]
+    fn schema_new_rejects_null_pk_cols() {
+        let sch = unsafe { gnitz_schema_new(1, std::ptr::null()) };
+        assert!(sch.is_null());
+    }
+
+    #[test]
+    fn schema_new_rejects_duplicate_pk_cols() {
+        let cols: [u32; 2] = [0, 0];
+        let sch = unsafe { gnitz_schema_new(2, cols.as_ptr()) };
+        assert!(sch.is_null());
+    }
+
+    #[test]
+    fn schema_new_rejects_excess_pk_count() {
+        // MAX_PK_COLUMNS is 5; ask for 6.
+        let cols: [u32; 6] = [0, 1, 2, 3, 4, 5];
+        let sch = unsafe { gnitz_schema_new(6, cols.as_ptr()) };
+        assert!(sch.is_null());
+    }
+
+    #[test]
+    fn schema_pk_stride_single_u64() {
+        unsafe {
+            let pk: [u32; 1] = [0];
+            let sch = build_schema(&pk, &[
+                ("id", GNITZ_TYPE_U64, false),
+                ("v",  GNITZ_TYPE_I64, false),
+            ]);
+            assert_eq!(gnitz_schema_pk_stride(sch), 8);
+            gnitz_schema_free(sch);
+        }
+    }
+
+    #[test]
+    fn schema_pk_stride_compound_u64_u32() {
+        unsafe {
+            let pk: [u32; 2] = [0, 1];
+            let sch = build_schema(&pk, &[
+                ("a", GNITZ_TYPE_U64, false),
+                ("b", GNITZ_TYPE_U32, false),
+                ("v", GNITZ_TYPE_I64, false),
+            ]);
+            assert_eq!(gnitz_schema_pk_stride(sch), 12);
+            gnitz_schema_free(sch);
+        }
+    }
+
+    #[test]
+    fn schema_pk_stride_null_returns_zero() {
+        assert_eq!(unsafe { gnitz_schema_pk_stride(std::ptr::null()) }, 0);
+        assert_eq!(unsafe { gnitz_batch_pk_stride(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn batch_new_rejects_oob_pk_cols() {
+        unsafe {
+            // PK index 5, but the schema only has 2 columns.
+            let pk: [u32; 1] = [5];
+            let sch = gnitz_schema_new(1, pk.as_ptr());
+            assert!(!sch.is_null());
+            let id = CString::new("id").unwrap();
+            let v  = CString::new("v").unwrap();
+            assert_eq!(gnitz_schema_add_col(sch, id.as_ptr(), GNITZ_TYPE_U64 as c_int, 0), 0);
+            assert_eq!(gnitz_schema_add_col(sch, v.as_ptr(),  GNITZ_TYPE_I64 as c_int, 0), 0);
+            let b = gnitz_batch_new(sch);
+            assert!(b.is_null());
+            gnitz_schema_free(sch);
+        }
+    }
+
+    #[test]
+    fn batch_get_i64_unsigned_above_signed_range() {
+        // U8 column with value 200 must return 200, not -56 (sign-extension bug).
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::U8,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        let pk = gnitz_core::PkTuple::from_u128(8, 1u128);
+        batch.pks.push_tuple(&pk);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] { buf.push(200u8); }
+        let b = Box::into_raw(Box::new(GnitzBatch {
+            schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()),
+        }));
+        assert_eq!(unsafe { gnitz_batch_get_i64(b, 1, 0) }, 200);
+        unsafe { drop(Box::from_raw(b)); }
+    }
+
+    #[test]
+    fn batch_get_i64_signed_negative_i8() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I8,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        let pk = gnitz_core::PkTuple::from_u128(8, 1u128);
+        batch.pks.push_tuple(&pk);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.push((-56i8) as u8);
+        }
+        let b = Box::into_raw(Box::new(GnitzBatch {
+            schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()),
+        }));
+        assert_eq!(unsafe { gnitz_batch_get_i64(b, 1, 0) }, -56);
+        unsafe { drop(Box::from_raw(b)); }
+    }
+
+    #[test]
+    fn batch_append_row_then_get_pk_bytes_single_u64() {
+        unsafe {
+            let pk_cols: [u32; 1] = [0];
+            let sch = build_schema(&pk_cols, &[
+                ("id", GNITZ_TYPE_U64, false),
+                ("v",  GNITZ_TYPE_I64, false),
+            ]);
+            let b = gnitz_batch_new(sch);
+            assert!(!b.is_null());
+            let pk_le: u64 = 42;
+            let v: i64 = 1234;
+            let rc = gnitz_batch_append_row(
+                b,
+                &pk_le as *const u64 as *const u8,
+                1, 0,
+                &v as *const i64 as *const c_void,
+                8,
+            );
+            assert_eq!(rc, 0, "append_row failed: {:?}",
+                std::ffi::CStr::from_ptr(gnitz_last_error()).to_string_lossy());
+            assert_eq!(gnitz_batch_pk_stride(b), 8);
+
+            let mut out = [0u8; 8];
+            assert_eq!(gnitz_batch_get_pk_bytes(b, 0, out.as_mut_ptr(), out.len()), 0);
+            assert_eq!(u64::from_le_bytes(out), 42);
+            assert_eq!(gnitz_batch_get_i64(b, 1, 0), 1234);
+
+            // Buffer too small → -1.
+            let mut small = [0u8; 4];
+            assert_eq!(gnitz_batch_get_pk_bytes(b, 0, small.as_mut_ptr(), small.len()), -1);
+
+            gnitz_batch_free(b);
+            gnitz_schema_free(sch);
+        }
+    }
+
+    #[test]
+    fn batch_append_row_then_get_pk_bytes_compound() {
+        unsafe {
+            let pk_cols: [u32; 2] = [0, 1];
+            let sch = build_schema(&pk_cols, &[
+                ("a", GNITZ_TYPE_U64, false),
+                ("b", GNITZ_TYPE_U32, false),
+                ("v", GNITZ_TYPE_I64, false),
+            ]);
+            let b = gnitz_batch_new(sch);
+            assert!(!b.is_null());
+
+            // Packed PK bytes: 8-byte a (LE) || 4-byte b (LE).
+            let mut pk_bytes = [0u8; 12];
+            pk_bytes[..8].copy_from_slice(&7u64.to_le_bytes());
+            pk_bytes[8..].copy_from_slice(&9u32.to_le_bytes());
+            let v: i64 = 555;
+            assert_eq!(
+                gnitz_batch_append_row(b, pk_bytes.as_ptr(), 1, 0,
+                    &v as *const i64 as *const c_void, 8),
+                0,
+            );
+            assert_eq!(gnitz_batch_pk_stride(b), 12);
+            let mut out = [0u8; 12];
+            assert_eq!(gnitz_batch_get_pk_bytes(b, 0, out.as_mut_ptr(), out.len()), 0);
+            assert_eq!(&out[..], &pk_bytes[..]);
+            assert_eq!(gnitz_batch_get_i64(b, 2, 0), 555);
+
+            gnitz_batch_free(b);
+            gnitz_schema_free(sch);
+        }
+    }
+
+    #[test]
+    fn batch_rollback_last_row_restores_lengths() {
+        // Build a (U64 pk, String, U64) schema; append the PK + null mask via
+        // append_row with no payload, then truncate. Verify gnitz_batch_len
+        // drops from 1 → 0.
+        unsafe {
+            let pk_cols: [u32; 1] = [0];
+            let sch = build_schema(&pk_cols, &[
+                ("id",  GNITZ_TYPE_U64,    false),
+                ("name", GNITZ_TYPE_STRING, false),
+                ("v",   GNITZ_TYPE_U64,    false),
+            ]);
+            let b = gnitz_batch_new(sch);
+            assert!(!b.is_null());
+
+            // For a row with a String column we must call set_string after
+            // append_row; emulate the "set_string fails" scenario by
+            // appending then rolling back without ever setting the string.
+            let pk_le: u64 = 1;
+            let v: u64 = 99;
+            // append_row will fail because the schema has a String column —
+            // it should set last_error and we then rollback any partial state.
+            // For this test we instead append PK metadata directly so we can
+            // test rollback against a partially-filled batch.
+            let br = &mut *b;
+            br.batch.pks.push_tuple(&gnitz_core::PkTuple::from_u128(8, pk_le as u128));
+            br.batch.weights.push(1);
+            br.batch.nulls.push(0);
+            // Pretend payload col 2 (the second non-PK col, U64) was written:
+            if let ColData::Fixed(buf) = &mut br.batch.columns[2] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            // col 1 (String) was not written — batch is in an inconsistent
+            // state with 1 pk row but 0 strings; rollback should clear it.
+            assert_eq!(gnitz_batch_len(b), 1);
+
+            gnitz_batch_rollback_last_row(b);
+            assert_eq!(gnitz_batch_len(b), 0);
+            let br2 = &*b;
+            if let ColData::Fixed(buf) = &br2.batch.columns[2] {
+                assert_eq!(buf.len(), 0);
+            } else { panic!("col 2 should be Fixed"); }
+            // Rollback on empty batch is a no-op.
+            gnitz_batch_rollback_last_row(b);
+            assert_eq!(gnitz_batch_len(b), 0);
+
+            gnitz_batch_free(b);
+            gnitz_schema_free(sch);
+        }
     }
 }

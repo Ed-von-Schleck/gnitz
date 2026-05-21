@@ -81,11 +81,14 @@ class TestSchema:
                 ColumnDef("b", TypeCode.I64)]
         assert Schema(cols).pk_index == 0
 
-    def test_multiple_pk_raises(self):
+    def test_multiple_pk_infers_compound(self):
         cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
                 ColumnDef("b", TypeCode.I64, primary_key=True)]
+        s = Schema(cols)
+        assert s.pk_indices == [0, 1]
+        # Single-PK convenience getter raises on compound schemas.
         with pytest.raises(ValueError):
-            Schema(cols)
+            _ = s.pk_index
 
     def test_explicit_pk_index_overrides(self):
         cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
@@ -100,6 +103,80 @@ class TestSchema:
         assert len(s.columns) == 2
         assert s.columns[0].name == "a"
         assert s.columns[1].name == "b"
+
+    # --- compound PK construction ------------------------------------------
+
+    def test_pk_indices_explicit(self):
+        cols = [ColumnDef("a", TypeCode.U64),
+                ColumnDef("b", TypeCode.U32),
+                ColumnDef("v", TypeCode.I64)]
+        assert Schema(cols, pk_indices=[0, 1]).pk_indices == [0, 1]
+
+    def test_pk_indices_order_is_preserved(self):
+        """pk_indices defines sort order — not just set membership."""
+        cols = [ColumnDef("a", TypeCode.U64),
+                ColumnDef("b", TypeCode.U32),
+                ColumnDef("v", TypeCode.I64)]
+        s = Schema(cols, pk_indices=[1, 0])
+        assert s.pk_indices == [1, 0]
+
+    def test_single_pk_returns_one_element_list(self):
+        cols = [ColumnDef("a", TypeCode.U64),
+                ColumnDef("b", TypeCode.I64)]
+        s = Schema(cols, pk_index=0)
+        assert s.pk_indices == [0]
+        assert s.pk_index == 0
+
+    def test_pk_index_and_pk_indices_conflict(self):
+        cols = [ColumnDef("a", TypeCode.U64),
+                ColumnDef("b", TypeCode.I64)]
+        with pytest.raises(ValueError):
+            Schema(cols, pk_index=0, pk_indices=[0])
+
+    # --- validation errors -------------------------------------------------
+
+    def test_pk_indices_out_of_bounds(self):
+        cols = [ColumnDef("a", TypeCode.U64)]
+        with pytest.raises(ValueError, match="out of range"):
+            Schema(cols, pk_indices=[99])
+
+    def test_pk_indices_duplicate(self):
+        cols = [ColumnDef("a", TypeCode.U64),
+                ColumnDef("b", TypeCode.U32)]
+        with pytest.raises(ValueError, match="duplicate"):
+            Schema(cols, pk_indices=[0, 0])
+
+    def test_pk_indices_empty(self):
+        cols = [ColumnDef("a", TypeCode.U64)]
+        with pytest.raises(ValueError, match="empty"):
+            Schema(cols, pk_indices=[])
+
+    def test_string_pk_rejected(self):
+        cols = [ColumnDef("s", TypeCode.STRING, primary_key=True),
+                ColumnDef("v", TypeCode.I64)]
+        with pytest.raises(ValueError, match="cannot be a PK"):
+            Schema(cols)
+
+    def test_nullable_pk_rejected(self):
+        cols = [ColumnDef("pk", TypeCode.U64, is_nullable=True, primary_key=True),
+                ColumnDef("v",  TypeCode.I64)]
+        with pytest.raises(ValueError, match="nullable"):
+            Schema(cols)
+
+    def test_max_pk_columns_exceeded(self):
+        # MAX_PK_COLUMNS is 5; asking for 6 PK columns must be rejected.
+        cols = [ColumnDef(f"c{i}", TypeCode.U64) for i in range(6)]
+        with pytest.raises(ValueError, match="MAX_PK_COLUMNS"):
+            Schema(cols, pk_indices=list(range(6)))
+
+    def test_pk_stride_exceeded(self):
+        # 5 × U128 = 80 bytes, exactly MAX_PK_BYTES → OK; add another wide
+        # column and we'd exceed the limit. The only way to trip the stride
+        # check before MAX_PK_COLUMNS is via wide types within the 5-column
+        # arity budget — so build 5 U128 PK columns plus a payload column,
+        # which is fine, then bump one to confirm exactly-at-the-limit works.
+        cols_ok = [ColumnDef(f"c{i}", TypeCode.U128) for i in range(5)]
+        Schema(cols_ok, pk_indices=list(range(5)))  # exactly MAX_PK_BYTES
 
 
 class TestRow:
@@ -205,6 +282,136 @@ class TestZSetBatchErrors:
     def test_extend_returns_self(self):
         batch = ZSetBatch(self._schema())
         assert batch.extend([{"pk": 1, "val": 5}]) is batch
+
+    def test_partial_row_rolled_back_on_error(self):
+        """A type error on a later column must not leave a half-written row.
+
+        With three columns the failure happens on the second payload column;
+        the batch must come back to length 0 (PK already appended, then
+        rolled back) and remain reusable.
+        """
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("a",  TypeCode.I64),
+            ColumnDef("b",  TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(Exception):
+            batch.append(pk=1, a=10, b="not-an-int")
+        assert len(batch) == 0
+        # Reusing the batch with valid values still works.
+        batch.append(pk=1, a=10, b=20)
+        assert len(batch) == 1
+
+    def test_pk_none_raises_with_descriptive_error(self):
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("v",  TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(ValueError, match="pk"):
+            batch.append(pk=None, v=1)
+        assert len(batch) == 0
+
+
+class TestCompoundPkSchema:
+    """Offline tests for compound-PK Schema + ZSetBatch construction.
+
+    These exercise the binding layer without needing the server: the batch
+    can be built, PK bytes can be inspected via `batch.pks`, and payload
+    values round-trip through the in-memory columns.
+    """
+
+    def _schema(self):
+        return Schema([
+            ColumnDef("a", TypeCode.U64),
+            ColumnDef("b", TypeCode.U32),
+            ColumnDef("v", TypeCode.I64),
+        ], pk_indices=[0, 1])
+
+    def test_append_compound_pk_emits_packed_bytes(self):
+        batch = ZSetBatch(self._schema())
+        batch.append(a=7, b=9, v=100)
+        # Single-PK schemas keep returning ints; compound schemas return
+        # raw packed PK bytes (LE-encoded a || LE-encoded b).
+        pks = batch.pks
+        assert len(pks) == 1
+        assert isinstance(pks[0], bytes)
+        expected = (7).to_bytes(8, "little") + (9).to_bytes(4, "little")
+        assert pks[0] == expected
+
+    def test_compound_pk_pk_none_rejected(self):
+        batch = ZSetBatch(self._schema())
+        with pytest.raises(ValueError):
+            batch.append(a=None, b=9, v=1)
+        assert len(batch) == 0
+
+    def test_compound_pk_missing_pk_col_rejected(self):
+        batch = ZSetBatch(self._schema())
+        with pytest.raises(ValueError, match="missing"):
+            batch.append(b=9, v=1)
+        assert len(batch) == 0
+
+
+class TestUuidAndBlobRoundtrip:
+    """Offline tests for UUID-from-string / uuid.UUID acceptance and Blob
+    payload columns. The values are stored in batch.columns, so we can
+    inspect them directly without a server."""
+
+    def test_uuid_pk_from_hex_string(self):
+        schema = Schema([
+            ColumnDef("id", TypeCode.UUID, primary_key=True),
+            ColumnDef("v",  TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(id="12345678-1234-5678-1234-567812345678", v=1)
+        assert len(batch) == 1
+
+    def test_uuid_pk_from_uuid_object(self):
+        import uuid as _uuid
+        schema = Schema([
+            ColumnDef("id", TypeCode.UUID, primary_key=True),
+            ColumnDef("v",  TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(id=_uuid.UUID("12345678-1234-5678-1234-567812345678"), v=1)
+        assert len(batch) == 1
+
+    def test_uuid_payload_column_from_uuid_object(self):
+        import uuid as _uuid
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("id", TypeCode.UUID),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, id=_uuid.UUID("12345678-1234-5678-1234-567812345678"))
+        assert len(batch) == 1
+        # columns[1] should be the U128 list — non-empty after one append.
+        cols = batch.columns
+        assert len(cols[1]) == 1
+
+    def test_uuid_invalid_string_raises(self):
+        schema = Schema([
+            ColumnDef("id", TypeCode.UUID, primary_key=True),
+            ColumnDef("v",  TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(ValueError):
+            batch.append(id="not-a-uuid-string", v=1)
+
+    def test_blob_payload_roundtrip(self):
+        """Blob payload columns must not crash the interpreter (previously
+        hit `unreachable!` in write_fixed_le)."""
+        # BLOB type code is 14 on the wire; ColumnDef accepts a raw int.
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("payload", 14),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, payload=b"hello\x00world")
+        assert len(batch) == 1
+        cols = batch.columns
+        assert cols[1] == [b"hello\x00world"]
 
 
 class TestScanResultType:

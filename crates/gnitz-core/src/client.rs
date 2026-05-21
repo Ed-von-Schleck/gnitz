@@ -80,6 +80,11 @@ fn idx_tab_schema() -> &'static Schema {
 fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     let pkl = gnitz_wire::unpack_pk_cols(packed);
     let slice = pkl.as_slice();
+    if slice.is_empty() {
+        return Err(ClientError::ServerError(
+            "catalog returned an empty primary key column list".to_string()
+        ));
+    }
     if pkl.decoded_count() != slice.len() {
         return Err(ClientError::ServerError(format!(
             "PK column count {} exceeds maximum 4", pkl.decoded_count()

@@ -39,13 +39,19 @@ typedef struct GnitzCircuit        GnitzCircuit;
 
 #define GNITZ_TYPE_U128 12
 
+#define GNITZ_TYPE_UUID 13
+
+#define GNITZ_TYPE_BLOB 14
+
 const char *gnitz_last_error(void);
 
 GnitzConn *gnitz_connect(const char *socket_path);
 
 void gnitz_disconnect(GnitzConn *conn);
 
-GnitzSchema *gnitz_schema_new(uint32_t pk_index);
+GnitzSchema *gnitz_schema_new(uint32_t pk_count, const uint32_t *pk_cols);
+
+size_t gnitz_schema_pk_stride(const GnitzSchema *schema);
 
 int gnitz_schema_add_col(GnitzSchema *schema, const char *name, int type_code, int nullable);
 
@@ -55,21 +61,22 @@ void gnitz_schema_free(GnitzSchema *schema);
 
 GnitzBatch *gnitz_batch_new(const GnitzSchema *schema);
 
+size_t gnitz_batch_pk_stride(const GnitzBatch *batch);
+
 int gnitz_batch_append_row(GnitzBatch *batch,
-                           uint64_t pk_lo,
-                           uint64_t pk_hi,
+                           const uint8_t *pk_bytes,
                            int64_t weight,
                            uint64_t null_mask,
                            const void *col_data,
                            size_t col_data_len);
 
+void gnitz_batch_rollback_last_row(GnitzBatch *batch);
+
 int gnitz_batch_set_string(GnitzBatch *batch, size_t col_idx, const char *value);
 
 size_t gnitz_batch_len(const GnitzBatch *batch);
 
-uint64_t gnitz_batch_get_pk_lo(const GnitzBatch *batch, size_t row);
-
-uint64_t gnitz_batch_get_pk_hi(const GnitzBatch *batch, size_t row);
+int gnitz_batch_get_pk_bytes(const GnitzBatch *batch, size_t row, uint8_t *buf, size_t buf_len);
 
 int64_t gnitz_batch_get_weight(const GnitzBatch *batch, size_t row);
 
@@ -105,8 +112,7 @@ GnitzBatch *gnitz_scan(GnitzConn *conn, uint64_t table_id, const GnitzSchema *sc
 int gnitz_delete(GnitzConn *conn,
                  uint64_t table_id,
                  const GnitzSchema *schema,
-                 const uint64_t *pks_lo,
-                 const uint64_t *pks_hi,
+                 const uint8_t *pks_bytes,
                  size_t n_rows);
 
 uint64_t gnitz_create_view(GnitzConn *conn,
@@ -214,8 +220,8 @@ void gnitz_circuit_free(GnitzCircuit *c);
 
 int gnitz_seek(GnitzConn *conn,
                uint64_t table_id,
-               uint64_t pk_lo,
-               uint64_t pk_hi,
+               const uint8_t *pk_bytes,
+               size_t pk_len,
                GnitzBatch **out_batch);
 
 int gnitz_seek_by_index(GnitzConn *conn,

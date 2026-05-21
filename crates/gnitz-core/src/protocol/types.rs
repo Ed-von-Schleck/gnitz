@@ -126,6 +126,26 @@ impl Schema {
         cols.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| cols.contains(p))
     }
 
+    /// Validate a candidate PK index list against the schema's arity and
+    /// column count constraints. Shared by all FFI surfaces (capi, py) so the
+    /// rules — non-empty, ≤ `MAX_PK_COLUMNS`, all indices `< ncols`, no
+    /// duplicates — stay in one place. `ncols` is passed in because the C ABI
+    /// builds the PK list before adding columns.
+    pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), &'static str> {
+        if pk_cols.is_empty()                 { return Err("pk_cols must not be empty"); }
+        if pk_cols.len() > MAX_PK_COLUMNS     { return Err("pk_cols exceeds MAX_PK_COLUMNS"); }
+        if pk_cols.iter().any(|&c| c >= ncols) {
+            return Err("pk_cols index out of range");
+        }
+        // O(n²) is faster than HashSet for n ≤ 5.
+        for i in 0..pk_cols.len() {
+            for j in i + 1..pk_cols.len() {
+                if pk_cols[i] == pk_cols[j] { return Err("pk_cols contains duplicates"); }
+            }
+        }
+        Ok(())
+    }
+
     /// True iff `cols` is a single non-nullable column whose type permits
     /// using the source column directly as the reduce output PK (vs. a
     /// synthetic U128). Mirrors `engine::ops::is_single_col_natural_pk`;
@@ -366,6 +386,16 @@ impl PkTuple {
         Self::from_u128(16, v)
     }
 
+    /// Build a tuple from a raw byte slice. `bytes.len()` becomes the stride.
+    /// Used by all FFI paths that pass packed PK regions through opaque
+    /// byte buffers.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() <= MAX_PK_BYTES);
+        let mut t = Self::new(bytes.len() as u8);
+        t.buf[..bytes.len()].copy_from_slice(bytes);
+        t
+    }
+
     /// On-wire PK region bytes 0..stride.
     pub fn as_bytes(&self) -> &[u8] { &self.buf[..self.stride as usize] }
 
@@ -499,6 +529,27 @@ impl ZSetBatch {
                 (ColData::Bytes(a), ColData::Bytes(b)) => a.extend(b.iter().cloned()),
                 (ColData::U128s(a), ColData::U128s(b)) => a.extend_from_slice(b),
                 _ => panic!("extend_from: column type mismatch"),
+            }
+        }
+    }
+
+    /// Truncate all per-row vectors back to `n` rows. PK column and
+    /// payload columns (including string/blob spill buffers) are kept
+    /// consistent — used to roll back partially appended rows.
+    pub fn truncate(&mut self, n: usize, schema: &Schema) {
+        self.pks.truncate(n);
+        self.weights.truncate(n);
+        self.nulls.truncate(n);
+        for ci in 0..self.columns.len() {
+            if schema.is_pk_col(ci) { continue; }
+            match &mut self.columns[ci] {
+                ColData::Fixed(buf) => {
+                    let stride = schema.columns[ci].type_code.wire_stride();
+                    buf.truncate(n * stride);
+                }
+                ColData::Strings(v) => v.truncate(n),
+                ColData::Bytes(v)   => v.truncate(n),
+                ColData::U128s(v)   => v.truncate(n),
             }
         }
     }

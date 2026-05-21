@@ -370,3 +370,129 @@ def test_compound_pk_multi_worker_partition_routing(client):
         assert seen == sorted(expected)
     finally:
         _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# Binding-layer (Python) introspection + DML by raw PK bytes
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_resolve_preserves_order(client):
+    """`resolve_table` must return a Schema whose `pk_indices` reflects the
+    PRIMARY KEY column order from the DDL — not just set membership.
+
+    Here the payload column comes first in the table definition, and the
+    PRIMARY KEY clause lists `(b, a)` — i.e. sort by b first, then a.
+    The Schema returned to Python must round-trip that as
+    `pk_indices == [2, 1]`.
+    """
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (payload BIGINT, a BIGINT UNSIGNED, b BIGINT UNSIGNED, "
+            "PRIMARY KEY (b, a))",
+            schema_name=sn,
+        )
+        _, schema = client.resolve_table(sn, "t")
+        assert schema.pk_indices == [2, 1]
+        # Compound schema: pk_index getter must raise.
+        with pytest.raises(ValueError):
+            _ = schema.pk_index
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_scan_returns_bytes_pks(client):
+    """Scanning a compound-PK table must return PK column as `list[bytes]`,
+    one packed PK per row (LE-encoded in column-list order)."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 2, 10), (3, 4, 20)",
+            schema_name=sn,
+        )
+        tid, _ = client.resolve_table(sn, "t")
+        sr = client.scan(tid)
+        pks = sr.batch.pks
+        assert len(pks) == 2
+        # Each packed PK is 16 bytes: 8 (a, LE) || 8 (b, LE).
+        for p in pks:
+            assert isinstance(p, bytes)
+            assert len(p) == 16
+        decoded = sorted(
+            (int.from_bytes(p[:8], "little"), int.from_bytes(p[8:], "little"))
+            for p in pks
+        )
+        assert decoded == [(1, 2), (3, 4)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_scalars_on_pk_columns(client):
+    """`scan_result.scalars(pk_col_idx)` must work on PK columns of a
+    compound-PK table (`PkColumn::Bytes` variant)."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 5, 100), (2, 6, 200)",
+            schema_name=sn,
+        )
+        tid, _ = client.resolve_table(sn, "t")
+        sr = client.scan(tid)
+        a_vals = sorted(sr.scalars("a"))
+        b_vals = sorted(sr.scalars("b"))
+        assert a_vals == [1, 2]
+        assert b_vals == [5, 6]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_delete_single_pk_u64_accepts_int(client):
+    """`client.delete(...)` on a single-PK U64 table accepts plain int PKs.
+    The binding must adopt the schema's PK stride so the resulting tuple
+    matches the `PkColumn::U64s` variant in `push_tuple`."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT UNSIGNED PRIMARY KEY, v BIGINT)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (pk, v) VALUES (1, 10), (2, 20), (3, 30)",
+            schema_name=sn,
+        )
+        tid, schema = client.resolve_table(sn, "t")
+        client.delete(tid, schema, [1, 3])
+        sr = client.scan(tid)
+        seen = sorted((row.pk, row.v) for row in sr)
+        assert seen == [(2, 20)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_delete_by_bytes(client):
+    """`client.delete(...)` on a compound-PK table accepts packed PK bytes."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)",
+            schema_name=sn,
+        )
+        tid, schema = client.resolve_table(sn, "t")
+        # Delete (1, 2): 16 bytes packed.
+        pk_bytes = (1).to_bytes(8, "little") + (2).to_bytes(8, "little")
+        client.delete(tid, schema, [pk_bytes])
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 10), (2, 1, 30)]
+    finally:
+        _cleanup(client, sn, "t")
