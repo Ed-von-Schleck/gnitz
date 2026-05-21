@@ -1,15 +1,12 @@
 """End-to-end tests for compound (multi-column) PRIMARY KEY tables.
 
-The compound-PK planner gate (see `plans/compound-pk-planner-gate.md`)
-flips `CREATE TABLE ... PRIMARY KEY (a, b, ...)` from rejected to
-accepted, while leaving CREATE VIEW / CREATE INDEX / FK-references-
-compound paths rejected.
+Covers schema acceptance/rejection (planner gate from
+`plans/compound-pk-planner-gate.md`), INSERT/SELECT/DELETE round-trips,
+byte-path PK delivery, and named-projection through `apply_projection`.
 
-The Python `Schema` shim exposes a single `pk_index` (it calls
-`pk_index_single()` under the hood — explicitly out of scope for this
-plan per the plan's "Out" list). These tests therefore exercise the
-planner-gate behavior through SQL DDL only, not through the schema
-introspection API.
+The Python `Schema` shim still exposes a single `pk_index` (it calls
+`pk_index_single()` under the hood), so the introspection API is not
+exercised here — the tests interact through SQL DDL/DML only.
 """
 
 import os
@@ -494,5 +491,118 @@ def test_compound_pk_delete_by_bytes(client):
         rows_result = next(r for r in results if r["type"] == "Rows")
         seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
         assert seen == [(1, 1, 10), (2, 1, 30)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# Named projection through apply_projection (see plans/apply-projection-compound-pk.md)
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_full_projection(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 2, 100), (3, 4, 200)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT a, b, payload FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 2, 100), (3, 4, 200)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_subset_projection(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 2, 100), (3, 4, 200)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT a, payload FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 100), (3, 200)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_reorder_projection(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 2, 100), (3, 4, 200)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT b, a, payload FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.b, row.a, row.payload) for row in rows_result["rows"])
+        assert seen == [(2, 1, 100), (4, 3, 200)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_payload_reorder_with_nulls(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, "
+            "p1 BIGINT, p2 BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, p1, p2) VALUES (1, 2, NULL, 100), (3, 4, 200, NULL)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT a, b, p2, p1 FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.p2, row.p1) for row in rows_result["rows"])
+        assert seen == [(1, 2, 100, None), (3, 4, None, 200)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_pk_and_payload_reorder_with_nulls(client):
+    """Both PK columns AND payload columns reordered: exercises the
+    `!pk_preserved && !payload_preserved` combination — both rebuild
+    loops fire in the same call."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, "
+            "p1 BIGINT, p2 BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, p1, p2) VALUES (1, 2, NULL, 100), (3, 4, 200, NULL)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT b, a, p2, p1 FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.b, row.a, row.p2, row.p1) for row in rows_result["rows"])
+        assert seen == [(2, 1, 100, None), (4, 3, None, 200)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_no_pk_projection_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql("SELECT payload FROM t", schema_name=sn)
+        assert "must project at least one PRIMARY KEY column" in str(exc.value)
     finally:
         _cleanup(client, sn, "t")
