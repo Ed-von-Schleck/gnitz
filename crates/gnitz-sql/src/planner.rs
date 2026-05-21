@@ -494,20 +494,6 @@ fn execute_create_index(
     };
     let is_unique = ci.unique;
 
-    // Reject before the request reaches the engine. Index circuits pack
-    // `(indexed_value, source_pk)` into a `u128`, so a compound source PK
-    // would silently truncate. `client.create_index` also enforces this
-    // for non-SQL callers; the planner-side check produces the clearer
-    // error pointing at the SQL statement.
-    let (_, owner_schema) = client.resolve_table_or_view_id(schema_name, &table_name)
-        .map_err(GnitzSqlError::Exec)?;
-    if owner_schema.pk_count() >= 2 {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "CREATE INDEX on compound-PK table '{}' is not yet supported",
-            table_name,
-        )));
-    }
-
     let index_id = client.create_index(schema_name, &table_name, &col_name, is_unique)
         .map_err(GnitzSqlError::Exec)?;
 

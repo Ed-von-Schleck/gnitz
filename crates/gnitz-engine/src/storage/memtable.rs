@@ -77,8 +77,14 @@ impl MemTable {
             return Ok(());
         }
         self.check_capacity()?;
-        for i in 0..batch.count {
-            self.bloom.add(batch.get_pk(i));
+        // The bloom filter takes u128; wide-PK (`pk_stride > 16`) batches
+        // can't feed it directly. Skip on wide PKs — `may_contain_pk` is
+        // only ever called for narrow tables today, and a missing bloom
+        // just falls through to the sorted-run search.
+        if !self.schema.pk_is_wide() {
+            for i in 0..batch.count {
+                self.bloom.add(batch.get_pk(i));
+            }
         }
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();

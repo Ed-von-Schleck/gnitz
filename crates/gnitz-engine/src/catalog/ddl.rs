@@ -383,14 +383,20 @@ impl CatalogEngine {
         if projected.count == 0 { return Ok(()); }
 
         if is_unique {
-            // The projected batch's PK is the indexed column value, one row
-            // per source row with net weight +1.  For a unique index to be
-            // valid, every key must appear at most once.
+            // Compound-PK index layout: index PK is `(indexed_key, src_pk…)`.
+            // Uniqueness applies to the leading `indexed_key` slot only —
+            // two rows differing only in their source-PK suffix represent
+            // two source rows sharing the indexed value. `make_index_schema`
+            // always promotes the leading key to ≤16 bytes, so a u128 dedup
+            // token suffices (zero-padded LE for narrower types).
+            let key_size = idx_schema.columns[0].size() as usize;
             let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
             for row in 0..projected.count {
                 if projected.get_weight(row) <= 0 { continue; }
-                let key = projected.get_pk(row);
-                if !seen.insert(key) {
+                let pk_bytes = projected.get_pk_bytes(row);
+                let mut buf = [0u8; 16];
+                buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);
+                if !seen.insert(u128::from_le_bytes(buf)) {
                     return Err(format!(
                         "cannot create unique index: column contains duplicate values (table_id={}, col_idx={})",
                         owner_id, col_idx,

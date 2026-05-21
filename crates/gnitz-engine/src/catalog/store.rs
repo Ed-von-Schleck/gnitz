@@ -255,45 +255,47 @@ impl CatalogEngine {
         Ok(Some(batch))
     }
 
-    /// Index-assisted lookup: look up by secondary index key, resolve to source row.
-    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, key: u128)
+    /// Index-assisted lookup: prefix-scan the index by the leading indexed
+    /// column value, reconstruct the source PK from the index PK suffix,
+    /// and resolve to the source row.
+    ///
+    /// `prefix` is the indexed column value in LE bytes (at most 8 bytes for
+    /// a promoted U64 — `make_index_schema` always promotes to ≤8). The
+    /// trailing bytes of the stored index PK are zero in `batch_project_index`
+    /// for narrow indexed columns, so a `starts_with(prefix)` check terminates
+    /// the scan at the right key boundary.
+    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, prefix: &[u8])
         -> Result<Option<Batch>, String>
     {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
-        // Find matching index circuit
         let ic = entry.index_circuits.iter()
             .find(|ic| ic.col_idx == col_idx)
             .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
 
-        // Seek in index table
-        let idx_table = ic.table_mut();
-        let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
-        cursor.cursor.seek(key);
-        if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key != key {
-            return Ok(None);
+        let src_pk_stride = entry.schema.pk_stride() as usize;
+        if src_pk_stride > 16 {
+            return Err("wide-PK source not yet supported in seek_by_index".to_string());
         }
-        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+        let idx_key_size = ic.index_schema.columns[0].size() as usize;
 
-        // Index payload column 0 is the source table PK.
-        // Read it and resolve to the source row.
-        let idx_schema = &ic.index_schema;
-        let payload_col_idx = idx_schema.payload_col_idx(0);
-        let pk_size = idx_schema.columns[payload_col_idx].size() as usize;
-        let ptr = cursor.cursor.col_ptr(payload_col_idx, pk_size);
-        if ptr.is_null() { return Ok(None); }
-        let src_pk: u128 = if pk_size == 16 {
-            u128::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 16) }.try_into().unwrap())
-        } else {
-            let mut buf = [0u8; 8];
-            let copy_len = pk_size.min(8);
-            unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len) };
-            u64::from_le_bytes(buf) as u128
-        };
+        let idx_table = ic.table_mut();
+        let mut cursor = idx_table.create_cursor_no_compact();
 
-        self.seek_family(table_id, src_pk)
+        while cursor.cursor.seek_first_positive_with_prefix(prefix) {
+            let current_pk = cursor.cursor.current_pk_bytes();
+            let mut src_pk_buf = [0u8; 16];
+            src_pk_buf[..src_pk_stride].copy_from_slice(
+                &current_pk[idx_key_size..idx_key_size + src_pk_stride]
+            );
+            let src_pk = u128::from_le_bytes(src_pk_buf);
+            if let Some(batch) = self.seek_family(table_id, src_pk)? {
+                return Ok(Some(batch));
+            }
+            cursor.cursor.advance();
+        }
+        Ok(None)
     }
 
     /// Flush a table's WAL.

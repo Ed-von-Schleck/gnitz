@@ -142,7 +142,10 @@ impl MappedShard {
 
         let num_cols = schema.num_columns();
         let pk_stride = schema.pk_stride();
-        let num_non_pk = num_cols - 1;
+        // num_payload_cols is non-PK columns; matches what `Batch::regions`
+        // writes (PK + weight + null_bmp + per-payload + blob). The historical
+        // `num_cols - 1` form only held for single-PK schemas.
+        let num_non_pk = schema.num_payload_cols();
         let num_regions = 3 + num_non_pk + 1;
 
         // Parse directory entries

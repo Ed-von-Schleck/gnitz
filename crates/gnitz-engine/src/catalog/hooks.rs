@@ -95,6 +95,8 @@ impl CatalogEngine {
                 let name = self.read_batch_string(batch, i, 0);
                 let path = format!("{}/{}", self.base_dir, name);
                 ensure_dir(&path)?;
+                // Flush the child inode itself, then the parent's dirent.
+                fsync_dir(&path);
                 fsync_dir(&self.base_dir);
             }
         }
@@ -293,22 +295,10 @@ impl CatalogEngine {
                 let entry = self.dag.tables.get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
                 let owner_schema = entry.schema;
-                // Reject before `pk_index_single()` to keep the catalog
-                // worker alive on a crafted `raw_store_ingest` into
-                // `IDX_TAB` against a compound-PK owner. The SQL planner
-                // and `gnitz-core::create_index` close the same path for
-                // ordinary callers; this guard covers the bypass.
-                if owner_schema.pk_indices().len() >= 2 {
-                    return Err(format!(
-                        "Secondary index on compound-PK table (tid={owner_id}) is not \
-                         supported (index entry packs source PK into a u128)"
-                    ));
-                }
                 let source_col_type = owner_schema.columns[source_col_idx as usize].type_code;
-                let source_pk_type = owner_schema.columns[owner_schema.pk_index_single() as usize].type_code;
 
                 let index_key_type = get_index_key_type(source_col_type)?;
-                let idx_schema = make_index_schema(index_key_type, source_pk_type);
+                let idx_schema = make_index_schema(index_key_type, &owner_schema);
 
                 let owner_dir = self.dag.tables.get(&owner_id)
                     .map(|e| e.directory.clone()).unwrap_or_default();

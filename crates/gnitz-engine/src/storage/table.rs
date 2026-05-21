@@ -418,6 +418,18 @@ impl Table {
         Ok(handle)
     }
 
+    /// Read-only cursor that skips `compact_if_needed`. Hot-path queries
+    /// (unique-index existence checks via prefix scan) don't need an
+    /// up-to-date L1; running compaction synchronously inside the validator
+    /// turns its Io / InvalidShard failure modes into spurious "no match"
+    /// answers. The snapshot-driven cursor itself doesn't care whether L0
+    /// has accumulated past the compact threshold.
+    pub fn create_cursor_no_compact(&self) -> CursorHandle {
+        let snapshots = self.memtable.snapshot_runs();
+        let shard_arcs = self.shard_index.all_shard_arcs();
+        read_cursor::create_cursor_from_snapshots(snapshots, &shard_arcs, self.schema)
+    }
+
     /// Return the fully consolidated batch of all live rows, caching the result.
     /// The cache is invalidated on any logical write (upsert or test-helper upsert).
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
@@ -586,23 +598,6 @@ impl Table {
             FoundSource::Shard(arc, _) => arc.blob_slice().as_ptr(),
             FoundSource::None => std::ptr::null(),
         }
-    }
-
-    /// Read the found row's payload column as a u128 (little-endian, zero-padded for col_size < 16).
-    /// Returns None if no row was found.
-    pub fn read_found_u128(&self, payload_col: usize, col_size: usize) -> Option<u128> {
-        let ptr = self.found_col_ptr(payload_col, col_size);
-        if ptr.is_null() { return None; }
-        let val = if col_size == 16 {
-            let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
-            let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
-            ((hi as u128) << 64) | lo as u128
-        } else {
-            let mut buf = [0u8; 8];
-            unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), col_size.min(8)) };
-            u64::from_le_bytes(buf) as u128
-        };
-        Some(val)
     }
 
     // ------------------------------------------------------------------

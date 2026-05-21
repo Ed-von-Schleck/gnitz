@@ -500,34 +500,6 @@ fn test_view_over_compound_pk_join_rejected() {
 }
 
 #[test]
-fn test_index_on_compound_pk_rejected_via_sql() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (mut client, sn) = make_planner(&srv);
-    create_compound_pk_table(&mut client, &sn, "ci_src");
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE INDEX ci_idx ON ci_src (payload)"));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
-}
-
-#[test]
-fn test_index_on_compound_pk_rejected_via_client_direct() {
-    // Closes the gnitz-py / gnitz-capi bypass: client.create_index
-    // also rejects compound-PK owners up front, so a direct caller
-    // cannot reach the server `pk_index_single()` assert.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (mut client, sn) = make_planner(&srv);
-    create_compound_pk_table(&mut client, &sn, "ci_direct");
-    let err = client.create_index(&sn, "ci_direct", "payload", false).unwrap_err();
-    let msg = format!("{}", err);
-    assert!(msg.to_lowercase().contains("compound"), "got: {}", msg);
-    // Server must still be alive (we'd see a connection error here otherwise).
-    assert!(client.resolve_table_id(&sn, "ci_direct").is_ok());
-}
-
-#[test]
 fn test_fk_references_compound_pk_rejected() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);

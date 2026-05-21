@@ -767,7 +767,18 @@ impl WorkerProcess {
 
             SalMessageKind::SeekByIndex => {
                 let col_idx = seek_col_idx as u32;
-                match self.cat().seek_by_index(target_id, col_idx, seek_pk) {
+                // The indexed source column is at most 16 bytes (UUID/U128) and
+                // we never need `seek_pk_extra` here — index keys are always
+                // promoted to ≤16 bytes. Prefix length = source column size,
+                // matching the leading zero-padded bytes written by
+                // `batch_project_index`.
+                let col_size = self.cat()
+                    .get_schema_desc(target_id)
+                    .map(|s| s.columns[col_idx as usize].size() as usize)
+                    .unwrap_or(0);
+                let key_bytes = seek_pk.to_le_bytes();
+                let prefix = &key_bytes[..col_size.min(16)];
+                match self.cat().seek_by_index(target_id, col_idx, prefix) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
@@ -1068,8 +1079,22 @@ impl WorkerProcess {
                     .and_then(|b| b.schema)
                     .or_else(|| self.cat().get_schema_desc(target_id))
                     .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                // Index layout: PK = (indexed-key field, src_pk_cols). The
+                // check-batch carries the promoted indexed value in the low
+                // bytes of its PK. Any positive-weight match means the value
+                // is already in the index. `create_cursor_no_compact` avoids
+                // letting a compaction Io/InvalidShard failure silently turn
+                // a present key into "absent".
+                let owner_schema = self.cat().get_schema_desc(target_id)
+                    .ok_or_else(|| format!("no owner schema for tid={}", target_id))?;
+                let src_col_size = owner_schema.columns[col_idx as usize].size() as usize;
                 let table = unsafe { &mut *index_handle };
-                (schema, filter_by_pk(&batch, schema, n, |pk| table.has_pk(pk)))
+                let mut cursor = table.create_cursor_no_compact();
+                let result = filter_by_pk(&batch, schema, n, |pk_u128| {
+                    let key_bytes = pk_u128.to_le_bytes();
+                    cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..src_col_size])
+                });
+                (schema, result)
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self.cat().get_schema_desc(target_id)

@@ -92,6 +92,10 @@ impl CatalogEngine {
         let children = self.fk_children_of(table_id);
         if children.is_empty() { return Ok(()); }
 
+        let parent_pk_stride = self.dag.tables.get(&table_id)
+            .map(|e| e.schema.pk_stride() as usize)
+            .unwrap_or(8);
+
         for &(child_tid, fk_col_idx) in children {
             let child_entry = match self.dag.tables.get(&child_tid) {
                 Some(e) => e,
@@ -108,12 +112,20 @@ impl CatalogEngine {
                     ));
                 }
             };
+            let idx_key_size = ic.index_schema.columns[0].size() as usize;
+            let prefix_len = parent_pk_stride.min(idx_key_size);
             let idx_table = ic.table_mut();
+            let mut cursor = idx_table.create_cursor_no_compact();
 
             for row in 0..batch.count {
                 if batch.get_weight(row) >= 0 { continue; }
-                let pk = batch.get_pk(row);
-                if idx_table.has_pk(pk) {
+                // Prefix-scan the child's FK index for any positive-weight
+                // entry whose leading column matches this parent's PK.
+                let pk_bytes_full = batch.get_pk_bytes(row);
+                let prefix = &pk_bytes_full[..prefix_len];
+                let referenced = cursor.cursor.seek_first_positive_with_prefix(prefix);
+
+                if referenced {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
                     let (csn, ctn) = self.caches.entity_by_id.get(&child_tid)
@@ -144,37 +156,37 @@ impl CatalogEngine {
         if !has_unique { return Ok(()); }
 
         let schema = entry.schema;
+        let src_pk_stride = schema.pk_stride() as usize;
 
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
             let source_col_idx = ic.col_idx as usize;
             let col_type = schema.columns[source_col_idx].type_code;
             let payload_col = schema.payload_idx(source_col_idx);
-
-            let idx_table = ic.table_mut();
-
             let col_size = schema.columns[source_col_idx].size() as usize;
 
-            // Track seen keys for batch-internal duplicate detection
+            let idx_key_size = ic.index_schema.columns[0].size() as usize;
+            let prefix_len = col_size.min(idx_key_size);
+            let take = src_pk_stride.min(16);
+            let idx_table = ic.table_mut();
+            let mut cursor = idx_table.create_cursor_no_compact();
+
+            // Promoted u128 key uniquely identifies the indexed value for
+            // every type we accept (promote_to_index_key widens to ≤16 bytes).
             let mut seen: HashSet<u128> = HashSet::with_capacity(batch.count);
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
 
-                // Skip null values
                 let null_word = batch.get_null_word(row);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
                 let row_pk = batch.get_pk(row);
-
-                // Determine if this is an UPSERT (PK already exists in store)
                 let is_upsert = entry.unique_pk && entry.handle.has_pk(row_pk);
 
-                // Promote column value to index key
                 let col_data = batch.col_data(payload_col);
                 let key_u128 = promote_to_index_key(col_data, row * col_size, col_size, col_type);
 
-                // Batch-internal duplicate check
                 if !seen.insert(key_u128) {
                     let col_names = self.get_column_names(table_id);
                     let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
@@ -183,40 +195,28 @@ impl CatalogEngine {
                     ));
                 }
 
-                // Check index store for existing key
-                if idx_table.has_pk(key_u128) {
-                    if is_upsert {
-                        // For UPSERT: the index entry might belong to this same row
-                        // (same value being re-inserted). Check the index payload (source PK).
-                        // Index schema: PK = index_key, payload[0] = source_pk.
-                        let (_net_w, found) = idx_table.retract_pk(key_u128);
-                        if found {
-                            // Read the source PK from the index entry's payload.
-                            // Index schema: PK = index_key (col 0), payload[0] = source_pk.
-                            let idx_schema = &ic.index_schema;
-                            let pk_payload_col = 0usize;
-                            let pk_size = idx_schema.columns[idx_schema.payload_col_idx(0)].size() as usize;
-                            // None means the found_source cursor is in an unexpected state;
-                            // treat as a conflict (fail-safe) rather than silently permitting.
-                            let src_pk = idx_table.read_found_u128(pk_payload_col, pk_size)
-                                .unwrap_or(u128::MAX);
-                            if src_pk != row_pk {
-                                let col_names = self.get_column_names(table_id);
-                                let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
-                                return Err(format!(
-                                    "Unique index violation on column '{}'", cname
-                                ));
-                            }
-                            // Same PK — this is fine, enforce_unique_pk will handle it
-                        }
-                    } else {
-                        let col_names = self.get_column_names(table_id);
-                        let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
-                        return Err(format!(
-                            "Unique index violation on column '{}'", cname
-                        ));
-                    }
-                }
+                // Index PK layout: indexed-key field (col_size LE bytes,
+                // zero-padded to idx_key_size) followed by the source PK bytes.
+                let key_bytes = key_u128.to_le_bytes();
+                let prefix = &key_bytes[..prefix_len];
+                if !cursor.cursor.seek_first_positive_with_prefix(prefix) { continue; }
+
+                let pk_bytes = cursor.cursor.current_pk_bytes();
+                let mut src_pk_buf = [0u8; 16];
+                src_pk_buf[..take].copy_from_slice(
+                    &pk_bytes[idx_key_size..idx_key_size + take]
+                );
+                let existing_src_pk = u128::from_le_bytes(src_pk_buf);
+
+                // For UPSERT: the existing entry may be the same row whose
+                // index entry will be retracted by enforce_unique_pk.
+                if is_upsert && existing_src_pk == row_pk { continue; }
+
+                let col_names = self.get_column_names(table_id);
+                let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
+                return Err(format!(
+                    "Unique index violation on column '{}'", cname
+                ));
             }
         }
         Ok(())

@@ -466,6 +466,32 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
+    /// Position the cursor at the first row whose PK begins with `prefix` and
+    /// whose weight is `> 0`. Returns `true` on a hit (cursor stays positioned;
+    /// `current_pk_bytes`, `current_weight` etc. are valid). Returns `false`
+    /// on miss (cursor may be past the prefix range or fully invalid).
+    ///
+    /// Centralises the seek-pad-walk dance used by the compound-PK secondary
+    /// index: zero-pads `prefix` to `pk_stride` for `seek_bytes`, then walks
+    /// forward until the prefix terminates or a positive-weight match appears.
+    pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
+        let stride = self.schema.pk_stride() as usize;
+        let mut key = [0u8; crate::schema::MAX_PK_BYTES];
+        let copy_len = prefix.len().min(stride);
+        key[..copy_len].copy_from_slice(&prefix[..copy_len]);
+        self.seek_bytes(&key[..stride]);
+        while self.valid {
+            if !self.current_pk_bytes().starts_with(prefix) {
+                return false;
+            }
+            if self.current_weight > 0 {
+                return true;
+            }
+            self.advance();
+        }
+        false
+    }
+
     pub fn advance(&mut self) {
         if !self.valid {
             return;
@@ -717,12 +743,13 @@ impl ReadCursor {
 
         let batch = match &self.sources[0] {
             CursorSource::Batch(b) => {
-                // Batch sources are always consolidated (no ghosts).
+                // Batch sources may wrap unconsolidated intermediate batches;
+                // propagate the source flags rather than asserting both.
                 let end = start + row_count;
                 let mut out = Batch::with_schema(*schema, row_count.max(1));
                 out.append_batch(b, start, end);
-                out.sorted = true;
-                out.consolidated = true;
+                out.sorted = b.sorted;
+                out.consolidated = b.consolidated;
                 out
             }
             CursorSource::Shard(s) => {

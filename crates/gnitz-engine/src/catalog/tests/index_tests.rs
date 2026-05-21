@@ -222,7 +222,7 @@ fn test_seek_by_index_found() {
     engine.flush_family(tid).unwrap();
 
     // Seek by index: val=200 → should find PK=20
-    let result = engine.seek_by_index(tid, 1, 200u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &200u64.to_le_bytes()).unwrap();
     assert!(result.is_some());
     let row = result.unwrap();
     assert_eq!(row.count, 1);
@@ -247,7 +247,7 @@ fn test_seek_by_index_not_found() {
     engine.flush_family(tid).unwrap();
 
     // Seek by index: val=999 → should return None
-    let result = engine.seek_by_index(tid, 1, 999u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &999u64.to_le_bytes()).unwrap();
     assert!(result.is_none());
 
     engine.close();
@@ -274,15 +274,15 @@ fn test_seek_by_index_negative_i64() {
     engine.flush_family(tid).unwrap();
 
     // Index stores I64 values as their raw bit pattern (2's complement).
-    let result = engine.seek_by_index(tid, 1, (-1i64) as u64 as u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &((-1i64) as u64).to_le_bytes()).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
-    let result2 = engine.seek_by_index(tid, 1, (-5i64) as u64 as u128).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, &((-5i64) as u64).to_le_bytes()).unwrap();
     assert!(result2.is_some(), "index must find row with score=-5");
     assert_eq!(result2.unwrap().get_pk(0), 1);
 
-    let result3 = engine.seek_by_index(tid, 1, 10u128).unwrap();
+    let result3 = engine.seek_by_index(tid, 1, &10u64.to_le_bytes()).unwrap();
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 4);
 
@@ -309,11 +309,11 @@ fn test_seek_by_index_negative_i32() {
     engine.flush_family(tid).unwrap();
 
     // I32 values are zero-extended to u64 in the index (NOT sign-extended).
-    let result = engine.seek_by_index(tid, 1, (-1i32) as u32 as u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &((-1i32) as u32).to_le_bytes()).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
-    let result2 = engine.seek_by_index(tid, 1, (-100i32) as u32 as u128).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, &((-100i32) as u32).to_le_bytes()).unwrap();
     assert!(result2.is_some(), "index must find row with score=-100");
     assert_eq!(result2.unwrap().get_pk(0), 2);
 
@@ -338,11 +338,11 @@ fn test_seek_by_index_u8_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, 1, 42u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &[42u8]).unwrap();
     assert!(result.is_some(), "U8 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 10);
 
-    let result2 = engine.seek_by_index(tid, 1, 99u128).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, &[99u8]).unwrap();
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 20);
 
@@ -365,7 +365,7 @@ fn test_seek_by_index_u16_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, 1, 443u128).unwrap();
+    let result = engine.seek_by_index(tid, 1, &443u16.to_le_bytes()).unwrap();
     assert!(result.is_some(), "U16 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
@@ -416,13 +416,13 @@ fn test_seek_by_index_i32_negative_value() {
     engine.flush_family(tid).unwrap();
 
     // Seek negative value: key = zero-extended u32 representation of -5
-    let neg5_key = (-5i32) as u32 as u128;
-    let result = engine.seek_by_index(tid, 1, neg5_key).unwrap();
+    let neg5_key = ((-5i32) as u32).to_le_bytes();
+    let result = engine.seek_by_index(tid, 1, &neg5_key).unwrap();
     assert!(result.is_some(), "I32 negative index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
     // Seek positive value
-    let result2 = engine.seek_by_index(tid, 1, 10u128).unwrap();
+    let result2 = engine.seek_by_index(tid, 1, &10u32.to_le_bytes()).unwrap();
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 2);
 
@@ -586,6 +586,117 @@ fn test_drop_table_cascades_multiple_indices() {
 // duplicate values), the earlier apply_index_by_{name,id} hooks have
 // already mutated the caches. The rollback must reverse those writes
 // or the name/id caches end up pointing at a ghost index.
+
+// ── Compound-PK source: secondary index ──────────────────────────────
+//
+// Sanity coverage for the compound-PK index path: build a source table
+// with two PK columns, register a secondary index on a non-PK column,
+// ingest rows, and check that `seek_by_index` returns the expected
+// source rows. Retract one row and verify the index reports it gone.
+
+#[test]
+fn test_compound_pk_secondary_index_seek() {
+    let dir = temp_dir("compound_pk_idx_seek");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Compound PK = (a: U32, b: U32), payload = val: U64.
+    // Source PK stride = 8 → index PK stride = 8 (promoted U64) + 8 = 16,
+    // which keeps the index cursor on the narrow-PK fast path.
+    let cols = vec![
+        ColumnDef { name: "a".into(), type_code: type_code::U32,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "b".into(), type_code: type_code::U32,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        u64_col_def("val"),
+    ];
+    let tid = engine.create_table("public.cpk_t", &cols, &[0, 1], false).unwrap();
+    engine.create_index("public.cpk_t", "val", false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+    assert_eq!(schema.pk_stride(), 8, "compound (U32,U32) PK stride should be 8");
+
+    let mut b = Batch::with_schema(schema, 4);
+    let rows: &[(u32, u32, u64)] = &[
+        (10, 1, 100),
+        (20, 1, 200),
+        (10, 2, 300), // same a as row 0, different b
+        (40, 1, 200), // same val as row 1, different PK
+    ];
+    let mut pk_buf = vec![0u8; 8];
+    for &(a, bcol, val) in rows {
+        pk_buf[..4].copy_from_slice(&a.to_le_bytes());
+        pk_buf[4..8].copy_from_slice(&bcol.to_le_bytes());
+        b.extend_pk_bytes(&pk_buf);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+    engine.ingest_to_family(tid, &b).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // val=100 → exactly one match
+    let r = engine.seek_by_index(tid, 2, &100u64.to_le_bytes()).unwrap();
+    assert!(r.is_some(), "val=100 should find a row");
+    assert_eq!(r.unwrap().count, 1);
+
+    // val=300 → one match (a=10, b=2)
+    let r = engine.seek_by_index(tid, 2, &300u64.to_le_bytes()).unwrap();
+    assert!(r.is_some(), "val=300 should find a row");
+
+    // val=999 → miss
+    let r = engine.seek_by_index(tid, 2, &999u64.to_le_bytes()).unwrap();
+    assert!(r.is_none(), "val=999 should miss");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_compound_pk_secondary_index_retract() {
+    let dir = temp_dir("compound_pk_idx_retract");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![
+        ColumnDef { name: "a".into(), type_code: type_code::U32,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "b".into(), type_code: type_code::U32,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        u64_col_def("val"),
+    ];
+    let tid = engine.create_table("public.cpk_r", &cols, &[0, 1], true).unwrap();
+    engine.create_index("public.cpk_r", "val", false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut b = Batch::with_schema(schema, 2);
+    let mut pk_buf = vec![0u8; 8];
+    pk_buf[..4].copy_from_slice(&7u32.to_le_bytes());
+    pk_buf[4..8].copy_from_slice(&3u32.to_le_bytes());
+    b.extend_pk_bytes(&pk_buf);
+    b.extend_weight(&1i64.to_le_bytes());
+    b.extend_null_bmp(&0u64.to_le_bytes());
+    b.extend_col(0, &500u64.to_le_bytes());
+    b.count += 1;
+    engine.ingest_to_family(tid, &b).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    assert!(engine.seek_by_index(tid, 2, &500u64.to_le_bytes()).unwrap().is_some());
+
+    // Retract the same row.
+    let mut r = Batch::with_schema(schema, 1);
+    r.extend_pk_bytes(&pk_buf);
+    r.extend_weight(&(-1i64).to_le_bytes());
+    r.extend_null_bmp(&0u64.to_le_bytes());
+    r.extend_col(0, &500u64.to_le_bytes());
+    r.count += 1;
+    engine.ingest_to_family(tid, &r).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    assert!(engine.seek_by_index(tid, 2, &500u64.to_le_bytes()).unwrap().is_none(),
+        "after retraction the indexed value must not resolve to a row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn test_create_unique_index_duplicate_rolls_back_cleanly() {

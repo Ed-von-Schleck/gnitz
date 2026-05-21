@@ -235,14 +235,31 @@ def test_view_group_by_over_compound_pk_rejected(client):
         _cleanup(client, sn, "src")
 
 
-def test_index_on_compound_pk_rejected_via_sql(client):
+def test_index_on_compound_pk_narrow_source_via_sql(client):
+    """Compound source PK that fits within 8 bytes ⇒ index PK ≤ 16, which the
+    cursor handles natively. (U32, U32) = stride 8 → index PK = 16."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
-        _make_compound_table(client, sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql("CREATE INDEX idx ON src (payload)", schema_name=sn)
-        assert "compound" in str(exc.value).lower()
+        client.execute_sql(
+            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, payload BIGINT, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE INDEX idx ON src (payload)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO src (a, b, payload) VALUES (1, 1, 100), (1, 2, 200), (3, 4, 100)",
+            schema_name=sn,
+        )
+        # `WHERE payload = 200` resolves via the secondary index. The
+        # SQL planner currently builds a wildcard projection over
+        # compound-PK tables, so we ask for `*`.
+        results = client.execute_sql(
+            "SELECT * FROM src WHERE payload = 200", schema_name=sn,
+        )
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 2, 200)]
     finally:
         _cleanup(client, sn, "src")
 

@@ -35,6 +35,11 @@ enum RegionEncoding {
 /// Returns `Constant` if every element is identical, else `Raw`.
 fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
     debug_assert!(!data.is_empty() && data.len().is_multiple_of(element_width));
+    // The Constant payload buffer is 16 bytes; wider regions (compound
+    // PK strides > 16) cannot use this encoding and stay Raw.
+    if element_width > 16 {
+        return RegionEncoding::Raw;
+    }
     let first = &data[..element_width];
     let n = data.len() / element_width;
     for i in 1..n {

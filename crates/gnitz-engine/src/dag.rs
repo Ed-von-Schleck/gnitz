@@ -1423,6 +1423,13 @@ impl DagEngine {
     }
 
     /// Batch-level index projection.
+    ///
+    /// Compound-PK index schema layout:
+    ///   `(indexed_col [promoted], src_pk_0, src_pk_1, …)`
+    /// every column is in the PK, no payload columns. We hand-pack the index
+    /// PK bytes: the leading slot is the indexed column value (low bytes of
+    /// its LE form, zero-padded out to the index column's width), followed
+    /// by each source PK column laid out contiguously after it.
     pub(crate) fn batch_project_index(
         src: &Batch,
         source_col_idx: u32,
@@ -1431,73 +1438,63 @@ impl DagEngine {
     ) -> Batch {
         let source_col = source_col_idx as usize;
         let is_pk_col = src_schema.is_pk_col(source_col);
-
         let src_payload_idx = if is_pk_col {
             usize::MAX
         } else {
             src_schema.payload_idx(source_col)
         };
-
         let src_col_size = src_schema.columns[source_col].size() as usize;
-        let out_payload_col_idx = idx_schema.payload_col_idx(0);
-        let out_payload_size = idx_schema.columns[out_payload_col_idx].size() as usize;
+        let src_pk_stride = src_schema.pk_stride() as usize;
+        let idx_stride = idx_schema.pk_stride() as usize;
+        let idx_key_size = idx_schema.columns[0].size() as usize;
+        // If the indexed value is in the PK, find its byte offset once.
+        let src_pk_field_off = if is_pk_col {
+            src_schema.pk_byte_offset(source_col) as usize
+        } else { 0 };
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
+        // `vec![0u8; idx_stride]` zero-fills once. The leading `[..src_col_size]`
+        // and trailing `[idx_key_size..]` slots are fully overwritten per row;
+        // the middle `[src_col_size..idx_key_size]` zero-pad stays zero across
+        // rows, so no per-row re-zero is needed.
+        let mut idx_pk_buf = vec![0u8; idx_stride];
 
         for row in 0..src.count {
             let weight = src.get_weight(row);
             if weight == 0 { continue; }
 
-            // Null check
             if !is_pk_col {
                 let null_word = src.get_null_word(row);
                 let payload_bit = src_schema.payload_idx(source_col);
                 if (null_word >> payload_bit) & 1 != 0 {
-                    continue; // NULL column → skip
+                    continue;
                 }
             }
 
-            // Read source column value as index key
-            let (key_lo, key_hi) = if is_pk_col {
-                crate::util::split_pk(src.get_pk(row))
+            let src_pk_bytes = src.get_pk_bytes(row);
+            // Leading index-key slot: indexed value LE bytes.
+            if is_pk_col {
+                idx_pk_buf[..src_col_size]
+                    .copy_from_slice(&src_pk_bytes[src_pk_field_off..src_pk_field_off + src_col_size]);
             } else {
                 let col_data = src.col_data(src_payload_idx);
                 let offset = row * src_col_size;
-                if src_col_size == 8 {
-                    let v = u64::from_le_bytes(col_data[offset..offset+8].try_into().unwrap());
-                    (v, 0u64)
-                } else if src_col_size == 16 {
-                    let lo = u64::from_le_bytes(col_data[offset..offset+8].try_into().unwrap());
-                    let hi = u64::from_le_bytes(col_data[offset+8..offset+16].try_into().unwrap());
-                    (lo, hi)
-                } else if src_col_size == 4 {
-                    let v = u32::from_le_bytes(col_data[offset..offset+4].try_into().unwrap());
-                    (v as u64, 0u64)
-                } else if src_col_size == 2 {
-                    let v = u16::from_le_bytes(col_data[offset..offset+2].try_into().unwrap());
-                    (v as u64, 0u64)
-                } else if src_col_size == 1 {
-                    (col_data[offset] as u64, 0u64)
-                } else {
-                    continue;
-                }
-            };
-
-            // Payload = source row's PK
-            let src_pk = src.get_pk(row);
-            let (src_pk_lo, src_pk_hi) = crate::util::split_pk(src_pk);
-
-            out.extend_pk(crate::util::make_pk(key_lo, key_hi));
-            out.extend_weight(&weight.to_le_bytes());
-            out.extend_null_bmp(&0u64.to_le_bytes());
-
-            // Write payload column (source PK mapped to index payload)
-            if out_payload_size == 16 {
-                out.extend_col(0, &src_pk_lo.to_le_bytes());
-                out.extend_col(0, &src_pk_hi.to_le_bytes());
-            } else if out_payload_size == 8 {
-                out.extend_col(0, &src_pk_lo.to_le_bytes());
+                idx_pk_buf[..src_col_size]
+                    .copy_from_slice(&col_data[offset..offset + src_col_size]);
             }
+
+            // The source PK region is laid out in pk_indices order, so the
+            // index's trailing PK suffix is byte-identical to the source's PK.
+            idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride]
+                .copy_from_slice(src_pk_bytes);
+
+            out.extend_pk_bytes(&idx_pk_buf);
+            out.extend_weight(&weight.to_le_bytes());
+            // Index schema has zero payload columns, but the null_bmp region
+            // is still part of the batch layout. Keep the per-row null-bmp
+            // append so the batch's region cursors stay in lockstep with
+            // `count` independent of `with_schema`'s zero-init.
+            out.extend_null_bmp(&0u64.to_le_bytes());
             out.count += 1;
         }
 

@@ -798,12 +798,10 @@ async fn handle_seek_by_index(
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
-        match unsafe { (*shared.catalog).seek_by_index(target_id, col_idx, key) } {
-            Ok(batch) => send_ok_response(
-                shared, fd, target_id, batch.as_ref(), client_id, 0, client_version,
-            ).await,
-            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
-        }
+        // System tables never carry secondary indexes.
+        let _ = (col_idx, key, client_version);
+        let msg = format!("SEEK_BY_INDEX on system table {} is not supported", target_id);
+        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
     }
 }
 

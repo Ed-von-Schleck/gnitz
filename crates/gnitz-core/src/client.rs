@@ -213,18 +213,6 @@ impl GnitzClient {
         &mut self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
     ) -> Result<u64, ClientError> {
         let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
-        // Reject before the request reaches the server: the index circuit
-        // packs (indexed_value, source_pk) into a u128 composite, which can
-        // only hold a single source PK column. Closing this here keeps
-        // non-SQL callers (gnitz-py, gnitz-capi, direct GnitzClient) from
-        // tripping `hook_index_register`'s `pk_index_single()` assert.
-        if schema.pk_cols.len() >= 2 {
-            return Err(ClientError::ServerError(format!(
-                "CREATE INDEX on compound-PK table '{}' is not supported \
-                 (the index entry packs the source PK into a u128)",
-                table_name,
-            )));
-        }
         let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
             .ok_or_else(|| ClientError::ServerError(
                 format!("column '{}' not found in table '{}'", col_name, table_name)

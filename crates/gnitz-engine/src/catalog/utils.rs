@@ -148,10 +148,26 @@ pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
     }
 }
 
-pub(crate) fn make_index_schema(index_key_type: u8, source_pk_type: u8) -> SchemaDescriptor {
-    let key_col = SchemaColumn::new(index_key_type, 0);
-    let pk_col = SchemaColumn::new(source_pk_type, 0);
-    make_schema(&[key_col, pk_col], 0)
+/// Build a compound-PK index schema for a secondary index on `source`.
+///
+/// Layout: `(indexed_col: <promoted>, src_pk_0, src_pk_1, …)` with every
+/// column in the PK and zero payload columns. `seek_by_index` walks the
+/// index by prefix-scanning the leading indexed column, then reads the
+/// source PK bytes directly out of the index PK region.
+pub(crate) fn make_index_schema(
+    index_key_type: u8,
+    source: &SchemaDescriptor,
+) -> SchemaDescriptor {
+    let src_pk = source.pk_indices();
+    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(1 + src_pk.len());
+    let mut pk_indices: Vec<u32> = Vec::with_capacity(1 + src_pk.len());
+    cols.push(SchemaColumn::new(index_key_type, 0));
+    pk_indices.push(0);
+    for (i, &ci) in src_pk.iter().enumerate() {
+        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
+        pk_indices.push((i + 1) as u32);
+    }
+    SchemaDescriptor::new(&cols, &pk_indices)
 }
 
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
