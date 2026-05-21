@@ -131,7 +131,16 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
         let col = &schema.columns[ci];
         let mut flags: u64 = 0;
         if col.nullable != 0 { flags |= META_FLAG_NULLABLE; }
-        if schema.is_pk_col(ci) { flags |= META_FLAG_IS_PK; }
+        // For compound PKs the position within `schema.pk_indices()` is
+        // what determines decode order — column order ≠ PK order in
+        // general (e.g. `PRIMARY KEY (b, a)`). Encode the position so
+        // the decoder rebuilds `pk_indices` exactly as the user wrote
+        // them. Single-PK schemas write position 0, matching the
+        // pre-compound wire form (flag bit 1 set, upper bits zero).
+        if let Some(pos) = schema.pk_indices().iter().position(|&p| p as usize == ci) {
+            flags |= META_FLAG_IS_PK;
+            flags |= (pos as u64) << gnitz_wire::META_FLAG_PK_POS_SHIFT;
+        }
 
         let type_code_val = col.type_code as u64;
         let name = if ci < col_names.len() { col_names[ci] } else { b"" };
@@ -154,8 +163,8 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
     if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut names = Vec::with_capacity(batch.count);
-    let mut pk_index: u32 = 0;
-    let mut pk_found = false;
+    let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_count: usize = 0;
     for (i, col) in cols.iter_mut().enumerate().take(batch.count) {
         let off8 = i * 8;
         let type_code_val = u64::from_le_bytes(
@@ -172,13 +181,22 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
         *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
         if is_pk {
-            if pk_found { return Err("multiple PK columns"); }
-            pk_index = i as u32;
-            pk_found = true;
+            if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
+                return Err("too many PK columns");
+            }
+            let pos = ((flags_val & gnitz_wire::META_FLAG_PK_POS_MASK)
+                       >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
+            pk_pairs[pk_count] = (pos, i as u32);
+            pk_count += 1;
         }
     }
-    if !pk_found { return Err("no PK column"); }
-    let sd = SchemaDescriptor::new(&cols[..batch.count], &[pk_index]);
+    if pk_count == 0 { return Err("no PK column"); }
+    pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
+    let mut pk_indices: [u32; gnitz_wire::MAX_PK_COLUMNS] = [0; gnitz_wire::MAX_PK_COLUMNS];
+    for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
+        pk_indices[k] = *ci;
+    }
+    let sd = SchemaDescriptor::new(&cols[..batch.count], &pk_indices[..pk_count]);
     Ok((sd, names))
 }
 
@@ -846,6 +864,21 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     if count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
     if num_regions < 5 { return Err("schema block region count mismatch"); }
 
+    // Region 0 is the PK (col_idx). Validate that col_idx values are
+    // exactly [0, 1, ..., count-1] — every malformed-schema test relies
+    // on this ordering, and downstream consumers index columns by the
+    // physical row position, so an out-of-order/gap/duplicate col_idx
+    // would silently re-route columns to the wrong type.
+    let (pk_off, pk_sz) = wal_dir_entry(data, 0);
+    if pk_sz < count * 8 || pk_off + pk_sz > data.len() { return Err("schema col_idx region OOB"); }
+    let pk_data = &data[pk_off..pk_off + count * 8];
+    for i in 0..count {
+        let v = u64::from_le_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap());
+        if v != i as u64 {
+            return Err("schema col_idx not in monotonic order");
+        }
+    }
+
     let (tc_off, tc_sz) = wal_dir_entry(data, 3);
     let (fl_off, fl_sz) = wal_dir_entry(data, 4);
 
@@ -856,24 +889,43 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     let flags_data = &data[fl_off..fl_off + count * 8];
 
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut pk_index: u32 = 0;
-    let mut pk_found = false;
+    // Each entry pairs the PK column's logical index with its 0-indexed
+    // position in the PK tuple (carried in the column's flags word).
+    // Sorted by position before building the SchemaDescriptor.
+    let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_count: usize = 0;
 
     for (i, col) in cols[..count].iter_mut().enumerate() {
         let off8 = i * 8;
         let tc = u64::from_le_bytes(type_data[off8..off8+8].try_into().unwrap()) as u8;
         let fl = u64::from_le_bytes(flags_data[off8..off8+8].try_into().unwrap());
+        // Reject unknown type codes here so a crafted wire schema cannot
+        // smuggle in a type_code the downstream cursors can't decode.
+        if gnitz_wire::TypeCode::try_from_u8(tc).is_none() {
+            return Err("schema: invalid type code");
+        }
         let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
         let is_pk       = (fl & META_FLAG_IS_PK)       != 0;
         *col = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
         if is_pk {
-            if pk_found { return Err("multiple PK columns"); }
-            pk_index = i as u32;
-            pk_found = true;
+            if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
+                return Err("too many PK columns");
+            }
+            let pos = ((fl & gnitz_wire::META_FLAG_PK_POS_MASK)
+                       >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
+            pk_pairs[pk_count] = (pos, i as u32);
+            pk_count += 1;
         }
     }
-    if !pk_found { return Err("no PK column"); }
-    Ok(SchemaDescriptor::new(&cols[..count], &[pk_index]))
+    if pk_count == 0 { return Err("no PK column"); }
+    // Sort by position; single-PK schemas all carry position 0 so this
+    // is a no-op for the common path.
+    pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
+    let mut pk_indices: [u32; gnitz_wire::MAX_PK_COLUMNS] = [0; gnitz_wire::MAX_PK_COLUMNS];
+    for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
+        pk_indices[k] = *ci;
+    }
+    Ok(SchemaDescriptor::new(&cols[..count], &pk_indices[..pk_count]))
 }
 
 /// Read just the `(target_id, client_id)` routing tuple from a wire

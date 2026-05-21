@@ -46,57 +46,17 @@ pub(super) const TABLETAB_COL_CREATED_LSN: usize = 5;
 pub(super) const TABLETAB_COL_FLAGS: usize = 6;
 pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
 
-pub(super) const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct PkColList {
-    cols: [u32; 4],
-    len: usize,
-}
-
-impl PkColList {
-    /// Single-column PK with `len = 1`.
-    pub(super) fn single(idx: u32) -> Self {
-        PkColList { cols: [idx, 0, 0, 0], len: 1 }
-    }
-    /// The count exactly as decoded from the wire. May be 0 or >4 for a
-    /// malformed/crafted packed value — deliberately NOT clamped, because
-    /// `validate_pk_cols` gates on this raw value to reject out-of-range
-    /// counts. Not a safe slice length: iterate `as_slice()` instead.
-    pub(super) fn decoded_count(&self) -> usize { self.len }
-    /// Always in bounds: indexes at most the 4-element backing array even
-    /// when the decoded count is out of range. A crafted wire count of
-    /// 5..=15 must NOT panic here — it has to survive long enough to
-    /// reach `validate_pk_cols` and be returned as `Err`.
-    pub(super) fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(4)] }
-}
-
-pub(super) fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
-    // assert! (not debug_assert!): a violated contract here corrupts the
-    // persisted PK encoding via the `& 0x7f` mask, so it must fail in
-    // release too rather than silently truncate.
-    assert!((1..=4).contains(&pk_cols.len()), "pack_pk_cols: count out of range 1..=4");
-    let mut v = pk_cols.len() as u64;            // bits [0..4)
-    for (i, &c) in pk_cols.iter().enumerate() {
-        assert!(c < 128, "pack_pk_cols: column index {c} exceeds 7-bit field");
-        v |= (c as u64 & 0x7f) << (4 + 7 * i);
-    }
-    v | PK_LIST_PACKED_FLAG
-}
-
-pub(super) fn unpack_pk_cols(packed: u64) -> PkColList {
-    if packed & PK_LIST_PACKED_FLAG == 0 {
-        // Bare single index: an unmodified gnitz-core client, or an
-        // engine-written system-table row (always bare `0`).
-        return PkColList { cols: [packed as u32, 0, 0, 0], len: 1 };
-    }
-    let n = (packed & 0xf) as usize;             // 0..=15, validated later
-    let mut cols = [0u32; 4];
-    for (i, slot) in cols.iter_mut().enumerate().take(n.min(4)) {
-        *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
-    }
-    PkColList { cols, len: n }
-}
+// PK list encoding lives in gnitz-wire so the client and engine cannot
+// drift on the on-disk format. Re-export under the historical paths so
+// existing `pub(super)` callers in this crate keep working unchanged.
+// The `unused_imports` allow covers two cases: (1) symbols used only by
+// sibling modules via `use sys_tables::*`, and (2) symbols referenced
+// only from the cfg(test) block below.
+#[allow(unused_imports)]
+pub(super) use gnitz_wire::PK_LIST_PACKED_FLAG;
+pub(crate) use gnitz_wire::PkColList;
+#[allow(unused_imports)]
+pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols};
 
 /// Hard-validate a decoded PK list against the table's columns. Shared by
 /// the production wire path (`hook_table_register`) and the test-only
@@ -136,6 +96,21 @@ pub(super) fn validate_pk_cols(
         if cols[..j].contains(&c) {
             return Err("Primary Key has duplicate column".into());
         }
+    }
+    // Engine cursors project the PK region to `u128` via
+    // `storage::batch::widen_pk_le`, which panics on any stride outside
+    // {1, 2, 4, 8, 16}. Defends the catalog worker against a crafted
+    // `raw_store_ingest` into `TABLE_TAB` that names a compound encoding
+    // the cursor cannot widen (e.g. `(U64, U32)` stride 12 or three
+    // `U64`s stride 24). Single-PK rows always satisfy this — every
+    // column type's `wire_stride()` is already in that set.
+    let pk_stride: usize = cols.iter()
+        .map(|&c| gnitz_wire::wire_stride(col_defs[c as usize].type_code))
+        .sum();
+    if !matches!(pk_stride, 1 | 2 | 4 | 8 | 16) {
+        return Err(format!(
+            "Primary Key total stride must be 1/2/4/8/16 bytes, got {pk_stride}"
+        ));
     }
     Ok(())
 }

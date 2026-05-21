@@ -62,10 +62,13 @@ impl Schema {
 
     /// The single PK column index. Use only at boundaries that have not yet
     /// been generalized (format encoders, catalog serialization, SQL parser
-    /// path, wire/client BatchAppender). Asserts length-1.
+    /// path, wire/client BatchAppender). Hard-asserts length-1: a
+    /// `debug_assert!` would compile out in release and let the silent
+    /// truncation to the first PK column ship to production.
     #[inline]
+    #[track_caller]
     pub fn pk_index_single(&self) -> usize {
-        debug_assert_eq!(self.pk_cols.len(), 1, "compound PK not yet supported here");
+        assert_eq!(self.pk_cols.len(), 1, "compound PK not yet supported here");
         self.pk_cols[0]
     }
 

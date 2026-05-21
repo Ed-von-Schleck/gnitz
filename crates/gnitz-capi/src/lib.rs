@@ -478,9 +478,13 @@ pub unsafe extern "C" fn gnitz_create_table(
     clear_error();
     let c = check_ptr_mut!(conn, 0);
     let s = check_ptr!(schema, 0);
+    // C API surface is single-PK; pass a one-element slice to satisfy the
+    // shared compound-PK signature. `pk_index_single()` asserts the schema
+    // has exactly one PK column, which the C API contract already requires.
+    let pk_slice = [s.0.pk_index_single() as u32];
     match c.0.create_table(
         cstr(schema_name), cstr(table_name),
-        &s.0.columns, s.0.pk_index_single(), unique_pk != 0,
+        &s.0.columns, &pk_slice, unique_pk != 0,
     ) {
         Ok(id) => id, Err(e) => { set_error(e); 0 }
     }

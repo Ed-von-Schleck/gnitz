@@ -1081,8 +1081,6 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        let pki = source_schema.pk_index_single() as usize;
-
         // Build PK aggregation using pooled map; release borrow before any `.await`.
         let pk_lo_hi: Option<Vec<u128>> = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
             let mut m = cell.borrow_mut();
@@ -1101,15 +1099,13 @@ impl MasterDispatcher {
             if needs_pk_rejection {
                 for (&pk, &(_, pos_count)) in m.iter() {
                     if pos_count > 1 {
-                        let (pk_name, (sn, tn)) = unsafe {
-                            let disp = &mut *disp_ptr;
-                            (disp.get_col_name(target_id, pki),
-                             disp.get_qualified_name_owned(target_id))
+                        let (pk_names, sn, tn) = unsafe {
+                            (*disp_ptr).pk_violation_context(target_id, &source_schema)
                         };
                         let key_str = format_pk_value(pk, &source_schema);
                         return Err(format!(
                             "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
-                            sn, tn, pk_name, key_str,
+                            sn, tn, pk_names, key_str,
                         ));
                     }
                 }
@@ -1284,16 +1280,13 @@ impl MasterDispatcher {
                             && !existing_pks.is_empty()
                         {
                             let conflict_pk = *existing_pks.iter().next().unwrap();
-                            let (pk_name, sn, tn) = unsafe {
-                                let disp = &mut *disp_ptr;
-                                let pkn = disp.get_col_name(target_id, pki);
-                                let (s, t) = disp.get_qualified_name_owned(target_id);
-                                (pkn, s, t)
+                            let (pk_names, sn, tn) = unsafe {
+                                (*disp_ptr).pk_violation_context(target_id, &source_schema)
                             };
                             let key_str = format_pk_value(conflict_pk, &source_schema);
                             return Err(format!(
                                 "duplicate key value violates unique constraint \"{}_{}_pkey\": Key ({})=({}) already exists",
-                                sn, tn, pk_name, key_str,
+                                sn, tn, pk_names, key_str,
                             ));
                         }
                     }
@@ -1634,6 +1627,20 @@ impl MasterDispatcher {
             .map(|(s, t)| (s.to_string(), t.to_string()))
             .unwrap_or_default()
     }
+
+    /// Build the `(pk_names_joined, schema_name, table_name)` triple used
+    /// in PG-style "violates unique constraint \"{sn}_{tn}_pkey\": ... key
+    /// ({pk_names_joined})=(...)" error messages. Compound PKs join column
+    /// names with commas in declaration order.
+    fn pk_violation_context(
+        &mut self, target_id: i64, schema: &SchemaDescriptor,
+    ) -> (String, String, String) {
+        let names: Vec<String> = schema.pk_indices().iter()
+            .map(|&ci| self.get_col_name(target_id, ci as usize))
+            .collect();
+        let (sn, tn) = self.get_qualified_name_owned(target_id);
+        (names.join(", "), sn, tn)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1771,17 +1778,38 @@ fn format_uuid_hyphenated(v: u128) -> String {
 }
 
 /// Render a PK u128 as a human-readable string for error messages.
+/// Compound PKs are formatted as comma-separated per-column values in
+/// declaration order; the u128 holds all PK columns concatenated little-
+/// endian, so we slice it column by column.
 fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
-    let pk_col = schema.columns[schema.pk_index_single() as usize];
-    match pk_col.type_code {
-        crate::schema::type_code::U128 => format!("{}", pk),
-        crate::schema::type_code::UUID => format_uuid_hyphenated(pk),
-        crate::schema::type_code::I64  => format!("{}", pk as u64 as i64),
-        crate::schema::type_code::I32  => format!("{}", pk as u64 as i32),
-        crate::schema::type_code::I16  => format!("{}", pk as u64 as i16),
-        crate::schema::type_code::I8   => format!("{}", pk as u64 as i8),
-        _ => format!("{}", pk as u64),
+    let pk_bytes = pk.to_le_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    for &ci in schema.pk_indices() {
+        let col = schema.columns[ci as usize];
+        let size = col.size() as usize;
+        let slice = &pk_bytes[off..off + size];
+        // Reassemble the per-column value into a u128 (LE) and dispatch
+        // on its `type_code`. The slice is always at most 16 bytes wide
+        // and pad with zeros to 16 to reuse the existing scalar format.
+        let mut padded = [0u8; 16];
+        padded[..size].copy_from_slice(slice);
+        let v = u128::from_le_bytes(padded);
+        let s = match col.type_code {
+            crate::schema::type_code::U128 => format!("{}", v),
+            crate::schema::type_code::UUID => format_uuid_hyphenated(v),
+            crate::schema::type_code::I64  => format!("{}", v as u64 as i64),
+            crate::schema::type_code::I32  => format!("{}", v as u64 as i32),
+            crate::schema::type_code::I16  => format!("{}", v as u64 as i16),
+            crate::schema::type_code::I8   => format!("{}", v as u64 as i8),
+            crate::schema::type_code::F32  => format!("{}", f32::from_bits(v as u32)),
+            crate::schema::type_code::F64  => format!("{}", f64::from_bits(v as u64)),
+            _ => format!("{}", v as u64),
+        };
+        parts.push(s);
+        off += size;
     }
+    parts.join(", ")
 }
 
 /// Build a constraint-check batch for `keys`, optionally reusing a
@@ -1998,5 +2026,25 @@ mod unique_filter_tests {
         let sa = format_pk_value(uuid_a, &schema);
         let sb = format_pk_value(uuid_b, &schema);
         assert_ne!(sa, sb, "UUIDs differing in high bits must format differently");
+    }
+
+    #[test]
+    fn format_pk_value_f32_uses_bitcast_not_truncation() {
+        // A non-trivial f32 reinterpreted via `as u64` formats as a large
+        // integer (the IEEE-754 bit pattern) — the bit-cast path must
+        // produce a human-readable float instead.
+        let v: f32 = 1.5_f32;
+        let bits = v.to_bits() as u128;
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::F32, 0)], &[0]);
+        let s = format_pk_value(bits, &schema);
+        assert_eq!(s, format!("{}", v));
+    }
+
+    #[test]
+    fn format_pk_value_f64_uses_bitcast_not_truncation() {
+        let bits = (-2.5_f64).to_bits() as u128;
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::F64, 0)], &[0]);
+        let s = format_pk_value(bits, &schema);
+        assert_eq!(s, format!("{}", -2.5_f64));
     }
 }

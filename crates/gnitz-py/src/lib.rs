@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyString, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, Circuit, GnitzClient};
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, MAX_COLUMNS};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_sql::{SqlPlanner, SqlResult};
 
@@ -563,20 +563,29 @@ fn build_row_values_into(
 
     for ci in 0..schema.columns.len() {
         if schema.is_pk_col(ci) {
-            let pk = batch.pks.get(row);
             let tc = schema.columns[ci].type_code;
-            // UUID / U128 don't fit through read_fixed_le's i64/u64/f64 shape;
-            // route them through the dedicated formatters.
-            match tc {
-                TypeCode::UUID => out.push(format_uuid(pk).into_pyobject(py)?.into_any().unbind()),
-                TypeCode::U128 => out.push(pk.into_pyobject(py)?.into_any().unbind()),
-                _ => {
-                    // pk is the packed-LE u128 from extract_pk_value; the low
-                    // `wire_stride()` bytes carry the column's native LE
-                    // encoding, which is exactly what read_fixed_le decodes.
-                    let bytes = pk.to_le_bytes();
-                    let stride = tc.wire_stride();
-                    out.push(read_fixed_le(py, tc, &bytes[..stride]));
+            let stride = tc.wire_stride();
+            let off = schema.pk_byte_offset(ci);
+            // Compound PKs land in PkColumn::Bytes (raw concatenated LE);
+            // narrow single PKs in U64s; UUID/U128 single PKs in U128s.
+            // UUID/U128 have wire_stride = 16 and cannot fit in a compound
+            // PK (total pk_stride ≤ 16), so they only appear in U128s.
+            match &batch.pks {
+                PkColumn::Bytes { stride: row_stride, buf } => {
+                    let base = row * (*row_stride as usize);
+                    out.push(read_fixed_le(py, tc, &buf[base + off..base + off + stride]));
+                }
+                PkColumn::U128s(v) => match tc {
+                    TypeCode::UUID => out.push(format_uuid(v[row]).into_pyobject(py)?.into_any().unbind()),
+                    TypeCode::U128 => out.push(v[row].into_pyobject(py)?.into_any().unbind()),
+                    _ => {
+                        let bytes = v[row].to_le_bytes();
+                        out.push(read_fixed_le(py, tc, &bytes[off..off + stride]));
+                    }
+                },
+                PkColumn::U64s(v) => {
+                    let bytes = (v[row] as u128).to_le_bytes();
+                    out.push(read_fixed_le(py, tc, &bytes[off..off + stride]));
                 }
             }
         } else {
@@ -1112,7 +1121,12 @@ impl PyGnitzClient {
         let cols: Vec<ColumnDef> = columns.iter()
             .map(|item| { let c: PyRef<'_, PyColumnDef> = item.extract()?; py_col_to_rust(&c) })
             .collect::<PyResult<_>>()?;
-        client!(self).create_table(schema_name, table_name, &cols, pk_col_idx, unique_pk)
+        // The Python binding stays single-PK; wrap the supplied index in a
+        // one-element slice for the shared compound-PK signature. Compound
+        // PKs are reached through SQL DDL (`CREATE TABLE ... PRIMARY KEY
+        // (a, b)`), not this surface.
+        let pk_slice = [pk_col_idx as u32];
+        client!(self).create_table(schema_name, table_name, &cols, &pk_slice, unique_pk)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 

@@ -1,5 +1,8 @@
 use super::error::ProtocolError;
-use super::header::{META_FLAG_NULLABLE, META_FLAG_IS_PK};
+use super::header::{
+    META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    META_FLAG_PK_POS_SHIFT, META_FLAG_PK_POS_MASK,
+};
 use super::types::{ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_from_u64};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
@@ -24,7 +27,12 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
 
         let mut flags: u64 = 0;
         if col.is_nullable        { flags |= META_FLAG_NULLABLE; }
-        if schema.is_pk_col(ci)   { flags |= META_FLAG_IS_PK; }
+        // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
+        // decodes back to the user-declared order.
+        if let Some(pos) = schema.pk_cols.iter().position(|&p| p == ci) {
+            flags |= META_FLAG_IS_PK;
+            flags |= (pos as u64) << META_FLAG_PK_POS_SHIFT;
+        }
         flags_bytes.extend_from_slice(&flags.to_le_bytes());
 
         names.push(Some(col.name.clone()));
@@ -48,7 +56,10 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
 pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     let count = batch.len();
     let mut columns: Vec<ColumnDef> = Vec::with_capacity(count);
-    let mut pk_cols: Vec<usize> = Vec::new();
+    // Collect (position, column_idx) so we can sort by position before
+    // building `pk_cols`. Single-PK schemas all carry position 0 and the
+    // sort is a no-op.
+    let mut pk_pairs: Vec<(u8, usize)> = Vec::new();
 
     let type_code_fixed = match &batch.columns[1] {
         ColData::Fixed(v) => v,
@@ -87,15 +98,18 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         let is_pk       = (flags & META_FLAG_IS_PK)    != 0;
 
         if is_pk {
-            pk_cols.push(i);
+            let pos = ((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8;
+            pk_pairs.push((pos, i));
         }
 
         columns.push(ColumnDef { name, type_code: tc, is_nullable, fk_table_id: 0, fk_col_idx: 0 });
     }
 
-    if pk_cols.is_empty() {
+    if pk_pairs.is_empty() {
         return Err(ProtocolError::DecodeError("no PK column found in schema batch".into()));
     }
+    pk_pairs.sort_by_key(|(p, _)| *p);
+    let pk_cols: Vec<usize> = pk_pairs.into_iter().map(|(_, i)| i).collect();
 
     Ok(Schema { columns, pk_cols })
 }

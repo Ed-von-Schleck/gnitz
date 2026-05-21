@@ -385,7 +385,9 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         }
 
         // Honour the coalesce deadline only if no trigger is row-threshold
-        // urgent. Lets pipelined inserts batch into a single tick.
+        // urgent and no Drain is pending. Drain is a synchronous probe
+        // (handle_scan awaits its `done`) so coalescing would just stall
+        // the caller for TICK_DEADLINE_MS with nothing to coalesce.
         //
         // The timer is pinned outside the inner loop so every iteration
         // re-polls the same TimerFuture — its SQE is submitted once on
@@ -394,14 +396,16 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         // fresh TimerFuture per iteration and submitted a new SQE every
         // time `rx.recv()` resolved Pending-then-Ready, which was
         // unnecessary kernel churn.
-        if !shared.any_threshold_crossed() {
+        let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
+        if !has_drain && !shared.any_threshold_crossed() {
             let deadline = Instant::now() + Duration::from_millis(TICK_DEADLINE_MS);
             let mut timer = Box::pin(shared.reactor.timer(deadline));
             loop {
                 match select2(rx.recv(), timer.as_mut()).await {
                     Either::A(Some(more)) => {
+                        let was_drain = matches!(more, TickTrigger::Drain { .. });
                         triggers.push(more);
-                        if shared.any_threshold_crossed() { break; }
+                        if was_drain || shared.any_threshold_crossed() { break; }
                     }
                     Either::A(None) => return, // channel closed mid-coalesce
                     Either::B(()) => break,    // deadline elapsed
@@ -808,26 +812,33 @@ async fn handle_scan(
     client_version: u16,
 ) {
     // Drain pending ticks before reading: views derive from source-table
-    // pushes through the DAG (IV.2). Loop until `tick_rows` is empty —
-    // a push landing during the tick may add more rows; the outer
-    // is_empty() re-check closes the race.
+    // pushes through the DAG (IV.2). Send a Drain trigger unconditionally
+    // — even when `tick_tids` is observed empty — so any in-flight
+    // auto-tick has time to complete. The tick loop processes triggers
+    // serially, so awaiting our Drain's `done` guarantees serialization
+    // behind a concurrent Auto. Without this, a large push fires Auto
+    // asynchronously, drains `tick_tids`, but the scan reads before the
+    // tick body finishes — the view appears empty until the next scan
+    // triggers another drain.
+    //
     // The catalog lock is intentionally acquired AFTER the drain: the drain
     // parks at rx.await, and AsyncRwLock is writer-preferring. Holding a
     // read lock here while parked would block concurrent DDL writers and
     // prevent tick_loop_async from acquiring its own read lock, causing a
     // three-way deadlock (BF-1).
     loop {
-        let snapshot: Vec<i64> = {
-            let tids = shared.tick_tids.borrow();
-            if tids.is_empty() { break; }
-            tids.clone()
-        };
+        let snapshot: Vec<i64> = shared.tick_tids.borrow().clone();
+        let was_empty = snapshot.is_empty();
         let (tx, rx) = oneshot::channel::<()>();
         shared.tick_tx.send(TickTrigger::Drain {
             tids: snapshot,
             done: tx,
         });
         let _ = rx.await;
+        // After the drain ack: if there were no tids queued AND none
+        // appeared during the wait, we're done. Re-check before
+        // breaking so a new push during the drain doesn't slip past.
+        if was_empty && shared.tick_tids.borrow().is_empty() { break; }
     }
     let _g = shared.catalog_rwlock.read().await;
     if !shared.cat().has_id(target_id) {

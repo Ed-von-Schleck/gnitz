@@ -1,0 +1,372 @@
+"""End-to-end tests for compound (multi-column) PRIMARY KEY tables.
+
+The compound-PK planner gate (see `plans/compound-pk-planner-gate.md`)
+flips `CREATE TABLE ... PRIMARY KEY (a, b, ...)` from rejected to
+accepted, while leaving CREATE VIEW / CREATE INDEX / FK-references-
+compound paths rejected.
+
+The Python `Schema` shim exposes a single `pk_index` (it calls
+`pk_index_single()` under the hood — explicitly out of scope for this
+plan per the plan's "Out" list). These tests therefore exercise the
+planner-gate behavior through SQL DDL only, not through the schema
+introspection API.
+"""
+
+import os
+import random
+import pytest
+import gnitz
+
+
+_NEEDS_MULTI = pytest.mark.skipif(
+    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
+    reason="requires GNITZ_WORKERS>=2",
+)
+
+
+def _uid() -> str:
+    return str(random.randint(100_000, 999_999))
+
+
+def _cleanup(client, sn, *tables):
+    for t in tables:
+        try:
+            client.drop_table(sn, t)
+        except Exception:
+            pass
+    try:
+        client.drop_schema(sn)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Schema acceptance: legal compound forms must not raise.
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_two_u64_accepted(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_four_u32_accepted(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a INT UNSIGNED, b INT UNSIGNED, c INT UNSIGNED, d INT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c, d))",
+            schema_name=sn,
+        )
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_uuid_plus_companion_rejected_by_stride(client):
+    """`(UUID, U64)` = stride 24, rejected. Sanity check that mixed-width
+    compound PKs trip the stride membership rule."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a UUID, b BIGINT UNSIGNED, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+        assert "stride" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn)
+
+
+# ---------------------------------------------------------------------------
+# Schema rejection
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_five_columns_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a TINYINT UNSIGNED, b TINYINT UNSIGNED, c TINYINT UNSIGNED, "
+                "d TINYINT UNSIGNED, e TINYINT UNSIGNED, PRIMARY KEY (a, b, c, d, e))",
+                schema_name=sn,
+            )
+        assert "at most 4" in str(exc.value)
+    finally:
+        _cleanup(client, sn)
+
+
+def test_compound_pk_stride_12_rejected(client):
+    """(U64, U32) = stride 12, not in {1,2,4,8,16}."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+        assert "stride" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn)
+
+
+def test_compound_pk_stride_24_rejected(client):
+    """Three U64s = stride 24."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+                "PRIMARY KEY (a, b, c))",
+                schema_name=sn,
+            )
+        assert "stride" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn)
+
+
+def test_compound_pk_string_column_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+        msg = str(exc.value)
+        # Error names the offending column so the user can act on it.
+        assert "String" in msg or "string" in msg.lower()
+    finally:
+        _cleanup(client, sn)
+
+
+def test_compound_pk_duplicate_column_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, a))",
+                schema_name=sn,
+            )
+        msg = str(exc.value).lower()
+        assert "duplicate" in msg
+    finally:
+        _cleanup(client, sn)
+
+
+def test_compound_pk_mixed_inline_and_table_level_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT UNSIGNED PRIMARY KEY, b BIGINT UNSIGNED, "
+                "PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+        assert "Multiple PRIMARY KEY" in str(exc.value)
+    finally:
+        _cleanup(client, sn)
+
+
+# ---------------------------------------------------------------------------
+# View / Index / FK against compound-PK source rejected
+# ---------------------------------------------------------------------------
+
+
+def _make_compound_table(client, sn, name="src"):
+    client.execute_sql(
+        f"CREATE TABLE {name} (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
+        f"PRIMARY KEY (a, b))",
+        schema_name=sn,
+    )
+
+
+def test_view_over_compound_pk_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn)
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql("CREATE VIEW v AS SELECT * FROM src", schema_name=sn)
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_view_distinct_over_compound_pk_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn)
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT DISTINCT a, b FROM src", schema_name=sn,
+            )
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_view_group_by_over_compound_pk_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn)
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, COUNT(*) AS n FROM src GROUP BY a",
+                schema_name=sn,
+            )
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_index_on_compound_pk_rejected_via_sql(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn)
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql("CREATE INDEX idx ON src (payload)", schema_name=sn)
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_fk_references_compound_pk_rejected(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "parent")
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
+                "ref_a BIGINT UNSIGNED REFERENCES parent(a))",
+                schema_name=sn,
+            )
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "parent", "chi")
+
+
+def test_on_conflict_target_column_rejected_on_compound_pk(client):
+    """`ON CONFLICT (a) DO NOTHING` against PK(a, b) hits the
+    `validate_conflict_target` guard before any `pk_index_single()`
+    access — a clean SQL error, not a server-side panic."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "conf_t")
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(
+                "INSERT INTO conf_t (a, b, payload) VALUES (1, 2, 3) "
+                "ON CONFLICT (a) DO NOTHING",
+                schema_name=sn,
+            )
+        assert "compound" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "conf_t")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end DML round-trips
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_insert_distinct_rows_round_trip(client):
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)",
+            schema_name=sn,
+        )
+        # Read back via SELECT *. Named projection through
+        # `apply_projection` rebuilds the schema as single-PK (see
+        # `plans/apply-projection-compound-pk.md`), so we go through
+        # the wildcard branch that returns the source batch unchanged.
+        # This exercises compound-PK byte decoding: the second PK
+        # column lives in bytes 8..16 of each row's PK region.
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 10), (1, 2, 20), (2, 1, 30)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_insert_duplicate_tuple_rejected(client):
+    """Same (a, b) tuple twice → conflict; sharing one column is fine."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql("INSERT INTO t (a, b, payload) VALUES (1, 1, 10)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql(
+                "INSERT INTO t (a, b, payload) VALUES (1, 1, 99)", schema_name=sn,
+            )
+        # Different tuple → accepted.
+        client.execute_sql("INSERT INTO t (a, b, payload) VALUES (1, 2, 20)", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_on_conflict_no_target_do_nothing(client):
+    """No-target arms (`ON CONFLICT DO NOTHING` / `DO UPDATE`) don't
+    touch `pk_index_single()` — should accept compound-PK tables."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 1, 10) ON CONFLICT DO NOTHING",
+            schema_name=sn,
+        )
+        # Same tuple again → DO NOTHING; no error.
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 1, 999) ON CONFLICT DO NOTHING",
+            schema_name=sn,
+        )
+    finally:
+        _cleanup(client, sn, "t")
+
+
+@_NEEDS_MULTI
+def test_compound_pk_multi_worker_partition_routing(client):
+    """Multi-worker correctness: 20 rows distributed across workers
+    via compound-PK partition routing must all survive a scan, in
+    the right (a, b, payload) shape."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        expected = [(i, (i * 7) % 11, i * 100) for i in range(20)]
+        values = ", ".join(f"({a}, {b}, {p})" for (a, b, p) in expected)
+        client.execute_sql(f"INSERT INTO t (a, b, payload) VALUES {values}", schema_name=sn)
+        # SELECT * sidesteps apply_projection's single-PK assumption
+        # (see plans/apply-projection-compound-pk.md).
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == sorted(expected)
+    finally:
+        _cleanup(client, sn, "t")

@@ -70,6 +70,24 @@ fn idx_tab_schema() -> &'static Schema {
     })
 }
 
+/// Decode the persisted PK-list `u64` (from `TABLE_TAB.pk_col_idx`) into a
+/// `Vec<usize>` for the `Schema` type. The shared `gnitz_wire::unpack_pk_cols`
+/// handles both the bare-scalar (pre-compound) row form and the packed
+/// compound form. Rejects a `decoded_count()` that doesn't match the
+/// returned slice length: that signals a malformed wire payload (count
+/// > 4) that the server's `validate_pk_cols` would have rejected too —
+/// silently truncating here would hide the divergence from the client.
+fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
+    let pkl = gnitz_wire::unpack_pk_cols(packed);
+    let slice = pkl.as_slice();
+    if pkl.decoded_count() != slice.len() {
+        return Err(ClientError::ServerError(format!(
+            "PK column count {} exceeds maximum 4", pkl.decoded_count()
+        )));
+    }
+    Ok(slice.iter().map(|&c| c as usize).collect())
+}
+
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
     if col_idx >= 512 {
         return Err(ClientError::ServerError(
@@ -190,6 +208,18 @@ impl GnitzClient {
         &mut self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
     ) -> Result<u64, ClientError> {
         let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
+        // Reject before the request reaches the server: the index circuit
+        // packs (indexed_value, source_pk) into a u128 composite, which can
+        // only hold a single source PK column. Closing this here keeps
+        // non-SQL callers (gnitz-py, gnitz-capi, direct GnitzClient) from
+        // tripping `hook_index_register`'s `pk_index_single()` assert.
+        if schema.pk_cols.len() >= 2 {
+            return Err(ClientError::ServerError(format!(
+                "CREATE INDEX on compound-PK table '{}' is not supported \
+                 (the index entry packs the source PK into a u128)",
+                table_name,
+            )));
+        }
         let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
             .ok_or_else(|| ClientError::ServerError(
                 format!("column '{}' not found in table '{}'", col_name, table_name)
@@ -316,9 +346,15 @@ impl GnitzClient {
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
-        pk_col_idx: usize,
+        pk_cols: &[u32],
         unique_pk: bool,
     ) -> Result<u64, ClientError> {
+        if !(1..=4).contains(&pk_cols.len()) {
+            return Err(ClientError::ServerError(format!(
+                "create_table: PK column count {} out of range 1..=4", pk_cols.len(),
+            )));
+        }
+
         let new_tid = self.conn.alloc_table_id()?;
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
@@ -326,6 +362,12 @@ impl GnitzClient {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
+
+        // Encode the PK list using the shared wire packer so the engine
+        // catalog decodes it identically. Single-PK callers still flow
+        // through the same packer; the packed form's flag bit is what
+        // distinguishes it from a bare scalar index.
+        let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
 
         // COL_TAB first — server hook fires on TABLE_TAB insert and reads COL_TAB
         self.push_col_tab_records(new_tid, OWNER_KIND_TABLE, columns)?;
@@ -338,7 +380,7 @@ impl GnitzClient {
             .u64_val(schema_id)
             .str_val(table_name)
             .str_val("")
-            .u64_val(pk_col_idx as u64)
+            .u64_val(pk_packed)
             .u64_val(0)
             .u64_val(unique_pk as u64);
         self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
@@ -591,7 +633,7 @@ impl GnitzClient {
         })?;
 
         let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        Ok((record.tid, Schema { columns, pk_cols: vec![record.pk_col_idx as usize] }))
+        Ok((record.tid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }))
     }
 
     pub fn resolve_table_or_view_id(
@@ -616,7 +658,7 @@ impl GnitzClient {
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-                return Ok((record.tid, Schema { columns, pk_cols: vec![record.pk_col_idx as usize] }));
+                return Ok((record.tid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }));
             }
         }
 
@@ -781,5 +823,35 @@ mod tests {
         let id = pack_col_id(12345, 7).unwrap();
         assert_eq!(id >> 9, 12345);
         assert_eq!(id & 0x1FF, 7);
+    }
+
+    #[test]
+    fn decode_pk_cols_bare_single() {
+        let v = decode_pk_cols(3).unwrap();
+        assert_eq!(v, vec![3]);
+    }
+
+    #[test]
+    fn decode_pk_cols_packed_compound() {
+        let packed = gnitz_wire::pack_pk_cols(&[2, 5, 7, 1]);
+        let v = decode_pk_cols(packed).unwrap();
+        assert_eq!(v, vec![2, 5, 7, 1]);
+    }
+
+    #[test]
+    fn decode_pk_cols_rejects_overflow_count() {
+        // Hand-craft a packed value with the flag bit set and the count
+        // field claiming 5 columns. `as_slice()` clamps to 4 entries,
+        // but `decoded_count()` reports the malformed 5 — the client
+        // must surface that as an error instead of silently returning
+        // four columns.
+        let bad = gnitz_wire::PK_LIST_PACKED_FLAG | 5;
+        let err = decode_pk_cols(bad).expect_err("expected error on count=5");
+        match err {
+            ClientError::ServerError(s) => {
+                assert!(s.contains("5"), "expected '5' in message, got: {}", s);
+            }
+            other => panic!("expected ServerError, got {:?}", other),
+        }
     }
 }

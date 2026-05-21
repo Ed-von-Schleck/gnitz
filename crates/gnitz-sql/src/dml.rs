@@ -50,6 +50,17 @@ fn validate_conflict_target(
     match target {
         None => Ok(()),
         Some(ConflictTarget::Columns(cols)) => {
+            // Partial-tuple targets like `ON CONFLICT (a) DO NOTHING`
+            // against `PRIMARY KEY (a, b)` are out of scope for the
+            // compound-PK planner gate. Reject before any
+            // `pk_index_single()` access so the assert turns into a
+            // clean SQL error.
+            if schema.pk_cols.len() >= 2 {
+                return Err(GnitzSqlError::Unsupported(
+                    "ON CONFLICT with target columns is not supported on \
+                     compound-PK tables".to_string()
+                ));
+            }
             if cols.len() != 1 {
                 return Err(GnitzSqlError::Unsupported(
                     "composite ON CONFLICT targets not supported; \

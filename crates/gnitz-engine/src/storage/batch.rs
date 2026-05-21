@@ -436,10 +436,15 @@ impl Batch {
     /// scalar_func::copy_column).
     #[inline]
     pub fn set_schema(&mut self, s: SchemaDescriptor) {
+        // The batch carries one combined PK region (all PK columns
+        // concatenated) + one payload region per non-PK column. So the
+        // batch's payload-region count must equal the schema's non-PK
+        // column count regardless of single-vs-compound PK.
         debug_assert_eq!(
-            self.num_payload_cols() + 1, s.num_columns(),
-            "Batch::set_schema: batch has {} payload cols, schema declares {}",
-            self.num_payload_cols(), s.num_payload_cols()
+            self.num_payload_cols(), s.num_payload_cols(),
+            "Batch::set_schema: batch has {} payload cols, schema declares {} payload cols \
+             (pk_count={})",
+            self.num_payload_cols(), s.num_payload_cols(), s.pk_indices().len()
         );
         self.schema = Some(s);
     }

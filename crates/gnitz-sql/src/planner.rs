@@ -60,6 +60,19 @@ fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
+/// Reject any CREATE VIEW form that reads from a compound-PK source.
+/// Lifting this needs the view storage layer (which registers every view
+/// with a hardcoded `pk_cols = &[0]`) and every planner reindex site
+/// (which calls `pk_index_single()`) to widen first — a separate plan.
+fn reject_compound_pk_view_source(schema: &Schema) -> Result<(), GnitzSqlError> {
+    if schema.pk_count() >= 2 {
+        return Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW over a compound-PK table is not yet supported".into()
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx, parent_pk_type).
 /// Validates that fk_col_type is compatible with the parent PK type and
 /// returns the parent PK type so the caller can widen the child column.
@@ -73,6 +86,15 @@ fn resolve_fk_target(
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
+    // Reject before any `pk_index_single()` access below. A FK against a
+    // compound-PK parent needs a separate rule (the referenced column
+    // must have its own UNIQUE index); that's a later plan.
+    if ref_schema.pk_count() >= 2 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "FOREIGN KEY references compound-PK table '{}'; not yet supported",
+            ref_table,
+        )));
+    }
     if !referred_columns.is_empty() {
         let ref_col_name = &referred_columns[0].value;
         let pk_col_name = &ref_schema.columns[ref_schema.pk_index_single()].name;
@@ -107,7 +129,6 @@ fn execute_create_table(
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
 
     let sql_cols = &create.columns;
-    let mut pk_idx: Option<usize> = None;
 
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
@@ -121,26 +142,37 @@ fn execute_create_table(
         });
     }
 
-    // Phase 2 — table-level PRIMARY KEY constraints. Done before inline-PK
-    // detection so that an unknown column name in `PRIMARY KEY (...)` raises a
-    // bind error instead of being eclipsed by a duplicate-PK error from a
-    // separate inline `PRIMARY KEY` clause.
+    // Phase 2 — gather PK column indices.
+    //   * One table-level `PRIMARY KEY (a, b, ...)` clause OR one inline
+    //     `col PRIMARY KEY`; mixing the two is rejected.
+    //   * Unknown column names raise a Bind error.
+    //   * Duplicate columns inside a `PRIMARY KEY (...)` list are rejected
+    //     before the engine catalog reports the same.
+    let mut pk_indices: Vec<u32> = Vec::new();
+    let mut pk_decl_seen = false;
+
+    // Table-level PRIMARY KEY (...). Done before the inline pass so an
+    // unknown column name produces a Bind error rather than being eclipsed
+    // by a duplicate-PK error from a separate inline `PRIMARY KEY` clause.
     for constraint in &create.constraints {
         if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
-            if pk_cols.len() != 1 {
-                return Err(GnitzSqlError::Unsupported(
-                    "PRIMARY KEY must specify exactly one column".into()
-                ));
-            }
-            let idx = sql_cols.iter()
-                .position(|c| c.name.value.eq_ignore_ascii_case(&pk_cols[0].value))
-                .ok_or_else(|| GnitzSqlError::Bind(
-                    format!("PRIMARY KEY column '{}' not found", pk_cols[0].value)
-                ))?;
-            if pk_idx.is_some() {
+            if pk_decl_seen {
                 return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
             }
-            pk_idx = Some(idx);
+            pk_decl_seen = true;
+            for col_ident in pk_cols {
+                let idx = sql_cols.iter()
+                    .position(|c| c.name.value.eq_ignore_ascii_case(&col_ident.value))
+                    .ok_or_else(|| GnitzSqlError::Bind(format!(
+                        "PRIMARY KEY column '{}' not found", col_ident.value
+                    )))?;
+                if pk_indices.contains(&(idx as u32)) {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "Duplicate column '{}' in PRIMARY KEY", col_ident.value
+                    )));
+                }
+                pk_indices.push(idx as u32);
+            }
         }
     }
 
@@ -149,10 +181,11 @@ fn execute_create_table(
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::Unique { is_primary: true, .. } => {
-                    if pk_idx.is_some() {
+                    if pk_decl_seen {
                         return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
                     }
-                    pk_idx = Some(i);
+                    pk_decl_seen = true;
+                    pk_indices.push(i as u32);
                 }
                 ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
                     let (tid, idx, parent_pk_type) = resolve_fk_target(
@@ -190,16 +223,54 @@ fn execute_create_table(
         }
     }
 
-    let pk_idx = pk_idx.ok_or_else(|| GnitzSqlError::Plan(
-        "CREATE TABLE: exactly one PRIMARY KEY must be defined".into()
-    ))?;
+    // Admission rule — every base table must satisfy these conditions.
+    // The order here matches the order of error messages a user would
+    // expect to see: missing PK → count cap → type allow-list → stride.
+    if pk_indices.is_empty() {
+        return Err(GnitzSqlError::Plan(
+            "CREATE TABLE requires at least one PRIMARY KEY column".into()
+        ));
+    }
+    if pk_indices.len() > 4 {
+        return Err(GnitzSqlError::Unsupported(
+            "PRIMARY KEY supports at most 4 columns".into()
+        ));
+    }
+    for &i in &pk_indices {
+        let tc = cols[i as usize].type_code;
+        // String/Blob are bulk-copied without blob relocation in the PK
+        // region — the schema layer asserts on them, and `validate_pk_cols`
+        // on the server would reject them too. Catching it here produces a
+        // clearer error that names the offending column.
+        if matches!(tc, TypeCode::String | TypeCode::Blob) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "PRIMARY KEY column '{}' of type {:?} is not supported \
+                 (String/Blob cannot be PK columns)",
+                cols[i as usize].name, tc,
+            )));
+        }
+    }
+    // Engine cursors project the PK region to `u128` via
+    // `storage::batch::widen_pk_le`, which panics on any stride outside
+    // {1, 2, 4, 8, 16}. Single-PK tables always satisfy this because every
+    // column type's `wire_stride()` is already in that set.
+    let pk_stride: usize = pk_indices.iter()
+        .map(|&i| cols[i as usize].type_code.wire_stride())
+        .sum();
+    if !matches!(pk_stride, 1 | 2 | 4 | 8 | 16) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "Compound PRIMARY KEY stride must be 1/2/4/8/16 bytes, got {pk_stride}"
+        )));
+    }
 
     // PK columns keep their declared type. The null bitmap excludes the PK
     // region, so a nullable PK has no place to carry the null — enforce
     // non-nullable here regardless of type.
-    cols[pk_idx].is_nullable = false;
+    for &i in &pk_indices {
+        cols[i as usize].is_nullable = false;
+    }
 
-    let tid = client.create_table(schema_name, &table_name, &cols, pk_idx, true)
+    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::TableCreated { table_id: tid })
@@ -327,6 +398,7 @@ fn execute_create_view(
     let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
 
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    reject_compound_pk_view_source(&source_schema)?;
 
     // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
@@ -421,6 +493,20 @@ fn execute_create_index(
         )),
     };
     let is_unique = ci.unique;
+
+    // Reject before the request reaches the engine. Index circuits pack
+    // `(indexed_value, source_pk)` into a `u128`, so a compound source PK
+    // would silently truncate. `client.create_index` also enforces this
+    // for non-SQL callers; the planner-side check produces the clearer
+    // error pointing at the SQL statement.
+    let (_, owner_schema) = client.resolve_table_or_view_id(schema_name, &table_name)
+        .map_err(GnitzSqlError::Exec)?;
+    if owner_schema.pk_count() >= 2 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "CREATE INDEX on compound-PK table '{}' is not yet supported",
+            table_name,
+        )));
+    }
 
     let index_id = client.create_index(schema_name, &table_name, &col_name, is_unique)
         .map_err(GnitzSqlError::Exec)?;
@@ -586,7 +672,9 @@ fn execute_create_join_view(
 
     // Resolve both tables
     let (left_tid, left_schema) = binder.resolve(client, &left_name)?;
+    reject_compound_pk_view_source(&left_schema)?;
     let (right_tid, right_schema) = binder.resolve(client, &right_name)?;
+    reject_compound_pk_view_source(&right_schema)?;
 
     // Build alias map for qualified column resolution
     let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
@@ -849,6 +937,7 @@ fn execute_create_group_by_view(
     // 1. Resolve source table
     let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    reject_compound_pk_view_source(&source_schema)?;
 
     // 2. Parse GROUP BY → group column indices
     let group_exprs = match &select.group_by {
@@ -1263,6 +1352,7 @@ fn compile_set_op_side(
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "set operation")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    reject_compound_pk_view_source(&source_schema)?;
 
     let inp = cb.input_delta_tagged(source_tid);
 
@@ -1391,6 +1481,7 @@ fn execute_create_distinct_view(
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "SELECT DISTINCT")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    reject_compound_pk_view_source(&source_schema)?;
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, source_tid);

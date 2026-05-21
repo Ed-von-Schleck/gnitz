@@ -293,6 +293,17 @@ impl CatalogEngine {
                 let entry = self.dag.tables.get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
                 let owner_schema = entry.schema;
+                // Reject before `pk_index_single()` to keep the catalog
+                // worker alive on a crafted `raw_store_ingest` into
+                // `IDX_TAB` against a compound-PK owner. The SQL planner
+                // and `gnitz-core::create_index` close the same path for
+                // ordinary callers; this guard covers the bypass.
+                if owner_schema.pk_indices().len() >= 2 {
+                    return Err(format!(
+                        "Secondary index on compound-PK table (tid={owner_id}) is not \
+                         supported (index entry packs source PK into a u128)"
+                    ));
+                }
                 let source_col_type = owner_schema.columns[source_col_idx as usize].type_code;
                 let source_pk_type = owner_schema.columns[owner_schema.pk_index_single() as usize].type_code;
 

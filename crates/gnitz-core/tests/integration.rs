@@ -7,6 +7,13 @@ use gnitz_core::{GnitzClient, ExprBuilder, CircuitBuilder};
 use gnitz_core::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, PkColumn};
 use helpers::ServerHandle;
 
+/// Build a fresh schema cache for tests that drive `Connection` directly.
+/// The production client (`GnitzClient`) owns this cache; raw-`Connection`
+/// callers must supply their own.
+fn fresh_cache() -> lru::LruCache<u64, (Schema, u16)> {
+    lru::LruCache::new(std::num::NonZeroUsize::new(64).unwrap())
+}
+
 #[test]
 fn test_connect_disconnect() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
@@ -17,7 +24,7 @@ fn test_connect_disconnect() {
 #[test]
 fn test_alloc_ids() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let conn = Connection::connect(&srv.sock_path).unwrap();
+    let mut conn = Connection::connect(&srv.sock_path).unwrap();
 
     let mut ids = Vec::new();
     for _ in 0..10 {
@@ -41,7 +48,8 @@ fn test_alloc_ids() {
 #[test]
 fn test_push_scan_roundtrip() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let conn = Connection::connect(&srv.sock_path).unwrap();
+    let mut conn = Connection::connect(&srv.sock_path).unwrap();
+    let mut cache = fresh_cache();
 
     // SCHEMA_TAB: pk=U64 (col 0), name=STRING (col 1)
     let schema_tab_schema = Schema {
@@ -64,9 +72,9 @@ fn test_push_scan_roundtrip() {
             ColData::Strings((0..5usize).map(|i| Some(format!("test_{}", i))).collect()),
         ],
     };
-    conn.push(SCHEMA_TAB, &schema_tab_schema, &batch).unwrap();
+    conn.push(SCHEMA_TAB, &schema_tab_schema, &batch, &mut cache).unwrap();
 
-    let (wire_schema, data, _) = conn.scan(SCHEMA_TAB).unwrap();
+    let (wire_schema, data, _) = conn.scan(SCHEMA_TAB, &mut cache).unwrap();
     assert!(wire_schema.is_some(), "scan must return schema");
     let data = data.unwrap();
 
@@ -90,7 +98,7 @@ fn test_push_scan_roundtrip() {
 #[test]
 fn test_scan_system_tables() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     let (_, data, _) = client.scan(SCHEMA_TAB).unwrap();
     let data = data.expect("SCHEMA_TAB must return rows");
@@ -115,7 +123,7 @@ fn test_scan_system_tables() {
 #[test]
 fn test_create_drop_schema() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     let sid = client.create_schema("myapp").unwrap();
     assert!(sid >= gnitz_core::FIRST_USER_SCHEMA_ID, "schema id too small: {}", sid);
@@ -145,7 +153,7 @@ fn test_create_drop_schema() {
 #[test]
 fn test_create_drop_table() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("s1").unwrap();
 
@@ -153,7 +161,7 @@ fn test_create_drop_table() {
         ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("s1", "t1", &cols, 0, true).unwrap();
+    let tid = client.create_table("s1", "t1", &cols, &[0u32], true).unwrap();
     assert!(tid >= FIRST_USER_TABLE_ID, "table id too small: {}", tid);
 
     // Scan user table — should be empty but return a schema.
@@ -172,7 +180,7 @@ fn test_create_drop_table() {
 #[test]
 fn test_push_and_scan() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("s2").unwrap();
 
@@ -180,7 +188,7 @@ fn test_push_and_scan() {
         ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("s2", "t2", &cols, 0, true).unwrap();
+    let tid = client.create_table("s2", "t2", &cols, &[0u32], true).unwrap();
 
     let table_schema = Schema {
         columns: cols,
@@ -213,7 +221,7 @@ fn test_push_and_scan() {
 #[test]
 fn test_delete_rows() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("s3").unwrap();
 
@@ -221,7 +229,7 @@ fn test_delete_rows() {
         ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("s3", "t3", &cols, 0, true).unwrap();
+    let tid = client.create_table("s3", "t3", &cols, &[0u32], true).unwrap();
 
     let table_schema = Schema {
         columns: cols,
@@ -261,7 +269,7 @@ fn test_delete_rows() {
 #[test]
 fn test_string_columns() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("s4").unwrap();
 
@@ -270,7 +278,7 @@ fn test_string_columns() {
         ColumnDef { name: "label".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "note".into(),  type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("s4", "t4", &cols, 0, true).unwrap();
+    let tid = client.create_table("s4", "t4", &cols, &[0u32], true).unwrap();
 
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
@@ -317,7 +325,7 @@ fn test_string_columns() {
 #[test]
 fn test_resolve_table_id() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("s5").unwrap();
 
@@ -326,7 +334,7 @@ fn test_resolve_table_id() {
         ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("s5", "t5", &cols, 0, true).unwrap();
+    let tid = client.create_table("s5", "t5", &cols, &[0u32], true).unwrap();
 
     let (resolved_tid, schema) = client.resolve_table_id("s5", "t5").unwrap();
     assert_eq!(resolved_tid, tid);
@@ -357,14 +365,14 @@ fn col_i64(col: &ColData, i: usize) -> i64 {
 #[test]
 fn test_filter_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv1").unwrap();
     let cols = vec![
         ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("sv1", "ft1", &cols, 0, true).unwrap();
+    let tid = client.create_table("sv1", "ft1", &cols, &[0u32], true).unwrap();
 
     // Build filter: val > 50
     let mut eb = ExprBuilder::new();
@@ -411,7 +419,7 @@ fn test_filter_view() {
 #[test]
 fn test_reduce_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv2").unwrap();
     let cols = vec![
@@ -419,7 +427,7 @@ fn test_reduce_view() {
         ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("sv2", "rt2", &cols, 0, true).unwrap();
+    let tid = client.create_table("sv2", "rt2", &cols, &[0u32], true).unwrap();
 
     let vid = client.alloc_table_id().unwrap();
     let mut cb = CircuitBuilder::new(vid, tid);
@@ -470,7 +478,7 @@ fn test_reduce_view() {
 #[test]
 fn test_join_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv3").unwrap();
     let cols = vec![
@@ -478,8 +486,8 @@ fn test_join_view() {
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
-    let tid_a = client.create_table("sv3", "jt3a", &table_schema.columns, 0, true).unwrap();
-    let tid_b = client.create_table("sv3", "jt3b", &table_schema.columns, 0, true).unwrap();
+    let tid_a = client.create_table("sv3", "jt3a", &table_schema.columns, &[0u32], true).unwrap();
+    let tid_b = client.create_table("sv3", "jt3b", &table_schema.columns, &[0u32], true).unwrap();
 
     // Pre-populate B with pk=1,2,3
     let mut batch_b = ZSetBatch::new(&table_schema);
@@ -531,7 +539,7 @@ fn test_join_view() {
 #[test]
 fn test_anti_join_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv4").unwrap();
     let cols = vec![
@@ -539,8 +547,8 @@ fn test_anti_join_view() {
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
-    let tid_a = client.create_table("sv4", "ajt4a", &table_schema.columns, 0, true).unwrap();
-    let tid_b = client.create_table("sv4", "ajt4b", &table_schema.columns, 0, true).unwrap();
+    let tid_a = client.create_table("sv4", "ajt4a", &table_schema.columns, &[0u32], true).unwrap();
+    let tid_b = client.create_table("sv4", "ajt4b", &table_schema.columns, &[0u32], true).unwrap();
 
     // Pre-populate B with pk=1,2
     let mut batch_b = ZSetBatch::new(&table_schema);
@@ -587,13 +595,13 @@ fn test_anti_join_view() {
 #[test]
 fn test_exchange_multi_worker() {
     let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv5").unwrap();
     let cols = vec![
         ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("sv5", "et5", &cols, 0, true).unwrap();
+    let tid = client.create_table("sv5", "et5", &cols, &[0u32], true).unwrap();
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Push 1000 rows
@@ -623,7 +631,7 @@ fn test_exchange_multi_worker() {
 #[test]
 fn test_incremental_update() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv6").unwrap();
     let table_schema = Schema {
@@ -634,7 +642,7 @@ fn test_incremental_update() {
         ],
         pk_cols: vec![0],
     };
-    let tid = client.create_table("sv6", "iu6", &table_schema.columns, 0, true).unwrap();
+    let tid = client.create_table("sv6", "iu6", &table_schema.columns, &[0u32], true).unwrap();
 
     let vid = client.alloc_table_id().unwrap();
     let mut cb = CircuitBuilder::new(vid, tid);
@@ -702,14 +710,14 @@ fn test_incremental_update() {
 #[test]
 fn test_bulk_filter() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("bf1").unwrap();
     let cols = vec![
         ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("bf1", "bft1", &cols, 0, true).unwrap();
+    let tid = client.create_table("bf1", "bft1", &cols, &[0u32], true).unwrap();
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Build filter: val > 50_000
@@ -756,14 +764,14 @@ fn test_bulk_filter() {
 #[ignore]
 fn test_bulk_exchange_multi_worker() {
     let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("bem1").unwrap();
     let cols = vec![
         ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let tid = client.create_table("bem1", "bemt1", &cols, 0, true).unwrap();
+    let tid = client.create_table("bem1", "bemt1", &cols, &[0u32], true).unwrap();
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
 
     // Push 500 000 rows in a single batch
@@ -790,7 +798,7 @@ fn test_bulk_exchange_multi_worker() {
 #[test]
 fn test_left_join_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv7").unwrap();
     let schema_a = Schema {
@@ -807,8 +815,8 @@ fn test_left_join_view() {
         ],
         pk_cols: vec![0],
     };
-    let tid_a = client.create_table("sv7", "lj7a", &schema_a.columns, 0, true).unwrap();
-    let tid_b = client.create_table("sv7", "lj7b", &schema_b.columns, 0, true).unwrap();
+    let tid_a = client.create_table("sv7", "lj7a", &schema_a.columns, &[0u32], true).unwrap();
+    let tid_b = client.create_table("sv7", "lj7b", &schema_b.columns, &[0u32], true).unwrap();
 
     // Pre-populate B: only pk=1 exists (pk=2 will be unmatched)
     let mut batch_b = ZSetBatch::new(&schema_b);
@@ -875,7 +883,7 @@ fn test_left_join_view() {
 #[test]
 fn test_distinct_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv8").unwrap();
     let table_schema = Schema {
@@ -885,7 +893,7 @@ fn test_distinct_view() {
         ],
         pk_cols: vec![0],
     };
-    let tid = client.create_table("sv8", "dt8", &table_schema.columns, 0, true).unwrap();
+    let tid = client.create_table("sv8", "dt8", &table_schema.columns, &[0u32], true).unwrap();
 
     // union(inp, inp) doubles all weights to 2; distinct reduces back to 1.
     let vid = client.alloc_table_id().unwrap();
@@ -925,7 +933,7 @@ fn test_distinct_view() {
 #[test]
 fn test_min_max_aggregate_view() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
 
     client.create_schema("sv9").unwrap();
     let table_schema = Schema {
@@ -936,7 +944,7 @@ fn test_min_max_aggregate_view() {
         ],
         pk_cols: vec![0],
     };
-    let tid = client.create_table("sv9", "ma9", &table_schema.columns, 0, true).unwrap();
+    let tid = client.create_table("sv9", "ma9", &table_schema.columns, &[0u32], true).unwrap();
 
     let agg_out_cols = |agg_name: &str| vec![
         ColumnDef { name: "_hash".into(),    type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
@@ -976,7 +984,7 @@ fn test_min_max_aggregate_view() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let read_groups = |vid| -> (i64, i64) {
+    let mut read_groups = |vid| -> (i64, i64) {
         let (_, data, _) = client.scan(vid).unwrap();
         let data = data.unwrap();
         let (mut g1, mut g2) = (i64::MAX, i64::MAX);
