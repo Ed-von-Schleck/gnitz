@@ -257,6 +257,16 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     pub fn close_partitions_outside(&mut self, start: u32, end: u32) {
+        assert!(
+            start <= end,
+            "close_partitions_outside: start ({start}) > end ({end})",
+        );
+        assert!(
+            start >= self.part_offset,
+            "close_partitions_outside: left-expansion (start={start} < part_offset={}) \
+             not supported — surviving tables would map to wrong indices",
+            self.part_offset,
+        );
         let old_offset = self.part_offset;
         let old_tables = std::mem::take(&mut self.tables);
 

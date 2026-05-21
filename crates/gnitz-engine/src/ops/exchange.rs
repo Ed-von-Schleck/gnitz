@@ -34,7 +34,15 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
 /// STRING columns are hashed to u64 (stored as u128); all others use the full value.
 fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
     if schema.is_pk_col(col_idx) {
-        return mb.get_pk(row);
+        if schema.pk_indices().len() == 1 {
+            return mb.get_pk(row);
+        }
+        // get_pk() returns all PK bytes packed; for a compound PK we need
+        // only this column's slice, not the concatenated region.
+        let offset = schema.pk_byte_offset(col_idx) as usize;
+        let bytes = mb.get_pk_bytes(row);
+        let col = &schema.columns[col_idx];
+        return crate::schema::promote_to_index_key(bytes, offset, col.size() as usize, col.type_code);
     }
     let pi = schema.payload_idx(col_idx);
     let col = &schema.columns[col_idx];
@@ -160,7 +168,7 @@ impl PartitionRouter {
 /// routing can read the PK directly instead of extracting a group key.
 #[inline]
 fn is_single_pk_col(schema: &SchemaDescriptor, col_indices: &[u32]) -> bool {
-    col_indices.len() == 1 && schema.is_pk_col(col_indices[0] as usize)
+    col_indices.len() == 1 && schema.pk_indices() == col_indices
 }
 
 fn hash_row_for_partition(
@@ -663,7 +671,7 @@ pub fn op_multi_scatter(
         // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
         for si in 0..n_specs {
             let spec = col_specs[si];
-            if is_single_pk_col(schema, spec) {
+            if schema.group_cols_eq_pk(spec) {
                 if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
                     for batch in results[si].iter_mut().take(num_workers) {
                         if batch.count > 0 {
@@ -834,7 +842,7 @@ mod tests {
             (wide_pk(7, 0, 0), 1, 32),
         ]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
-        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
+        let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
         assert_eq!(total_rows(&result), 9);
         for (w, sb) in result.iter().enumerate() {
@@ -1022,7 +1030,7 @@ mod tests {
             (wide_pk(10, 11, 12), 1, 4),
         ]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
-        let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
+        let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
         assert_eq!(total_rows(&result), 4);
         for (w, sb) in result.iter().enumerate() {

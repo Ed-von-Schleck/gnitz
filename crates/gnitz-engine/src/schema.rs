@@ -109,11 +109,9 @@ const fn compute_mappings(
 
 impl SchemaDescriptor {
     /// Construct a SchemaDescriptor from a column list and PK index list.
-    /// Today only single-PK schemas are supported in practice (`pk_indices.len() == 1`);
-    /// the empty case `pk_indices = &[]` is reserved for the placeholder
+    /// The empty case `pk_indices = &[]` is reserved for the placeholder
     /// produced by `Default::default()` and is structurally invalid for real
-    /// use. The representation itself accepts up to `MAX_PK_COLUMNS` entries
-    /// so the field shape is ready for compound PKs without a re-layout.
+    /// use. Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
     pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");

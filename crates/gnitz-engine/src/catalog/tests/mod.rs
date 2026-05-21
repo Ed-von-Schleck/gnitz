@@ -1,3 +1,4 @@
+mod compound_pk_smoke;
 mod ddl_tests;
 mod fk_tests;
 mod uuid_tests;

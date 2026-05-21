@@ -299,7 +299,7 @@ impl Batch {
                 buf.resize(total_size, 0);
                 buf
             } else {
-                super::batch_pool::recycle_buf(buf);
+                drop(buf);   // evict the undersized buffer; pool converges to larger sizes
                 vec![0u8; total_size]
             }
         };
@@ -341,18 +341,24 @@ impl Batch {
         // Derive strides from sizes / count.
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         for i in 0..nr {
-            strides[i] = (sizes[i] as usize / count) as u8;
+            assert_eq!(
+                sizes[i] as usize % count,
+                0,
+                "from_regions: region {i} size ({}) is not a multiple of row count ({count})",
+                sizes[i],
+            );
+            let stride = sizes[i] as usize / count;
+            assert!(
+                stride <= u8::MAX as usize,
+                "from_regions: region {i} stride ({stride}) exceeds u8::MAX",
+            );
+            strides[i] = stride as u8;
         }
         let (offsets, total_size) = compute_offsets(&strides, nr, count);
 
-        // SAFETY: the loop below writes every byte of every non-null region with
-        // stride>0. compute_offsets packs regions back-to-back, so total_size is
-        // fully covered. Bytes belonging to a stride-0 or null-ptr region are
-        // zero bytes that no accessor reads (count*stride == 0 for those slots).
         let mut data = super::batch_pool::acquire_buf();
         data.clear();
-        data.reserve(total_size);
-        unsafe { data.set_len(total_size); }
+        data.resize(total_size, 0);
 
         // Copy each region into the contiguous buffer.
         for i in 0..nr {
@@ -591,7 +597,7 @@ impl Batch {
                     unsafe { buf.set_len(new_total); }
                     buf
                 } else {
-                    super::batch_pool::recycle_buf(buf);
+                    drop(buf);   // evict the undersized buffer; pool converges to larger sizes
                     let mut v = Vec::with_capacity(new_total);
                     unsafe { v.set_len(new_total); }
                     v
@@ -776,6 +782,8 @@ impl Batch {
         end: usize,
         weight_override: Option<i64>,
     ) {
+        assert!(start <= end, "append_mem_batch_range: start ({start}) > end ({end})");
+        assert!(end <= src.count, "append_mem_batch_range: end ({end}) > src.count ({})", src.count);
         let n = end - start;
         if n == 0 { return; }
         self.reserve_rows(n);
@@ -1696,7 +1704,7 @@ pub fn write_to_batch(
     // Sized for max_rows; blob is separate.
     let (offsets, arena_size) = compute_offsets(&strides, nr, max_rows);
 
-    // Match `with_schema`: a too-small pooled buffer is recycled rather than
+    // Match `with_schema`: a too-small pooled buffer is evicted rather than
     // grown in place — `Vec::reserve` would copy old bytes forward before the
     // tail is zeroed, slower than a fresh zeroed allocation.
     let mut data = {
@@ -1705,7 +1713,7 @@ pub fn write_to_batch(
             buf.resize(arena_size, 0);
             buf
         } else {
-            super::batch_pool::recycle_buf(buf);
+            drop(buf);   // evict the undersized buffer; pool converges to larger sizes
             alloc_large_zeroed(arena_size)
         }
     };
@@ -1807,6 +1815,11 @@ pub fn encode_multi_to_wire(
     let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
     let mut total_count: u32 = 0;
     for batch in batches {
+        debug_assert_eq!(
+            batch.num_regions_total(),
+            nr,
+            "encode_multi_to_wire: batch schema mismatch in multi-encode payload"
+        );
         total_count += batch.count as u32;
         for (i, size) in sizes[..nr].iter_mut().enumerate() {
             *size += batch.region_size(i) as u32;
