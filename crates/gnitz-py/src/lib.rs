@@ -1750,16 +1750,36 @@ struct IoRequest {
     kind:    ResponseKind,
 }
 
+/// Bound on the I/O request channel. Limits RAM when Python sends faster than
+/// the network flushes. `enqueue` returns GnitzError if the channel is full.
+const IO_CHANNEL_DEPTH: usize = 4096;
+
+/// Cap on requests merged into one natural-batching cycle.
+const IO_BATCH_MAX: usize = 1024;
+
+static TRANSPORT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// dup() of the connection's socket fd. The I/O thread owns the original
+/// sock_fd; `DupFd` is an independent reference whose `shutdown` wakes any
+/// in-flight `recv_framed` on the shared open file description, even after
+/// the I/O thread has closed sock_fd (the integer may already be recycled).
+struct DupFd(std::os::unix::io::RawFd);
+
+impl Drop for DupFd {
+    fn drop(&mut self) {
+        unsafe { libc::shutdown(self.0, libc::SHUT_RDWR); }
+        gnitz_core::close_fd(self.0);
+    }
+}
+
 #[pyclass(name = "AsyncTransport")]
 struct PyAsyncTransport {
-    tx:               Option<std::sync::mpsc::Sender<IoRequest>>,
-    event_loop:       Py<PyAny>,
-    client_id:        u64,
-    thread:           Option<std::thread::JoinHandle<()>>,
-    // Kept alive so GC doesn't collect the Python callables while the I/O thread
-    // holds clones of them.
-    #[allow(dead_code)] set_result_fn:    Py<PyAny>,
-    #[allow(dead_code)] set_exception_fn: Py<PyAny>,
+    tx:         Option<std::sync::mpsc::SyncSender<IoRequest>>,
+    dup_fd:     Option<DupFd>,
+    event_loop: Py<PyAny>,
+    client_id:  u64,
+    thread:     Option<std::thread::JoinHandle<()>>,
 }
 
 impl PyAsyncTransport {
@@ -1770,11 +1790,16 @@ impl PyAsyncTransport {
             GnitzError::new_err("connection closed")
         })?;
         let fut = self.event_loop.call_method0(py, "create_future")?;
-        tx.send(IoRequest {
+        tx.try_send(IoRequest {
             payload,
             future: fut.clone_ref(py),
             kind,
-        }).map_err(|_| GnitzError::new_err("I/O thread exited"))?;
+        }).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) =>
+                GnitzError::new_err("transport queue full"),
+            std::sync::mpsc::TrySendError::Disconnected(_) =>
+                GnitzError::new_err("I/O thread exited"),
+        })?;
         Ok(fut)
     }
 }
@@ -1803,9 +1828,17 @@ impl PyAsyncTransport {
                 return Err(GnitzError::new_err(e.to_string()));
             }
         };
-        let client_id = std::process::id() as u64;
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let raw_dup = unsafe { libc::dup(sock_fd) };
+        if raw_dup < 0 {
+            let err = std::io::Error::last_os_error();
+            gnitz_core::close_fd(sock_fd);
+            return Err(GnitzError::new_err(format!("dup socket fd: {}", err)));
+        }
+        let dup_fd = DupFd(raw_dup);
+
+        let client_id = TRANSPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::sync_channel(IO_CHANNEL_DEPTH);
         let loop_ref: Py<PyAny> = event_loop.clone_ref(py);
         let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py);
         let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py);
@@ -1815,12 +1848,11 @@ impl PyAsyncTransport {
         });
 
         Ok(PyAsyncTransport {
-            tx:               Some(tx),
+            tx:         Some(tx),
+            dup_fd:     Some(dup_fd),
             event_loop,
             client_id,
-            thread:           Some(handle),
-            set_result_fn,
-            set_exception_fn,
+            thread:     Some(handle),
         })
     }
 
@@ -1847,19 +1879,30 @@ impl PyAsyncTransport {
         self.enqueue(py, payload, ResponseKind::Scan)
     }
 
-    fn close(&mut self, _py: Python<'_>) {
-        self.tx.take(); // drop sender → I/O thread exits
+    #[getter]
+    fn client_id(&self) -> u64 { self.client_id }
+
+    fn close(&mut self, py: Python<'_>) {
+        self.tx.take();
+        // DupFd::drop shuts down + closes the dup'd fd; the shutdown wakes
+        // any in-flight recv_framed on the I/O thread.
+        self.dup_fd.take();
         if let Some(h) = self.thread.take() {
-            let _ = h.join();
+            // Release the GIL so the I/O thread can finish any in-progress
+            // with_gil block before the join returns.
+            py.allow_threads(|| { let _ = h.join(); });
         }
     }
 }
 
 impl Drop for PyAsyncTransport {
     fn drop(&mut self) {
-        // Drop the sender so the I/O thread can exit.
-        // Do NOT join here — may deadlock during GC.
+        // Do NOT join: Drop may be called from GC while holding the GIL, and
+        // the I/O thread acquires the GIL to resolve futures — joining would
+        // deadlock. DupFd::drop still fires the shutdown so the I/O thread
+        // can exit promptly on its own.
         self.tx.take();
+        self.dup_fd.take();
     }
 }
 
@@ -1912,7 +1955,8 @@ fn async_io_loop(
 ) {
     use std::collections::VecDeque;
 
-    let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> = VecDeque::new();
+    let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> =
+        VecDeque::with_capacity(IO_BATCH_MAX);
 
     loop {
         // Block until at least one request
@@ -1923,29 +1967,34 @@ fn async_io_loop(
 
         // Drain additional queued requests (natural batching), capped to
         // avoid filling the socket send buffer before reading any responses.
-        let mut batch = vec![first];
-        while batch.len() < 1024 {
+        // Py<PyAny>: Send, so moving futures into pending_futures needs no GIL.
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(IO_BATCH_MAX);
+        let mut kinds:    Vec<ResponseKind> = Vec::with_capacity(IO_BATCH_MAX);
+        payloads.push(first.payload);
+        kinds.push(first.kind);
+        pending_futures.push_back((first.future, first.kind));
+        while payloads.len() < IO_BATCH_MAX {
             match rx.try_recv() {
-                Ok(req) => batch.push(req),
-                Err(_)  => break,
+                Ok(req) => {
+                    payloads.push(req.payload);
+                    kinds.push(req.kind);
+                    pending_futures.push_back((req.future, req.kind));
+                }
+                Err(_) => break,
             }
         }
 
-        // Single GIL acquisition to register all futures before any sends,
-        // so error handling only needs to drain pending_futures once.
-        Python::with_gil(|py| {
-            for req in &batch {
-                pending_futures.push_back((req.future.clone_ref(py), req.kind));
-            }
-        });
-
         // Send all requests in this batch.
-        for req in &batch {
-            if let Err(e) = gnitz_core::send_framed(sock_fd, &req.payload) {
-                // Fatal send error — fail all futures (previous batches + this batch) and exit
-                for (fut, _) in pending_futures.drain(..) {
-                    fail_future(&loop_ref, &se_fn, &fut, &e.to_string());
-                }
+        for payload in &payloads {
+            if let Err(e) = gnitz_core::send_framed(sock_fd, payload) {
+                Python::with_gil(|py| {
+                    let exc = GnitzError::new_err(e.to_string())
+                        .into_pyobject(py).unwrap().into_any().unbind();
+                    for (fut, _) in pending_futures.drain(..) {
+                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                            (&se_fn, &fut, exc.clone_ref(py)));
+                    }
+                });
                 gnitz_core::close_fd(sock_fd);
                 return;
             }
@@ -1953,14 +2002,12 @@ fn async_io_loop(
 
         // Recv all responses for this batch (pure Rust, no GIL).
         // Scan requests use recv_scan_response to collect streaming frames.
-        let mut results: Vec<Result<gnitz_core::Message, String>> = Vec::with_capacity(batch.len());
-        let mut recv_failed = false;
-        for req in &batch {
-            if recv_failed {
-                results.push(Err("connection lost".to_string()));
-                continue;
-            }
-            let recv_result = match req.kind {
+        // On transport failure: stop reading and record the error once —
+        // remaining futures are failed with the same exception below.
+        let mut results: Vec<gnitz_core::Message> = Vec::with_capacity(kinds.len());
+        let mut recv_err: Option<String> = None;
+        for &kind in &kinds {
+            let r = match kind {
                 ResponseKind::Scan => recv_scan_response(sock_fd, max_payload_len),
                 ResponseKind::Push => {
                     gnitz_core::recv_framed(sock_fd, max_payload_len)
@@ -1968,82 +2015,67 @@ fn async_io_loop(
                         .and_then(|buf| gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string()))
                 }
             };
-            match recv_result {
-                Ok(msg)  => results.push(Ok(msg)),
-                Err(e)   => { results.push(Err(e)); recv_failed = true; }
+            match r {
+                Ok(msg) => results.push(msg),
+                Err(e)  => { recv_err = Some(e); break; }
             }
         }
 
-        // Single GIL acquisition to resolve all futures
+        // Single GIL acquisition to resolve all futures.
+        let conn_lost = recv_err.is_some();
         Python::with_gil(|py| {
-            for result in results {
+            for msg in results {
                 let (fut, kind) = pending_futures.pop_front().unwrap();
-                match result {
-                    Ok(msg) => {
-                        if msg.status == gnitz_core::STATUS_ERROR {
-                            let err_text = msg.error_text.unwrap_or_default();
-                            let exc = GnitzError::new_err(err_text);
-                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                                (&se_fn, &fut, exc));
-                        } else {
-                            let py_val = match kind {
-                                ResponseKind::Push => {
-                                    (msg.seek_pk as u64).into_pyobject(py).unwrap().into_any().unbind()
-                                }
-                                ResponseKind::Scan => {
-                                    let lsn = msg.seek_pk as u64;
-                                    let data = match (msg.schema, msg.data_batch) {
-                                        (Some(s), Some(b)) => {
-                                            let names: Vec<&str> = s.columns.iter()
-                                                .map(|c| c.name.as_str()).collect();
-                                            let fields = PyTuple::new(py, names).unwrap().unbind();
-                                            let field_index = build_field_index(&s);
-                                            Some(Arc::new(SharedBatchData {
-                                                schema: s, batch: b, fields, field_index
-                                            }))
-                                        }
-                                        _ => None,
-                                    };
-                                    Py::new(py, PyScanResult {
-                                        data, lsn, cached_schema: None, cached_batch: None,
-                                    }).unwrap().into_any()
-                                }
-                            };
-                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                                (&sr_fn, &fut, py_val));
+                if msg.status == gnitz_core::STATUS_ERROR {
+                    let err_text = msg.error_text.unwrap_or_default();
+                    let exc = GnitzError::new_err(err_text);
+                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                        (&se_fn, &fut, exc));
+                } else {
+                    let py_val = match kind {
+                        ResponseKind::Push => {
+                            (msg.seek_pk as u64).into_pyobject(py).unwrap().into_any().unbind()
                         }
-                    }
-                    Err(e) => {
-                        let exc = GnitzError::new_err(e);
-                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                            (&se_fn, &fut, exc));
-                    }
+                        ResponseKind::Scan => {
+                            let lsn = msg.seek_pk as u64;
+                            let data = match (msg.schema, msg.data_batch) {
+                                (Some(s), Some(b)) => {
+                                    let names: Vec<&str> = s.columns.iter()
+                                        .map(|c| c.name.as_str()).collect();
+                                    let fields = PyTuple::new(py, names).unwrap().unbind();
+                                    let field_index = build_field_index(&s);
+                                    Some(Arc::new(SharedBatchData {
+                                        schema: s, batch: b, fields, field_index
+                                    }))
+                                }
+                                _ => None,
+                            };
+                            Py::new(py, PyScanResult {
+                                data, lsn, cached_schema: None, cached_batch: None,
+                            }).unwrap().into_any()
+                        }
+                    };
+                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                        (&sr_fn, &fut, py_val));
+                }
+            }
+            if let Some(e) = recv_err {
+                let exc = GnitzError::new_err(e)
+                    .into_pyobject(py).unwrap().into_any().unbind();
+                for (fut, _) in pending_futures.drain(..) {
+                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                        (&se_fn, &fut, exc.clone_ref(py)));
                 }
             }
         });
 
-        if recv_failed {
-            // Connection is broken — fail any remaining pending futures and exit
-            Python::with_gil(|py| {
-                for (fut, _) in pending_futures.drain(..) {
-                    let exc = GnitzError::new_err("connection lost");
-                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                        (&se_fn, &fut, exc));
-                }
-            });
+        if conn_lost {
             gnitz_core::close_fd(sock_fd);
             return;
         }
     }
 
     gnitz_core::close_fd(sock_fd);
-}
-
-fn fail_future(loop_ref: &Py<PyAny>, se_fn: &Py<PyAny>, fut: &Py<PyAny>, msg: &str) {
-    Python::with_gil(|py| {
-        let exc = GnitzError::new_err(msg.to_string());
-        let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (se_fn, fut, exc));
-    });
 }
 
 // ---------------------------------------------------------------------------

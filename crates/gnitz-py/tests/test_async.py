@@ -478,3 +478,71 @@ def test_api_parity_sync_has_all_dml():
     """Connection must expose every DML method that AsyncConnection does."""
     missing = _DML_METHODS - set(dir(gnitz.Connection))
     assert not missing, f"Connection missing DML methods: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Transport lifecycle — cleanup on close()/drop()
+# ---------------------------------------------------------------------------
+
+import gc
+import time
+
+
+def _os_thread_count() -> int:
+    # Linux-only — the rest of the suite already assumes Linux.
+    return len(os.listdir("/proc/self/task"))
+
+
+@pytest.mark.asyncio
+async def test_drop_without_close_releases_thread(server):
+    """Dropping an AsyncTransport (no close()) must let the I/O thread exit
+    on its own — Drop shuts down the dup'd fd so recv_framed unblocks."""
+    before = _os_thread_count()
+    conn = await aio.connect(server)
+    # Issue one request so the I/O thread has actually started its recv loop
+    # (otherwise it might still be at the initial rx.recv() blocking point).
+    await conn.scan(1)
+    assert _os_thread_count() >= before + 1
+
+    # Drop without close(): no aclose, no __aexit__.
+    del conn
+    gc.collect()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _os_thread_count() <= before:
+            break
+        time.sleep(0.05)
+    assert _os_thread_count() <= before, (
+        f"I/O thread did not exit after Drop "
+        f"(threads: before={before}, now={_os_thread_count()})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_close_no_deadlock(server):
+    """close() must release the GIL so the I/O thread can finish its
+    in-progress with_gil block, and must complete promptly."""
+    conn = await aio.connect(server)
+    await conn.scan(1)
+    t0 = time.monotonic()
+    await conn.aclose()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 3.0, f"aclose took {elapsed:.2f}s — possible join deadlock"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_after_close_raises(server):
+    """Once close() has run, push/scan/seek must raise GnitzError immediately."""
+    conn = await aio.connect(server)
+    await conn.aclose()
+
+    with pytest.raises(gnitz.GnitzError, match="connection closed"):
+        await conn.scan(1)
+
+
+@pytest.mark.asyncio
+async def test_distinct_client_ids(server):
+    """Two transports from the same process must have distinct client_ids."""
+    async with aio.connect(server) as c1, aio.connect(server) as c2:
+        assert c1._transport.client_id != c2._transport.client_id
