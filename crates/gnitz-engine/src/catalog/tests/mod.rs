@@ -11,7 +11,9 @@ use std::fs;
 
 fn temp_dir(name: &str) -> String {
     crate::util::raise_fd_limit_for_tests();
-    let path = format!("/tmp/gnitz_catalog_test_{}", name);
+    let path = std::env::temp_dir()
+        .join(format!("gnitz_catalog_test_{}", name))
+        .to_str().unwrap().to_owned();
     let _ = fs::remove_dir_all(&path);
     path
 }

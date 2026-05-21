@@ -1525,9 +1525,15 @@ impl DagEngine {
 mod tests {
     use super::*;
 
+    fn dag_test_dir(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("gnitz_dag_test_{}", name))
+            .to_str().unwrap().to_owned()
+    }
+
     fn make_test_table(name: &str) -> Box<Table> {
         let schema = SchemaDescriptor::default();
-        let dir = format!("/tmp/gnitz_dag_test_{}", name);
+        let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
         Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, false).unwrap())
     }
@@ -1550,7 +1556,7 @@ mod tests {
 
         dag.unregister_table(100);
         assert!(!dag.tables.contains_key(&100));
-        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_reg_unreg");
+        let _ = std::fs::remove_dir_all(dag_test_dir("reg_unreg"));
     }
 
     #[test]
@@ -1590,8 +1596,8 @@ mod tests {
         dag.remove_index_circuit(50, 2);
         assert_eq!(dag.tables[&50].index_circuits.len(), 0);
         dag.close();
-        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_idx_parent");
-        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_idx_child");
+        let _ = std::fs::remove_dir_all(dag_test_dir("idx_parent"));
+        let _ = std::fs::remove_dir_all(dag_test_dir("idx_child"));
     }
 
     // `test_validate_graph_*` tests previously exercised
@@ -1625,7 +1631,7 @@ mod tests {
 
         // Durable index table: flush writes shard_*.db only if called.
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
-        let idx_dir = "/tmp/gnitz_dag_test_flush_ic_idx".to_string();
+        let idx_dir = dag_test_dir("flush_ic_idx");
         let _ = std::fs::remove_dir_all(&idx_dir);
         let idx_tbl = Box::new(
             Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, true).unwrap(),
@@ -1654,7 +1660,7 @@ mod tests {
         assert!(shard_count > 0, "index circuit shard must be written by flush");
 
         dag.close();
-        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_flush_ic_parent");
+        let _ = std::fs::remove_dir_all(dag_test_dir("flush_ic_parent"));
         let _ = std::fs::remove_dir_all(idx_dir);
     }
 }
