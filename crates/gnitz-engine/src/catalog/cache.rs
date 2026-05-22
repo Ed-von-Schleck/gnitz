@@ -31,7 +31,7 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) index_by_id:      FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
     pub(crate) fk_by_child:      FxHashMap<i64, Vec<FkConstraint>>,
-    pub(crate) fk_by_parent:     FxHashMap<i64, Vec<(i64, usize)>>,
+    pub(crate) fk_by_parent:     FxHashMap<i64, Vec<FkParentRef>>,
     pub(crate) needs_lock:       FxHashSet<i64>,
     pub(crate) cascade_enabled:  bool,
 }
@@ -266,12 +266,13 @@ impl CatalogEngine {
 
             let weight = batch.get_weight(i);
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let col_idx = self.read_batch_u64(batch, i, 2) as usize;
+            let col_idx = self.read_batch_u64(batch, i, 2) as usize;        // child col
+            let target_col_idx = self.read_batch_u64(batch, i, 7) as usize; // parent col (COL_TAB col 8)
 
             if weight > 0 {
                 let constraints = self.caches.fk_by_child.entry(owner_id).or_default();
                 if !constraints.iter().any(|c| c.fk_col_idx == col_idx) {
-                    constraints.push(FkConstraint { fk_col_idx: col_idx, target_table_id: fk_table_id });
+                    constraints.push(FkConstraint { fk_col_idx: col_idx, target_table_id: fk_table_id, target_col_idx });
                 }
             } else if let Entry::Occupied(mut e) = self.caches.fk_by_child.entry(owner_id) {
                 let constraints = e.get_mut();
@@ -291,16 +292,19 @@ impl CatalogEngine {
 
             let weight = batch.get_weight(i);
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let col_idx = self.read_batch_u64(batch, i, 2) as usize;
-            
+            let col_idx = self.read_batch_u64(batch, i, 2) as usize;        // child col
+            let target_col_idx = self.read_batch_u64(batch, i, 7) as usize; // parent col (COL_TAB col 8)
+
             if weight > 0 {
                 let parents = self.caches.fk_by_parent.entry(fk_table_id).or_default();
-                if !parents.iter().any(|&(t, c)| t == owner_id && c == col_idx) {
-                    parents.push((owner_id, col_idx));
+                if !parents.iter().any(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
+                    parents.push(FkParentRef {
+                        child_tid: owner_id, fk_col_idx: col_idx, parent_col_idx: target_col_idx,
+                    });
                 }
             } else if let Entry::Occupied(mut e) = self.caches.fk_by_parent.entry(fk_table_id) {
                 let parents = e.get_mut();
-                if let Some(pos) = parents.iter().position(|&(t, c)| t == owner_id && c == col_idx) {
+                if let Some(pos) = parents.iter().position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
                     parents.swap_remove(pos);
                 }
                 if e.get().is_empty() { e.remove(); }

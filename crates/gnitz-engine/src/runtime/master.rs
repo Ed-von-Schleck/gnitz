@@ -86,6 +86,9 @@ enum P2Label {
         source_col: usize,
         upsert_keys: Vec<(u128, u128)>,
     },
+    /// UPDATE retired a referenced UNIQUE value that is still present in a
+    /// child index: a non-empty result set is a RESTRICT violation.
+    FkRestrict { child_tid: i64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +702,29 @@ impl MasterDispatcher {
                             worker, pk, 0, "seek").await
     }
 
+    /// Seek `pk` in `target_id`'s committed storage and, if a live row is
+    /// present, hand the decoded single-row batch to `f`. Returns `f`'s result,
+    /// or `None` when no committed row exists. Folds the mandatory
+    /// peek-control + zero-copy-decode that every point-seek caller performs;
+    /// the closure form keeps the `MemBatch`'s borrow of the slot sound.
+    async fn fan_out_seek_row<T>(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64, pk: u128,
+        f: impl FnOnce(&crate::storage::MemBatch<'_>) -> T,
+    ) -> Result<Option<T>, String> {
+        let slot = Self::fan_out_seek_async(disp_ptr, reactor, sal_excl, target_id, pk).await?;
+        let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
+        if ctrl.flags & FLAG_HAS_DATA == 0 { return Ok(None); }
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
+            slot.bytes(), ctrl.block_size, ctrl, None).map_err(|e| e.to_string())?;
+        match zc.data_batch {
+            Some(b) if b.count > 0 => Ok(Some(f(&b))),
+            _ => Ok(None),
+        }
+    }
+
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
@@ -1033,6 +1059,9 @@ impl MasterDispatcher {
     /// changes (DROP TABLE, DROP/CREATE INDEX).
     pub(crate) fn unique_filter_invalidate_table(&mut self, table_id: i64) {
         self.unique_filters.retain(|&(t, _), _| t != table_id);
+        // The check-batch pool is a pure allocation cache keyed by table id;
+        // drop the dropped table's entry so it doesn't leak across DDL cycles.
+        self.check_batch_pool.remove(&table_id);
     }
 
     // -----------------------------------------------------------------------
@@ -1123,10 +1152,10 @@ impl MasterDispatcher {
         let mut p1_labels: Vec<P1Label> = Vec::new();
 
         for fi in 0..n_fk {
-            let (fk_col_idx, parent_table_id, col_type, parent_schema) = unsafe {
+            let (fk_col_idx, parent_table_id, parent_col_idx, col_type, parent_schema) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
-                let (fk_col_idx, parent_table_id) = match cat.get_fk_constraint(target_id, fi) {
+                let (fk_col_idx, parent_table_id, parent_col_idx) = match cat.get_fk_constraint(target_id, fi) {
                     Some(c) => c,
                     None => continue,
                 };
@@ -1134,7 +1163,7 @@ impl MasterDispatcher {
                 let parent_schema = cat.get_schema_desc(parent_table_id)
                     .ok_or_else(|| format!(
                         "FK parent table {} schema not found", parent_table_id))?;
-                (fk_col_idx, parent_table_id, col_type, parent_schema)
+                (fk_col_idx, parent_table_id, parent_col_idx, col_type, parent_schema)
             };
 
             let payload_col = source_schema.payload_idx(fk_col_idx);
@@ -1156,55 +1185,108 @@ impl MasterDispatcher {
             }
 
             if keys.is_empty() { continue; }
-
             let expected_count = keys.len();
-            let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
-            let check_batch = build_check_batch(&parent_schema, &keys, pooled);
-            let pk_col = parent_schema.pk_indices();
-            let worker_indices = compute_worker_indices(
-                &check_batch, pk_col, &parent_schema, num_workers);
 
-            p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
-            p1_checks.push(PipelinedCheck {
-                target_id: parent_table_id,
-                flags: FLAG_HAS_PK,
-                col_hint: 0,
-                payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
-                schema: parent_schema,
-            });
+            // PK fast-path only when the referenced column *is* the parent's
+            // lone PK. Otherwise probe the parent's UNIQUE index by broadcast,
+            // since index entries are distributed independently of the PK.
+            let pk = parent_schema.pk_indices();
+            let is_parent_pk = pk.len() == 1 && pk[0] as usize == parent_col_idx;
+
+            if is_parent_pk {
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
+                let check_batch = build_check_batch(&parent_schema, &keys, pooled);
+                let worker_indices = compute_worker_indices(
+                    &check_batch, pk, &parent_schema, num_workers);
+                p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
+                p1_checks.push(PipelinedCheck {
+                    target_id: parent_table_id,
+                    flags: FLAG_HAS_PK,
+                    col_hint: 0,
+                    payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
+                    schema: parent_schema,
+                });
+            } else {
+                let idx_schema = unsafe {
+                    let cat = &mut *(*disp_ptr).catalog;
+                    cat.get_index_schema_by_col(parent_table_id, parent_col_idx as u32)
+                        .ok_or_else(|| format!(
+                            "FK check: no unique index on parent table {} col {}",
+                            parent_table_id, parent_col_idx))?
+                };
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
+                let check_batch = build_check_batch(&idx_schema, &keys, pooled);
+                p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
+                p1_checks.push(PipelinedCheck {
+                    target_id: parent_table_id,
+                    flags: FLAG_HAS_PK,
+                    col_hint: (parent_col_idx as u64) + 1,
+                    payload: CheckPayload::Broadcast(check_batch),
+                    schema: idx_schema,
+                });
+            }
         }
 
+        // Parent DELETE → child RESTRICT. `target_id` / `source_schema` here
+        // are the PARENT (the table receiving the deletes). The probe keys are
+        // the *referenced parent column's* values of the removed rows, which
+        // differ per child (different children may reference different columns).
         if n_children > 0 {
-            let mut neg_pks: HashSet<u128> = HashSet::new();
+            let mut net_pk: FxHashMap<u128, i64> = FxHashMap::default();
             for i in 0..batch.count {
-                if batch.get_weight(i) < 0 {
-                    neg_pks.insert(batch.get_pk(i));
-                }
+                let w = batch.get_weight(i);
+                if w == 0 { continue; }
+                *net_pk.entry(batch.get_pk(i)).or_insert(0) += w;
             }
-            for i in 0..batch.count {
-                if batch.get_weight(i) > 0 {
-                    neg_pks.remove(&batch.get_pk(i));
-                }
-            }
+            let removed_pks: Vec<u128> =
+                net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect();
 
-            if !neg_pks.is_empty() {
-                let keys: Vec<u128> = neg_pks.iter().copied().collect();
-
+            if !removed_pks.is_empty() {
                 for ci in 0..n_children {
-                    let (child_tid, fk_col_idx, idx_schema) = unsafe {
-                        let disp = &mut *disp_ptr;
-                        let cat = &mut *disp.catalog;
-                        let (child_tid, fk_col_idx) = match cat.get_fk_child_info(target_id, ci) {
+                    let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
+                        let cat = &mut *(*disp_ptr).catalog;
+                        let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
                             Some(info) => info,
                             None => continue,
                         };
                         let idx_schema = cat.get_index_schema_by_col(child_tid, fk_col_idx as u32)
                             .ok_or_else(|| format!(
                                 "FK RESTRICT check failed: no index on child table {} col {}",
-                                child_tid, fk_col_idx,
-                            ))?;
-                        (child_tid, fk_col_idx, idx_schema)
+                                child_tid, fk_col_idx))?;
+                        (child_tid, fk_col_idx, parent_col_idx, idx_schema)
                     };
+
+                    // PK-column target → value is on the wire inside the packed
+                    // PK; extract just that column. Non-PK UNIQUE target → the
+                    // delete carries no payload, so resolve from stored rows.
+                    let keys: Vec<u128> = if source_schema.is_pk_col(parent_col_idx) {
+                        let col_type = source_schema.columns[parent_col_idx].type_code;
+                        let col_size = source_schema.columns[parent_col_idx].size() as usize;
+                        let pk_field_off = source_schema.pk_byte_offset(parent_col_idx) as usize;
+                        removed_pks.iter().map(|&pk| {
+                            promote_to_index_key(&pk.to_le_bytes(), pk_field_off, col_size, col_type)
+                        }).collect()
+                    } else {
+                        let col_type = source_schema.columns[parent_col_idx].type_code;
+                        let col_size = source_schema.columns[parent_col_idx].size() as usize;
+                        let payload_col = source_schema.payload_idx(parent_col_idx);
+                        let mut vals: Vec<u128> = Vec::with_capacity(removed_pks.len());
+                        for &pk in &removed_pks {
+                            // A NULL referenced value can be referenced by no
+                            // child, so it never blocks the delete.
+                            let v = Self::fan_out_seek_row(
+                                disp_ptr, reactor, sal_excl, target_id, pk,
+                                |found| if found.get_null_word(0) & (1u64 << payload_col) != 0 {
+                                    None
+                                } else {
+                                    Some(promote_to_index_key(found.col_data(payload_col, col_size), 0, col_size, col_type))
+                                },
+                            ).await?.flatten();
+                            if let Some(v) = v { vals.push(v); }
+                        }
+                        vals
+                    };
+                    if keys.is_empty() { continue; }
 
                     let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
                     let check_batch = build_check_batch(&idx_schema, &keys, pooled);
@@ -1295,7 +1377,73 @@ impl MasterDispatcher {
         }
 
         // ----- Phase 2 plan (unique index checks) -------------------------
-        if !has_unique {
+        //
+        // UPDATE of a referenced non-PK UNIQUE column can orphan child rows:
+        // the validation batch holds only the new `+1` row (no retraction), so
+        // the Phase-1 net-negative scan never sees the retired value. Resolve
+        // the OLD committed value for each updated PK and RESTRICT-check any
+        // value that both changed and is still referenced. Pipelined into the
+        // Phase-2 burst alongside the unique-index broadcasts.
+        let mut p2_restrict: Vec<(i64, u32, SchemaDescriptor, Vec<u128>)> = Vec::new();
+        if n_children > 0 && !existing_pks.is_empty() {
+            for ci in 0..n_children {
+                let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
+                    let cat = &mut *(*disp_ptr).catalog;
+                    let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
+                        Some(info) => info,
+                        None => continue,
+                    };
+                    // PK columns are immutable under UPDATE — nothing to enforce.
+                    if source_schema.is_pk_col(parent_col_idx) { continue; }
+                    let idx_schema = match cat.get_index_schema_by_col(child_tid, fk_col_idx as u32) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    (child_tid, fk_col_idx, parent_col_idx, idx_schema)
+                };
+
+                let col_type    = source_schema.columns[parent_col_idx].type_code;
+                let col_size    = source_schema.columns[parent_col_idx].size() as usize;
+                let payload_col = source_schema.payload_idx(parent_col_idx);
+
+                let mut retired: Vec<u128> = Vec::new();
+                for i in 0..batch.count {
+                    if batch.get_weight(i) <= 0 { continue; }
+                    let pk = batch.get_pk(i);
+                    if !existing_pks.contains(&pk) { continue; } // not an update
+
+                    let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
+                        None
+                    } else {
+                        Some(promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
+                    };
+
+                    // Old value comes from committed storage (validation is
+                    // pre-commit, under the FK table locks held by the executor).
+                    let old_val = match Self::fan_out_seek_row(
+                        disp_ptr, reactor, sal_excl, target_id, pk,
+                        |found| if found.get_null_word(0) & (1u64 << payload_col) != 0 {
+                            None
+                        } else {
+                            Some(promote_to_index_key(found.col_data(payload_col, col_size), 0, col_size, col_type))
+                        },
+                    ).await? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // Only a changed, non-null old value can orphan child rows.
+                    if old_val != new_val {
+                        if let Some(v) = old_val { retired.push(v); }
+                    }
+                }
+                if !retired.is_empty() {
+                    p2_restrict.push((child_tid, fk_col_idx as u32, idx_schema, retired));
+                }
+            }
+        }
+
+        if !has_unique && p2_restrict.is_empty() {
             return Ok(());
         }
 
@@ -1400,6 +1548,20 @@ impl MasterDispatcher {
             }
         }
 
+        // RESTRICT probes for referenced UNIQUE values retired by UPDATE.
+        for (child_tid, fk_col, idx_schema, keys) in p2_restrict {
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
+            let chk_batch = build_check_batch(&idx_schema, &keys, pooled);
+            p2_labels.push(P2Label::FkRestrict { child_tid });
+            p2_checks.push(PipelinedCheck {
+                target_id: child_tid,
+                flags: FLAG_HAS_PK,
+                col_hint: (fk_col as u64) + 1,
+                payload: CheckPayload::Broadcast(chk_batch),
+                schema: idx_schema,
+            });
+        }
+
         if p2_checks.is_empty() {
             return Ok(());
         }
@@ -1414,6 +1576,20 @@ impl MasterDispatcher {
                         let col_name = unsafe { (*disp_ptr).get_col_name(target_id, *source_col) };
                         return Err(format!(
                             "Unique index violation on column '{}'", col_name));
+                    }
+                }
+                P2Label::FkRestrict { child_tid } => {
+                    if !p2_results[idx].is_empty() {
+                        let (sn, tn, csn, ctn) = unsafe {
+                            let disp = &mut *disp_ptr;
+                            let (s, t) = disp.get_qualified_name_owned(target_id);
+                            let (cs, ct) = disp.get_qualified_name_owned(*child_tid);
+                            (s, t, cs, ct)
+                        };
+                        return Err(format!(
+                            "Foreign Key violation: cannot update '{}.{}', row still referenced by '{}.{}'",
+                            sn, tn, csn, ctn,
+                        ));
                     }
                 }
                 P2Label::Upsert { col_idx, source_col, upsert_keys } => {

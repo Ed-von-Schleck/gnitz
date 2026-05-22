@@ -57,6 +57,7 @@ impl CatalogEngine {
             sys_circuit_node_columns,
             pending_broadcasts: Vec::new(),
             ddl_zone_lsn: 0,
+            cascading_drop: false,
         };
 
         if is_new {

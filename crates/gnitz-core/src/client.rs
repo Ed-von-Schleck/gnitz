@@ -198,16 +198,22 @@ impl GnitzClient {
     ) -> Result<Option<(u64, bool)>, ClientError> {
         let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
+        // A column may be covered by both a unique and a non-unique index;
+        // prefer the UNIQUE one so a FK admission gate sees the right answer.
+        let mut found_non_unique = None;
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
             let owner_id       = col_u64(&idx_batch.columns[1], i)?;
             let source_col_idx = col_u64(&idx_batch.columns[3], i)?;
             if owner_id == table_id && source_col_idx == col_idx as u64 {
-                let is_unique = col_u64(&idx_batch.columns[5], i)? != 0;
-                return Ok(Some((idx_batch.pks.get(i) as u64, is_unique)));
+                let index_id = idx_batch.pks.get(i) as u64;
+                if col_u64(&idx_batch.columns[5], i)? != 0 {
+                    return Ok(Some((index_id, true)));
+                }
+                found_non_unique = Some((index_id, false));
             }
         }
-        Ok(None)
+        Ok(found_non_unique)
     }
 
     pub fn create_index(

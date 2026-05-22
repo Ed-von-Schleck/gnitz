@@ -25,8 +25,19 @@ pub(crate) struct ColumnDef {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct FkConstraint {
-    pub(crate) fk_col_idx: usize,
-    pub(crate) target_table_id: i64,
+    pub(crate) fk_col_idx: usize,      // child column position
+    pub(crate) target_table_id: i64,   // parent table id
+    pub(crate) target_col_idx: usize,  // parent referenced column position
+}
+
+/// A child-side FK reference seen from the parent's perspective. The two
+/// `usize` positions are easy to transpose, so they are named rather than left
+/// as a bare tuple.
+#[derive(Clone, Copy)]
+pub(crate) struct FkParentRef {
+    pub(crate) child_tid: i64,         // referencing child table id
+    pub(crate) fk_col_idx: usize,      // child column position
+    pub(crate) parent_col_idx: usize,  // referenced parent column position
 }
 
 // ---------------------------------------------------------------------------

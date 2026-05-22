@@ -14,23 +14,38 @@ impl CatalogEngine {
     ) -> Result<(), String> {
         if col.fk_table_id == 0 { return Ok(()); }
 
-        let (target_pk_index, target_pk_type) = if col.fk_table_id == self_table_id {
-            (self_pk_index, self_pk_type)
+        // `col.fk_col_idx` here is the PARENT's referenced column index (the
+        // planner sets the child column's fk_col_idx to it). The target is a
+        // legal reference iff it is the parent's lone PK column, or it carries
+        // its own UNIQUE index. Mirrors the production planner gate.
+        let target_type = if col.fk_table_id == self_table_id {
+            // Self-referential FK: only single-PK self-reference is supported.
+            if col.fk_col_idx != self_pk_index {
+                return Err("FK must reference target PK".into());
+            }
+            self_pk_type
         } else {
             let entry = self.dag.tables.get(&col.fk_table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
-            (entry.schema.pk_index_single(), entry.schema.columns[entry.schema.pk_index_single() as usize].type_code)
+            let pk = entry.schema.pk_indices();
+            let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
+            if !is_lone_pk {
+                let has_unique = entry.index_circuits.iter()
+                    .any(|ic| ic.col_idx == col.fk_col_idx && ic.is_unique);
+                if !has_unique {
+                    return Err(
+                        "FK must reference the primary key or a UNIQUE-indexed column".into()
+                    );
+                }
+            }
+            entry.schema.columns[col.fk_col_idx as usize].type_code
         };
 
-        if col.fk_col_idx != target_pk_index {
-            return Err("FK must reference target PK".into());
-        }
-
         let promoted = get_index_key_type(col.type_code)?;
-        if promoted != target_pk_type {
+        if promoted != target_type {
             return Err(format!(
                 "FK type mismatch: promoted code {} vs target {}",
-                promoted, target_pk_type
+                promoted, target_type
             ));
         }
         Ok(())
@@ -51,26 +66,47 @@ impl CatalogEngine {
         for constraint in constraints {
             let col_idx = constraint.fk_col_idx;
             let target_id = constraint.target_table_id;
+            let target_col_idx = constraint.target_col_idx;
 
             let target_entry = self.dag.tables.get(&target_id)
                 .ok_or_else(|| format!("FK target table {} not found", target_id))?;
 
+            // Probe the parent PK when the referenced column is the lone PK;
+            // otherwise seek the parent's UNIQUE index circuit for the column.
+            let tpk = target_entry.schema.pk_indices();
+            let is_lone_pk = tpk.len() == 1 && tpk[0] as usize == target_col_idx;
+            let idx_ic = if is_lone_pk {
+                None
+            } else {
+                Some(target_entry.index_circuits.iter()
+                    .find(|ic| ic.col_idx as usize == target_col_idx && ic.is_unique)
+                    .ok_or_else(|| format!(
+                        "FK target {} col {} has no UNIQUE index", target_id, target_col_idx))?)
+            };
+            let idx_key_size = idx_ic.map(|ic| ic.index_schema.columns[0].size() as usize);
+
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
 
-                // Check null
                 let null_word = batch.get_null_word(row);
                 let payload_col = schema.payload_idx(col_idx);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
-                // Promote column value to PK key
                 let col_type = schema.columns[col_idx].type_code;
                 let col_size = schema.columns[col_idx].size() as usize;
                 let col_data = batch.col_data(payload_col);
                 let fk_key = promote_to_index_key(col_data, row * col_size, col_size, col_type);
 
-                // Check if target has this PK
-                if !target_entry.handle.has_pk(fk_key) {
+                let found = if is_lone_pk {
+                    target_entry.handle.has_pk(fk_key)
+                } else {
+                    let ic = idx_ic.unwrap();
+                    let prefix_len = col_size.min(idx_key_size.unwrap());
+                    let key_bytes = fk_key.to_le_bytes();
+                    ic.table_mut().open_cursor().cursor
+                        .seek_first_positive_with_prefix(&key_bytes[..prefix_len])
+                };
+                if !found {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
                     let (tsn, ttn) = self.caches.entity_by_id.get(&target_id)
@@ -88,15 +124,50 @@ impl CatalogEngine {
     /// Validate FK RESTRICT on parent DELETE (single-worker path).
     /// For each retraction row, checks whether any child table still references
     /// the PK being deleted via the child's FK index. Returns an error if so.
-    pub(crate) fn validate_fk_parent_restrict(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        let children = self.fk_children_of(table_id);
+    pub(crate) fn validate_fk_parent_restrict(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+        // Owned snapshot so the `seek_family` (&mut self) probe below doesn't
+        // alias the borrow of the children list.
+        let children: Vec<FkParentRef> = self.fk_children_of(table_id).to_vec();
         if children.is_empty() { return Ok(()); }
 
-        let parent_pk_stride = self.dag.tables.get(&table_id)
-            .map(|e| e.schema.pk_stride() as usize)
-            .unwrap_or(8);
+        let parent_schema = self.dag.tables.get(&table_id)
+            .map(|e| e.schema)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
-        for &(child_tid, fk_col_idx) in children {
+        let removed_pks: Vec<u128> = (0..batch.count)
+            .filter(|&row| batch.get_weight(row) < 0)
+            .map(|row| batch.get_pk(row))
+            .collect();
+        if removed_pks.is_empty() { return Ok(()); }
+
+        for FkParentRef { child_tid, fk_col_idx, parent_col_idx } in children {
+            let col_type = parent_schema.columns[parent_col_idx].type_code;
+            let col_size = parent_schema.columns[parent_col_idx].size() as usize;
+            let is_pk_col = parent_schema.is_pk_col(parent_col_idx);
+
+            // Resolve the referenced value of each removed row. A PK-column
+            // target rides inside the packed PK; a non-PK UNIQUE target is not
+            // on the delete wire (the payload is inert filler), so it is read
+            // from the parent's committed row. A NULL value can be referenced
+            // by no child, so it never blocks the delete.
+            let keys: Vec<u128> = if is_pk_col {
+                let pk_field_off = parent_schema.pk_byte_offset(parent_col_idx) as usize;
+                removed_pks.iter()
+                    .map(|&pk| promote_to_index_key(&pk.to_le_bytes(), pk_field_off, col_size, col_type))
+                    .collect()
+            } else {
+                let payload_col = parent_schema.payload_idx(parent_col_idx);
+                let mut v = Vec::with_capacity(removed_pks.len());
+                for &pk in &removed_pks {
+                    if let Some(row) = self.seek_family(table_id, pk)? {
+                        if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
+                        v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                    }
+                }
+                v
+            };
+            if keys.is_empty() { continue; }
+
             let child_entry = match self.dag.tables.get(&child_tid) {
                 Some(e) => e,
                 None => continue,
@@ -113,19 +184,15 @@ impl CatalogEngine {
                 }
             };
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
-            let prefix_len = parent_pk_stride.min(idx_key_size);
+            let prefix_len = col_size.min(idx_key_size);
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
 
-            for row in 0..batch.count {
-                if batch.get_weight(row) >= 0 { continue; }
+            for fk_key in keys {
                 // Prefix-scan the child's FK index for any positive-weight
-                // entry whose leading column matches this parent's PK.
-                let pk_bytes_full = batch.get_pk_bytes(row);
-                let prefix = &pk_bytes_full[..prefix_len];
-                let referenced = cursor.cursor.seek_first_positive_with_prefix(prefix);
-
-                if referenced {
+                // entry whose leading column matches the referenced value.
+                let key_bytes = fk_key.to_le_bytes();
+                if cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..prefix_len]) {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
                     let (csn, ctn) = self.caches.entity_by_id.get(&child_tid)

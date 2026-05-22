@@ -265,19 +265,219 @@ def test_index_on_compound_pk_narrow_source_via_sql(client):
 
 
 def test_fk_references_compound_pk_rejected(client):
+    """A FK targeting a non-UNIQUE column of a compound-PK parent is rejected:
+    a compound PK has no lone PK column, so the column qualifies only via its
+    own UNIQUE index. `a` (a PK member, no separate UNIQUE index) and `payload`
+    (a plain column) both fail."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "parent")
+        for col in ("a", "payload"):
+            with pytest.raises(gnitz.GnitzError) as exc:
+                client.execute_sql(
+                    f"CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
+                    f"ref BIGINT UNSIGNED REFERENCES parent({col}))",
+                    schema_name=sn,
+                )
+            assert "unique" in str(exc.value).lower()
+    finally:
+        _cleanup(client, sn, "parent", "chi")
+
+
+def test_fk_references_compound_pk_unique_col_enforced(client):
+    """A FK targeting a UNIQUE-indexed column of a compound-PK parent is
+    accepted and enforced end to end: matching child INSERT succeeds,
+    non-matching is rejected, and deleting the referenced parent is blocked."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        # Narrow (U32, U32) compound PK so the email index PK (key + source PK)
+        # stays within the 16-byte index-PK limit.
+        client.execute_sql(
+            "CREATE TABLE parent (a INT UNSIGNED, b INT UNSIGNED, "
+            "email BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON parent(email)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES parent(email))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO parent (a, b, email) VALUES (1, 1, 1000)", schema_name=sn
+        )
+        # Matching referenced value → accepted.
+        client.execute_sql("INSERT INTO chi (cid, ref) VALUES (1, 1000)", schema_name=sn)
+        # Non-matching referenced value → rejected.
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO chi (cid, ref) VALUES (2, 9999)", schema_name=sn)
+        # Deleting the referenced parent row is blocked by RESTRICT.
+        parent_tid, parent_schema = client.resolve_table(sn, "parent")
+        pk_bytes = (1).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        with pytest.raises(gnitz.GnitzError):
+            client.delete(parent_tid, parent_schema, [pk_bytes])
+    finally:
+        _cleanup(client, sn, "parent", "chi")
+
+
+def test_fk_references_single_pk_column_enforced(client):
+    """Regression: a FK targeting a single-PK parent's PK column is accepted
+    and enforced (the long-standing form)."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, name BIGINT)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES p(pid))",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO p (pid, name) VALUES (5, 50)", schema_name=sn)
+        client.execute_sql("INSERT INTO c (cid, ref) VALUES (1, 5)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO c (cid, ref) VALUES (2, 99)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("DELETE FROM p WHERE pid = 5", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "p", "c")
+
+
+def test_fk_references_single_pk_unique_col_enforced(client):
+    """A FK targeting a non-PK UNIQUE column of a single-PK parent is accepted
+    and enforced — the form newly enabled by the unified admission rule. It
+    exercises the non-PK runtime branch on a single-PK parent."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES p(code))",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO p (pid, code) VALUES (1, 1000)", schema_name=sn)
+        client.execute_sql("INSERT INTO c (cid, ref) VALUES (1, 1000)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO c (cid, ref) VALUES (2, 9999)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "p", "c")
+
+
+def test_fk_multi_column_against_compound_pk_rejected(client):
+    """A multi-column FK is out of scope and rejected."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
         _make_compound_table(client, sn, "parent")
         with pytest.raises(gnitz.GnitzError) as exc:
             client.execute_sql(
-                "CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
-                "ref_a BIGINT UNSIGNED REFERENCES parent(a))",
+                "CREATE TABLE chi (x BIGINT UNSIGNED, y BIGINT UNSIGNED, "
+                "cid BIGINT PRIMARY KEY, "
+                "FOREIGN KEY (x, y) REFERENCES parent (a, b))",
                 schema_name=sn,
             )
-        assert "compound" in str(exc.value).lower()
+        assert "multi-column" in str(exc.value).lower()
     finally:
         _cleanup(client, sn, "parent", "chi")
+
+
+def test_fk_parent_delete_with_null_referenced_value(client):
+    """A NULL referenced value can be referenced by no child, so RESTRICT must
+    not block deleting a parent row whose UNIQUE column is NULL. Exercises the
+    storage-resolved RESTRICT path on a nullable UNIQUE column."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES p(code))",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO p (pid, code) VALUES (1, NULL)", schema_name=sn)
+        # No child references NULL → the delete must succeed.
+        client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=sn)
+        results = client.execute_sql("SELECT * FROM p", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        assert [row for row in rows_result["rows"]] == []
+    finally:
+        _cleanup(client, sn, "p", "c")
+
+
+def test_fk_update_referenced_unique_value_restricted(client):
+    """Updating a referenced non-PK UNIQUE value is blocked by RESTRICT while a
+    child still references the old value; updating an unreferenced value
+    succeeds."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES p(code))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO p (pid, code) VALUES (1, 1000), (2, 2000)", schema_name=sn
+        )
+        client.execute_sql("INSERT INTO c (cid, ref) VALUES (1, 1000)", schema_name=sn)
+        # Referenced value (code=1000) still referenced → UPDATE rejected.
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("UPDATE p SET code = 1500 WHERE pid = 1", schema_name=sn)
+        # Unreferenced value (code=2000) → UPDATE succeeds.
+        client.execute_sql("UPDATE p SET code = 2500 WHERE pid = 2", schema_name=sn)
+        results = client.execute_sql("SELECT * FROM p", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.pid, row.code) for row in rows_result["rows"])
+        assert seen == [(1, 1000), (2, 2500)]
+    finally:
+        _cleanup(client, sn, "p", "c")
+
+
+def test_fk_referenced_unique_index_drop_protected(client):
+    """A UNIQUE index targeted by a FK is load-bearing and cannot be dropped;
+    once the FK is gone the drop succeeds."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+            "ref BIGINT UNSIGNED REFERENCES p(code))",
+            schema_name=sn,
+        )
+        idx_name = f"{sn}__p__idx_code"
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql(f"DROP INDEX {idx_name}", schema_name=sn)
+        assert "integrity" in str(exc.value).lower()
+        # Remove the FK, then the index can be dropped.
+        client.execute_sql("DROP TABLE c", schema_name=sn)
+        client.execute_sql(f"DROP INDEX {idx_name}", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "p", "c")
 
 
 def test_on_conflict_target_column_rejected_on_compound_pk(client):

@@ -170,8 +170,13 @@ pub(crate) fn make_index_schema(
     SchemaDescriptor::new(&cols, &pk_indices)
 }
 
+/// Infix that marks an index as an internal FK-backing index. The single
+/// source of truth for both name construction and the DROP INDEX integrity
+/// guard that protects these indices.
+pub(crate) const FK_INDEX_INFIX: &str = "__fk_";
+
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{}__{}__fk_{}", schema_name, table_name, col_name)
+    format!("{}__{}{}{}", schema_name, table_name, FK_INDEX_INFIX, col_name)
 }
 
 pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {

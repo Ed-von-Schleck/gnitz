@@ -56,9 +56,9 @@ pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
 use sys_tables::*;
 
 // Re-export types needed by other modules.
-pub(crate) use types::{ColumnDef, FkConstraint};
+pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
 pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_name,
-                       make_fk_index_name, make_secondary_index_name, ingest_batch_into,
+                       make_fk_index_name, FK_INDEX_INFIX, make_secondary_index_name, ingest_batch_into,
                        ensure_dir, fsync_dir,
                        get_index_key_type, make_index_schema,
                        cursor_read_u64, cursor_read_string,
@@ -116,5 +116,11 @@ pub struct CatalogEngine {
     // zone writes the same `current_lsn`. Recovery's dedup filter then
     // matches the SAL group's zone LSN, preventing double-apply.
     ddl_zone_lsn: u64,
+
+    // Set while a DROP TABLE cascade is retracting an owner's own indices.
+    // Those retractions are legitimate (the table's drop already passed the
+    // FK/view-dep precheck), so the IDX_TAB integrity guard is suppressed for
+    // them — it only protects against standalone user DROP INDEX.
+    cascading_drop: bool,
 }
 

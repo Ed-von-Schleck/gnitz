@@ -89,7 +89,7 @@ impl CatalogEngine {
     /// Only TABLE_TAB and VIEW_TAB retractions have pre-conditions; other
     /// system tables (including cascade targets) are no-ops.
     fn precheck_sys_ingest(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID {
+        if table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID && table_id != IDX_TAB_ID {
             return Ok(());
         }
 
@@ -105,10 +105,42 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
         drop_ids.dedup();
 
+        // A UNIQUE index referenced by a FK, and any internal `__fk_` index the
+        // RESTRICT seek depends on, are load-bearing — block their drop. A
+        // DROP TABLE cascade legitimately retracts the owner's own indices, so
+        // it is exempt (the table drop already passed its own precheck).
+        if table_id == IDX_TAB_ID {
+            if self.cascading_drop {
+                return Ok(());
+            }
+            for &idx_id in &drop_ids {
+                if let Some(name) = self.caches.index_by_id.get(&idx_id) {
+                    if name.contains(FK_INDEX_INFIX) {
+                        return Err("Integrity violation: cannot drop an internal FK index".into());
+                    }
+                }
+                let (owner_id, src_col) = {
+                    let mut cursor = self.sys_indices.open_cursor();
+                    cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
+                    if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
+                        continue;
+                    }
+                    (cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64,
+                     cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX) as usize)
+                };
+                if self.fk_children_of(owner_id).iter().any(|r| r.parent_col_idx == src_col) {
+                    let (sn, tn) = self.caches.entity_by_id.get(&owner_id).cloned().unwrap_or_default();
+                    return Err(format!(
+                        "Integrity violation: index on '{}.{}' is referenced by a foreign key", sn, tn));
+                }
+            }
+            return Ok(());
+        }
+
         if table_id == TABLE_TAB_ID {
             for &tid in &drop_ids {
-                if let Some(&(child_tid, _)) = self.fk_children_of(tid).first() {
-                    let (sn, tn) = self.caches.entity_by_id.get(&child_tid)
+                if let Some(r) = self.fk_children_of(tid).first() {
+                    let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid)
                         .cloned().unwrap_or_default();
                     return Err(format!(
                         "Integrity violation: table referenced by '{}.{}'", sn, tn
@@ -441,11 +473,11 @@ impl CatalogEngine {
         self.caches.fk_by_child.get(&table_id).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Get FK constraint at index: (fk_col_idx, target_table_id).
-    pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64)> {
+    /// Get FK constraint at index: (fk_col_idx, target_table_id, target_col_idx).
+    pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64, usize)> {
         self.caches.fk_by_child.get(&table_id)
             .and_then(|v| v.get(idx))
-            .map(|c| (c.fk_col_idx, c.target_table_id))
+            .map(|c| (c.fk_col_idx, c.target_table_id, c.target_col_idx))
     }
 
     /// Get FK column type code (for promote_to_key in distributed validation).
@@ -510,11 +542,11 @@ impl CatalogEngine {
             .unwrap_or(false)
     }
 
-    /// Get child info at index: (child_table_id, fk_col_idx).
-    pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize)> {
+    /// Get child info at index: (child_table_id, fk_col_idx, parent_col_idx).
+    pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize, usize)> {
         self.caches.fk_by_parent.get(&parent_id)
             .and_then(|v| v.get(idx))
-            .copied()
+            .map(|r| (r.child_tid, r.fk_col_idx, r.parent_col_idx))
     }
 
     /// Get the index schema for a specific column's FK index on a table.
@@ -598,8 +630,8 @@ impl CatalogEngine {
             }
         }
         if let Some(children) = self.caches.fk_by_parent.get(&table_id) {
-            for &(child_tid, _) in children {
-                tids.push(child_tid);
+            for r in children {
+                tids.push(r.child_tid);
             }
         }
         tids.sort_unstable();
@@ -756,7 +788,7 @@ impl CatalogEngine {
     // -- FK constraint queries ---------------------------------------------
 
     /// Returns all child tables that have FK constraints targeting `parent_id`.
-    pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[(i64, usize)] {
+    pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkParentRef] {
         self.caches.fk_by_parent.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 

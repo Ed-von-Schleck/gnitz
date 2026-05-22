@@ -174,13 +174,23 @@ impl CatalogEngine {
             _ => return Ok(()),
         };
         let schema = sys_tab_schema(IDX_TAB_ID);
-        for idx_id in idx_ids {
-            let batch = retract_single_row(&mut self.sys_indices, &schema, idx_id as u128);
-            if batch.count > 0 {
-                self.ingest_to_family(IDX_TAB_ID, &batch)?;
+        // These retractions are part of the owner's drop, not a standalone
+        // DROP INDEX, so the IDX_TAB integrity guard must not block them.
+        // Save/restore rather than blind reset so a nested cascade can't clear
+        // an outer cascade's flag.
+        let prev = self.cascading_drop;
+        self.cascading_drop = true;
+        let result = (|| {
+            for idx_id in idx_ids {
+                let batch = retract_single_row(&mut self.sys_indices, &schema, idx_id as u128);
+                if batch.count > 0 {
+                    self.ingest_to_family(IDX_TAB_ID, &batch)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.cascading_drop = prev;
+        result
     }
 
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {

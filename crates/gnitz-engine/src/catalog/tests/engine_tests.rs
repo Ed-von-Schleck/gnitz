@@ -369,7 +369,7 @@ fn test_fk_index_metadata_queries() {
 
     // FK count
     assert!(engine.get_fk_count(child_tid) > 0);
-    let (col_idx, target_id) = engine.get_fk_constraint(child_tid, 0).unwrap();
+    let (col_idx, target_id, _parent_col) = engine.get_fk_constraint(child_tid, 0).unwrap();
     assert_eq!(target_id, tid);
 
     // Create an explicit index

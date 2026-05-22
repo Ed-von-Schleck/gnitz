@@ -73,9 +73,11 @@ fn reject_compound_pk_view_source(schema: &Schema) -> Result<(), GnitzSqlError> 
     Ok(())
 }
 
-/// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx, parent_pk_type).
-/// Validates that fk_col_type is compatible with the parent PK type and
-/// returns the parent PK type so the caller can widen the child column.
+/// Resolve a REFERENCES clause to (fk_table_id, ref_col_idx, parent_col_type).
+/// The referenced column is a legal target iff it is the parent's lone PK
+/// column or it carries its own active UNIQUE index. Validates that
+/// fk_col_type is compatible with the referenced column type and returns that
+/// type so the caller can widen the child column.
 fn resolve_fk_target(
     client:           &mut GnitzClient,
     schema_name:      &str,
@@ -86,38 +88,65 @@ fn resolve_fk_target(
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
-    // Reject before any `pk_index_single()` access below. A FK against a
-    // compound-PK parent needs a separate rule (the referenced column
-    // must have its own UNIQUE index); that's a later plan.
-    if ref_schema.pk_count() >= 2 {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "FOREIGN KEY references compound-PK table '{}'; not yet supported",
+
+    if referred_columns.len() > 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "multi-column FOREIGN KEY references are not supported".into()
+        ));
+    }
+
+    // Referenced parent column. An omitted column list defaults to the PK and
+    // is only well-defined for a single-column PK.
+    let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
+        ref_schema.columns.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+            .ok_or_else(|| GnitzSqlError::Bind(format!(
+                "FK references column '{}' not found in table '{}'",
+                ident.value, ref_table,
+            )))?
+    } else if ref_schema.pk_count() == 1 {
+        ref_schema.pk_index_single()
+    } else {
+        return Err(GnitzSqlError::Bind(format!(
+            "FK against compound-PK table '{}' must name the referenced column",
             ref_table,
         )));
-    }
-    if !referred_columns.is_empty() {
-        let ref_col_name = &referred_columns[0].value;
-        let pk_col_name = &ref_schema.columns[ref_schema.pk_index_single()].name;
-        if ref_col_name != pk_col_name {
-            return Err(GnitzSqlError::Bind(format!(
-                "FK must reference the primary key column '{}', got '{}'",
-                pk_col_name, ref_col_name,
-            )));
+    };
+
+    // Legal target iff the referenced column is the parent's lone PK, or it
+    // carries an active UNIQUE index. The `&&` short-circuits, so
+    // `pk_index_single()` is never reached for a compound parent.
+    let is_lone_pk = ref_schema.pk_count() == 1
+        && ref_col_idx == ref_schema.pk_index_single();
+    if !is_lone_pk {
+        match client.find_index_for_column(ref_tid, ref_col_idx)
+            .map_err(GnitzSqlError::Exec)?
+        {
+            Some((_, true)) => {}
+            _ => return Err(GnitzSqlError::Unsupported(format!(
+                "FK against table '{}' must reference the primary key or a column \
+                 with a UNIQUE index; column '{}' has neither",
+                ref_table, ref_schema.columns[ref_col_idx].name,
+            ))),
         }
     }
-    let parent_pk_type = ref_schema.columns[ref_schema.pk_index_single()].type_code;
-    let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_pk_type) {
+
+    // Child column widens to the referenced parent column's type.
+    let parent_col_type = ref_schema.columns[ref_col_idx].type_code;
+    let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_col_type) {
         true
     } else {
-        fk_col_type == parent_pk_type
+        fk_col_type == parent_col_type
     };
     if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
-            "FK type mismatch: column type {:?} is not compatible with parent PK type {:?}",
-            fk_col_type, parent_pk_type,
+            "FK type mismatch: column type {:?} is not compatible with referenced \
+             column type {:?}",
+            fk_col_type, parent_col_type,
         )));
     }
-    Ok((ref_tid, ref_schema.pk_index_single() as u64, parent_pk_type))
+
+    Ok((ref_tid, ref_col_idx as u64, parent_col_type))
 }
 
 fn execute_create_table(

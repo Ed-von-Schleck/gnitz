@@ -291,7 +291,7 @@ impl CatalogEngine {
     }
 
     pub fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
-        if index_name.contains("__fk_") {
+        if index_name.contains(FK_INDEX_INFIX) {
             return Err("Forbidden: cannot drop internal FK index".into());
         }
         let idx_id = *self.caches.index_by_name.get(index_name)
