@@ -120,7 +120,6 @@ pub fn op_reduce(
     avi_input_schema: Option<&SchemaDescriptor>,
     gi_cursor: Option<&mut ReadCursor>,
     gi_col_idx: u32,
-    _gi_col_type_code: TypeCode,
     finalize_prog: Option<&crate::expr::ExprProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
 ) -> (Batch, Option<Batch>) {
@@ -202,6 +201,12 @@ pub fn op_reduce(
     let mut trace_in = trace_in_cursor;
     let mut avi = avi_cursor;
     let mut gi = gi_cursor;
+
+    // GI group-column extractor: built once so population and read-back agree
+    // on a raw, injective gc. `gi_col_idx` defaults to a valid column index
+    // (0) when GI is unused, so building unconditionally is safe.
+    let gc_extractor =
+        super::super::util::IndexColExtractor::new(input_schema, gi_col_idx as usize);
 
     // Hoist replay batch outside the group loop: reuse the allocation across groups
     // rather than allocating and dropping once per group (can be 100k+ times per epoch).
@@ -318,17 +323,7 @@ pub fn op_reduce(
                             ti_cursor.advance();
                         }
                     } else if let Some(gi_c) = gi.as_deref_mut() {
-                        let gi_ci = gi_col_idx as usize;
-                        let gc_u64_val = if input_schema.is_pk_col(gi_ci) {
-                            mb.get_pk(group_start_idx) as u64
-                        } else {
-                            let cs = input_schema.columns[gi_ci].size() as usize;
-                            let pi = input_schema.payload_idx(gi_ci);
-                            let ptr = mb.get_col_ptr(group_start_idx, pi, cs);
-                            let mut buf = [0u8; 8];
-                            buf[..cs].copy_from_slice(ptr);
-                            u64::from_le_bytes(buf)
-                        };
+                        let gc_u64_val = gc_extractor.extract(&mb, group_start_idx);
                         gi_c.seek(crate::util::make_pk(0, gc_u64_val));
                         while gi_c.valid {
                             let gk_hi = (gi_c.current_key >> 64) as u64;

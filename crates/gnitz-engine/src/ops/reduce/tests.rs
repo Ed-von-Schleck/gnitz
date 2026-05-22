@@ -7,10 +7,10 @@ use crate::schema::{
 };
 use crate::storage::{Batch, ConsolidatedBatch};
 
-use super::super::util::{extract_gc_u64, extract_group_key};
-use super::agg::{
-    Accumulator, AggDescriptor, AggOp, ieee_order_bits_f32, ieee_order_bits_f32_reverse,
+use super::super::util::{
+    extract_gc_u64, extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse,
 };
+use super::agg::{Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_finalized_row, emit_reduce_row};
 use super::op_gather::op_gather_reduce;
 use super::op_reduce::{cursor_matches_group, op_reduce};
@@ -194,7 +194,7 @@ fn test_reduce_sum_retraction() {
     let (out1, _) = op_reduce(
         &delta1, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     // SUM of (100+200+300) = 600
     assert_eq!(out1.count, 1);
@@ -222,7 +222,7 @@ fn test_reduce_sum_retraction() {
     let (out2, _) = op_reduce(
         &delta2, None, to_ch2.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows
     assert_eq!(out2.count, 2);
@@ -260,7 +260,7 @@ fn test_reduce_count() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[0u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     // Each pk forms its own group, COUNT=1 for each
     assert_eq!(out.count, 3);
@@ -322,7 +322,6 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
         None,               // avi_input_schema
         Some(gi_handle.cursor_mut()), // gi_cursor
         1u32,               // gi_col_idx: grp column
-        TypeCode::I64,      // gi_col_type_code
         None,               // finalize_prog
         None,               // finalize_out_schema
     );
@@ -456,7 +455,7 @@ fn test_promote_agg_col_f32_ordering() {
         let pi = schema.payload_idx(1); // col_idx=1, pk_index=0
         let ptr = mb.get_col_ptr(row, pi, 4);
         let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
-        // Replicate promote_agg_col_to_u64_ordered for F32 without for_max
+        // Order-preserving F32 encode (the encode_ordered F32 arm, for_max=false).
         ieee_order_bits_f32(raw32)
     }).collect();
     // Encoded values must be strictly ascending (order-preserving)
@@ -566,7 +565,7 @@ fn test_reduce_sum_i32() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[0u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out.count, 3);
     // Check values: row offsets depend on PK order (group_by_pk path)
@@ -609,7 +608,7 @@ fn test_reduce_min_f32() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[0u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out.count, 1);
     // MIN should be -1.0 stored as f64 bits
@@ -648,7 +647,7 @@ fn test_reduce_max_i16() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[0u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out.count, 1);
     let max_val = crate::util::read_i64_le(out.col_data(0), 0);
@@ -941,7 +940,6 @@ fn test_reduce_gi_i32_group_key_overread() {
         None, false, TypeCode::U64, &[], None,
         Some(gi_handle.cursor_mut()),
         1u32,
-        TypeCode::I32,
         None, None,
     );
 
@@ -1394,7 +1392,7 @@ fn test_reduce_min_pk_col_compound_pk() {
         &in_schema, &out_schema,
         &[0u32, 1u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
     // group_by_pk: each (pk0, pk1) is its own group, so we get one row
     // per input row; MIN within each group equals the row's pk_col_1.
@@ -1438,7 +1436,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
     // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
     assert_eq!(out.count, 3);
@@ -1486,7 +1484,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
         &in_schema, &out_schema,
         &[1u32, 0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 2);
@@ -1692,7 +1690,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     // Two groups: pk_col_0=1 (count=2), pk_col_0=2 (count=1).
@@ -1833,7 +1831,7 @@ fn test_reduce_min_u64_high_bit_set() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out.count, 1);
     let min_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
@@ -1867,7 +1865,7 @@ fn test_reduce_max_u64_high_bit_set() {
     let (out, _) = op_reduce(
         &delta, None, to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out.count, 1);
     let max_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
@@ -1900,7 +1898,7 @@ fn test_reduce_min_u64_incremental() {
     let (out1, _) = op_reduce(
         &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out1.count, 1);
     let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -1928,7 +1926,7 @@ fn test_reduce_min_u64_incremental() {
     let (out2, _) = op_reduce(
         &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out2.count, 2, "retract old MIN + emit new MIN");
     let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
@@ -1966,7 +1964,7 @@ fn test_reduce_max_u64_incremental() {
     let (out1, _) = op_reduce(
         &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out1.count, 1);
     let max1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -1989,7 +1987,7 @@ fn test_reduce_max_u64_incremental() {
     let (out2, _) = op_reduce(
         &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     // Expect: retract old MAX (10) + emit new MAX (u64::MAX).
     assert_eq!(out2.count, 2);
@@ -2069,7 +2067,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
     let (out1, _) = op_reduce(
         &delta1, Some(ti_ch.cursor_mut()), to_ch.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     assert_eq!(out1.count, 1);
     let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -2093,7 +2091,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
     let (out2, _) = op_reduce(
         &delta2, Some(ti_ch2.cursor_mut()), to_ch2.cursor_mut(),
         &in_schema, &out_schema, &[1u32], &[agg],
-        None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+        None, false, TypeCode::U64, &[], None, None, 0, None, None,
     );
     // Retract old MIN (u64::MAX) + emit new MIN (5).
     assert_eq!(out2.count, 2);
@@ -2136,7 +2134,7 @@ fn test_reduce_min_max_i64_boundary() {
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
-            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, None, None,
         );
         assert_eq!(out.count, 1);
         let min = crate::util::read_i64_le(out.col_data(1), 0);
@@ -2162,7 +2160,7 @@ fn test_reduce_min_max_i64_boundary() {
         let (out, _) = op_reduce(
             &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
-            None, false, TypeCode::U64, &[], None, None, 0, TypeCode::U64, None, None,
+            None, false, TypeCode::U64, &[], None, None, 0, None, None,
         );
         assert_eq!(out.count, 1);
         let max = crate::util::read_i64_le(out.col_data(1), 0);
@@ -2340,7 +2338,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 2, "one row per distinct PK");
@@ -2383,7 +2381,7 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 2);
@@ -2423,7 +2421,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 2);
@@ -2471,7 +2469,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         &in_schema, &out_schema,
         &[1u32, 0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 2);
@@ -2525,7 +2523,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::I64, &[], None,
-        None, 0, TypeCode::I64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 3, "one row per distinct signed PK");
@@ -2578,7 +2576,7 @@ fn test_reduce_group_by_pk_unsorted_float_pk() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::F64, &[], None,
-        None, 0, TypeCode::F64, None, None,
+        None, 0, None, None,
     );
 
     assert_eq!(out.count, 3);
@@ -2640,7 +2638,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
         &in_schema, &out_schema,
         &[0u32], &[agg],
         None, false, TypeCode::U64, &[], None,
-        None, 0, TypeCode::U64, None, None,
+        None, 0, None, None,
     );
 
     // Expected: one retract (pk=5, w=-1, SUM=100), one emit (pk=5,

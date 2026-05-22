@@ -736,7 +736,7 @@ fn build_reduce_output_schema(
 }
 
 fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String)
+    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob)
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1195,7 @@ fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, table_ptr: *
     builder.add_integrate(
         in_reg,
         table_ptr,
-        std::ptr::null_mut(), 0, 0, // no GI
+        std::ptr::null_mut(), 0, // no GI
         std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0, // no AVI
     );
 }
@@ -1326,7 +1326,6 @@ fn emit_reduce(
 
     let mut gi_table_ptr: *mut Table = std::ptr::null_mut();
     let mut gi_col_idx: u32 = 0;
-    let mut gi_col_type_code: u8 = 0;
 
     if tr_in_table_idx.is_some() && gcols.len() == 1 {
         let gc_col_idx = gcols[0] as usize;
@@ -1346,7 +1345,6 @@ fn emit_reduce(
                 owned_tables.push(Box::new(gi_table));
                 gi_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
                 gi_col_idx = gc_col_idx as u32;
-                gi_col_type_code = gc_raw;
             }
         }
     }
@@ -1376,7 +1374,7 @@ fn emit_reduce(
         builder.add_integrate(
             in_reg_id as u16,
             std::ptr::null_mut(),
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             avi_table_ptr, avi_for_max, avi_agg_col_type_code,
             &avi_group_cols, &in_reg_schema as *const SchemaDescriptor, avi_agg_col_idx,
         );
@@ -1409,7 +1407,7 @@ fn emit_reduce(
         &avi_group_cols,
         if !avi_table_ptr.is_null() { &in_reg_schema as *const SchemaDescriptor } else { std::ptr::null() },
         avi_agg_col_idx,
-        gi_table_ptr, gi_col_idx, gi_col_type_code,
+        gi_table_ptr, gi_col_idx,
         fin_prog_ptr,
         fin_schema_ptr,
     );
@@ -1418,7 +1416,7 @@ fn emit_reduce(
         builder.add_integrate(
             in_reg_id as u16,
             tr_in_table_ptr,
-            gi_table_ptr, gi_col_idx, gi_col_type_code,
+            gi_table_ptr, gi_col_idx,
             avi_table_ptr, avi_for_max, avi_agg_col_type_code,
             &avi_group_cols,
             if !avi_table_ptr.is_null() { &in_reg_schema as *const SchemaDescriptor } else { std::ptr::null() },

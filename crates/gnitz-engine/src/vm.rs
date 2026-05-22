@@ -60,7 +60,6 @@ pub enum Instr {
         // GI params — GI cursor is created fresh from the GI table each tick
         gi_table_idx: i16,    // -1 = no GI; index into Program::tables
         gi_col_idx: u32,
-        gi_col_type_code: u8,
         // Finalize
         finalize_func_idx: i16,  // -1 = no finalize program
         finalize_schema_idx: i16,  // -1 = no finalize schema
@@ -78,7 +77,6 @@ pub enum Instr {
 pub struct IntegrateGi {
     pub table_idx: u16,
     pub col_idx: u32,
-    pub col_type_code: u8,
 }
 
 /// AVI descriptor embedded in an Integrate instruction.
@@ -269,7 +267,6 @@ impl ProgramBuilder {
         // GI params (all NULL/0 if no GI)
         gi_table: *mut Table,
         gi_col_idx: u32,
-        gi_col_type_code: u8,
         // AVI params (all NULL/0 if no AVI)
         avi_table: *mut Table,
         avi_for_max: bool,
@@ -283,7 +280,6 @@ impl ProgramBuilder {
             Some(IntegrateGi {
                 table_idx: self.table_idx(gi_table) as u16,
                 col_idx: gi_col_idx,
-                col_type_code: gi_col_type_code,
             })
         } else {
             None
@@ -330,7 +326,6 @@ impl ProgramBuilder {
         // GI params
         gi_table: *mut Table,
         gi_col_idx: u32,
-        gi_col_type_code: u8,
         // Finalize
         finalize_prog: *const crate::expr::ExprProgram,
         finalize_schema: *const SchemaDescriptor,
@@ -380,7 +375,6 @@ impl ProgramBuilder {
             avi_agg_col_idx,
             gi_table_idx,
             gi_col_idx,
-            gi_col_type_code,
             finalize_func_idx,
             finalize_schema_idx,
         });
@@ -954,7 +948,6 @@ pub fn execute_epoch(
                 let gi_desc = gi.as_ref().map(|g| GiDesc {
                     table: program.tables[g.table_idx as usize],
                     col_idx: g.col_idx,
-                    col_type_code: g.col_type_code,
                 });
 
                 let avi_desc = avi.as_ref().map(|a| {
@@ -986,7 +979,7 @@ pub fn execute_epoch(
                 avi_table_idx, avi_for_max, avi_agg_col_type_code,
                 avi_group_cols_offset, avi_group_cols_count,
                 avi_input_schema_idx, avi_agg_col_idx: _,
-                gi_table_idx, gi_col_idx, gi_col_type_code,
+                gi_table_idx, gi_col_idx,
                 finalize_func_idx, finalize_schema_idx,
             } => {
                 let in_schema = reg!(*in_reg).schema;
@@ -1078,11 +1071,6 @@ pub fn execute_epoch(
                 } else {
                     crate::schema::TypeCode::U64
                 };
-                let gi_tc = if gi_opt.is_some() {
-                    crate::schema::TypeCode::from_validated_u8(*gi_col_type_code)
-                } else {
-                    crate::schema::TypeCode::U64
-                };
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
@@ -1099,7 +1087,6 @@ pub fn execute_epoch(
                     avi_in_schema,
                     gi_opt,
                     *gi_col_idx,
-                    gi_tc,
                     fin_prog,
                     fin_schema,
                 );
@@ -1995,7 +1982,7 @@ mod tests {
             std::ptr::null_mut(), // avi_table
             false, 0, &[], std::ptr::null(), 0,
             std::ptr::null_mut(), // gi_table
-            0, 0,
+            0,
             std::ptr::null(),     // finalize_prog
             std::ptr::null(),     // finalize_schema
         );
@@ -2004,7 +1991,7 @@ mod tests {
         builder.add_integrate(
             2,                    // in_reg (raw_delta)
             trace_out_ptr,        // target table
-            std::ptr::null_mut(), 0, 0,   // no GI
+            std::ptr::null_mut(), 0,   // no GI
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0, // no AVI
         );
 
@@ -2012,7 +1999,7 @@ mod tests {
         builder.add_integrate(
             0,                    // in_reg
             trace_in_ptr,         // target table
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
         );
 
@@ -2354,17 +2341,17 @@ mod tests {
             0, 3, 1, 2, -1,
             &agg_descs, &group_cols, out_schema,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null(), std::ptr::null(),
         );
         builder.add_integrate(
             2, trace_out_ptr,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
         );
         builder.add_integrate(
             0, trace_in_ptr,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
         );
         builder.add_halt();
@@ -2546,14 +2533,14 @@ mod tests {
             0, 2, 1, 3, -1,
             &agg_descs, &group_cols, out_schema,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null(), std::ptr::null(),
         );
         builder.add_integrate(3, trace_out_ptr,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
         builder.add_integrate(0, trace_in_ptr,
-            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), 0,
             std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
         builder.add_halt();
 

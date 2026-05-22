@@ -1,75 +1,7 @@
 //! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
 
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
-use crate::storage::{Batch, MemBatch};
-
-// ---------------------------------------------------------------------------
-// Column promotion helpers
-// ---------------------------------------------------------------------------
-
-/// Promote a column value to u64 for GroupIndex composite keys.
-///
-/// Caller is responsible for resolving `pi`; this helper is schema-agnostic
-/// so PK and payload reads can dispatch externally.
-fn promote_col_to_u64(mb: &MemBatch, row: usize, pi: usize, col_type_code: u8) -> u64 {
-    let cs = match col_type_code {
-        type_code::U8 | type_code::I8 => 1,
-        type_code::U16 | type_code::I16 => 2,
-        type_code::U32 | type_code::I32 | type_code::F32 => 4,
-        _ => 8, // U64, I64, F64; U128 excluded by caller
-    };
-    let ptr = mb.get_col_ptr(row, pi, cs);
-    let mut buf = [0u8; 8];
-    buf[..cs].copy_from_slice(ptr);
-    u64::from_le_bytes(buf)
-}
-
-/// Promote an aggregate column value to an order-preserving u64 for AVI keys.
-fn promote_agg_col_to_u64_ordered(
-    mb: &MemBatch,
-    row: usize,
-    pi: usize,
-    col_type_code: u8,
-    for_max: bool,
-) -> u64 {
-    if col_type_code == type_code::F32 {
-        let ptr = mb.get_col_ptr(row, pi, 4);
-        let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
-        let val = ieee_order_bits_f32(raw32);
-        return if for_max { !val } else { val };
-    }
-
-    let cs = crate::schema::type_size(col_type_code) as usize;
-    let ptr = mb.get_col_ptr(row, pi, cs);
-    let mut buf = [0u8; 8];
-    buf[..cs].copy_from_slice(ptr);
-    let raw = u64::from_le_bytes(buf);
-
-    let val = match col_type_code {
-        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => raw,
-        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
-            // Sign-extend then offset-binary
-            let signed = crate::schema::read_signed(&buf[..cs], cs);
-            (signed as u64).wrapping_add(1u64 << 63)
-        }
-        type_code::F64 => ieee_order_bits(raw),
-        _ => raw,
-    };
-
-    if for_max { !val } else { val }
-}
-
-fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
-}
+use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // Public descriptor types
@@ -79,7 +11,6 @@ fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
 pub struct GiDesc {
     pub table: *mut crate::storage::Table,
     pub col_idx: u32,
-    pub col_type_code: u8,
 }
 
 pub struct AviDesc {
@@ -149,6 +80,7 @@ pub fn op_integrate_with_indexes(
         // PK has no payload-index slot; the null-bit probe is skipped below,
         // so a dummy 0 is safe.
         let gi_pi = if gi_is_pk { 0 } else { input_schema.payload_idx(gi_col) };
+        let gc_extractor = super::util::IndexColExtractor::new(input_schema, gi_col);
 
         for row in 0..batch.count {
             // PK is never null (catalog rule: pk-not-null.md), so its dense
@@ -158,11 +90,7 @@ pub fn op_integrate_with_indexes(
             }
 
             let source_pk = mb.get_pk(row);
-            let gc_u64 = if gi_is_pk {
-                source_pk as u64
-            } else {
-                promote_col_to_u64(&mb, row, gi_pi, gi_desc.col_type_code)
-            };
+            let gc_u64 = gc_extractor.extract(&mb, row);
             let source_pk_lo = source_pk as u64;
             let source_pk_hi = (source_pk >> 64) as u64;
             let weight = mb.get_weight(row);
@@ -191,7 +119,15 @@ pub fn op_integrate_with_indexes(
 
         let avi_col = avi_desc.agg_col_idx as usize;
         let avi_is_pk = input_schema.is_pk_col(avi_col);
-        let avi_pi = if avi_is_pk { 0 } else { input_schema.payload_idx(avi_col) };
+        // Column width is loop-invariant; resolve it (and the PK byte offset or
+        // payload slot) once. A PK aggregate is sliced from the packed PK
+        // region, a payload aggregate read from its dense slot.
+        let avi_w = input_schema.columns[avi_col].size() as usize;
+        let (avi_pk_off, avi_pi) = if avi_is_pk {
+            (input_schema.pk_byte_offset(avi_col) as usize, 0)
+        } else {
+            (0, input_schema.payload_idx(avi_col))
+        };
 
         for row in 0..batch.count {
             // PK is never null, so its dense bit position is undefined.
@@ -202,15 +138,14 @@ pub fn op_integrate_with_indexes(
             let gc_u64 = super::util::extract_gc_u64(
                 &mb, row, &avi_desc.input_schema, &avi_desc.group_by_cols,
             );
-            let av_u64 = if avi_is_pk {
-                let val = mb.get_pk(row) as u64;
-                if avi_desc.for_max { !val } else { val }
+            let av_bytes = if avi_is_pk {
+                &mb.get_pk_bytes(row)[avi_pk_off..avi_pk_off + avi_w]
             } else {
-                promote_agg_col_to_u64_ordered(
-                    &mb, row, avi_pi,
-                    avi_desc.agg_col_type_code, avi_desc.for_max,
-                )
+                mb.get_col_ptr(row, avi_pi, avi_w)
             };
+            let av_u64 = super::util::encode_ordered(
+                av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max,
+            );
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = av_u64, ck_hi = gc_u64
@@ -222,12 +157,14 @@ pub fn op_integrate_with_indexes(
         }
 
         if avi_batch.count > 0 {
-            gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
-                avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
-            for i in 0..avi_batch.count {
-                let pk = avi_batch.get_pk(i);
-                let w = i64::from_le_bytes(avi_batch.weight_data()[i*8..(i+1)*8].try_into().unwrap());
-                gnitz_debug!("  avi[{}]: pk={:#034x} w={}", i, pk, w);
+            if crate::log::is_debug() {
+                gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
+                    avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
+                for i in 0..avi_batch.count {
+                    let pk = avi_batch.get_pk(i);
+                    let w = i64::from_le_bytes(avi_batch.weight_data()[i*8..(i+1)*8].try_into().unwrap());
+                    gnitz_debug!("  avi[{}]: pk={:#034x} w={}", i, pk, w);
+                }
             }
             let avi_table = unsafe { &mut *avi_desc.table };
             let _ = avi_table.ingest_owned_batch_memonly(avi_batch);
@@ -235,4 +172,73 @@ pub fn op_integrate_with_indexes(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod avi_encode_tests {
+    use super::super::util::{encode_ordered, decode_ordered};
+    use crate::schema::{type_code, TypeCode};
+
+    fn decode_i32(enc: u64, for_max: bool) -> i32 {
+        decode_ordered(enc, TypeCode::I32, for_max) as i32
+    }
+
+    // A signed aggregate (PK or payload) must encode order-preservingly so the
+    // ascending AVI cursor walk yields MIN first, and decode back to the value.
+    #[test]
+    fn i32_encoding_is_order_preserving_and_round_trips() {
+        let vals: [i32; 5] = [i32::MIN, -100, -1, 0, 1_000_000];
+        let enc: Vec<u64> = vals
+            .iter()
+            .map(|v| encode_ordered(&v.to_le_bytes(), type_code::I32, false))
+            .collect();
+        for w in enc.windows(2) {
+            assert!(w[0] < w[1], "ascending i32 must encode to ascending u64");
+        }
+        for (v, &e) in vals.iter().zip(enc.iter()) {
+            assert_eq!(decode_i32(e, false), *v, "round-trip i32");
+        }
+    }
+
+    // for_max inverts the order so the ascending walk yields MAX first.
+    #[test]
+    fn for_max_inverts_order() {
+        let lo = encode_ordered(&(-5i32).to_le_bytes(), type_code::I32, true);
+        let hi = encode_ordered(&100i32.to_le_bytes(), type_code::I32, true);
+        assert!(lo > hi, "for_max: larger value must encode smaller");
+        assert_eq!(decode_i32(hi, true), 100);
+    }
+
+    #[test]
+    fn f32_encoding_is_order_preserving() {
+        let vals: [f32; 4] = [-2.5, -0.5, 0.5, 2.5];
+        let enc: Vec<u64> = vals
+            .iter()
+            .map(|v| encode_ordered(&v.to_bits().to_le_bytes(), type_code::F32, false))
+            .collect();
+        for w in enc.windows(2) {
+            assert!(w[0] < w[1], "ascending f32 must encode to ascending u64");
+        }
+    }
+
+    // The shared bytes core means a PK aggregate column (sliced out of the
+    // packed slot) encodes identically to the same value in a payload column.
+    #[test]
+    fn pk_slice_and_standalone_encode_identically() {
+        let v: i32 = -42;
+        // Standalone payload-style 4-byte buffer.
+        let payload = encode_ordered(&v.to_le_bytes(), type_code::I32, false);
+        // Same value sliced from offset 4 of an 8-byte (U32,U32)-style PK slot.
+        let mut slot = [0u8; 8];
+        slot[4..8].copy_from_slice(&v.to_le_bytes());
+        let pk_slice = encode_ordered(&slot[4..8], type_code::I32, false);
+        assert_eq!(payload, pk_slice);
+    }
+
+    #[test]
+    fn unsigned_encoding_is_raw_value() {
+        let v: u32 = 0xABCD_1234;
+        let enc = encode_ordered(&v.to_le_bytes(), type_code::U32, false);
+        assert_eq!(enc, v as u64);
+    }
 }

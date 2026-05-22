@@ -389,32 +389,6 @@ pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[
 }
 
 // ---------------------------------------------------------------------------
-// IEEE 754 order-preserving encoding (used by the AVI scan)
-// ---------------------------------------------------------------------------
-
-/// Reverse IEEE order-preserving encoding.
-fn ieee_order_bits_reverse(encoded: u64) -> u64 {
-    if encoded >> 63 != 0 {
-        encoded ^ (1u64 << 63)
-    } else {
-        !encoded
-    }
-}
-
-/// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
-/// Checks the F32 sign bit (bit 31), not bit 63.
-#[cfg(test)]
-pub(super) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
-}
-
-/// Reverse of ieee_order_bits_f32.
-pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
-    let e = encoded as u32;
-    if e >> 31 != 0 { e ^ (1u32 << 31) } else { !e }
-}
-
-// ---------------------------------------------------------------------------
 // AVI lookup
 // ---------------------------------------------------------------------------
 
@@ -437,24 +411,9 @@ pub(super) fn apply_agg_from_value_index(
             break;
         }
         if avi_cursor.current_weight > 0 {
-            let mut encoded = avi_cursor.current_key as u64;
-            if for_max {
-                encoded = !encoded;
-            }
-            match agg_col_type_code {
-                TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-                    encoded = (encoded as i64).wrapping_sub(1i64 << 63) as u64;
-                }
-                TypeCode::F64 => {
-                    encoded = ieee_order_bits_reverse(encoded);
-                }
-                TypeCode::F32 => {
-                    encoded = ieee_order_bits_f32_reverse(encoded) as u64;
-                }
-                TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 |
-                TypeCode::U128 | TypeCode::UUID | TypeCode::String => {}
-                TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
-            }
+            let encoded = super::super::util::decode_ordered(
+                avi_cursor.current_key as u64, agg_col_type_code, for_max,
+            );
             acc.seed_from_raw_bits(encoded);
             return true;
         }

@@ -134,6 +134,129 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 }
 
 // ---------------------------------------------------------------------------
+// Raw injective index/group column extractor
+// ---------------------------------------------------------------------------
+
+/// Precomputed reader for one raw, injective index/group column. Built once
+/// before a population or read-back loop so the per-row path is a slice plus a
+/// `read_unsigned`, with no schema walk.
+///
+/// Raw (not hashed): GroupIndex replay groups source rows by this exact value
+/// and does not re-filter by group membership, so the encoding must stay
+/// injective within the column's domain — a hashed (colliding) value would
+/// merge distinct groups. GI's gc column is always U8..I64 (size ∈ {1,2,4,8}),
+/// so `read_unsigned` never sees an out-of-range width.
+pub(super) struct IndexColExtractor {
+    is_pk: bool,
+    /// PK byte offset when `is_pk`, else the dense payload slot index.
+    off_or_pi: usize,
+    size: usize,
+}
+
+impl IndexColExtractor {
+    pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
+        let size = schema.columns[col_idx].size() as usize;
+        let is_pk = schema.is_pk_col(col_idx);
+        let off_or_pi = if is_pk {
+            schema.pk_byte_offset(col_idx) as usize
+        } else {
+            schema.payload_idx(col_idx)
+        };
+        Self { is_pk, off_or_pi, size }
+    }
+
+    #[inline]
+    pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
+        let bytes = if self.is_pk {
+            &mb.get_pk_bytes(row)[self.off_or_pi..self.off_or_pi + self.size]
+        } else {
+            mb.get_col_ptr(row, self.off_or_pi, self.size)
+        };
+        crate::schema::read_unsigned(bytes, self.size)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Order-preserving aggregate-value codec (AVI keys)
+// ---------------------------------------------------------------------------
+//
+// `encode_ordered` (index population) and `decode_ordered` (AVI scan in
+// `agg::apply_agg_from_value_index`) are the two halves of one codec: encode
+// maps a value to a u64 whose unsigned ordering matches the value's natural
+// ordering, decode recovers the original bits. They must stay mutual inverses.
+
+#[inline]
+fn ieee_order_bits(raw_bits: u64) -> u64 {
+    if raw_bits >> 63 != 0 {
+        !raw_bits
+    } else {
+        raw_bits ^ (1u64 << 63)
+    }
+}
+
+#[inline]
+fn ieee_order_bits_reverse(encoded: u64) -> u64 {
+    if encoded >> 63 != 0 {
+        encoded ^ (1u64 << 63)
+    } else {
+        !encoded
+    }
+}
+
+/// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
+/// Checks the F32 sign bit (bit 31), not bit 63.
+#[inline]
+pub(super) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
+    (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
+}
+
+/// Reverse of [`ieee_order_bits_f32`].
+#[inline]
+pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
+    let e = encoded as u32;
+    if e >> 31 != 0 { e ^ (1u32 << 31) } else { !e }
+}
+
+/// Order-preserving u64 encoding of a fixed-width aggregate value held in
+/// `bytes` (native little-endian). Shared by the payload and PK-column AVI
+/// paths so a PK aggregate column encodes identically to the same value in a
+/// payload column. `for_max` inverts the order so the cursor's ascending walk
+/// yields the maximum first. Width is ≤ 8 (F32 is 4); U128/UUID/String/Blob
+/// are excluded upstream by `agg_value_idx_eligible`, so the fallback arm is
+/// unreachable.
+pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> u64 {
+    let val = match col_type_code {
+        type_code::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        type_code::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => {
+            crate::schema::read_unsigned(bytes, bytes.len())
+        }
+        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
+            (crate::schema::read_signed(bytes, bytes.len()) as u64).wrapping_add(1u64 << 63)
+        }
+        other => unreachable!("AVI agg type {other} is not order-encodable (gated by agg_value_idx_eligible)"),
+    };
+    if for_max { !val } else { val }
+}
+
+/// Inverse of [`encode_ordered`]: recover the original value's raw little-endian
+/// bits (IEEE bits for floats, two's-complement for signed, the value itself for
+/// unsigned) from its order-preserving u64 key.
+pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: bool) -> u64 {
+    let e = if for_max { !encoded } else { encoded };
+    match col_type_code {
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+            (e as i64).wrapping_sub(1i64 << 63) as u64
+        }
+        TypeCode::F64 => ieee_order_bits_reverse(e),
+        TypeCode::F32 => ieee_order_bits_f32_reverse(e) as u64,
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
+        | TypeCode::U128 | TypeCode::UUID | TypeCode::String => e,
+        TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Group key helpers (shared by reduce, exchange)
 // ---------------------------------------------------------------------------
 
@@ -273,4 +396,81 @@ pub(super) fn extract_gc_u64(
     }
 
     key_u128 as u64
+}
+
+#[cfg(test)]
+mod index_col_extractor_tests {
+    use super::IndexColExtractor;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::storage::Batch;
+
+    // Compound narrow PK (U32, U32), stride 8: the addressed column must be
+    // sliced from the packed slot, not read as the whole slot.
+    #[test]
+    fn compound_pk_slices_addressed_column() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(schema.pk_byte_offset(0), 0);
+        assert_eq!(schema.pk_byte_offset(1), 4);
+
+        let (c0, c1): (u32, u32) = (0x1111_2222, 0xAAAA_BBBB);
+        let mut b = Batch::with_schema(schema, 1);
+        // Packed LE slot: col0 in bytes [0..4], col1 in bytes [4..8].
+        b.extend_pk(((c1 as u128) << 32) | c0 as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+        let mb = b.as_mem_batch();
+
+        let ex0 = IndexColExtractor::new(&schema, 0);
+        let ex1 = IndexColExtractor::new(&schema, 1);
+        assert_eq!(ex0.extract(&mb, 0), c0 as u64, "col 0 must be the low U32 only");
+        assert_eq!(ex1.extract(&mb, 0), c1 as u64, "col 1 must be the high U32, not the whole slot");
+    }
+
+    // Single U64 PK spanning the whole slot: extractor reduces to the old
+    // `source_pk as u64`, preserving bit-identical behaviour.
+    #[test]
+    fn single_u64_pk_is_bit_identical() {
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        let v: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(v as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+        let mb = b.as_mem_batch();
+
+        let ex = IndexColExtractor::new(&schema, 0);
+        assert_eq!(ex.extract(&mb, 0), v);
+        assert_eq!(ex.extract(&mb, 0), mb.get_pk(0) as u64);
+    }
+
+    // Payload column path: the addressed payload slot is zero-extended to u64.
+    #[test]
+    fn payload_column_zero_extends() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U16, 0),
+            ],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(7u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(pi, &0xBEEFu16.to_le_bytes());
+        b.count += 1;
+        let mb = b.as_mem_batch();
+
+        let ex = IndexColExtractor::new(&schema, 1);
+        assert_eq!(ex.extract(&mb, 0), 0xBEEFu64);
+    }
 }
