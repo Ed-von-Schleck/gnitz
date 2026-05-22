@@ -74,9 +74,10 @@ fn idx_tab_schema() -> &'static Schema {
 /// `Vec<usize>` for the `Schema` type. The shared `gnitz_wire::unpack_pk_cols`
 /// handles both the bare-scalar (pre-compound) row form and the packed
 /// compound form. Rejects a `decoded_count()` that doesn't match the
-/// returned slice length: that signals a malformed wire payload (count
-/// > 4) that the server's `validate_pk_cols` would have rejected too —
-/// silently truncating here would hide the divergence from the client.
+/// returned slice length: that signals a malformed wire payload
+/// (count exceeding 4) that the server's `validate_pk_cols` would have
+/// rejected too — silently truncating here would hide the divergence
+/// from the client.
 fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     let pkl = gnitz_wire::unpack_pk_cols(packed);
     let slice = pkl.as_slice();

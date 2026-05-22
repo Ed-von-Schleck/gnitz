@@ -658,7 +658,7 @@ fn pk_column_to_pylist(py: Python<'_>, pks: &PkColumn) -> PyResult<Py<PyList>> {
     match pks {
         PkColumn::Bytes { stride, buf } => {
             let s = *stride as usize;
-            let n = if s == 0 { 0 } else { buf.len() / s };
+            let n = buf.len().checked_div(s).unwrap_or(0);
             let items: Vec<PyObject> = (0..n)
                 .map(|i| pyo3::types::PyBytes::new(py, &buf[i * s..(i + 1) * s])
                     .into_any().unbind())
@@ -1958,6 +1958,13 @@ fn async_io_loop(
     let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> =
         VecDeque::with_capacity(IO_BATCH_MAX);
 
+    // Hoisted scratch — .clear()ed each iteration so the outer slot
+    // arrays are reused. (Inner `Vec<u8>` payloads are still produced
+    // and dropped per batch by `encode_push_payload`.)
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(IO_BATCH_MAX);
+    let mut kinds:    Vec<ResponseKind> = Vec::with_capacity(IO_BATCH_MAX);
+    let mut results:  Vec<gnitz_core::Message> = Vec::with_capacity(IO_BATCH_MAX);
+
     loop {
         // Block until at least one request
         let first = match rx.recv() {
@@ -1968,8 +1975,8 @@ fn async_io_loop(
         // Drain additional queued requests (natural batching), capped to
         // avoid filling the socket send buffer before reading any responses.
         // Py<PyAny>: Send, so moving futures into pending_futures needs no GIL.
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(IO_BATCH_MAX);
-        let mut kinds:    Vec<ResponseKind> = Vec::with_capacity(IO_BATCH_MAX);
+        payloads.clear();
+        kinds.clear();
         payloads.push(first.payload);
         kinds.push(first.kind);
         pending_futures.push_back((first.future, first.kind));
@@ -1984,27 +1991,25 @@ fn async_io_loop(
             }
         }
 
-        // Send all requests in this batch.
-        for payload in &payloads {
-            if let Err(e) = gnitz_core::send_framed(sock_fd, payload) {
-                Python::with_gil(|py| {
-                    let exc = GnitzError::new_err(e.to_string())
-                        .into_pyobject(py).unwrap().into_any().unbind();
-                    for (fut, _) in pending_futures.drain(..) {
-                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                            (&se_fn, &fut, exc.clone_ref(py)));
-                    }
-                });
-                gnitz_core::close_fd(sock_fd);
-                return;
-            }
+        // Send the whole batch as one writev sequence.
+        if let Err(e) = gnitz_core::send_framed_batch(sock_fd, &payloads) {
+            Python::with_gil(|py| {
+                let exc = GnitzError::new_err(e.to_string())
+                    .into_pyobject(py).unwrap().into_any().unbind();
+                for (fut, _) in pending_futures.drain(..) {
+                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                        (&se_fn, &fut, exc.clone_ref(py)));
+                }
+            });
+            gnitz_core::close_fd(sock_fd);
+            return;
         }
 
         // Recv all responses for this batch (pure Rust, no GIL).
         // Scan requests use recv_scan_response to collect streaming frames.
         // On transport failure: stop reading and record the error once —
         // remaining futures are failed with the same exception below.
-        let mut results: Vec<gnitz_core::Message> = Vec::with_capacity(kinds.len());
+        results.clear();
         let mut recv_err: Option<String> = None;
         for &kind in &kinds {
             let r = match kind {
@@ -2024,7 +2029,7 @@ fn async_io_loop(
         // Single GIL acquisition to resolve all futures.
         let conn_lost = recv_err.is_some();
         Python::with_gil(|py| {
-            for msg in results {
+            for msg in results.drain(..) {
                 let (fut, kind) = pending_futures.pop_front().unwrap();
                 if msg.status == gnitz_core::STATUS_ERROR {
                     let err_text = msg.error_text.unwrap_or_default();

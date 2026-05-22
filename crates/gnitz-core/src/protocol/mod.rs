@@ -28,7 +28,7 @@ pub use wal_block::{
 };
 pub use codec::{schema_to_batch, batch_to_schema};
 pub use transport::{
-    connect, connect_unix, send_framed, send_framed_iov, recv_framed, close_fd,
+    connect, connect_unix, send_framed, send_framed_iov, send_framed_batch, recv_framed, close_fd,
     hello_handshake,
 };
 pub use message::{
