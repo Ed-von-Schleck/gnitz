@@ -1,10 +1,8 @@
 #![cfg(feature = "integration")]
 
-mod helpers;
-
 use gnitz_core::{GnitzClient, TypeCode};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
-use helpers::ServerHandle;
+use gnitz_test_harness::ServerHandle;
 
 /// Local replacement for `Result::unwrap_err` — `SqlResult` doesn't impl `Debug`,
 /// so the stdlib version doesn't compile.

@@ -1,10 +1,8 @@
 #![cfg(feature = "integration")]
 
-mod helpers;
-
 use gnitz_core::GnitzClient;
 use gnitz_sql::SqlPlanner;
-use helpers::ServerHandle;
+use gnitz_test_harness::ServerHandle;
 
 // Returns (client, schema_name) with a unique schema already created.
 // The schema name is unique per call so parallel tests don't collide.

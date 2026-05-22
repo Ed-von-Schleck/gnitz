@@ -7,8 +7,6 @@
 
 #![cfg(feature = "integration")]
 
-mod helpers;
-
 use std::os::unix::io::RawFd;
 
 use gnitz_core::{GnitzClient, SCHEMA_TAB};
@@ -23,7 +21,7 @@ use gnitz_core::{
     connect, hello_handshake, send_framed, recv_framed, close_fd,
     WAL_BLOCK_HEADER_SIZE,
 };
-use helpers::ServerHandle;
+use gnitz_test_harness::ServerHandle;
 
 // ── RawClient ─────────────────────────────────────────────────────────────────
 

@@ -11,3 +11,6 @@ gnitz-wire  = { path = "../gnitz-wire" }
 libc        = "0.2"
 lru         = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+gnitz-test-harness = { path = "../gnitz-test-harness" }

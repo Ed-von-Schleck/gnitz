@@ -1,11 +1,9 @@
 #![cfg(feature = "integration")]
 
-mod helpers;
-
 use gnitz_core::{Connection, SCHEMA_TAB, FIRST_USER_TABLE_ID};
 use gnitz_core::{GnitzClient, ExprBuilder, CircuitBuilder};
 use gnitz_core::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, PkColumn};
-use helpers::ServerHandle;
+use gnitz_test_harness::ServerHandle;
 
 /// Build a fresh schema cache for tests that drive `Connection` directly.
 /// The production client (`GnitzClient`) owns this cache; raw-`Connection`

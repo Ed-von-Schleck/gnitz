@@ -7,6 +7,7 @@ members = [
     "gnitz-capi",
     "gnitz-py",
     "gnitz-engine",
+    "gnitz-test-harness",
 ]
 
 # Release: panic aborts the process so reactor-task panics surface as a

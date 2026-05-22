@@ -9,3 +9,6 @@ integration = []
 [dependencies]
 sqlparser  = "0.56"
 gnitz-core = { path = "../gnitz-core" }
+
+[dev-dependencies]
+gnitz-test-harness = { path = "../gnitz-test-harness" }
