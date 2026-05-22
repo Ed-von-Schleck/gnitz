@@ -228,6 +228,105 @@ fn test_reduce_sum_retraction() {
     assert_eq!(out2.count, 2);
 }
 
+/// Reduce-of-trace over a wide PK (3×U64, stride 24, GROUP BY the full PK).
+/// The retraction read seeks `trace_out` by the group's PK bytes; the u128
+/// `seek` cannot carry a stride-24 key.
+#[test]
+fn reduce_trace_seek_wide_pk() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use crate::schema::{SchemaColumn, type_code};
+
+    // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1, 2],
+    );
+    // Output: natural wide PK (3×U64) + SUM(I64, nullable).
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0, 1, 2],
+    );
+    assert!(in_schema.pk_is_wide(), "test invariant: stride 24 is wide");
+
+    let pk = |a: u64, b: u64, c: u64| -> [u8; 24] {
+        let mut k = [0u8; 24];
+        k[0..8].copy_from_slice(&a.to_le_bytes());
+        k[8..16].copy_from_slice(&b.to_le_bytes());
+        k[16..24].copy_from_slice(&c.to_le_bytes());
+        k
+    };
+
+    let agg = AggDescriptor {
+        col_idx: 3, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+    let group_by = [0u32, 1, 2];
+
+    // Tick 1: two rows in one group (7,7,7) — val 100 and 200 → SUM = 300.
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta1 = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for val in [100i64, 200] {
+            b.extend_pk_bytes(&pk(7, 7, 7));
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out1.count, 1, "one group");
+    assert_eq!(out1.get_pk_bytes(0), &pk(7, 7, 7)[..]);
+    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 300);
+
+    // Tick 2: retract the val=200 row. SUM 300 → 100; reads the prior aggregate
+    // out of trace_out by PK bytes.
+    let prev_out = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+    let delta2 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk_bytes(&pk(7, 7, 7));
+        b.extend_weight(&(-1i64).to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &200i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out2, _) = op_reduce(
+        &delta2, None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    // Retraction of old SUM (300, w=-1) then insert of new SUM (100, w=+1).
+    assert_eq!(out2.count, 2,
+        "wide-PK retraction must read trace_out and emit retract+insert");
+    assert_eq!(out2.get_weight(0), -1);
+    assert_eq!(out2.get_pk_bytes(0), &pk(7, 7, 7)[..]);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 300, "retracted old SUM");
+    assert_eq!(out2.get_weight(1), 1);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 100, "new SUM");
+}
+
 #[test]
 fn test_reduce_count() {
     use std::rc::Rc;

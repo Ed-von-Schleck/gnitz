@@ -234,6 +234,9 @@ pub fn op_reduce(
         } else {
             extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
         };
+        // Byte-form group key for the wide-PK (`pk_stride > 16`) trace seeks
+        // below; `seek_group`/`current_pk_eq` ignore it on the narrow path.
+        let group_pk_bytes = mb.get_pk_bytes(group_start_idx);
 
         // Step linear accumulators over delta rows in this group
         for acc in accs.iter_mut() {
@@ -263,10 +266,10 @@ pub fn op_reduce(
             idx += 1;
         }
 
-        // Retraction: read old value from trace_out
-        trace_out_cursor.seek(group_key);
+        // Retraction: read old value from trace_out, keyed by the group's PK.
+        trace_out_cursor.seek_group(group_key, group_pk_bytes);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_key == group_key;
+            && trace_out_cursor.current_pk_eq(group_key, group_pk_bytes);
 
         if has_old {
             // Read old agg values from trace_out
@@ -324,9 +327,9 @@ pub fn op_reduce(
 
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {
-                        ti_cursor.seek(group_key);
+                        ti_cursor.seek_group(group_key, group_pk_bytes);
                         while ti_cursor.valid
-                            && ti_cursor.current_key == group_key
+                            && ti_cursor.current_pk_eq(group_key, group_pk_bytes)
                         {
                             ti_cursor.push_current_row(&mut trace_rows);
                             ti_cursor.advance();

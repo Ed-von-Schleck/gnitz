@@ -65,15 +65,16 @@ pub fn op_gather_reduce(
             idx += 1;
         }
 
-        // `trace_out_cursor.seek` still takes a u128 — wide-PK cursor lift
-        // is separate work. `get_pk` panics for pk_stride ∉ {8, 16}; today's
-        // call sites can only reach this with stride 8 or 16.
-        let group_pk: u128 = smb.get_pk(exemplar_row);
+        // `get_pk` panics for wide PKs (stride > 16); leave the u128 0 there. It
+        // is consumed only by the narrow seek/equality (via `seek_group`/
+        // `current_pk_eq`) and by `emit_gather_row`, which re-derives compound
+        // PKs from the exemplar row's bytes and ignores it.
+        let group_pk: u128 = if partial_schema.pk_is_wide() { 0 } else { smb.get_pk(exemplar_row) };
 
-        // Read old global from trace_out
-        trace_out_cursor.seek(group_pk);
+        // Read old global from trace_out, keyed by the group PK.
+        trace_out_cursor.seek_group(group_pk, group_pk_bytes);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_key == group_pk;
+            && trace_out_cursor.current_pk_eq(group_pk, group_pk_bytes);
 
         if has_old {
             for k in 0..num_aggs {

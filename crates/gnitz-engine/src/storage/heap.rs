@@ -609,6 +609,49 @@ mod tests {
         }
     }
 
+    /// Wide-PK prefix collision: two leaves carry the SAME u128 `.key` (their
+    /// low-16 prefix) but full PK bytes that disagree past byte 16. With a
+    /// `less` that orders off the full bytes (as the wide cursor path does via
+    /// `compare_pk_bytes`), the tournament must emit them in byte order, not
+    /// treat the equal prefix as an equal key.
+    #[test]
+    fn loser_tree_wide_pk_prefix_collision() {
+        // Two full 24-byte keys sharing low-16 (1,1) prefix, differing in the
+        // trailing 8 bytes. `row` holds the index into this table.
+        let full: [[u8; 24]; 2] = [
+            {
+                let mut k = [0u8; 24];
+                k[0] = 1; k[8] = 1; k[16] = 100;
+                k
+            },
+            {
+                let mut k = [0u8; 24];
+                k[0] = 1; k[8] = 1; k[16] = 200;
+                k
+            },
+        ];
+        // Shared low-16 prefix as the heap key.
+        let prefix = {
+            let mut p = [0u8; 16];
+            p[0] = 1; p[8] = 1;
+            u128::from_le_bytes(p)
+        };
+        let byte_less = |a: &HeapNode, b: &HeapNode| {
+            full[a.row][..].cmp(&full[b.row][..]) == std::cmp::Ordering::Less
+        };
+        // Build with both leaves keyed by the identical prefix; src 1 carries
+        // the larger full key (200), src 0 the smaller (100).
+        let t = LoserTree::build(2, |i| Some((prefix, i)), byte_less);
+        let mut order = Vec::new();
+        let mut t = t;
+        while !t.is_empty() {
+            order.push(t.peek().row);
+            t.pop_top(&byte_less);
+        }
+        assert_eq!(order, vec![0, 1],
+            "prefix-colliding wide PKs must order by full bytes, not by equal prefix");
+    }
+
     /// Round-trip a real `u128::MAX` PK to confirm sentinel-vs-value
     /// separation: the tree must never treat a `u128::MAX` key as
     /// "exhausted source" — only `source_idx == usize::MAX` does.

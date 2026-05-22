@@ -390,7 +390,7 @@ impl<'a> DirectWriter<'a> {
 /// this one prefix-truncates wide regions for the comparator filter
 /// where that one panics.
 #[inline(always)]
-fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
+pub(super) fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
         16 => u128::from_le_bytes(pk_bytes.try_into().unwrap()),
         8 => u64::from_le_bytes(pk_bytes.try_into().unwrap()) as u128,

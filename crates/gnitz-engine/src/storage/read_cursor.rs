@@ -12,7 +12,7 @@ use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::{make_slow_pk_cmp, ColPtr, MemBatch, UnifiedSource};
+use super::merge::{make_slow_pk_cmp, pack_pk_le, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
 thread_local! {
@@ -92,14 +92,6 @@ enum CursorSource {
 
 impl CursorSource {
     #[inline]
-    fn get_pk(&self, row: usize) -> u128 {
-        match self {
-            CursorSource::Batch(b) => b.get_pk(row),
-            CursorSource::Shard(s) => s.get_pk(row),
-        }
-    }
-
-    #[inline]
     fn get_weight(&self, row: usize) -> i64 {
         match self {
             CursorSource::Batch(b) => b.get_weight(row),
@@ -157,7 +149,6 @@ impl CursorSource {
     /// `Shard` arm forwards `schema` (a `MappedShard` has no
     /// `SchemaDescriptor`, only `pk_stride`). `key` must be exactly
     /// `pk_stride` bytes.
-    #[allow(dead_code)]
     fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
         match self {
             CursorSource::Batch(b) => b.find_lower_bound_bytes(key),
@@ -165,13 +156,22 @@ impl CursorSource {
         }
     }
 
-    #[allow(dead_code)]
     #[inline]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         match self {
             CursorSource::Batch(b) => b.get_pk_bytes(row),
             CursorSource::Shard(s) => s.get_pk_bytes(row),
         }
+    }
+
+    /// Loser-tree heap key. For `pk_stride ≤ 16` this IS the full PK
+    /// (zero-extended for narrow); for `pk_stride > 16` it is the low-16
+    /// LE prefix and is non-authoritative — callers tie-break via
+    /// `compare_pk_bytes` on the full `get_pk_bytes` slice. Bit-identical to
+    /// `get_pk`/`widen_pk_le` for the reachable narrow strides {1,2,4,8,16}.
+    #[inline]
+    fn get_pk_prefix(&self, row: usize) -> u128 {
+        pack_pk_le(self.get_pk_bytes(row))
     }
 
     /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
@@ -318,7 +318,6 @@ impl CursorState {
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
     /// bytes; `schema` is forwarded to the `Shard` arm of
     /// [`CursorSource::find_lower_bound_bytes`].
-    #[allow(dead_code)]
     fn seek_bytes(&mut self, src: &CursorSource, key: &[u8], schema: &SchemaDescriptor) {
         self.position = src.find_lower_bound_bytes(key, schema);
         self.skip_ghosts(src);
@@ -369,6 +368,9 @@ pub struct ReadCursor {
     pk_cmp: Option<Box<dyn Fn(u128, u128) -> Ordering>>,
     // Current row state
     pub valid: bool,
+    /// The current row's PK as a u128: the full PK for `pk_stride ≤ 16`, the
+    /// low-16 LE prefix for wide PKs (non-authoritative — wide consumers must
+    /// read `current_pk_bytes()` and compare via `compare_pk_bytes`).
     pub current_key: u128,
     pub current_weight: i64,
     pub current_null_word: u64,
@@ -390,34 +392,57 @@ impl ReadCursor {
         row_cmp: RowCmp,
         pk_cmp: Option<&dyn Fn(u128, u128) -> Ordering>,
     ) -> LoserTree {
-        // Mirror the storage sort order (merge.rs): PK-primary via the same
-        // comparator each source run was sorted by, then payload tie-break.
-        let less = move |a: &HeapNode, b: &HeapNode| {
-            let pk_ord = match pk_cmp {
-                None => a.key.cmp(&b.key),
-                Some(f) => f(a.key, b.key),
-            };
-            match pk_ord {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => row_cmp(
-                    schema,
-                    &sources[a.source_idx], a.row,
-                    &sources[b.source_idx], b.row,
-                ) == Ordering::Less,
+        // The heap key is the packed PK prefix (= full PK for narrow strides,
+        // low-16 prefix for wide). `get_pk_prefix` never panics on wide.
+        let init = |i: usize| {
+            if states[i].is_valid() {
+                Some((sources[i].get_pk_prefix(states[i].position), states[i].position))
+            } else {
+                None
             }
         };
-        LoserTree::build(
-            sources.len(),
-            |i| {
-                if states[i].is_valid() {
-                    Some((sources[i].get_pk(states[i].position), states[i].position))
-                } else {
-                    None
+        // Mirror the storage sort order (merge.rs): PK-primary, then payload
+        // tie-break. Dispatch the wide vs narrow `less` once here (as
+        // `merge_batches` splits merge_run_wide/narrow) so the reachable narrow
+        // path stays branch-free.
+        if schema.pk_is_wide() {
+            // Wide: the u128 prefix is not a valid ordered-comparison input
+            // (a compound PK packs col_0 low, so raw u128 order is col_1-major).
+            // Order straight off the full PK bytes via compare_pk_bytes.
+            let less = move |a: &HeapNode, b: &HeapNode| {
+                match columnar::compare_pk_bytes(
+                    schema,
+                    sources[a.source_idx].get_pk_bytes(a.row),
+                    sources[b.source_idx].get_pk_bytes(b.row),
+                ) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => row_cmp(
+                        schema,
+                        &sources[a.source_idx], a.row,
+                        &sources[b.source_idx], b.row,
+                    ) == Ordering::Less,
                 }
-            },
-            less,
-        )
+            };
+            LoserTree::build(sources.len(), init, less)
+        } else {
+            let less = move |a: &HeapNode, b: &HeapNode| {
+                let pk_ord = match pk_cmp {
+                    None => a.key.cmp(&b.key),
+                    Some(f) => f(a.key, b.key),
+                };
+                match pk_ord {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => row_cmp(
+                        schema,
+                        &sources[a.source_idx], a.row,
+                        &sources[b.source_idx], b.row,
+                    ) == Ordering::Less,
+                }
+            };
+            LoserTree::build(sources.len(), init, less)
+        }
     }
 
     fn build_tree(
@@ -444,8 +469,12 @@ impl ReadCursor {
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
         let is_fast = columnar::schema_is_int_nonnull(&schema);
-        let pk_cmp: Option<Box<dyn Fn(u128, u128) -> Ordering>> = (!schema.pk_is_fast())
-            .then(|| Box::new(make_slow_pk_cmp(&schema)) as Box<dyn Fn(u128, u128) -> Ordering>);
+        // Wide PKs route through `compare_pk_bytes` (build_tree_with /
+        // drive_with), never `pk_cmp` — and `make_slow_pk_cmp`'s compound arm
+        // panics for `pk_stride > 16`. So don't construct it for wide schemas.
+        let pk_cmp: Option<Box<dyn Fn(u128, u128) -> Ordering>> =
+            (!schema.pk_is_fast() && !schema.pk_is_wide())
+                .then(|| Box::new(make_slow_pk_cmp(&schema)) as Box<dyn Fn(u128, u128) -> Ordering>);
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
@@ -473,6 +502,11 @@ impl ReadCursor {
     }
 
     pub fn seek(&mut self, key: u128) {
+        // Narrow-PK only: a u128 key cannot carry a `pk_stride > 16` PK. Every
+        // caller either guards the schema (op_join/op_distinct/vm SeekTrace) or
+        // operates on a fixed narrow-PK system table; wide-PK traces seek via
+        // `seek_bytes`/`seek_group`. Debug-only fail-stop if that ever breaks.
+        debug_assert!(!self.schema.pk_is_wide(), "ReadCursor::seek: wide PK; use seek_bytes");
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.seek(src, key);
         }
@@ -485,12 +519,9 @@ impl ReadCursor {
     }
 
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
-    /// bytes. Narrow PK only: `drive`/`build_tree` unconditionally widen the
-    /// PK via `widen_pk_le`, which panics for `pk_stride ∉ {8, 16}`. Wide-PK
-    /// exercise of the byte path happens at the source level
-    /// (`Batch`/`MappedShard::find_lower_bound_bytes`), never through the
-    /// cursor.
-    #[allow(dead_code)]
+    /// bytes. Correct at every PK width: the inner `drive`/`build_tree` key the
+    /// heap via `get_pk_prefix` (prefix + `compare_pk_bytes` tie-break for
+    /// wide), so this survives `pk_stride > 16` where the u128 `seek` cannot.
     pub fn seek_bytes(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.seek_bytes(src, key, &self.schema);
@@ -507,6 +538,32 @@ impl ReadCursor {
     /// sibling of the `current_key` field; correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
+    }
+
+    /// Seek to a group's PK, dispatching on this cursor's PK width. `key` and
+    /// `key_bytes` must encode the same PK. Narrow PKs take the u128 `key`
+    /// (its single-word `find_lower_bound` compare beats the per-probe column
+    /// walk); wide PKs (`pk_stride > 16`) take the byte-addressed `seek_bytes`.
+    pub fn seek_group(&mut self, key: u128, key_bytes: &[u8]) {
+        if self.schema.pk_is_wide() {
+            self.seek_bytes(key_bytes);
+        } else {
+            self.seek(key);
+        }
+    }
+
+    /// Whether the current row's PK equals the group key — dispatch sibling of
+    /// [`seek_group`] for bounding a per-group scan. Narrow compares the cached
+    /// u128 `current_key`; wide compares the full PK bytes (the u128 key is only
+    /// the low-16 prefix). Callers must gate on `valid` first: the wide arm reads
+    /// the current row's bytes, which is undefined on an unpositioned cursor.
+    #[inline]
+    pub fn current_pk_eq(&self, key: u128, key_bytes: &[u8]) -> bool {
+        if self.schema.pk_is_wide() {
+            self.current_pk_bytes() == key_bytes
+        } else {
+            self.current_key == key
+        }
     }
 
     /// Position the cursor at the first row whose PK begins with `prefix` and
@@ -592,7 +649,7 @@ impl ReadCursor {
             let pos = state.position;
             let src = &self.sources[0];
             self.valid = true;
-            self.current_key = src.get_pk(pos);
+            self.current_key = src.get_pk_prefix(pos);
             self.current_weight = src.get_weight(pos);
             self.current_null_word = src.get_null_word(pos);
             self.current_entry_idx = 0;
@@ -600,6 +657,44 @@ impl ReadCursor {
         } else {
             self.valid = false;
         }
+    }
+
+    /// Shared N-way merge driver body for [`drive_with`]. Mirrors storage's
+    /// `merge_batches_inner`: the caller selects only `less`/`eq_payload` per PK
+    /// width, and monomorphization compiles each width to its own branch-free
+    /// copy of the (width-independent) advance/weight/emit hot loop. Returns the
+    /// emitted group as `(key, weight, source_idx, row)`, or `None` if drained.
+    #[inline]
+    fn drive_inner<L, EQ>(
+        heap: &mut LoserTree,
+        sources: &[CursorSource],
+        states: &mut [CursorState],
+        less: L,
+        eq_payload: EQ,
+    ) -> Option<(u128, i64, usize, usize)>
+    where
+        L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+        EQ: Fn(usize, usize, usize, usize) -> bool,
+    {
+        let mut emitted: Option<(u128, i64, usize, usize)> = None;
+        drive_merge(
+            heap, less,
+            |src| {
+                states[src].advance(&sources[src]);
+                if states[src].is_valid() {
+                    Some((sources[src].get_pk_prefix(states[src].position), states[src].position))
+                } else {
+                    None
+                }
+            },
+            eq_payload,
+            |src, row| sources[src].get_weight(row),
+            |gs, gr, gk, nw| {
+                emitted = Some((gk, nw, gs, gr));
+                std::ops::ControlFlow::Break(())
+            },
+        );
+        emitted
     }
 
     /// Heap path: emit one consolidated non-ghost group, or invalidate.
@@ -618,50 +713,61 @@ impl ReadCursor {
         let schema  = &self.schema;
         let sources = &self.sources;
         let states  = &mut self.states;
-        // The closure already borrows `&sources` + `&mut states`; capturing
-        // the five `&mut self.current_*` fields in addition would force
-        // `&mut self` (incompatible with the field-level reborrow above).
-        // Stage into a stack tuple, commit after `drive_merge` returns.
-        // `get_null_word` is fetched after return — no need to evaluate
-        // it inside the emit closure that runs at most once per call.
-        let mut emitted: Option<(u128, i64, usize, usize)> = None;
-
-        // Same PK-primary-then-payload order the storage layer sorted each
-        // source by; the prebuilt `pk_cmp` is `Some` only when the u128 fast
-        // path is unsound (compound or signed single-column PK).
-        let pk_cmp = self.pk_cmp.as_deref();
-        let less = |a: &HeapNode, b: &HeapNode| -> bool {
-            let pk_ord = match pk_cmp {
-                None => a.key.cmp(&b.key),
-                Some(f) => f(a.key, b.key),
-            };
-            match pk_ord {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
-                                                   &sources[b.source_idx], b.row) == Ordering::Less,
-            }
-        };
-        drive_merge(
-            heap, less,
-            |src| {
-                states[src].advance(&sources[src]);
-                if states[src].is_valid() {
-                    Some((sources[src].get_pk(states[src].position), states[src].position))
-                } else {
-                    None
+        // `drive_inner` returns the emitted group as a tuple rather than writing
+        // `self.current_*` directly: its closures already reborrow `&sources` +
+        // `&mut states`, so also capturing `&mut self.current_*` would force a
+        // whole-`self` borrow. We commit the tuple (and fetch `get_null_word`)
+        // after it returns.
+        //
+        // Dispatch the wide vs narrow closure set once (mirroring storage's
+        // merge_run_wide/narrow split) so the reachable narrow hot loop has no
+        // width term. Only `less`/`eq_payload` differ.
+        let emitted = if schema.pk_is_wide() {
+            // Wide: order off the full PK bytes (the u128 key is only the
+            // low-16 prefix). `eq_payload` adds the column-aware PK equality
+            // term so two distinct wide PKs sharing a low-16 prefix AND a
+            // payload are not folded into one summed group.
+            let less = |a: &HeapNode, b: &HeapNode| -> bool {
+                match columnar::compare_pk_bytes(schema,
+                    sources[a.source_idx].get_pk_bytes(a.row),
+                    sources[b.source_idx].get_pk_bytes(b.row)) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
+                                                       &sources[b.source_idx], b.row) == Ordering::Less,
                 }
-            },
-            |a_src, a_row, b_src, b_row| {
+            };
+            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+                columnar::compare_pk_bytes(schema, sources[a_src].get_pk_bytes(a_row),
+                                                   sources[b_src].get_pk_bytes(b_row))
+                    == Ordering::Equal
+                && row_cmp(schema, &sources[a_src], a_row,
+                                   &sources[b_src], b_row) == Ordering::Equal
+            };
+            Self::drive_inner(heap, sources, states, less, eq_payload)
+        } else {
+            // Same PK-primary-then-payload order the storage layer sorted each
+            // source by; the prebuilt `pk_cmp` is `Some` only when the u128 fast
+            // path is unsound (compound or signed single-column PK).
+            let pk_cmp = self.pk_cmp.as_deref();
+            let less = |a: &HeapNode, b: &HeapNode| -> bool {
+                let pk_ord = match pk_cmp {
+                    None => a.key.cmp(&b.key),
+                    Some(f) => f(a.key, b.key),
+                };
+                match pk_ord {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
+                                                       &sources[b.source_idx], b.row) == Ordering::Less,
+                }
+            };
+            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
                 row_cmp(schema, &sources[a_src], a_row,
                                 &sources[b_src], b_row) == Ordering::Equal
-            },
-            |src, row| sources[src].get_weight(row),
-            |gs, gr, gk, nw| {
-                emitted = Some((gk, nw, gs, gr));
-                std::ops::ControlFlow::Break(())
-            },
-        );
+            };
+            Self::drive_inner(heap, sources, states, less, eq_payload)
+        };
         if let Some((key, weight, idx, row)) = emitted {
             self.valid = true;
             self.current_key = key;
@@ -727,7 +833,16 @@ impl ReadCursor {
 
     /// Copy the current row into `batch` with an explicit weight.
     pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        batch.extend_pk(self.current_key);
+        // `current_pk_bytes()` indexes `self.sources[current_entry_idx]`, which
+        // panics on an unpositioned/Empty cursor (empty `sources`). The col/blob
+        // helpers below already no-op on `!valid`; restore that contract here so
+        // the byte-form PK write does too.
+        if !self.valid {
+            return;
+        }
+        // Byte-form is correct at every width; for narrow PKs these bytes equal
+        // what `extend_pk(current_key)` would have re-encoded.
+        batch.extend_pk_bytes(self.current_pk_bytes());
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&self.current_null_word.to_le_bytes());
         let blob_ptr = self.blob_ptr();
@@ -1400,5 +1515,106 @@ mod tests {
             vec![(1u64, 2u64), (2u64, 1u64)],
             "compound PK must order by (col_A, col_B), not raw u128 (col_B, col_A)",
         );
+    }
+
+    /// 3×U64 compound PK (stride 24, wide): col_0 in PK bytes 0..8, col_1 in
+    /// 8..16, col_2 in 16..24. The u128 heap key only carries the low-16
+    /// prefix, so col_2 lives entirely past it.
+    fn make_wide_pk_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
+        let mut k = [0u8; 24];
+        k[0..8].copy_from_slice(&a.to_le_bytes());
+        k[8..16].copy_from_slice(&b.to_le_bytes());
+        k[16..24].copy_from_slice(&c.to_le_bytes());
+        k
+    }
+
+    fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
+        let schema = make_wide_pk_schema();
+        let mut bt = Batch::with_schema(schema, rows.len().max(1));
+        for (pk, w, val) in rows {
+            bt.extend_pk_bytes(pk);
+            bt.extend_weight(&w.to_le_bytes());
+            bt.extend_null_bmp(&0u64.to_le_bytes());
+            bt.extend_col(0, &val.to_le_bytes());
+            bt.count += 1;
+        }
+        bt.sorted = true;
+        bt.consolidated = true;
+        Rc::new(bt)
+    }
+
+    /// seek_bytes over a 24-byte PK whose third column lies past the 16-byte
+    /// heap prefix. Two rows share their low-16 prefix `(col_0, col_1)=(1,0)`
+    /// and differ only in `col_2`; the prefix tie-break must keep them ordered.
+    #[test]
+    fn seek_bytes_wide_pk_24_byte_stride() {
+        let schema = make_wide_pk_schema();
+        let pk_a = pk3(0, 0, 0);
+        let pk_b = pk3(1, 0, 0);
+        let pk_c = pk3(1, 0, 1); // differs from pk_b only past byte 16
+        let batch = make_wide_batch(&[(pk_a, 1, 100), (pk_b, 1, 200), (pk_c, 1, 300)]);
+
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
+        cursor.seek_bytes(&pk_b);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &pk_b[..]);
+        assert_eq!(cursor.current_weight, 1);
+
+        cursor.advance();
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &pk_c[..],
+            "the third row, distinguished only in its trailing 8 bytes, must follow");
+    }
+
+    /// Two wide PKs that collide on their low-16 prefix `(col_0, col_1)=(1,1)`,
+    /// differ only in `col_2` (100 vs 200) and carry EQUAL payload must survive
+    /// as distinct outputs with their own weights — never folded into one
+    /// summed group. Regression for the `eq_payload` PK-equality term: a
+    /// payload-only `eq_payload` would collapse them.
+    #[test]
+    fn wide_pk_prefix_collision_not_consolidated() {
+        let schema = make_wide_pk_schema();
+        let pk_x = pk3(1, 1, 100);
+        let pk_y = pk3(1, 1, 200);
+        // Two sources so the merge heap, not a pre-sorted single batch, drives
+        // the group fold.
+        let b1 = make_wide_batch(&[(pk_x, 3, 42)]);
+        let b2 = make_wide_batch(&[(pk_y, 5, 42)]); // identical payload (42)
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
+
+        let mut emitted: Vec<([u8; 24], i64)> = Vec::new();
+        while cursor.valid {
+            let mut k = [0u8; 24];
+            k.copy_from_slice(cursor.current_pk_bytes());
+            emitted.push((k, cursor.current_weight));
+            cursor.advance();
+        }
+        assert_eq!(emitted.len(), 2, "distinct wide PKs must not be folded");
+        assert_eq!(emitted[0], (pk_x, 3));
+        assert_eq!(emitted[1], (pk_y, 5));
+    }
+
+    /// `copy_current_row_into` on an invalid cursor must be a no-op; the
+    /// byte-form PK write would otherwise index empty `sources` and panic.
+    #[test]
+    fn copy_current_row_into_invalid_is_noop() {
+        let schema = make_schema_i64();
+        let cursor = create_read_cursor(&[], &[], schema);
+        assert!(!cursor.valid);
+        let mut out = Batch::with_schema(schema, 1);
+        cursor.copy_current_row_into(&mut out, 1);
+        assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
     }
 }

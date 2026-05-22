@@ -22,6 +22,8 @@ pub fn op_anti_join_delta_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> ConsolidatedBatch {
+    assert!(!schema.pk_is_wide(),
+        "op_anti_join_delta_trace: wide PK trace is unsupported (narrow u128 seek API)");
     let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
@@ -84,6 +86,8 @@ pub fn op_semi_join_delta_trace(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> ConsolidatedBatch {
+    assert!(!schema.pk_is_wide(),
+        "op_semi_join_delta_trace: wide PK trace is unsupported (narrow u128 seek API)");
     let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
@@ -212,6 +216,8 @@ pub fn op_join_delta_trace(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
+    assert!(!left_schema.pk_is_wide(),
+        "op_join_delta_trace: wide PK trace is unsupported (narrow u128 seek API)");
     let left_npc = left_schema.num_payload_cols();
     let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;
@@ -341,6 +347,8 @@ pub fn op_join_delta_trace_outer(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
+    assert!(!left_schema.pk_is_wide(),
+        "op_join_delta_trace_outer: wide PK trace is unsupported (narrow u128 seek API)");
     let left_npc = left_schema.num_payload_cols();
     let right_npc = right_schema.num_payload_cols();
     let out_npc = left_npc + right_npc;

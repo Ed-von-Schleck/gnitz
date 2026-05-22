@@ -18,6 +18,8 @@ pub fn op_distinct(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> (ConsolidatedBatch, ConsolidatedBatch) {
+    assert!(!schema.pk_is_wide(),
+        "op_distinct: wide PK trace is unsupported (narrow u128 seek API)");
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;

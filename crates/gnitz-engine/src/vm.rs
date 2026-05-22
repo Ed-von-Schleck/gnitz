@@ -766,6 +766,8 @@ pub fn execute_epoch(
             }
 
             Instr::SeekTrace { trace_reg, key_reg } => {
+                assert!(!reg!(*key_reg).schema.pk_is_wide(),
+                    "SeekTrace: wide PK trace is unsupported (narrow u128 seek API)");
                 let kb = &reg!(*key_reg).batch;
                 if kb.count > 0 {
                     let key = kb.get_pk(0);
