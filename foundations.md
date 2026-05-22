@@ -37,20 +37,8 @@ U128/UUID) or signed scalar (I8/I16/I32/I64); STRING, BLOB, and float
 (F32/F64) cannot be PK columns, and PK columns are non-nullable. Floats
 are excluded because IEEE-754 breaks the byte-equal key contract: -0.0
 and +0.0 compare unequal byte-wise but equal numerically, and NaN has no
-single canonical bit pattern. The PK
-occupies a 128-bit slot (`pk_lo`/`pk_hi`): each column's native LE bytes
-are packed tightly in PK-list order into the low `pk_stride` bytes, with
-zeros above. A lone U64 PK is `(value, 0)`; a `(U64, U64)` compound PK
-fills both halves. The packed key must fit the slot, so the total
-`pk_stride` is one of {1, 2, 4, 8, 16} bytes.
-
-**Physical stride narrowing.** Shard files, WAL blocks, and wire batches
-store only `pk_stride` bytes per PK row — the sum of the PK columns' wire
-strides (1/2/4/8 bytes for a narrow scalar, 16 for U128, or their compound
-sum). The in-engine `ArenaZSetBatch` uses a 128-bit PK slot (pk_lo + pk_hi
-u64s) regardless of schema type. Boundary code packs the PK columns' native
-LE bytes into the low `pk_stride` bytes and zeros the rest; the wire/shard
-layer truncates back to `pk_stride` bytes on emit.
+single canonical bit pattern. The PK columns are packed in PK-list order,
+each contributing its native LE bytes; the concatenation is the key.
 
 **PK ordering is type-aware.** A single unsigned PK column (U8/U16/U32/
 U64/U128/UUID) sorts by its packed u128 — `a.cmp(&b)` agrees with the
