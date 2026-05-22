@@ -226,6 +226,55 @@ mod tests {
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
 
+    #[test]
+    fn test_batch_to_schema_nullable_pk_rejected() {
+        use crate::protocol::error::ProtocolError;
+        use crate::protocol::header::META_FLAG_NULLABLE;
+        let mut batch = make_meta_batch(2);
+        // Set the NULLABLE flag on the PK column (col 0).
+        if let ColData::Fixed(ref mut v) = batch.columns[2] {
+            let f = u64::from_le_bytes(v[0..8].try_into().unwrap()) | META_FLAG_NULLABLE;
+            v[0..8].copy_from_slice(&f.to_le_bytes());
+        }
+        let err = batch_to_schema(&batch).unwrap_err();
+        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("non-nullable")));
+    }
+
+    #[test]
+    fn test_batch_to_schema_ineligible_pk_rejected() {
+        use crate::protocol::error::ProtocolError;
+        let mut batch = make_meta_batch(2);
+        // Retype the PK column (col 0) to F64 (10), which is not PK-eligible.
+        if let ColData::Fixed(ref mut v) = batch.columns[1] {
+            v[0..8].copy_from_slice(&10u64.to_le_bytes());
+        }
+        let err = batch_to_schema(&batch).unwrap_err();
+        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("PK-eligible")));
+    }
+
+    #[test]
+    fn test_batch_to_schema_too_many_pk_rejected() {
+        use crate::protocol::error::ProtocolError;
+        use crate::protocol::header::META_FLAG_IS_PK;
+        // MAX_PK_COLUMNS is 5; flag 6 columns as PK.
+        let mut batch = make_meta_batch(6);
+        if let ColData::Fixed(ref mut v) = batch.columns[2] {
+            for i in 0..6 {
+                v[i * 8..i * 8 + 8].copy_from_slice(&META_FLAG_IS_PK.to_le_bytes());
+            }
+        }
+        let err = batch_to_schema(&batch).unwrap_err();
+        assert!(matches!(err, ProtocolError::DecodeError(_)));
+    }
+
+    #[test]
+    fn test_batch_to_schema_exceeds_column_limit_rejected() {
+        use crate::protocol::error::ProtocolError;
+        let batch = make_meta_batch(MAX_COLUMNS + 1);
+        let err = batch_to_schema(&batch).unwrap_err();
+        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("column limit")));
+    }
+
     // ── schema/meta roundtrip ────────────────────────────────────────────────
 
     #[test]

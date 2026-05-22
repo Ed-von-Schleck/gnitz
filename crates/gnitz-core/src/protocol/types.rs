@@ -997,6 +997,70 @@ mod tests {
         assert!(err.contains("Fixed"));
     }
 
+    /// A two-column wide-PK schema whose `Bytes` PK buffer is not a whole
+    /// number of `stride`-byte rows must be rejected by `validate`.
+    fn wide_pk_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0, 1],
+        }
+    }
+
+    #[test]
+    fn test_validate_wide_pk_buffer_not_multiple_of_stride() {
+        let schema = wide_pk_schema();
+        // stride 16 (two U64 PK cols), buffer 20 bytes → 1.25 rows.
+        // Keep weights/nulls consistent with the truncated row count (1) so
+        // only the stride-divisibility check can trip.
+        let batch = ZSetBatch {
+            pks: PkColumn::Bytes { stride: 16, buf: vec![0u8; 20] },
+            weights: vec![1],
+            nulls: vec![0],
+            columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
+        };
+        let err = batch.validate(&schema).unwrap_err();
+        assert!(err.contains("multiple of stride"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_wide_pk_zero_stride() {
+        let schema = wide_pk_schema();
+        // A zero stride would panic the `len()`/modulo divides; validate must
+        // reject it as the malformed-input gate.
+        let batch = ZSetBatch {
+            pks: PkColumn::Bytes { stride: 0, buf: vec![0u8; 16] },
+            weights: vec![],
+            nulls: vec![],
+            columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
+        };
+        let err = batch.validate(&schema).unwrap_err();
+        assert!(err.contains("stride must be non-zero"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "column count mismatch")]
+    fn test_extend_from_column_count_mismatch_panics() {
+        let schema2 = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let schema1 = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut a = ZSetBatch::new(&schema1);
+        let b = ZSetBatch::new(&schema2);
+        a.extend_from(&b);
+    }
+
     #[test]
     fn test_validate_wrong_column_count() {
         let schema2 = Schema {

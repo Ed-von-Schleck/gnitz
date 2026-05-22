@@ -1071,6 +1071,92 @@ pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+mod german_string_tests {
+    use super::*;
+
+    fn roundtrip(s: &[u8]) {
+        let mut blob = Vec::new();
+        let st = encode_german_string(s, &mut blob);
+        assert_eq!(
+            try_decode_german_string(&st, &blob).as_deref(),
+            Some(s),
+            "try_decode roundtrip failed for len {}",
+            s.len(),
+        );
+        assert_eq!(decode_german_string(&st, &blob), s, "decode roundtrip failed for len {}", s.len());
+    }
+
+    #[test]
+    fn roundtrip_across_length_boundaries() {
+        roundtrip(b"");                            // empty
+        roundtrip(b"a");                           // 1 (prefix only)
+        roundtrip(b"abcd");                         // 4 (prefix exactly full)
+        roundtrip(b"abcde");                        // 5 (prefix + 1 suffix byte)
+        roundtrip(b"abcdefghijkl");                 // 12 == SHORT_STRING_THRESHOLD (fully inline)
+        roundtrip(b"abcdefghijklm");                // 13 (first length that spills to blob)
+        roundtrip(&vec![0xABu8; 1000]);             // long blob string
+    }
+
+    #[test]
+    fn roundtrip_long_string_after_prefix_in_blob() {
+        // A non-empty blob prefix exercises the offset (not just offset 0).
+        let mut blob = vec![0u8; 7];
+        let payload = vec![0x5Au8; 40];
+        let st = encode_german_string(&payload, &mut blob);
+        assert_eq!(try_decode_german_string(&st, &blob).as_deref(), Some(&payload[..]));
+    }
+
+    #[test]
+    fn try_decode_rejects_offset_plus_len_past_blob() {
+        // len > threshold so the decoder reads from the blob; offset 0 but the
+        // blob is shorter than len.
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&100u32.to_le_bytes());
+        st[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let blob = vec![0u8; 50];
+        assert_eq!(try_decode_german_string(&st, &blob), None);
+    }
+
+    #[test]
+    fn try_decode_rejects_offset_at_blob_end() {
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&13u32.to_le_bytes());
+        st[8..16].copy_from_slice(&50u64.to_le_bytes()); // offset == blob.len()
+        let blob = vec![0u8; 50];
+        assert_eq!(try_decode_german_string(&st, &blob), None);
+    }
+
+    #[test]
+    fn try_decode_rejects_offset_overflow() {
+        // offset + len overflows u64; checked_add must catch it rather than
+        // wrapping to a small in-bounds value.
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&20u32.to_le_bytes());
+        st[8..16].copy_from_slice(&(u64::MAX - 5).to_le_bytes());
+        let blob = vec![0u8; 50];
+        assert_eq!(try_decode_german_string(&st, &blob), None);
+    }
+
+    #[test]
+    fn try_decode_long_string_exact_fit() {
+        let payload = vec![0x33u8; 30];
+        let mut blob = Vec::new();
+        let st = encode_german_string(&payload, &mut blob);
+        assert_eq!(blob.len(), 30, "exact-fit precondition");
+        assert_eq!(try_decode_german_string(&st, &blob).as_deref(), Some(&payload[..]));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn decode_panics_on_out_of_bounds() {
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&100u32.to_le_bytes());
+        let blob = vec![0u8; 10];
+        let _ = decode_german_string(&st, &blob);
+    }
+}
+
+#[cfg(test)]
 mod hello_tests {
     use super::*;
 

@@ -1400,6 +1400,67 @@ mod tests {
         }
     }
 
+    /// A nullable PK in a wire schema must be rejected with an error rather
+    /// than abort the engine inside `SchemaDescriptor::new`. Built by flipping
+    /// the NULLABLE flag on a valid non-nullable PK (the engine builder won't
+    /// produce a nullable PK directly).
+    #[test]
+    fn decode_schema_block_rejects_nullable_pk() {
+        let cols = [SchemaColumn::new(type_code::U64, 0)];
+        let sd = SchemaDescriptor::new(&cols, &[0]);
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
+        let (fl_off, _) = wal_dir_entry(&wire, 4);
+        let f = u64::from_le_bytes(wire[fl_off..fl_off + 8].try_into().unwrap())
+            | META_FLAG_NULLABLE;
+        wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
+        // verify_checksum=false: the flags region is inside the checksummed body.
+        match decode_schema_block(&wire, false) {
+            Err("PK column must be non-nullable") => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("nullable PK must be rejected"),
+        }
+    }
+
+    /// A schema header claiming more regions than the buffer can hold must be
+    /// rejected before any `wal_dir_entry` indexes past the end.
+    #[test]
+    fn decode_schema_block_rejects_directory_overflow() {
+        let cols = [SchemaColumn::new(type_code::U64, 0)];
+        let sd = SchemaDescriptor::new(&cols, &[0]);
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        // num_regions lives in the header (outside the checksummed body), so a
+        // huge value still passes the checksum and trips the directory guard.
+        wire[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4]
+            .copy_from_slice(&100_000u32.to_le_bytes());
+        match decode_schema_block(&wire, true) {
+            Err("schema block directory overflows buffer") => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("directory overflow must be rejected"),
+        }
+    }
+
+    /// A control block whose error_msg German-string struct points past the
+    /// blob must surface an error, not panic, when peeked.
+    #[test]
+    fn peek_control_block_rejects_oob_error_msg_offset() {
+        use gnitz_wire::control as ctrl;
+        let long_msg = b"this error message exceeds twelve bytes so it spills into the blob";
+        let mut buf = vec![0u8; 512];
+        let written = encode_ctrl_block_ipc(
+            &mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"", true,
+        );
+        buf.truncate(written);
+        // Corrupt the long-string blob offset (struct bytes [8..16]) to overflow.
+        let (err_off, _) = wal_dir_entry(&buf, ctrl::REGION_ERROR_MSG);
+        buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        match peek_control_block(&buf) {
+            Err("error_msg string offset out of bounds") => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("OOB error_msg offset must be rejected"),
+        }
+    }
+
     /// Byte-level cross-crate consistency check: the engine encoder
     /// (`encode_ctrl_block_ipc`) and the client encoder
     /// (`gnitz_core::protocol::message::encode_control_block`) must produce
