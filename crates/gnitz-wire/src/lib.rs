@@ -1032,12 +1032,12 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     st
 }
 
-/// Decode a 16-byte German String struct into raw bytes.
-/// `blob` is the shared blob arena.
-pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
+/// Decode a 16-byte German String struct into raw bytes, or `None` if a
+/// long string's blob offset/length overruns `blob`.
+pub fn try_decode_german_string(st: &[u8; 16], blob: &[u8]) -> Option<Vec<u8>> {
     let len = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
     if len == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     if len <= SHORT_STRING_THRESHOLD {
         let mut out = Vec::with_capacity(len);
@@ -1046,11 +1046,28 @@ pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
         if len > 4 {
             out.extend_from_slice(&st[8..8 + (len - 4)]);
         }
-        out
+        Some(out)
     } else {
-        let off = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
-        blob[off..off + len].to_vec()
+        // Resolve the blob slice entirely in u64 space before narrowing to
+        // usize: a 64-bit wire offset would silently truncate under `as usize`
+        // on a 32-bit target, and the truncated value could pass the bounds
+        // check while pointing at the wrong range. Once `end <= blob.len()`
+        // holds, both `off` and `end` fit in usize losslessly.
+        let off = u64::from_le_bytes(st[8..16].try_into().unwrap());
+        let end = off.checked_add(len as u64)?;
+        if end > blob.len() as u64 {
+            return None;
+        }
+        Some(blob[off as usize..end as usize].to_vec())
     }
+}
+
+/// Decode a 16-byte German String struct into raw bytes.
+/// `blob` is the shared blob arena. Panics if a long string's offset/length
+/// overruns `blob`; use `try_decode_german_string` on untrusted input.
+pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
+    try_decode_german_string(st, blob)
+        .expect("decode_german_string: blob offset/length out of bounds")
 }
 
 #[cfg(test)]

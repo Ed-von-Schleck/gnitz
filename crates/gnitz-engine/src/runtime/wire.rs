@@ -1,6 +1,6 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, encode_german_string, decode_german_string};
+use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, encode_german_string, try_decode_german_string};
 use crate::storage::{Batch, MemBatch};
 use crate::util::align8;
 
@@ -176,7 +176,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         let off16 = i * 16;
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
-        names.push(decode_german_string(&st, &batch.blob));
+        names.push(crate::schema::decode_german_string(&st, &batch.blob));
         let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
         *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
@@ -800,7 +800,8 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[err_off..err_off + 16]);
-        decode_german_string(&st, blob)
+        try_decode_german_string(&st, blob)
+            .ok_or("error_msg string offset out of bounds")?
     };
 
     let seek_pk_extra = if seek_extra_is_null {
@@ -812,7 +813,8 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[sx_off..sx_off + 16]);
-        decode_german_string(&st, blob)
+        try_decode_german_string(&st, blob)
+            .ok_or("seek_pk_extra string offset out of bounds")?
     };
 
     let block_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
@@ -864,6 +866,13 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     if count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
     if num_regions < 5 { return Err("schema block region count mismatch"); }
 
+    // The directory table is `num_regions` × 8 bytes immediately after the
+    // header; every `wal_dir_entry` call below indexes into it. Reject any
+    // frame too short to hold it before reading a single entry.
+    if HEADER.saturating_add(num_regions.saturating_mul(8)) > data.len() {
+        return Err("schema block directory overflows buffer");
+    }
+
     // Region 0 is the PK (col_idx). Validate that col_idx values are
     // exactly [0, 1, ..., count-1] — every malformed-schema test relies
     // on this ordering, and downstream consumers index columns by the
@@ -908,6 +917,16 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
         let is_pk       = (fl & META_FLAG_IS_PK)       != 0;
         *col = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
         if is_pk {
+            // Reject malformed PK columns here rather than letting them reach
+            // `SchemaDescriptor::new`, whose `assert!`s would abort the engine
+            // process on a nullable/STRING/BLOB PK and which silently accepts
+            // float PKs that `is_pk_eligible` (and the client decoder) reject.
+            if is_nullable {
+                return Err("PK column must be non-nullable");
+            }
+            if !gnitz_wire::is_pk_eligible(tc) {
+                return Err("PK column type not PK-eligible");
+            }
             if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
@@ -1172,6 +1191,214 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::collection::vec;
+    use proptest::test_runner::TestCaseError;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use gnitz_wire::{is_pk_eligible, MAX_PK_COLUMNS};
+
+    fn arb_type_code() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            Just(type_code::U8),  Just(type_code::I8),
+            Just(type_code::U16), Just(type_code::I16),
+            Just(type_code::U32), Just(type_code::I32),
+            Just(type_code::F32), Just(type_code::U64),
+            Just(type_code::I64), Just(type_code::F64),
+            Just(type_code::U128), Just(type_code::UUID),
+            Just(type_code::STRING), Just(type_code::BLOB),
+        ]
+    }
+
+    /// `proptest!` requires the generated value to be `Debug` so it can print
+    /// failing cases. `SchemaDescriptor` deliberately has no `Debug` impl, so
+    /// wrap it in a newtype whose `Debug` prints only the load-bearing fields
+    /// (the same ones `assert_descriptor_eq` compares).
+    #[derive(Clone)]
+    struct ArbSchema(SchemaDescriptor);
+
+    impl std::fmt::Debug for ArbSchema {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let sd = &self.0;
+            let types: Vec<u8> = (0..sd.num_columns()).map(|i| sd.columns[i].type_code).collect();
+            let nullable: Vec<u8> = (0..sd.num_columns()).map(|i| sd.columns[i].nullable).collect();
+            f.debug_struct("ArbSchema")
+                .field("pk_indices", &sd.pk_indices())
+                .field("types", &types)
+                .field("nullable", &nullable)
+                .finish()
+        }
+    }
+
+    fn arb_schema() -> impl Strategy<Value = ArbSchema> {
+        // n_cols ≥ 1, so `1..=n_cols.min(MAX_PK_COLUMNS)` is never empty.
+        (1usize..=8).prop_flat_map(|n_cols| {
+            (
+                Just(n_cols),
+                vec(arb_type_code(), n_cols),     // column types
+                vec(any::<bool>(), n_cols),       // nullability
+                vec(any::<u32>(), n_cols),        // permutation weights
+                1usize..=n_cols.min(MAX_PK_COLUMNS), // PK arity
+            )
+        })
+        .prop_map(|(n_cols, types, nullables, weights, k)| {
+            // PK index set = first `k` columns ordered by their weight.
+            // The order is the "declared" PK order the encoder must preserve.
+            let mut idx: Vec<u32> = (0..n_cols as u32).collect();
+            idx.sort_by_key(|&i| weights[i as usize]);
+            let pk_indices: Vec<u32> = idx[..k].to_vec();
+
+            let cols: Vec<SchemaColumn> = (0..n_cols)
+                .map(|i| {
+                    let is_pk = pk_indices.contains(&(i as u32));
+                    // PK columns must be PK-eligible and non-nullable; remap
+                    // ineligible draws to U64 so `new()` accepts the schema.
+                    let tc = if is_pk && !is_pk_eligible(types[i]) {
+                        type_code::U64
+                    } else {
+                        types[i]
+                    };
+                    let nullable = if is_pk { 0 } else { nullables[i] as u8 };
+                    SchemaColumn::new(tc, nullable)
+                })
+                .collect();
+
+            ArbSchema(SchemaDescriptor::new(&cols, &pk_indices))
+        })
+    }
+
+    fn assert_descriptor_eq(
+        a: &SchemaDescriptor, b: &SchemaDescriptor,
+    ) -> Result<(), TestCaseError> {
+        prop_assert_eq!(a.pk_indices(), b.pk_indices(),
+            "pk_indices (declared order) changed on round-trip");
+        prop_assert_eq!(a.num_columns(), b.num_columns(),
+            "column count changed on round-trip");
+        for i in 0..a.num_columns() {
+            prop_assert_eq!(a.columns[i].type_code, b.columns[i].type_code,
+                "type_code at col {} changed", i);
+            prop_assert_eq!(a.columns[i].nullable, b.columns[i].nullable,
+                "nullable at col {} changed", i);
+        }
+        Ok(())
+    }
+
+    /// SchemaDescriptor → owned client Schema, with synthetic `c{i}` names.
+    fn descriptor_to_client_schema(
+        sd: &SchemaDescriptor,
+    ) -> gnitz_core::protocol::types::Schema {
+        use gnitz_core::protocol::types::{Schema, ColumnDef, TypeCode};
+        let columns = (0..sd.num_columns())
+            .map(|i| {
+                let col = &sd.columns[i];
+                ColumnDef {
+                    name: format!("c{i}"),
+                    // arb_schema only emits valid codes, so unwrap is total.
+                    type_code: TypeCode::try_from_u8(col.type_code).unwrap(),
+                    is_nullable: col.nullable != 0,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                }
+            })
+            .collect();
+        let pk_cols = sd.pk_indices().iter().map(|&i| i as usize).collect();
+        Schema { columns, pk_cols }
+    }
+
+    proptest! {
+        /// Engine encoder → engine decoder.
+        #[test]
+        fn schema_roundtrip_engine_codec(original in arb_schema()) {
+            let original = &original.0;
+            let names: Vec<Vec<u8>> = (0..original.num_columns())
+                .map(|i| format!("c{i}").into_bytes())
+                .collect();
+            let (refs, n) = col_names_as_refs(&names);
+            let wire = build_schema_wire_block(original, &refs[..n], 0);
+            let decoded = decode_schema_block(&wire, true)
+                .expect("decode must succeed for any valid schema");
+            assert_descriptor_eq(original, &decoded)?;
+        }
+
+        /// Client encoder → client decoder.
+        #[test]
+        fn schema_roundtrip_client_codec(original in arb_schema()) {
+            use gnitz_core::protocol::codec::{schema_to_batch, batch_to_schema};
+            use gnitz_core::protocol::types::meta_schema;
+            use gnitz_core::protocol::wal_block::{
+                encode_wal_block, decode_wal_block, VerifyChecksum,
+            };
+
+            let original = &original.0;
+            let client = descriptor_to_client_schema(original);
+            let ms = meta_schema();
+            let batch = schema_to_batch(&client);
+            let encoded = encode_wal_block(ms, 0, &batch);
+            let (decoded_batch, _, _) =
+                decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
+            let reconstructed = batch_to_schema(&decoded_batch).unwrap();
+            prop_assert_eq!(client, reconstructed);
+        }
+
+        /// Engine encoder → client decoder.
+        #[test]
+        fn schema_cross_codec_engine_to_client(original in arb_schema()) {
+            use gnitz_core::protocol::codec::batch_to_schema;
+            use gnitz_core::protocol::types::meta_schema;
+            use gnitz_core::protocol::wal_block::{decode_wal_block, VerifyChecksum};
+
+            let original = &original.0;
+            let names: Vec<Vec<u8>> = (0..original.num_columns())
+                .map(|i| format!("c{i}").into_bytes())
+                .collect();
+            let (refs, n) = col_names_as_refs(&names);
+            let wire = build_schema_wire_block(original, &refs[..n], 0);
+
+            let ms = meta_schema();
+            let (decoded_batch, _, _) =
+                decode_wal_block(&wire, ms, VerifyChecksum::Yes)
+                    .expect("client failed to decode engine-encoded WAL block");
+            let client_schema = batch_to_schema(&decoded_batch)
+                .expect("client failed to parse meta batch");
+
+            prop_assert_eq!(client_schema, descriptor_to_client_schema(original));
+        }
+
+        /// Client encoder → engine decoder.
+        #[test]
+        fn schema_cross_codec_client_to_engine(original in arb_schema()) {
+            use gnitz_core::protocol::codec::schema_to_batch;
+            use gnitz_core::protocol::types::meta_schema;
+            use gnitz_core::protocol::wal_block::encode_wal_block;
+
+            let original = &original.0;
+            let client = descriptor_to_client_schema(original);
+            let ms = meta_schema();
+            let batch = schema_to_batch(&client);
+            let wire = encode_wal_block(ms, 0, &batch);
+
+            let decoded = decode_schema_block(&wire, true)
+                .expect("engine failed to decode client-encoded WAL block");
+            assert_descriptor_eq(original, &decoded)?;
+        }
+    }
+
+    /// A wire schema declaring a float PK must be rejected with an error, not
+    /// abort the engine. `SchemaDescriptor::new` only asserts STRING/BLOB and
+    /// nullable PKs, so a float PK would otherwise slip through and silently
+    /// violate the byte-equal key contract.
+    #[test]
+    fn decode_schema_block_rejects_float_pk() {
+        // F64 PK is constructible via `new` (it doesn't assert floats), so we
+        // can build the wire block and confirm the decoder gates it.
+        let cols = [SchemaColumn::new(type_code::F64, 0)];
+        let sd = SchemaDescriptor::new(&cols, &[0]);
+        let wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        match decode_schema_block(&wire, true) {
+            Err("PK column type not PK-eligible") => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("float PK must be rejected"),
+        }
+    }
 
     /// Byte-level cross-crate consistency check: the engine encoder
     /// (`encode_ctrl_block_ipc`) and the client encoder

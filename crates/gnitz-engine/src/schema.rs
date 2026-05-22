@@ -506,6 +506,7 @@ pub(crate) fn relocate_german_string_vec(
 
 pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::decode_german_string;
+pub(crate) use gnitz_wire::try_decode_german_string;
 
 /// Returns bytes [4..end] of a German string as a contiguous slice.
 /// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].

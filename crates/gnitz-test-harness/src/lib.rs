@@ -110,7 +110,6 @@ impl Drop for ServerHandle {
             if let Some(dir) = tmpdir {
                 eprintln!("server artifacts preserved at: {}", dir.keep().display());
             }
-            return;
         }
         // Clean pass: dropping the TempDir removes the directory.
     }

@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use super::error::ProtocolError;
 
 pub use gnitz_wire::TypeCode;
-pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
+pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
 /// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
@@ -511,6 +511,11 @@ impl ZSetBatch {
 
     /// Append all rows from `other` into `self`. Panics if column layouts differ.
     pub fn extend_from(&mut self, other: &ZSetBatch) {
+        assert_eq!(
+            self.columns.len(), other.columns.len(),
+            "extend_from: column count mismatch (self {}, other {})",
+            self.columns.len(), other.columns.len(),
+        );
         match (&mut self.pks, &other.pks) {
             (PkColumn::U64s(a), PkColumn::U64s(b)) => a.extend_from_slice(b),
             (PkColumn::U128s(a), PkColumn::U128s(b)) => a.extend_from_slice(b),
@@ -556,6 +561,17 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
+        if let PkColumn::Bytes { stride, buf } = &self.pks {
+            if *stride == 0 {
+                return Err("wide PK stride must be non-zero".into());
+            }
+            if buf.len() % (*stride as usize) != 0 {
+                return Err(format!(
+                    "wide PK buffer length {} is not a multiple of stride {}",
+                    buf.len(), stride
+                ));
+            }
+        }
         let n = self.pks.len();
         if self.weights.len() != n {
             return Err(format!("weights length {} != row count {}", self.weights.len(), n));

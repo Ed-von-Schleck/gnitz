@@ -3,7 +3,10 @@ use super::header::{
     META_FLAG_NULLABLE, META_FLAG_IS_PK,
     META_FLAG_PK_POS_SHIFT, META_FLAG_PK_POS_MASK,
 };
-use super::types::{ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_from_u64};
+use super::types::{
+    ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_from_u64,
+    MAX_COLUMNS,
+};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
@@ -55,6 +58,9 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
 /// Mirrors Python's `batch_to_schema`.
 pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     let count = batch.len();
+    if count > MAX_COLUMNS {
+        return Err(ProtocolError::DecodeError("schema exceeds column limit".into()));
+    }
     let mut columns: Vec<ColumnDef> = Vec::with_capacity(count);
     // Collect (position, column_idx) so we can sort by position before
     // building `pk_cols`. Single-PK schemas all carry position 0 and the
@@ -105,11 +111,21 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         columns.push(ColumnDef { name, type_code: tc, is_nullable, fk_table_id: 0, fk_col_idx: 0 });
     }
 
-    if pk_pairs.is_empty() {
-        return Err(ProtocolError::DecodeError("no PK column found in schema batch".into()));
-    }
     pk_pairs.sort_by_key(|(p, _)| *p);
     let pk_cols: Vec<usize> = pk_pairs.into_iter().map(|(_, i)| i).collect();
+
+    Schema::validate_pk_cols(&pk_cols, columns.len())
+        .map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    // PK columns must additionally be non-nullable and PK-eligible — the same
+    // invariants the engine's SchemaDescriptor::new hard-asserts.
+    for &pk in &pk_cols {
+        if columns[pk].is_nullable {
+            return Err(ProtocolError::DecodeError("PK column must be non-nullable".into()));
+        }
+        if !columns[pk].type_code.is_pk_eligible() {
+            return Err(ProtocolError::DecodeError("PK column type not PK-eligible".into()));
+        }
+    }
 
     Ok(Schema { columns, pk_cols })
 }
