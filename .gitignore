@@ -176,3 +176,5 @@ crates/doc/
 
 # Compiled C examples
 crates/gnitz-capi/examples/c_test
+
+plans/
