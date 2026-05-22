@@ -33,8 +33,11 @@ weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 
 **Compound PKs (1–4 columns).** A table's primary key is an ordered list
 of 1–4 columns. Each PK column is an unsigned scalar (U8/U16/U32/U64/
-U128/UUID), signed scalar (I8/I16/I32/I64), or float (F32/F64); STRING
-and BLOB cannot be PK columns, and PK columns are non-nullable. The PK
+U128/UUID) or signed scalar (I8/I16/I32/I64); STRING, BLOB, and float
+(F32/F64) cannot be PK columns, and PK columns are non-nullable. Floats
+are excluded because IEEE-754 breaks the byte-equal key contract: -0.0
+and +0.0 compare unequal byte-wise but equal numerically, and NaN has no
+single canonical bit pattern. The PK
 occupies a 128-bit slot (`pk_lo`/`pk_hi`): each column's native LE bytes
 are packed tightly in PK-list order into the low `pk_stride` bytes, with
 zeros above. A lone U64 PK is `(value, 0)`; a `(U64, U64)` compound PK
@@ -54,9 +57,9 @@ U64/U128/UUID) sorts by its packed u128 — `a.cmp(&b)` agrees with the
 column's native unsigned order (the "fast" comparator arm, selected by
 `SchemaDescriptor::pk_is_fast`, which holds only for a single unsigned
 column). Everything else takes the "slow" comparator
-(`storage::make_slow_pk_cmp`): a single signed (I8/I16/I32/I64) or float
-(F32/F64) column interprets the low `pk_stride` bytes as its native type
-and applies signed or `total_cmp` ordering; a compound PK walks its
+(`storage::make_slow_pk_cmp`): a single signed (I8/I16/I32/I64) column
+interprets the low `pk_stride` bytes as its native type and applies
+signed ordering; a compound PK walks its
 columns in PK-list order via the column-aware `compare_pk_bytes`. Raw
 u128 ordering of `-1_i64`'s packed bytes (`0xFFFF…`) would sort it AFTER
 `+1`, inverting the signed order — and the column boundaries of a compound
@@ -302,10 +305,10 @@ fields in its columnar layout regardless of schema type. Boundary code
 (WAL encode/decode, shard read/write) packs each PK column's native LE
 bytes, in PK-list order, into the low `pk_stride` bytes of the 128-bit
 slot and truncates back to
-`pk_stride` on emit. Signed integers and floats use their native bit
-patterns (`(v as iN as uN) as u128`, `to_bits()`), not sign-extension —
-the type-aware comparator (§1 "PK ordering is type-aware") restores the
-ordering semantics.
+`pk_stride` on emit. Signed integers use their native bit pattern
+(`(v as iN as uN) as u128`), not sign-extension — the type-aware
+comparator (§1 "PK ordering is type-aware") restores the ordering
+semantics.
 
 PK columns are not included in the payload region pointers.
 

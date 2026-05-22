@@ -230,7 +230,7 @@ impl SchemaDescriptor {
 
     /// True iff the PK is a single unsigned column — selects the fast
     /// `a_key.cmp(&b_key)` arm (packed u128 order == native unsigned order).
-    /// Signed integers and floats need the `make_slow_pk_cmp` arm; compound
+    /// Signed integers need the `make_slow_pk_cmp` arm; compound
     /// PKs route through the column-walk byte comparator.
     #[inline]
     pub const fn pk_is_fast(&self) -> bool {

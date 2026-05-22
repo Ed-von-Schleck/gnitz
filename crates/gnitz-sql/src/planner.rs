@@ -238,14 +238,14 @@ fn execute_create_table(
     }
     for &i in &pk_indices {
         let tc = cols[i as usize].type_code;
-        // String/Blob are bulk-copied without blob relocation in the PK
-        // region — the schema layer asserts on them, and `validate_pk_cols`
-        // on the server would reject them too. Catching it here produces a
-        // clearer error that names the offending column.
-        if matches!(tc, TypeCode::String | TypeCode::Blob) {
+        // Pre-check before the DDL reaches the engine (which re-validates via
+        // `validate_pk_cols`); naming the offending column here gives a clearer
+        // error. Same eligibility rule, shared via `TypeCode::is_pk_eligible`.
+        if !tc.is_pk_eligible() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "PRIMARY KEY column '{}' of type {:?} is not supported \
-                 (String/Blob cannot be PK columns)",
+                 (PK must be a fixed-width integer, U128, or UUID column; \
+                 String, Blob, and float columns cannot be PK)",
                 cols[i as usize].name, tc,
             )));
         }
@@ -1034,9 +1034,9 @@ fn execute_create_group_by_view(
     //    The two natural-PK cases must mirror the compiler's
     //    `build_reduce_output_schema` decision (compiler.rs:695-697):
     //      (a) `group_set_eq_pk`: group cols are a permutation of the source
-    //          PK cols, regardless of PK type — even native I64/F64.
+    //          PK cols, regardless of PK type — even native I64.
     //      (b) `is_single_col_natural_pk`: a single non-nullable U64/U128/UUID
-    //          group col. Narrow unsigned/signed/floats still take the
+    //          group col. Narrow unsigned/signed group cols still take the
     //          synthetic path because the engine helper rejects them.
     //    A divergence between planner and compiler here scrambles the view's
     //    output column positions silently.

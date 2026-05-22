@@ -118,11 +118,35 @@ impl TypeCode {
         matches!(self, TypeCode::F32 | TypeCode::F64)
     }
 
+    /// Whether this type may be a PRIMARY KEY column. PK regions are compared
+    /// as raw bytes, which is correct only for integer scalars: String/Blob
+    /// carry out-of-line blob heaps that cannot be bulk-copied in the PK
+    /// region, and IEEE-754 floats break the byte-equal contract (-0.0/+0.0
+    /// compare unequal byte-wise but equal numerically, and NaN bit patterns
+    /// have no single canonical form). Allow-list (not deny-list) so new
+    /// variants are PK-ineligible until explicitly vetted.
+    pub const fn is_pk_eligible(&self) -> bool {
+        matches!(
+            self,
+            TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
+                | TypeCode::U128 | TypeCode::UUID
+                | TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64,
+        )
+    }
+
     /// Wire stride in bytes. Alias for `stride()` returning `usize`.
     #[inline]
     pub fn wire_stride(self) -> usize {
         self.stride() as usize
     }
+}
+
+/// Whether a raw wire type code may be a PRIMARY KEY column. u8-based
+/// counterpart to [`TypeCode::is_pk_eligible`] for callers holding a raw
+/// `type_code` (mirrors the free `wire_stride`). Unknown codes are ineligible.
+#[inline]
+pub fn is_pk_eligible(tc: u8) -> bool {
+    TypeCode::try_from_u8(tc).is_some_and(|t| t.is_pk_eligible())
 }
 
 /// Wire stride (byte width) for a column type code.

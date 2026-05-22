@@ -375,7 +375,7 @@ impl<'a> DirectWriter<'a> {
 /// Pack a PK region's low 16 bytes into a `u128`, LE bytes in the low
 /// positions. For `len ≤ 16` this is an exact, zero-extended encoding of
 /// the whole region; truncating the packed key back to the native type
-/// (`as i32`, `from_bits`, …) recovers the exact original value, which is
+/// (`as i32`, …) recovers the exact original value, which is
 /// why single-column narrow PKs never enter the `compare_pk_bytes`
 /// column-walk regardless of signedness. For `len > 16` (wide compound
 /// region) the result is the deterministic low-16-byte LE *prefix* — not a
@@ -429,7 +429,7 @@ macro_rules! dispatch_pk_row {
     }};
 }
 
-/// The slow ordered PK comparator for single-column signed/float PKs and for
+/// The slow ordered PK comparator for single-column signed PKs and for
 /// compound PKs. All loop-invariants are extracted as owned `Copy` scalars
 /// (or the `Copy` `SchemaDescriptor`) *before* the `move` closure so it stays
 /// `Copy` and captures no slice reference (a captured `pk_indices()` slice
@@ -458,8 +458,6 @@ pub(crate) fn make_slow_pk_cmp(schema: &SchemaDescriptor) -> impl Fn(u128, u128)
                 type_code::I32 => (a as i32).cmp(&(b as i32)),
                 type_code::I16 => (a as i16).cmp(&(b as i16)),
                 type_code::I8 => (a as i8).cmp(&(b as i8)),
-                type_code::F64 => f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64)),
-                type_code::F32 => f32::from_bits(a as u32).total_cmp(&f32::from_bits(b as u32)),
                 // Single-col unsigned is routed to the `fast` closure by
                 // `pk_is_fast`, so it never reaches here; this arm stays a
                 // correct lossless fallback for any unsigned that does.
@@ -2217,7 +2215,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Narrow-region merge dispatch: signed / narrow-unsigned / float / compound
+    // Narrow-region merge dispatch: signed / narrow-unsigned / compound
     // -----------------------------------------------------------------------
 
     fn make_schema_single(pk_tc: u8) -> SchemaDescriptor {
@@ -2384,51 +2382,6 @@ mod tests {
                 (0..n).map(|idx| (le(idx), 1, idx as i64)).collect();
             let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
             assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} fold");
-        }
-    }
-
-    #[test]
-    fn float_single_pk_ordering() {
-        // total_cmp order: -2.5 < -0.0 < 0.0 < 1.0 < 3.5
-        // F64 (stride 8)
-        {
-            let schema = make_schema_single(type_code::F64);
-            assert_eq!(schema.pk_stride(), 8);
-            let vals: Vec<f64> = vec![-2.5, -0.0, 0.0, 1.0, 3.5];
-            let n = vals.len();
-            let order = [3usize, 0, 4, 2, 1];
-            let expect: Vec<i64> = (0..n as i64).collect();
-            let mk = |idx: usize| (vals[idx].to_bits().to_le_bytes()[..8].to_vec(), 1i64, idx as i64);
-            let batches: Vec<Batch> =
-                order.iter().map(|&i| make_batch_bytes(&schema, &[mk(i)])).collect();
-            let m = run_merge(&batches, &schema);
-            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 merge");
-            let uns: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&i| mk(i)).collect();
-            let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
-            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 consolidate");
-            let srt: Vec<(Vec<u8>, i64, i64)> = (0..n).map(mk).collect();
-            let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
-            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F64 fold");
-        }
-        // F32 (stride 4)
-        {
-            let schema = make_schema_single(type_code::F32);
-            assert_eq!(schema.pk_stride(), 4);
-            let vals: Vec<f32> = vec![-2.5, -0.0, 0.0, 1.0, 3.5];
-            let n = vals.len();
-            let order = [1usize, 4, 0, 3, 2];
-            let expect: Vec<i64> = (0..n as i64).collect();
-            let mk = |idx: usize| (vals[idx].to_bits().to_le_bytes()[..4].to_vec(), 1i64, idx as i64);
-            let batches: Vec<Batch> =
-                order.iter().map(|&i| make_batch_bytes(&schema, &[mk(i)])).collect();
-            let m = run_merge(&batches, &schema);
-            assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 merge");
-            let uns: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&i| mk(i)).collect();
-            let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
-            assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 consolidate");
-            let srt: Vec<(Vec<u8>, i64, i64)> = (0..n).map(mk).collect();
-            let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
-            assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "F32 fold");
         }
     }
 

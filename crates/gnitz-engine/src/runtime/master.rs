@@ -1802,8 +1802,6 @@ fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
             crate::schema::type_code::I32  => format!("{}", v as u64 as i32),
             crate::schema::type_code::I16  => format!("{}", v as u64 as i16),
             crate::schema::type_code::I8   => format!("{}", v as u64 as i8),
-            crate::schema::type_code::F32  => format!("{}", f32::from_bits(v as u32)),
-            crate::schema::type_code::F64  => format!("{}", f64::from_bits(v as u64)),
             _ => format!("{}", v as u64),
         };
         parts.push(s);
@@ -2026,25 +2024,5 @@ mod unique_filter_tests {
         let sa = format_pk_value(uuid_a, &schema);
         let sb = format_pk_value(uuid_b, &schema);
         assert_ne!(sa, sb, "UUIDs differing in high bits must format differently");
-    }
-
-    #[test]
-    fn format_pk_value_f32_uses_bitcast_not_truncation() {
-        // A non-trivial f32 reinterpreted via `as u64` formats as a large
-        // integer (the IEEE-754 bit pattern) — the bit-cast path must
-        // produce a human-readable float instead.
-        let v: f32 = 1.5_f32;
-        let bits = v.to_bits() as u128;
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::F32, 0)], &[0]);
-        let s = format_pk_value(bits, &schema);
-        assert_eq!(s, format!("{}", v));
-    }
-
-    #[test]
-    fn format_pk_value_f64_uses_bitcast_not_truncation() {
-        let bits = (-2.5_f64).to_bits() as u128;
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::F64, 0)], &[0]);
-        let s = format_pk_value(bits, &schema);
-        assert_eq!(s, format!("{}", -2.5_f64));
     }
 }

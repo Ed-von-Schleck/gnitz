@@ -149,7 +149,7 @@ impl Schema {
     /// True iff `cols` is a single non-nullable column whose type permits
     /// using the source column directly as the reduce output PK (vs. a
     /// synthetic U128). Mirrors `engine::ops::is_single_col_natural_pk`;
-    /// narrow signed/unsigned and floats stay on the synthetic path.
+    /// narrow signed/unsigned cols stay on the synthetic path.
     #[inline]
     pub fn is_single_col_natural_pk(&self, cols: &[usize]) -> bool {
         cols.len() == 1

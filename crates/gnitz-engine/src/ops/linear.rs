@@ -433,7 +433,7 @@ impl PkPromoter {
             type_code::STRING => PromoteKind::String { pi },
             // All ≤8-byte integer and float types: zero-extend the little-
             // endian bytes to u128. Float bit patterns are intentionally
-            // re-used as-is — identical floats hash to identical PKs.
+            // re-used as-is — identical floats map to identical group keys.
             _ => PromoteKind::Narrow { pi, cs: crate::schema::type_size(tc) as usize },
         };
         PkPromoter { kind }

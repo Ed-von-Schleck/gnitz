@@ -161,12 +161,6 @@ pub fn compare_pk_bytes(
                 let vb = read_signed(&b[off..], cs);
                 va.cmp(&vb)
             }
-            // Mirror `compare_rows` float ordering so PK and payload
-            // float ordering stay identical (total ordering, NaN-safe).
-            TYPE_F64 => f64::from_le_bytes(a[off..off + 8].try_into().unwrap())
-                .total_cmp(&f64::from_le_bytes(b[off..off + 8].try_into().unwrap())),
-            TYPE_F32 => f32::from_le_bytes(a[off..off + 4].try_into().unwrap())
-                .total_cmp(&f32::from_le_bytes(b[off..off + 4].try_into().unwrap())),
             other => panic!(
                 "compare_pk_bytes: type_code {other} is not PK-eligible",
             ),

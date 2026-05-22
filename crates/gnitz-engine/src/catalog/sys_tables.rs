@@ -79,16 +79,12 @@ pub(super) fn validate_pk_cols(
             return Err("Primary Key index out of bounds".into());
         }
         let cd = &col_defs[c as usize];
-        if !matches!(
-            cd.type_code,
-            type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
-                | type_code::U128 | type_code::UUID
-                | type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64
-                | type_code::F32 | type_code::F64,
-        ) {
+        if !gnitz_wire::is_pk_eligible(cd.type_code) {
             return Err(format!(
-                "Primary Key must be a numeric scalar type (signed/unsigned \
-                 integer, float, U128, or UUID), got type_code={}", cd.type_code));
+                "Primary Key must be a fixed-width integer, U128, or UUID column; \
+                 got type_code={} (String, Blob, and float columns cannot be PK)",
+                cd.type_code
+            ));
         }
         if cd.is_nullable {
             return Err("Primary Key column must not be nullable".into());

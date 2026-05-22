@@ -376,11 +376,12 @@ fn test_hook_table_register_rejects_malformed_pk() {
     let dir = temp_dir("pk_reject");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable].
+    // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable, c3 F32 non-null].
     let col_defs = vec![
         u64_col_def("c0"),
         str_col_def("c1"),
         ColumnDef { name: "c2".into(), type_code: type_code::U64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "c3".into(), type_code: type_code::F32, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = engine.allocate_table_id();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
@@ -403,8 +404,10 @@ fn test_hook_table_register_rejects_malformed_pk() {
     #[allow(clippy::identity_op)]
     let packed = PK_LIST_PACKED_FLAG | 2 | (0u64 << 4) | (0u64 << 11);
     assert_rejects(packed, "duplicate column");
-    // Non-numeric PK column (c1 is STRING).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be a numeric scalar type");
+    // Non-integer PK column (c1 is STRING).
+    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be a fixed-width integer");
+    // Float PK column (c3 is F32) — floats break the byte-equal PK contract.
+    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (3 << 4), "must be a fixed-width integer");
     // Nullable PK column (c2 is nullable).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (2 << 4), "must not be nullable");
 

@@ -1371,8 +1371,8 @@ class TestTypeErrors:
 
 class TestPKNativeTypes:
     """The planner preserves each PK column's declared type. Every PK-eligible
-    numeric scalar — signed integer, unsigned integer, float, U128/UUID — is
-    accepted as a primary key and stored at its native stride."""
+    scalar — signed integer, unsigned integer, U128/UUID — is accepted as a
+    primary key and stored at its native stride."""
 
     def _create_table_with_pk(self, client, sn, pk_sql):
         client.create_schema(sn)

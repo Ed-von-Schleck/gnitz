@@ -356,7 +356,7 @@ pub struct ReadCursor {
     is_fast: bool,
     /// PK comparator for the merge. `None` is the fast path: a single-column
     /// unsigned narrow PK whose raw `u128` key compare already equals the
-    /// storage sort order. `Some` (compound PK, or single-column signed/float)
+    /// storage sort order. `Some` (compound PK, or single-column signed)
     /// holds [`make_slow_pk_cmp`] — the same column-aware comparator the
     /// storage layer (`merge.rs`) sorts each source run by. Using the `u128`
     /// order for those would desync the merge from the on-disk order: a
@@ -629,7 +629,7 @@ impl ReadCursor {
 
         // Same PK-primary-then-payload order the storage layer sorted each
         // source by; the prebuilt `pk_cmp` is `Some` only when the u128 fast
-        // path is unsound (compound or signed/float single-column PK).
+        // path is unsound (compound or signed single-column PK).
         let pk_cmp = self.pk_cmp.as_deref();
         let less = |a: &HeapNode, b: &HeapNode| -> bool {
             let pk_ord = match pk_cmp {

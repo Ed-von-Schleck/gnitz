@@ -447,9 +447,7 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
 /// u128 holds the on-disk LE bytes in its low `pk_stride` bytes: signed
 /// types pass through `(v as iN as uN) as u128` so the low `stride` bytes
 /// match the column's native LE encoding (e.g. `-1_i8` → `0xFF`, not
-/// `0xFFFF_FFFF_FFFF_FFFF`). Floats use `f{32,64}::to_bits()` so
-/// `total_cmp` ordering at the comparator agrees with the partition rule
-/// here.
+/// `0xFFFF_FFFF_FFFF_FFFF`).
 ///
 /// `negated` is true when the literal sits under `Expr::UnaryOp(Minus, _)`;
 /// the prepend-`-`-then-parse rule accepts `i64::MIN`'s digit string
@@ -472,8 +470,6 @@ fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u
                 _             => (v as u64) as u128,
             })
         }
-        TypeCode::F64 => Some(s.parse::<f64>().ok()?.to_bits() as u128),
-        TypeCode::F32 => Some(s.parse::<f32>().ok()?.to_bits() as u128),
         TypeCode::U128 | TypeCode::UUID => {
             if negated { return None; }
             s.parse::<u128>().ok()
@@ -903,10 +899,10 @@ fn apply_residual_filter(
     Ok((schema_opt, Some(new_batch)))
 }
 
-enum ColumnValue { Int(i64), #[allow(dead_code)] Float(f64), Str(String), Null }
+enum ColumnValue { Int(i64), Str(String), Null }
 
-/// Decode the native LE bytes of a PK column into an i64. F32/F64/U128/UUID
-/// don't fit through the i64 return shape and are rejected.
+/// Decode the native LE bytes of a PK column into an i64. U128/UUID don't fit
+/// through the i64 return shape and are rejected.
 fn decode_pk_bytes_to_i64(tc: TypeCode, slice: &[u8]) -> Result<i64, GnitzSqlError> {
     Ok(match tc {
         TypeCode::I8  => slice[0] as i8 as i64,
@@ -952,8 +948,8 @@ fn eval_expr(
             // The PK column's slot in `batch.columns` is `Fixed(vec![])`
             // (placeholder set by ZSetBatch::new). The PK value lives in
             // `batch.pks`; decode the bytes for column `*c` under the
-            // column's declared signedness. F32/F64/U128/UUID don't fit
-            // through the i64 return shape — reject explicitly.
+            // column's declared signedness. U128/UUID don't fit through the
+            // i64 return shape — reject explicitly.
             if schema.is_pk_col(*c) {
                 let stride = col_def.type_code.wire_stride();
                 match &batch.pks {
@@ -1356,16 +1352,6 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
                 _ => return Err(GnitzSqlError::Bind("Int value for non-numeric column".to_string())),
             }
         }
-        ColumnValue::Float(f) => {
-            match col {
-                ColData::Fixed(buf) => match tc {
-                    TypeCode::F32 => buf.extend_from_slice(&(f as f32).to_le_bytes()),
-                    TypeCode::F64 => buf.extend_from_slice(&f.to_le_bytes()),
-                    _ => return Err(GnitzSqlError::Bind(format!("cannot assign Float to {:?}", tc))),
-                },
-                _ => return Err(GnitzSqlError::Bind("Float value for non-float column".to_string())),
-            }
-        }
         ColumnValue::Str(s) => {
             match col {
                 ColData::Strings(v) => v.push(Some(s)),
@@ -1436,7 +1422,7 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
-            // Unwrap UnaryOp(Minus, Number) so signed/float PK lists like
+            // Unwrap UnaryOp(Minus, Number) so signed PK lists like
             // `IN (-1, -2)` can match the fast path; without this they
             // fall through to the slow scan.
             let (val_expr, negated) = match item {
@@ -2175,22 +2161,6 @@ mod tests {
     }
 
     #[test]
-    fn pk_parity_f64_neg_zero() {
-        check_pk_parity(TypeCode::F64, neg_num_expr("0.0"), (-0.0_f64).to_bits() as u128);
-    }
-
-    #[test]
-    fn pk_parity_f64_one_integer_literal() {
-        // Integer literal for an F64 PK column → 1.0_f64.to_bits().
-        check_pk_parity(TypeCode::F64, num_expr("1"), (1.0_f64).to_bits() as u128);
-    }
-
-    #[test]
-    fn pk_parity_f32_neg_one_point_five() {
-        check_pk_parity(TypeCode::F32, neg_num_expr("1.5"), (-1.5_f32).to_bits() as u128);
-    }
-
-    #[test]
     fn extract_pk_value_u64_rejects_negative() {
         let schema = pk_schema(TypeCode::U64);
         let row = vec![neg_num_expr("1"), num_expr("0")];
@@ -2214,14 +2184,6 @@ mod tests {
         let expr = in_list_expr("id", vec![neg_num_expr("1"), neg_num_expr("2")]);
         let got = super::try_extract_pk_in(&expr, &schema).expect("should match fast path");
         assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
-    }
-
-    #[test]
-    fn try_extract_pk_in_f64_list() {
-        let schema = pk_schema(TypeCode::F64);
-        let expr = in_list_expr("id", vec![num_expr("1.5"), neg_num_expr("0.5")]);
-        let got = super::try_extract_pk_in(&expr, &schema).expect("should match fast path");
-        assert_eq!(got, vec![1.5_f64.to_bits() as u128, (-0.5_f64).to_bits() as u128]);
     }
 
     // ------------------------------------------------------------------
@@ -2258,19 +2220,19 @@ mod tests {
     }
 
     #[test]
-    fn eval_expr_pk_f64_unsupported() {
-        // F64 PK doesn't fit through eval_expr's i64 projection; must error,
+    fn eval_expr_pk_u128_unsupported() {
+        // U128 PK doesn't fit through eval_expr's i64 projection; must error,
         // not panic.
-        let schema = pk_schema(TypeCode::F64);
+        let schema = pk_schema(TypeCode::U128);
         let mut batch = ZSetBatch::new(&schema);
-        batch.pks.push_u128(1.5_f64.to_bits() as u128);
+        batch.pks.push_u128(u128::MAX);
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
             buf.extend_from_slice(&0i64.to_le_bytes());
         }
         let err = super::eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema)
-            .expect_err("F64 PK must return Unsupported");
+            .expect_err("U128 PK must return Unsupported");
         assert!(err.to_string().contains("residual filter on PK"), "error: {err}");
     }
 

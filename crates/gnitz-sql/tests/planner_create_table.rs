@@ -243,6 +243,28 @@ fn test_compound_pk_string_column_rejected() {
 }
 
 #[test]
+fn test_pk_float_column_rejected() {
+    // Float PK columns are rejected: IEEE-754 floats break the byte-equal PK
+    // contract (-0.0/+0.0, NaN), so neither F32 (REAL/FLOAT) nor F64 (DOUBLE)
+    // may be a PK column.
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute("CREATE TABLE pk_f32 (id REAL PRIMARY KEY)"));
+    match err {
+        GnitzSqlError::Unsupported(s) => {
+            assert!(s.contains("float"), "expected float hint, got: {}", s);
+            assert!(s.contains("'id'"),
+                "expected offending column name in error, got: {}", s);
+        }
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+    let err = must_err(p.execute("CREATE TABLE pk_f64 (id DOUBLE PRIMARY KEY)"));
+    assert!(matches!(err, GnitzSqlError::Unsupported(_)),
+        "expected Unsupported for DOUBLE PK, got {:?}", err);
+}
+
+#[test]
 fn test_table_level_pk_typo_bind_error() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);

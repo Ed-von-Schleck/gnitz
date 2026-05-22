@@ -13,10 +13,8 @@ U64/I64; 16 for U128/UUID). This file exercises:
     regardless of stride or signedness).
 """
 
-import math
 import os
 import random
-import struct
 
 import pytest
 import gnitz
@@ -69,8 +67,6 @@ class TestNativePkSchema:
         ("SMALLINT UNSIGNED",   gnitz.TypeCode.U16),
         ("INT UNSIGNED",        gnitz.TypeCode.U32),
         ("BIGINT UNSIGNED",     gnitz.TypeCode.U64),
-        ("FLOAT",               gnitz.TypeCode.F32),
-        ("DOUBLE",              gnitz.TypeCode.F64),
         ("DECIMAL(38,0)",       gnitz.TypeCode.U128),
     ])
     def test_pk_type_preserved(self, client, sql, tc):
@@ -127,63 +123,23 @@ class TestSignedPkOrdering:
 
 
 # ---------------------------------------------------------------------------
-# Float PK ordering (total_cmp)
+# Float PK rejection
 # ---------------------------------------------------------------------------
 
-def _f64_bits_as_u64(x: float) -> int:
-    """Reinterpret f64 → u64 bit pattern (what the scan returns for an F64 PK)."""
-    return struct.unpack("<Q", struct.pack("<d", x))[0]
+class TestFloatPkRejected:
+    """Float columns cannot be PRIMARY KEYs: IEEE-754 breaks the byte-equal
+    key contract (-0.0/+0.0, NaN), so CREATE TABLE must reject them."""
 
-
-def _f32_bits_as_u32(x: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", x))[0]
-
-
-class TestFloatPkOrdering:
-    """Floats sort by `total_cmp`: NaN-stable, sign-aware (-0.0 < 0.0)."""
-
-    def test_f64_all_values_round_trip(self, client):
-        """Every inserted float PK round-trips by bit pattern (total_cmp identity).
-        Multi-worker scan order isn't guaranteed, so verify presence by
-        bit pattern rather than asserting ordering at the API boundary."""
+    @pytest.mark.parametrize("pk_sql", ["FLOAT", "DOUBLE", "REAL"])
+    def test_float_pk_create_rejected(self, client, pk_sql):
         sn = "n" + _uid()
         try:
             client.create_schema(sn)
-            client.execute_sql(
-                "CREATE TABLE t (score DOUBLE NOT NULL PRIMARY KEY, label INT NOT NULL)",
-                schema_name=sn,
-            )
-            tid, _ = client.resolve_table(sn, "t")
-            values = [-math.inf, -2.5, -0.0, 0.0, 1.0, 3.5, math.inf]
-            vals_sql = ",".join(
-                f"({v if math.isfinite(v) else ('-1e400' if v < 0 else '1e400')}, {i})"
-                for i, v in enumerate(values)
-            )
-            client.execute_sql(f"INSERT INTO t VALUES {vals_sql}", schema_name=sn)
-
-            # Compare by bit pattern so -0.0 vs 0.0 stays distinct.
-            seen_bits = {_f64_bits_as_u64(row[0]) for row in client.scan(tid) if row.weight > 0}
-            expected_bits = {_f64_bits_as_u64(v) for v in values}
-            assert seen_bits == expected_bits, \
-                f"missing/extra bit patterns: expected={expected_bits} seen={seen_bits}"
-        finally:
-            _cleanup(client, sn, "t")
-
-    def test_f64_negative_zero_is_distinct_from_positive_zero(self, client):
-        """Float PK *identity* follows to_bits(): -0.0 and 0.0 are separate keys."""
-        sn = "n" + _uid()
-        try:
-            client.create_schema(sn)
-            client.execute_sql(
-                "CREATE TABLE t (score DOUBLE NOT NULL PRIMARY KEY, tag INT NOT NULL)",
-                schema_name=sn,
-            )
-            tid, _ = client.resolve_table(sn, "t")
-            # Both inserts succeed (no PK conflict) because to_bits differs.
-            client.execute_sql("INSERT INTO t VALUES (-0.0, 1)", schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (0.0, 2)", schema_name=sn)
-            rows = [r for r in client.scan(tid) if r.weight > 0]
-            assert len(rows) == 2, f"-0.0 and 0.0 must be distinct PKs; got {rows}"
+            with pytest.raises(Exception):
+                client.execute_sql(
+                    f"CREATE TABLE t (score {pk_sql} NOT NULL PRIMARY KEY, v INT NOT NULL)",
+                    schema_name=sn,
+                )
         finally:
             _cleanup(client, sn, "t")
 
@@ -335,22 +291,6 @@ class TestNativePkMultiWorker:
             tid, _ = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (-1, 42)", schema_name=sn)
             client.execute_sql("DELETE FROM t WHERE id = -1", schema_name=sn)
-            assert _pks_sorted(client, tid) == []
-        finally:
-            _cleanup(client, sn, "t")
-
-    def test_seek_float_negative_zero(self, client):
-        """-0.0 routes via the to_bits() pattern, not 0u128."""
-        sn = "n" + _uid()
-        try:
-            client.create_schema(sn)
-            client.execute_sql(
-                "CREATE TABLE t (score DOUBLE NOT NULL PRIMARY KEY, v INT NOT NULL)",
-                schema_name=sn,
-            )
-            tid, _ = client.resolve_table(sn, "t")
-            client.execute_sql("INSERT INTO t VALUES (-0.0, 42)", schema_name=sn)
-            client.execute_sql("DELETE FROM t WHERE score = -0.0", schema_name=sn)
             assert _pks_sorted(client, tid) == []
         finally:
             _cleanup(client, sn, "t")

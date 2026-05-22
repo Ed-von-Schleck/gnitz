@@ -668,8 +668,8 @@ impl Batch {
     /// argument verbatim. The contract is that the *caller* placed the
     /// on-disk LE bytes in the low `stride` bytes — `extract_pk_value`,
     /// `try_col_eq_literal`, and `try_extract_pk_in` all follow this rule
-    /// (signed integers via `(v as iN as uN) as u128`, floats via
-    /// `to_bits()`, narrow unsigned via zero-extension). The high
+    /// (signed integers via `(v as iN as uN) as u128`, narrow unsigned via
+    /// zero-extension). The high
     /// `16 - stride` bytes are dropped on truncation, which is correct
     /// under that contract for every PK type GnitzDB allows.
     #[inline]
@@ -2018,8 +2018,6 @@ mod tests {
             (type_code::I32, 0xFFFF_FFFFu128),
             // U32 PK = u32::MAX
             (type_code::U32, u32::MAX as u128),
-            // F32 PK = -1.5: to_bits()
-            (type_code::F32, (-1.5_f32).to_bits() as u128),
         ];
         for &(tc, pk) in cases {
             let schema = single_col_pk_schema(tc);

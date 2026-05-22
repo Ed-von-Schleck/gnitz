@@ -166,7 +166,7 @@ pub(super) fn argsort_delta(
 
 /// Argsort indices into canonical PK order — `pk_indices` order as defined
 /// by `compare_pk_bytes`. Routes through `make_slow_pk_cmp` for signed
-/// single-col PKs, float single-col PKs, and compound PKs; `pk_is_fast`
+/// single-col PKs and compound PKs; `pk_is_fast`
 /// schemas (single-col unsigned U8..U64/U128/UUID) collapse to a tight
 /// `u128.cmp` on the widened PK. Caller must ensure `pk_stride ∈ {8, 16}`
 /// (so `mb.get_pk` is well-defined).
@@ -184,7 +184,7 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch, schema: &SchemaDescriptor) -> 
         // ascending. No dispatch needed.
         idx.sort_unstable_by_key(|&i| pks[i as usize]);
     } else {
-        // Signed / float / compound: route via the typed comparator. The
+        // Signed / compound: route via the typed comparator. The
         // closure is `Copy` so it inlines cleanly through sort_unstable_by.
         let pk_cmp = crate::storage::make_slow_pk_cmp(schema);
         idx.sort_unstable_by(|&a, &b| pk_cmp(pks[a as usize], pks[b as usize]));
@@ -224,11 +224,10 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     let mut indices: Vec<u32> = (0..n as u32).collect();
 
     // Direct `u128.cmp` on the widened PK is sound only for `pk_is_fast`
-    // schemas (single-col unsigned). Signed / float / compound PKs must
-    // dispatch through `make_slow_pk_cmp` — otherwise negatives sort after
-    // positives (signed), total_cmp ordering is skipped (float), and the
-    // low-priority PK column dominates (compound), all of which make the
-    // `output.sorted = true` mark below a lie.
+    // schemas (single-col unsigned). Signed / compound PKs must dispatch
+    // through `make_slow_pk_cmp` — otherwise negatives sort after positives
+    // (signed) and the low-priority PK column dominates (compound), both of
+    // which make the `output.sorted = true` mark below a lie.
     let slow_pk_cmp = crate::storage::make_slow_pk_cmp(schema);
     let fast_pk_cmp = |a: u128, b: u128| a.cmp(&b);
     let row_int = |a: usize, b: usize| compare_rows_int_nonnull(schema, &mb, a, &mb, b);

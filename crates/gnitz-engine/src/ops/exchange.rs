@@ -460,7 +460,7 @@ fn relay_scatter_merge_walk(
 
     if !is_wide {
         // Narrow winner-comparator: native u128 `<` for single-unsigned PKs,
-        // else make_slow_pk_cmp (signed/float single column, or compound).
+        // else make_slow_pk_cmp (signed single column, or compound).
         // make_slow_pk_cmp's closure is Copy and captures only Copy scalars.
         let pk_fast = schema.pk_is_fast();
         let slow_cmp = make_slow_pk_cmp(schema);

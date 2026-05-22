@@ -54,7 +54,7 @@ pub(super) fn cursor_matches_group(
 
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            // Raw byte equality suffices here (no order, no signed/float
+            // Raw byte equality suffices here (no order, no signed
             // dispatch): rows with identical bytes at this PK-column window
             // are equal regardless of type.
             let off = desc.pk_off as usize;

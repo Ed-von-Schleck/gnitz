@@ -2256,7 +2256,7 @@ fn test_gather_reduce_min_u64() {
 /// Build a raw `Batch` (`sorted = false`, `consolidated = false`) with
 /// one I64 payload column. `pk_encode` maps the row's PK type to the
 /// u128 that `extend_pk` expects (e.g. `|pk: i64| (pk as u64) as u128`
-/// for signed, `|pk: f64| pk.to_bits() as u128` for float).
+/// for signed, `|pk: u64| pk as u128` for unsigned).
 fn make_batch_raw_pk<T: Copy>(
     schema: &SchemaDescriptor,
     rows: &[(T, i64, i64)],
@@ -2281,17 +2281,6 @@ fn make_schema_i64pk_i64val() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
-/// F64 pk + I64 payload schema (float-PK exercise of make_slow_pk_cmp).
-fn make_schema_f64pk_i64val() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::F64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
@@ -2541,64 +2530,6 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
     assert_eq!(pks, vec![-3, -1, 2],
         "signed PK must sort via i64 order, not u128-of-bits order");
     assert_eq!(sums, vec![30, 10, 20]);
-}
-
-#[test]
-fn test_reduce_group_by_pk_unsorted_float_pk() {
-    use std::rc::Rc;
-    use crate::storage::CursorHandle;
-
-    let in_schema = make_schema_f64pk_i64val();
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
-
-    // total_cmp order: -1.5, -0.0, 1.5. u128-of-bits would interleave
-    // negatives with positives (sign bit flips the natural order).
-    let delta = make_batch_raw_pk(&in_schema, &[
-        (-0.0, 1, 1),
-        (1.5,  1, 2),
-        (-1.5, 1, 3),
-    ], |pk: f64| pk.to_bits() as u128);
-
-    let agg = AggDescriptor {
-        col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
-    };
-
-    let (out, _) = op_reduce(
-        &delta, None, to_ch.cursor_mut(),
-        &in_schema, &out_schema,
-        &[0u32], &[agg],
-        None, false, TypeCode::F64, &[], None,
-        None, 0, None, None,
-    );
-
-    assert_eq!(out.count, 3);
-    let pks: Vec<f64> = (0..out.count)
-        .map(|i| {
-            let bytes = out.get_pk_bytes(i);
-            let low = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            f64::from_bits(low)
-        })
-        .collect();
-    let sums: Vec<i64> = (0..out.count)
-        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
-        .collect();
-    // total_cmp ascending.
-    let expected_pks = [-1.5_f64, -0.0_f64, 1.5_f64];
-    for (got, exp) in pks.iter().zip(expected_pks.iter()) {
-        assert_eq!(
-            got.total_cmp(exp), std::cmp::Ordering::Equal,
-            "F64 PK must sort by total_cmp (got {:?}, want {:?})", pks, expected_pks,
-        );
-    }
-    assert_eq!(sums, vec![3, 1, 2]);
 }
 
 #[test]
