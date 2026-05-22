@@ -45,6 +45,36 @@ pub const FLAG_FLUSH: u32               = 16384;
 /// rides on top of FLAG_DDL_SYNC for the worker's dispatch loop, which
 /// already no-ops on a DDL_SYNC group with `count == 0`.
 pub const FLAG_TXN_COMMIT: u32          = 32768;
+/// Batched stored-row gather: scatter a set of PKs to their owning workers,
+/// each worker reads the committed rows for the PKs it owns and replies with
+/// the rows projected to the columns named in the control block's
+/// `seek_col_idx` mask (see `pack_gather_cols`). Distinct from `FLAG_SEEK`
+/// (single key) and `FLAG_HAS_PK` (existence echo of the caller's payload);
+/// the gather returns the *stored* value of columns the caller does not have.
+pub const FLAG_GATHER: u32              = 65536;
+
+/// Pack up to 8 projected column indices into the gather control block's
+/// `seek_col_idx`. Each index is stored as `col_idx + 1` in one byte (valid
+/// because MAX_COLUMNS = 65 ≤ 255); a zero byte terminates the list and
+/// keeps column index 0 representable. Returns `None` if more than 8 distinct
+/// columns must be projected (caller falls back to a wider gather).
+pub(crate) fn pack_gather_cols(cols: &[u8]) -> Option<u64> {
+    if cols.len() > 8 { return None; }
+    let mut packed = 0u64;
+    for (i, &c) in cols.iter().enumerate() {
+        debug_assert!((c as usize) < crate::schema::MAX_COLUMNS);
+        packed |= ((c as u64) + 1) << (8 * i);
+    }
+    Some(packed)
+}
+
+/// Inverse of `pack_gather_cols`: yields the projected column indices.
+pub(crate) fn unpack_gather_cols(packed: u64) -> impl Iterator<Item = u8> {
+    (0..8)
+        .map(move |i| ((packed >> (8 * i)) & 0xff) as u8)
+        .take_while(|&b| b != 0)
+        .map(|b| b - 1)
+}
 
 // ---------------------------------------------------------------------------
 // SalMessageKind — receive-side classification of a SAL group's flag bits.
@@ -75,6 +105,7 @@ pub enum SalMessageKind {
     PreloadedExchange,
     Backfill,
     HasPk,
+    Gather,
     Push,
     Tick,
     SeekByIndex,
@@ -88,7 +119,8 @@ impl SalMessageKind {
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
     /// EXCHANGE_RELAY > PRELOADED_EXCHANGE > BACKFILL > HAS_PK >
-    /// PUSH > TICK > SEEK_BY_INDEX > SEEK > Scan. The first match wins.
+    /// GATHER > PUSH > TICK > SEEK_BY_INDEX > SEEK > Scan. The first
+    /// match wins.
     pub fn classify(flags: u32) -> SalMessageKind {
         if flags & FLAG_SHUTDOWN != 0           { return SalMessageKind::Shutdown; }
         if flags & FLAG_FLUSH != 0              { return SalMessageKind::Flush; }
@@ -97,6 +129,7 @@ impl SalMessageKind {
         if flags & FLAG_PRELOADED_EXCHANGE != 0 { return SalMessageKind::PreloadedExchange; }
         if flags & FLAG_BACKFILL != 0           { return SalMessageKind::Backfill; }
         if flags & FLAG_HAS_PK != 0             { return SalMessageKind::HasPk; }
+        if flags & FLAG_GATHER != 0             { return SalMessageKind::Gather; }
         if flags & FLAG_PUSH != 0               { return SalMessageKind::Push; }
         if flags & FLAG_TICK != 0               { return SalMessageKind::Tick; }
         if flags & FLAG_SEEK_BY_INDEX != 0      { return SalMessageKind::SeekByIndex; }
@@ -117,6 +150,7 @@ impl SalMessageKind {
                 | SalMessageKind::PreloadedExchange
                 | SalMessageKind::Backfill
                 | SalMessageKind::HasPk
+                | SalMessageKind::Gather
                 | SalMessageKind::Push
                 | SalMessageKind::Tick
         )
@@ -125,7 +159,7 @@ impl SalMessageKind {
     /// All variants in classification priority order. Used by tests that
     /// walk every kind to exercise the dispatcher's full match.
     #[allow(dead_code)]
-    pub const ALL: [SalMessageKind; 12] = [
+    pub const ALL: [SalMessageKind; 13] = [
         SalMessageKind::Shutdown,
         SalMessageKind::Flush,
         SalMessageKind::DdlSync,
@@ -133,6 +167,7 @@ impl SalMessageKind {
         SalMessageKind::PreloadedExchange,
         SalMessageKind::Backfill,
         SalMessageKind::HasPk,
+        SalMessageKind::Gather,
         SalMessageKind::Push,
         SalMessageKind::Tick,
         SalMessageKind::SeekByIndex,

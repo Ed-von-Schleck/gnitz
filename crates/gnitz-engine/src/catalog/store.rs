@@ -288,6 +288,43 @@ impl CatalogEngine {
         Ok(Some(batch))
     }
 
+    /// Batched point lookup. Open one cursor on `table_id` and seek each PK in
+    /// `pks`, appending the stored row (weight 1) for every present, live key
+    /// into a result batch projected to `project`. Each `seek` re-probes every
+    /// source independently, so order is not required for correctness; passing
+    /// `pks` ascending keeps the per-source binary-search probes monotonic for
+    /// better cache locality.
+    /// Absent / retracted keys are skipped — identical to `seek_family`'s
+    /// single-key `None` — so a removed PK with no committed row contributes
+    /// nothing. `project` lists the parent column indices to return (all
+    /// non-PK scalar columns); an empty `project` returns PK-only rows.
+    ///
+    /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
+    /// each of which re-opens a cursor). Projection keeps the result scalar-
+    /// only — FK-referenced columns are never STRING/BLOB — so the blob arena
+    /// is never touched.
+    pub fn gather_family(
+        &mut self,
+        table_id: i64,
+        pks: &[u128],
+        project: &[u8],
+    ) -> Result<Batch, String> {
+        let schema = self.dag.tables.get(&table_id)
+            .map(|e| e.schema)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+        let result_schema = project_schema(&schema, project);
+        let mut out = Batch::with_schema(result_schema, pks.len());
+        let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
+        for &pk in pks {
+            cursor.cursor.seek(pk);
+            if !cursor.cursor.valid { continue; }
+            if cursor.cursor.current_key != pk { continue; }
+            if cursor.cursor.current_weight <= 0 { continue; }
+            copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
+        }
+        Ok(out)
+    }
+
     /// Index-assisted lookup: prefix-scan the index by the leading indexed
     /// column value, reconstruct the source PK from the index PK suffix,
     /// and resolve to the source row.
@@ -903,4 +940,62 @@ impl CatalogEngine {
         };
         entry.handle.open_cursor().cursor.materialize()
     }
+}
+
+/// Build the schema for a `gather_family` result: the PK columns of `schema`
+/// (in pk-list order, so the packed PK round-trips identically) followed by
+/// the projected columns in `project` order as payload. `project` must list
+/// only non-PK columns (PK members are resolved from the packed PK without a
+/// gather); a projected PK column would be emitted twice.
+fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
+    let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
+    for (_, ci, col) in schema.pk_columns() {
+        pk_idx.push(cols.len() as u32);
+        cols.push(*col);
+    }
+    for &p in project {
+        debug_assert!(!schema.is_pk_col(p as usize),
+            "project_schema: projected column {} is a PK column", p);
+        cols.push(schema.columns[p as usize]);
+    }
+    SchemaDescriptor::new(&cols, &pk_idx)
+}
+
+/// Projecting sibling of `copy_cursor_row_with_weight`: append the cursor's
+/// current row to `out` (which has the `project_schema` layout) with weight 1,
+/// copying only the columns named in `project`. The projected payload column
+/// at position `k` corresponds to source column `project[k]`; the projected
+/// null bit `k` mirrors the source row's null bit for that column. Projected
+/// columns are scalar, so no blob relocation is required.
+fn copy_cursor_cols_to_batch(
+    cursor: &CursorHandle,
+    out: &mut Batch,
+    src_schema: &SchemaDescriptor,
+    project: &[u8],
+) {
+    out.extend_pk(cursor.cursor.current_key);
+    out.extend_weight(&1i64.to_le_bytes());
+
+    let src_null = cursor.cursor.current_null_word;
+    let mut proj_null = 0u64;
+    for (k, &p) in project.iter().enumerate() {
+        let pi = src_schema.payload_idx(p as usize);
+        if src_null & (1u64 << pi) != 0 {
+            proj_null |= 1u64 << k;
+        }
+    }
+    out.extend_null_bmp(&proj_null.to_le_bytes());
+
+    for (k, &p) in project.iter().enumerate() {
+        let col_size = src_schema.columns[p as usize].size() as usize;
+        let ptr = cursor.cursor.col_ptr(p as usize, col_size);
+        if !ptr.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
+            out.extend_col(k, data);
+        } else {
+            out.fill_col_zero(k, col_size);
+        }
+    }
+    out.count += 1;
 }

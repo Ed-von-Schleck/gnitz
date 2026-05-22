@@ -652,6 +652,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::Flush)
             | (_, SalMessageKind::Backfill)
             | (_, SalMessageKind::HasPk)
+            | (_, SalMessageKind::Gather)
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
@@ -741,6 +742,31 @@ impl WorkerProcess {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
                 if let Err(msg) = self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk) {
                     return DispatchResult::Error(msg);
+                }
+                DispatchResult::Continue
+            }
+
+            SalMessageKind::Gather => {
+                // The projected column mask rides in `seek_col_idx`. The PK
+                // batch arrives in `data_batch` (a worker with an empty
+                // sublist still replies — the master joins one reply per
+                // worker). PKs come pre-sorted from the master's global sort
+                // (scatter preserves per-worker order), aiding the cursor.
+                let project: Vec<u8> =
+                    crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
+                let pks: Vec<u128> = match &batch {
+                    Some(b) => (0..b.count).map(|i| b.get_pk(i)).collect(),
+                    None => Vec::new(),
+                };
+                match self.cat().gather_family(target_id, &pks, &project) {
+                    Ok(result) => {
+                        let schema = result.schema;
+                        self.send_response(
+                            target_id as u64, Some(&result), schema.as_ref(),
+                            request_id, client_id, 0,
+                        );
+                    }
+                    Err(msg) => return DispatchResult::Error(msg),
                 }
                 DispatchResult::Continue
             }

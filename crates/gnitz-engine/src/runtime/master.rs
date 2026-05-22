@@ -21,8 +21,8 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
 use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
-    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL,
-    FLAG_TICK, FLAG_FLUSH, SalWriter,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL, FLAG_GATHER,
+    FLAG_TICK, FLAG_FLUSH, SalWriter, pack_gather_cols,
 };
 use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
 use gnitz_wire::wire_flags_set_conflict_mode;
@@ -702,29 +702,6 @@ impl MasterDispatcher {
                             worker, pk, 0, "seek").await
     }
 
-    /// Seek `pk` in `target_id`'s committed storage and, if a live row is
-    /// present, hand the decoded single-row batch to `f`. Returns `f`'s result,
-    /// or `None` when no committed row exists. Folds the mandatory
-    /// peek-control + zero-copy-decode that every point-seek caller performs;
-    /// the closure form keeps the `MemBatch`'s borrow of the slot sound.
-    async fn fan_out_seek_row<T>(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, pk: u128,
-        f: impl FnOnce(&crate::storage::MemBatch<'_>) -> T,
-    ) -> Result<Option<T>, String> {
-        let slot = Self::fan_out_seek_async(disp_ptr, reactor, sal_excl, target_id, pk).await?;
-        let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
-        if ctrl.flags & FLAG_HAS_DATA == 0 { return Ok(None); }
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-            slot.bytes(), ctrl.block_size, ctrl, None).map_err(|e| e.to_string())?;
-        match zc.data_batch {
-            Some(b) if b.count > 0 => Ok(Some(f(&b))),
-            _ => Ok(None),
-        }
-    }
-
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
@@ -906,6 +883,113 @@ impl MasterDispatcher {
             }
         }
         Ok(results)
+    }
+
+    /// Batched stored-row gather. Scatters `pks` to their owning workers (one
+    /// group, partitioned by the parent PK columns so each worker only reads
+    /// rows it stores), each worker reads the committed rows for its PKs and
+    /// replies with them projected to `project` (the referenced parent column
+    /// indices). Returns a `pk → projected values` map: each value is the
+    /// promoted index key, or `None` for a NULL referenced value; PKs whose
+    /// committed row is absent are omitted entirely. The per-row `Vec` is
+    /// aligned to `project`.
+    ///
+    /// This is the `O(num_workers)`-round-trip replacement for the per-row
+    /// serial single-key seek loop used by FK RESTRICT on non-PK UNIQUE
+    /// targets. It is a sibling of `execute_pipeline_async` (which returns only
+    /// existence) rather than a modification of it: the has-pk pipeline echoes
+    /// the caller's payload (`filter_by_pk`), so it structurally cannot return
+    /// a stored column the caller does not already hold.
+    ///
+    /// `sal_excl` is held only across the synchronous write + signal; there is
+    /// no `.await` between `signal_all()` and the first poll of `join_all_unpin`
+    /// — that first poll registers every req id's waker before any worker reply
+    /// can arrive, so a reply cannot be dropped (see `execute_pipeline_async`).
+    async fn execute_gather_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64,
+        mut pks: Vec<u128>,
+        project: &[u8],
+    ) -> Result<FxHashMap<u128, Vec<Option<u128>>>, String> {
+        if pks.is_empty() {
+            return Ok(FxHashMap::default());
+        }
+        // Sort so each worker's sublist reaches `gather_family` ascending:
+        // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
+        // order) and `scatter_wire_group` preserves per-worker relative order,
+        // so a globally sorted input yields per-worker-sorted sublists.
+        pks.sort_unstable();
+        let col_mask = pack_gather_cols(project)
+            .ok_or("gather: more than 8 projected columns")?;
+
+        let parent_schema = unsafe {
+            (&*(*disp_ptr).catalog).get_schema_desc(target_id)
+                .ok_or_else(|| format!("gather: no schema for table {}", target_id))?
+        };
+
+        let req_ids: Vec<u64> = {
+            let _guard = sal_excl.lock().await;
+            unsafe {
+                let disp = &mut *disp_ptr;
+                let nw = disp.num_workers;
+                let pk_cols = parent_schema.pk_indices();
+                let pooled = disp.pool_pop_batch(target_id);
+                let batch = build_check_batch(&parent_schema, &pks, pooled);
+                let worker_indices =
+                    compute_worker_indices(&batch, pk_cols, &parent_schema, nw);
+                let rids: Vec<u64> =
+                    (0..nw).map(|_| reactor.alloc_request_id()).collect();
+                let lsn = disp.next_lsn();
+                disp.sal.scatter_wire_group(
+                    &batch, &worker_indices, &parent_schema, None,
+                    target_id as u32, lsn, FLAG_GATHER,
+                    /* wire_flags */ 0, /* seek_pk */ 0, /* seek_col_idx */ col_mask,
+                    &rids, /* unicast_worker */ -1, None, None,
+                )?;
+                disp.signal_all();
+                // The scatter batch is fully consumed by the synchronous
+                // scatter_wire_group above; return it to the pool.
+                recycle_check_batch(disp, target_id, batch);
+                rids
+            }
+        };
+
+        let decoded: Vec<DecodedWire> = crate::runtime::reactor::join_all_unpin(
+            req_ids.iter().map(|&id| reactor.await_reply(id))
+        ).await;
+        if let Some(err) = first_worker_error("gather", &decoded) {
+            return Err(err);
+        }
+
+        // Precompute (type_code, col_size) per projected column from the parent
+        // schema; the reply's projected payload index k corresponds to project[k].
+        let proj_meta: Vec<(u8, usize)> = project.iter().map(|&p| {
+            let col = parent_schema.columns[p as usize];
+            (col.type_code, col.size() as usize)
+        }).collect();
+
+        let mut out: FxHashMap<u128, Vec<Option<u128>>> = FxHashMap::default();
+        for d in &decoded {
+            if let Some(ref b) = d.data_batch {
+                for j in 0..b.count {
+                    let mut vals: Vec<Option<u128>> = Vec::with_capacity(proj_meta.len());
+                    let null_word = b.get_null_word(j);
+                    for (k, &(col_type, col_size)) in proj_meta.iter().enumerate() {
+                        if null_word & (1u64 << k) != 0 {
+                            vals.push(None);
+                        } else {
+                            let col_data = b.col_data(k);
+                            vals.push(Some(promote_to_index_key(
+                                col_data, j * col_size, col_size, col_type)));
+                        }
+                    }
+                    out.insert(b.get_pk(j), vals);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Broadcast a DDL batch to every worker. `lsn` is supplied by the
@@ -1242,6 +1326,21 @@ impl MasterDispatcher {
                 net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect();
 
             if !removed_pks.is_empty() {
+                // Resolve every non-PK referenced parent column in ONE batched
+                // gather instead of one serial seek per (removed PK × child).
+                let project = unsafe {
+                    collect_fk_projection(
+                        &*(*disp_ptr).catalog, target_id, n_children, &source_schema)
+                };
+                let gathered = if project.is_empty() {
+                    FxHashMap::default()
+                } else {
+                    Self::execute_gather_async(
+                        disp_ptr, reactor, sal_excl, target_id,
+                        removed_pks.clone(), &project,
+                    ).await?
+                };
+
                 for ci in 0..n_children {
                     let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
                         let cat = &mut *(*disp_ptr).catalog;
@@ -1258,7 +1357,10 @@ impl MasterDispatcher {
 
                     // PK-column target → value is on the wire inside the packed
                     // PK; extract just that column. Non-PK UNIQUE target → the
-                    // delete carries no payload, so resolve from stored rows.
+                    // delete carries no payload, so read the value resolved by
+                    // the gather above. A NULL or absent referenced value is
+                    // omitted from the gather map and so never blocks the
+                    // delete (matching the old per-row seek's skip).
                     let keys: Vec<u128> = if source_schema.is_pk_col(parent_col_idx) {
                         let col_type = source_schema.columns[parent_col_idx].type_code;
                         let col_size = source_schema.columns[parent_col_idx].size() as usize;
@@ -1267,22 +1369,16 @@ impl MasterDispatcher {
                             promote_to_index_key(&pk.to_le_bytes(), pk_field_off, col_size, col_type)
                         }).collect()
                     } else {
-                        let col_type = source_schema.columns[parent_col_idx].type_code;
-                        let col_size = source_schema.columns[parent_col_idx].size() as usize;
-                        let payload_col = source_schema.payload_idx(parent_col_idx);
+                        let proj_pos = project.iter()
+                            .position(|&c| c == parent_col_idx as u8)
+                            .expect("non-PK referenced column missing from gather projection");
                         let mut vals: Vec<u128> = Vec::with_capacity(removed_pks.len());
                         for &pk in &removed_pks {
-                            // A NULL referenced value can be referenced by no
-                            // child, so it never blocks the delete.
-                            let v = Self::fan_out_seek_row(
-                                disp_ptr, reactor, sal_excl, target_id, pk,
-                                |found| if found.get_null_word(0) & (1u64 << payload_col) != 0 {
-                                    None
-                                } else {
-                                    Some(promote_to_index_key(found.col_data(payload_col, col_size), 0, col_size, col_type))
-                                },
-                            ).await?.flatten();
-                            if let Some(v) = v { vals.push(v); }
+                            if let Some(row) = gathered.get(&pk) {
+                                if let Some(v) = row[proj_pos] {
+                                    vals.push(v);
+                                }
+                            }
                         }
                         vals
                     };
@@ -1386,59 +1482,87 @@ impl MasterDispatcher {
         // Phase-2 burst alongside the unique-index broadcasts.
         let mut p2_restrict: Vec<(i64, u32, SchemaDescriptor, Vec<u128>)> = Vec::new();
         if n_children > 0 && !existing_pks.is_empty() {
-            for ci in 0..n_children {
-                let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
-                    let cat = &mut *(*disp_ptr).catalog;
-                    let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
-                        Some(info) => info,
-                        None => continue,
-                    };
-                    // PK columns are immutable under UPDATE — nothing to enforce.
-                    if source_schema.is_pk_col(parent_col_idx) { continue; }
-                    let idx_schema = match cat.get_index_schema_by_col(child_tid, fk_col_idx as u32) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    (child_tid, fk_col_idx, parent_col_idx, idx_schema)
-                };
+            // Resolve the OLD committed values for all updated PKs in ONE
+            // batched gather, rather than one serial seek per (updated PK ×
+            // child). UPDATE cannot change PK columns, so only non-PK
+            // referenced columns participate.
+            let project = unsafe {
+                collect_fk_projection(
+                    &*(*disp_ptr).catalog, target_id, n_children, &source_schema)
+            };
 
-                let col_type    = source_schema.columns[parent_col_idx].type_code;
-                let col_size    = source_schema.columns[parent_col_idx].size() as usize;
-                let payload_col = source_schema.payload_idx(parent_col_idx);
+            if !project.is_empty() {
+                // Batch rows that are UPDATEs: positive weight and a PK that
+                // already exists in committed storage (not an INSERT). Computed
+                // once; the per-child loop below indexes into this instead of
+                // re-walking the whole batch and re-checking `existing_pks`.
+                let update_rows: Vec<usize> = (0..batch.count)
+                    .filter(|&i| batch.get_weight(i) > 0
+                        && existing_pks.contains(&batch.get_pk(i)))
+                    .collect();
 
-                let mut retired: Vec<u128> = Vec::new();
-                for i in 0..batch.count {
-                    if batch.get_weight(i) <= 0 { continue; }
+                let mut updated: Vec<u128> = Vec::new();
+                let mut seen: HashSet<u128> = HashSet::new();
+                for &i in &update_rows {
                     let pk = batch.get_pk(i);
-                    if !existing_pks.contains(&pk) { continue; } // not an update
+                    if seen.insert(pk) { updated.push(pk); }
+                }
 
-                    let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
-                        None
-                    } else {
-                        Some(promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
+                // Old values come from committed storage (validation is
+                // pre-commit, under the FK table locks held by the executor,
+                // so the committed parent state is static across the gather).
+                let gathered = Self::execute_gather_async(
+                    disp_ptr, reactor, sal_excl, target_id, updated, &project,
+                ).await?;
+
+                for ci in 0..n_children {
+                    let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
+                        let cat = &mut *(*disp_ptr).catalog;
+                        let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
+                            Some(info) => info,
+                            None => continue,
+                        };
+                        // PK columns are immutable under UPDATE — nothing to enforce.
+                        if source_schema.is_pk_col(parent_col_idx) { continue; }
+                        let idx_schema = match cat.get_index_schema_by_col(child_tid, fk_col_idx as u32) {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        (child_tid, fk_col_idx, parent_col_idx, idx_schema)
                     };
 
-                    // Old value comes from committed storage (validation is
-                    // pre-commit, under the FK table locks held by the executor).
-                    let old_val = match Self::fan_out_seek_row(
-                        disp_ptr, reactor, sal_excl, target_id, pk,
-                        |found| if found.get_null_word(0) & (1u64 << payload_col) != 0 {
+                    let col_type    = source_schema.columns[parent_col_idx].type_code;
+                    let col_size    = source_schema.columns[parent_col_idx].size() as usize;
+                    let payload_col = source_schema.payload_idx(parent_col_idx);
+                    let proj_pos = project.iter()
+                        .position(|&c| c == parent_col_idx as u8)
+                        .expect("non-PK referenced column missing from gather projection");
+
+                    let mut retired: Vec<u128> = Vec::new();
+                    for &i in &update_rows {
+                        let pk = batch.get_pk(i);
+
+                        let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
                             None
                         } else {
-                            Some(promote_to_index_key(found.col_data(payload_col, col_size), 0, col_size, col_type))
-                        },
-                    ).await? {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                            Some(promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
+                        };
 
-                    // Only a changed, non-null old value can orphan child rows.
-                    if old_val != new_val {
-                        if let Some(v) = old_val { retired.push(v); }
+                        // Absent committed row → omitted from the gather map →
+                        // skip (matches the old per-row seek's None).
+                        let old_val = match gathered.get(&pk) {
+                            Some(row) => row[proj_pos],
+                            None => continue,
+                        };
+
+                        // Only a changed, non-null old value can orphan child rows.
+                        if old_val != new_val {
+                            if let Some(v) = old_val { retired.push(v); }
+                        }
                     }
-                }
-                if !retired.is_empty() {
-                    p2_restrict.push((child_tid, fk_col_idx as u32, idx_schema, retired));
+                    if !retired.is_empty() {
+                        p2_restrict.push((child_tid, fk_col_idx as u32, idx_schema, retired));
+                    }
                 }
             }
         }
@@ -2022,11 +2146,20 @@ fn build_check_batch(
     batch
 }
 
+/// Return `batch` to `disp.check_batch_pool[target_id]` and cap the pool depth.
+fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, batch: Batch) {
+    const POOL_MAX_DEPTH: usize = 4;
+    let pool = disp.check_batch_pool.entry(target_id).or_default();
+    pool.push(batch);
+    if pool.len() > POOL_MAX_DEPTH {
+        pool.remove(0);
+    }
+}
+
 /// Take each `Batch` out of `checks` (leaving a zero-allocation sentinel),
 /// push it into `disp.check_batch_pool[target_id]`, and cap the pool depth.
 /// Called after `execute_pipeline_async` to recycle allocations.
 fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedCheck]) {
-    const POOL_MAX_DEPTH: usize = 4;
     for check in checks.iter_mut() {
         let target_id = check.target_id;
         let sentinel = Batch::empty_with_schema(&check.schema);
@@ -2034,12 +2167,31 @@ fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedChe
             CheckPayload::Broadcast(b) => std::mem::replace(b, sentinel),
             CheckPayload::ScatterSource { source, .. } => std::mem::replace(source, sentinel),
         };
-        let pool = disp.check_batch_pool.entry(target_id).or_default();
-        pool.push(batch);
-        if pool.len() > POOL_MAX_DEPTH {
-            pool.remove(0);
+        recycle_check_batch(disp, target_id, batch);
+    }
+}
+
+/// Collect the distinct non-PK parent columns referenced by `target_id`'s FK
+/// children, as a projection list for `execute_gather_async`. A PK-target child
+/// reads its referenced value from the packed PK on the wire and needs no
+/// gather, so PK columns are excluded.
+fn collect_fk_projection(
+    cat: &CatalogEngine,
+    target_id: i64,
+    n_children: usize,
+    source_schema: &SchemaDescriptor,
+) -> Vec<u8> {
+    let mut project: Vec<u8> = Vec::new();
+    for ci in 0..n_children {
+        if let Some((_, _, parent_col_idx)) = cat.get_fk_child_info(target_id, ci) {
+            if !source_schema.is_pk_col(parent_col_idx)
+                && !project.contains(&(parent_col_idx as u8))
+            {
+                project.push(parent_col_idx as u8);
+            }
         }
     }
+    project
 }
 
 #[cfg(test)]

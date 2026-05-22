@@ -604,3 +604,174 @@ class TestFkMultiWorker:
             assert len(rows) == n
         finally:
             _cleanup(client, sn, "child", "parent")
+
+
+class TestFkNonPkUniqueGather:
+    """RESTRICT against a non-PK UNIQUE FK target, which resolves the
+    referenced parent column from committed storage via the batched gather.
+
+    These run at whatever GNITZ_WORKERS is set (the e2e suite uses 4), so the
+    gather's sort + per-worker partition routing is exercised; at W=1 they
+    confirm the single-worker parity of the same path. The referenced values
+    span all partitions (parent PKs 1..N spread across workers)."""
+
+    def test_bulk_delete_referenced_blocked_unreferenced_succeeds(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            n = 20
+            pvals = ", ".join(f"({i}, {1000 + i})" for i in range(1, n + 1))
+            client.execute_sql(f"INSERT INTO p VALUES {pvals}", schema_name=sn)
+            # Children reference the codes of pid 1..10; pid 11..20 unreferenced.
+            cvals = ", ".join(f"({i}, {1000 + i})" for i in range(1, 11))
+            client.execute_sql(f"INSERT INTO c VALUES {cvals}", schema_name=sn)
+
+            # Bulk DELETE spanning referenced rows → blocked (RESTRICT).
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DELETE FROM p WHERE pid <= 10", schema_name=sn)
+            # Bulk DELETE of only unreferenced rows → succeeds.
+            client.execute_sql("DELETE FROM p WHERE pid > 10", schema_name=sn)
+
+            results = client.execute_sql("SELECT pid FROM p", schema_name=sn)
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            seen = sorted(row.pid for row in rows_result["rows"])
+            assert seen == list(range(1, 11))
+        finally:
+            _cleanup(client, sn, "c", "p")
+
+    def test_bulk_update_retire_referenced_blocked(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            n = 20
+            pvals = ", ".join(f"({i}, {1000 + i})" for i in range(1, n + 1))
+            client.execute_sql(f"INSERT INTO p VALUES {pvals}", schema_name=sn)
+            cvals = ", ".join(f"({i}, {1000 + i})" for i in range(1, 11))
+            client.execute_sql(f"INSERT INTO c VALUES {cvals}", schema_name=sn)
+
+            # Bulk UPDATE retiring referenced codes → blocked.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "UPDATE p SET code = code + 500000 WHERE pid <= 10",
+                    schema_name=sn,
+                )
+            # Bulk UPDATE of unreferenced rows → succeeds.
+            client.execute_sql(
+                "UPDATE p SET code = code + 500000 WHERE pid > 10", schema_name=sn
+            )
+
+            results = client.execute_sql("SELECT pid, code FROM p", schema_name=sn)
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            seen = sorted(
+                (row.pid, row.code) for row in rows_result["rows"] if row.pid > 10
+            )
+            assert seen == [(i, 1000 + i + 500000) for i in range(11, 21)]
+        finally:
+            _cleanup(client, sn, "c", "p")
+
+    def test_two_children_two_columns_single_gather(self, client):
+        """Two children referencing two distinct non-PK UNIQUE columns of one
+        parent: the single hoisted gather must resolve both columns so each
+        child's RESTRICT check sees its own referenced value."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED NOT NULL, email BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON p(email)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c1 (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, "
+                "eref BIGINT UNSIGNED REFERENCES p(email))",
+                schema_name=sn,
+            )
+            n = 12
+            pvals = ", ".join(
+                f"({i}, {1000 + i}, {7000 + i})" for i in range(1, n + 1)
+            )
+            client.execute_sql(f"INSERT INTO p VALUES {pvals}", schema_name=sn)
+            # c1 references code of pid=1; c2 references email of pid=2.
+            client.execute_sql("INSERT INTO c1 VALUES (1, 1001)", schema_name=sn)
+            client.execute_sql("INSERT INTO c2 VALUES (1, 7002)", schema_name=sn)
+
+            # Deleting pid=1 is blocked by c1 (code), pid=2 by c2 (email).
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DELETE FROM p WHERE pid = 2", schema_name=sn)
+            # An unreferenced parent row deletes fine.
+            client.execute_sql("DELETE FROM p WHERE pid = 3", schema_name=sn)
+
+            results = client.execute_sql("SELECT pid FROM p", schema_name=sn)
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            seen = sorted(row.pid for row in rows_result["rows"])
+            assert 3 not in seen and 1 in seen and 2 in seen
+        finally:
+            _cleanup(client, sn, "c1", "c2", "p")
+
+    def test_null_and_absent_referenced_value_never_block(self, client):
+        """A NULL referenced value blocks no child, and deleting a non-existent
+        PK is a harmless no-op — neither must error or block."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO p (pid, code) VALUES (1, NULL), (2, 500)", schema_name=sn
+            )
+            client.execute_sql("INSERT INTO c VALUES (1, 500)", schema_name=sn)
+
+            # NULL referenced value → delete not blocked.
+            client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=sn)
+            # Absent PK → no-op, no error, no block.
+            client.execute_sql("DELETE FROM p WHERE pid = 999", schema_name=sn)
+            # Referenced value still blocks.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DELETE FROM p WHERE pid = 2", schema_name=sn)
+
+            results = client.execute_sql("SELECT pid FROM p", schema_name=sn)
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            seen = sorted(row.pid for row in rows_result["rows"])
+            assert seen == [2]
+        finally:
+            _cleanup(client, sn, "c", "p")
