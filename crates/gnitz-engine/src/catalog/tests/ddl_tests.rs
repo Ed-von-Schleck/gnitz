@@ -296,7 +296,7 @@ fn test_restart_long_strings() {
         assert!(engine.get_by_name("longtest", "tbl").is_some());
         // Verify column name survived out-of-line blob round-trip
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
-        let col_defs = engine.read_column_defs(tid).unwrap();
+        let col_defs = engine.read_column_defs(tid);
         assert_eq!(col_defs.len(), 2);
         assert_eq!(col_defs[1].name, long_name, "Long column name corrupted after restart");
         engine.close();

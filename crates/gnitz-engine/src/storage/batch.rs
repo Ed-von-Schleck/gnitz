@@ -540,8 +540,8 @@ impl Batch {
     /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Used by tests today;
     /// activated as a production call site by the pending compound-PK
     /// migration of `ops/join.rs::write_join_row` and
-    /// `ops/reduce.rs::emit_reduce_row` (`plans/compound-pk.md`), which
-    /// switch `extend_pk(get_pk(...))` to `extend_pk_bytes(get_pk_bytes(...))`.
+    /// `ops/reduce.rs::emit_reduce_row`, which switch
+    /// `extend_pk(get_pk(...))` to `extend_pk_bytes(get_pk_bytes(...))`.
     #[allow(dead_code)]
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {

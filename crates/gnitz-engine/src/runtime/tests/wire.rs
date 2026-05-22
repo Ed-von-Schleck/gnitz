@@ -572,7 +572,7 @@ fn encode_ctrl_block_direct_matches_ipc() {
 }
 
 // ---------------------------------------------------------------------------
-// Scan chunking tests (plan 03-ipc-scan-chunking)
+// Scan chunking tests
 // ---------------------------------------------------------------------------
 
 use crate::runtime::wire::{

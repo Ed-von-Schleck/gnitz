@@ -235,19 +235,18 @@ pub(crate) fn collect_for_schema(
     id_to_qualified: &HashMap<i64, (String, String)>,
 ) -> Vec<String> {
     let mut result = Vec::new();
-    if let Ok(mut c) = table.create_cursor() {
-        while c.cursor.valid {
-            if c.cursor.current_weight > 0 {
-                let row_sid = cursor_read_u64(&c, schema_col) as i64;
-                if row_sid == sid {
-                    let eid = c.cursor.current_key as u64 as i64;
-                    if let Some((sn, en)) = id_to_qualified.get(&eid) {
-                        result.push(format!("{}.{}", sn, en));
-                    }
+    let mut c = table.open_cursor();
+    while c.cursor.valid {
+        if c.cursor.current_weight > 0 {
+            let row_sid = cursor_read_u64(&c, schema_col) as i64;
+            if row_sid == sid {
+                let eid = c.cursor.current_key as u64 as i64;
+                if let Some((sn, en)) = id_to_qualified.get(&eid) {
+                    result.push(format!("{}.{}", sn, en));
                 }
             }
-            c.cursor.advance();
         }
+        c.cursor.advance();
     }
     result
 }
@@ -293,10 +292,7 @@ pub(crate) fn copy_cursor_row_with_weight(
 /// Returns a single-row retraction batch (or empty batch if PK not found).
 pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_schema(*schema, 1);
-    let mut cursor = match table.create_cursor() {
-        Ok(c) => c,
-        Err(_) => return batch,
-    };
+    let mut cursor = table.open_cursor();
     cursor.cursor.seek(pk);
     if cursor.cursor.valid
         && cursor.cursor.current_key == pk
@@ -318,10 +314,7 @@ pub(crate) fn retract_rows_in_pk_range(
     pk_end: u128,
 ) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
-    let mut cursor = match table.create_cursor() {
-        Ok(c) => c,
-        Err(_) => return batch,
-    };
+    let mut cursor = table.open_cursor();
     cursor.cursor.seek(start);
 
     // Bulk path: single consolidated MemBatch source.
@@ -350,10 +343,7 @@ pub(crate) fn retract_rows_in_pk_range(
 /// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
 pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
-    let mut cursor = match table.create_cursor() {
-        Ok(c) => c,
-        Err(_) => return batch,
-    };
+    let mut cursor = table.open_cursor();
     cursor.cursor.seek(crate::util::make_pk(0, pk_hi));
 
     // Bulk path: single consolidated MemBatch source. Consolidated rows always

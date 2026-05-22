@@ -740,3 +740,56 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── seek_by_index orphaned-entry infinite-loop guard ─────────────────────
+//
+// An orphaned index entry (positive weight, no matching source row) must
+// terminate the seek scan, not spin: seek_by_index must seek once and walk
+// forward, never re-seek to the same orphan on each iteration.
+
+#[test]
+fn test_seek_by_index_orphan_entry_terminates() {
+    let dir = temp_dir("seek_by_index_orphan");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.orphan_t", &cols, &[0], false).unwrap();
+    engine.create_index("public.orphan_t", "val", false).unwrap();
+
+    // Locate the index circuit on `val` (col_idx 1) and grab its schema.
+    let n = engine.get_index_circuit_count(tid);
+    let idx_pos = (0..n)
+        .find(|&i| engine.get_index_circuit_info(tid, i).unwrap().0 == 1)
+        .expect("index circuit on col 1");
+    let idx_schema = engine.get_index_circuit_schema(tid, idx_pos).unwrap();
+    let idx_key_size = idx_schema.columns[0].size() as usize;
+
+    // Forge an orphan index row directly into the index table, bypassing the
+    // source-table ingest: index PK = (promoted indexed value || src_pk),
+    // weight +1, but no source row with src_pk=12345 exists.
+    let stride = idx_schema.pk_stride() as usize;
+    let mut pk = vec![0u8; stride];
+    pk[..idx_key_size].copy_from_slice(&777u64.to_le_bytes()[..idx_key_size]);
+    pk[idx_key_size..idx_key_size + 8].copy_from_slice(&12345u64.to_le_bytes());
+
+    let mut b = Batch::with_schema(idx_schema, 1);
+    b.extend_pk_bytes(&pk);
+    b.extend_weight(&1i64.to_le_bytes());
+    b.extend_null_bmp(&0u64.to_le_bytes());
+    b.count += 1;
+
+    let handle = engine.get_index_store_handle(tid, 1) as *mut Table;
+    assert!(!handle.is_null());
+    unsafe {
+        (*handle).ingest_owned_batch_memonly(b).unwrap();
+        (*handle).flush().unwrap();
+    }
+
+    // The indexed value resolves to an orphan whose source row is missing.
+    // Must return None and, crucially, must not hang.
+    let r = engine.seek_by_index(tid, 1, &777u64.to_le_bytes()).unwrap();
+    assert!(r.is_none(), "orphan index entry must resolve to no source row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

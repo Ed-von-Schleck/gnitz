@@ -115,7 +115,7 @@ impl CatalogEngine {
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
             let prefix_len = parent_pk_stride.min(idx_key_size);
             let idx_table = ic.table_mut();
-            let mut cursor = idx_table.create_cursor_no_compact();
+            let mut cursor = idx_table.open_cursor();
 
             for row in 0..batch.count {
                 if batch.get_weight(row) >= 0 { continue; }
@@ -169,7 +169,7 @@ impl CatalogEngine {
             let prefix_len = col_size.min(idx_key_size);
             let take = src_pk_stride.min(16);
             let idx_table = ic.table_mut();
-            let mut cursor = idx_table.create_cursor_no_compact();
+            let mut cursor = idx_table.open_cursor();
 
             // Promoted u128 key uniquely identifies the indexed value for
             // every type we accept (promote_to_index_key widens to ≤16 bytes).

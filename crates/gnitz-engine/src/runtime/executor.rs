@@ -846,8 +846,8 @@ async fn handle_scan(
     }
     let lsn = shared.last_tick_lsn.get();
 
-    // Plan 08B: on a cache miss, master sends a preliminary schema-only frame
-    // before dispatching workers. This eliminates N-1 redundant schema blocks
+    // On a cache miss, master sends a preliminary schema-only frame before
+    // dispatching workers. This eliminates N-1 redundant schema blocks
     // (one per worker) from the client's perspective.
     let server_version = shared.cat().get_schema_version(target_id);
     let include_schema = gnitz_wire::wire_should_include_schema(client_version, server_version);

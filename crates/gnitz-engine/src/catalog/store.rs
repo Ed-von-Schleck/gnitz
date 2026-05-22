@@ -119,10 +119,18 @@ impl CatalogEngine {
 
         let dep_map = self.dag.get_dep_map();
         for &id in &drop_ids {
-            if dep_map.get(&id).map(|v| !v.is_empty()).unwrap_or(false) {
-                let (sn, tn) = self.caches.entity_by_id.get(&id)
-                    .cloned().unwrap_or_default();
-                return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+            if let Some(dependents) = dep_map.get(&id) {
+                // A dependent that is itself being dropped in this same batch
+                // is self-resolving — only an *outside* dependent blocks the
+                // drop. drop_ids is sorted+deduped above, so binary_search is
+                // O(N log M) vs the O(N·M) of `contains`.
+                let still_active = dependents.iter()
+                    .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
+                if still_active {
+                    let (sn, tn) = self.caches.entity_by_id.get(&id)
+                        .cloned().unwrap_or_default();
+                    return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+                }
             }
         }
         Ok(())
@@ -208,9 +216,7 @@ impl CatalogEngine {
         // The CIRCUIT_* tables are now SQL-introspectable: every operator's
         // parameter shape is expressible in catalog schema.
         if let Some(table) = self.sys_table_mut(table_id) {
-            return Ok(table.full_scan().unwrap_or_else(|_| {
-                Rc::new(Batch::empty_with_schema(&schema))
-            }));
+            return Ok(table.full_scan());
         }
         Ok(self.scan_store(table_id, &schema))
     }
@@ -228,19 +234,14 @@ impl CatalogEngine {
         // Create cursor and seek. The new CircuitNodes/CircuitEdges/
         // CircuitNodeColumns layout is SQL-introspectable; only unrecognised
         // system table IDs return None.
-        let cursor_result = if table_id < FIRST_USER_TABLE_ID {
+        let mut cursor = if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
-                table.create_cursor()
+                table.open_cursor()
             } else {
                 return Ok(None);
             }
         } else {
-            self.dag.tables.get(&table_id).unwrap().handle.create_cursor()
-        };
-
-        let mut cursor = match cursor_result {
-            Ok(c) => c,
-            Err(_) => return Ok(None),
+            self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
         };
 
         cursor.cursor.seek(pk);
@@ -281,19 +282,26 @@ impl CatalogEngine {
         let idx_key_size = ic.index_schema.columns[0].size() as usize;
 
         let idx_table = ic.table_mut();
-        let mut cursor = idx_table.create_cursor_no_compact();
+        let mut cursor = idx_table.open_cursor();
 
-        while cursor.cursor.seek_first_positive_with_prefix(prefix) {
+        // Seek to the first positive-weight match, then walk forward with
+        // `walk_to_positive_with_prefix` after each consumed entry. Re-calling
+        // `seek_first_positive_with_prefix` inside the loop would re-seek and
+        // re-find the same entry forever — an orphaned index entry (positive
+        // weight, no source row) would spin.
+        let mut hit = cursor.cursor.seek_first_positive_with_prefix(prefix);
+        while hit {
             let current_pk = cursor.cursor.current_pk_bytes();
             let mut src_pk_buf = [0u8; 16];
             src_pk_buf[..src_pk_stride].copy_from_slice(
-                &current_pk[idx_key_size..idx_key_size + src_pk_stride]
+                &current_pk[idx_key_size..idx_key_size + src_pk_stride],
             );
             let src_pk = u128::from_le_bytes(src_pk_buf);
             if let Some(batch) = self.seek_family(table_id, src_pk)? {
                 return Ok(Some(batch));
             }
             cursor.cursor.advance();
+            hit = cursor.cursor.walk_to_positive_with_prefix(prefix);
         }
         Ok(None)
     }
@@ -465,11 +473,11 @@ impl CatalogEngine {
     }
 
     /// Get index store handle for a specific column index (for worker has_pk via index).
-    pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *mut Table {
+    pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *const Table {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
-            .map(|ic| std::ptr::addr_of!(*ic.index_table) as *mut Table)
-            .unwrap_or(std::ptr::null_mut())
+            .map(|ic| std::ptr::addr_of!(*ic.index_table))
+            .unwrap_or(std::ptr::null())
     }
 
     /// Get the SchemaDescriptor for the index circuit at position idx.
@@ -521,10 +529,8 @@ impl CatalogEngine {
         if let Some(names) = self.caches.col_names.get(&table_id) {
             return names.clone();
         }
-        let names = match self.read_column_defs(table_id) {
-            Ok(defs) => defs.into_iter().map(|cd| cd.name).collect(),
-            Err(_) => Vec::new(),
-        };
+        let names: Vec<String> = self.read_column_defs(table_id)
+            .into_iter().map(|cd| cd.name).collect();
         self.caches.col_names.insert(table_id, names.clone());
         names
     }
@@ -704,10 +710,10 @@ impl CatalogEngine {
 
     // -- Read column definitions from sys_columns --------------------------
 
-    pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Result<Vec<ColumnDef>, String> {
+    pub(crate) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
-        let mut cursor = self.sys_columns.create_cursor().map_err(|e| e.to_string())?;
+        let mut cursor = self.sys_columns.open_cursor();
         cursor.cursor.seek(start_pk as u128);
 
         let mut defs = Vec::new();
@@ -730,7 +736,7 @@ impl CatalogEngine {
             }
             cursor.cursor.advance();
         }
-        Ok(defs)
+        defs
     }
 
     pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_cols: &[u32]) -> SchemaDescriptor {
@@ -863,9 +869,6 @@ impl CatalogEngine {
             Some(e) => e,
             None => return Rc::new(Batch::empty_with_schema(schema)),
         };
-        match entry.handle.create_cursor() {
-            Ok(c) => c.cursor.materialize(),
-            Err(_) => Rc::new(Batch::empty_with_schema(schema)),
-        }
+        entry.handle.open_cursor().cursor.materialize()
     }
 }

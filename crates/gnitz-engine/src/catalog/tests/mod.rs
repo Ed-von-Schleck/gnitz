@@ -43,12 +43,10 @@ fn u128_col_def(name: &str) -> ColumnDef {
 
 fn count_records(table: &mut Table) -> usize {
     let mut count = 0;
-    if let Ok(cursor) = table.create_cursor() {
-        let mut c = cursor;
-        while c.cursor.valid {
-            if c.cursor.current_weight > 0 { count += 1; }
-            c.cursor.advance();
-        }
+    let mut c = table.open_cursor();
+    while c.cursor.valid {
+        if c.cursor.current_weight > 0 { count += 1; }
+        c.cursor.advance();
     }
     count
 }

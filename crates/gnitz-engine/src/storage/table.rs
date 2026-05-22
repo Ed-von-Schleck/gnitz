@@ -408,39 +408,43 @@ impl Table {
     // Cursor
     // ------------------------------------------------------------------
 
-    /// Create a cursor over all data (memtable runs + shards).
-    /// Runs compaction if needed.  Returns an opaque CursorHandle.
-    pub fn create_cursor(&mut self) -> Result<CursorHandle, StorageError> {
-        self.compact_if_needed()?;
-        let snapshots = self.memtable.snapshot_runs();
-        let shard_arcs = self.shard_index.all_shard_arcs();
-        let handle = read_cursor::create_cursor_from_snapshots(snapshots, &shard_arcs, self.schema);
-        Ok(handle)
-    }
-
-    /// Read-only cursor that skips `compact_if_needed`. Hot-path queries
-    /// (unique-index existence checks via prefix scan) don't need an
-    /// up-to-date L1; running compaction synchronously inside the validator
-    /// turns its Io / InvalidShard failure modes into spurious "no match"
-    /// answers. The snapshot-driven cursor itself doesn't care whether L0
-    /// has accumulated past the compact threshold.
-    pub fn create_cursor_no_compact(&self) -> CursorHandle {
+    /// Open a read-only cursor over (memtable runs + shards).
+    /// Does NOT mutate the table — compaction is a maintenance operation,
+    /// not part of the read path. Cheap and infallible.
+    ///
+    /// This is the recommended default. Use `create_cursor_compacting` only
+    /// when the caller explicitly wants L0→L1 to run synchronously (manual
+    /// FLUSH, foreground checkpoint, etc.). The snapshot-driven cursor itself
+    /// doesn't care whether L0 has accumulated past the compact threshold.
+    pub fn open_cursor(&self) -> CursorHandle {
         let snapshots = self.memtable.snapshot_runs();
         let shard_arcs = self.shard_index.all_shard_arcs();
         read_cursor::create_cursor_from_snapshots(snapshots, &shard_arcs, self.schema)
     }
 
+    /// Open a cursor after running `compact_if_needed`. Intended for
+    /// maintenance / flush paths that want an up-to-date L1.
+    ///
+    /// **Do not use from validators.** A compaction `Err` returned here is a
+    /// correctness hazard if the caller treats cursor absence as "no match":
+    /// a transient Io turns "value exists" into "value absent", silently
+    /// corrupting unique-index / FK checks. Use `open_cursor` instead.
+    pub fn create_cursor_compacting(&mut self) -> Result<CursorHandle, StorageError> {
+        self.compact_if_needed()?;
+        Ok(self.open_cursor())
+    }
+
     /// Return the fully consolidated batch of all live rows, caching the result.
     /// The cache is invalidated on any logical write (upsert or test-helper upsert).
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
-    pub fn full_scan(&mut self) -> Result<Rc<Batch>, StorageError> {
+    /// Infallible: delegates to `open_cursor`.
+    pub fn full_scan(&mut self) -> Rc<Batch> {
         if let Some(ref rc) = self.cached_full_scan {
-            return Ok(Rc::clone(rc));
+            return Rc::clone(rc);
         }
-        let handle = self.create_cursor()?;
-        let rc = handle.cursor.materialize();
+        let rc = self.open_cursor().cursor.materialize();
         self.cached_full_scan = Some(Rc::clone(&rc));
-        Ok(rc)
+        rc
     }
 
     /// Borrow the current memtable runs (for PartitionedTable cursor
@@ -821,7 +825,7 @@ mod tests {
 
         t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)])).unwrap();
 
-        let cursor = t.create_cursor().unwrap();
+        let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key as u64, 10);
         // Don't need to iterate further — cursor creation works
@@ -928,7 +932,7 @@ mod tests {
         t.ingest_owned_batch(batch).unwrap();
 
         // Cursor must yield rows in ascending PK order
-        let cursor = t.create_cursor().unwrap();
+        let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key as u64, 10, "cursor should start at PK=10 (smallest)");
     }
@@ -963,7 +967,7 @@ mod tests {
         t.ingest_owned_batch(make_batch(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)])).unwrap();
 
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
-        let cursor = t.create_cursor().unwrap();
+        let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key as u64, 1, "cursor should start at PK=1 from flushed shard");
     }

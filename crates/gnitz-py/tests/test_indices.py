@@ -504,6 +504,53 @@ class TestIndexIntegrity:
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
 
+    def test_unique_index_anticorrelated_multi_source(self, client):
+        """Unique-constraint check must hold across an anti-correlated,
+        multi-source index.
+
+        The duplicate check seeks the indexed value in the secondary index,
+        whose PK is compound ``(value, src_pk)``. With several distinct values
+        inserted one-per-push (anti-correlated: value falls as pk rises), the
+        check merges N runs. If that merge orders by the raw u128 PK
+        (``(src_pk, value)``) instead of column order (``(value, src_pk)``),
+        the seek for a smaller value lands on a larger value's run, reports
+        "absent", and a duplicate slips through. Every duplicate here must be
+        rejected.
+        """
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            n = 6
+            vals = [(n - i) * 100 for i in range(n)]  # 600,500,...,100
+            for i, val in enumerate(vals):
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({i + 1}, {val})", schema_name=sn)
+            # Re-inserting any existing value (with a fresh pk) must be
+            # rejected — including the smallest values, which under a u128
+            # merge would be masked by a larger value's run.
+            for j, val in enumerate(vals):
+                try:
+                    client.execute_sql(
+                        f"INSERT INTO t VALUES ({1000 + j}, {val})",
+                        schema_name=sn,
+                    )
+                    raise AssertionError(
+                        f"duplicate val={val} was accepted — unique check "
+                        f"missed it (index merge order bug)"
+                    )
+                except gnitz.GnitzError:
+                    pass  # expected: duplicate rejected
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
     def test_create_view_with_filter(self, client):
         """CREATE VIEW with a WHERE clause succeeds."""
         sn = _sn()
@@ -817,6 +864,52 @@ class TestIndexReadBarrier:
                 rows = results[0]["rows"]
                 assert len(rows.batch.pks) == 1
                 assert rows.batch.pks[0] == i + 1
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_index_seek_anticorrelated_multi_source(self, client):
+        """Index seek must hold when the indexed value and source PK are
+        ANTI-correlated across many pushes.
+
+        A secondary index has a compound PK ``(indexed_value, src_pk)``. The
+        read-cursor's N-way merge must order it the same way storage sorts
+        each run — column order ``(value, src_pk)`` — not by the raw u128
+        view of the PK bytes (which would order by ``(src_pk, value)`` because
+        src_pk lands in the high 64 bits). Correlated data (value rising with
+        pk) hides the difference; anti-correlated data (value falling as pk
+        rises) makes the two orders disagree, so a wrong merge order seeks the
+        wrong run's head and the lookup misses.
+        """
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            n = 6
+            # Each INSERT is a separate push -> a separate index run, so the
+            # lookup below merges N anti-correlated sources.
+            for i in range(n):
+                pk = i + 1
+                val = (n - i) * 100  # pk=1->600, pk=2->500, ... pk=6->100
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({pk}, {val})", schema_name=sn)
+            for i in range(n):
+                pk = i + 1
+                val = (n - i) * 100
+                results = client.execute_sql(
+                    f"SELECT * FROM t WHERE val = {val}", schema_name=sn)
+                assert results[0]["type"] == "Rows"
+                rows = results[0]["rows"]
+                assert len(rows.batch.pks) == 1, \
+                    f"val={val} (pk={pk}) not found — index merge order bug"
+                assert rows.batch.pks[0] == pk, \
+                    f"val={val} resolved to pk={rows.batch.pks[0]}, expected {pk}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],

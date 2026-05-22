@@ -119,7 +119,7 @@ impl CatalogEngine {
                 // with the DAG already populated. Skip to avoid double-registration.
                 if self.dag.tables.contains_key(&tid) { continue; }
 
-                let col_defs = self.read_column_defs(tid)?;
+                let col_defs = self.read_column_defs(tid);
                 if col_defs.is_empty() {
                     return Err(format!(
                         "catalog invariant violated: table '{}' (tid={}) registered \
@@ -208,7 +208,7 @@ impl CatalogEngine {
                 // views are not, so this only skips re-registration on replay.
                 if self.dag.tables.contains_key(&vid) { continue; }
 
-                let col_defs = self.read_column_defs(vid)?;
+                let col_defs = self.read_column_defs(vid);
                 if col_defs.is_empty() {
                     return Err(format!(
                         "catalog invariant violated: view '{}' (vid={}) registered \

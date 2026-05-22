@@ -12,7 +12,7 @@ use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::{ColPtr, MemBatch, UnifiedSource};
+use super::merge::{make_slow_pk_cmp, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
 thread_local! {
@@ -51,10 +51,25 @@ impl std::ops::DerefMut for DrainGuard {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
+/// 65 536 × 16 bytes = 1 MB. Caps the retained scratch so a one-off oversized
+/// query can't pin an unusually large allocation for the thread's lifetime.
+const MAX_DRAIN_BUFFER_CAP: usize = 65_536;
+
 impl Drop for DrainGuard {
     #[inline]
     fn drop(&mut self) {
-        DRAIN_BUFFER.with(|b| b.set(std::mem::take(&mut self.inner)));
+        DRAIN_BUFFER.with(|b| {
+            // Keep whichever Vec has the larger capacity. A nested cursor may
+            // drop a smaller guard after we took the (larger) thread-local;
+            // unconditionally writing our own inner back would shrink it.
+            let mut cached = b.take();
+            if self.inner.capacity() > cached.capacity()
+                && self.inner.capacity() <= MAX_DRAIN_BUFFER_CAP
+            {
+                cached = std::mem::take(&mut self.inner);
+            }
+            b.set(cached);
+        });
     }
 }
 
@@ -339,6 +354,19 @@ pub struct ReadCursor {
     mode: SourceMode,
     schema: SchemaDescriptor,
     is_fast: bool,
+    /// PK comparator for the merge. `None` is the fast path: a single-column
+    /// unsigned narrow PK whose raw `u128` key compare already equals the
+    /// storage sort order. `Some` (compound PK, or single-column signed/float)
+    /// holds [`make_slow_pk_cmp`] — the same column-aware comparator the
+    /// storage layer (`merge.rs`) sorts each source run by. Using the `u128`
+    /// order for those would desync the merge from the on-disk order: a
+    /// compound `(u64, u64)` key puts col_B in the high bits, so `u128` compare
+    /// orders by `(col_B, col_A)` while storage orders by `(col_A, col_B)`.
+    ///
+    /// Built once per cursor and shared by every `build_tree`/`drive` call —
+    /// `make_slow_pk_cmp` copies the full `SchemaDescriptor`, so rebuilding it
+    /// per `drive` would memcpy that on every emitted row.
+    pk_cmp: Option<Box<dyn Fn(u128, u128) -> Ordering>>,
     // Current row state
     pub valid: bool,
     pub current_key: u128,
@@ -360,16 +388,24 @@ impl ReadCursor {
         states: &[CursorState],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
+        pk_cmp: Option<&dyn Fn(u128, u128) -> Ordering>,
     ) -> LoserTree {
+        // Mirror the storage sort order (merge.rs): PK-primary via the same
+        // comparator each source run was sorted by, then payload tie-break.
         let less = move |a: &HeapNode, b: &HeapNode| {
-            if a.key != b.key {
-                return a.key < b.key;
+            let pk_ord = match pk_cmp {
+                None => a.key.cmp(&b.key),
+                Some(f) => f(a.key, b.key),
+            };
+            match pk_ord {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => row_cmp(
+                    schema,
+                    &sources[a.source_idx], a.row,
+                    &sources[b.source_idx], b.row,
+                ) == Ordering::Less,
             }
-            row_cmp(
-                schema,
-                &sources[a.source_idx], a.row,
-                &sources[b.source_idx], b.row,
-            ) == Ordering::Less
         };
         LoserTree::build(
             sources.len(),
@@ -389,26 +425,33 @@ impl ReadCursor {
         states: &[CursorState],
         schema: &SchemaDescriptor,
         is_fast: bool,
+        pk_cmp: Option<&dyn Fn(u128, u128) -> Ordering>,
     ) -> LoserTree {
         // Wrap as a non-capturing closure: a direct fn-item reference would
         // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
         #[allow(clippy::redundant_closure)]
         if is_fast {
             Self::build_tree_with(sources, states, schema,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi))
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi),
+                pk_cmp)
         } else {
             Self::build_tree_with(sources, states, schema,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi))
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi),
+                pk_cmp)
         }
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
         let is_fast = columnar::schema_is_int_nonnull(&schema);
+        let pk_cmp: Option<Box<dyn Fn(u128, u128) -> Ordering>> = (!schema.pk_is_fast())
+            .then(|| Box::new(make_slow_pk_cmp(&schema)) as Box<dyn Fn(u128, u128) -> Ordering>);
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
-            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, is_fast)),
+            _ => SourceMode::Multi(
+                Self::build_tree(&sources, &states, &schema, is_fast, pk_cmp.as_deref()),
+            ),
         };
         let mut cursor = ReadCursor {
             sources,
@@ -417,6 +460,7 @@ impl ReadCursor {
             mode,
             schema,
             is_fast,
+            pk_cmp,
             valid: false,
             current_key: 0,
             current_weight: 0,
@@ -434,7 +478,7 @@ impl ReadCursor {
         }
         if let SourceMode::Multi(_) = &self.mode {
             self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast),
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast, self.pk_cmp.as_deref()),
             );
         }
         self.drive();
@@ -453,7 +497,7 @@ impl ReadCursor {
         }
         if let SourceMode::Multi(_) = &self.mode {
             self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast),
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast, self.pk_cmp.as_deref()),
             );
         }
         self.drive();
@@ -480,6 +524,16 @@ impl ReadCursor {
         let copy_len = prefix.len().min(stride);
         key[..copy_len].copy_from_slice(&prefix[..copy_len]);
         self.seek_bytes(&key[..stride]);
+        self.walk_to_positive_with_prefix(prefix)
+    }
+
+    /// Walk forward from the current position (no seek) to the next row whose
+    /// PK begins with `prefix` and whose weight is `> 0`. Returns `false` once
+    /// the prefix range ends or the cursor exhausts. The seek-less companion to
+    /// [`seek_first_positive_with_prefix`]: callers that already consumed one
+    /// match `advance()` past it then call this to find the next, instead of
+    /// re-seeking (which would re-find the same entry and spin forever).
+    pub fn walk_to_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         while self.valid {
             if !self.current_pk_bytes().starts_with(prefix) {
                 return false;
@@ -573,10 +627,21 @@ impl ReadCursor {
         // it inside the emit closure that runs at most once per call.
         let mut emitted: Option<(u128, i64, usize, usize)> = None;
 
+        // Same PK-primary-then-payload order the storage layer sorted each
+        // source by; the prebuilt `pk_cmp` is `Some` only when the u128 fast
+        // path is unsound (compound or signed/float single-column PK).
+        let pk_cmp = self.pk_cmp.as_deref();
         let less = |a: &HeapNode, b: &HeapNode| -> bool {
-            if a.key != b.key { return a.key < b.key; }
-            row_cmp(schema, &sources[a.source_idx], a.row,
-                            &sources[b.source_idx], b.row) == Ordering::Less
+            let pk_ord = match pk_cmp {
+                None => a.key.cmp(&b.key),
+                Some(f) => f(a.key, b.key),
+            };
+            match pk_ord {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
+                                                   &sources[b.source_idx], b.row) == Ordering::Less,
+            }
         };
         drive_merge(
             heap, less,
@@ -1288,4 +1353,53 @@ mod tests {
         }
     }
 
+    fn make_compound_pk_schema() -> SchemaDescriptor {
+        // 2×U64 compound PK (stride 16): col_A in PK bytes 0..8, col_B in 8..16.
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        )
+    }
+
+    /// Multi-source merge over a compound `(col_A, col_B)` PK must order by
+    /// `(col_A, col_B)`. As a raw `u128`, col_B occupies the high 64 bits, so
+    /// the integer-comparison shortcut would (wrongly) order by `(col_B,
+    /// col_A)`. Chosen rows make the two orderings disagree.
+    #[test]
+    fn test_compound_pk_multi_source_merge_order() {
+        let schema = make_compound_pk_schema();
+        let pack = |a: u64, b: u64| (a as u128) | ((b as u128) << 64);
+        let make = |a: u64, b: u64, val: i64| -> Rc<Batch> {
+            let mut bt = Batch::with_schema(schema, 1);
+            bt.extend_pk(pack(a, b));
+            bt.extend_weight(&1i64.to_le_bytes());
+            bt.extend_null_bmp(&0u64.to_le_bytes());
+            bt.extend_col(0, &val.to_le_bytes());
+            bt.count += 1;
+            bt.sorted = true;
+            bt.consolidated = true;
+            Rc::new(bt)
+        };
+        // (1,2) precedes (2,1) by (col_A, col_B); the raw-u128 order is reversed.
+        let b1 = make(1, 2, 100);
+        let b2 = make(2, 1, 200);
+        let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
+
+        let mut emitted = Vec::new();
+        while cursor.valid {
+            let a = cursor.current_key as u64;
+            let b = (cursor.current_key >> 64) as u64;
+            emitted.push((a, b));
+            cursor.advance();
+        }
+        assert_eq!(
+            emitted,
+            vec![(1u64, 2u64), (2u64, 1u64)],
+            "compound PK must order by (col_A, col_B), not raw u128 (col_B, col_A)",
+        );
+    }
 }

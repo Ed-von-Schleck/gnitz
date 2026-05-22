@@ -170,8 +170,8 @@ fn open_system_cursor(
     if table.is_null() {
         return None;
     }
-    let t = unsafe { &mut *table };
-    let mut ch = t.create_cursor().ok()?;
+    let t = unsafe { &*table };
+    let mut ch = t.open_cursor();
     ch.cursor.seek(crate::util::make_pk(0, view_id));
     Some(ch)
 }

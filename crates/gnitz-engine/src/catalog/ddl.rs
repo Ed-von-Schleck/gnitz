@@ -242,7 +242,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
         // Find column
-        let col_defs = self.read_column_defs(owner_id)?;
+        let col_defs = self.read_column_defs(owner_id);
         let col_idx = col_defs.iter().position(|cd| cd.name == col_name)
             .ok_or("Column not found in owner")?;
 
@@ -298,8 +298,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
 
         // Read the full index record from sys_indices to retract it
-        let mut cursor = self.sys_indices.create_cursor()
-            .map_err(|e| format!("cursor error: {}", e))?;
+        let mut cursor = self.sys_indices.open_cursor();
         cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
 
         if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
@@ -413,7 +412,7 @@ impl CatalogEngine {
     // -- FK auto-index creation -------------------------------------------
 
     pub(crate) fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
-        let col_defs = self.read_column_defs(table_id)?;
+        let col_defs = self.read_column_defs(table_id);
         let pk_list = self.caches.pk_col_of.get(&table_id)
             .copied().unwrap_or_else(|| PkColList::single(0));
 

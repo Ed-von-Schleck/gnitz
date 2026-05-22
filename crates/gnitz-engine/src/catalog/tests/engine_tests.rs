@@ -28,8 +28,7 @@ fn test_enforce_unique_pk() {
     };
 
     let scan = |table: &mut Table| -> usize {
-        let cursor = table.create_cursor().unwrap();
-        let mut c = cursor;
+        let mut c = table.open_cursor();
         let mut count = 0;
         while c.cursor.valid {
             if c.cursor.current_weight > 0 { count += 1; }

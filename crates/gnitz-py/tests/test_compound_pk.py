@@ -1,8 +1,8 @@
 """End-to-end tests for compound (multi-column) PRIMARY KEY tables.
 
-Covers schema acceptance/rejection (planner gate from
-`plans/compound-pk-planner-gate.md`), INSERT/SELECT/DELETE round-trips,
-byte-path PK delivery, and named-projection through `apply_projection`.
+Covers schema acceptance/rejection (planner gate), INSERT/SELECT/DELETE
+round-trips, byte-path PK delivery, and named-projection through
+`apply_projection`.
 
 The Python `Schema` shim still exposes a single `pk_index` (it calls
 `pk_index_single()` under the hood), so the introspection API is not
@@ -314,9 +314,8 @@ def test_compound_pk_insert_distinct_rows_round_trip(client):
             schema_name=sn,
         )
         # Read back via SELECT *. Named projection through
-        # `apply_projection` rebuilds the schema as single-PK (see
-        # `plans/apply-projection-compound-pk.md`), so we go through
-        # the wildcard branch that returns the source batch unchanged.
+        # `apply_projection` rebuilds the schema as single-PK, so we go
+        # through the wildcard branch that returns the source batch unchanged.
         # This exercises compound-PK byte decoding: the second PK
         # column lives in bytes 8..16 of each row's PK region.
         results = client.execute_sql("SELECT * FROM t", schema_name=sn)
@@ -376,8 +375,7 @@ def test_compound_pk_multi_worker_partition_routing(client):
         expected = [(i, (i * 7) % 11, i * 100) for i in range(20)]
         values = ", ".join(f"({a}, {b}, {p})" for (a, b, p) in expected)
         client.execute_sql(f"INSERT INTO t (a, b, payload) VALUES {values}", schema_name=sn)
-        # SELECT * sidesteps apply_projection's single-PK assumption
-        # (see plans/apply-projection-compound-pk.md).
+        # SELECT * sidesteps apply_projection's single-PK assumption.
         results = client.execute_sql("SELECT * FROM t", schema_name=sn)
         rows_result = next(r for r in results if r["type"] == "Rows")
         seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
@@ -513,7 +511,7 @@ def test_compound_pk_delete_by_bytes(client):
 
 
 # ---------------------------------------------------------------------------
-# Named projection through apply_projection (see plans/apply-projection-compound-pk.md)
+# Named projection through apply_projection
 # ---------------------------------------------------------------------------
 
 

@@ -37,6 +37,13 @@ impl PartitionedTable {
         part_end: u32,
         arena_size: u64,
     ) -> Result<Self, StorageError> {
+        // `mix` is hardcoded to 256 buckets (`(h >> 56) as usize`); any other
+        // partition count makes `part_indices[p]` index out of bounds in
+        // `ingest_owned_batch`. Programming invariant — must fire in release.
+        assert!(
+            num_partitions == 1 || num_partitions == 256,
+            "PartitionedTable supports only 1 or 256 partitions, got {num_partitions}",
+        );
         table::ensure_dir(dir)?;
 
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
@@ -119,13 +126,39 @@ impl PartitionedTable {
     // Cursor
     // ------------------------------------------------------------------
 
-    pub fn create_cursor(&mut self) -> Result<CursorHandle, StorageError> {
+    /// Open a read-only cursor over every partition (memtable runs + shards).
+    /// Infallible, non-mutating — the recommended default. See
+    /// `Table::open_cursor`.
+    pub fn open_cursor(&self) -> CursorHandle {
+        if self.tables.is_empty() {
+            return read_cursor::create_cursor_from_snapshots(&[], &[], self.schema);
+        }
+        if self.num_partitions == 1 {
+            return self.tables[0].open_cursor();
+        }
+        let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
+        let mut all_shard_arcs: Vec<Rc<MappedShard>> = Vec::new();
+        for table in &self.tables {
+            all_snapshots.extend(table.snapshot_runs().iter().cloned());
+            all_shard_arcs.extend(table.all_shard_arcs());
+        }
+        read_cursor::create_cursor_from_snapshots(
+            &all_snapshots, &all_shard_arcs, self.schema,
+        )
+    }
+
+    /// Open a cursor after running `compact_if_needed` on each partition.
+    /// Maintenance-only — see `Table::create_cursor_compacting` for the
+    /// validator hazard this name surfaces. The lint guards external callers,
+    /// not this delegation.
+    #[allow(clippy::disallowed_methods)]
+    pub fn create_cursor_compacting(&mut self) -> Result<CursorHandle, StorageError> {
         if self.tables.is_empty() {
             return Ok(read_cursor::create_cursor_from_snapshots(&[], &[], self.schema));
         }
 
         if self.num_partitions == 1 {
-            return self.tables[0].create_cursor();
+            return self.tables[0].create_cursor_compacting();
         }
 
         let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
@@ -257,6 +290,9 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     pub fn close_partitions_outside(&mut self, start: u32, end: u32) {
+        // The cached index refers to the old `tables` layout; rebuilding the
+        // vector below would leave it dangling.
+        self.last_found_partition = None;
         assert!(
             start <= end,
             "close_partitions_outside: start ({start}) > end ({end})",
@@ -281,6 +317,7 @@ impl PartitionedTable {
     }
 
     pub fn close_all_partitions(&mut self) {
+        self.last_found_partition = None;
         self.tables.clear();
         self.part_offset = 0;
     }
@@ -448,7 +485,7 @@ mod tests {
 
         pt.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200), (40, 1, 400)])).unwrap();
 
-        let cursor = pt.create_cursor().unwrap();
+        let cursor = pt.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key as u64, 10);
     }
@@ -592,5 +629,36 @@ mod tests {
         pt.close_partitions_outside(100, 110);
         assert_eq!(pt.tables.len(), 10);
         assert_eq!(pt.part_offset, 100);
+    }
+
+    /// A stale `last_found_partition` (set by a prior `retract_pk` hit) must be
+    /// invalidated when `close_partitions_outside` rebuilds the `tables` vector,
+    /// or `found_null_word()` would index into the now-smaller vector.
+    #[test]
+    fn close_partitions_outside_invalidates_found_partition() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("cpo_stale_test");
+        let schema = make_schema();
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 600, 256, false, 0, 256,
+            partition_arena_size(256),
+        ).unwrap();
+
+        // Pick a PK whose partition we can exclude from the surviving range.
+        let pk = 12345u128;
+        let part = partition_for_key(pk) as u32;
+        pt.ingest_owned_batch(make_batch(&[(pk as u64, 1, 999)])).unwrap();
+
+        let (_, found) = pt.retract_pk(pk);
+        assert!(found, "row must be found, setting last_found_partition");
+
+        // Close every partition except a small range that excludes `part`.
+        let (start, end) = if part >= 200 { (0u32, 10u32) } else { (200u32, 210u32) };
+        pt.close_partitions_outside(start, end);
+
+        // Must not panic and must report the cleared-found default.
+        assert_eq!(pt.found_null_word(), 0);
+        assert!(pt.found_col_ptr(0, 8).is_null());
     }
 }

@@ -31,30 +31,38 @@ negative weights, but base table traces never accumulate negative net
 weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 4.5/4.6 (distinct-elimination) require positive inputs.
 
-**Single-column PKs only.** Each table has exactly one PK column
-(enforced by schema validation). PK types are unsigned scalars (U8/U16/U32/
-U64/U128/UUID), signed scalars (I8/I16/I32/I64), or floats (F32/F64). The
-128-bit API surface holds one column value: `(lo, hi)` for U128, `(value, 0)`
-for narrower types (with the column's native LE bytes in the low `pk_stride`
-bytes and zeros above).
+**Compound PKs (1–4 columns).** A table's primary key is an ordered list
+of 1–4 columns. Each PK column is an unsigned scalar (U8/U16/U32/U64/
+U128/UUID), signed scalar (I8/I16/I32/I64), or float (F32/F64); STRING
+and BLOB cannot be PK columns, and PK columns are non-nullable. The PK
+occupies a 128-bit slot (`pk_lo`/`pk_hi`): each column's native LE bytes
+are packed tightly in PK-list order into the low `pk_stride` bytes, with
+zeros above. A lone U64 PK is `(value, 0)`; a `(U64, U64)` compound PK
+fills both halves. The packed key must fit the slot, so the total
+`pk_stride` is one of {1, 2, 4, 8, 16} bytes.
 
 **Physical stride narrowing.** Shard files, WAL blocks, and wire batches
-store only `pk_stride` bytes per PK row: 1/2/4/8 bytes for narrow scalars,
-16 bytes for U128. The in-engine `ArenaZSetBatch` uses a 128-bit PK slot
-(pk_lo + pk_hi u64s) regardless of schema type. Boundary code packs the
-column's native LE bytes into the low `pk_stride` bytes and zeros the rest;
-the wire/shard layer truncates back to `pk_stride` bytes on emit.
+store only `pk_stride` bytes per PK row — the sum of the PK columns' wire
+strides (1/2/4/8 bytes for a narrow scalar, 16 for U128, or their compound
+sum). The in-engine `ArenaZSetBatch` uses a 128-bit PK slot (pk_lo + pk_hi
+u64s) regardless of schema type. Boundary code packs the PK columns' native
+LE bytes into the low `pk_stride` bytes and zeros the rest; the wire/shard
+layer truncates back to `pk_stride` bytes on emit.
 
-**PK ordering is type-aware.** Unsigned PKs (U8/U16/U32/U64/U128/UUID)
-sort by their packed u128 — `a.cmp(&b)` agrees with the column's native
-unsigned order (the "fast" comparator arm, selected by `SchemaDescriptor::
-pk_is_fast`). Signed PKs (I8/I16/I32/I64) and floats (F32/F64) require
-the "slow" comparator (`storage::make_slow_pk_cmp`) which interprets the
-low `pk_stride` bytes as the column's native type and applies signed or
-`total_cmp` ordering. Raw u128 ordering of `-1_i64`'s packed bytes
-(`0xFFFF…`) would sort it AFTER `+1`, inverting the signed order. The
-sort-merge, scatter-merge-walk, and reduce code paths all branch on
-`pk_is_fast` to pick the correct comparator.
+**PK ordering is type-aware.** A single unsigned PK column (U8/U16/U32/
+U64/U128/UUID) sorts by its packed u128 — `a.cmp(&b)` agrees with the
+column's native unsigned order (the "fast" comparator arm, selected by
+`SchemaDescriptor::pk_is_fast`, which holds only for a single unsigned
+column). Everything else takes the "slow" comparator
+(`storage::make_slow_pk_cmp`): a single signed (I8/I16/I32/I64) or float
+(F32/F64) column interprets the low `pk_stride` bytes as its native type
+and applies signed or `total_cmp` ordering; a compound PK walks its
+columns in PK-list order via the column-aware `compare_pk_bytes`. Raw
+u128 ordering of `-1_i64`'s packed bytes (`0xFFFF…`) would sort it AFTER
+`+1`, inverting the signed order — and the column boundaries of a compound
+key are likewise invisible to a flat u128 compare. The sort-merge,
+scatter-merge-walk, and reduce code paths all branch on `pk_is_fast` to
+pick the correct comparator.
 
 **Hash invariant.** `hash_u128(v as u128) == hash_u128(v)` for all narrow
 PK types (after the native-LE pack-and-zero-extend described above). XOR8
@@ -156,7 +164,7 @@ Only non-linear and bilinear operators need the integral. The output of
 - **GnitzDB's symmetric 2-term form:**
   `d(A ⋈ B) = dA ⋈ z⁻¹(I(B)) + dB ⋈ z⁻¹(I(A))`
   Both sides use old-state cursors. Correct under single-source-per-epoch
-  (dA ⋈ dB = 0). Must be revised if batched multi-source epochs are added.
+  (dA ⋈ dB = 0).
 - Require integral of both operands. Consolidation required.
 - **Join output schema:** `[left_PK, left_payload..., right_payload...]`.
   Output PK = left input PK (= join key after exchange repartition).
@@ -256,12 +264,6 @@ Pending-group drain: pops one entry at a time, accumulates weight while
 (PK, payload) matches, flushes on differ — same algorithm as 4b.
 Per-shard data is already consolidated; cross-shard duplicates are not.
 
-Historical bug (fixed 2026-03): the heap used PK-only ordering.
-`collect_min_indices` used full comparison but its tree walk stopped at
-non-equal nodes, missing matching entries deeper in the heap. This
-corrupted any table flushed between ticks where retractions and
-insertions for the same (PK, payload) ended up in different shards.
-
 ## 5. Row Comparison: `compare_rows`
 
 Compares **payload columns only** (PK compared separately). Iterates
@@ -282,13 +284,13 @@ inputs, including NaN.
 ## 6. The Region Convention
 
 Column buffers are stored as flat (pointer, size) pairs in canonical order.
-This layout applies to WAL blocks (WAL_FORMAT_VERSION ≥ 4) and shard files
-(SHARD_VERSION ≥ 6). `pk_stride` is the sum of each PK column's `wire_stride()`,
-tightly packed: 1/2/4/8 bytes for single narrow scalar PKs, 16 bytes for U128,
-or the compound sum for multi-column PKs.
+This layout applies to WAL blocks and shard files. `pk_stride` is the sum
+of each PK column's `wire_stride()`, tightly packed: 1/2/4/8 bytes for a
+single narrow scalar PK, 16 bytes for U128, or the compound sum for
+multi-column PKs.
 
 ```
-region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {1, 2, 4, 8, 16, …})
+region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {1, 2, 4, 8, 16})
 region[1] = weight     (count × 8 bytes, i64 LE)
 region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
 region[3..3+P-1] = payload columns (non-PK, schema order)
@@ -297,8 +299,9 @@ region[3+P] = blob     (variable-length string heap)
 
 The in-engine `ArenaZSetBatch` uses separate pk_lo (u64) and pk_hi (u64)
 fields in its columnar layout regardless of schema type. Boundary code
-(WAL encode/decode, shard read/write) packs the column's native LE bytes
-into the low `pk_stride` bytes of the 128-bit slot and truncates back to
+(WAL encode/decode, shard read/write) packs each PK column's native LE
+bytes, in PK-list order, into the low `pk_stride` bytes of the 128-bit
+slot and truncates back to
 `pk_stride` on emit. Signed integers and floats use their native bit
 patterns (`(v as iN as uN) as u128`, `to_bits()`), not sign-extension —
 the type-aware comparator (§1 "PK ordering is type-aware") restores the

@@ -1082,14 +1082,14 @@ impl WorkerProcess {
                 // Index layout: PK = (indexed-key field, src_pk_cols). The
                 // check-batch carries the promoted indexed value in the low
                 // bytes of its PK. Any positive-weight match means the value
-                // is already in the index. `create_cursor_no_compact` avoids
-                // letting a compaction Io/InvalidShard failure silently turn
-                // a present key into "absent".
+                // is already in the index. `open_cursor` avoids letting a
+                // compaction Io/InvalidShard failure silently turn a present
+                // key into "absent".
                 let owner_schema = self.cat().get_schema_desc(target_id)
                     .ok_or_else(|| format!("no owner schema for tid={}", target_id))?;
                 let src_col_size = owner_schema.columns[col_idx as usize].size() as usize;
-                let table = unsafe { &mut *index_handle };
-                let mut cursor = table.create_cursor_no_compact();
+                let table = unsafe { &*index_handle };
+                let mut cursor = table.open_cursor();
                 let result = filter_by_pk(&batch, schema, n, |pk_u128| {
                     let key_bytes = pk_u128.to_le_bytes();
                     cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..src_col_size])
@@ -1341,13 +1341,26 @@ mod tests {
         assert_eq!(result, vec![10i32, 20i32, 30i32]);
     }
 
+    /// Build an io_uring ring, or return `None` if the platform denies the
+    /// syscall (no io_uring support, no CAP_SYS_ADMIN, or AppArmor/seccomp
+    /// restriction) so the caller can skip rather than panic.
+    fn try_new_ring(entries: u32) -> Option<io_uring::IoUring> {
+        match io_uring::IoUring::new(entries) {
+            Ok(r) => Some(r),
+            Err(e) if e.raw_os_error().is_some_and(|c| {
+                c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES
+            }) => None,
+            Err(e) => panic!("io_uring::new: {}", e),
+        }
+    }
+
     /// uring_batch_fdatasync must complete one CQE per fd it submitted, and
     /// drain the SQ when the fd count exceeds the ring's SQ entries (forcing
     /// multiple submit_and_wait rounds).
     #[test]
     fn test_uring_batch_fdatasync_chunked() {
         // Tiny ring forces multiple submit_and_wait rounds for >4 fds.
-        let mut ring = io_uring::IoUring::new(4).expect("io_uring::new");
+        let Some(mut ring) = try_new_ring(4) else { return };
         let dir = tempfile::tempdir().unwrap();
 
         let mut fds: Vec<libc::c_int> = Vec::new();
@@ -1378,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_uring_batch_fdatasync_empty() {
-        let mut ring = io_uring::IoUring::new(8).expect("io_uring::new");
+        let Some(mut ring) = try_new_ring(8) else { return };
         uring_batch_fdatasync(&mut ring, &[]).expect("empty batch should succeed");
     }
 
@@ -1386,7 +1399,7 @@ mod tests {
     /// before the interrupt are drained, the loop retries, and all fds complete.
     #[test]
     fn test_uring_batch_fdatasync_eintr_retries() {
-        let mut ring = io_uring::IoUring::new(8).expect("io_uring::new");
+        let Some(mut ring) = try_new_ring(8) else { return };
         let dir = tempfile::tempdir().unwrap();
 
         let mut fds: Vec<libc::c_int> = Vec::new();

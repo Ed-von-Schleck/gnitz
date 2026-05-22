@@ -561,8 +561,12 @@ impl VmHandle {
             // because owned_trace_regs is not modified here, and the table is
             // accessed through owned_tables which is a separate field.
             let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
-            let _ = table.compact_if_needed();
-            match table.create_cursor() {
+            // Operator-state read path: keep compacting so L0 on owned trace
+            // tables stays bounded (no background compactor yet). Not a
+            // validator, so a compaction Err safely degrades to a null cursor
+            // pointer.
+            #[allow(clippy::disallowed_methods)] // explicit maintenance: owned-trace operator state
+            match table.create_cursor_compacting() {
                 Ok(ch) => {
                     let mut boxed = Box::new(ch);
                     let ptr = &mut *boxed as *mut CursorHandle;
@@ -1009,19 +1013,23 @@ pub fn execute_epoch(
 
                 // AVI cursor — created fresh from the AVI table (not a register).
                 // Must be created AFTER INTEGRATE populates the AVI table.
+                // Operator-state read; keep compacting (see refresh_owned_cursors).
+                #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE AVI operator state
                 let mut avi_cursor_handle: Option<Box<CursorHandle>> = if *avi_table_idx >= 0 {
                     let avi_ptr = program.tables[*avi_table_idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
-                    avi_table.create_cursor().ok().map(Box::new)
+                    avi_table.create_cursor_compacting().ok().map(Box::new)
                 } else {
                     None
                 };
 
                 // GI cursor — created fresh from the GI table (not a register)
+                // Operator-state read; keep compacting (see refresh_owned_cursors).
+                #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE GI operator state
                 let mut gi_cursor_handle: Option<Box<CursorHandle>> = if *gi_table_idx >= 0 {
                     let gi_ptr = program.tables[*gi_table_idx as usize];
                     let gi_table = unsafe { &mut *gi_ptr };
-                    gi_table.create_cursor().ok().map(Box::new)
+                    gi_table.create_cursor_compacting().ok().map(Box::new)
                 } else {
                     None
                 };
@@ -1631,7 +1639,7 @@ mod tests {
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
         // Need to create a cursor for the history register
-        let cursor1 = table.create_cursor().unwrap();
+        let cursor1 = table.open_cursor();
         let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
 
@@ -1647,7 +1655,7 @@ mod tests {
 
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
-        let cursor2 = table.create_cursor().unwrap();
+        let cursor2 = table.open_cursor();
         let ch2 = Box::into_raw(Box::new(cursor2)) as *mut libc::c_void;
         let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
@@ -1657,7 +1665,7 @@ mod tests {
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
-        let cursor3 = table.create_cursor().unwrap();
+        let cursor3 = table.open_cursor();
         let ch3 = Box::into_raw(Box::new(cursor3)) as *mut libc::c_void;
         let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
         let input3 = make_batch(schema, &[(1u128, -2, 42)]);
@@ -1692,7 +1700,7 @@ mod tests {
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 200)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
-        let cursor = table.create_cursor().unwrap();
+        let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         let mut builder = ProgramBuilder::new(3);
@@ -1746,7 +1754,7 @@ mod tests {
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
-        let cursor = table.create_cursor().unwrap();
+        let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         let mut builder = ProgramBuilder::new(3);
@@ -1793,7 +1801,7 @@ mod tests {
         ]);
         table.ingest_owned_batch(batch).unwrap();
 
-        let mut ch = table.create_cursor().unwrap();
+        let mut ch = table.open_cursor();
         let cursor = ch.cursor_mut();
 
         // Verify cursor iteration
@@ -1851,7 +1859,7 @@ mod tests {
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
-        let cursor = table.create_cursor().unwrap();
+        let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         let mut builder = ProgramBuilder::new(3);
@@ -1898,7 +1906,7 @@ mod tests {
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
-        let cursor = table.create_cursor().unwrap();
+        let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         let mut builder = ProgramBuilder::new(3);
@@ -2022,9 +2030,9 @@ mod tests {
         ]);
 
         // Create cursors for trace registers
-        let tr_out_cursor = trace_out_table.create_cursor().unwrap();
+        let tr_out_cursor = trace_out_table.open_cursor();
         let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
-        let tr_in_cursor = trace_in_table.create_cursor().unwrap();
+        let tr_in_cursor = trace_in_table.open_cursor();
         let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
 
         let cursors1 = vec![
@@ -2070,7 +2078,7 @@ mod tests {
         ]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
-        let cursor = table.create_cursor().unwrap();
+        let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         // Build: reg0=key input, reg1=trace, reg2=scan output
@@ -2193,7 +2201,7 @@ mod tests {
         table.ingest_owned_batch(trace_batch).unwrap();
 
         // Anti-join pipeline: reg 0 -> anti_join(reg 0, reg 1) -> reg 2
-        let cursor_aj = table.create_cursor().unwrap();
+        let cursor_aj = table.open_cursor();
         let ch_aj = Box::into_raw(Box::new(cursor_aj)) as *mut libc::c_void;
 
         let mut builder_aj = ProgramBuilder::new(3);
@@ -2215,7 +2223,7 @@ mod tests {
         ).unwrap().unwrap();
 
         // Semi-join pipeline
-        let cursor_sj = table.create_cursor().unwrap();
+        let cursor_sj = table.open_cursor();
         let ch_sj = Box::into_raw(Box::new(cursor_sj)) as *mut libc::c_void;
 
         let mut builder_sj = ProgramBuilder::new(3);
@@ -2372,9 +2380,9 @@ mod tests {
             (1u128, 1, 30),
         ]);
 
-        let tr_out_cursor = trace_out_table.create_cursor().unwrap();
+        let tr_out_cursor = trace_out_table.open_cursor();
         let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
-        let tr_in_cursor = trace_in_table.create_cursor().unwrap();
+        let tr_in_cursor = trace_in_table.open_cursor();
         let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
 
         let cursors = vec![
@@ -2560,8 +2568,8 @@ mod tests {
             (1u128, 1, 30),
         ]);
 
-        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.create_cursor().unwrap())) as *mut libc::c_void;
-        let tr_in_ch  = Box::into_raw(Box::new(trace_in_table.create_cursor().unwrap()))  as *mut libc::c_void;
+        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.open_cursor())) as *mut libc::c_void;
+        let tr_in_ch  = Box::into_raw(Box::new(trace_in_table.open_cursor()))  as *mut libc::c_void;
         let cursors = vec![std::ptr::null_mut(), tr_out_ch, tr_in_ch, std::ptr::null_mut()];
 
         let result = execute_epoch(
@@ -2605,7 +2613,7 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
 
         // Epoch 1: supply a real cursor for reg 1.
-        let cursor1 = table.create_cursor().unwrap();
+        let cursor1 = table.open_cursor();
         let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
         execute_epoch(

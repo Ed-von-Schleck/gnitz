@@ -21,7 +21,7 @@ impl CatalogEngine {
         };
 
         let sys_schemas = create_sys_table(&SYS_TAB_INFOS[0])?;
-        let mut sys_tables = create_sys_table(&SYS_TAB_INFOS[1])?;
+        let sys_tables = create_sys_table(&SYS_TAB_INFOS[1])?;
         let sys_views = create_sys_table(&SYS_TAB_INFOS[2])?;
         let sys_columns = create_sys_table(&SYS_TAB_INFOS[3])?;
         let sys_indices = create_sys_table(&SYS_TAB_INFOS[4])?;
@@ -32,12 +32,7 @@ impl CatalogEngine {
         let sys_circuit_node_columns = create_sys_table(&SYS_TAB_INFOS[9])?;
 
         // Check if this is a fresh database (no table records yet)
-        let is_new = {
-            match sys_tables.create_cursor() {
-                Ok(cursor) => !cursor.cursor.valid,
-                Err(_) => true,
-            }
-        };
+        let is_new = !sys_tables.open_cursor().cursor.valid;
 
         let dag = DagEngine::new();
 
@@ -230,10 +225,7 @@ impl CatalogEngine {
     // -- Recover sequence counters from sys_sequences ----------------------
 
     fn recover_sequences(&mut self) {
-        let mut cursor = match self.sys_sequences.create_cursor() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let mut cursor = self.sys_sequences.open_cursor();
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 let seq_id = cursor.cursor.current_key as u64 as i64;
@@ -339,7 +331,7 @@ impl CatalogEngine {
         }
         let table = self.sys_table_mut(sys_table_id)
             .expect("sys_table_mut covers the match arms above");
-        let arc = table.full_scan().map_err(|e| format!("scan error: {}", e))?;
+        let arc = table.full_scan();
         if arc.count > 0 {
             self.fire_hooks(sys_table_id, &arc)?;
         }

@@ -87,14 +87,31 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched `create_cursor` across all variants.
-    pub fn create_cursor(&self) -> Result<CursorHandle, StorageError> {
+    /// Dispatched non-compacting `open_cursor` across all variants.
+    /// Infallible, non-mutating — the recommended default. See
+    /// `Table::open_cursor`.
+    pub fn open_cursor(&self) -> CursorHandle {
         let tptr = self.table_ptr();
         unsafe {
             if !tptr.is_null() {
-                (*tptr).create_cursor()
+                (*tptr).open_cursor()
             } else {
-                (*self.ptable_ptr()).create_cursor()
+                (*self.ptable_ptr()).open_cursor()
+            }
+        }
+    }
+
+    /// Dispatched compacting cursor across all variants. Maintenance-only —
+    /// see `Table::create_cursor_compacting` for the validator hazard this
+    /// name surfaces. The lint guards external callers, not this dispatch.
+    #[allow(clippy::disallowed_methods)]
+    pub fn create_cursor_compacting(&self) -> Result<CursorHandle, StorageError> {
+        let tptr = self.table_ptr();
+        unsafe {
+            if !tptr.is_null() {
+                (*tptr).create_cursor_compacting()
+            } else {
+                (*self.ptable_ptr()).create_cursor_compacting()
             }
         }
     }
@@ -405,8 +422,9 @@ impl DagEngine {
         self.source_map.clear();
 
         if !self.sys.dep_tab.is_null() {
-            let t = unsafe { &mut *self.sys.dep_tab };
-            if let Ok(mut ch) = t.create_cursor() {
+            let t = unsafe { &*self.sys.dep_tab };
+            {
+                let mut ch = t.open_cursor();
                 while ch.cursor.valid {
                     let w = ch.cursor.current_weight;
                     if w > 0 {
@@ -1190,17 +1208,12 @@ impl DagEngine {
         let mut storage: Vec<Box<CursorHandle>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
             if let Some(entry) = self.tables.get(&table_id) {
-                let tbl_ptr = entry.handle.table_ptr();
-                let ptbl_ptr = entry.handle.ptable_ptr();
-                let cursor_opt = if !tbl_ptr.is_null() {
-                    let tbl = unsafe { &mut *tbl_ptr };
-                    let _ = tbl.compact_if_needed();
-                    tbl.create_cursor().ok()
-                } else if !ptbl_ptr.is_null() {
-                    unsafe { &mut *ptbl_ptr }.create_cursor().ok()
-                } else {
-                    None
-                };
+                // External-trace reads are the operator-state read path: keep
+                // them compacting so L0 on intermediate/trace tables stays
+                // bounded (no background compactor yet). These are not
+                // validators, so a compaction Err safely degrades to `None`.
+                #[allow(clippy::disallowed_methods)] // explicit maintenance: operator-state trace read
+                let cursor_opt = entry.handle.create_cursor_compacting().ok();
                 if let Some(ch) = cursor_opt {
                     let mut boxed = Box::new(ch);
                     if (reg_id as usize) < num_regs {
