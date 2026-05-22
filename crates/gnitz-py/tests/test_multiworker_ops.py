@@ -431,6 +431,164 @@ def test_max_multiworker_incremental(client):
 
 
 # -----------------------------------------------------------------------
+# Grouped MIN/MAX retraction (correct path): each group lives on a single
+# worker (rows partition by group key), so retracting a group's current
+# extremum is handled by the local reduce's trace_in / AggValueIndex and
+# recomputes the next-best. These pass; they guard that the common grouped
+# case is unaffected by the global-aggregate gap documented below.
+# -----------------------------------------------------------------------
+
+
+@_NEEDS_MULTI
+def test_grouped_min_multiworker_retract_current_min(client):
+    sn = "gmin_" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, MIN(val) AS m FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        # Three groups, each with a clear MIN.
+        rows = []
+        pk = 0
+        for grp in (1, 2, 3):
+            for k in range(5):
+                rows.append(f"({pk}, {grp}, {grp * 100 + k})")
+                pk += 1
+        client.execute_sql(f"INSERT INTO t VALUES {', '.join(rows)}", schema_name=sn)
+        m = _scan_reduce_map(client, vid)
+        assert m == {1: 100, 2: 200, 3: 300}
+
+        # Retract group 2's current MIN (pk=5, val=200) → next-best is 201.
+        client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+        m = _scan_reduce_map(client, vid)
+        assert m == {1: 100, 2: 201, 3: 300}, f"grouped MIN retraction: {m}"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_grouped_max_multiworker_retract_current_max(client):
+    sn = "gmax_" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, MAX(val) AS m FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        rows = []
+        pk = 0
+        for grp in (1, 2, 3):
+            for k in range(5):
+                rows.append(f"({pk}, {grp}, {grp * 100 + k})")
+                pk += 1
+        client.execute_sql(f"INSERT INTO t VALUES {', '.join(rows)}", schema_name=sn)
+        m = _scan_reduce_map(client, vid)
+        assert m == {1: 104, 2: 204, 3: 304}
+
+        # Retract group 2's current MAX (pk=9, val=204) → next-best is 203.
+        client.execute_sql("DELETE FROM t WHERE pk = 9", schema_name=sn)
+        m = _scan_reduce_map(client, vid)
+        assert m == {1: 104, 2: 203, 3: 304}, f"grouped MAX retraction: {m}"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+# -----------------------------------------------------------------------
+# KNOWN BUG (expected failures): distributed gather-reduce cannot recompute
+# the next-best extremum when the current GLOBAL MIN/MAX is retracted.
+#
+# A grouped aggregate keeps each group on one worker (rows partition by group
+# key), so its retraction is handled entirely by the local single-node reduce
+# (with its trace_in / AggValueIndex) and works. A GLOBAL aggregate (no GROUP
+# BY) is the broken case: the one logical group is split across all workers,
+# and `op_gather_reduce` combines their partials with no per-worker input
+# history — it only has the previous global result in trace_out, drops
+# negative-weight non-linear partials, and re-folds its own previous global. So
+# deleting the current global extremum re-emits the deleted value instead of
+# the next-best. Fixing it needs its own design (a distributed replay trace, or
+# gating gather-reduce off for non-linear aggregates over retractable sources).
+# xfail(strict) so a future fix trips this and prompts removal of the marker.
+# -----------------------------------------------------------------------
+
+
+def _scan_global_agg(client, vid):
+    """Single positive-weight row of a global (no GROUP BY) aggregate → m."""
+    rows = [r for r in client.scan(vid) if r.weight > 0]
+    assert len(rows) == 1, f"expected one global row, got {len(rows)}"
+    return rows[0]["m"]
+
+
+@_NEEDS_MULTI
+@pytest.mark.xfail(strict=True, reason="distributed gather-reduce global MIN retraction re-emits deleted extremum")
+def test_global_min_multiworker_retract_current_min(client):
+    sn = "gmr_" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT MIN(val) AS m FROM t",
+            schema_name=sn,
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        # Global MIN = 5 (pk=0). 30 rows spread across workers.
+        vals = ", ".join(f"({i}, {5 + i})" for i in range(30))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        assert _scan_global_agg(client, vid) == 5
+
+        # Delete the global minimum; next-best is 6 (pk=1).
+        client.execute_sql("DELETE FROM t WHERE pk = 0", schema_name=sn)
+        assert _scan_global_agg(client, vid) == 6, "global MIN must recompute to next-best after deletion"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+@pytest.mark.xfail(strict=True, reason="distributed gather-reduce global MAX retraction re-emits deleted extremum")
+def test_global_max_multiworker_retract_current_max(client):
+    sn = "gxr_" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT MAX(val) AS m FROM t",
+            schema_name=sn,
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        # Global MAX = 34 (pk=29). Next-best after deletion is 33.
+        vals = ", ".join(f"({i}, {5 + i})" for i in range(30))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        assert _scan_global_agg(client, vid) == 34
+
+        client.execute_sql("DELETE FROM t WHERE pk = 29", schema_name=sn)
+        assert _scan_global_agg(client, vid) == 33, "global MAX must recompute to next-best after deletion"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+# -----------------------------------------------------------------------
 # EXCEPT incremental correctness
 # -----------------------------------------------------------------------
 

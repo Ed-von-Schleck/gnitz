@@ -739,6 +739,36 @@ fn agg_value_idx_eligible(tc: TypeCode) -> bool {
     !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob)
 }
 
+/// AVI stores the group key as a fixed-width byte prefix. A group key is
+/// byte-form-eligible iff every group column is a non-nullable, fixed-width,
+/// non-float scalar (a valid PK-column type) and the composite key
+/// `group_stride + av_encoded` fits the narrow PK budget. The cap is
+/// `NARROW_PK_MAX_BYTES` because the AVI cursor drives narrow byte-form keys
+/// only; wider group keys fall back to a trace scan.
+fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
+    if gcols.len() + 1 > crate::schema::MAX_PK_COLUMNS {
+        return false;
+    }
+    let mut stride = 0usize;
+    for &c in gcols {
+        let col = &schema.columns[c as usize];
+        if col.nullable != 0 {
+            return false;
+        }
+        if !matches!(
+            TypeCode::from_validated_u8(col.type_code),
+            TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
+            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
+            TypeCode::U128 | TypeCode::UUID
+        ) {
+            return false; // STRING / BLOB / F32 / F64 — fall back to trace scan
+        }
+        stride += col.size() as usize;
+    }
+    let key_bytes = stride + crate::ops::util::AVI_AV_BYTES;
+    key_bytes <= crate::schema::NARROW_PK_MAX_BYTES
+}
+
 // ---------------------------------------------------------------------------
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
@@ -1196,7 +1226,7 @@ fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, table_ptr: *
         in_reg,
         table_ptr,
         std::ptr::null_mut(), 0, // no GI
-        std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0, // no AVI
+        std::ptr::null_mut(), false, 0, &[], 0, // no AVI
     );
 }
 
@@ -1297,7 +1327,8 @@ fn emit_reduce(
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
         && agg_value_idx_eligible(
             TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code),
-        );
+        )
+        && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
 
     let mut tr_in_reg_id: i32 = -1;
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();
@@ -1362,7 +1393,9 @@ fn emit_reduce(
         avi_group_cols = gcols_u32.clone();
         let avi_child = format!("_avidx_{}_{}", view_id, nid);
         if let Ok(av_table) = create_child_table(
-            view_dir, &avi_child, crate::ops::index::make_avi_schema(), view_table_id,
+            view_dir, &avi_child,
+            crate::ops::index::make_avi_schema(&in_reg_schema, &gcols_u32),
+            view_table_id,
         ) {
             let idx = owned_tables.len();
             owned_tables.push(Box::new(av_table));
@@ -1376,7 +1409,7 @@ fn emit_reduce(
             std::ptr::null_mut(),
             std::ptr::null_mut(), 0,
             avi_table_ptr, avi_for_max, avi_agg_col_type_code,
-            &avi_group_cols, &in_reg_schema as *const SchemaDescriptor, avi_agg_col_idx,
+            &avi_group_cols, avi_agg_col_idx,
         );
     }
 
@@ -1404,8 +1437,6 @@ fn emit_reduce(
         &gcols_u32,
         reduce_out_schema,
         avi_table_ptr, avi_for_max, avi_agg_col_type_code,
-        &avi_group_cols,
-        if !avi_table_ptr.is_null() { &in_reg_schema as *const SchemaDescriptor } else { std::ptr::null() },
         avi_agg_col_idx,
         gi_table_ptr, gi_col_idx,
         fin_prog_ptr,
@@ -1418,9 +1449,7 @@ fn emit_reduce(
             tr_in_table_ptr,
             gi_table_ptr, gi_col_idx,
             avi_table_ptr, avi_for_max, avi_agg_col_type_code,
-            &avi_group_cols,
-            if !avi_table_ptr.is_null() { &in_reg_schema as *const SchemaDescriptor } else { std::ptr::null() },
-            avi_agg_col_idx,
+            &avi_group_cols, avi_agg_col_idx,
         );
     }
 

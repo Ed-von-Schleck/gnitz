@@ -40,10 +40,11 @@ pub(super) const REG_PAYLOAD_START: usize = 3;
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
-/// LE-widen a single-PK region slice to its u128 fast-path key. Only
-/// widths 8 and 16 are valid; any other width is a wide/compound region
-/// that reached a u128 path — a routing bug, so panic (rather than
-/// silently zero-extend) to surface the misroute at its source.
+/// LE-widen a PK region slice to its u128 fast-path key. Any width `≤ 16` is
+/// valid (zero-extended for non-power-of-two strides, e.g. a 9/10/12/14-byte
+/// byte-form composite key); a stride `> 16` is a wide region that cannot fit a
+/// u128 and reaching this path with one is a routing bug, so panic to surface
+/// the misroute at its source.
 ///
 /// `stride` is taken explicitly rather than read from `src.len()`
 /// because the fixed-array callers (`PkBuf::as_u128_single_pk`) pass a
@@ -61,6 +62,11 @@ pub(super) fn widen_pk_le(src: &[u8], stride: usize) -> u128 {
         4  => u32::from_le_bytes(src[..4].try_into().unwrap()) as u128,
         8  => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
         16 => u128::from_le_bytes(src[..16].try_into().unwrap()),
+        n if n < 16 => {
+            let mut b = [0u8; 16];
+            b[..n].copy_from_slice(&src[..n]);
+            u128::from_le_bytes(b)
+        }
         n => panic!("widen_pk_le: wide PK region (stride {n}); caller must use get_pk_bytes/pk_bytes instead"),
     }
 }
@@ -1980,7 +1986,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "wide PK region")]
-    fn widen_pk_le_rejects_non_8_16_width() {
+    fn widen_pk_le_rejects_width_above_16() {
         widen_pk_le(&[0u8; 24], 24);
     }
 
@@ -1997,6 +2003,22 @@ mod tests {
         let mut backing = [0u8; 80];
         backing[..2].copy_from_slice(&0x1234u16.to_le_bytes());
         assert_eq!(widen_pk_le(&backing, 2), 0x1234u128);
+
+        // Non-power-of-two byte-form composite strides (group_stride + 8 for a
+        // single narrow group column): zero-extended to u128 verbatim.
+        for &n in &[9usize, 10, 12, 14] {
+            let mut src = [0u8; 16];
+            for (i, b) in src.iter_mut().enumerate().take(n) {
+                *b = (0xA0 + i) as u8;
+            }
+            let mut expect = [0u8; 16];
+            expect[..n].copy_from_slice(&src[..n]);
+            assert_eq!(
+                widen_pk_le(&src[..n], n),
+                u128::from_le_bytes(expect),
+                "stride {n} must zero-extend",
+            );
+        }
     }
 
     #[test]

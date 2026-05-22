@@ -52,9 +52,6 @@ pub enum Instr {
         avi_table_idx: i16,   // -1 = no AVI; index into Program::tables
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
-        avi_group_cols_offset: u32,
-        avi_group_cols_count: u16,
-        avi_input_schema_idx: i16,  // -1 = use input schema
         #[allow(dead_code)]
         avi_agg_col_idx: u32,
         // GI params — GI cursor is created fresh from the GI table each tick
@@ -86,7 +83,6 @@ pub struct IntegrateAvi {
     pub agg_col_type_code: u8,
     pub group_cols_offset: u32,
     pub group_cols_count: u16,
-    pub input_schema_idx: u16,
     pub agg_col_idx: u32,
 }
 
@@ -272,7 +268,6 @@ impl ProgramBuilder {
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
         avi_group_cols: &[u32],
-        avi_input_schema: *const SchemaDescriptor,
         avi_agg_col_idx: u32,
     ) {
         let table_idx = self.table_idx(target_table);
@@ -285,18 +280,13 @@ impl ProgramBuilder {
             None
         };
         let avi = if !avi_table.is_null() {
-            assert!(!avi_input_schema.is_null(),
-                "add_integrate: avi_input_schema must be non-null when avi_table is non-null");
             let (gc_off, gc_cnt) = self.add_group_cols(avi_group_cols);
-            let avi_schema = unsafe { *avi_input_schema };
-            let schema_idx = self.schema_idx(avi_schema);
             Some(IntegrateAvi {
                 table_idx: self.table_idx(avi_table) as u16,
                 for_max: avi_for_max,
                 agg_col_type_code: avi_agg_col_type_code,
                 group_cols_offset: gc_off,
                 group_cols_count: gc_cnt,
-                input_schema_idx: schema_idx,
                 agg_col_idx: avi_agg_col_idx,
             })
         } else {
@@ -320,8 +310,6 @@ impl ProgramBuilder {
         avi_table: *mut Table,
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
-        avi_group_cols: &[u32],
-        avi_input_schema: *const SchemaDescriptor,
         avi_agg_col_idx: u32,
         // GI params
         gi_table: *mut Table,
@@ -335,16 +323,6 @@ impl ProgramBuilder {
         let output_schema_idx = self.schema_idx(output_schema);
 
         let avi_table_idx = self.table_idx(avi_table) as i16;
-        let (avi_gc_off, avi_gc_cnt) = if !avi_table.is_null() {
-            self.add_group_cols(avi_group_cols)
-        } else {
-            (0, 0)
-        };
-        let avi_input_schema_idx = if !avi_table.is_null() && !avi_input_schema.is_null() {
-            self.schema_idx(unsafe { *avi_input_schema }) as i16
-        } else {
-            -1
-        };
 
         let gi_table_idx = self.table_idx(gi_table) as i16;
 
@@ -369,9 +347,6 @@ impl ProgramBuilder {
             avi_table_idx,
             avi_for_max,
             avi_agg_col_type_code,
-            avi_group_cols_offset: avi_gc_off,
-            avi_group_cols_count: avi_gc_cnt,
-            avi_input_schema_idx,
             avi_agg_col_idx,
             gi_table_idx,
             gi_col_idx,
@@ -958,7 +933,6 @@ pub fn execute_epoch(
                         for_max: a.for_max,
                         agg_col_type_code: a.agg_col_type_code,
                         group_by_cols: gcols.to_vec(),
-                        input_schema: program.schemas[a.input_schema_idx as usize],
                         agg_col_idx: a.agg_col_idx,
                     }
                 });
@@ -977,8 +951,7 @@ pub fn execute_epoch(
                 group_cols_offset, group_cols_count,
                 output_schema_idx,
                 avi_table_idx, avi_for_max, avi_agg_col_type_code,
-                avi_group_cols_offset, avi_group_cols_count,
-                avi_input_schema_idx, avi_agg_col_idx: _,
+                avi_agg_col_idx: _,
                 gi_table_idx, gi_col_idx,
                 finalize_func_idx, finalize_schema_idx,
             } => {
@@ -1034,17 +1007,6 @@ pub fn execute_epoch(
                     gi_cursor_handle.is_some(),
                     aggs.len());
 
-                let avi_gcols = if *avi_group_cols_count > 0 {
-                    &program.group_cols[*avi_group_cols_offset as usize
-                        ..(*avi_group_cols_offset as usize + *avi_group_cols_count as usize)]
-                } else {
-                    &[] as &[u32]
-                };
-                let avi_in_schema = if *avi_input_schema_idx >= 0 {
-                    Some(&program.schemas[*avi_input_schema_idx as usize])
-                } else {
-                    None
-                };
                 let fin_prog = if *finalize_func_idx >= 0 {
                     Some(unsafe { &*program.expr_progs[*finalize_func_idx as usize] })
                 } else {
@@ -1083,8 +1045,6 @@ pub fn execute_epoch(
                     avi_opt,
                     *avi_for_max,
                     avi_tc,
-                    avi_gcols,
-                    avi_in_schema,
                     gi_opt,
                     *gi_col_idx,
                     fin_prog,
@@ -1980,7 +1940,7 @@ mod tests {
             &group_cols,
             out_schema,
             std::ptr::null_mut(), // avi_table
-            false, 0, &[], std::ptr::null(), 0,
+            false, 0, 0,
             std::ptr::null_mut(), // gi_table
             0,
             std::ptr::null(),     // finalize_prog
@@ -1992,7 +1952,7 @@ mod tests {
             2,                    // in_reg (raw_delta)
             trace_out_ptr,        // target table
             std::ptr::null_mut(), 0,   // no GI
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0, // no AVI
+            std::ptr::null_mut(), false, 0, &[], 0, // no AVI
         );
 
         // INTEGRATE input → trace_in
@@ -2000,7 +1960,7 @@ mod tests {
             0,                    // in_reg
             trace_in_ptr,         // target table
             std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), false, 0, &[], 0,
         );
 
         builder.add_halt();
@@ -2340,19 +2300,19 @@ mod tests {
         builder.add_reduce(
             0, 3, 1, 2, -1,
             &agg_descs, &group_cols, out_schema,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), false, 0, 0,
             std::ptr::null_mut(), 0,
             std::ptr::null(), std::ptr::null(),
         );
         builder.add_integrate(
             2, trace_out_ptr,
             std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), false, 0, &[], 0,
         );
         builder.add_integrate(
             0, trace_in_ptr,
             std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), false, 0, &[], 0,
         );
         builder.add_halt();
 
@@ -2532,16 +2492,16 @@ mod tests {
         builder.add_reduce(
             0, 2, 1, 3, -1,
             &agg_descs, &group_cols, out_schema,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), false, 0, 0,
             std::ptr::null_mut(), 0,
             std::ptr::null(), std::ptr::null(),
         );
         builder.add_integrate(3, trace_out_ptr,
             std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
+            std::ptr::null_mut(), false, 0, &[], 0);
         builder.add_integrate(0, trace_in_ptr,
             std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0);
+            std::ptr::null_mut(), false, 0, &[], 0);
         builder.add_halt();
 
         let reg_schemas = [in_schema, out_schema, in_schema, out_schema];

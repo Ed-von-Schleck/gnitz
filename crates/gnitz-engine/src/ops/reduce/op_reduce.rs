@@ -6,7 +6,7 @@ use crate::storage::{
     scatter_copy,
 };
 
-use super::super::util::{extract_gc_u64, extract_group_key};
+use super::super::util::{GroupKeyExtractor, extract_group_key};
 use super::agg::{
     Accumulator, AggDescriptor, apply_agg_from_value_index, is_single_col_natural_pk,
 };
@@ -40,6 +40,12 @@ fn fill_cleared_batch(
         scatter_copy(delta_mb, delta_indices, &[], &mut writer);
     }
     batch.count = needed;
+    // `clear()` left the reused batch flagged sorted+consolidated; the rows just
+    // written are neither. Without this, `consolidate_if_needed` short-circuits
+    // and a retracted (PK,payload) and its insert both survive, corrupting
+    // non-linear (MIN/MAX) aggregates.
+    batch.sorted = false;
+    batch.consolidated = false;
 }
 
 /// Check if a cursor's current row matches the group columns of an exemplar row.
@@ -116,8 +122,6 @@ pub fn op_reduce(
     avi_cursor: Option<&mut ReadCursor>,
     avi_for_max: bool,
     avi_agg_col_type_code: TypeCode,
-    avi_group_by_cols: &[u32],
-    avi_input_schema: Option<&SchemaDescriptor>,
     gi_cursor: Option<&mut ReadCursor>,
     gi_col_idx: u32,
     finalize_prog: Option<&crate::expr::ExprProgram>,
@@ -208,6 +212,12 @@ pub fn op_reduce(
     let gc_extractor =
         super::super::util::IndexColExtractor::new(input_schema, gi_col_idx as usize);
 
+    // AVI group-key gatherer: built once so the per-group lookup gathers the
+    // full byte-form group key (the prefix the AVI cursor seeks on).
+    let avi_extractor = avi
+        .is_some()
+        .then(|| GroupKeyExtractor::new(input_schema, group_by_cols));
+
     // Hoist replay batch outside the group loop: reuse the allocation across groups
     // rather than allocating and dropping once per group (can be 100k+ times per epoch).
     let mut replay = (!all_linear && avi.is_none())
@@ -295,15 +305,14 @@ pub fn op_reduce(
                 accs[k].merge_accumulated(old_vals[k], 1);
             }
         } else if !all_linear {
-            if let Some(ref mut avi_c) = avi {
-                // AVI path
-                let avi_schema = avi_input_schema.unwrap_or(input_schema);
-                let gc_u64 = extract_gc_u64(&mb, group_start_idx, avi_schema, avi_group_by_cols);
-                let found = apply_agg_from_value_index(
-                    avi_c, gc_u64, avi_for_max, avi_agg_col_type_code,
+            if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &avi_extractor) {
+                // AVI path: gather the full group key and prefix-seek the index.
+                let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
+                extractor.gather(&mb, group_start_idx, &mut gk);
+                apply_agg_from_value_index(
+                    avi_c, &gk[..extractor.stride], avi_for_max, avi_agg_col_type_code,
                     &mut accs[0],
                 );
-                gnitz_debug!("reduce: AVI lookup gc={:#x} found={}", gc_u64, found);
             } else {
                 let replay = replay.as_mut().unwrap();
                 replay.clear();

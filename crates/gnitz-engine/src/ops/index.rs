@@ -18,7 +18,6 @@ pub struct AviDesc {
     pub for_max: bool,
     pub agg_col_type_code: u8,
     pub group_by_cols: Vec<u32>,
-    pub input_schema: SchemaDescriptor,
     pub agg_col_idx: u32,
 }
 
@@ -33,9 +32,30 @@ pub(crate) fn make_gi_schema() -> SchemaDescriptor {
     )
 }
 
-/// AVI schema: U128 PK only, no payload.
-pub(crate) fn make_avi_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0])
+/// AVI index schema: the group-by columns (native fixed-width types, in GROUP
+/// BY order) followed by the order-encoded aggregate value (U64). All columns
+/// are PK; there is no payload. Built only for byte-form-eligible group keys
+/// (see `compiler::avi_group_key_eligible`).
+pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
+    let mut cols = Vec::with_capacity(group_by_cols.len() + 1);
+    let mut pk = Vec::with_capacity(group_by_cols.len() + 1);
+    for (i, &c) in group_by_cols.iter().enumerate() {
+        // Force non-nullable: eligibility guarantees the value is always present.
+        cols.push(SchemaColumn::new(src.columns[c as usize].type_code, 0));
+        pk.push(i as u32);
+    }
+    cols.push(SchemaColumn::new(type_code::U64, 0)); // av_encoded
+    pk.push(group_by_cols.len() as u32);
+    let schema = SchemaDescriptor::new(&cols, &pk);
+    // Mirror the eligibility gate's budget (compiler::avi_group_key_eligible),
+    // not the looser MAX_PK_BYTES: the AVI cursor only drives narrow keys, so a
+    // future gate relaxation that overshoots this cap must trip here.
+    debug_assert!(
+        schema.pk_stride() as usize <= crate::schema::NARROW_PK_MAX_BYTES,
+        "make_avi_schema: composite key {} exceeds NARROW_PK_MAX_BYTES",
+        schema.pk_stride(),
+    );
+    schema
 }
 
 // ---------------------------------------------------------------------------
@@ -110,9 +130,13 @@ pub fn op_integrate_with_indexes(
         }
     }
 
-    // AggValueIndex population
+    // AggValueIndex population. Key layout: group_key_bytes ++ av_encoded(8),
+    // ordered group-major then aggregate-minor, so the lookup's prefix walk
+    // (`agg::apply_agg_from_value_index`) matches the full group identity — no
+    // hash, no collision. Gather against `input_schema`: the delta `mb` is
+    // physically laid out in it.
     if let Some(avi_desc) = avi {
-        let avi_schema = make_avi_schema();
+        let avi_schema = make_avi_schema(input_schema, &avi_desc.group_by_cols);
         let mut avi_batch = Batch::with_schema(avi_schema, batch.count);
         avi_batch.sorted = false;
         avi_batch.consolidated = false;
@@ -129,15 +153,16 @@ pub fn op_integrate_with_indexes(
             (0, input_schema.payload_idx(avi_col))
         };
 
+        let extractor = super::util::GroupKeyExtractor::new(input_schema, &avi_desc.group_by_cols);
+        let n = extractor.stride;
+        let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..batch.count {
             // PK is never null, so its dense bit position is undefined.
             if !avi_is_pk && (mb.get_null_word(row) >> avi_pi) & 1 != 0 {
                 continue;
             }
 
-            let gc_u64 = super::util::extract_gc_u64(
-                &mb, row, &avi_desc.input_schema, &avi_desc.group_by_cols,
-            );
+            extractor.gather(&mb, row, &mut key);
             let av_bytes = if avi_is_pk {
                 &mb.get_pk_bytes(row)[avi_pk_off..avi_pk_off + avi_w]
             } else {
@@ -146,26 +171,15 @@ pub fn op_integrate_with_indexes(
             let av_u64 = super::util::encode_ordered(
                 av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max,
             );
-            let weight = mb.get_weight(row);
+            key[n..n + super::util::AVI_AV_BYTES].copy_from_slice(&av_u64.to_le_bytes());
 
-            // Composite key: ck_lo = av_u64, ck_hi = gc_u64
-            avi_batch.extend_pk(((gc_u64 as u128) << 64) | (av_u64 as u128));
-            avi_batch.extend_weight(&weight.to_le_bytes());
+            avi_batch.extend_pk_bytes(&key[..n + super::util::AVI_AV_BYTES]);
+            avi_batch.extend_weight(&mb.get_weight(row).to_le_bytes());
             avi_batch.extend_null_bmp(&0u64.to_le_bytes());
-            // No payload columns (AVI schema is U128 PK only)
             avi_batch.count += 1;
         }
 
         if avi_batch.count > 0 {
-            if crate::log::is_debug() {
-                gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
-                    avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
-                for i in 0..avi_batch.count {
-                    let pk = avi_batch.get_pk(i);
-                    let w = i64::from_le_bytes(avi_batch.weight_data()[i*8..(i+1)*8].try_into().unwrap());
-                    gnitz_debug!("  avi[{}]: pk={:#034x} w={}", i, pk, w);
-                }
-            }
             let avi_table = unsafe { &mut *avi_desc.table };
             let _ = avi_table.ingest_owned_batch_memonly(avi_batch);
         }

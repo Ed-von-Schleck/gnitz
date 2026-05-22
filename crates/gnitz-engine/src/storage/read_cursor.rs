@@ -505,7 +505,6 @@ impl ReadCursor {
 
     /// PK region of the current row as raw bytes, without copying. Byte-addressed
     /// sibling of the `current_key` field; correct for compound/wide PKs.
-    #[allow(dead_code)]
     pub fn current_pk_bytes(&self) -> &[u8] {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }

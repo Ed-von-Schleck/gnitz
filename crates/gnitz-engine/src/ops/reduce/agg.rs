@@ -392,32 +392,34 @@ pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[
 // AVI lookup
 // ---------------------------------------------------------------------------
 
-/// Seek AVI cursor to group, apply decoded min/max to accumulator.
+/// Seek the AVI cursor to a group via its full byte-form group key and apply
+/// the decoded MIN/MAX to the accumulator.
+///
+/// The AVI PK is `group_key_bytes ++ av_encoded(8)`, ordered group-major then
+/// aggregate-minor. The first positive-weight entry whose key starts with the
+/// full group key is therefore the extremal value, and the prefix match
+/// confirms the row belongs to this exact group (no hash, so no collision).
 pub(super) fn apply_agg_from_value_index(
     avi_cursor: &mut ReadCursor,
-    gc_u64: u64,
+    group_key: &[u8],
     for_max: bool,
     agg_col_type_code: TypeCode,
     acc: &mut Accumulator,
 ) -> bool {
-    avi_cursor.seek(crate::util::make_pk(0, gc_u64));
-    gnitz_debug!("avi_lookup: seek(0, {:#x}) valid={}", gc_u64, avi_cursor.valid);
-    while avi_cursor.valid {
-        let k_hi = (avi_cursor.current_key >> 64) as u64;
-        let k_lo = avi_cursor.current_key as u64;
-        let w = avi_cursor.current_weight;
-        gnitz_debug!("avi_lookup: at pk_lo={:#x} pk_hi={:#x} w={}", k_lo, k_hi, w);
-        if k_hi != gc_u64 {
-            break;
-        }
-        if avi_cursor.current_weight > 0 {
-            let encoded = super::super::util::decode_ordered(
-                avi_cursor.current_key as u64, agg_col_type_code, for_max,
-            );
-            acc.seed_from_raw_bits(encoded);
-            return true;
-        }
-        avi_cursor.advance();
+    use super::super::util::AVI_AV_BYTES;
+    if avi_cursor.seek_first_positive_with_prefix(group_key) {
+        let k = avi_cursor.current_pk_bytes();
+        // current_pk_bytes() is the full AVI PK region; make_avi_schema lays it
+        // out as group_stride + AVI_AV_BYTES (av_encoded), so the trailing bytes
+        // are always in bounds for a group_key of length group_stride.
+        debug_assert_eq!(
+            k.len(), group_key.len() + AVI_AV_BYTES,
+            "AVI key = group_stride + AVI_AV_BYTES",
+        );
+        let av_start = group_key.len();
+        let av = u64::from_le_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
+        acc.seed_from_raw_bits(super::super::util::decode_ordered(av, agg_col_type_code, for_max));
+        return true;
     }
     acc.reset();
     false

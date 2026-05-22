@@ -142,6 +142,71 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_multi_col_group_by_min_distinct_groups(self, client):
+        """Single MIN over a two-column GROUP BY routes through the byte-form
+        AVI (group key = a ++ b ++ encoded value). Each distinct (a, b) must
+        resolve its own minimum — the index carries the full group key, so two
+        groups can never share a bucket."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  a INT NOT NULL,"
+                "  b INT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo "
+                "FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # 9 distinct (a, b) groups, each with several rows. The expected
+            # MIN per group is a*100 + b (the smallest val inserted for it).
+            pk = 0
+            expected = {}
+            rows_sql = []
+            for a in range(3):
+                for b in range(3):
+                    base = a * 100 + b
+                    expected[(a, b)] = base
+                    for k in range(3):
+                        pk += 1
+                        rows_sql.append(f"({pk}, {a}, {b}, {base + k * 10})")
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql),
+                schema_name=sn,
+            )
+
+            rows = client.scan(vid)
+            assert len(rows) == len(expected)
+            for r in rows:
+                key = (r["a"], r["b"])
+                assert r["lo"] == expected[key], (
+                    f"group {key}: expected MIN {expected[key]}, got {r['lo']}"
+                )
+
+            # Incremental update: push a value below group (1,1)'s current MIN.
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({pk + 1}, 1, 1, -5)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            by_key = {(r["a"], r["b"]): r["lo"] for r in rows}
+            assert by_key[(1, 1)] == -5, "pushing a smaller value must lower the MIN"
+            # Other groups unchanged.
+            assert by_key[(2, 2)] == expected[(2, 2)]
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

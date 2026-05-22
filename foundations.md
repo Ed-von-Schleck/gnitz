@@ -281,7 +281,7 @@ single narrow scalar PK, 16 bytes for U128, or the compound sum for
 multi-column PKs.
 
 ```
-region[0] = pk         (count × pk_stride bytes, LE; pk_stride ∈ {1, 2, 4, 8, 16})
+region[0] = pk         (count × pk_stride bytes, LE; pk_stride = packed PK-column sum, ≤ 16 for narrow keys)
 region[1] = weight     (count × 8 bytes, i64 LE)
 region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
 region[3..3+P-1] = payload columns (non-PK, schema order)

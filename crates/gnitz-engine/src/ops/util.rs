@@ -134,27 +134,21 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 }
 
 // ---------------------------------------------------------------------------
-// Raw injective index/group column extractor
+// Fixed-width column location + raw index/group column extractors
 // ---------------------------------------------------------------------------
 
-/// Precomputed reader for one raw, injective index/group column. Built once
-/// before a population or read-back loop so the per-row path is a slice plus a
-/// `read_unsigned`, with no schema walk.
-///
-/// Raw (not hashed): GroupIndex replay groups source rows by this exact value
-/// and does not re-filter by group membership, so the encoding must stay
-/// injective within the column's domain — a hashed (colliding) value would
-/// merge distinct groups. GI's gc column is always U8..I64 (size ∈ {1,2,4,8}),
-/// so `read_unsigned` never sees an out-of-range width.
-pub(super) struct IndexColExtractor {
+/// Physical location of one fixed-width column within a `MemBatch` row: either
+/// a byte offset into the PK region or a dense payload slot. Resolved once from
+/// the schema so `bytes` is a pure slice with no per-row schema walk.
+struct ColLoc {
     is_pk: bool,
     /// PK byte offset when `is_pk`, else the dense payload slot index.
     off_or_pi: usize,
     size: usize,
 }
 
-impl IndexColExtractor {
-    pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
+impl ColLoc {
+    fn resolve(schema: &SchemaDescriptor, col_idx: usize) -> Self {
         let size = schema.columns[col_idx].size() as usize;
         let is_pk = schema.is_pk_col(col_idx);
         let off_or_pi = if is_pk {
@@ -166,13 +160,79 @@ impl IndexColExtractor {
     }
 
     #[inline]
-    pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
-        let bytes = if self.is_pk {
+    fn bytes<'a>(&self, mb: &'a MemBatch, row: usize) -> &'a [u8] {
+        if self.is_pk {
             &mb.get_pk_bytes(row)[self.off_or_pi..self.off_or_pi + self.size]
         } else {
             mb.get_col_ptr(row, self.off_or_pi, self.size)
-        };
-        crate::schema::read_unsigned(bytes, self.size)
+        }
+    }
+}
+
+/// Precomputed reader for one raw, injective index/group column. Built once
+/// before a population or read-back loop so the per-row path is a slice plus a
+/// `read_unsigned`, with no schema walk.
+///
+/// Raw (not hashed): GroupIndex replay groups source rows by this exact value
+/// and does not re-filter by group membership, so the encoding must stay
+/// injective within the column's domain — a hashed (colliding) value would
+/// merge distinct groups. GI's gc column is always U8..I64 (size ∈ {1,2,4,8}),
+/// so `read_unsigned` never sees an out-of-range width.
+pub(super) struct IndexColExtractor {
+    loc: ColLoc,
+}
+
+impl IndexColExtractor {
+    pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
+        Self { loc: ColLoc::resolve(schema, col_idx) }
+    }
+
+    #[inline]
+    pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
+        crate::schema::read_unsigned(self.loc.bytes(mb, row), self.loc.size)
+    }
+}
+
+/// Precomputed gatherer for the byte-form AVI composite group key. Resolves
+/// each group column's layout once; `gather` then concatenates raw bytes per
+/// row. Callers must have passed `compiler::avi_group_key_eligible`
+/// (fixed-width, non-nullable columns), so it never sees STRING/BLOB or a NULL.
+pub(super) struct GroupKeyExtractor {
+    cols: Vec<ColLoc>,
+    /// Total group-key width in bytes (the group stride).
+    pub(super) stride: usize,
+}
+
+impl GroupKeyExtractor {
+    pub(super) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
+        let mut cols = Vec::with_capacity(group_by_cols.len());
+        let mut stride = 0;
+        for &c in group_by_cols {
+            let ci = c as usize;
+            // gather() reads each column's raw bytes unconditionally; a nullable
+            // column would let a NULL row's stale slot bytes form a phantom key.
+            // avi_group_key_eligible already excludes nullable/STRING/BLOB/float
+            // columns — assert it so a future gate change can't silently regress.
+            debug_assert_eq!(
+                schema.columns[ci].nullable, 0,
+                "GroupKeyExtractor: group columns must be non-nullable",
+            );
+            let loc = ColLoc::resolve(schema, ci);
+            stride += loc.size;
+            cols.push(loc);
+        }
+        Self { cols, stride }
+    }
+
+    /// Concatenate the group columns' raw little-endian bytes into `out` (which
+    /// must be at least `self.stride` long), in `group_by_cols` order.
+    #[inline]
+    pub(super) fn gather(&self, mb: &MemBatch, row: usize, out: &mut [u8]) {
+        let mut off = 0;
+        for col in &self.cols {
+            out[off..off + col.size].copy_from_slice(col.bytes(mb, row));
+            off += col.size;
+        }
     }
 }
 
@@ -184,6 +244,12 @@ impl IndexColExtractor {
 // `agg::apply_agg_from_value_index`) are the two halves of one codec: encode
 // maps a value to a u64 whose unsigned ordering matches the value's natural
 // ordering, decode recovers the original bits. They must stay mutual inverses.
+
+/// Width in bytes of the order-encoded aggregate value appended to every AVI
+/// composite key (`group_key_bytes ++ av_encoded`). The codec always emits a
+/// u64, so this is the trailing-segment length the index schema, the population
+/// loop, and the lookup all agree on.
+pub(crate) const AVI_AV_BYTES: usize = 8;
 
 #[inline]
 fn ieee_order_bits(raw_bits: u64) -> u64 {
@@ -367,35 +433,6 @@ pub(super) fn extract_group_key(
     }
     let h_hi = mix64(h ^ (group_by_cols.len() as u64));
     ((h_hi as u128) << 64) | (h as u128)
-}
-
-/// Extract 64-bit group key for AVI / GI composite keys.
-///
-/// For single-column non-nullable U128/UUID (including U128/UUID PK), mix
-/// both halves to avoid truncation collisions; `extract_group_key` returns
-/// the raw 128 bits in those cases. All other shapes already encode their
-/// distinguishing information in the low 64 bits.
-pub(super) fn extract_gc_u64(
-    mb: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u64 {
-    let key_u128 = extract_group_key(mb, row, schema, group_by_cols);
-
-    if group_by_cols.len() == 1 {
-        let c_idx = group_by_cols[0] as usize;
-        let tc = schema.columns[c_idx].type_code;
-        if (tc == type_code::U128 || tc == type_code::UUID)
-            && schema.columns[c_idx].nullable == 0
-        {
-            let lo = key_u128 as u64;
-            let hi = (key_u128 >> 64) as u64;
-            return mix64(lo ^ mix64(hi));
-        }
-    }
-
-    key_u128 as u64
 }
 
 #[cfg(test)]

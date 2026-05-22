@@ -5,7 +5,7 @@ mod join;
 mod linear;
 mod reduce;
 mod scan;
-mod util;
+pub(crate) mod util;
 
 pub use distinct::op_distinct;
 pub use exchange::{
