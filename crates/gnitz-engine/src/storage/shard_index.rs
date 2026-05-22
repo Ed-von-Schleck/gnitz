@@ -13,12 +13,11 @@ use crate::schema::SchemaDescriptor;
 use super::manifest::{self, ManifestEntryRaw, PkBuf, PreparedManifest};
 use super::shard_reader::MappedShard;
 
-/// Compound-PK (`pk_count >= 2`) range check. Compound-only by
-/// construction: every single-PK site hoists the raw-`u128` compare out,
-/// and the only caller (`probe_pk`'s compound arm) has already gated on
-/// `pk_indices().len() != 1`, so a single-PK arm here would be dead code.
-/// `&[u8]` key so the `sort_by`/probe closures never copy the 81-byte
-/// `PkBuf` by value.
+/// Non-fast PK range check (compound `pk_count >= 2`, or a single signed
+/// column). The `probe_pk` caller hoists the raw-`u128` compare out for
+/// `pk_is_fast` (single unsigned) keys, so this column-aware path runs only
+/// when the packed u128 order diverges from storage order. `&[u8]` key so the
+/// `sort_by`/probe closures never copy the 81-byte `PkBuf` by value.
 #[inline]
 fn pk_in_range(
     schema: &SchemaDescriptor,
@@ -113,25 +112,25 @@ impl ShardEntry {
         if self.is_empty() {
             return None;
         }
-        let in_range = if schema.pk_indices().len() == 1 {
-            // Every table today. Raw u128 range check, behaviourally and
+        let in_range = if schema.pk_is_fast() {
+            // Single unsigned column. Raw u128 range check, behaviourally and
             // cost-identical to the pre-PkBuf `pk_min <= key <= pk_max`.
             debug_assert!(schema.pk_stride() == 8 || schema.pk_stride() == 16);
             self.pk_min.as_u128_single_pk() <= key
                 && key <= self.pk_max.as_u128_single_pk()
         } else {
-            // Compound (pk_count >= 2): not reachable by a caller in this
-            // layer yet, but exercised by the range-prune test. The u128
-            // entry point can only carry a region that fits in 16 bytes,
-            // so a wider pk_stride here is a routing bug.
+            // Compound (pk_count >= 2) or single signed column: the raw u128
+            // order diverges from storage order, so range-check via
+            // `compare_pk_bytes`. The u128 entry point can only carry a region
+            // that fits in 16 bytes, so a wider pk_stride here is a routing bug.
             let stride = schema.pk_stride() as usize;
             assert!(
                 stride <= 16,
-                "probe_pk: compound PK region wider than 16 bytes reached \
+                "probe_pk: PK region wider than 16 bytes reached \
                  the u128 entry point (routing bug)",
             );
-            // `key` is the LE concatenation of the compound PK columns;
-            // slice it to the region width.
+            // `key` is the faithful narrow encoding (LE concatenation for
+            // compound, zero-extended for signed); slice it to the region width.
             let key_le = key.to_le_bytes();
             pk_in_range(schema, &self.pk_min, &self.pk_max, &key_le[..stride])
         };
@@ -139,7 +138,18 @@ impl ShardEntry {
             if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
-            if let Some(row) = self.shard.find_row_index(key) {
+            // `find_row_index` binary-searches by raw u128 (storage order only
+            // for `pk_is_fast`); compound/signed PKs must look up by bytes.
+            let row = if schema.pk_is_fast() {
+                self.shard.find_row_index(key)
+            } else {
+                let stride = schema.pk_stride() as usize;
+                let key_le = key.to_le_bytes();
+                let k = &key_le[..stride];
+                let idx = self.shard.find_lower_bound_bytes(k, schema);
+                (idx < self.shard.count && self.shard.get_pk_bytes(idx) == k).then_some(idx)
+            };
+            if let Some(row) = row {
                 return Some((Rc::clone(&self.shard), row));
             }
         }

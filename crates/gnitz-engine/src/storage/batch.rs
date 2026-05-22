@@ -955,8 +955,11 @@ impl Batch {
 
     /// Byte-addressed sibling of [`find_lower_bound`]. Runs the same binary
     /// search but orders rows with the column-aware [`compare_pk_bytes`]
-    /// against the batch's own schema, so it is correct for compound and
-    /// wide (`pk_stride > 16`) PKs as well as single-column ones.
+    /// against the supplied `schema`, so it is correct for compound, signed,
+    /// and wide (`pk_stride > 16`) PKs as well as single-column ones.
+    ///
+    /// `schema` is passed in rather than read from `self.schema`, which is
+    /// unset (`None`) on the intermediate batches that join/cursor ops wrap.
     ///
     /// `key` must be exactly `pk_stride` bytes — identical width to the
     /// stored regions it is compared against. In a release build the length
@@ -964,15 +967,10 @@ impl Batch {
     /// panics with no diagnostic. Uphold it at the call site; do not rely
     /// on the debug assert in `compare_pk_bytes`.
     ///
-    /// Single-column PKs should keep using [`find_lower_bound`] — its single
-    /// `u128` compare is strictly faster than the per-probe column walk here
-    /// for a bit-identical result.
-    ///
-    /// No production caller exists yet; activated by later compound-PK work.
-    #[allow(dead_code)]
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        let schema = self.schema.as_ref()
-            .expect("find_lower_bound_bytes requires schema");
+    /// Single unsigned-column PKs (`pk_is_fast`) should keep using
+    /// [`find_lower_bound`] — its single `u128` compare is strictly faster than
+    /// the per-probe column walk here for a bit-identical result.
+    pub fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
@@ -2271,7 +2269,7 @@ mod tests {
         for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 50, 51, u64::MAX] {
             let key_bytes = probe.to_le_bytes();
             let by_u128 = b.find_lower_bound(probe as u128);
-            let by_bytes = b.find_lower_bound_bytes(&key_bytes);
+            let by_bytes = b.find_lower_bound_bytes(&key_bytes, &schema);
             assert_eq!(by_u128, by_bytes, "probe={probe}");
         }
     }
@@ -2324,7 +2322,7 @@ mod tests {
                 super::super::columnar::compare_pk_bytes(&schema, b.get_pk_bytes(i), key)
                     != std::cmp::Ordering::Less
             }).unwrap_or(b.count);
-            let got = b.find_lower_bound_bytes(key);
+            let got = b.find_lower_bound_bytes(key, &schema);
             assert_eq!(got, expected, "probe={key:?}");
         }
     }

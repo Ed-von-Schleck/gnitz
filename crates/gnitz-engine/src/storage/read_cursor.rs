@@ -144,14 +144,14 @@ impl CursorSource {
         }
     }
 
-    /// Byte-addressed sibling of [`find_lower_bound`]. The `Batch` arm
-    /// compares against the batch's own schema and ignores `schema`; the
-    /// `Shard` arm forwards `schema` (a `MappedShard` has no
-    /// `SchemaDescriptor`, only `pk_stride`). `key` must be exactly
-    /// `pk_stride` bytes.
+    /// Byte-addressed sibling of [`find_lower_bound`]. Both arms order rows by
+    /// the cursor's `schema` via [`compare_pk_bytes`] — the `Batch` arm does NOT
+    /// read the batch's own `schema` field, which is unset for the intermediate
+    /// batches a cursor often wraps. (A `MappedShard` has no `SchemaDescriptor`
+    /// at all, only `pk_stride`.) `key` must be exactly `pk_stride` bytes.
     fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
         match self {
-            CursorSource::Batch(b) => b.find_lower_bound_bytes(key),
+            CursorSource::Batch(b) => b.find_lower_bound_bytes(key, schema),
             CursorSource::Shard(s) => s.find_lower_bound_bytes(key, schema),
         }
     }
@@ -507,15 +507,52 @@ impl ReadCursor {
         // operates on a fixed narrow-PK system table; wide-PK traces seek via
         // `seek_bytes`/`seek_group`. Debug-only fail-stop if that ever breaks.
         debug_assert!(!self.schema.pk_is_wide(), "ReadCursor::seek: wide PK; use seek_bytes");
+        // Raw u128 binary search (`find_lower_bound`) orders by the packed key,
+        // which equals storage order only for a single unsigned column
+        // (`pk_is_fast`). Compound and signed-single PKs sort via
+        // `compare_pk_bytes`, and their packed u128 order differs: a compound
+        // key packs col_0 in the low bytes, so u128 order is last-column-major;
+        // a signed key zero-extends, so negatives sort after positives. Route
+        // those through the byte path. The narrow u128 encoding is faithful, so
+        // `key.to_le_bytes()[..stride]` reproduces the stored PK bytes exactly.
+        if !self.schema.pk_is_fast() {
+            let stride = self.schema.pk_stride() as usize;
+            let kb = key.to_le_bytes();
+            self.seek_bytes(&kb[..stride]);
+            return;
+        }
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.seek(src, key);
         }
+        self.rebuild_and_drive();
+    }
+
+    /// Rebuild the loser tree (when multi-source) after the per-source
+    /// positions have been moved, then drive to the first live row. Shared
+    /// tail of [`seek`], [`seek_bytes`], and [`rewind`]: repositioning a source
+    /// invalidates the tree's cached head comparisons, so it must be rebuilt
+    /// before the next `drive`.
+    fn rebuild_and_drive(&mut self) {
         if let SourceMode::Multi(_) = &self.mode {
             self.mode = SourceMode::Multi(
                 Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast, self.pk_cmp.as_deref()),
             );
         }
         self.drive();
+    }
+
+    /// Reset every source to its first row and re-drive, positioning the cursor
+    /// at the first row in storage order. Use this instead of `seek(u128::MIN)`
+    /// to rewind a cursor: a signed-PK trace's minimum is a negative value, not
+    /// the all-zero bytes `seek(0)` lands on, so `seek(u128::MIN)` would skip
+    /// every negative-keyed row. Rewinding by row index is correct at every PK
+    /// shape.
+    pub fn rewind(&mut self) {
+        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+            state.position = 0;
+            state.skip_ghosts(src);
+        }
+        self.rebuild_and_drive();
     }
 
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
@@ -526,12 +563,7 @@ impl ReadCursor {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.seek_bytes(src, key, &self.schema);
         }
-        if let SourceMode::Multi(_) = &self.mode {
-            self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast, self.pk_cmp.as_deref()),
-            );
-        }
-        self.drive();
+        self.rebuild_and_drive();
     }
 
     /// PK region of the current row as raw bytes, without copying. Byte-addressed
@@ -540,29 +572,53 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
-    /// Seek to a group's PK, dispatching on this cursor's PK width. `key` and
-    /// `key_bytes` must encode the same PK. Narrow PKs take the u128 `key`
-    /// (its single-word `find_lower_bound` compare beats the per-probe column
-    /// walk); wide PKs (`pk_stride > 16`) take the byte-addressed `seek_bytes`.
+    /// Seek to a group's PK, dispatching on whether the packed u128 key orders
+    /// like storage. `key` and `key_bytes` must encode the same PK. A single
+    /// unsigned column (`pk_is_fast`) takes the u128 `key` (its single-word
+    /// `find_lower_bound` compare beats the per-probe column walk); every other
+    /// shape — compound, signed-single, or wide (`pk_stride > 16`) — takes the
+    /// byte-addressed `seek_bytes`, whose `compare_pk_bytes` order matches the
+    /// storage sort.
     pub fn seek_group(&mut self, key: u128, key_bytes: &[u8]) {
-        if self.schema.pk_is_wide() {
-            self.seek_bytes(key_bytes);
-        } else {
+        if self.schema.pk_is_fast() {
             self.seek(key);
+        } else {
+            self.seek_bytes(key_bytes);
         }
     }
 
     /// Whether the current row's PK equals the group key — dispatch sibling of
-    /// [`seek_group`] for bounding a per-group scan. Narrow compares the cached
-    /// u128 `current_key`; wide compares the full PK bytes (the u128 key is only
-    /// the low-16 prefix). Callers must gate on `valid` first: the wide arm reads
-    /// the current row's bytes, which is undefined on an unpositioned cursor.
+    /// [`seek_group`] for bounding a per-group scan. A single unsigned column
+    /// (`pk_is_fast`) compares the cached u128 `current_key`; every other shape
+    /// compares the full PK bytes. Callers must gate on `valid` first: the
+    /// byte arm reads the current row's bytes, which is undefined on an
+    /// unpositioned cursor.
     #[inline]
     pub fn current_pk_eq(&self, key: u128, key_bytes: &[u8]) -> bool {
-        if self.schema.pk_is_wide() {
-            self.current_pk_bytes() == key_bytes
-        } else {
+        if self.schema.pk_is_fast() {
             self.current_key == key
+        } else {
+            self.current_pk_bytes() == key_bytes
+        }
+    }
+
+    /// Storage-order comparison of the current row's PK against `key`.
+    /// Dispatches like [`seek`]: the fast (single unsigned column) arm compares
+    /// the packed u128 `current_key`; every other narrow PK compares via
+    /// `compare_pk_bytes` on the row's stored bytes, since the packed u128 order
+    /// is unsound for compound/signed keys. `key` is the same faithful narrow
+    /// u128 encoding `seek` accepts. Callers must gate on `valid` first — the
+    /// non-fast arm reads the current row.
+    #[inline]
+    pub fn current_pk_cmp(&self, key: u128) -> Ordering {
+        if self.schema.pk_is_fast() {
+            self.current_key.cmp(&key)
+        } else {
+            debug_assert!(!self.schema.pk_is_wide(),
+                "current_pk_cmp: wide PK; a u128 key cannot encode it");
+            let stride = self.schema.pk_stride() as usize;
+            let kb = key.to_le_bytes();
+            columnar::compare_pk_bytes(&self.schema, self.current_pk_bytes(), &kb[..stride])
         }
     }
 
@@ -1252,6 +1308,99 @@ mod tests {
         // Seek past end
         cursor.seek(100);
         assert!(!cursor.valid);
+    }
+
+    fn make_schema_compound_u64() -> SchemaDescriptor {
+        // PK = (col0:U64, col1:U64); payload = I64. Stored first-column-major.
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        )
+    }
+
+    fn compound_pk_bytes(col0: u64, col1: u64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&col0.to_le_bytes());
+        b[8..].copy_from_slice(&col1.to_le_bytes());
+        b
+    }
+
+    /// A compound `(U64, U64)` PK packs col0 in the low 64 bits, so raw u128
+    /// order is last-column-major while storage sorts first-column-major.
+    /// `seek` must land on the exact row, not the u128-nearest one.
+    #[test]
+    fn test_seek_compound_pk_lands_on_exact_row() {
+        let schema = make_schema_compound_u64();
+        // Canonical (first-column-major) storage order: (1,5) then (2,3).
+        // As u128 the order is reversed: pack(2,3) < pack(1,5).
+        let mut b = Batch::with_schema(schema, 2);
+        for &(c0, c1, v) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
+            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &v.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
+
+        cursor.seek(crate::util::make_pk(2, 3));
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(2, 3));
+
+        // Seek the first group too.
+        cursor.seek(crate::util::make_pk(1, 5));
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(1, 5));
+    }
+
+    fn make_schema_signed_i64() -> SchemaDescriptor {
+        // PK = single I64 column; payload = I64.
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// A signed single-column PK zero-extends into the u128 key, so negative
+    /// keys sort *after* positives in raw u128 order while storage sorts them
+    /// first. `seek` to a negative key must land on the matching row.
+    #[test]
+    fn test_seek_signed_pk_lands_on_negative_row() {
+        let schema = make_schema_signed_i64();
+        // Storage (signed) order: -3, -1, 2.
+        let mut b = Batch::with_schema(schema, 3);
+        for &(pk, v) in &[(-3i64, 30i64), (-1, 10), (2, 20)] {
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &v.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
+
+        cursor.seek(((-1i64) as u64) as u128);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &(-1i64).to_le_bytes());
+
+        cursor.seek(((-3i64) as u64) as u128);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &(-3i64).to_le_bytes());
+
+        // A positive key still lands correctly.
+        cursor.seek(2u128);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_pk_bytes(), &2i64.to_le_bytes());
     }
 
     #[test]

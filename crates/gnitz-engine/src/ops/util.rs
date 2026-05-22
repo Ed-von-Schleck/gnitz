@@ -358,20 +358,25 @@ pub(super) fn extract_group_key(
 
     if group_by_cols.len() == 1 {
         let c_idx = group_by_cols[0] as usize;
-        let tc = schema.columns[c_idx].type_code;
+        let col = &schema.columns[c_idx];
+        let tc = col.type_code;
         // Skip fast path for nullable — hash loop handles NULL distinctly.
-        if schema.columns[c_idx].nullable == 0 {
-            if tc == type_code::U64 || tc == type_code::I64 {
-                let pi = schema.payload_idx(c_idx);
-                let ptr = mb.get_col_ptr(row, pi, 8);
-                let v = u64::from_le_bytes(ptr.try_into().unwrap());
-                return v as u128;
-            }
-            if tc == type_code::U128 || tc == type_code::UUID {
-                let pi = schema.payload_idx(c_idx);
-                let ptr = mb.get_col_ptr(row, pi, 16);
-                return u128::from_le_bytes(ptr[0..16].try_into().unwrap());
-            }
+        // Any fixed-width integer (1/2/4/8 bytes, signed or unsigned) or 16-byte
+        // U128/UUID widens through the same `promote_to_index_key` the PK-column
+        // branch above uses, so a value routes to the same partition whether it
+        // is the PK on one side of a join or a non-PK column on the other.
+        // STRING/BLOB/F32/F64 deliberately fall through to the hash loop: a
+        // zero-extended content prefix is not a valid routing key for them.
+        if col.nullable == 0
+            && matches!(tc,
+                type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
+                    | type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64
+                    | type_code::U128 | type_code::UUID)
+        {
+            let cs = col.size() as usize;
+            let pi = schema.payload_idx(c_idx);
+            let ptr = mb.get_col_ptr(row, pi, cs);
+            return crate::schema::promote_to_index_key(ptr, 0, cs, tc);
         }
     }
 
@@ -509,5 +514,55 @@ mod index_col_extractor_tests {
 
         let ex = IndexColExtractor::new(&schema, 1);
         assert_eq!(ex.extract(&mb, 0), 0xBEEFu64);
+    }
+
+    // Co-partition invariant: a single narrow-int routing/group column must
+    // yield the RAW zero-extended value — bit-identical to `widen_pk_le`/
+    // `get_pk` — so a join key routes to the same worker whether it is the PK
+    // on one side or a non-PK column on the other. Regression guard for the
+    // multi-worker join-drop where narrow ints fell into the `mix64` hash loop.
+    #[test]
+    fn extract_group_key_single_narrow_int_is_raw_widen() {
+        use super::extract_group_key;
+        use crate::storage::Batch as B;
+
+        // I32 payload column.
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I32, 0)],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        for v in [1i32, -1, 2, 100, i32::MIN, i32::MAX] {
+            let mut b = B::with_schema(schema, 1);
+            b.extend_pk(0u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi, &v.to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            // Zero-extended raw value (matches widen_pk_le of an I32 PK slot).
+            assert_eq!(
+                extract_group_key(&mb, 0, &schema, &[1]),
+                (v as u32) as u128,
+                "I32 group key must be the raw zero-extended value (v={v})",
+            );
+        }
+
+        // U16 payload column.
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::U16, 0)],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        for v in [0u16, 1, 0xBEEF, u16::MAX] {
+            let mut b = B::with_schema(schema, 1);
+            b.extend_pk(0u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi, &v.to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            assert_eq!(extract_group_key(&mb, 0, &schema, &[1]), v as u128);
+        }
     }
 }

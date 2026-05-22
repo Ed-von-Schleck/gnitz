@@ -363,7 +363,7 @@ pub fn op_reduce(
                         }
                     } else {
                         // Fallback: full trace scan, predicate-filtered.
-                        ti_cursor.seek(0u128);
+                        ti_cursor.rewind();
                         let ti_mb_exemplar_row = group_start_idx;
                         while ti_cursor.valid {
                             if cursor_matches_group(

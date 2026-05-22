@@ -44,13 +44,13 @@ pub fn op_anti_join_delta_trace(
             // Same PK as previous row (different payload) — re-seek cursor.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && cursor.current_key < d_pk {
+            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
                 cursor.advance();
             }
         }
 
         let in_trace = cursor.valid
-            && cursor.current_key == d_pk
+            && cursor.current_pk_cmp(d_pk) == Ordering::Equal
             && cursor.current_weight > 0;
 
         if !in_trace {
@@ -98,7 +98,7 @@ pub fn op_semi_join_delta_trace(
 
     // Reset cursor to position 0 for the same reason as op_join_delta_trace:
     // the same trace register may be shared across multiple ops in one tick.
-    cursor.seek(u128::MIN);
+    cursor.rewind();
 
     let trace_len = cursor.estimated_length();
     if n > trace_len {
@@ -119,13 +119,13 @@ pub fn op_semi_join_delta_trace(
             // Same PK as previous row (different payload) — re-seek cursor.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && cursor.current_key < d_pk {
+            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
                 cursor.advance();
             }
         }
 
         let in_trace = cursor.valid
-            && cursor.current_key == d_pk
+            && cursor.current_pk_cmp(d_pk) == Ordering::Equal
             && cursor.current_weight > 0;
 
         if in_trace {
@@ -161,8 +161,12 @@ fn semi_join_dt_swapped(
 
     let con_pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut last_pk: Option<u128> = None;
+    let fast = schema.pk_is_fast();
 
     while cursor.valid {
+        // Packed u128 of the trace PK. Injective for narrow PKs, so it works
+        // as an equality/dedup token; the ORDERED binary search below routes
+        // through bytes when the packed order is unsound (compound/signed).
         let t_pk = cursor.current_key;
 
         if cursor.current_weight <= 0 {
@@ -177,8 +181,14 @@ fn semi_join_dt_swapped(
             continue;
         }
 
-        // Binary search in consolidated delta
-        let pos = consolidated.find_lower_bound(t_pk);
+        // Binary search in consolidated delta. `find_lower_bound` orders by
+        // raw u128 (storage order only for `pk_is_fast`); non-fast PKs must use
+        // the column-aware `find_lower_bound_bytes`.
+        let pos = if fast {
+            consolidated.find_lower_bound(t_pk)
+        } else {
+            consolidated.find_lower_bound_bytes(cursor.current_pk_bytes(), schema)
+        };
         let mut j = pos;
         while j < n && con_pks[j] == t_pk {
             emit_indices.push(j as u32);
@@ -233,7 +243,7 @@ pub fn op_join_delta_trace(
     // (e.g. both join_ba and correction_raw share trace_a in a LEFT JOIN circuit).
     // Reset to position 0 so estimated_length() sees the full trace and
     // join_dt_swapped iterates from the beginning.
-    cursor.seek(u128::MIN);
+    cursor.rewind();
 
     let trace_len = cursor.estimated_length();
     if n > trace_len {
@@ -273,12 +283,12 @@ fn join_dt_merge_walk(
             // Multiset delta: same PK, different payload — re-seek trace.
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && cursor.current_key < d_pk {
+            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
                 cursor.advance();
             }
         }
 
-        while cursor.valid && cursor.current_key == d_pk {
+        while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
             let w_trace = cursor.current_weight;
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
@@ -309,13 +319,21 @@ fn join_dt_swapped(
     let delta_mb = delta.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
     let delta_pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
+    let fast = left_schema.pk_is_fast();
 
     while cursor.valid {
+        // Packed u128 trace PK: injective for narrow PKs, valid as an equality
+        // token; the ordered search below dispatches to bytes when unsound.
         let t_pk = cursor.current_key;
         let w_trace = cursor.current_weight;
 
-        // Binary search in consolidated delta
-        let pos = delta.find_lower_bound(t_pk);
+        // Binary search in consolidated delta. Raw-u128 `find_lower_bound`
+        // matches storage order only for `pk_is_fast`; otherwise go by bytes.
+        let pos = if fast {
+            delta.find_lower_bound(t_pk)
+        } else {
+            delta.find_lower_bound_bytes(cursor.current_pk_bytes(), left_schema)
+        };
         let mut j = pos;
         while j < n && delta_pks[j] == t_pk {
             let w_delta = delta.get_weight(j);
@@ -374,13 +392,13 @@ pub fn op_join_delta_trace_outer(
         if i > 0 && prev_pk == d_pk {
             cursor.seek(d_pk);
         } else {
-            while cursor.valid && cursor.current_key < d_pk {
+            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
                 cursor.advance();
             }
         }
 
         let mut matched = false;
-        while cursor.valid && cursor.current_key == d_pk {
+        while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
             let w_trace = cursor.current_weight;
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
@@ -937,6 +955,61 @@ mod tests {
         crate::util::read_i64_le(b.col_data(0), row * 8)
     }
 
+    fn make_schema_compound() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        )
+    }
+
+    fn make_compound_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, i64, i64)],
+    ) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(c0, c1, w, val) in rows {
+            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    fn make_schema_signed() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_signed_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(i64, i64, i64)],
+    ) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
     // -----------------------------------------------------------------------
     // Anti-join DD tests
     // -----------------------------------------------------------------------
@@ -1206,6 +1279,59 @@ mod tests {
         assert_eq!((out.get_pk(1) as u64), 3);
     }
 
+    /// Compound PK: the merge-walk advance loop compares trace PK vs delta PK.
+    /// Raw u128 order is last-column-major, so without `current_pk_cmp` the
+    /// scan mislocates and matches/anti-matches are wrong.
+    #[test]
+    fn test_semi_anti_join_dt_compound_pk() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_compound();
+        // Trace (storage order): (1,5) and (2,3).
+        let trace = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]).into_inner());
+
+        // Delta (storage order): (1,5), (2,3), (3,1).
+        let delta = make_compound_batch(&schema, &[(1, 5, 1, 10), (2, 3, 1, 20), (3, 1, 1, 30)]);
+
+        let mut ch = CursorHandle::from_owned(&[Rc::clone(&trace)], schema);
+        let semi = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(semi.count, 2, "semi: (1,5) and (2,3) match the trace");
+        assert_eq!(semi.get_pk(0), crate::util::make_pk(1, 5));
+        assert_eq!(semi.get_pk(1), crate::util::make_pk(2, 3));
+
+        let mut ch2 = CursorHandle::from_owned(&[trace], schema);
+        let anti = op_anti_join_delta_trace(&delta, ch2.cursor_mut(), &schema);
+        assert_eq!(anti.count, 1, "anti: only (3,1) is absent from the trace");
+        assert_eq!(anti.get_pk(0), crate::util::make_pk(3, 1));
+    }
+
+    /// Signed single-column PK: negatives sort first in storage but last in raw
+    /// u128, so the advance loop must use `current_pk_cmp`.
+    #[test]
+    fn test_semi_anti_join_dt_signed_pk() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_signed();
+        // Trace (signed order): -3, -1.
+        let trace = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10)]).into_inner());
+
+        // Delta (signed order): -3, -1, 2.
+        let delta = make_signed_batch(&schema, &[(-3, 1, 1), (-1, 1, 2), (2, 1, 3)]);
+
+        let mut ch = CursorHandle::from_owned(&[Rc::clone(&trace)], schema);
+        let semi = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(semi.count, 2, "semi: -3 and -1 match the trace");
+        assert_eq!(semi.get_pk(0) as i64, -3);
+        assert_eq!(semi.get_pk(1) as i64, -1);
+
+        let mut ch2 = CursorHandle::from_owned(&[trace], schema);
+        let anti = op_anti_join_delta_trace(&delta, ch2.cursor_mut(), &schema);
+        assert_eq!(anti.count, 1, "anti: only 2 is absent from the trace");
+        assert_eq!(anti.get_pk(0) as i64, 2);
+    }
+
     #[test]
     fn test_semi_join_dt_nonconsolidated() {
         use std::rc::Rc;
@@ -1268,6 +1394,52 @@ mod tests {
         // Right column (payload col 1) should be null
         let null_word = u64::from_le_bytes(out.null_bmp_data()[8..16].try_into().unwrap());
         assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
+    }
+
+    fn make_schema_i32() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_i32_batch(schema: &SchemaDescriptor, rows: &[(i32, i64, i64)]) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk((pk as u32) as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    /// Inner join delta×trace on a narrow (I32, 4-byte) signed PK. Every delta
+    /// key has a trace match; all must be found, including the smallest key
+    /// (regression guard for the byte-seek path at sub-8-byte stride).
+    #[test]
+    fn test_join_dt_i32_key_all_match() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let left_schema = make_schema_i32();
+        let right_schema = make_schema_i32();
+        // Trace (right): keys 1 and 2, both present.
+        let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
+        // Delta (left): keys 1 and 2.
+        let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
+
+        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &left_schema, &right_schema);
+        assert_eq!(out.count, 2, "both I32 keys must join (smallest key not dropped)");
+        assert_eq!(out.get_pk(0) as i32, 1);
+        assert_eq!(out.get_pk(1) as i32, 2);
     }
 
     // -----------------------------------------------------------------------

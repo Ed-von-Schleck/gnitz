@@ -327,6 +327,186 @@ fn reduce_trace_seek_wide_pk() {
     assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 100, "new SUM");
 }
 
+/// Incremental REDUCE over a narrow COMPOUND PK (2×U64, stride 16), GROUP BY
+/// the full PK, SUM. The tick-2 retraction seeks `trace_out` by the group's
+/// PK. A compound key's raw-u128 order is last-column-major, so the seek must
+/// go by bytes (storage order) to land on the group and retract the old SUM.
+#[test]
+fn reduce_trace_seek_compound_pk() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use crate::schema::{SchemaColumn, type_code};
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0, 1],
+    );
+    assert!(!in_schema.pk_is_fast(), "test invariant: compound PK is not fast");
+    assert!(!in_schema.pk_is_wide(), "test invariant: stride 16 is narrow");
+
+    let pk = |a: u64, b: u64| -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[0..8].copy_from_slice(&a.to_le_bytes());
+        k[8..16].copy_from_slice(&b.to_le_bytes());
+        k
+    };
+    let agg = AggDescriptor {
+        col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+    let group_by = [0u32, 1];
+
+    // Tick 1: insert (1,5)->100 and (2,3)->200 (two distinct groups).
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta1 = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for &(a, c, val) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
+            b.extend_pk_bytes(&pk(a, c));
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out1.count, 2, "two groups");
+    assert_eq!(out1.get_pk_bytes(0), &pk(1, 5)[..]);
+    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 100);
+    assert_eq!(out1.get_pk_bytes(1), &pk(2, 3)[..]);
+    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 8), 200);
+
+    // Tick 2: insert (2,3)->50. SUM for (2,3) goes 200 → 250: retract 200,
+    // insert 250. Group (1,5) is untouched.
+    let prev_out = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+    let delta2 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk_bytes(&pk(2, 3));
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &50i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out2, _) = op_reduce(
+        &delta2, None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out2.count, 2,
+        "compound-PK retraction must read trace_out and emit retract+insert");
+    assert_eq!(out2.get_pk_bytes(0), &pk(2, 3)[..]);
+    assert_eq!(out2.get_weight(0), -1);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
+    assert_eq!(out2.get_weight(1), 1);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 250, "new SUM");
+}
+
+/// Incremental REDUCE over a narrow SIGNED single-column PK (I64), GROUP BY the
+/// full PK, SUM. The tick-2 retraction seek to a negative key used to
+/// mislocate (signed zero-extends → negatives sort after positives in raw
+/// u128), dropping the retraction.
+#[test]
+fn reduce_trace_seek_signed_pk() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use crate::schema::{SchemaColumn, type_code};
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    assert!(!in_schema.pk_is_fast(), "test invariant: signed PK is not fast");
+
+    let agg = AggDescriptor {
+        col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+    let group_by = [0u32];
+
+    // Tick 1: insert key=-1 -> 200, key=2 -> 100.
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta1 = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for &(k, val) in &[(-1i64, 200i64), (2, 100)] {
+            b.extend_pk((k as u64) as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out1.count, 2, "two groups (-1 sorts before 2)");
+    assert_eq!(out1.get_pk(0) as i64, -1);
+    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 200);
+
+    // Tick 2: insert key=-1 -> 50. SUM goes 200 → 250: retract + insert.
+    let prev_out = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+    let delta2 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(((-1i64) as u64) as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &50i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out2, _) = op_reduce(
+        &delta2, None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &group_by, &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out2.count, 2,
+        "signed-PK retraction must read trace_out and emit retract+insert");
+    assert_eq!(out2.get_pk(0) as i64, -1);
+    assert_eq!(out2.get_weight(0), -1);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
+    assert_eq!(out2.get_weight(1), 1);
+    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 250, "new SUM");
+}
+
 #[test]
 fn test_reduce_count() {
     use std::rc::Rc;

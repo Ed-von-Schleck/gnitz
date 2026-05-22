@@ -262,6 +262,116 @@ mod tests {
         assert_eq!(out.count, 0, "I8: matching (PK,payload) should produce no output");
     }
 
+    fn make_schema_compound() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        )
+    }
+
+    fn make_compound_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, i64, i64)],
+    ) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(c0, c1, w, val) in rows {
+            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// With a compound PK the raw-u128 order is last-column-major, so the trace
+    /// seek must go by bytes to find an existing element. A delta that re-adds
+    /// an element already in the trace must net to no output (not emit `+1`).
+    #[test]
+    fn test_distinct_compound_pk_finds_existing() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_compound();
+        // Trace in storage order: (1,5) then (2,3).
+        let trace = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Re-add (2,3) with the same payload → already present → no output.
+        let delta = make_compound_batch(&schema, &[(2, 3, 1, 200)]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "compound: re-adding an existing element must net to no output");
+
+        // Adding a genuinely new (2,3) payload IS a new element → +1.
+        let trace2 = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
+        let mut ch2 = CursorHandle::from_owned(&[trace2], schema);
+        let delta2 = make_compound_batch(&schema, &[(2, 3, 1, 999)]);
+        let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
+        assert_eq!(out2.count, 1, "compound: a new payload at an existing PK emits +1");
+        assert_eq!(out2.get_pk(0), crate::util::make_pk(2, 3));
+        assert_eq!(out2.get_weight(0), 1);
+    }
+
+    fn make_schema_signed() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_signed_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(i64, i64, i64)],
+    ) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// Signed single-column PK: negatives sort first in storage but last in raw
+    /// u128. The trace seek to a negative key must find the existing element.
+    #[test]
+    fn test_distinct_signed_pk_finds_existing() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_signed();
+        // Storage (signed) order: -3, -1, 2.
+        let trace = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10), (2, 1, 20)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Re-add (-1) with the same payload → already present → no output.
+        let delta = make_signed_batch(&schema, &[(-1, 1, 10)]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "signed: re-adding an existing element must net to no output");
+
+        // Retract (-1) fully → element leaves the set → -1.
+        let trace2 = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10), (2, 1, 20)]));
+        let mut ch2 = CursorHandle::from_owned(&[trace2], schema);
+        let delta2 = make_signed_batch(&schema, &[(-1, -1, 10)]);
+        let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
+        assert_eq!(out2.count, 1, "signed: fully retracting an element emits -1");
+        assert_eq!(out2.get_pk(0) as i64, -1);
+        assert_eq!(out2.get_weight(0), -1);
+    }
+
     #[test]
     fn test_op_distinct_consolidated_flag() {
         use std::rc::Rc;

@@ -17,6 +17,36 @@ use super::batch::relocate_string_cell;
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
 
+/// Lower-bound index of `key` in `run`, or `run.count` when `key` lies outside
+/// the run's `[min, max]` range (so the caller's `get_pk(lo) == key` loop runs
+/// zero times). Dispatches on `pk_is_fast`: a single unsigned column uses the
+/// raw-u128 binary search, whose order matches storage order. Compound and
+/// signed PKs order via `compare_pk_bytes` — their packed u128 order diverges
+/// (compound is last-column-major; signed sorts negatives last), so the raw
+/// search would mislocate and the range-reject would wrongly skip live runs.
+/// `key` is the faithful narrow encoding: `to_le_bytes()[..stride]` reproduces
+/// the stored PK bytes.
+fn run_lower_bound(run: &Batch, key: u128, schema: &SchemaDescriptor) -> usize {
+    if run.count == 0 {
+        return 0;
+    }
+    if schema.pk_is_fast() {
+        if key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
+            return run.count;
+        }
+        return run.find_lower_bound(key);
+    }
+    let stride = schema.pk_stride() as usize;
+    let kb = key.to_le_bytes();
+    let k = &kb[..stride];
+    if columnar::compare_pk_bytes(schema, k, run.get_pk_bytes(0)) == Ordering::Less
+        || columnar::compare_pk_bytes(schema, k, run.get_pk_bytes(run.count - 1)) == Ordering::Greater
+    {
+        return run.count;
+    }
+    run.find_lower_bound_bytes(k, schema)
+}
+
 /// Merge N sorted MemBatch views into a single consolidated Batch.
 fn consolidate_batches(
     batches: &[SortedMemBatch],
@@ -162,12 +192,10 @@ impl MemTable {
         let mut total_w: i64 = 0;
         let mut row_count: usize = 0;
         self.has_found = false;
+        let schema = self.schema;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
-                continue;
-            }
-            let mut lo = run.find_lower_bound(key);
+            let mut lo = run_lower_bound(run, key, &schema);
             while lo < run.count && run.get_pk(lo) == key {
                 total_w += run.get_weight(lo);
                 if !self.has_found {
@@ -222,10 +250,7 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
-                continue;
-            }
-            let mut lo = run.find_lower_bound(key);
+            let mut lo = run_lower_bound(run, key, &self.schema);
             while lo < run.count && run.get_pk(lo) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, run.as_ref(), lo, ref_source, ref_row,
@@ -248,11 +273,9 @@ impl MemTable {
     /// sequence where the old payload has been cancelled but the new payload
     /// is still positive.
     pub fn find_positive_payload_row(&mut self, key: u128) -> bool {
+        let schema = self.schema;
         for (ri, run) in self.runs.iter().enumerate() {
-            if run.count == 0 || key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
-                continue;
-            }
-            let mut lo = run.find_lower_bound(key);
+            let mut lo = run_lower_bound(run, key, &schema);
             while lo < run.count && run.get_pk(lo) == key {
                 let net_w = self.find_weight_for_row(key, run.as_ref(), lo);
                 if net_w > 0 {

@@ -492,11 +492,10 @@ impl MappedShard {
     /// wrong-length slice silently misreads or panics with no diagnostic.
     /// Uphold it at the call site.
     ///
-    /// Single-column PKs should keep using [`find_lower_bound`] — its single
-    /// `u128` compare is strictly faster than the per-probe column walk.
-    ///
-    /// No production caller exists yet; activated by later compound-PK work.
-    #[allow(dead_code)]
+    /// Single unsigned-column PKs (`pk_is_fast`) should keep using
+    /// [`find_lower_bound`] — its single `u128` compare is strictly faster than
+    /// the per-probe column walk. Reached in production by the cursor byte-seek
+    /// path and `shard_index::probe_pk` for compound/signed PKs.
     pub fn find_lower_bound_bytes(
         &self,
         key: &[u8],
