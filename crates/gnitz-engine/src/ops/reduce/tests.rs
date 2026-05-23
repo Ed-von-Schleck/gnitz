@@ -3606,3 +3606,536 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     assert_eq!(inserted, Some(9),
         "must return group (3,4)'s own next MIN (9), not the decoy group (3,5)'s value");
 }
+
+// =======================================================================
+// Wide byte-form AVI (composite key > 16 bytes). Multi-column and U128/UUID
+// group keys produce a composite AVI key past the narrow 16-byte budget, up
+// to MAX_PK_BYTES. These tests drive `seek_first_positive_with_prefix`
+// through the wide cursor path (pk_stride > 16, ordered by compare_pk_bytes),
+// the surface the narrow tests above never reach.
+// =======================================================================
+
+// Randomized equivalence: over many wide `(a, b)` groups the AVI lookup must
+// return each group's own MIN — the same per-group extremum a trace scan
+// would compute. The expected MIN is computed directly in-test (the
+// reference); the AVI carries that post-state and the indexed result must
+// match it group-for-group. Composite key = a(8) ++ b(8) ++ av(8) = 24 bytes.
+#[test]
+fn avi_wide_two_u64_groups_match_reference() {
+    use std::rc::Rc;
+    use std::collections::BTreeMap;
+    use crate::storage::CursorHandle;
+    use super::super::util::encode_ordered;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // pk
+            SchemaColumn::new(type_code::U64, 0), // a (group)
+            SchemaColumn::new(type_code::U64, 0), // b (group)
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    assert_eq!(
+        crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]).pk_stride(),
+        24,
+        "wide composite: 8 + 8 + 8",
+    );
+
+    // Deterministic LCG. Group coordinates span the full u64 range (high bit
+    // set) to exercise the wide compare_pk_bytes ordering, not just low bytes.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+
+    // 40 distinct groups, several rows each; reference MIN computed in-test.
+    let mut reference: BTreeMap<(u64, u64), i64> = BTreeMap::new();
+    let mut group_coords: Vec<(u64, u64)> = Vec::new();
+    for _ in 0..40 {
+        let a = next() | (1u64 << 63);
+        let b = next();
+        group_coords.push((a, b));
+        let rows = 1 + (next() % 5) as usize;
+        let mut group_min = i64::MAX;
+        for _ in 0..rows {
+            let v = next() as i64;
+            group_min = group_min.min(v);
+        }
+        reference.insert((a, b), group_min);
+    }
+
+    // AVI post-state: one entry per group holding its MIN, sorted by
+    // compare_pk_bytes order (ascending a, then b — both unsigned).
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]);
+    let mut sorted: Vec<(u64, u64, i64)> =
+        reference.iter().map(|(&(a, b), &m)| (a, b, m)).collect();
+    sorted.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    let avi_batch = {
+        let mut bt = Batch::with_schema(avi_schema, sorted.len());
+        for &(a, b, m) in &sorted {
+            let mut key = [0u8; 24];
+            key[0..8].copy_from_slice(&a.to_le_bytes());
+            key[8..16].copy_from_slice(&b.to_le_bytes());
+            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            key[16..24].copy_from_slice(&av.to_le_bytes());
+            bt.extend_pk_bytes(&key);
+            bt.extend_weight(&1i64.to_le_bytes());
+            bt.extend_null_bmp(&0u64.to_le_bytes());
+            bt.count += 1;
+        }
+        bt.sorted = true;
+        bt.consolidated = true;
+        bt
+    };
+
+    // Delta: one representative insert per group. Its val is deliberately the
+    // group's MIN + 1000 so a correct result can only come from the index.
+    let delta = {
+        let mut bt = Batch::with_schema(in_schema, group_coords.len());
+        for (i, &(a, b)) in group_coords.iter().enumerate() {
+            bt.extend_pk(i as u128 + 1);
+            bt.extend_weight(&1i64.to_le_bytes());
+            bt.extend_null_bmp(&0u64.to_le_bytes());
+            bt.extend_col(in_schema.payload_idx(1), &a.to_le_bytes());
+            bt.extend_col(in_schema.payload_idx(2), &b.to_le_bytes());
+            let decoy = reference[&(a, b)].wrapping_add(1000);
+            bt.extend_col(in_schema.payload_idx(3), &decoy.to_le_bytes());
+            bt.count += 1;
+        }
+        bt
+    };
+
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_batch)], avi_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 3, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32], &[agg],
+        Some(avi_ch.cursor_mut()), false, TypeCode::I64, None, 0, None, None,
+    );
+
+    assert_eq!(out.count, reference.len(), "one row per group");
+    let mut seen: BTreeMap<(u64, u64), i64> = BTreeMap::new();
+    for i in 0..out.count {
+        let a = crate::util::read_u64_le(out.col_data(0), i * 8);
+        let b = crate::util::read_u64_le(out.col_data(1), i * 8);
+        let m = crate::util::read_i64_le(out.col_data(2), i * 8);
+        seen.insert((a, b), m);
+    }
+    assert_eq!(seen, reference,
+        "wide AVI per-group MIN must match the in-test trace-scan reference");
+}
+
+// Single U128 group column: composite = g(16) ++ av(8) = 24 bytes. Confirms a
+// 16-byte group column drives the wide seek and that two groups never share a
+// bucket.
+#[test]
+fn avi_wide_single_u128_group_distinct() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use super::super::util::encode_ordered;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),  // pk
+            SchemaColumn::new(type_code::U128, 0), // g (group)
+            SchemaColumn::new(type_code::I64, 0),  // val
+        ],
+        &[0],
+    );
+    // A single U128 group column uses a natural PK: the group value IS the
+    // output PK; the only payload column is the aggregate.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0), // PK = group value g
+            SchemaColumn::new(type_code::I64, 1),  // MIN
+        ],
+        &[0],
+    );
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32]);
+    assert_eq!(avi_schema.pk_stride(), 24, "16 + 8");
+
+    // Two groups, large U128 values (high 64 bits set) → exercises the full
+    // 16-byte compare. Group g1 MIN=10, g2 MIN=20.
+    let g1: u128 = (1u128 << 120) | 7;
+    let g2: u128 = (1u128 << 120) | 9; // shares top bytes with g1, differs low
+    let groups = [(g1, 10i64), (g2, 20i64)];
+
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for (i, &(g, _)) in groups.iter().enumerate() {
+            b.extend_pk(i as u128 + 1);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(1), &g.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(2), &999i64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+
+    let avi_batch = {
+        let mut b = Batch::with_schema(avi_schema, 2);
+        // sorted ascending by g (both share high bytes; g1 < g2 by low byte).
+        for &(g, m) in &groups {
+            let mut key = [0u8; 24];
+            key[0..16].copy_from_slice(&g.to_le_bytes());
+            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            key[16..24].copy_from_slice(&av.to_le_bytes());
+            b.extend_pk_bytes(&key);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_batch)], avi_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        Some(avi_ch.cursor_mut()), false, TypeCode::I64, None, 0, None, None,
+    );
+
+    assert_eq!(out.count, 2);
+    for i in 0..out.count {
+        let g = out.get_pk(i);
+        let m = crate::util::read_i64_le(out.col_data(0), i * 8);
+        let expected = if g == g1 { 10 } else if g == g2 { 20 } else { panic!("group {g}") };
+        assert_eq!(m, expected, "U128 group {g} must resolve its own MIN");
+    }
+}
+
+// Mixed signed/unsigned wide key: GROUP BY (a I64, b U64), composite 24. The
+// negative `a` group must sort before the positive one under the per-column
+// signed comparison in compare_pk_bytes; a seek for each must land on its own
+// group. Guards that make_avi_schema preserves each column's type_code.
+#[test]
+fn avi_wide_mixed_signed_unsigned_key() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use super::super::util::encode_ordered;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // pk
+            SchemaColumn::new(type_code::I64, 0), // a (signed group)
+            SchemaColumn::new(type_code::U64, 0), // b (group)
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]);
+    assert_eq!(avi_schema.pk_stride(), 24);
+
+    // Groups: (-5, 10) MIN=100, (-5, 11) MIN=50, (3, 10) MIN=200.
+    // Signed order on column a: -5 < 3, so the (-5,*) groups precede (3,*).
+    let groups: [(i64, u64, i64); 3] = [(-5, 10, 100), (-5, 11, 50), (3, 10, 200)];
+
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 3);
+        for (i, &(a, bb, _)) in groups.iter().enumerate() {
+            b.extend_pk(i as u128 + 1);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(1), &a.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(2), &bb.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(3), &777i64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+
+    // AVI rows in compare_pk_bytes order: a ascending (signed), then b.
+    let avi_batch = {
+        let mut b = Batch::with_schema(avi_schema, 3);
+        let mut sorted = groups.to_vec();
+        sorted.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+        for &(a, bb, m) in &sorted {
+            let mut key = [0u8; 24];
+            key[0..8].copy_from_slice(&a.to_le_bytes());
+            key[8..16].copy_from_slice(&bb.to_le_bytes());
+            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            key[16..24].copy_from_slice(&av.to_le_bytes());
+            b.extend_pk_bytes(&key);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_batch)], avi_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 3, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32], &[agg],
+        Some(avi_ch.cursor_mut()), false, TypeCode::I64, None, 0, None, None,
+    );
+
+    assert_eq!(out.count, 3);
+    for i in 0..out.count {
+        let a = crate::util::read_i64_le(out.col_data(0), i * 8);
+        let bb = crate::util::read_u64_le(out.col_data(1), i * 8);
+        let m = crate::util::read_i64_le(out.col_data(2), i * 8);
+        let expected = match (a, bb) {
+            (-5, 10) => 100,
+            (-5, 11) => 50,
+            (3, 10) => 200,
+            _ => panic!("unexpected group ({a}, {bb})"),
+        };
+        assert_eq!(m, expected,
+            "signed-key group ({a},{bb}) must resolve its own MIN");
+    }
+}
+
+// Wide prefix collision: two groups whose composite keys share their first 16
+// bytes (a, b) but differ in bytes 17–24 (c). The seek must keep them distinct
+// and never return the colliding group's value — even though the decoy holds a
+// smaller value that would win a 16-byte-prefix-only match. GROUP BY
+// (a, b, c) → composite a(8)++b(8)++c(8)++av(8) = 32 bytes.
+#[test]
+fn avi_wide_prefix_collision_distinct_groups() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use super::super::util::encode_ordered;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // pk
+            SchemaColumn::new(type_code::U64, 0), // a
+            SchemaColumn::new(type_code::U64, 0), // b
+            SchemaColumn::new(type_code::U64, 0), // c
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32, 3u32]);
+    assert_eq!(avi_schema.pk_stride(), 32, "8 + 8 + 8 + 8");
+
+    // Both groups share (a, b) = (1, 2); they differ only in c.
+    // Group (1,2,3) MIN=100; decoy (1,2,4) MIN=5 (smaller — must NOT leak).
+    let groups: [(u64, u64, u64, i64); 2] = [(1, 2, 3, 100), (1, 2, 4, 5)];
+
+    // delta inserts only group (1,2,3); its val is a decoy 999.
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(1), &1u64.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(2), &2u64.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(3), &3u64.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(4), &999i64.to_le_bytes());
+        b.count += 1;
+        b
+    };
+
+    let avi_batch = {
+        let mut b = Batch::with_schema(avi_schema, 2);
+        // sorted by (a,b,c): (1,2,3) before (1,2,4).
+        for &(a, bb, c, m) in &groups {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&a.to_le_bytes());
+            key[8..16].copy_from_slice(&bb.to_le_bytes());
+            key[16..24].copy_from_slice(&c.to_le_bytes());
+            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            key[24..32].copy_from_slice(&av.to_le_bytes());
+            b.extend_pk_bytes(&key);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_batch)], avi_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 4, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32, 3u32], &[agg],
+        Some(avi_ch.cursor_mut()), false, TypeCode::I64, None, 0, None, None,
+    );
+
+    assert_eq!(out.count, 1, "delta touched only group (1,2,3)");
+    let c = crate::util::read_u64_le(out.col_data(2), 0);
+    let m = crate::util::read_i64_le(out.col_data(3), 0);
+    assert_eq!(c, 3, "must resolve group (1,2,3)");
+    assert_eq!(m, 100,
+        "the 16-byte-prefix-sharing decoy (1,2,4)'s smaller value must not leak");
+}
+
+// Wide retraction: retracting a wide-key group's current MIN must return the
+// next-best from the index — the wide analog of
+// `avi_multi_col_retraction_returns_next_extremum`. A prefix-colliding decoy
+// group (sharing the first 16 bytes) must not be matched.
+#[test]
+fn avi_wide_retraction_returns_next_extremum() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use super::super::util::encode_ordered;
+
+    // GROUP BY (a U64, b U64); composite a(8)++b(8)++av(8) = 24 bytes.
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]);
+    assert_eq!(avi_schema.pk_stride(), 24);
+
+    // Retract group (1<<40, 2)'s current MIN (val=5).
+    let ga: u64 = 1 << 40;
+    let gb: u64 = 2;
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&(-1i64).to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(1), &ga.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(2), &gb.to_le_bytes());
+        b.extend_col(in_schema.payload_idx(3), &5i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let group_key = extract_group_key(&delta.as_mem_batch(), 0, &in_schema, &[1u32, 2u32]);
+
+    // AVI post-state: group (ga, gb) surviving values {9, 15}; a decoy group
+    // (ga, gb+1) sharing the first 8 bytes holds a smaller 1 that must not win.
+    let avi_batch = {
+        let mut b = Batch::with_schema(avi_schema, 3);
+        let put = |b: &mut Batch, a: u64, bb: u64, m: i64| {
+            let mut key = [0u8; 24];
+            key[0..8].copy_from_slice(&a.to_le_bytes());
+            key[8..16].copy_from_slice(&bb.to_le_bytes());
+            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            key[16..24].copy_from_slice(&av.to_le_bytes());
+            b.extend_pk_bytes(&key);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        };
+        // sorted by (a, b, av): (ga,gb,9),(ga,gb,15),(ga,gb+1,1).
+        put(&mut b, ga, gb, 9);
+        put(&mut b, ga, gb, 15);
+        put(&mut b, ga, gb + 1, 1);
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    let to_batch = {
+        let mut b = Batch::with_schema(out_schema, 1);
+        b.extend_pk(group_key);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &ga.to_le_bytes());
+        b.extend_col(1, &gb.to_le_bytes());
+        b.extend_col(2, &5i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        Rc::new(b)
+    };
+
+    let mut to_ch = CursorHandle::from_owned(&[to_batch], out_schema);
+    let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_batch)], avi_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 3, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32], &[agg],
+        Some(avi_ch.cursor_mut()), false, TypeCode::I64, None, 0, None, None,
+    );
+
+    let mut retracted = None;
+    let mut inserted = None;
+    for i in 0..out.count {
+        let w = out.get_weight(i);
+        let v = crate::util::read_i64_le(out.col_data(2), i * 8);
+        if w < 0 { retracted = Some(v); } else { inserted = Some(v); }
+    }
+    assert_eq!(retracted, Some(5), "must retract the stale wide-key MIN");
+    assert_eq!(inserted, Some(9),
+        "wide AVI must return group (ga,gb)'s next MIN (9), not the decoy's 1");
+}

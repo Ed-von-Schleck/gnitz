@@ -742,9 +742,10 @@ fn agg_value_idx_eligible(tc: TypeCode) -> bool {
 /// AVI stores the group key as a fixed-width byte prefix. A group key is
 /// byte-form-eligible iff every group column is a non-nullable, fixed-width,
 /// non-float scalar (a valid PK-column type) and the composite key
-/// `group_stride + av_encoded` fits the narrow PK budget. The cap is
-/// `NARROW_PK_MAX_BYTES` because the AVI cursor drives narrow byte-form keys
-/// only; wider group keys fall back to a trace scan.
+/// `group_stride + av_encoded` fits the composite PK budget (`MAX_PK_BYTES`).
+/// The byte-form cursor (drive, seek, consolidation) orders by
+/// `compare_pk_bytes`, so any stride up to the engine PK limit is wide-safe;
+/// only column type/count and the byte budget gate eligibility.
 fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
     if gcols.len() + 1 > crate::schema::MAX_PK_COLUMNS {
         return false;
@@ -766,7 +767,7 @@ fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
         stride += col.size() as usize;
     }
     let key_bytes = stride + crate::ops::util::AVI_AV_BYTES;
-    key_bytes <= crate::schema::NARROW_PK_MAX_BYTES
+    key_bytes <= crate::schema::MAX_PK_BYTES
 }
 
 // ---------------------------------------------------------------------------

@@ -207,6 +207,95 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_wide_multi_col_group_by_min_max(self, client):
+        """A two-column GROUP BY over two BIGINT columns gives a composite AVI
+        key of a(8) ++ b(8) ++ encoded value(8) = 24 bytes, past the 16-byte
+        narrow cap — so this exercises the wide byte-form AVI seek. Inserting in
+        several batches forces memtable flushes (multi-source + on-disk shard
+        reads), and MIN/MAX must stay correct per group across incremental
+        inserts and a retraction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  a BIGINT NOT NULL,"
+                "  b BIGINT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo, MAX(val) AS hi "
+                "FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # 6 distinct (a, b) groups; values chosen so the per-group MIN/MAX
+            # are unambiguous. Use large group coordinates to span >32 bits.
+            groups = [
+                (1_000_000_001, 2_000_000_001),
+                (1_000_000_001, 2_000_000_002),  # shares `a` with the first
+                (1_000_000_002, 2_000_000_001),
+                (5, 7),
+                (5, 8),
+                (9_999_999_999, 9_999_999_998),
+            ]
+            expected_lo = {}
+            expected_hi = {}
+            pk = 0
+            # Insert in several batches so the source table flushes between
+            # them — drives multi-source consolidation of the wide AVI key.
+            for batch_no in range(3):
+                rows_sql = []
+                for gi, (a, b) in enumerate(groups):
+                    for k in range(2):
+                        pk += 1
+                        v = (gi + 1) * 1000 + batch_no * 100 + k
+                        rows_sql.append(f"({pk}, {a}, {b}, {v})")
+                        expected_lo[(a, b)] = min(expected_lo.get((a, b), v), v)
+                        expected_hi[(a, b)] = max(expected_hi.get((a, b), v), v)
+                client.execute_sql(
+                    "INSERT INTO t VALUES " + ", ".join(rows_sql),
+                    schema_name=sn,
+                )
+
+            rows = client.scan(vid)
+            assert len(rows) == len(groups)
+            for r in rows:
+                key = (r["a"], r["b"])
+                assert r["lo"] == expected_lo[key], (
+                    f"group {key}: MIN expected {expected_lo[key]}, got {r['lo']}"
+                )
+                assert r["hi"] == expected_hi[key], (
+                    f"group {key}: MAX expected {expected_hi[key]}, got {r['hi']}"
+                )
+
+            # Incremental insert below the current MIN of group (5, 7).
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({pk + 1}, 5, 7, -42)",
+                schema_name=sn,
+            )
+            by_lo = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
+            assert by_lo[(5, 7)] == -42, "smaller value must lower the group MIN"
+
+            # Retract the new extremum: MIN of (5, 7) must recover its prior value.
+            client.execute_sql(
+                f"DELETE FROM t WHERE pk = {pk + 1}",
+                schema_name=sn,
+            )
+            by_lo = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
+            assert by_lo[(5, 7)] == expected_lo[(5, 7)], (
+                "retracting the extremum must restore the next-best MIN"
+            )
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

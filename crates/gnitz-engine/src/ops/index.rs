@@ -47,12 +47,12 @@ pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> 
     cols.push(SchemaColumn::new(type_code::U64, 0)); // av_encoded
     pk.push(group_by_cols.len() as u32);
     let schema = SchemaDescriptor::new(&cols, &pk);
-    // Mirror the eligibility gate's budget (compiler::avi_group_key_eligible),
-    // not the looser MAX_PK_BYTES: the AVI cursor only drives narrow keys, so a
-    // future gate relaxation that overshoots this cap must trip here.
+    // Guard against a gate relaxation overshooting the engine PK limit. The
+    // byte-form cursor orders wide keys via compare_pk_bytes, so the bound is
+    // MAX_PK_BYTES, not the narrow cap.
     debug_assert!(
-        schema.pk_stride() as usize <= crate::schema::NARROW_PK_MAX_BYTES,
-        "make_avi_schema: composite key {} exceeds NARROW_PK_MAX_BYTES",
+        schema.pk_stride() as usize <= crate::schema::MAX_PK_BYTES,
+        "make_avi_schema: composite key {} exceeds MAX_PK_BYTES",
         schema.pk_stride(),
     );
     schema
