@@ -1371,7 +1371,7 @@ fn emit_reduce(
                 "{}/scratch__reduce_in_{}_{}/_gidx", view_dir, view_id, nid,
             );
             if let Ok(gi_table) = Table::new(
-                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(), 0, 1024 * 1024, false,
+                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, false,
             ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));

@@ -336,30 +336,37 @@ pub fn op_reduce(
                         }
                     } else if let Some(gi_c) = gi.as_deref_mut() {
                         let gc_u64_val = gc_extractor.extract(&mb, group_start_idx);
-                        gi_c.seek(crate::util::make_pk(0, gc_u64_val));
-                        while gi_c.valid {
-                            let gk_hi = (gi_c.current_key >> 64) as u64;
-                            if gk_hi != gc_u64_val {
-                                break;
-                            }
-                            if gi_c.current_weight > 0 {
-                                let spk_lo = gi_c.current_key as u64;
-                                // spk_hi is in payload col 1 (first payload col = col index 1)
-                                let spk_hi_ptr = gi_c.col_ptr(1, 8);
-                                let spk_hi = if !spk_hi_ptr.is_null() {
-                                    let bytes = unsafe { std::slice::from_raw_parts(spk_hi_ptr, 8) };
-                                    u64::from_le_bytes(bytes.try_into().unwrap())
-                                } else {
-                                    0
-                                };
-                                let trace_key = crate::util::make_pk(spk_lo, spk_hi);
-                                ti_cursor.seek(trace_key);
-                                while ti_cursor.valid && ti_cursor.current_key == trace_key {
-                                    ti_cursor.push_current_row(&mut trace_rows);
-                                    ti_cursor.advance();
-                                }
+                        let mut prefix = [0u8; crate::ops::index::GI_GC_BYTES];
+                        prefix.copy_from_slice(&gc_u64_val.to_le_bytes());
+                        let mut hit = gi_c.seek_first_positive_with_prefix(&prefix);
+                        while hit {
+                            let k = gi_c.current_pk_bytes();
+                            let src_pk_bytes = &k[crate::ops::index::GI_GC_BYTES..];
+                            // Canonical packing — the same `pack_pk_le` the
+                            // loser-tree heap key and `ReadCursor::current_pk`
+                            // use. For a single unsigned source PK (pk_is_fast)
+                            // this u128 drives the trace seek; seek_group/
+                            // current_pk_eq ignore it for compound, signed, or
+                            // wide (> 16) schemas and compare bytes instead, so
+                            // the low-16 prefix pack_pk_le returns for a wide PK
+                            // is never read as a key.
+                            let src_pk_u128 = crate::storage::pack_pk_le(src_pk_bytes);
+                            // ti_cursor traversal is non-monotonic for signed
+                            // sources: GI orders within a gc prefix by the
+                            // remapped *unsigned* source PK, ti_cursor by the
+                            // original *signed* PK, so consecutive re-seeks can
+                            // move backward. seek/seek_bytes are absolute binary
+                            // searches, so a backward seek is O(log N) and
+                            // correct; do not turn this into a forward walk.
+                            ti_cursor.seek_group(src_pk_u128, src_pk_bytes);
+                            while ti_cursor.valid
+                                && ti_cursor.current_pk_eq(src_pk_u128, src_pk_bytes)
+                            {
+                                ti_cursor.push_current_row(&mut trace_rows);
+                                ti_cursor.advance();
                             }
                             gi_c.advance();
+                            hit = gi_c.walk_to_positive_with_prefix(&prefix);
                         }
                     } else {
                         // Fallback: full trace scan, predicate-filtered.

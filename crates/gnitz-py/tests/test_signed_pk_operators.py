@@ -199,3 +199,61 @@ class TestJoinSignedKey:
             )
         finally:
             _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-aggregate GROUP BY reduce whose GroupIndex re-seeks a signed source PK
+# ---------------------------------------------------------------------------
+
+class TestReduceGiSignedKey:
+    """`SELECT g, MIN(v), MAX(v) FROM t GROUP BY g` carries TWO aggregates, so it
+    routes through the GroupIndex (GI) read-back rather than the AggValueIndex —
+    AVI is built only for a single MIN/MAX. On every incremental recompute the GI
+    maps a group to its source rows' PKs and re-seeks the source trace by each
+    PK. When t's PK is a signed BIGINT with negative keys, that re-seek must
+    locate the negative key (the same byte-ordering hazard op_distinct/op_join
+    face, but on the reduce trace). The positive-PK aggregate suites never
+    exercise this, so it is covered here end to end."""
+
+    def test_incremental_min_max_negative_pk(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g INT NOT NULL, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW vw AS SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "vw")[0]
+
+            # Build the trace: group g=1 has two rows at NEGATIVE PKs.
+            client.execute_sql(
+                "INSERT INTO t VALUES (-5, 1, 100), (-3, 1, 50), (10, 2, 7)",
+                schema_name=sn,
+            )
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[1]["lo"], by_g[1]["hi"]) == (50, 100)
+            assert (by_g[2]["lo"], by_g[2]["hi"]) == (7, 7)
+
+            # Incremental retraction at a negative PK: delete the current MIN of
+            # g=1 (v=50 at id=-3). Recomputing g=1 must re-seek the trace at the
+            # remaining negative key id=-5 (v=100) — the GI-driven trace seek.
+            client.execute_sql("DELETE FROM t WHERE id = -3", schema_name=sn)
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[1]["lo"], by_g[1]["hi"]) == (100, 100), (
+                f"after deleting id=-3, g=1 must recompute from id=-5 (v=100); got {by_g[1]}"
+            )
+
+            # Incremental insert below the current MIN at a fresh negative PK.
+            client.execute_sql("INSERT INTO t VALUES (-9, 1, 25)", schema_name=sn)
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[1]["lo"], by_g[1]["hi"]) == (25, 100), (
+                f"after inserting v=25 at id=-9, g=1 MIN must drop to 25; got {by_g[1]}"
+            )
+            # The untouched group is unchanged.
+            assert (by_g[2]["lo"], by_g[2]["hi"]) == (7, 7)
+        finally:
+            _cleanup(client, sn, tables=["t"], views=["vw"])

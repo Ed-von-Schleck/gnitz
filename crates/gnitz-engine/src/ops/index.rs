@@ -21,15 +21,47 @@ pub struct AviDesc {
     pub agg_col_idx: u32,
 }
 
-/// GI schema: U128 PK + I64 payload (spk_hi).
-pub(crate) fn make_gi_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
+/// Width of the GI key's leading `gc` (group-code) prefix: a single U64. The
+/// source PK columns follow at byte offset `GI_GC_BYTES`.
+pub(crate) const GI_GC_BYTES: usize = 8;
+
+/// GI index PK = [U64 gc] ++ source PK columns, all in the PK region; no
+/// payload. Signed source PK columns are mapped to their unsigned counterpart
+/// of the same width: GI ordering only groups entries by the `gc` prefix, so
+/// within-prefix order is irrelevant, but a signed column would sort negative
+/// source PKs *before* the zero-padded prefix-seek key and the scan would skip
+/// them. The remap keeps the byte width (pk_stride unchanged) and equality
+/// (consolidation holds), and makes 0 the true minimum so a zero-padded prefix
+/// seek lands on the first entry of the group.
+pub(crate) fn make_gi_schema(src: &SchemaDescriptor) -> SchemaDescriptor {
+    // gc + src PK columns must fit MAX_PK_COLUMNS.
+    assert!(
+        src.pk_indices().len() < crate::schema::MAX_PK_COLUMNS,
+        "make_gi_schema: source PK column count {} leaves no room for the gc \
+         prefix within MAX_PK_COLUMNS={}",
+        src.pk_indices().len(), crate::schema::MAX_PK_COLUMNS,
+    );
+    // gc + source pk_stride must fit MAX_PK_BYTES.
+    assert!(
+        GI_GC_BYTES + src.pk_stride() as usize <= crate::schema::MAX_PK_BYTES,
+        "make_gi_schema: gc({GI_GC_BYTES}) + source pk_stride {} exceeds MAX_PK_BYTES={}",
+        src.pk_stride(), crate::schema::MAX_PK_BYTES,
+    );
+    let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
+    let mut pk = vec![0u32];
+    for (ord, _ci, col) in src.pk_columns() {
+        let mut c = *col;
+        c.type_code = match col.type_code {
+            type_code::I8  => type_code::U8,
+            type_code::I16 => type_code::U16,
+            type_code::I32 => type_code::U32,
+            type_code::I64 => type_code::U64,
+            other => other,
+        };
+        cols.push(c);
+        pk.push((ord + 1) as u32);
+    }
+    SchemaDescriptor::new(&cols, &pk)
 }
 
 /// AVI index schema: the group-by columns (native fixed-width types, in GROUP
@@ -90,7 +122,7 @@ pub fn op_integrate_with_indexes(
 
     // GroupIndex population
     if let Some(gi_desc) = gi {
-        let gi_schema = make_gi_schema();
+        let gi_schema = make_gi_schema(input_schema);
         let mut gi_batch = Batch::with_schema(gi_schema, batch.count);
         gi_batch.sorted = false;
         gi_batch.consolidated = false;
@@ -102,6 +134,9 @@ pub fn op_integrate_with_indexes(
         let gi_pi = if gi_is_pk { 0 } else { input_schema.payload_idx(gi_col) };
         let gc_extractor = super::util::IndexColExtractor::new(input_schema, gi_col);
 
+        // Each row overwrites a constant-length `key[..GI_GC_BYTES + src_pk.len()]`
+        // window, so no stale trailing bytes can leak across iterations.
+        let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..batch.count {
             // PK is never null (catalog rule: pk-not-null.md), so its dense
             // bit position is undefined and the null probe is skipped.
@@ -109,18 +144,16 @@ pub fn op_integrate_with_indexes(
                 continue;
             }
 
-            let source_pk = mb.get_pk(row);
             let gc_u64 = gc_extractor.extract(&mb, row);
-            let source_pk_lo = source_pk as u64;
-            let source_pk_hi = (source_pk >> 64) as u64;
             let weight = mb.get_weight(row);
 
-            // Composite key: ck_lo = source_pk_lo, ck_hi = gc_u64
-            gi_batch.extend_pk(((gc_u64 as u128) << 64) | (source_pk_lo as u128));
+            key[..GI_GC_BYTES].copy_from_slice(&gc_u64.to_le_bytes());
+            let src_pk = mb.get_pk_bytes(row);
+            key[GI_GC_BYTES..GI_GC_BYTES + src_pk.len()].copy_from_slice(src_pk);
+
+            gi_batch.extend_pk_bytes(&key[..GI_GC_BYTES + src_pk.len()]);
             gi_batch.extend_weight(&weight.to_le_bytes());
             gi_batch.extend_null_bmp(&0u64.to_le_bytes());
-            // Payload: spk_hi (source pk high 64 bits) as I64
-            gi_batch.extend_col(0, &(source_pk_hi as i64).to_le_bytes());
             gi_batch.count += 1;
         }
 

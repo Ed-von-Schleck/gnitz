@@ -123,17 +123,20 @@ fn make_batch_3col_grp_str(
     ConsolidatedBatch::new_unchecked(b)
 }
 
-/// Build a GI Batch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
-fn make_gi_batch(rows: &[(u64, u64, i64)]) -> ConsolidatedBatch {
-    let gi_schema = crate::ops::index::make_gi_schema();
+/// Build a byte-form GI Batch for a single-U64-PK source: key = gc(8) ++
+/// source_pk(8). Each row is `(source_pk_u64, gc_u64)`.
+fn make_gi_batch(src: &SchemaDescriptor, rows: &[(u64, u64)]) -> ConsolidatedBatch {
+    let gi_schema = crate::ops::index::make_gi_schema(src);
     let n = rows.len();
     let mut b = Batch::with_schema(gi_schema, n.max(1));
 
-    for &(ck_lo, gc_u64, spk_hi) in rows {
-        b.extend_pk(((gc_u64 as u128) << 64) | (ck_lo as u128));
+    let mut key = [0u8; 16];
+    for &(source_pk, gc_u64) in rows {
+        key[..8].copy_from_slice(&gc_u64.to_le_bytes());
+        key[8..].copy_from_slice(&source_pk.to_le_bytes());
+        b.extend_pk_bytes(&key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &spk_hi.to_le_bytes());
         b.count += 1;
     }
     b.sorted = true;
@@ -557,7 +560,7 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
 
     let input_schema = make_schema_3col_grp_str();
     let output_schema = make_reduce_str_out_schema();
-    let gi_schema = crate::ops::index::make_gi_schema();
+    let gi_schema = crate::ops::index::make_gi_schema(&input_schema);
 
     // trace_in: apple and zebra both at PK=1 (apple sorts first by payload)
     let ti_batch = Rc::new(make_batch_3col_grp_str(
@@ -566,7 +569,7 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
     ).into_inner());
 
     // GI: only PK=1 → group gc_u64=1
-    let gi_batch = Rc::new(make_gi_batch(&[(1, 1, 0)]).into_inner());
+    let gi_batch = Rc::new(make_gi_batch(&input_schema, &[(1, 1)]).into_inner());
 
     // trace_out: empty (no previous aggregate, no retraction emitted)
     let to_batch = Rc::new(Batch::empty(output_schema.num_payload_cols(), 16));
@@ -1149,7 +1152,7 @@ fn test_reduce_gi_i32_group_key_overread() {
         &[0],
     );
 
-    let gi_schema = crate::ops::index::make_gi_schema();
+    let gi_schema = crate::ops::index::make_gi_schema(&in_schema);
 
     // trace_in: history row for grp=5, val=200, source pk=30
     let ti_batch = Rc::new({
@@ -1166,7 +1169,7 @@ fn test_reduce_gi_i32_group_key_overread() {
     });
 
     // GI: gc_u64=5 → source pk=30
-    let gi_batch = Rc::new(make_gi_batch(&[(30, 5, 0)]).into_inner());
+    let gi_batch = Rc::new(make_gi_batch(&in_schema, &[(30, 5)]).into_inner());
 
     // Empty trace_out (no prior aggregate)
     let to_batch = Rc::new(Batch::empty(2, 16));
@@ -1237,6 +1240,305 @@ fn test_reduce_gi_i32_group_key_overread() {
     assert_eq!(m, 200,
         "MIN(grp=5) must include history row val=200; \
          got {m} — GI group-key over-read produced a garbage gc_u64_val");
+}
+
+// -----------------------------------------------------------------------
+// Byte-form GI key: signed source PK, wide source PK, narrow equivalence.
+// -----------------------------------------------------------------------
+
+/// Read the MIN (output col 1, I64) for a given group value (output col 0).
+/// Output PK is the synthetic U128 hash, so groups are matched by the carried
+/// group column, not by row order.
+fn gi_out_min_for_grp(out: &Batch, grp: i64) -> Option<i64> {
+    let grp_data = out.col_data(0);
+    let min_data = out.col_data(1);
+    for i in 0..out.count {
+        let g = i64::from_le_bytes(grp_data[i * 8..(i + 1) * 8].try_into().unwrap());
+        if g == grp {
+            return Some(i64::from_le_bytes(
+                min_data[i * 8..(i + 1) * 8].try_into().unwrap(),
+            ));
+        }
+    }
+    None
+}
+
+/// Synthetic-PK reduce output for a single I64 group column + single I64 MIN:
+/// U128 pk | I64 grp | I64 min (nullable).
+fn gi_synthetic_out_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// GI read-back over a SIGNED source PK with negative key values. The GI schema
+/// remaps the signed source-PK column to unsigned so a zero-padded prefix seek
+/// lands on the first entry of the `gc` group instead of sorting the negative
+/// keys before it and skipping them; the per-hit trace re-seek uses
+/// `seek_group`/`current_pk_eq`, which compare PK *bytes* for a signed column
+/// rather than the raw `current_key`. Before the byte-form change the negative
+/// source rows were dropped and the MIN reflected only the delta.
+#[test]
+fn test_reduce_gi_signed_source_pk_negative() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // Source: I64 pk (col 0) | I64 grp (col 1) | I64 val (col 2).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = gi_synthetic_out_schema();
+    let gi_schema = crate::ops::index::make_gi_schema(&in_schema);
+
+    let build = |rows: &[(i64, i64, i64)]| -> Batch {
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, grp, val) in rows {
+            // Low 8 bytes of the u128 carry the signed PK's two's-complement LE.
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes());
+            b.extend_col(1, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    // History in grp=7 at NEGATIVE source PKs, ascending signed order (-5, -3).
+    // The smaller val (50) lives at pk=-5: if its prefix seek is skipped, MIN
+    // misses it.
+    let ti_batch = Rc::new(build(&[(-5, 7, 50), (-3, 7, 300)]));
+
+    // GI: gc=7 ++ source pk. Listed in remapped-unsigned order: -5 → 0xFF..FB
+    // sorts before -3 → 0xFF..FD.
+    let gi_batch = Rc::new(make_gi_batch(&in_schema,
+        &[((-5i64) as u64, 7), ((-3i64) as u64, 7)]).into_inner());
+
+    let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+
+    // Delta: a new positive-PK row in grp=7 with the largest val.
+    let delta = build(&[(99, 7, 400)]);
+
+    let mut ti_handle = CursorHandle::from_owned(&[ti_batch], in_schema);
+    let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
+    let mut to_handle = CursorHandle::from_owned(&[to_batch], out_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta,
+        Some(ti_handle.cursor_mut()),
+        to_handle.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64,
+        Some(gi_handle.cursor_mut()), 1u32,
+        None, None,
+    );
+
+    let m = gi_out_min_for_grp(&out, 7).expect("no output row for grp=7");
+    assert_eq!(m, 50,
+        "MIN(grp=7) must include the negative-PK history rows (50, 300); \
+         got {m} — the prefix seek skipped the negative source PKs");
+}
+
+/// GI re-seek over a WIDE source PK `(U64, U64, U64)` (stride 24). The byte-form
+/// GI key round-trips the full 24-byte source PK so the trace re-seek finds the
+/// wide source rows; the old `(lo, hi)` u128 packing could not represent a PK
+/// past 16 bytes. GROUP BY is a separate small column, so the reduce takes the
+/// slow group-identity path and only the GI source re-seek exercises the wide
+/// width.
+#[test]
+fn test_reduce_gi_wide_source_pk_stride24() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // Source: U64,U64,U64 PK (cols 0..2) | I64 grp (col 3) | I64 val (col 4).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1, 2],
+    );
+    assert!(in_schema.pk_is_wide(), "source PK must be wide (stride 24)");
+    let out_schema = gi_synthetic_out_schema();
+    let gi_schema = crate::ops::index::make_gi_schema(&in_schema);
+    assert_eq!(gi_schema.pk_stride(), 32, "GI key = gc(8) + 24-byte source PK");
+
+    let build = |rows: &[([u64; 3], i64, i64)]| -> Batch {
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, grp, val) in rows {
+            let mut kb = [0u8; 24];
+            kb[0..8].copy_from_slice(&pk[0].to_le_bytes());
+            kb[8..16].copy_from_slice(&pk[1].to_le_bytes());
+            kb[16..24].copy_from_slice(&pk[2].to_le_bytes());
+            b.extend_pk_bytes(&kb);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes()); // payload idx 0 = grp (col 3)
+            b.extend_col(1, &val.to_le_bytes()); // payload idx 1 = val (col 4)
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    // History in grp=9 at two wide PKs, ascending PK-byte order.
+    let ti_batch = Rc::new(build(&[([1, 2, 3], 9, 500), ([4, 5, 6], 9, 250)]));
+
+    // GI: gc=9 ++ 24-byte source PK, in PK-byte order.
+    let gi_batch = Rc::new({
+        let mut gib = Batch::with_schema(gi_schema, 2);
+        for &(pk, gc) in &[([1u64, 2, 3], 9u64), ([4, 5, 6], 9)] {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&gc.to_le_bytes());
+            key[8..16].copy_from_slice(&pk[0].to_le_bytes());
+            key[16..24].copy_from_slice(&pk[1].to_le_bytes());
+            key[24..32].copy_from_slice(&pk[2].to_le_bytes());
+            gib.extend_pk_bytes(&key);
+            gib.extend_weight(&1i64.to_le_bytes());
+            gib.extend_null_bmp(&0u64.to_le_bytes());
+            gib.count += 1;
+        }
+        gib.sorted = true;
+        gib.consolidated = true;
+        gib
+    });
+
+    let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+
+    // Delta: a new wide-PK row in grp=9 with the largest val.
+    let delta = build(&[([7, 8, 9], 9, 900)]);
+
+    let mut ti_handle = CursorHandle::from_owned(&[ti_batch], in_schema);
+    let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
+    let mut to_handle = CursorHandle::from_owned(&[to_batch], out_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 4, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta,
+        Some(ti_handle.cursor_mut()),
+        to_handle.cursor_mut(),
+        &in_schema, &out_schema, &[3u32], &[agg],
+        None, false, TypeCode::U64,
+        Some(gi_handle.cursor_mut()), 3u32,
+        None, None,
+    );
+
+    let m = gi_out_min_for_grp(&out, 9).expect("no output row for grp=9");
+    assert_eq!(m, 250,
+        "MIN(grp=9) must include the wide-PK history rows (500, 250); \
+         got {m} — the wide source PK was not re-found through the GI key");
+}
+
+/// The byte-form GI MIN result for a narrow (single U64) source PK must equal
+/// the full-trace-scan result (no GI cursor). The byte-form key changes the
+/// index bytes — the dead `source_pk_hi` payload is gone — but the re-found
+/// source rows, and thus the aggregate, must be bit-identical.
+#[test]
+fn test_reduce_gi_narrow_source_matches_no_gi() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = gi_synthetic_out_schema();
+    let gi_schema = crate::ops::index::make_gi_schema(&in_schema);
+
+    let build = |rows: &[(u64, i64, i64)]| -> Batch {
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, grp, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes());
+            b.extend_col(1, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    let history = [(1u64, 5i64, 100i64), (2, 5, 30), (3, 9, 70)];
+    let delta_rows = [(4u64, 5i64, 20i64)];
+
+    let run = |with_gi: bool| -> i64 {
+        let ti_batch = Rc::new(build(&history));
+        let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let delta = build(&delta_rows);
+        let mut ti_handle = CursorHandle::from_owned(&[ti_batch], in_schema);
+        let mut to_handle = CursorHandle::from_owned(&[to_batch], out_schema);
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2],
+        };
+        if with_gi {
+            let gi_batch = Rc::new(make_gi_batch(&in_schema,
+                &[(1, 5), (2, 5), (3, 9)]).into_inner());
+            let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
+            let (out, _) = op_reduce(
+                &delta, Some(ti_handle.cursor_mut()), to_handle.cursor_mut(),
+                &in_schema, &out_schema, &[1u32], &[agg],
+                None, false, TypeCode::U64,
+                Some(gi_handle.cursor_mut()), 1u32, None, None,
+            );
+            gi_out_min_for_grp(&out, 5).expect("GI: no output row for grp=5")
+        } else {
+            // No GI cursor → read-back falls back to the full predicate-filtered
+            // trace scan.
+            let (out, _) = op_reduce(
+                &delta, Some(ti_handle.cursor_mut()), to_handle.cursor_mut(),
+                &in_schema, &out_schema, &[1u32], &[agg],
+                None, false, TypeCode::U64,
+                None, 1u32, None, None,
+            );
+            gi_out_min_for_grp(&out, 5).expect("no-GI: no output row for grp=5")
+        }
+    };
+
+    let with_gi = run(true);
+    let without_gi = run(false);
+    assert_eq!(with_gi, 20, "MIN(grp=5) over {{100, 30, 20}} must be 20");
+    assert_eq!(with_gi, without_gi,
+        "byte-form GI MIN ({with_gi}) must equal the full-scan MIN ({without_gi})");
+}
+
+/// A source PK that fills the whole column budget leaves no room for the `gc`
+/// prefix, so the GI descriptor build panics rather than silently truncating.
+#[test]
+#[should_panic(expected = "leaves no room for the gc prefix")]
+fn test_make_gi_schema_rejects_full_pk_column_budget() {
+    let cols = [SchemaColumn::new(type_code::U8, 0); crate::schema::MAX_PK_COLUMNS];
+    let pk: Vec<u32> = (0..crate::schema::MAX_PK_COLUMNS as u32).collect();
+    let src = SchemaDescriptor::new(&cols, &pk);
+    let _ = crate::ops::index::make_gi_schema(&src);
 }
 
 // -----------------------------------------------------------------------
