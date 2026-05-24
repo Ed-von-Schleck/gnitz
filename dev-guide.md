@@ -238,6 +238,35 @@ Results: `benchmarks/results/` (gitignored). The runner rotates old results (kee
 
 Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
 
+### Rust micro-benchmarks
+
+`make bench` is end-to-end (full server + IPC), so it cannot isolate a tight
+in-process loop. For that, the engine carries `#[ignore]`d timing tests (the
+crate is a binary, so it cannot host external `benches/` targets). They print
+throughput with `--nocapture` and must be run in `--release`:
+
+```bash
+cd crates && cargo test -p gnitz-engine --release secondary_index_bench \
+    -- --ignored --nocapture --test-threads=1
+```
+
+`src/ops/bench_secondary_index.rs` measures GroupIndex/AggValueIndex population
+and decomposes per-row cost into compose / assembly / sort / upsert layers. It
+lives inside `ops` (not the crate root) so it can call the crate-internal
+key-composition helpers. Two knobs matter for representativeness:
+
+- `GNITZ_BENCH_ARENA_KB` — memtable arena size. Default (1 GiB) isolates the
+  in-memory cost with no flush; set it to the production arena (index tables
+  use 256 KiB–1 MiB) to include shard-flush cost. **Pick the arena to match the
+  scenario** — an oversized arena both skips flushes and inflates the bloom
+  filter (sized `arena/40`), which distorts the upsert layer.
+- run in `--release`; debug numbers are meaningless.
+
+Add new micro-benchmarks alongside it: name the test `*_bench`, mark it
+`#[ignore]`, time only the hot region with `std::time::Instant`, and
+`std::hint::black_box` anything the optimizer could elide. Compare a baseline
+vs. a change by running the same test on each tree.
+
 ## Debugging failures
 
 1. **Log first, never guess.** Rebuilds are expensive. One well-instrumented

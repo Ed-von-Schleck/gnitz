@@ -7,6 +7,9 @@ mod reduce;
 mod scan;
 pub(crate) mod util;
 
+#[cfg(test)]
+mod bench_secondary_index;
+
 pub use distinct::op_distinct;
 pub use exchange::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
