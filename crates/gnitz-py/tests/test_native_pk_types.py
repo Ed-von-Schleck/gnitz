@@ -90,9 +90,8 @@ class TestNativePkSchema:
 class TestSignedPkOrdering:
     """Negative values must sort *before* positives (signed semantics).
     Before native PK types, BIGINT was coerced to U64 and `-1` widened to
-    0xFFFF…FFFF, sorting AFTER `+1`. The cursor's single-PK fast path widens
-    narrow strides to u128; only `make_slow_pk_cmp`'s signed arm restores
-    correct order."""
+    0xFFFF…FFFF, sorting AFTER `+1`. The order-preserving sort key applies a
+    signed bias-flip so the raw u128 compare restores correct order."""
 
     @pytest.mark.parametrize("pk_sql,values", [
         ("BIGINT",   [-100, -1, 0, 1, 100]),

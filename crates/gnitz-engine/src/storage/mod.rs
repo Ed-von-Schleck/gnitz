@@ -34,7 +34,7 @@ pub use error::StorageError;
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use read_cursor::{DrainGuard, ReadCursor};
 pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
-pub(crate) use merge::{BlobCacheGuard, DirectWriter, make_slow_pk_cmp, pack_pk_le};
+pub(crate) use merge::{BlobCacheGuard, DirectWriter, pack_pk_le, pk_sort_key};
 pub(crate) use batch::carve_writer_slices;
 
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.

@@ -259,9 +259,9 @@ impl MemBatchCursor {
     }
 
     #[inline]
-    pub fn peek_key(&self, batch: &SortedMemBatch) -> u128 {
+    pub fn peek_key(&self, batch: &SortedMemBatch, schema: &SchemaDescriptor) -> u128 {
         debug_assert!(self.is_valid());
-        pack_pk_le(batch.get_pk_bytes(self.position))
+        pk_sort_key(schema, batch.get_pk_bytes(self.position))
     }
 }
 
@@ -406,64 +406,36 @@ pub(crate) fn pack_pk_le(pk_bytes: &[u8]) -> u128 {
     }
 }
 
-/// 2×2 monomorphisation over the two orthogonal axes — PK column
-/// type/signedness (`pk_cmp`) and payload column types (`row_cmp`). Emits
-/// four specialised copies of `$inner` so each comparator is inlined. The
-/// row comparators are wrapped as non-capturing closures: a direct fn-item
-/// reference would fix the source-ref lifetime, conflicting with the
-/// inner's HRTB `Fn` bound.
-macro_rules! dispatch_pk_row {
-    ($schema:expr, $inner:ident ( $($pre:expr),* $(,)? )) => {{
-        let slow = make_slow_pk_cmp($schema);
-        let fast = |a: u128, b: u128| a.cmp(&b);
-        match (columnar::schema_is_int_nonnull($schema), $schema.pk_is_fast()) {
-            (true, true) => $inner($($pre),*,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), fast),
-            (true, false) => $inner($($pre),*,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi), slow),
-            (false, true) => $inner($($pre),*,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi), fast),
-            (false, false) => $inner($($pre),*,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi), slow),
-        }
-    }};
-}
-
-/// The slow ordered PK comparator for single-column signed PKs and for
-/// compound PKs. All loop-invariants are extracted as owned `Copy` scalars
-/// (or the `Copy` `SchemaDescriptor`) *before* the `move` closure so it stays
-/// `Copy` and captures no slice reference (a captured `pk_indices()` slice
-/// would need a lifetime that cannot outlive the entry-point frame).
+/// Order-preserving sort key for a PK region. The returned `u128`'s unsigned
+/// order equals `compare_pk_bytes` order, so callers compare with a plain
+/// `a.cmp(&b)` regardless of signedness or column count. Order-preserving twin
+/// of `pack_pk_le`, with the same prefix semantics:
+///   * `pk_stride ≤ 16`  — the *whole* PK, exact and authoritative.
+///   * `pk_stride > 16`   — the order-preserving 16-byte *prefix*. Because the
+///     per-column OPK encoding is big-endian, this is a correct lexicographic
+///     prefix (authoritative whenever two prefixes differ) but needs a
+///     `compare_pk_bytes` tiebreak on a prefix collision, exactly as the wide
+///     sort/merge paths apply.
+///
+/// `pk_is_fast` schemas reuse `pack_pk_le` directly (a single unsigned column's
+/// LE-packed value is already order-correct, so no re-encoding is needed).
 #[inline]
-pub(crate) fn make_slow_pk_cmp(schema: &SchemaDescriptor) -> impl Fn(u128, u128) -> Ordering + Copy {
-    let schema_copy = *schema;
-    let pk_cols = schema.pk_indices();
-    let stride = schema.pk_stride() as usize;
-    let is_compound = pk_cols.len() >= 2;
-    let tc = schema.columns[pk_cols[0] as usize].type_code;
-    move |a: u128, b: u128| -> Ordering {
-        if is_compound {
-            // The `[u8; 16]` temporaries must stay inline in the call: they
-            // live only for the duration of `compare_pk_bytes`. The
-            // `len == pk_stride` debug-assert holds because `a`/`b` were
-            // packed from a `pk_stride`-wide region.
-            columnar::compare_pk_bytes(
-                &schema_copy,
-                &a.to_le_bytes()[..stride],
-                &b.to_le_bytes()[..stride],
-            )
-        } else {
-            match tc {
-                type_code::I64 => (a as i64).cmp(&(b as i64)),
-                type_code::I32 => (a as i32).cmp(&(b as i32)),
-                type_code::I16 => (a as i16).cmp(&(b as i16)),
-                type_code::I8 => (a as i8).cmp(&(b as i8)),
-                // Single-col unsigned is routed to the `fast` closure by
-                // `pk_is_fast`, so it never reaches here; this arm stays a
-                // correct lossless fallback for any unsigned that does.
-                _ => a.cmp(&b),
-            }
-        }
+pub(crate) fn pk_sort_key(schema: &SchemaDescriptor, pk_bytes: &[u8]) -> u128 {
+    if schema.pk_is_fast() {
+        return pack_pk_le(pk_bytes);
+    }
+    let stride = pk_bytes.len();
+    debug_assert_eq!(stride, schema.pk_stride() as usize,
+        "pk_sort_key: pk_bytes.len() must equal pk_stride");
+    if stride <= crate::schema::NARROW_PK_MAX_BYTES {
+        let mut buf = [0u8; crate::schema::NARROW_PK_MAX_BYTES];
+        columnar::encode_order_preserving_pk(schema, pk_bytes, &mut buf[..stride]);
+        u128::from_be_bytes(buf)
+    } else {
+        // Wide: encode the full OPK, take the leading 16-byte big-endian prefix.
+        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
+        columnar::encode_order_preserving_pk(schema, pk_bytes, &mut buf[..stride]);
+        u128::from_be_bytes(buf[..16].try_into().unwrap())
     }
 }
 
@@ -498,34 +470,42 @@ pub fn merge_batches(
 
     // `is_wide` derives from the runtime `&schema`; it only selects which
     // monomorphised closure set is handed to the single generic driver
-    // `merge_batches_inner` — it is never a term inside the hot loop.
+    // `merge_batches_inner` — it is never a term inside the hot loop. The
+    // narrow heap key (`peek_key` → `pk_sort_key`) is order-preserving, so the
+    // narrow PK axis collapses to a raw `u128` compare; only the payload
+    // comparator still needs the fast/generic split.
+    #[allow(clippy::redundant_closure)]
     if schema.pk_is_wide() {
         merge_run_wide(&mut cursors, batches, schema, writer);
+    } else if columnar::schema_is_int_nonnull(schema) {
+        merge_run_narrow(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
     } else {
-        dispatch_pk_row!(schema, merge_run_narrow(&mut cursors, batches, schema, writer));
+        merge_run_narrow(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
     }
 }
 
-/// Narrow-region closure builder: `less`/`eq_payload` bit-for-bit as before
-/// this generalisation — packed-`u128` ordered PK compare plus payload
-/// tiebreak, payload-only equality. Monomorphised by `dispatch_pk_row!`.
+/// Narrow-region closure builder. The heap key is the order-preserving
+/// `pk_sort_key`, so `less` orders the PK axis with a raw `a.key.cmp(&b.key)`
+/// (no per-comparison column decode) and tie-breaks on payload; `eq_payload`
+/// is payload-only (the order-preserving key is injective, so equal keys are
+/// equal PKs). Splits only on the payload row comparator.
 #[inline]
-fn merge_run_narrow<RowCmp, PkCmp>(
+fn merge_run_narrow<RowCmp>(
     cursors: &mut [MemBatchCursor],
     batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
-    pk_cmp: PkCmp,
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
-    PkCmp: Fn(u128, u128) -> Ordering + Copy,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`.  `source_idx` doubles as the batch index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        match pk_cmp(a.key, b.key) {
+        match a.key.cmp(&b.key) {
             Ordering::Less => true,
             Ordering::Greater => false,
             Ordering::Equal => row_cmp(schema, &batches[a.source_idx].0, a.row,
@@ -537,7 +517,7 @@ fn merge_run_narrow<RowCmp, PkCmp>(
         row_cmp(schema, &batches[a_src].0, a_row,
                         &batches[b_src].0, b_row) == Ordering::Equal
     };
-    merge_batches_inner(cursors, batches, writer, less, eq_payload);
+    merge_batches_inner(cursors, batches, schema, writer, less, eq_payload);
 }
 
 /// Wide-region (`pk_stride > 16`) closure builder. Splits on the payload
@@ -578,15 +558,24 @@ fn merge_run_wide_with<RowCmp>(
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
+    // Prefix-first: `node.key` is the order-preserving 16-byte OPK prefix
+    // (`peek_key` → `pk_sort_key`). A differing prefix settles the order
+    // without the column walk; only a prefix collision pays `compare_pk_bytes`.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        let ba = &batches[a.source_idx];
-        let bb = &batches[b.source_idx];
-        match columnar::compare_pk_bytes(schema, ba.get_pk_bytes(a.row),
-                                                 bb.get_pk_bytes(b.row)) {
+        match a.key.cmp(&b.key) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => row_cmp(schema, &ba.0, a.row, &bb.0, b.row)
-                == Ordering::Less,
+            Ordering::Equal => {
+                let ba = &batches[a.source_idx];
+                let bb = &batches[b.source_idx];
+                match columnar::compare_pk_bytes(schema, ba.get_pk_bytes(a.row),
+                                                         bb.get_pk_bytes(b.row)) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => row_cmp(schema, &ba.0, a.row, &bb.0, b.row)
+                        == Ordering::Less,
+                }
+            }
         }
     };
     let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
@@ -596,19 +585,21 @@ fn merge_run_wide_with<RowCmp>(
         && row_cmp(schema, &batches[a_src].0, a_row,
                            &batches[b_src].0, b_row) == Ordering::Equal
     };
-    merge_batches_inner(cursors, batches, writer, less, eq_payload);
+    merge_batches_inner(cursors, batches, schema, writer, less, eq_payload);
 }
 
 /// Single generic N-way merge driver body. Monomorphised on the `less` and
 /// `eq_payload` closure types its caller selects per PK width — each width
 /// compiles to its own branch-free copy of the hot loop with no width term
-/// inside. The `u128` key handed to the heap (via `peek_key`) is the exact
-/// packed PK for narrow and the low-16 prefix for wide; `less` orders
-/// correctly for both (narrow reads `node.key`, wide reads raw PK bytes).
+/// inside. The `u128` key handed to the heap (via `peek_key` → `pk_sort_key`)
+/// is order-preserving: the exact OPK for narrow and the OPK 16-byte prefix
+/// for wide; `less` orders correctly for both (narrow reads `node.key`, wide
+/// reads `node.key` first then tie-breaks on raw PK bytes).
 #[inline]
 fn merge_batches_inner<L, EQ>(
     cursors: &mut [MemBatchCursor],
     batches: &[SortedMemBatch],
+    schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     less: L,
     eq_payload: EQ,
@@ -620,7 +611,7 @@ fn merge_batches_inner<L, EQ>(
         cursors.len(),
         |i| {
             if cursors[i].is_valid() {
-                Some((cursors[i].peek_key(&batches[i]), cursors[i].position))
+                Some((cursors[i].peek_key(&batches[i], schema), cursors[i].position))
             } else {
                 None
             }
@@ -633,7 +624,7 @@ fn merge_batches_inner<L, EQ>(
         |src| {
             cursors[src].advance();
             if cursors[src].is_valid() {
-                Some((cursors[src].peek_key(&batches[src]), cursors[src].position))
+                Some((cursors[src].peek_key(&batches[src], schema), cursors[src].position))
             } else {
                 None
             }
@@ -697,27 +688,12 @@ fn sort_consolidate_inner<RowCmp>(
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    let mut entries: Vec<SortEntry> = if schema.pk_is_fast() {
-        // Single-unsigned: pack_pk_le already yields a raw-comparable u128.
-        (0..n as u32)
-            .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
-            .collect()
-    } else {
-        // `from_be_bytes` places buf[0] (col-0 MSB) in the high u128 byte, so
-        // `u128::cmp` is the lexicographic order of the OPK bytes. The trailing
-        // `16 - stride` bytes stay 0 across the whole batch (one fixed stride),
-        // so they never affect the comparison; only `buf[..stride]` is rewritten
-        // per row.
-        let stride = schema.pk_stride() as usize;
-        let mut buf = [0u8; crate::schema::NARROW_PK_MAX_BYTES];
-        (0..n as u32)
-            .map(|i| {
-                columnar::encode_order_preserving_pk(
-                    schema, batch.get_pk_bytes(i as usize), &mut buf[..stride]);
-                SortEntry { pk: u128::from_be_bytes(buf), idx: i }
-            })
-            .collect()
-    };
+    // `pk_sort_key` yields a raw-comparable u128 at this narrow stride: the full
+    // PK for `pk_is_fast` (pack_pk_le) and the order-preserving big-endian
+    // encoding otherwise. Either way `a.pk.cmp(&b.pk)` is the exact PK order.
+    let mut entries: Vec<SortEntry> = (0..n as u32)
+        .map(|i| SortEntry { pk: pk_sort_key(schema, batch.get_pk_bytes(i as usize)), idx: i })
+        .collect();
 
     entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
         Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
@@ -762,17 +738,12 @@ fn sort_consolidate_wide_with<RowCmp>(
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    let stride = schema.pk_stride() as usize;
-    let mut entries: Vec<SortEntry> = {
-        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
-        (0..n as u32)
-            .map(|i| {
-                columnar::encode_order_preserving_pk(
-                    schema, batch.get_pk_bytes(i as usize), &mut buf[..stride]);
-                SortEntry { pk: u128::from_be_bytes(buf[..16].try_into().unwrap()), idx: i }
-            })
-            .collect()
-    };
+    // Wide: `pk_sort_key` returns the order-preserving 16-byte OPK *prefix* —
+    // authoritative whenever two prefixes differ, with a `compare_pk_bytes`
+    // tiebreak on a collision (below).
+    let mut entries: Vec<SortEntry> = (0..n as u32)
+        .map(|i| SortEntry { pk: pk_sort_key(schema, batch.get_pk_bytes(i as usize)), idx: i })
+        .collect();
 
     entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
         Ordering::Equal => match columnar::compare_pk_bytes(

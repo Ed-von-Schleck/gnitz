@@ -1,6 +1,6 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, TypeCode, type_code};
+use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, TypeCode, long_string_bytes, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use crate::xxh;
@@ -419,7 +419,7 @@ pub(super) fn extract_group_key(
                 } else {
                     let heap_offset =
                         u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                    xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
+                    xxh::checksum(long_string_bytes(mb.blob, heap_offset, length))
                 }
             } else if tc == type_code::U128 || tc == type_code::UUID {
                 let ptr = mb.get_col_ptr(row, pi, 16);

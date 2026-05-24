@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, long_string_bytes, type_code};
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
@@ -458,7 +458,7 @@ impl PkPromoter {
                 } else {
                     let heap_offset =
                         u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                    xxh::checksum(&batch.blob[heap_offset..heap_offset + length])
+                    xxh::checksum(long_string_bytes(batch.blob, heap_offset, length))
                 };
                 let h_hi = mix64(h);
                 ((h_hi as u128) << 64) | (h as u128)

@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{
     Batch, MemBatch,
-    compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
+    compare_pk_bytes, compare_rows, compare_rows_int_nonnull, pk_sort_key, schema_is_int_nonnull,
     scatter_copy, write_to_batch,
 };
 
@@ -165,29 +165,26 @@ pub(super) fn argsort_delta(
 }
 
 /// Argsort indices into canonical PK order — `pk_indices` order as defined
-/// by `compare_pk_bytes`. Routes through `make_slow_pk_cmp` for signed
-/// single-col PKs and compound PKs; `pk_is_fast`
-/// schemas (single-col unsigned U8..U64/U128/UUID) collapse to a tight
-/// `u128.cmp` on the widened PK. Caller must ensure `pk_stride ∈ {8, 16}`
-/// (so `mb.get_pk` is well-defined).
+/// by `compare_pk_bytes`. Narrow PKs (`pk_stride ≤ 16`) materialise an
+/// order-preserving `pk_sort_key` once and sort by a raw `u128` compare; the
+/// fast single-col-unsigned schema reuses `pack_pk_le` (byte-identical) inside
+/// the same key. Wide PKs (`pk_stride > 16`) sort off the authoritative
+/// `compare_pk_bytes` walk, since `pk_sort_key` is only a non-authoritative
+/// 16-byte prefix there and this argsort has no payload tiebreak.
 pub(super) fn argsort_pk_canonical(mb: &MemBatch, schema: &SchemaDescriptor) -> Vec<u32> {
     let n = mb.count;
-    // Materialise the u128 PK keys once: get_pk widens via widen_pk_le on
-    // every call (stride match + bounds-checked sub-slice), so caching the
-    // keys avoids that overhead inside the sort comparator. 16n bytes is
-    // bounded (1.6 MB at n=100k) and lives only for the duration of this
-    // argsort.
-    let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
     let mut idx: Vec<u32> = (0..n as u32).collect();
-    if schema.pk_is_fast() {
-        // Single-col unsigned PK: u128 ascending == canonical unsigned
-        // ascending. No dispatch needed.
-        idx.sort_unstable_by_key(|&i| pks[i as usize]);
+    if schema.pk_is_wide() {
+        // pk_sort_key is only a 16-byte prefix here; settle prefix collisions
+        // (and order col-major compound keys) with the authoritative walk.
+        idx.sort_unstable_by(|&a, &b| {
+            compare_pk_bytes(schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
+        });
     } else {
-        // Signed / compound: route via the typed comparator. The
-        // closure is `Copy` so it inlines cleanly through sort_unstable_by.
-        let pk_cmp = crate::storage::make_slow_pk_cmp(schema);
-        idx.sort_unstable_by(|&a, &b| pk_cmp(pks[a as usize], pks[b as usize]));
+        // Order-preserving narrow key: raw `u128` ascending == canonical PK
+        // order for unsigned, signed, and compound alike.
+        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(schema, mb.get_pk_bytes(i))).collect();
+        idx.sort_unstable_by_key(|&i| pks[i as usize]);
     }
     idx
 }
@@ -220,23 +217,36 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
 
     let mb = batch.as_mem_batch();
 
-    let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
     let mut indices: Vec<u32> = (0..n as u32).collect();
 
-    // Direct `u128.cmp` on the widened PK is sound only for `pk_is_fast`
-    // schemas (single-col unsigned). Signed / compound PKs must dispatch
-    // through `make_slow_pk_cmp` — otherwise negatives sort after positives
-    // (signed) and the low-priority PK column dominates (compound), both of
-    // which make the `output.sorted = true` mark below a lie.
-    let slow_pk_cmp = crate::storage::make_slow_pk_cmp(schema);
-    let fast_pk_cmp = |a: u128, b: u128| a.cmp(&b);
     let row_int = |a: usize, b: usize| compare_rows_int_nonnull(schema, &mb, a, &mb, b);
     let row_full = |a: usize, b: usize| compare_rows(schema, &mb, a, &mb, b);
-    match (schema_is_int_nonnull(schema), schema.pk_is_fast()) {
-        (true, true)   => sort_indices_by_pk_then_row(&mut indices, &pks, fast_pk_cmp, row_int),
-        (true, false)  => sort_indices_by_pk_then_row(&mut indices, &pks, slow_pk_cmp, row_int),
-        (false, true)  => sort_indices_by_pk_then_row(&mut indices, &pks, fast_pk_cmp, row_full),
-        (false, false) => sort_indices_by_pk_then_row(&mut indices, &pks, slow_pk_cmp, row_full),
+
+    if schema.pk_is_wide() {
+        // Wide: authoritative column walk primary, payload tiebreak. Dispatch
+        // the row comparator once, outside the sort, exactly as the narrow arm.
+        if schema_is_int_nonnull(schema) {
+            indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
+                schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                Ordering::Equal => row_int(a as usize, b as usize),
+                ord => ord,
+            });
+        } else {
+            indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
+                schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                Ordering::Equal => row_full(a as usize, b as usize),
+                ord => ord,
+            });
+        }
+    } else {
+        // Narrow: order-preserving raw-`u128` key (unsigned/signed/compound),
+        // payload tiebreak. The PK axis is a single primitive compare.
+        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(schema, mb.get_pk_bytes(i))).collect();
+        if schema_is_int_nonnull(schema) {
+            sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_int);
+        } else {
+            sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_full);
+        }
     }
 
     let blob_cap = mb.blob.len().max(1);

@@ -2830,7 +2830,7 @@ fn make_batch_raw_pk<T: Copy>(
     b
 }
 
-/// I64 pk + I64 payload schema (signed-PK exercise of make_slow_pk_cmp).
+/// I64 pk + I64 payload schema (signed-PK exercise of the order-preserving key).
 fn make_schema_i64pk_i64val() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -3208,7 +3208,7 @@ fn test_gather_reduce_signed_pk_output_sorted_flag() {
     use crate::storage::CursorHandle;
 
     // op_gather_reduce's partial schema = output schema. Use a signed PK
-    // so the sort_owned path inside must route through make_slow_pk_cmp.
+    // so the sort_owned path inside must route through the order-preserving key.
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::I64, 0),

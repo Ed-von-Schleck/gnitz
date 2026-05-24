@@ -239,10 +239,11 @@ impl SchemaDescriptor {
         self.pk_stride as usize > NARROW_PK_MAX_BYTES
     }
 
-    /// True iff the PK is a single unsigned column — selects the fast
-    /// `a_key.cmp(&b_key)` arm (packed u128 order == native unsigned order).
-    /// Signed integers need the `make_slow_pk_cmp` arm; compound
-    /// PKs route through the column-walk byte comparator.
+    /// True iff the PK is a single unsigned column — its packed `pack_pk_le`
+    /// u128 is already order-correct (packed u128 order == native unsigned
+    /// order), so it can serve directly as the order-preserving sort key.
+    /// Signed and compound PKs are not order-correct in raw LE form and are
+    /// re-encoded by `pk_sort_key` (the order-preserving twin of `pack_pk_le`).
     #[inline]
     pub const fn pk_is_fast(&self) -> bool {
         if self.pk_count != 1 {
@@ -519,6 +520,21 @@ pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::decode_german_string;
 pub(crate) use gnitz_wire::try_decode_german_string;
 
+/// Bytes `[heap_offset, heap_offset + length)` of a long German string's blob
+/// payload, or `&[]` if the header overruns `blob`. Mirrors
+/// `relocate_german_string_vec`'s overrun guard: corrupt data that slipped past
+/// validation degrades to an empty payload rather than slicing OOB in release.
+/// A corrupt long string then hashes identically (`checksum(&[])`) at every
+/// call site, so routing stays deterministic.
+#[inline]
+pub(crate) fn long_string_bytes(blob: &[u8], heap_offset: usize, length: usize) -> &[u8] {
+    if heap_offset.saturating_add(length) > blob.len() {
+        &[]
+    } else {
+        &blob[heap_offset..heap_offset + length]
+    }
+}
+
 /// Returns bytes [4..end] of a German string as a contiguous slice.
 /// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
 /// Long strings: full string is in blob at heap_offset; skip first 4 bytes
@@ -532,12 +548,16 @@ pub(crate) fn german_string_tail<'a>(
         &s[8..4 + end]
     } else {
         let heap_offset = read_u64_le(s, 8) as usize;
+        let start = heap_offset.saturating_add(4);
+        let limit = heap_offset.saturating_add(end);
         debug_assert!(
-            heap_offset + end <= blob.len(),
-            "german_string_tail: long string [{}..{}) overruns blob (len={})",
-            heap_offset + 4, heap_offset + end, blob.len(),
+            limit <= blob.len(),
+            "german_string_tail: long string [{start}..{limit}) overruns blob (len={})",
+            blob.len(),
         );
-        &blob[heap_offset + 4..heap_offset + end]
+        // `end ≥ min_len > 4` at the one call site (compare_german_strings),
+        // so `start < limit`; if `limit ≤ blob.len()` the slice is in bounds.
+        if limit > blob.len() { &[] } else { &blob[start..limit] }
     }
 }
 
@@ -625,6 +645,54 @@ mod tests {
         assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
         assert_eq!(&result[8..16], &[0u8; 8], "fallback must leave blob offset zero");
         assert!(dst_blob.is_empty(), "fallback must not extend dst_blob");
+    }
+
+    #[test]
+    fn test_long_string_bytes_overrun_returns_empty() {
+        let blob = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        // In-bounds window returns the exact slice.
+        assert_eq!(long_string_bytes(&blob, 2, 3), &[3u8, 4, 5]);
+        // heap_offset + length past the end degrades to empty, no panic.
+        assert_eq!(long_string_bytes(&blob, 6, 10), &[] as &[u8]);
+        // heap_offset itself past the end.
+        assert_eq!(long_string_bytes(&blob, 99, 1), &[] as &[u8]);
+        // Saturating add: length near usize::MAX must not wrap to in-bounds.
+        assert_eq!(long_string_bytes(&blob, 4, usize::MAX), &[] as &[u8]);
+        // Exact fit is in bounds.
+        assert_eq!(long_string_bytes(&blob, 0, 8), &blob[..]);
+    }
+
+    // The german_string_tail / compare_german_strings overrun fallback is
+    // release-only: in debug the `debug_assert!` fires loudly (intended), so
+    // these tests run only when debug assertions are off.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_german_string_tail_overrun_returns_empty() {
+        // Long-string struct: length=20 (> SHORT_STRING_THRESHOLD), heap_offset
+        // far beyond a tiny blob. Release path must return &[] not slice OOB.
+        let mut s = [0u8; 16];
+        s[0..4].copy_from_slice(&20u32.to_le_bytes());
+        s[8..16].copy_from_slice(&999u64.to_le_bytes());
+        let blob = vec![0u8; 4];
+        // `end` = full length (the compare_german_strings call shape).
+        assert_eq!(german_string_tail(&s, &blob, 20, 20), &[] as &[u8]);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_compare_german_strings_corrupt_long_cell_no_panic() {
+        // Two long-string cells with out-of-range heap offsets. Both tails
+        // degrade to empty, so the comparison resolves on length/prefix
+        // instead of panicking on an OOB blob slice.
+        let mut a = [0u8; 16];
+        a[0..4].copy_from_slice(&20u32.to_le_bytes());
+        a[4..8].copy_from_slice(b"abcd");
+        a[8..16].copy_from_slice(&500u64.to_le_bytes());
+        let mut b = a;
+        b[8..16].copy_from_slice(&900u64.to_le_bytes());
+        let blob = vec![0u8; 4];
+        // Equal length + equal prefix + empty tails ⇒ Equal, and crucially no panic.
+        assert_eq!(compare_german_strings(&a, &blob, &b, &blob), std::cmp::Ordering::Equal);
     }
 
     #[test]

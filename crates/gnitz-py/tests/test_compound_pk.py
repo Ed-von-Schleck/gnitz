@@ -564,6 +564,57 @@ def test_compound_pk_adversarial_second_column_and_delete_consolidation(client):
         _cleanup(client, sn, "t")
 
 
+def test_compound_pk_signed_first_column_adversarial_consolidation(client):
+    """Compound PK whose FIRST column is signed (BIGINT) with negative values,
+    second column unsigned (BIGINT UNSIGNED). Combines the two ordering
+    dimensions the order-preserving key must get right at once: the signed
+    bias-flip (negatives sort before positives, not after as raw LE bytes
+    would place them) AND the column-by-column walk (column a dominates b).
+
+    No other e2e exercises a signed column inside a compound PK — the signed
+    suites use single-column PKs, the compound suites use unsigned columns.
+    Distinct (a, b) tuples must round-trip, and a DELETE retraction on a
+    negative-a row must fold cleanly across consolidation. Scan order isn't
+    globally sorted under multiple workers, so we assert the surviving
+    (a, b, payload) *set* — the grouping/folding the consolidation sort owns.
+    """
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+            "payload BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        umax = 18446744073709551615  # u64::MAX — adversarial unsigned col-b value
+        # Scrambled, with negatives. Under a raw-LE-byte compare, -3 (0xFFFF…FD)
+        # would sort after +2, and (a=-3, b=umax) would sort before (a=-3, b=0);
+        # the order-preserving key must place a=-3 first (signed) and order
+        # within a by b (column walk). Includes a shared col-a across distinct b.
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES "
+            f"(2, 0, 20), (-3, {umax}, 399), (-3, 0, 30), (-1, 5, 15), (2, 1, 21)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (-3, 0, 30), (-3, umax, 399), (-1, 5, 15), (2, 0, 20), (2, 1, 21),
+        ]
+        # Retract a negative-a row; the next consolidation must fold it against
+        # its insert (PK equality over the signed-compound key).
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = -3 AND b = {umax}", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(-3, 0, 30), (-1, 5, 15), (2, 0, 20), (2, 1, 21)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
 def test_compound_pk_insert_duplicate_tuple_rejected(client):
     """Same (a, b) tuple twice → conflict; sharing one column is fine."""
     sn = "cpk" + _uid()
