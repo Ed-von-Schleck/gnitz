@@ -323,7 +323,6 @@ pub fn op_reduce(
                 let delta_indices: &[u32] = &sorted_indices[group_start_pos..idx];
 
                 let mut trace_rows = DrainGuard::new();
-                trace_rows.clear();
 
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {

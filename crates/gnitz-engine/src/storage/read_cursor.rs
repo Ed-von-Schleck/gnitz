@@ -38,7 +38,12 @@ pub(crate) struct DrainGuard {
 impl DrainGuard {
     #[inline]
     pub(crate) fn new() -> Self {
-        Self { inner: DRAIN_BUFFER.with(|b| b.take()) }
+        // The thread-local Vec is reused across queries and may hold stale
+        // elements; clear so `new()` always yields an empty buffer. The
+        // elements are `Copy`, so this is an O(1) length reset.
+        let mut inner = DRAIN_BUFFER.with(|b| b.take());
+        inner.clear();
+        Self { inner }
     }
 }
 
