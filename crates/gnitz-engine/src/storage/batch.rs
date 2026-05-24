@@ -543,12 +543,10 @@ impl Batch {
         widen_pk_le(&self.data[off..off + stride], stride)
     }
 
-    /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Used by tests today;
-    /// activated as a production call site by the pending compound-PK
-    /// migration of `ops/join.rs::write_join_row` and
-    /// `ops/reduce.rs::emit_reduce_row`, which switch
-    /// `extend_pk(get_pk(...))` to `extend_pk_bytes(get_pk_bytes(...))`.
-    #[allow(dead_code)]
+    /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Returns exactly
+    /// `pk_stride` bytes; the wide-PK (`pk_stride > 16`) catalog constraint
+    /// checks in `catalog/validation.rs` key on it where a `u128` cannot
+    /// encode the PK.
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.strides[REG_PK] as usize;

@@ -134,11 +134,22 @@ impl CatalogEngine {
             .map(|e| e.schema)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
-        let removed_pks: Vec<u128> = (0..batch.count)
-            .filter(|&row| batch.get_weight(row) < 0)
-            .map(|row| batch.get_pk(row))
-            .collect();
-        if removed_pks.is_empty() { return Ok(()); }
+        // Removed PKs, collected once. A wide parent PK cannot be packed into a
+        // u128, so it goes into a single flat buffer iterated by
+        // `chunks_exact(parent_pk_stride)`; the narrow path keeps the u128 vec.
+        let wide = parent_schema.pk_is_wide();
+        let parent_pk_stride = parent_schema.pk_stride() as usize;
+        let mut removed_narrow: Vec<u128> = Vec::new();
+        let mut removed_wide: Vec<u8> = Vec::new();
+        for row in 0..batch.count {
+            if batch.get_weight(row) >= 0 { continue; }
+            if wide {
+                removed_wide.extend_from_slice(batch.get_pk_bytes(row));
+            } else {
+                removed_narrow.push(batch.get_pk(row));
+            }
+        }
+        if removed_narrow.is_empty() && removed_wide.is_empty() { return Ok(()); }
 
         for FkParentRef { child_tid, fk_col_idx, parent_col_idx } in children {
             let col_type = parent_schema.columns[parent_col_idx].type_code;
@@ -151,17 +162,37 @@ impl CatalogEngine {
             // from the parent's committed row. A NULL value can be referenced
             // by no child, so it never blocks the delete.
             let keys: Vec<u128> = if is_pk_col {
-                let pk_field_off = parent_schema.pk_byte_offset(parent_col_idx) as usize;
-                removed_pks.iter()
-                    .map(|&pk| promote_to_index_key(&pk.to_le_bytes(), pk_field_off, col_size, col_type))
-                    .collect()
+                let off = parent_schema.pk_byte_offset(parent_col_idx) as usize;
+                if wide {
+                    removed_wide.chunks_exact(parent_pk_stride)
+                        .map(|pk| promote_to_index_key(pk, off, col_size, col_type))
+                        .collect()
+                } else {
+                    removed_narrow.iter()
+                        .map(|&pk| promote_to_index_key(&pk.to_le_bytes(), off, col_size, col_type))
+                        .collect()
+                }
             } else {
                 let payload_col = parent_schema.payload_idx(parent_col_idx);
-                let mut v = Vec::with_capacity(removed_pks.len());
-                for &pk in &removed_pks {
-                    if let Some(row) = self.seek_family(table_id, pk)? {
-                        if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
-                        v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                let removed_count = if wide {
+                    removed_wide.len() / parent_pk_stride
+                } else {
+                    removed_narrow.len()
+                };
+                let mut v = Vec::with_capacity(removed_count);
+                if wide {
+                    for pk in removed_wide.chunks_exact(parent_pk_stride) {
+                        if let Some(row) = self.seek_family_bytes(table_id, pk)? {
+                            if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
+                            v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                        }
+                    }
+                } else {
+                    for &pk in &removed_narrow {
+                        if let Some(row) = self.seek_family(table_id, pk)? {
+                            if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
+                            v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                        }
                     }
                 }
                 v
@@ -223,7 +254,17 @@ impl CatalogEngine {
         if !has_unique { return Ok(()); }
 
         let schema = entry.schema;
+        let wide = schema.pk_is_wide();
         let src_pk_stride = schema.pk_stride() as usize;
+
+        // One base-table cursor, reused across every row's UPSERT probe on the
+        // wide path. The narrow `has_pk(u128)` probe is cheaper (memtable bloom
+        // + shard scan, no merge), so narrow keeps it and opens no cursor.
+        let mut base_cursor = if entry.unique_pk && wide {
+            Some(entry.handle.open_cursor())
+        } else {
+            None
+        };
 
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
@@ -234,7 +275,6 @@ impl CatalogEngine {
 
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
             let prefix_len = col_size.min(idx_key_size);
-            let take = src_pk_stride.min(16);
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
 
@@ -248,8 +288,19 @@ impl CatalogEngine {
                 let null_word = batch.get_null_word(row);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
-                let row_pk = batch.get_pk(row);
-                let is_upsert = entry.unique_pk && entry.handle.has_pk(row_pk);
+                // UPSERT iff the row's PK already has a live base-table row.
+                let is_upsert = if !entry.unique_pk {
+                    false
+                } else if wide {
+                    let row_pk_bytes = batch.get_pk_bytes(row);
+                    let cur = base_cursor.as_mut().unwrap();
+                    cur.cursor.seek_bytes(row_pk_bytes);
+                    cur.cursor.valid
+                        && cur.cursor.current_weight > 0
+                        && cur.cursor.current_pk_bytes() == row_pk_bytes
+                } else {
+                    entry.handle.has_pk(batch.get_pk(row))
+                };
 
                 let col_data = batch.col_data(payload_col);
                 let key_u128 = promote_to_index_key(col_data, row * col_size, col_size, col_type);
@@ -263,21 +314,24 @@ impl CatalogEngine {
                 }
 
                 // Index PK layout: indexed-key field (col_size LE bytes,
-                // zero-padded to idx_key_size) followed by the source PK bytes.
+                // zero-padded to idx_key_size) followed by the full source PK
+                // bytes — always idx_key_size + src_pk_stride wide.
                 let key_bytes = key_u128.to_le_bytes();
-                let prefix = &key_bytes[..prefix_len];
-                if !cursor.cursor.seek_first_positive_with_prefix(prefix) { continue; }
-
+                if !cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..prefix_len]) {
+                    continue;
+                }
                 let pk_bytes = cursor.cursor.current_pk_bytes();
-                let mut src_pk_buf = [0u8; 16];
-                src_pk_buf[..take].copy_from_slice(
-                    &pk_bytes[idx_key_size..idx_key_size + take]
-                );
-                let existing_src_pk = u128::from_le_bytes(src_pk_buf);
 
-                // For UPSERT: the existing entry may be the same row whose
-                // index entry will be retracted by enforce_unique_pk.
-                if is_upsert && existing_src_pk == row_pk { continue; }
+                // Is the existing index entry the SAME source row (whose old
+                // entry enforce_unique_pk retracts under an UPSERT)? Compare the
+                // full source PK by raw bytes; at any width truncating to 16
+                // bytes would misread two wide PKs sharing a 16-byte prefix as
+                // the same row.
+                debug_assert!(pk_bytes.len() >= idx_key_size + src_pk_stride);
+                let existing_src_pk = &pk_bytes[idx_key_size..idx_key_size + src_pk_stride];
+                let matches_existing = existing_src_pk == batch.get_pk_bytes(row);
+
+                if is_upsert && matches_existing { continue; }
 
                 let col_names = self.get_column_names(table_id);
                 let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");

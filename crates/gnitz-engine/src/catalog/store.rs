@@ -288,6 +288,38 @@ impl CatalogEngine {
         Ok(Some(batch))
     }
 
+    /// Byte-keyed sibling of [`seek_family`]: point lookup by full PK bytes,
+    /// correct for `pk_stride > 16` where a `u128` key cannot encode the PK.
+    /// Mirrors `seek_family` exactly — open the merged cursor, `seek_bytes`,
+    /// confirm exact PK and positive weight.
+    pub fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
+        let schema = if table_id < FIRST_USER_TABLE_ID {
+            sys_tab_schema(table_id)
+        } else {
+            self.dag.tables.get(&table_id)
+                .map(|e| e.schema)
+                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+        };
+
+        let mut cursor = if table_id < FIRST_USER_TABLE_ID {
+            match self.sys_table_mut(table_id) {
+                Some(table) => table.open_cursor(),
+                None => return Ok(None),
+            }
+        } else {
+            self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
+        };
+
+        cursor.cursor.seek_bytes(pk);
+        if !cursor.cursor.valid { return Ok(None); }
+        if cursor.cursor.current_pk_bytes() != pk { return Ok(None); }
+        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+
+        let mut batch = Batch::with_schema(schema, 1);
+        self.copy_cursor_row_to_batch(&cursor, &mut batch);
+        Ok(Some(batch))
+    }
+
     /// Batched point lookup. Open one cursor on `table_id` and seek each PK in
     /// `pks`, appending the stored row (weight 1) for every present, live key
     /// into a result batch projected to `project`. Each `seek` re-probes every

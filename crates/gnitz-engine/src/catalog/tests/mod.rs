@@ -4,6 +4,7 @@ mod fk_tests;
 mod uuid_tests;
 mod index_tests;
 mod engine_tests;
+mod wide_pk_validation;
 
 use super::*;
 use super::sys_tables::*;
