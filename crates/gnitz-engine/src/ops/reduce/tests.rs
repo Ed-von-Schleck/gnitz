@@ -3984,7 +3984,7 @@ fn avi_wide_two_u64_groups_match_reference() {
     let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]);
     let mut sorted: Vec<(u64, u64, i64)> =
         reference.iter().map(|(&(a, b), &m)| (a, b, m)).collect();
-    sorted.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    sorted.sort_by_key(|x| (x.0, x.1));
     let avi_batch = {
         let mut bt = Batch::with_schema(avi_schema, sorted.len());
         for &(a, b, m) in &sorted {
@@ -4188,7 +4188,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
     let avi_batch = {
         let mut b = Batch::with_schema(avi_schema, 3);
         let mut sorted = groups.to_vec();
-        sorted.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+        sorted.sort_by_key(|x| (x.0, x.1));
         for &(a, bb, m) in &sorted {
             let mut key = [0u8; 24];
             key[0..8].copy_from_slice(&a.to_le_bytes());

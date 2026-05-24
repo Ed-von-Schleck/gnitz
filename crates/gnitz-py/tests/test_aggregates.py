@@ -367,6 +367,63 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_wide_gi_group_by_min_max_u128_pk(self, client):
+        """GROUP BY MIN/MAX over a table with a 16-byte PRIMARY KEY
+        (DECIMAL(38,0) = U128). The GroupIndex key is `8-byte group code` ++
+        `16-byte source PK` = 24 bytes — the *wide* (>16) consolidation path,
+        which base-table compound PKs (stride capped at 16) can't reach. The
+        consolidation sort orders the wide GI key via an order-preserving
+        prefix + compare_pk_bytes tiebreak; deleting the row holding a group's
+        MIN/MAX forces an incremental recompute that re-seeks the source trace
+        through that wide key. Big ids (> u64::MAX) make the source PK occupy
+        all 16 bytes, so the OPK prefix straddles its high column."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  id DECIMAL(38,0) NOT NULL PRIMARY KEY,"
+                "  g BIGINT NOT NULL,"
+                "  amount BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, MIN(amount) AS lo, MAX(amount) AS hi "
+                "FROM t GROUP BY g",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # 38-nine id is ~1e38 (well beyond u64::MAX ~1.8e19): the U128 source
+            # PK uses its upper 8 bytes, exercising the wide OPK prefix.
+            big = 99999999999999999999999999999999999999
+            client.execute_sql(
+                f"INSERT INTO t VALUES "
+                f"(1, 10, 100), (2, 10, 50), ({big}, 10, 200), "
+                f"(3, 20, 70), (4, 20, 30)",
+                schema_name=sn,
+            )
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_g[10]["lo"] == 50 and by_g[10]["hi"] == 200, by_g
+            assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
+
+            # Delete group 10's MIN holder (id=2) → MIN recomputes to 100 via a
+            # wide-GI re-seek of the remaining group-10 source rows.
+            client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 200, by_g
+
+            # Delete group 10's MAX holder (the huge id) → MAX recomputes to 100.
+            client.execute_sql(f"DELETE FROM t WHERE id = {big}", schema_name=sn)
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 100, by_g
+            assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

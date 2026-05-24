@@ -160,6 +160,17 @@ impl SchemaDescriptor {
                 cols[pk_indices[k] as usize].nullable == 0,
                 "new: PK columns must be non-nullable",
             );
+            // `compare_pk_bytes` and the order-preserving sort-key encoder have
+            // no float arm (IEEE-754 breaks the byte-equal key contract), so
+            // both panic on a float PK. Float PKs are already rejected at the
+            // catalog DDL and wire layers; close the invariant here too so the
+            // descriptor constructor is the single authority on PK eligibility.
+            assert!(
+                cols[pk_indices[k] as usize].type_code != type_code::F32
+                    && cols[pk_indices[k] as usize].type_code != type_code::F64,
+                "new: F32 and F64 columns cannot be PK columns \
+                 (compare_pk_bytes has no float ordering)",
+            );
             pk_arr[k] = pk_indices[k];
             stride_acc += cols[pk_indices[k] as usize].size() as u16;
             k += 1;
@@ -756,10 +767,11 @@ mod tests {
 
     #[test]
     fn test_pk_stride_matches_single_pk_size() {
+        // Floats are excluded: F32/F64 are not PK-eligible (rejected in `new`).
         for tc in [
             type_code::U8, type_code::I8, type_code::U16, type_code::I16,
-            type_code::U32, type_code::I32, type_code::F32,
-            type_code::U64, type_code::I64, type_code::F64,
+            type_code::U32, type_code::I32,
+            type_code::U64, type_code::I64,
             type_code::U128, type_code::UUID,
         ] {
             let cols = [SchemaColumn::new(tc, 0)];
@@ -783,6 +795,20 @@ mod tests {
     #[should_panic(expected = "STRING and BLOB columns cannot be PK columns")]
     fn test_blob_pk_rejected() {
         let cols = [SchemaColumn::new(type_code::BLOB, 0)];
+        SchemaDescriptor::new(&cols, &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "F32 and F64 columns cannot be PK columns")]
+    fn test_f32_pk_rejected() {
+        let cols = [SchemaColumn::new(type_code::F32, 0)];
+        SchemaDescriptor::new(&cols, &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "F32 and F64 columns cannot be PK columns")]
+    fn test_f64_pk_rejected() {
+        let cols = [SchemaColumn::new(type_code::F64, 0)];
         SchemaDescriptor::new(&cols, &[0]);
     }
 

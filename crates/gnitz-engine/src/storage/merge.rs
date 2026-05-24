@@ -666,32 +666,60 @@ pub fn sort_and_consolidate(
 
     if schema.pk_is_wide() {
         sort_consolidate_wide(n, batch, schema, writer);
+    } else if columnar::schema_is_int_nonnull(schema) {
+        sort_consolidate_inner(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
     } else {
-        dispatch_pk_row!(schema, sort_consolidate_inner(n, batch, schema, writer));
+        sort_consolidate_inner(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
     }
 }
 
-/// Narrow-region sort-plus-consolidate body. `pk_cmp` orders the sort; the
-/// `SortEntry.pk` is the exact packed PK, so the `cur_pk == pending_pk`
-/// reject in `drain_groups_into` is exact and the `pk_eq` term is the
-/// DCE'd `|_, _| true` — group detection is bit-for-bit as before.
+/// Narrow-region sort-plus-consolidate body. The sort key in `SortEntry.pk` is
+/// an order-preserving raw-`u128`: `pack_pk_le` for a single-unsigned PK (LE
+/// magnitude is already raw-comparable, byte-identical to the historic fast
+/// path), and an order-preserving big-endian `encode_order_preserving_pk` for
+/// single-signed and compound PKs (whose raw LE bytes are *not* numerically
+/// ordered). Either way `a.pk.cmp(&b.pk)` is the exact PK order, so the PK axis
+/// of the comparator collapses to one primitive `u128` compare — no
+/// per-comparison typed column decode. The encoding is injective, so the
+/// `cur_pk == pending_pk` reject in `drain_groups_into` is exact PK-byte
+/// equality and the `pk_eq` term is the DCE'd `|_, _| true`; group detection is
+/// bit-for-bit equivalent to the historic
+/// `cur_pk == pending_pk && row_cmp == Equal`.
 #[inline]
-fn sort_consolidate_inner<RowCmp, PkCmp>(
+fn sort_consolidate_inner<RowCmp>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
-    pk_cmp: PkCmp,
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
-    PkCmp: Fn(u128, u128) -> Ordering + Copy,
 {
-    let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
-        .collect();
+    let mut entries: Vec<SortEntry> = if schema.pk_is_fast() {
+        // Single-unsigned: pack_pk_le already yields a raw-comparable u128.
+        (0..n as u32)
+            .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
+            .collect()
+    } else {
+        // `from_be_bytes` places buf[0] (col-0 MSB) in the high u128 byte, so
+        // `u128::cmp` is the lexicographic order of the OPK bytes. The trailing
+        // `16 - stride` bytes stay 0 across the whole batch (one fixed stride),
+        // so they never affect the comparison; only `buf[..stride]` is rewritten
+        // per row.
+        let stride = schema.pk_stride() as usize;
+        let mut buf = [0u8; crate::schema::NARROW_PK_MAX_BYTES];
+        (0..n as u32)
+            .map(|i| {
+                columnar::encode_order_preserving_pk(
+                    schema, batch.get_pk_bytes(i as usize), &mut buf[..stride]);
+                SortEntry { pk: u128::from_be_bytes(buf), idx: i }
+            })
+            .collect()
+    };
 
-    entries.sort_unstable_by(|a, b| match pk_cmp(a.pk, b.pk) {
+    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
         Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
         ord => ord,
     });
@@ -699,12 +727,15 @@ fn sort_consolidate_inner<RowCmp, PkCmp>(
         |pos| (entries[pos].idx as usize, entries[pos].pk));
 }
 
-/// Wide-region (`pk_stride > 16`) sort-plus-consolidate. The sort orders by
-/// `compare_pk_bytes` (the packed low-16 prefix is not a valid ordering),
-/// payload tiebreak on a PK tie. `SortEntry.pk` is still the low-16 prefix
-/// so the `cur_pk == pending_pk` O(1) reject in `drain_groups_into` stays
-/// live; a prefix collision falls through to the `compare_pk_bytes` `pk_eq`
-/// term. Splits only on the payload row comparator.
+/// Wide-region (`pk_stride > 16`) sort-plus-consolidate. `SortEntry.pk` holds
+/// the order-preserving 16-byte OPK *prefix*, used as the primary sort key and
+/// the `cur_pk == pending_pk` O(1) reject in `drain_groups_into`. Because the
+/// per-column OPK encoding is big-endian, the 16-byte prefix is a correct
+/// lexicographic prefix of the full OPK even when a column straddles byte 16 —
+/// so when prefixes differ, `pk.cmp` is authoritative and agrees with
+/// `compare_pk_bytes`. The full `compare_pk_bytes` column walk runs only on a
+/// genuine prefix collision (sort tiebreak and `pk_eq`), with a payload
+/// tiebreak on a true PK tie. Splits only on the payload row comparator.
 #[inline]
 fn sort_consolidate_wide(
     n: usize,
@@ -731,16 +762,26 @@ fn sort_consolidate_wide_with<RowCmp>(
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry { pk: pack_pk_le(batch.get_pk_bytes(i as usize)), idx: i })
-        .collect();
+    let stride = schema.pk_stride() as usize;
+    let mut entries: Vec<SortEntry> = {
+        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
+        (0..n as u32)
+            .map(|i| {
+                columnar::encode_order_preserving_pk(
+                    schema, batch.get_pk_bytes(i as usize), &mut buf[..stride]);
+                SortEntry { pk: u128::from_be_bytes(buf[..16].try_into().unwrap()), idx: i }
+            })
+            .collect()
+    };
 
-    entries.sort_unstable_by(|a, b| {
-        match columnar::compare_pk_bytes(schema, batch.get_pk_bytes(a.idx as usize),
-                                                 batch.get_pk_bytes(b.idx as usize)) {
+    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
+        Ordering::Equal => match columnar::compare_pk_bytes(
+            schema, batch.get_pk_bytes(a.idx as usize), batch.get_pk_bytes(b.idx as usize),
+        ) {
             Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
             ord => ord,
-        }
+        },
+        ord => ord,
     });
     drain_groups_into(n, batch, schema, writer, row_cmp,
         |p, c| columnar::compare_pk_bytes(schema, batch.get_pk_bytes(p),
@@ -2566,7 +2607,7 @@ mod tests {
     ];
 
     /// Schema with the given PK column type codes + one I64 payload.
-    fn wide_schema(tcs: &[u8]) -> SchemaDescriptor {
+    fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
         let mut cols: Vec<SchemaColumn> =
             tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
         cols.push(SchemaColumn::new(type_code::I64, 0));
@@ -2603,7 +2644,10 @@ mod tests {
         v
     }
 
-    fn wide_writer_run(
+    /// Run `run` against a fresh single-payload-column `DirectWriter` and return
+    /// the `(pk_bytes, weight, i64_payload)` of each output row. Width-agnostic:
+    /// drives both narrow and wide strides (callers build the schema explicitly).
+    fn writer_run(
         schema: &SchemaDescriptor,
         total_rows: usize,
         run: impl FnOnce(&mut DirectWriter),
@@ -2628,7 +2672,6 @@ mod tests {
                 count: 0,
                 schema: *schema,
             };
-            assert!(writer.pk_stride > 16, "wide test must exceed 16-byte PK");
             run(&mut writer);
             count = writer.row_count();
         }
@@ -2652,18 +2695,21 @@ mod tests {
             .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
             .collect();
         let total: usize = sorted.iter().map(|b| b.count).sum();
-        wide_writer_run(schema, total, |w| {
+        writer_run(schema, total, |w| {
             merge_batches(&sorted, schema, w);
         })
     }
 
-    fn run_consolidate_wide(
+    /// Byte-form consolidation harness: returns `(pk_bytes, weight, i64_payload)`
+    /// per output row. Width-agnostic (sibling of the packed-`u64` `run_consolidate`
+    /// above, for PK shapes whose bytes don't fit a single `u64`).
+    fn run_consolidate_bytes(
         b: &Batch,
         schema: &SchemaDescriptor,
     ) -> Vec<(Vec<u8>, i64, i64)> {
         let mb = b.as_mem_batch();
         let total = mb.count;
-        wide_writer_run(schema, total, |w| {
+        writer_run(schema, total, |w| {
             sort_and_consolidate(&mb, schema, w);
         })
     }
@@ -2674,7 +2720,7 @@ mod tests {
     ) -> Vec<(Vec<u8>, i64, i64)> {
         let mb = b.as_mem_batch();
         let total = mb.count;
-        wide_writer_run(schema, total, |w| {
+        writer_run(schema, total, |w| {
             fold_sorted(&mb, schema, w);
         })
     }
@@ -2684,7 +2730,7 @@ mod tests {
         for (tcs, want_stride) in
             [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)]
         {
-            let s = wide_schema(tcs);
+            let s = pk_payload_schema(tcs);
             assert_eq!(s.pk_stride() as usize, want_stride);
             // A < B < C < D < E by compare_pk_bytes. B,C,D share col0
             // (= the low-16 prefix); only the trailing column distinguishes
@@ -2727,7 +2773,7 @@ mod tests {
         // (weight-1, val=42) payload. Without the compare_pk_bytes term in
         // the wide `eq_payload` these would fold into one summed group.
         let tcs = WIDE_24;
-        let s = wide_schema(tcs);
+        let s = pk_payload_schema(tcs);
         let p1 = wpk(tcs, 7, 0);
         let p2 = wpk(tcs, 7, 1);
         let b1 = make_batch_bytes(&s, &[(p1.clone(), 1, 42)]);
@@ -2741,7 +2787,7 @@ mod tests {
     #[test]
     fn wide_consolidation_sum_ghost_and_payload_order() {
         let tcs = WIDE_64;
-        let s = wide_schema(tcs);
+        let s = pk_payload_schema(tcs);
         let p = wpk(tcs, 5, 5);
 
         // Same PK + same payload across two batches → weights sum.
@@ -2779,7 +2825,7 @@ mod tests {
     #[test]
     fn wide_fold_sorted_prefix_collision_and_identical_payload() {
         let tcs = WIDE_24;
-        let s = wide_schema(tcs);
+        let s = pk_payload_schema(tcs);
         // Pre-sorted: (1,1,0) and (1,1,1) collide in low 16 AND carry an
         // identical payload (val=0); they must remain two distinct rows.
         // (1,1,2) is a third distinct PK.
@@ -2810,7 +2856,7 @@ mod tests {
     #[test]
     fn wide_sort_and_consolidate_matches_merge() {
         let tcs = WIDE_24;
-        let s = wide_schema(tcs);
+        let s = pk_payload_schema(tcs);
         // Unsorted rows incl. prefix collisions, a consolidating pair, and a
         // ghost pair. compare_pk_bytes order: (1,1,0) < (1,1,2) < (4,4,4).
         let k0 = wpk(tcs, 1, 0);
@@ -2823,7 +2869,7 @@ mod tests {
             (k0.clone(), 2, 10),       // consolidates with row 1
             (k2.clone(), -1, 30),      // ghost-cancels row 0
         ];
-        let out = run_consolidate_wide(&make_batch_bytes(&s, &rows), &s);
+        let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows), &s);
         // (4,4,4) cancels out; (1,1,0) sums to weight 3.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], (k0.clone(), 3, 10));
@@ -2840,5 +2886,187 @@ mod tests {
         ];
         let via_merge = run_merge_wide(&[make_batch_bytes(&s, &sorted_rows)], &s);
         assert_eq!(via_merge, out);
+    }
+
+    // -----------------------------------------------------------------------
+    // OPK consolidation-output equivalence (signed / compound / wide)
+    //
+    // `sort_and_consolidate` now sorts by an order-preserving key instead of a
+    // per-comparison typed column decode. These tests pin that the consolidated
+    // output is identical to an independent reference built directly from
+    // `compare_pk_bytes` + `compare_rows` — the canonical total order — for the
+    // signed, compound, and wide PK shapes the new sort key covers.
+    // -----------------------------------------------------------------------
+
+    /// Independent reference: argsort by `compare_pk_bytes` then `compare_rows`,
+    /// fold consecutive equal `(PK, payload)` groups, drop net-zero ghosts.
+    fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
+        let mb = b.as_mem_batch();
+        let n = mb.count;
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&x, &y| {
+            match columnar::compare_pk_bytes(schema, mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
+                Ordering::Equal => columnar::compare_rows(schema, &mb, x, &mb, y),
+                ord => ord,
+            }
+        });
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let head = idx[i];
+            let mut w = mb.get_weight(head);
+            i += 1;
+            while i < n
+                && columnar::compare_pk_bytes(schema, mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i]))
+                    == Ordering::Equal
+                && columnar::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
+            {
+                w += mb.get_weight(idx[i]);
+                i += 1;
+            }
+            if w != 0 {
+                let pk = mb.get_pk_bytes(head).to_vec();
+                let v = i64::from_le_bytes(mb.get_col_ptr(head, 0, 8).try_into().unwrap());
+                out.push((pk, w, v));
+            }
+        }
+        out
+    }
+
+    fn assert_consolidate_matches_reference(
+        schema: &SchemaDescriptor,
+        rows: &[(Vec<u8>, i64, i64)],
+    ) {
+        let b = make_batch_bytes(schema, rows);
+        let got = run_consolidate_bytes(&b, schema);
+        let want = consolidate_reference(&b, schema);
+        assert_eq!(got, want, "OPK consolidated output diverged from reference");
+        // Independent of the reference's grouping: the OPK sort must leave the
+        // output non-descending under the canonical column-aware comparator.
+        for w in got.windows(2) {
+            assert_ne!(
+                columnar::compare_pk_bytes(schema, &w[0].0, &w[1].0),
+                Ordering::Greater,
+                "OPK output not ordered by compare_pk_bytes",
+            );
+        }
+    }
+
+    fn i64_pk(v: i64) -> Vec<u8> { v.to_le_bytes().to_vec() }
+
+    #[test]
+    fn opk_single_signed_i64_negatives() {
+        let s = pk_payload_schema(&[type_code::I64]);
+        // Unsorted, spanning negatives and extremes, with a fold and a ghost.
+        let rows = vec![
+            (i64_pk(5), 1, 50),
+            (i64_pk(-1), 1, 10),
+            (i64_pk(i64::MIN), 1, 99),
+            (i64_pk(-1), 2, 10),       // folds with row 1 → weight 3
+            (i64_pk(i64::MAX), 1, 7),
+            (i64_pk(0), 1, 0),
+            (i64_pk(5), -1, 50),       // ghost-cancels row 0
+            (i64_pk(-100), 1, 3),
+        ];
+        assert_consolidate_matches_reference(&s, &rows);
+        // Concrete order check: negatives precede non-negatives.
+        let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows), &s);
+        let pks: Vec<i64> =
+            out.iter().map(|r| i64::from_le_bytes(r.0[..8].try_into().unwrap())).collect();
+        assert_eq!(pks, vec![i64::MIN, -100, -1, 0, i64::MAX]);
+    }
+
+    #[test]
+    fn opk_compound_unsigned_first_column_dominates() {
+        let s = pk_payload_schema(&[type_code::U32, type_code::U64]);
+        let mk = |a: u32, b: u64| {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        // Second column large enough to invert order under a raw LE u128 compare;
+        // first column must still dominate.
+        let rows = vec![
+            (mk(2, 1), 1, 20),
+            (mk(1, u64::MAX), 1, 10),
+            (mk(1, u64::MAX), 1, 10),  // fold → weight 2
+            (mk(1, 5), 1, 11),
+        ];
+        assert_consolidate_matches_reference(&s, &rows);
+    }
+
+    #[test]
+    fn opk_compound_mixed_signed_negative_second_column() {
+        let s = pk_payload_schema(&[type_code::U64, type_code::I32]);
+        let mk = |a: u64, b: i32| {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        let rows = vec![
+            (mk(1, 0), 1, 1),
+            (mk(1, -5), 1, 2),         // negative second column sorts before 0
+            (mk(1, i32::MIN), 1, 3),
+            (mk(0, i32::MAX), 1, 4),
+            (mk(1, -5), -1, 2),        // ghost
+        ];
+        assert_consolidate_matches_reference(&s, &rows);
+    }
+
+    #[test]
+    fn opk_wide_prefix_straddle_and_collision() {
+        // WIDE_24: col straddling byte 16 is the third U64. wpk shares the
+        // 16-byte OPK prefix when `lead` matches, so the encoder's BE prefix
+        // must still order by the trailing column.
+        let tcs = WIDE_24;
+        let s = pk_payload_schema(tcs);
+        let rows = vec![
+            (wpk(tcs, 4, 4), 1, 30),
+            (wpk(tcs, 1, 2), 1, 20),
+            (wpk(tcs, 1, 0), 1, 10),
+            (wpk(tcs, 1, 0), 2, 10),   // fold
+            (wpk(tcs, 4, 4), -1, 30),  // ghost
+            (wpk(tcs, 1, 9), 1, 99),
+        ];
+        assert_consolidate_matches_reference(&s, &rows);
+    }
+
+    mod opk_consolidate_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn schemas() -> Vec<SchemaDescriptor> {
+            vec![
+                pk_payload_schema(&[type_code::I64]),
+                pk_payload_schema(&[type_code::I32]),
+                pk_payload_schema(&[type_code::U32, type_code::U64]),
+                pk_payload_schema(&[type_code::U64, type_code::I32]),
+                pk_payload_schema(&[type_code::U64, type_code::U64, type_code::U64]),
+            ]
+        }
+
+        fn arb_rows(stride: usize) -> impl Strategy<Value = Vec<(Vec<u8>, i64, i64)>> {
+            // Small weight and payload domains make folds and ghost-cancels
+            // likely; random PK bytes exercise the full ordering.
+            let row = (prop::collection::vec(any::<u8>(), stride), -3i64..=3i64, 0i64..4i64);
+            prop::collection::vec(row, 0..40)
+        }
+
+        proptest! {
+            /// New `sort_and_consolidate` output equals the `compare_pk_bytes`
+            /// reference for every covered PK shape, over random batches.
+            #[test]
+            fn consolidate_matches_reference(
+                (si, rows) in (0usize..5).prop_flat_map(|si| {
+                    let stride = schemas()[si].pk_stride() as usize;
+                    (Just(si), arb_rows(stride))
+                })
+            ) {
+                let s = schemas()[si];
+                assert_consolidate_matches_reference(&s, &rows);
+            }
+        }
     }
 }

@@ -1383,17 +1383,20 @@ mod tests {
     }
 
     /// A wire schema declaring a float PK must be rejected with an error, not
-    /// abort the engine. `SchemaDescriptor::new` only asserts STRING/BLOB and
-    /// nullable PKs, so a float PK would otherwise slip through and silently
-    /// violate the byte-equal key contract.
+    /// abort the engine. The decoder gates float PKs before they reach
+    /// `SchemaDescriptor::new` (whose assert would otherwise abort the process).
     #[test]
     fn decode_schema_block_rejects_float_pk() {
-        // F64 PK is constructible via `new` (it doesn't assert floats), so we
-        // can build the wire block and confirm the decoder gates it.
-        let cols = [SchemaColumn::new(type_code::F64, 0)];
+        // `new` itself now rejects float PKs, so the wire block is built from a
+        // valid U64 PK and the type_code region (region 3) is patched to F64 —
+        // mirroring how the nullable-PK test patches the flags region.
+        let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
-        match decode_schema_block(&wire, true) {
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        let (tc_off, _) = wal_dir_entry(&wire, 3);
+        wire[tc_off..tc_off + 8].copy_from_slice(&(type_code::F64 as u64).to_le_bytes());
+        // verify_checksum=false: the type_code region is inside the checksummed body.
+        match decode_schema_block(&wire, false) {
             Err("PK column type not PK-eligible") => {}
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("float PK must be rejected"),

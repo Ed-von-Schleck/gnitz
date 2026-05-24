@@ -526,6 +526,44 @@ def test_compound_pk_insert_distinct_rows_round_trip(client):
         _cleanup(client, sn, "t")
 
 
+def test_compound_pk_adversarial_second_column_and_delete_consolidation(client):
+    """Compound-PK ingest consolidation with second-column values that would
+    invert the order if the packed key were compared as one wide integer
+    (col b in the high half). The consolidation sort's order-preserving key
+    must order column-by-column (a dominates b), and DELETE retractions must
+    fold cleanly. Scan order isn't globally sorted under multiple workers, so
+    we assert the surviving (a, b, payload) *set* — the grouping/folding the
+    consolidation sort is responsible for."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        umax = 18446744073709551615  # u64::MAX — a huge col-b value
+        # Inserted scrambled. Under a naive packed-u128 compare treating b as
+        # the high half, (1, umax) would sort after (2, 0); column a must win.
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES "
+            f"(2, 1, 21), (1, {umax}, 1399), (1, 5, 15), (1, 0, 10), (2, 0, 20)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (1, 0, 10), (1, 5, 15), (1, umax, 1399), (2, 0, 20), (2, 1, 21),
+        ]
+        # Retract the group-a=1 max-b row; the next consolidation must fold it.
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = 1 AND b = {umax}", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 0, 10), (1, 5, 15), (2, 0, 20), (2, 1, 21)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
 def test_compound_pk_insert_duplicate_tuple_rejected(client):
     """Same (a, b) tuple twice → conflict; sharing one column is fine."""
     sn = "cpk" + _uid()

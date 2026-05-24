@@ -173,6 +173,68 @@ pub fn compare_pk_bytes(
     Ordering::Equal
 }
 
+/// Order-preserving big-endian encoding of one PK column.
+///
+/// `src` and `dst` are both exactly `cs = col.size()` bytes. The result is the
+/// order-twin of the matching arm in `compare_pk_bytes`: unsigned lexicographic
+/// comparison of `dst` equals the numeric comparison `compare_pk_bytes` performs
+/// for this column. Panics on the same non-PK-eligible type codes (floats) so a
+/// float PK — already rejected at the catalog, wire, and `SchemaDescriptor::new`
+/// layers — fails loudly here too rather than producing silent misorder.
+#[inline]
+fn encode_pk_column(src: &[u8], type_code: u8, dst: &mut [u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    // U128/UUID compare as `u128::from_le_bytes`; U8..U64 via `read_unsigned`
+    // (zero-extension); signed via `read_signed`. All are pure magnitude once the
+    // sign bit is handled below, so big-endian == reversed LE. The byte-swap is
+    // identical bit-work regardless of signedness, so the width arms read as the
+    // unsigned type. Width-specialised so each arm folds to a single
+    // `bswap`/`movbe` (a runtime-length byte loop would not), mirroring
+    // `pack_pk_le`.
+    let signed = match type_code {
+        TYPE_U128 | TYPE_UUID | TYPE_U64 | TYPE_U32 | TYPE_U16 | TYPE_U8 => false,
+        TYPE_I64 | TYPE_I32 | TYPE_I16 | TYPE_I8 => true,
+        other => panic!("encode_pk_column: type_code {other} is not PK-eligible"),
+    };
+    match dst.len() {
+        16 => dst.copy_from_slice(&u128::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
+        8 => dst.copy_from_slice(&u64::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
+        4 => dst.copy_from_slice(&u32::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
+        2 => dst.copy_from_slice(&u16::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
+        1 => dst[0] = src[0],
+        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
+    }
+    // Signed: biasing by 2^(bits-1) maps the signed range monotonically onto the
+    // unsigned range (negatives first). After the BE reversal that bias is a flip
+    // of the sign bit, which is the top bit of the leading byte.
+    if signed {
+        dst[0] ^= 0x80;
+    }
+}
+
+/// Encode a full PK region (`schema.pk_stride()` bytes, columns in pk-list
+/// order) into an order-preserving big-endian key. `pk_bytes` and `out` are both
+/// `pk_stride` bytes. Iterates `schema.pk_columns()` — the *same* iterator
+/// `compare_pk_bytes` walks — so a non-identity `pk_indices` (e.g. `[1, 0]`)
+/// encodes in pk-list order, matching the comparator.
+///
+/// The encoding is **injective**: `encode(a) == encode(b)` iff
+/// `a == b` byte-for-byte, because each column's transform is a bijection on its
+/// byte range. Consolidation grouping relies on this — an OPK equality test is
+/// exactly a PK-byte equality test.
+pub(crate) fn encode_order_preserving_pk(
+    schema: &SchemaDescriptor,
+    pk_bytes: &[u8],
+    out: &mut [u8],
+) {
+    let mut off = 0usize;
+    for (_ord, _ci, col) in schema.pk_columns() {
+        let cs = col.size() as usize;
+        encode_pk_column(&pk_bytes[off..off + cs], col.type_code, &mut out[off..off + cs]);
+        off += cs;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fast path: signed-integer, non-nullable schemas
 // ---------------------------------------------------------------------------
@@ -660,6 +722,24 @@ mod tests {
         SchemaDescriptor::new(&cols, &pk)
     }
 
+    /// The load-bearing OPK property: the order-preserving key's
+    /// byte-lexicographic order equals `compare_pk_bytes` order, column for
+    /// column. Both the narrow `u128::from_be_bytes(buf)` sort key and the wide
+    /// 16-byte prefix are order-equivalent to this byte-lexicographic compare
+    /// for a fixed per-batch stride, so validating the byte form validates both.
+    fn assert_opk_equivalence(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) {
+        let stride = schema.pk_stride() as usize;
+        let mut opk_a = vec![0u8; stride];
+        let mut opk_b = vec![0u8; stride];
+        encode_order_preserving_pk(schema, a, &mut opk_a);
+        encode_order_preserving_pk(schema, b, &mut opk_b);
+        assert_eq!(
+            opk_a.cmp(&opk_b),
+            compare_pk_bytes(schema, a, b),
+            "OPK order disagrees with compare_pk_bytes for a={a:?} b={b:?}",
+        );
+    }
+
     #[test]
     fn compare_pk_bytes_single_u64() {
         let s = pk_only_schema(&[type_code::U64]);
@@ -673,6 +753,7 @@ mod tests {
                     vals[i].cmp(&vals[j]),
                     "U64 mismatch at ({i}, {j})",
                 );
+                assert_opk_equivalence(&s, &a, &b);
             }
         }
         // Pin the LE-bytes vs lex-bytes regression: 1 < 256.
@@ -699,6 +780,8 @@ mod tests {
             compare_pk_bytes(&s, &lo.to_le_bytes(), &lo.to_le_bytes()),
             Ordering::Equal,
         );
+        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
+        assert_opk_equivalence(&s, &hi.to_le_bytes(), &lo.to_le_bytes());
     }
 
     #[test]
@@ -711,6 +794,7 @@ mod tests {
             compare_pk_bytes(&s, &low.to_le_bytes(), &high.to_le_bytes()),
             Ordering::Less,
         );
+        assert_opk_equivalence(&s, &low.to_le_bytes(), &high.to_le_bytes());
     }
 
     #[test]
@@ -726,6 +810,7 @@ mod tests {
                     vals[i].cmp(&vals[j]),
                     "I8 mismatch at ({i}, {j})",
                 );
+                assert_opk_equivalence(&s, &a, &b);
             }
         }
         // Sign-extension regression: -1 (0xFF) < 1 (0x01).
@@ -745,6 +830,7 @@ mod tests {
                     vals[i].cmp(&vals[j]),
                     "I16 mismatch at ({i}, {j})",
                 );
+                assert_opk_equivalence(&s, &a, &b);
             }
         }
     }
@@ -762,6 +848,7 @@ mod tests {
                     vals[i].cmp(&vals[j]),
                     "I32 mismatch at ({i}, {j})",
                 );
+                assert_opk_equivalence(&s, &a, &b);
             }
         }
     }
@@ -779,6 +866,7 @@ mod tests {
                     vals[i].cmp(&vals[j]),
                     "I64 mismatch at ({i}, {j})",
                 );
+                assert_opk_equivalence(&s, &a, &b);
             }
         }
     }
@@ -789,6 +877,8 @@ mod tests {
         // High-bit-set vs small: 0xFF > 0x01 numerically as unsigned.
         assert_eq!(compare_pk_bytes(&s, &[0xFFu8], &[0x01u8]), Ordering::Greater);
         assert_eq!(compare_pk_bytes(&s, &[0x00u8], &[0xFFu8]), Ordering::Less);
+        assert_opk_equivalence(&s, &[0xFFu8], &[0x01u8]);
+        assert_opk_equivalence(&s, &[0x00u8], &[0xFFu8]);
     }
 
     #[test]
@@ -801,6 +891,7 @@ mod tests {
             compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
             Ordering::Less,
         );
+        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
     }
 
     #[test]
@@ -812,6 +903,7 @@ mod tests {
             compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
             Ordering::Less,
         );
+        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
     }
 
     #[test]
@@ -831,6 +923,9 @@ mod tests {
         // First column dominates (would be Greater under a u128 LE compare,
         // which would treat the second column as the high-order bits).
         assert_eq!(compare_pk_bytes(&s, &r1, &r2), Ordering::Less);
+        assert_opk_equivalence(&s, &r0, &r1);
+        assert_opk_equivalence(&s, &r1, &r2);
+        assert_opk_equivalence(&s, &r0, &r2);
     }
 
     #[test]
@@ -847,6 +942,7 @@ mod tests {
         // Per-column dispatch picks read_signed for col 1 even though col 0
         // is unsigned: -5 < 0.
         assert_eq!(compare_pk_bytes(&s, &neg, &zero), Ordering::Less);
+        assert_opk_equivalence(&s, &neg, &zero);
     }
 
     #[test]
@@ -869,6 +965,8 @@ mod tests {
         b.extend_from_slice(&2u64.to_le_bytes()); // col1
         b.extend_from_slice(&0u64.to_le_bytes()); // col0
         assert_eq!(compare_pk_bytes(&s, &a, &b), Ordering::Less);
+        // Encoder iterates pk-list order [1,0], same as the comparator.
+        assert_opk_equivalence(&s, &a, &b);
     }
 
     #[test]
@@ -891,5 +989,58 @@ mod tests {
         let s = pk_only_schema(&[type_code::U64, type_code::U64]);
         let buf = vec![0x7Fu8; 16];
         assert_eq!(compare_pk_bytes(&s, &buf, &buf), Ordering::Equal);
+        assert_opk_equivalence(&s, &buf, &buf);
+    }
+
+    // -----------------------------------------------------------------------
+    // OPK ↔ compare_pk_bytes property test
+    // -----------------------------------------------------------------------
+
+    mod opk_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn tc_size(tc: u8) -> usize {
+            SchemaColumn::new(tc, 0).size() as usize
+        }
+
+        fn arb_pk_type() -> impl Strategy<Value = u8> {
+            prop_oneof![
+                Just(type_code::U8), Just(type_code::I8),
+                Just(type_code::U16), Just(type_code::I16),
+                Just(type_code::U32), Just(type_code::I32),
+                Just(type_code::U64), Just(type_code::I64),
+                Just(type_code::U128), Just(type_code::UUID),
+            ]
+        }
+
+        /// `(column type codes, pk_indices permutation, a_bytes, b_bytes)`.
+        /// The permutation exercises non-identity `pk_indices` (e.g. `[1, 0]`),
+        /// and 1..=4 columns spans both narrow (≤16) and wide (>16) strides.
+        fn arb_pk_case() -> impl Strategy<Value = (Vec<u8>, Vec<u32>, Vec<u8>, Vec<u8>)> {
+            prop::collection::vec(arb_pk_type(), 1..=4).prop_flat_map(|types| {
+                let stride: usize = types.iter().map(|&t| tc_size(t)).sum();
+                let n = types.len();
+                (
+                    Just(types),
+                    Just((0..n as u32).collect::<Vec<u32>>()).prop_shuffle(),
+                    prop::collection::vec(any::<u8>(), stride),
+                    prop::collection::vec(any::<u8>(), stride),
+                )
+            })
+        }
+
+        proptest! {
+            /// The order-preserving key agrees with `compare_pk_bytes` for every
+            /// PK-eligible type, every 1..=4-column compound arrangement, and any
+            /// `pk_indices` permutation — over random PK byte tuples.
+            #[test]
+            fn opk_matches_compare_pk_bytes((types, perm, a, b) in arb_pk_case()) {
+                let cols: Vec<SchemaColumn> =
+                    types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                let s = SchemaDescriptor::new(&cols, &perm);
+                assert_opk_equivalence(&s, &a, &b);
+            }
+        }
     }
 }

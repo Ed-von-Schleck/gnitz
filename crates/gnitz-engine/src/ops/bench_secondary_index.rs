@@ -180,6 +180,98 @@ fn secondary_index_bench_gi_decomposition() {
     println!("  (op_integrate full path: {:.2} ns/row)", ns_per_row(full));
 }
 
+/// Incremental lifecycle bench: one long-lived GI table fed many small
+/// per-epoch deltas, each epoch reading back (compacting cursor + prefix
+/// walk over the touched groups) exactly as `op_reduce` does. This is the
+/// production shape the single-batch decomposition tests above cannot see:
+/// a tiny arena (index tables ship 256 KiB–1 MiB) flushes frequently, and
+/// since the read path opens `create_cursor_compacting`, every read past
+/// `L0_COMPACT_THRESHOLD` shards triggers a compaction — LSM write
+/// amplification driven purely by memtable size. Sweep `GNITZ_BENCH_ARENA_KB`
+/// (e.g. 1024 = shipped GI arena vs. 65536 = working-set-sized) to price it.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn secondary_index_bench_gi_incremental() {
+    let delta: usize = std::env::var("GNITZ_BENCH_DELTA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let epochs: usize = N_ROWS / delta;
+
+    let schema = src_schema();
+    let gi_schema = make_gi_schema(&schema);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut t =
+        Table::new(tmp.path().to_str().unwrap(), "gi_inc", gi_schema, 0, arena(), false).unwrap();
+
+    let mut pk: u64 = 0;
+    let mut write_t = Duration::ZERO;
+    let mut open_t = Duration::ZERO;
+    let mut seek_t = Duration::ZERO;
+    let start = Instant::now();
+    for _ in 0..epochs {
+        let mut batch = Batch::with_schema(schema, delta);
+        batch.sorted = false;
+        batch.consolidated = false;
+        let mut touched: Vec<u64> = Vec::with_capacity(delta);
+        for _ in 0..delta {
+            let g = pk % N_GROUPS;
+            batch.extend_pk(pk as u128);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &(g as u32).to_le_bytes());
+            batch.extend_col(1, &((pk.wrapping_mul(2654435761)) as i64).to_le_bytes());
+            batch.count += 1;
+            touched.push(g);
+            pk += 1;
+        }
+
+        let gi = GiDesc { table: &mut t as *mut Table, col_idx: 1 };
+        let w0 = Instant::now();
+        op_integrate_with_indexes(&batch, None, &schema, Some(&gi), None).unwrap();
+        write_t += w0.elapsed();
+
+        // Read-back: compacting cursor, then walk each touched group's prefix
+        // (the GI group-column value widens to the u64 gc prefix).
+        touched.sort_unstable();
+        touched.dedup();
+        let o0 = Instant::now();
+        // Mirrors op_reduce's GI read path (vm.rs), which compacts on read.
+        #[allow(clippy::disallowed_methods)]
+        let mut handle = t.create_cursor_compacting().unwrap();
+        open_t += o0.elapsed();
+        let c = handle.cursor_mut();
+        let s0 = Instant::now();
+        for g in &touched {
+            let prefix = (*g).to_le_bytes();
+            let mut hit = c.seek_first_positive_with_prefix(&prefix);
+            while hit {
+                std::hint::black_box(c.current_pk_bytes());
+                c.advance();
+                hit = c.walk_to_positive_with_prefix(&prefix);
+            }
+        }
+        seek_t += s0.elapsed();
+    }
+    let elapsed = start.elapsed();
+    let rows = (epochs * delta) as f64;
+    println!(
+        "\nGI incremental — {epochs} epochs x {delta} rows, arena {} KiB:",
+        arena() / 1024
+    );
+    println!(
+        "  {:.1} ns/row   ({:.2} Mrows/s)   total {:.3}s",
+        elapsed.as_nanos() as f64 / rows,
+        rows / elapsed.as_secs_f64() / 1e6,
+        elapsed.as_secs_f64(),
+    );
+    let pct = |d: Duration| 100.0 * d.as_secs_f64() / elapsed.as_secs_f64();
+    let nspr = |d: Duration| d.as_nanos() as f64 / rows;
+    println!("    write (integrate)   {:7.1} ns/row   {:5.1}%", nspr(write_t), pct(write_t));
+    println!("    read: cursor open   {:7.1} ns/row   {:5.1}%", nspr(open_t), pct(open_t));
+    println!("    read: prefix seeks  {:7.1} ns/row   {:5.1}%", nspr(seek_t), pct(seek_t));
+}
+
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_avi_decomposition() {
@@ -251,4 +343,67 @@ fn secondary_index_bench_avi_decomposition() {
 
     report("AVI (U32 grp)", compose, build, sort, upsert);
     println!("  (op_integrate full path: {:.2} ns/row)", ns_per_row(full));
+}
+
+/// Time the `into_consolidated` sort layer for a single-column PK schema
+/// (`[pk, I64 val]`). `pk_bytes_for(row)` yields the 8-byte LE PK; payload is a
+/// scrambled I64 so the payload tiebreak is exercised. Hashed PKs keep the input
+/// unsorted (real sort work) with occasional folds.
+fn bench_single_pk_sort(
+    label: &str,
+    pk_schema: SchemaDescriptor,
+    pk_bytes_for: impl Fn(usize) -> [u8; 8],
+) {
+    let build = || {
+        let mut out = Batch::with_schema(pk_schema, N_ROWS);
+        out.sorted = false;
+        out.consolidated = false;
+        for row in 0..N_ROWS {
+            out.extend_pk_bytes(&pk_bytes_for(row));
+            out.extend_weight(&1i64.to_le_bytes());
+            out.extend_null_bmp(&0u64.to_le_bytes());
+            out.extend_col(0, &((row as i64).wrapping_mul(2654435761)).to_le_bytes());
+            out.count += 1;
+        }
+        out
+    };
+    let sort = time(|| {
+        std::hint::black_box(build().into_consolidated(&pk_schema));
+    });
+    let s = ns_per_row(sort);
+    println!(
+        "\n{label} — sort (into_consolidated): {s:7.2} ns/row   ({:.2} Mrows/s)",
+        1000.0 / s,
+    );
+}
+
+/// Single-U64 PK: the `pk_is_fast` path that must NOT regress (OPK is bypassed;
+/// `pack_pk_le` output is byte-identical). Guards against accidental routing of
+/// the fast path through the OPK encoder.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn secondary_index_bench_single_u64_pk_sort() {
+    let schema = SchemaDescriptor::new(
+        &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+        &[0],
+    );
+    bench_single_pk_sort("single-U64 PK (fast path)", schema, |row| {
+        (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes()
+    });
+}
+
+/// Single-I64 PK: the signed single-column case. Confirms the order-preserving
+/// key is a net win (or at least not a regression) versus the old
+/// per-comparison signed cast.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn secondary_index_bench_single_i64_pk_sort() {
+    let schema = SchemaDescriptor::new(
+        &[SchemaColumn::new(type_code::I64, 0), SchemaColumn::new(type_code::I64, 0)],
+        &[0],
+    );
+    bench_single_pk_sort("single-I64 PK (OPK path)", schema, |row| {
+        // Cast to i64 spreads the hash across negatives and positives.
+        ((row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64).to_le_bytes()
+    });
 }
