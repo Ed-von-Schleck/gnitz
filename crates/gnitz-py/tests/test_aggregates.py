@@ -296,6 +296,77 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_signed_group_key_negative_values_byte_form(self, client):
+        """A single MIN over a two-column GROUP BY whose group columns are
+        SIGNED and hold NEGATIVE values. The byte-form AVI key concatenates each
+        group column's raw two's-complement bytes (a negative INT has its high
+        bit set, e.g. -5 -> 0xFFFFFFFB), so the prefix seek must still isolate
+        the exact group and keep a negative group distinct from its positive
+        twin. The existing byte-form AVI suites only use non-negative group
+        coordinates, so this guards the signed gather + exact-prefix lookup."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  a INT NOT NULL,"
+                "  b INT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo "
+                "FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Sign twins: (-5,-7) vs (5,7) vs (-5,7) vs (5,-7) must never share a
+            # bucket. (0,0) anchors the all-zero key. Each group gets several
+            # vals; the expected MIN is the smallest inserted.
+            groups = [(-5, -7), (5, 7), (-5, 7), (5, -7), (0, 0)]
+            expected = {}
+            pk = 0
+            rows_sql = []
+            for gi, (a, b) in enumerate(groups):
+                base = (gi + 1) * 1000
+                for k in range(3):
+                    pk += 1
+                    v = base + (2 - k) * 10  # smallest is base (k=2)
+                    rows_sql.append(f"({pk}, {a}, {b}, {v})")
+                expected[(a, b)] = base
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql),
+                schema_name=sn,
+            )
+
+            rows = client.scan(vid)
+            by_key = {(r["a"], r["b"]): r["lo"] for r in rows if r.weight > 0}
+            assert len(by_key) == len(groups), f"expected {len(groups)} groups, got {by_key}"
+            for key, lo in expected.items():
+                assert by_key[key] == lo, f"group {key}: expected MIN {lo}, got {by_key[key]}"
+
+            # Push a value below the current MIN of a negative group, then retract
+            # it: the byte-form AVI must lower the MIN and then recover the prior
+            # extremum from the remaining entries of that exact (negative) group.
+            client.execute_sql(f"INSERT INTO t VALUES ({pk + 1}, -5, -7, -999)", schema_name=sn)
+            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid) if r.weight > 0}
+            assert by_key[(-5, -7)] == -999, "smaller value must lower the negative group's MIN"
+            assert by_key[(5, 7)] == expected[(5, 7)], "positive twin must be unaffected"
+
+            client.execute_sql(f"DELETE FROM t WHERE pk = {pk + 1}", schema_name=sn)
+            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid) if r.weight > 0}
+            assert by_key[(-5, -7)] == expected[(-5, -7)], (
+                "retracting the extremum must restore the negative group's next-best MIN"
+            )
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
