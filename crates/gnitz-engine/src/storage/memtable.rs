@@ -27,24 +27,34 @@ const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
 /// `key` is the faithful narrow encoding: `to_le_bytes()[..stride]` reproduces
 /// the stored PK bytes.
 fn run_lower_bound(run: &Batch, key: u128, schema: &SchemaDescriptor) -> usize {
-    if run.count == 0 {
-        return 0;
-    }
     if schema.pk_is_fast() {
+        if run.count == 0 {
+            return 0;
+        }
         if key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
             return run.count;
         }
         return run.find_lower_bound(key);
     }
     let stride = schema.pk_stride() as usize;
-    let kb = key.to_le_bytes();
-    let k = &kb[..stride];
-    if columnar::compare_pk_bytes(schema, k, run.get_pk_bytes(0)) == Ordering::Less
-        || columnar::compare_pk_bytes(schema, k, run.get_pk_bytes(run.count - 1)) == Ordering::Greater
+    run_lower_bound_bytes(run, &key.to_le_bytes()[..stride], schema)
+}
+
+/// Raw-PK-bytes lower-bound search: the `compare_pk_bytes` (compound/signed/
+/// wide) arm of [`run_lower_bound`]. `key` is the raw PK bytes (exactly
+/// `pk_stride` wide). Wide (`pk_stride > 16`) PKs can only enter here, since
+/// the packed `u128` can't represent them; [`run_lower_bound`] routes narrow
+/// non-fast PKs here too.
+fn run_lower_bound_bytes(run: &Batch, key: &[u8], schema: &SchemaDescriptor) -> usize {
+    if run.count == 0 {
+        return 0;
+    }
+    if columnar::compare_pk_bytes(schema, key, run.get_pk_bytes(0)) == Ordering::Less
+        || columnar::compare_pk_bytes(schema, key, run.get_pk_bytes(run.count - 1)) == Ordering::Greater
     {
         return run.count;
     }
-    run.find_lower_bound_bytes(k, schema)
+    run.find_lower_bound_bytes(key, schema)
 }
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
@@ -211,6 +221,32 @@ impl MemTable {
         (total_w, self.has_found, row_count)
     }
 
+    /// Byte-keyed sibling of [`lookup_pk`] for wide (`pk_stride > 16`) PKs.
+    /// `key` is the raw PK bytes. The bloom is never populated for wide PKs
+    /// (see `upsert_sorted_batch`), so this path goes straight to the runs.
+    pub fn lookup_pk_bytes(&mut self, key: &[u8]) -> (i64, bool, usize) {
+        let mut total_w: i64 = 0;
+        let mut row_count: usize = 0;
+        self.has_found = false;
+        let schema = self.schema;
+
+        for (ri, run) in self.runs.iter().enumerate() {
+            let mut lo = run_lower_bound_bytes(run, key, &schema);
+            while lo < run.count && run.get_pk_bytes(lo) == key {
+                total_w += run.get_weight(lo);
+                if !self.has_found {
+                    self.found_run = ri;
+                    self.found_row = lo;
+                    self.has_found = true;
+                }
+                row_count += 1;
+                lo += 1;
+            }
+        }
+
+        (total_w, self.has_found, row_count)
+    }
+
     fn found_entry(&self) -> Option<(&Batch, usize)> {
         if self.has_found && self.found_run < self.runs.len() {
             Some((self.runs[self.found_run].as_ref(), self.found_row))
@@ -265,6 +301,31 @@ impl MemTable {
         total_w
     }
 
+    /// Byte-keyed sibling of [`find_weight_for_row`] for wide PKs.
+    pub fn find_weight_for_row_bytes<S: super::columnar::ColumnarSource>(
+        &self,
+        key: &[u8],
+        ref_source: &S,
+        ref_row: usize,
+    ) -> i64 {
+        let mut total_w: i64 = 0;
+
+        for run in &self.runs {
+            let mut lo = run_lower_bound_bytes(run, key, &self.schema);
+            while lo < run.count && run.get_pk_bytes(lo) == key {
+                let ord = columnar::compare_rows(
+                    &self.schema, run.as_ref(), lo, ref_source, ref_row,
+                );
+                if ord == Ordering::Equal {
+                    total_w += run.get_weight(lo);
+                }
+                lo += 1;
+            }
+        }
+
+        total_w
+    }
+
     /// Find the first memtable row whose (PK, payload) has positive net weight
     /// across all runs.  Sets `found_run`/`found_row`/`has_found` on success.
     /// Returns true if such a row was found, false otherwise.
@@ -278,6 +339,26 @@ impl MemTable {
             let mut lo = run_lower_bound(run, key, &schema);
             while lo < run.count && run.get_pk(lo) == key {
                 let net_w = self.find_weight_for_row(key, run.as_ref(), lo);
+                if net_w > 0 {
+                    self.found_run = ri;
+                    self.found_row = lo;
+                    self.has_found = true;
+                    return true;
+                }
+                lo += 1;
+            }
+        }
+        self.has_found = false;
+        false
+    }
+
+    /// Byte-keyed sibling of [`find_positive_payload_row`] for wide PKs.
+    pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
+        let schema = self.schema;
+        for (ri, run) in self.runs.iter().enumerate() {
+            let mut lo = run_lower_bound_bytes(run, key, &schema);
+            while lo < run.count && run.get_pk_bytes(lo) == key {
+                let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
                 if net_w > 0 {
                     self.found_run = ri;
                     self.found_row = lo;

@@ -155,6 +155,36 @@ impl ShardEntry {
         }
         None
     }
+
+    /// Wide-only (`pk_stride > 16`) byte-keyed probe. `key` is the raw PK
+    /// bytes (exactly `pk_stride` wide). The XOR8 filter on a wide shard was
+    /// built from `xxh::checksum(pk_bytes) as u128` (see
+    /// `shard_file::build_xor8_from_pk_region`), so the probe queries it the
+    /// same way — unconditionally, since this entry point only ever sees wide
+    /// shards.
+    fn probe_pk_bytes(
+        &self,
+        key: &[u8],
+        schema: &SchemaDescriptor,
+    ) -> Option<(Rc<MappedShard>, usize)> {
+        debug_assert!(schema.pk_is_wide());
+        if self.is_empty() {
+            return None;
+        }
+        if !pk_in_range(schema, &self.pk_min, &self.pk_max, key) {
+            return None;
+        }
+        if self.shard.has_xor8()
+            && !self.shard.xor8_may_contain(crate::xxh::checksum(key) as u128)
+        {
+            return None;
+        }
+        let idx = self.shard.find_lower_bound_bytes(key, schema);
+        if idx < self.shard.count && self.shard.get_pk_bytes(idx) == key {
+            return Some((Rc::clone(&self.shard), idx));
+        }
+        None
+    }
 }
 
 struct LevelGuard {
@@ -318,14 +348,55 @@ impl ShardIndex {
             }
         }
 
+        // The guard-key space is order-preserving (`pk_sort_key`): identical to
+        // the raw key for `pk_is_fast`, re-encoded for compound/signed so the
+        // read-side routing matches `l1_guard_keys` and the compaction merge
+        // order. Route by the same OPK key the guards were built in.
+        let route_key = self.guard_route_key(key);
         for level in &self.levels {
-            if let Some(g_idx) = level.find_guard_idx(key) {
+            if let Some(g_idx) = level.find_guard_idx(route_key) {
                 for e in &level.guards[g_idx].entries {
                     if let Some((arc, idx)) = e.probe_pk(key, &self.schema) {
                         visitor(arc, idx);
                     }
                 }
             }
+        }
+    }
+
+    /// Wide-only (`pk_stride > 16`) byte-keyed point lookup. Wide PKs route all
+    /// compaction to guard 0 (see `l1_guard_keys`), so the per-level guard
+    /// index is meaningless — scan every entry; `probe_pk_bytes` range-rejects
+    /// cheaply via `pk_in_range`.
+    pub fn find_pk_bytes(&self, key: &[u8], visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+        debug_assert!(self.schema.pk_is_wide());
+        for e in &self.l0 {
+            if let Some((arc, idx)) = e.probe_pk_bytes(key, &self.schema) {
+                visitor(arc, idx);
+            }
+        }
+        for level in &self.levels {
+            for guard in &level.guards {
+                for e in &guard.entries {
+                    if let Some((arc, idx)) = e.probe_pk_bytes(key, &self.schema) {
+                        visitor(arc, idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map a narrow PK `u128` to its guard-routing key. `pk_is_fast` schemas
+    /// route by the raw key (raw LE == OPK). Compound/signed narrow PKs route
+    /// by `pk_sort_key`, the same order-preserving encoding `l1_guard_keys`
+    /// uses, so read routing and compaction merge order agree.
+    #[inline]
+    fn guard_route_key(&self, key: u128) -> u128 {
+        if self.schema.pk_is_fast() {
+            key
+        } else {
+            let stride = self.schema.pk_stride() as usize;
+            super::merge::pk_sort_key(&self.schema, &key.to_le_bytes()[..stride])
         }
     }
 
@@ -593,6 +664,14 @@ impl ShardIndex {
     }
 
     fn l1_guard_keys(&self) -> Vec<u128> {
+        // Wide PKs (`pk_stride > 16`) cannot be packed into a guard `u128`;
+        // `as_u128_single_pk()` would panic. Route all wide compaction to a
+        // single guard 0 — `find_guard_for_key(&[0], k)` returns 0 for any
+        // `k >= 0`, so `merge_and_route`'s `&[u128]` contract is preserved
+        // without a byte-keyed router (the read side scans every entry).
+        if self.schema.pk_is_wide() {
+            return vec![0];
+        }
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
             self.levels[0]
                 .guards
@@ -600,17 +679,18 @@ impl ShardIndex {
                 .map(|g| g.guard_key)
                 .collect()
         } else {
-            // Guard-key / routing path stays u128, single-PK only. Skip
-            // empty shards and widen via as_u128_single_pk so
-            // merge_and_route keeps its &[u128] contract; dedup in u128
-            // space (pk_min is now a PkBuf, not comparable to the u128
-            // accumulator).
+            // Guard-key / routing path stays u128. The guard space is the
+            // order-preserving `pk_sort_key`: identical to `as_u128_single_pk`
+            // for `pk_is_fast`, re-encoded for compound/signed so routing and
+            // the compaction merge order (now keyed by `pk_sort_key` via
+            // `peek_key`) agree. Skip empty shards; dedup consecutive keys
+            // (L0 is sorted by pk_min, so equal OPK keys are adjacent).
             let mut keys: Vec<u128> = Vec::new();
             for e in &self.l0 {
                 if e.is_empty() {
                     continue;
                 }
-                let pk = e.pk_min.as_u128_single_pk();
+                let pk = super::merge::pk_sort_key(&self.schema, e.pk_min.pk_bytes());
                 if keys.last().copied() != Some(pk) {
                     keys.push(pk);
                 }
@@ -1539,5 +1619,30 @@ mod tests {
             entry.probe_pk(pack2(3, 0), &schema).is_none(),
             "out-of-range compound key must be pruned by probe_pk",
         );
+    }
+
+    /// Wide (`pk_stride > 16`) 3×U64 schema. `as_u128_single_pk` would panic
+    /// for this width, so `l1_guard_keys` must short-circuit to guard 0.
+    fn wide_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    /// A wide-PK table routes all compaction to guard 0. `l1_guard_keys` must
+    /// return `vec![0]` without panicking in `as_u128_single_pk`.
+    #[test]
+    fn test_l1_guard_keys_wide_bypass() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = wide_schema();
+        assert_eq!(schema.pk_stride(), 24);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        assert_eq!(idx.l1_guard_keys(), vec![0]);
     }
 }

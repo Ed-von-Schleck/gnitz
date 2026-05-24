@@ -31,29 +31,23 @@ negative weights, but base table traces never accumulate negative net
 weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 4.5/4.6 (distinct-elimination) require positive inputs.
 
-**Compound PKs (1–4 columns).** A table's primary key is an ordered list
-of 1–4 columns. Each PK column is an unsigned scalar (U8/U16/U32/U64/
-U128/UUID) or signed scalar (I8/I16/I32/I64); STRING, BLOB, and float
-(F32/F64) cannot be PK columns, and PK columns are non-nullable. Floats
-are excluded because IEEE-754 breaks the byte-equal key contract: -0.0
-and +0.0 compare unequal byte-wise but equal numerically, and NaN has no
-single canonical bit pattern. The PK columns are packed in PK-list order,
-each contributing its native LE bytes; the concatenation is the key.
+**Compound PKs.** A table's primary key is an ordered list of one or more
+columns. Each PK column is a fixed-width integer scalar — unsigned or
+signed; STRING, BLOB, and float columns cannot be PK columns, and PK
+columns are non-nullable. Floats are excluded because IEEE-754 breaks the
+byte-equal key contract: -0.0 and +0.0 compare unequal byte-wise but equal
+numerically, and NaN has no single canonical bit pattern. The PK columns
+are packed in PK-list order, each contributing its native LE bytes; the
+concatenation is the key.
 
-**PK ordering is type-aware.** A single unsigned PK column (U8/U16/U32/
-U64/U128/UUID) sorts by its packed u128 — `a.cmp(&b)` agrees with the
-column's native unsigned order (the "fast" comparator arm, selected by
-`SchemaDescriptor::pk_is_fast`, which holds only for a single unsigned
-column). Everything else takes the "slow" comparator
-(`storage::make_slow_pk_cmp`): a single signed (I8/I16/I32/I64) column
-interprets the low `pk_stride` bytes as its native type and applies
-signed ordering; a compound PK walks its
-columns in PK-list order via the column-aware `compare_pk_bytes`. Raw
-u128 ordering of `-1_i64`'s packed bytes (`0xFFFF…`) would sort it AFTER
-`+1`, inverting the signed order — and the column boundaries of a compound
-key are likewise invisible to a flat u128 compare. The sort-merge,
-scatter-merge-walk, and reduce code paths all branch on `pk_is_fast` to
-pick the correct comparator.
+**PK ordering is type-aware.** A primary key is *not* ordered by a flat
+comparison of its packed bytes. A single unsigned column orders by native
+magnitude. A single signed column orders in signed order: a negative
+integer's packed bytes (`0xFFFF…`) would otherwise sort after a positive
+one, inverting it. A compound key orders lexicographically by column in
+PK-list order; its internal column boundaries are invisible to a flat
+compare. Every ordered operation — merge, sort, consolidation, range scan —
+honours this type-aware order, never the raw packed representation.
 
 **Hash invariant.** `hash_u128(v as u128) == hash_u128(v)` for all narrow
 PK types (after the native-LE pack-and-zero-extend described above). XOR8

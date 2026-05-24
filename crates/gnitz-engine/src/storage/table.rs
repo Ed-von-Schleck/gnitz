@@ -487,6 +487,15 @@ impl Table {
         total_w > 0
     }
 
+    /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
+    /// The memtable bloom is never populated for wide PKs, so the lookup goes
+    /// straight to the sorted runs and shard index (binary search, no cursor).
+    pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
+        let (mt_w, _, _) = self.memtable.lookup_pk_bytes(key);
+        let (shard_w, _) = self.scan_shards_for_pk_bytes(key, false);
+        mt_w + shard_w > 0
+    }
+
     /// Look up a PK for retraction.  Returns (net_weight, found).
     /// If found, sets `found_source` so `found_*` accessors can read the row.
     ///
@@ -545,6 +554,49 @@ impl Table {
         (total_w, true)
     }
 
+    /// Byte-keyed sibling of [`retract_pk`] for wide PKs. Read-only (the DBSP
+    /// retraction is the `-1` row appended downstream); sets `found_source`
+    /// so the `found_*` accessors expose the live row's payload.
+    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
+        self.found_source = FoundSource::None;
+
+        let (mt_w, _, mt_row_count) = self.memtable.lookup_pk_bytes(key);
+
+        let need_candidates = !(mt_row_count == 1 && mt_w > 0);
+        let mut total_w = mt_w;
+        let (shard_w, shard_candidates) = self.scan_shards_for_pk_bytes(key, need_candidates);
+        total_w += shard_w;
+
+        if total_w <= 0 {
+            return (total_w, false);
+        }
+
+        let in_memtable = if mt_row_count == 1 && mt_w > 0 {
+            true
+        } else if mt_row_count > 1 {
+            self.memtable.find_positive_payload_row_bytes(key)
+        } else {
+            false
+        };
+
+        if in_memtable {
+            self.found_source = FoundSource::MemTable;
+        } else if shard_candidates.len() == 1 {
+            let (rc, idx) = &shard_candidates[0];
+            self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
+        } else {
+            for (rc, idx) in &shard_candidates {
+                let net_w = self.get_weight_for_row_bytes(key, rc.as_ref(), *idx);
+                if net_w > 0 {
+                    self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
+                    break;
+                }
+            }
+        }
+
+        (total_w, true)
+    }
+
     /// Get net weight for a specific (PK, payload) row.
     pub fn get_weight_for_row<S: columnar::ColumnarSource>(
         &mut self,
@@ -563,6 +615,33 @@ impl Table {
         self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
             while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
+                let ord = columnar::compare_rows(
+                    &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
+                );
+                if ord == Ordering::Equal {
+                    total_w += shard_rc.get_weight(idx);
+                }
+                idx += 1;
+            }
+        });
+
+        total_w
+    }
+
+    /// Byte-keyed sibling of [`get_weight_for_row`] for wide PKs.
+    pub fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
+        &mut self,
+        key: &[u8],
+        ref_source: &S,
+        ref_row: usize,
+    ) -> i64 {
+        let mut total_w: i64 = 0;
+
+        total_w += self.memtable.find_weight_for_row_bytes(key, ref_source, ref_row);
+
+        self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
+            let mut idx = start_idx;
+            while idx < shard_rc.count && shard_rc.get_pk_bytes(idx) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
                 );
@@ -651,6 +730,29 @@ impl Table {
         self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
             while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
+                total_w += shard_rc.get_weight(idx);
+                if need_candidates {
+                    candidates.push((Rc::clone(&shard_rc), idx));
+                }
+                idx += 1;
+            }
+        });
+
+        (total_w, candidates)
+    }
+
+    /// Byte-keyed sibling of [`scan_shards_for_pk`] for wide PKs.
+    fn scan_shards_for_pk_bytes(
+        &self,
+        key: &[u8],
+        need_candidates: bool,
+    ) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
+        let mut total_w: i64 = 0;
+        let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
+
+        self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
+            let mut idx = start_idx;
+            while idx < shard_rc.count && shard_rc.get_pk_bytes(idx) == key {
                 total_w += shard_rc.get_weight(idx);
                 if need_candidates {
                     candidates.push((Rc::clone(&shard_rc), idx));
@@ -1120,5 +1222,88 @@ mod tests {
         assert!(t.memtable_is_empty(), "memtable must be reset after non-durable flush_prepare");
         assert!(t.has_pk(10));
         assert!(t.has_pk(20));
+    }
+
+    /// Wide (`pk_stride = 24`) PK: `has_pk_bytes`/`retract_pk_bytes` must work
+    /// across both the active memtable runs and flushed shards, and prefix-twins
+    /// (sharing the OPK 16-byte prefix, differing in the trailing column) must be
+    /// independently tracked.
+    #[test]
+    fn table_wide_pk_has_and_retract_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("wide_pk_test");
+        // (U64, U64, U64) PK + I64 payload.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+
+        let pk3 = |a: u64, b: u64, c: u64| {
+            let mut v = a.to_le_bytes().to_vec();
+            v.extend_from_slice(&b.to_le_bytes());
+            v.extend_from_slice(&c.to_le_bytes());
+            v
+        };
+        let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
+            let mut b = Batch::with_schema(schema, rows.len().max(1));
+            for (pk, w, val) in rows {
+                b.extend_pk_bytes(pk);
+                b.extend_weight(&w.to_le_bytes());
+                b.extend_null_bmp(&0u64.to_le_bytes());
+                b.extend_col(0, &val.to_le_bytes());
+                b.count += 1;
+            }
+            if !rows.is_empty() {
+                b.sorted = false;
+                b.consolidated = false;
+            }
+            b
+        };
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, false,
+        ).unwrap();
+
+        // Two prefix-twins (1,1,100)/(1,1,200) and a distinct (2,0,0).
+        t.ingest_owned_batch(wide_batch(&[
+            (pk3(1, 1, 100), 1, 10),
+            (pk3(1, 1, 200), 1, 20),
+            (pk3(2, 0, 0), 1, 30),
+        ])).unwrap();
+
+        // Memtable lookups.
+        assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
+        assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
+        assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
+        assert!(!t.has_pk_bytes(&pk3(1, 1, 300)), "absent prefix-twin must not be found");
+        assert!(!t.has_pk_bytes(&pk3(9, 9, 9)));
+
+        // Flush to a shard, then re-check the same keys from disk.
+        t.flush().unwrap();
+        assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
+        assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
+        assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
+        assert!(!t.has_pk_bytes(&pk3(1, 1, 300)));
+
+        // Retract one prefix-twin (DBSP -1 in the memtable); the other survives.
+        t.ingest_owned_batch(wide_batch(&[(pk3(1, 1, 100), -1, 10)])).unwrap();
+        assert!(!t.has_pk_bytes(&pk3(1, 1, 100)), "retracted twin must be gone");
+        assert!(t.has_pk_bytes(&pk3(1, 1, 200)), "the other twin must survive");
+
+        // retract_pk_bytes reports the live (PK, payload) row.
+        let (w, found) = t.retract_pk_bytes(&pk3(1, 1, 200));
+        assert_eq!(w, 1);
+        assert!(found);
+        let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
+        assert_eq!(w2, 0);
+        assert!(!found2);
+
+        t.close();
     }
 }

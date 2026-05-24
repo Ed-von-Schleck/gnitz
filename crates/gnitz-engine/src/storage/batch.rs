@@ -695,7 +695,6 @@ impl Batch {
         }
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub fn extend_pk_bytes(&mut self, bytes: &[u8]) {
         assert_eq!(
@@ -1343,13 +1342,47 @@ impl Batch {
         weight: i64,
         source: &S,
         row: usize,
-        mut blob_cache: Option<&mut BlobCache>,
+        blob_cache: Option<&mut BlobCache>,
     ) {
         if weight == 0 { return; }
         self.ensure_row_capacity();
+        self.extend_pk(key);
+        self.append_row_tail_from_source(weight, source, row, blob_cache);
+    }
+
+    /// Raw-PK-bytes counterpart of [`append_row_from_source`], for wide
+    /// (`pk_stride > 16`) PKs where `extend_pk` would panic. `pk_bytes` must be
+    /// exactly `pk_stride` bytes (asserted by `extend_pk_bytes`). Also valid for
+    /// narrow PKs — the only difference from the `u128` entry point is how the
+    /// PK region is written.
+    pub fn append_row_from_source_bytes<S: ColumnarSource>(
+        &mut self,
+        pk_bytes: &[u8],
+        weight: i64,
+        source: &S,
+        row: usize,
+        blob_cache: Option<&mut BlobCache>,
+    ) {
+        if weight == 0 { return; }
+        self.ensure_row_capacity();
+        self.extend_pk_bytes(pk_bytes);
+        self.append_row_tail_from_source(weight, source, row, blob_cache);
+    }
+
+    /// Shared tail of the two `append_row_from_source*` entry points: writes
+    /// weight, null bitmap, and the relocated payload columns, then bumps
+    /// `count`. The caller must have already written the PK region. `#[inline]`
+    /// so the compaction/merge emit loop pays nothing for the extraction.
+    #[inline]
+    fn append_row_tail_from_source<S: ColumnarSource>(
+        &mut self,
+        weight: i64,
+        source: &S,
+        row: usize,
+        mut blob_cache: Option<&mut BlobCache>,
+    ) {
         let schema = self.schema.expect("append_row_from_source requires schema");
 
-        self.extend_pk(key);
         self.extend_weight(&weight.to_le_bytes());
         let null_word = source.get_null_word(row);
         self.extend_null_bmp(&null_word.to_le_bytes());
@@ -2330,8 +2363,8 @@ mod tests {
 
     #[test]
     fn append_row_from_ptable_found_narrow_byte_roundtrip() {
-        // Narrow single-PK round-trip through the new byte-typed
-        // append_row_from_ptable_found. The §3 signature change must
+        // Narrow single-PK round-trip through the byte-typed
+        // append_row_from_ptable_found. The byte-typed signature must
         // preserve byte-for-byte equivalence with the old extend_pk(pk)
         // path: the stored PK region bytes are the same LE bytes
         // extend_pk would have written.

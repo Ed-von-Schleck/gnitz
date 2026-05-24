@@ -229,6 +229,16 @@ impl MappedShard {
         if matches!(pk, RegionView::TwoValue { .. }) || matches!(null_bmp, RegionView::TwoValue { .. }) {
             return Err(StorageError::InvalidShard);
         }
+        // Wide PK must be Raw: a Constant region holds only a 16-byte `value`,
+        // so `get_pk_bytes` would slice `&value[..stride]` out of bounds. The
+        // writer never emits Constant for a wide PK (wide strides stay Raw by
+        // construction), so this is defense-in-depth against a corrupt or
+        // forged file.
+        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES
+            && !matches!(pk, RegionView::Raw { .. })
+        {
+            return Err(StorageError::InvalidShard);
+        }
         // Validate Raw region sizes before the has_ghosts scan (which reads
         // count*8 bytes from the weight region and would panic on undersize).
         if let RegionView::Raw { size, .. } = &weight {
@@ -1358,5 +1368,63 @@ mod tests {
             let got = shard.find_lower_bound_bytes(key, &schema);
             assert_eq!(got, expected, "probe={key:?}");
         }
+    }
+
+    /// Defense-in-depth: a wide PK region (stride > 16) declaring
+    /// ENCODING_CONSTANT must be rejected at open time. A Constant region holds
+    /// only a `[u8; 16]` value, so `get_pk_bytes` would slice `&value[..24]`
+    /// out of bounds. The writer never emits this, so we forge it by patching
+    /// the PK directory entry's encoding byte on an otherwise-valid wide shard.
+    #[test]
+    fn wide_pk_constant_encoding_rejected() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+
+        // Two distinct wide PKs keep the PK region Raw.
+        let pks: [[u8; 24]; 2] = [
+            [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            [2,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        ];
+        let count = pks.len() as u32;
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|r| r.iter().copied()).collect();
+        let weights: Vec<i64> = vec![1; count as usize];
+        let null_bm: Vec<u64> = vec![0; count as usize];
+        let empty: Vec<u8> = Vec::new();
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_bytes.as_ptr(), pk_bytes.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
+            (empty.as_ptr(), 0),
+            (empty.as_ptr(), 0),
+            (empty.as_ptr(), 0),
+        ];
+        let image = super::super::shard_file::build_shard_image(0, count, &regions);
+        let path = dir.path().join("wide_const.db");
+        std::fs::write(&path, &image).unwrap();
+
+        // Sanity: unpatched shard opens fine with a Raw PK region.
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert!(MappedShard::open(&cpath, &schema, false).is_ok());
+
+        // Patch the PK directory entry (index 0) encoding byte to CONSTANT.
+        let mut data = std::fs::read(&path).unwrap();
+        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
+        data[dir_off + 24] = crate::layout::ENCODING_CONSTANT;
+        std::fs::write(&path, &data).unwrap();
+
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, false).err(),
+            Some(StorageError::InvalidShard),
+            "wide PK region declaring ENCODING_CONSTANT must be rejected",
+        );
     }
 }

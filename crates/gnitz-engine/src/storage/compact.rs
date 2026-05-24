@@ -76,10 +76,16 @@ impl ShardCursor {
         self.position = shard.next_non_ghost(self.position);
     }
 
+    /// Order-preserving sort key for the row at the cursor — the same key the
+    /// flush/merge/read paths use (`pk_sort_key`). Exact for narrow PKs; the
+    /// OPK 16-byte prefix for wide. Returning the raw `get_pk()` (as this did
+    /// before) mis-ordered narrow compound and signed PKs, whose raw-LE order
+    /// diverges from `compare_pk_bytes` — the order the input shards are
+    /// physically written in.
     #[inline]
-    fn peek_key(&self, shard: &MappedShard) -> u128 {
+    fn peek_key(&self, shard: &MappedShard, schema: &SchemaDescriptor) -> u128 {
         debug_assert!(self.is_valid());
-        shard.get_pk(self.position)
+        super::merge::pk_sort_key(schema, shard.get_pk_bytes(self.position))
     }
 }
 
@@ -124,44 +130,124 @@ fn open_and_merge(
         .map(|i| ShardCursor::new(&shards[i]))
         .collect();
 
+    // Select the comparator closure set once — never a per-comparison branch
+    // (mirrors `merge.rs`). Wide (`pk_stride > 16`) adds a `compare_pk_bytes`
+    // tiebreak on an OPK-prefix collision; the `schema_is_int_nonnull` split
+    // is the orthogonal payload-comparator fast path.
+    //
     // Wrap as a non-capturing closure: a direct fn-item reference would fix
     // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
     #[allow(clippy::redundant_closure)]
-    if columnar::schema_is_int_nonnull(schema) {
-        open_and_merge_inner(&shards, cursors, schema, emit,
+    if schema.pk_is_wide() {
+        if columnar::schema_is_int_nonnull(schema) {
+            open_and_merge_wide_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+        } else {
+            open_and_merge_wide_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        }
+    } else if columnar::schema_is_int_nonnull(schema) {
+        open_and_merge_narrow_with(&shards, cursors, schema, emit,
             |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
     } else {
-        open_and_merge_inner(&shards, cursors, schema, emit,
+        open_and_merge_narrow_with(&shards, cursors, schema, emit,
             |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
     }
     Ok(())
 }
 
-/// Inner cursor + tree merge body, monomorphised on the row comparator so
-/// LLVM can inline the fast/generic body across `LoserTree::build`'s
-/// initial bottom-up matches and the per-row advance loop alike.
+/// Narrow-region (`pk_stride <= 16`) closure builder. The heap key is the
+/// order-preserving `pk_sort_key`, which is injective at narrow stride, so
+/// `less` orders the PK axis with a raw `a.key.cmp(&b.key)` and tie-breaks on
+/// payload; `eq_payload` is payload-only (equal keys ⇒ equal PKs).
 #[inline]
-fn open_and_merge_inner<RowCmp>(
+fn open_and_merge_narrow_with<RowCmp>(
     shards: &[MappedShard],
-    mut cursors: Vec<ShardCursor>,
+    cursors: Vec<ShardCursor>,
     schema: &SchemaDescriptor,
-    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
+    emit: impl FnMut(u128, i64, &MappedShard, usize),
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
-    // by `advance` below.  `source_idx` doubles as the shard index here.
+    // by `advance`. `source_idx` doubles as the shard index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        if a.key != b.key { return a.key < b.key; }
-        row_cmp(schema, &shards[a.source_idx], a.row,
-                        &shards[b.source_idx], b.row) == std::cmp::Ordering::Less
+        match a.key.cmp(&b.key) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => row_cmp(schema, &shards[a.source_idx], a.row,
+                                                         &shards[b.source_idx], b.row)
+                == std::cmp::Ordering::Less,
+        }
     };
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        row_cmp(schema, &shards[a_src], a_row,
+                        &shards[b_src], b_row) == std::cmp::Ordering::Equal
+    };
+    open_and_merge_inner(shards, cursors, schema, emit, less, eq_payload);
+}
+
+/// Wide-region (`pk_stride > 16`) closure builder. `less` settles off the
+/// order-preserving 16-byte OPK prefix (`node.key`) and only pays a
+/// `compare_pk_bytes` column walk on a prefix collision; `eq_payload` adds the
+/// `compare_pk_bytes` term so distinct wide PKs sharing a prefix + payload are
+/// not folded into one summed group. Mirrors `merge.rs::merge_run_wide_with`.
+#[inline]
+fn open_and_merge_wide_with<RowCmp>(
+    shards: &[MappedShard],
+    cursors: Vec<ShardCursor>,
+    schema: &SchemaDescriptor,
+    emit: impl FnMut(u128, i64, &MappedShard, usize),
+    row_cmp: RowCmp,
+) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
+{
+    let less = |a: &HeapNode, b: &HeapNode| -> bool {
+        match a.key.cmp(&b.key) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => {
+                match columnar::compare_pk_bytes(schema, shards[a.source_idx].get_pk_bytes(a.row),
+                                                         shards[b.source_idx].get_pk_bytes(b.row)) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => row_cmp(schema, &shards[a.source_idx], a.row,
+                                                                 &shards[b.source_idx], b.row)
+                        == std::cmp::Ordering::Less,
+                }
+            }
+        }
+    };
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        columnar::compare_pk_bytes(schema, shards[a_src].get_pk_bytes(a_row),
+                                           shards[b_src].get_pk_bytes(b_row))
+            == std::cmp::Ordering::Equal
+        && row_cmp(schema, &shards[a_src], a_row,
+                           &shards[b_src], b_row) == std::cmp::Ordering::Equal
+    };
+    open_and_merge_inner(shards, cursors, schema, emit, less, eq_payload);
+}
+
+/// Inner cursor + tree merge body, monomorphised on the `less` / `eq_payload`
+/// closure set its caller selects per PK width so LLVM inlines a branch-free
+/// hot loop across `LoserTree::build` and the per-row advance loop alike.
+#[inline]
+fn open_and_merge_inner<L, EQ>(
+    shards: &[MappedShard],
+    mut cursors: Vec<ShardCursor>,
+    schema: &SchemaDescriptor,
+    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
+    less: L,
+    eq_payload: EQ,
+) where
+    L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+    EQ: Fn(usize, usize, usize, usize) -> bool,
+{
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| {
             if cursors[i].is_valid() {
-                Some((cursors[i].peek_key(&shards[i]), cursors[i].position))
+                Some((cursors[i].peek_key(&shards[i], schema), cursors[i].position))
             } else {
                 None
             }
@@ -174,15 +260,12 @@ fn open_and_merge_inner<RowCmp>(
         |src| {
             cursors[src].advance(&shards[src]);
             if cursors[src].is_valid() {
-                Some((cursors[src].peek_key(&shards[src]), cursors[src].position))
+                Some((cursors[src].peek_key(&shards[src], schema), cursors[src].position))
             } else {
                 None
             }
         },
-        |a_src, a_row, b_src, b_row| {
-            row_cmp(schema, &shards[a_src], a_row,
-                            &shards[b_src], b_row) == std::cmp::Ordering::Equal
-        },
+        eq_payload,
         |src, row| shards[src].get_weight(row),
         |group_src, group_row, group_key, w| {
             emit(group_key, w, &shards[group_src], group_row);
@@ -203,8 +286,13 @@ pub fn compact_shards(
 ) -> Result<(), StorageError> {
     let mut batch = Batch::with_schema(*schema, 1024);
     let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
-    open_and_merge(input_files, schema, |key, weight, shard, row| {
-        batch.append_row_from_source(key, weight, shard, row, blob_cache.get_mut());
+    // `_key` is the order-preserving sort key (no longer the raw PK); copy the
+    // PK from the source bytes so wide PKs are not truncated and narrow PKs are
+    // not written as their OPK encoding.
+    open_and_merge(input_files, schema, |_key, weight, shard, row| {
+        batch.append_row_from_source_bytes(
+            shard.get_pk_bytes(row), weight, shard, row, blob_cache.get_mut(),
+        );
     })?;
     batch.write_as_shard(output_file, table_id)
 }
@@ -236,9 +324,14 @@ pub fn merge_and_route(
         ))
         .collect();
 
+    // `key` is the order-preserving sort key — the guard-routing key (matching
+    // `l1_guard_keys`, now also OPK). The PK itself is copied from the source
+    // bytes so wide PKs are not truncated.
     open_and_merge(input_files, schema, |key, weight, shard, row| {
         let gi = find_guard_for_key(guard_keys, key);
-        batches[gi].append_row_from_source(key, weight, shard, row, blob_caches[gi].get_mut());
+        batches[gi].append_row_from_source_bytes(
+            shard.get_pk_bytes(row), weight, shard, row, blob_caches[gi].get_mut(),
+        );
     })?;
 
     // Validate all output paths fit in GuardResult.filename before writing anything.
@@ -1047,6 +1140,201 @@ mod tests {
         for &pk in &[50u64, 100, 150, 250] {
             assert!(shard.find_row_index(pk as u128).is_some(), "key {} not found in output shard", pk);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Wide / compound / signed PK compaction (OPK ordering) ---------------
+
+    /// Write a shard from explicit raw-PK-byte rows. `rows` is
+    /// `(pk_bytes, weight, payload_i64_vals)`; rows must already be in
+    /// `compare_pk_bytes` order (compaction assumes sorted inputs).
+    fn write_bytes_pk_shard(
+        path: &str,
+        schema: &SchemaDescriptor,
+        rows: &[(Vec<u8>, i64, Vec<i64>)],
+    ) {
+        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+        for (pk, w, vals) in rows {
+            batch.extend_pk_bytes(pk);
+            batch.extend_weight(&w.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            for (pi, v) in vals.iter().enumerate() {
+                batch.extend_col(pi, &v.to_le_bytes());
+            }
+            batch.count += 1;
+        }
+        let cpath = std::ffi::CString::new(path).unwrap();
+        batch.write_as_shard(&cpath, 0).unwrap();
+    }
+
+    fn assert_compare_pk_bytes_sorted(shard: &MappedShard, schema: &SchemaDescriptor) {
+        for i in 1..shard.count {
+            assert_ne!(
+                columnar::compare_pk_bytes(schema, shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
+                std::cmp::Ordering::Greater,
+                "merged shard not compare_pk_bytes-sorted at row {i}",
+            );
+        }
+    }
+
+    fn pk2(a: u64, b: u64) -> Vec<u8> {
+        let mut v = a.to_le_bytes().to_vec();
+        v.extend_from_slice(&b.to_le_bytes());
+        v
+    }
+
+    /// Regression: a narrow compound `(U64, U64)` PK whose raw-LE u128
+    /// order diverges from `compare_pk_bytes`. The input shards are physically
+    /// written in compound order; before the `peek_key → pk_sort_key` fix the
+    /// N-way merge compared raw-LE and produced mis-ordered output plus missed
+    /// cross-shard consolidation.
+    #[test]
+    fn test_compact_narrow_compound_opk_order() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_compound_opk");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // (U64, U64) PK + I64 payload.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_I64, 0),
+            ],
+            &[0, 1],
+        );
+        // Raw-LE u128 of these concatenations is scrambled vs compound order:
+        // (3,0)=3 < (2,3) < (1,5) < (1,9) — yet compound order is
+        // (1,5) < (1,9) < (2,3) < (3,0).
+        assert!(pk2(1, 5) < pk2(1, 9)); // byte-lex sanity for col0==1
+
+        // Shard 1 (compound-sorted): (1,5) v10, (2,3) v30 weight +1.
+        let s1 = dir.join("s1.db");
+        write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[
+            (pk2(1, 5), 1, vec![10]),
+            (pk2(2, 3), 1, vec![30]),
+        ]);
+        // Shard 2 (compound-sorted): (1,9) v20, (2,3) v30 weight -1, (3,0) v40.
+        let s2 = dir.join("s2.db");
+        write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[
+            (pk2(1, 9), 1, vec![20]),
+            (pk2(2, 3), -1, vec![30]),
+            (pk2(3, 0), 1, vec![40]),
+        ]);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
+        // (2,3) cancels (+1 -1 = 0). The cross-shard duplicate must fold, which
+        // requires the two (2,3) entries to be adjacent at the heap root.
+        assert_eq!(merged.count, 3, "expected 3 surviving rows (the (2,3) pair cancels)");
+        assert_compare_pk_bytes_sorted(&merged, &schema);
+
+        let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
+        assert_eq!(present, vec![pk2(1, 5), pk2(1, 9), pk2(3, 0)]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for a single narrow signed (`I64`) PK: negatives sort
+    /// last under raw-LE (zero-extended) but first under `compare_pk_bytes`.
+    #[test]
+    fn test_compact_narrow_signed_opk_order() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_signed_opk");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // I64 PK + I64 payload. Single signed column → not pk_is_fast.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_I64, 0),
+                SchemaColumn::new(TYPE_I64, 0),
+            ],
+            &[0],
+        );
+        let k = |v: i64| v.to_le_bytes().to_vec();
+
+        // Shard 1 (signed order): -5, 3.
+        let s1 = dir.join("s1.db");
+        write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[
+            (k(-5), 1, vec![1]),
+            (k(3), 1, vec![3]),
+        ]);
+        // Shard 2 (signed order): -2, 10.
+        let s2 = dir.join("s2.db");
+        write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[
+            (k(-2), 1, vec![2]),
+            (k(10), 1, vec![4]),
+        ]);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
+        assert_eq!(merged.count, 4);
+        assert_compare_pk_bytes_sorted(&merged, &schema);
+        let present: Vec<i64> = (0..merged.count)
+            .map(|i| i64::from_le_bytes(merged.get_pk_bytes(i).try_into().unwrap()))
+            .collect();
+        assert_eq!(present, vec![-5, -2, 3, 10], "must be signed-sorted, not raw-LE");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Wide (`pk_stride = 24`) prefix collision: two PKs share their
+    /// order-preserving 16-byte prefix (col0, col1) but differ in the trailing
+    /// column, with identical payloads. The `compare_pk_bytes` tiebreak in the
+    /// wide comparator must keep them as two distinct rows (no fold).
+    #[test]
+    fn test_compact_wide_prefix_collision_no_fold() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_wide_prefix");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // (U64, U64, U64) PK (stride 24) + U64 payload.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_U64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+        let pk3 = |a: u64, b: u64, c: u64| {
+            let mut v = a.to_le_bytes().to_vec();
+            v.extend_from_slice(&b.to_le_bytes());
+            v.extend_from_slice(&c.to_le_bytes());
+            v
+        };
+
+        // (1,1,100) and (1,1,200) share their first 16 bytes (col0,col1), differ
+        // in col2 — identical payloads. Separate shards, both weight +1.
+        let s1 = dir.join("s1.db");
+        write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[(pk3(1, 1, 100), 1, vec![7])]);
+        let s2 = dir.join("s2.db");
+        write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[(pk3(1, 1, 200), 1, vec![7])]);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
+        assert_eq!(merged.count, 2, "prefix-colliding distinct wide PKs must not fold");
+        assert_compare_pk_bytes_sorted(&merged, &schema);
+        let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
+        assert_eq!(present, vec![pk3(1, 1, 100), pk3(1, 1, 200)]);
 
         let _ = fs::remove_dir_all(&dir);
     }

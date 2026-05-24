@@ -213,6 +213,41 @@ impl PartitionedTable {
         (w, found)
     }
 
+    /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
+    pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
+        if self.tables.is_empty() {
+            return false;
+        }
+        if self.num_partitions == 1 {
+            return self.tables[0].has_pk_bytes(key);
+        }
+        match self.local_index_bytes(key) {
+            Some(local) => self.tables[local].has_pk_bytes(key),
+            None => false,
+        }
+    }
+
+    /// Byte-keyed sibling of [`retract_pk`] for wide PKs.
+    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
+        self.last_found_partition = None;
+        if self.tables.is_empty() {
+            return (0, false);
+        }
+        let local = if self.num_partitions == 1 {
+            0
+        } else {
+            match self.local_index_bytes(key) {
+                Some(l) => l,
+                None => return (0, false),
+            }
+        };
+        let (w, found) = self.tables[local].retract_pk_bytes(key);
+        if found {
+            self.last_found_partition = Some(local);
+        }
+        (w, found)
+    }
+
     // ------------------------------------------------------------------
     // Found-row accessors
     // ------------------------------------------------------------------
@@ -332,6 +367,18 @@ impl PartitionedTable {
 
     fn local_index(&self, key: u128) -> Option<usize> {
         let p = partition_for_key(key) as u32;
+        let local = p.wrapping_sub(self.part_offset) as usize;
+        if local < self.tables.len() {
+            Some(local)
+        } else {
+            None
+        }
+    }
+
+    /// Byte-keyed sibling of [`local_index`] for wide PKs. `partition_for_pk_bytes`
+    /// is bit-identical to `partition_for_key` for `len <= 16`.
+    fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
+        let p = partition_for_pk_bytes(key) as u32;
         let local = p.wrapping_sub(self.part_offset) as usize;
         if local < self.tables.len() {
             Some(local)

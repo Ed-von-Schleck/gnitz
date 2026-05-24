@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
-use crate::storage::{BlobCacheGuard, FlushWork};
+use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
 use crate::runtime::sal::{
     SAL_MMAP_SIZE, FLAG_EXCHANGE, FLAG_CHECKPOINT,
@@ -267,6 +267,28 @@ fn filter_by_pk(
             let pk = b.get_pk(i);
             if has_pk(pk) {
                 result.append_row_from_source(pk, 1, b, i, blob_cache.get_mut());
+            }
+        }
+    }
+    result
+}
+
+/// Byte-keyed sibling of [`filter_by_pk`] for wide (`pk_stride > 16`) PKs.
+/// The narrow version panics in both `get_pk` and `append_row_from_source`,
+/// so wide check-batches route here. `exists` receives the row's raw PK bytes.
+fn filter_by_pk_bytes(
+    batch: &Option<Batch>,
+    schema: SchemaDescriptor,
+    n: usize,
+    mut exists: impl FnMut(&[u8]) -> bool,
+) -> Batch {
+    let mut result = Batch::with_schema(schema, n);
+    if let Some(ref b) = batch {
+        let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
+        for i in 0..n {
+            let pkb = b.get_pk_bytes(i);
+            if exists(pkb) {
+                result.append_row_from_source_bytes(pkb, 1, b, i, blob_cache.get_mut());
             }
         }
     }
@@ -754,11 +776,27 @@ impl WorkerProcess {
                 // (scatter preserves per-worker order), aiding the cursor.
                 let project: Vec<u8> =
                     crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
-                let pks: Vec<u128> = match &batch {
-                    Some(b) => (0..b.count).map(|i| b.get_pk(i)).collect(),
-                    None => Vec::new(),
+                // Wide (`pk_stride > 16`) PK batches can't be projected to a
+                // `u128` key list — `get_pk` panics — so route them through the
+                // byte sibling `gather_family_bytes` with a `&[PkBuf]` key list.
+                let wide = batch.as_ref()
+                    .and_then(|b| b.schema)
+                    .map(|s| s.pk_is_wide())
+                    .unwrap_or(false);
+                let gathered = if wide {
+                    let pks: Vec<PkBuf> = match &batch {
+                        Some(b) => (0..b.count).map(|i| PkBuf::from_bytes(b.get_pk_bytes(i))).collect(),
+                        None => Vec::new(),
+                    };
+                    self.cat().gather_family_bytes(target_id, &pks, &project)
+                } else {
+                    let pks: Vec<u128> = match &batch {
+                        Some(b) => (0..b.count).map(|i| b.get_pk(i)).collect(),
+                        None => Vec::new(),
+                    };
+                    self.cat().gather_family(target_id, &pks, &project)
                 };
-                match self.cat().gather_family(target_id, &pks, &project) {
+                match gathered {
                     Ok(result) => {
                         let schema = result.schema;
                         self.send_response(
@@ -1116,19 +1154,36 @@ impl WorkerProcess {
                 let src_col_size = owner_schema.columns[col_idx as usize].size() as usize;
                 let table = unsafe { &*index_handle };
                 let mut cursor = table.open_cursor();
-                let result = filter_by_pk(&batch, schema, n, |pk_u128| {
-                    let key_bytes = pk_u128.to_le_bytes();
-                    cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..src_col_size])
-                });
+                // The check batch's PK is the index composite
+                // `(indexed-value, src_pk_cols)`, which can itself be wide.
+                // Either way the indexed prefix is the leading `src_col_size`
+                // bytes of the PK; route wide composites through the byte path
+                // (the narrow `get_pk` would panic for a wide composite).
+                let result = if schema.pk_is_wide() {
+                    filter_by_pk_bytes(&batch, schema, n, |pkb| {
+                        cursor.cursor.seek_first_positive_with_prefix(&pkb[..src_col_size])
+                    })
+                } else {
+                    filter_by_pk(&batch, schema, n, |pk_u128| {
+                        let key_bytes = pk_u128.to_le_bytes();
+                        cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..src_col_size])
+                    })
+                };
                 (schema, result)
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self.cat().get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={}", target_id))?;
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
-                let result = filter_by_pk(&batch, schema, n, |pk| {
-                    ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(pk))
-                });
+                let result = if schema.pk_is_wide() {
+                    filter_by_pk_bytes(&batch, schema, n, |pkb| {
+                        ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
+                    })
+                } else {
+                    filter_by_pk(&batch, schema, n, |pk| {
+                        ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(pk))
+                    })
+                };
                 (schema, result)
             }
         };

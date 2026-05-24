@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Table, PartitionedTable, StorageError};
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PkBuf, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
 
@@ -1325,6 +1325,9 @@ impl DagEngine {
         if batch.count == 0 {
             return batch;
         }
+        if schema.pk_is_wide() {
+            return self.enforce_unique_pk_wide(table, schema, batch);
+        }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
         // pk → batch row index of the last +1 insertion in this batch.
@@ -1360,6 +1363,37 @@ impl DagEngine {
         effective
     }
 
+    /// Wide-PK (`pk_stride > 16`) variant of [`enforce_unique_pk`]. Keys the
+    /// dedup map on `PkBuf` (probed zero-copy via `Borrow<[u8]>`) and retracts
+    /// via `retract_pk_bytes`, since a wide PK cannot be packed into a `u128`.
+    fn enforce_unique_pk_wide(
+        &self,
+        table: &mut Table,
+        schema: &SchemaDescriptor,
+        batch: Batch,
+    ) -> Batch {
+        let mut effective = Batch::with_schema(*schema, batch.count * 2);
+        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
+
+        for row in 0..batch.count {
+            let w = batch.get_weight(row);
+            let pkb = batch.get_pk_bytes(row);
+
+            if w > 0 {
+                let (_existing_w, _found) = table.retract_pk_bytes(pkb);
+                if let Some(&prev_pos) = seen.get(pkb) {
+                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                }
+                effective.append_batch(&batch, row, row + 1);
+                seen.insert(PkBuf::from_bytes(pkb), row);
+            } else if w < 0 {
+                effective.append_batch(&batch, row, row + 1);
+            }
+        }
+
+        effective
+    }
+
     /// Enforce unique PK for PartitionedTable (user base tables).
     ///
     /// Unlike `enforce_unique_pk` for Single stores, this version propagates
@@ -1373,6 +1407,9 @@ impl DagEngine {
     ) -> Batch {
         if batch.count == 0 {
             return batch;
+        }
+        if schema.pk_is_wide() {
+            return self.enforce_unique_pk_partitioned_wide(ptable, schema, batch);
         }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
@@ -1427,6 +1464,56 @@ impl DagEngine {
                     seen.remove(&pk);
                 } else if !found {
                     // Not in store and not in batch — pass through as-is
+                    effective.append_batch(&batch, row, row + 1);
+                }
+            }
+        }
+
+        effective
+    }
+
+    /// Wide-PK (`pk_stride > 16`) variant of [`enforce_unique_pk_partitioned`].
+    /// Keys the dedup map and store-retracted set on `PkBuf` (probed zero-copy
+    /// via `Borrow<[u8]>`) and retracts via `retract_pk_bytes`.
+    fn enforce_unique_pk_partitioned_wide(
+        &self,
+        ptable: &mut PartitionedTable,
+        schema: &SchemaDescriptor,
+        batch: Batch,
+    ) -> Batch {
+        let mut effective = Batch::with_schema(*schema, batch.count * 2);
+        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
+        let mut store_retracted: HashSet<PkBuf> = HashSet::with_capacity(batch.count);
+
+        for row in 0..batch.count {
+            let w = batch.get_weight(row);
+            let pkb = batch.get_pk_bytes(row);
+
+            if w > 0 {
+                let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
+                if found && !store_retracted.contains(pkb) {
+                    effective.append_row_from_ptable_found(ptable, pkb, -1);
+                    store_retracted.insert(PkBuf::from_bytes(pkb));
+                }
+
+                if let Some(&prev_pos) = seen.get(pkb) {
+                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                }
+
+                effective.append_batch(&batch, row, row + 1);
+                seen.insert(PkBuf::from_bytes(pkb), row);
+            } else if w < 0 {
+                let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
+                let store_hit = found && !store_retracted.contains(pkb);
+                if store_hit {
+                    effective.append_row_from_ptable_found(ptable, pkb, -1);
+                    store_retracted.insert(PkBuf::from_bytes(pkb));
+                }
+
+                if let Some(&prev_pos) = seen.get(pkb) {
+                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                    seen.remove(pkb);
+                } else if !found {
                     effective.append_batch(&batch, row, row + 1);
                 }
             }

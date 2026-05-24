@@ -528,8 +528,10 @@ fn test_fk_references_compound_pk_rejected() {
     let err = must_err(p.execute(
         "CREATE TABLE fk_child (cid BIGINT PRIMARY KEY, ref_a BIGINT UNSIGNED REFERENCES fk_parent(a))"
     ));
+    // A compound-PK parent has no lone PK column, so a member column qualifies
+    // as an FK target only via its own UNIQUE index; column 'a' has none.
     match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("UNIQUE index"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
     }
 }

@@ -357,6 +357,32 @@ impl CatalogEngine {
         Ok(out)
     }
 
+    /// Byte-keyed sibling of [`gather_family`] for wide (`pk_stride > 16`) PKs.
+    /// Reuses one cursor and matches `seek_family_bytes`'s confirm sequence
+    /// (`seek_bytes` → `current_pk_bytes() == key` → `current_weight > 0`).
+    pub fn gather_family_bytes(
+        &mut self,
+        table_id: i64,
+        pks: &[crate::storage::PkBuf],
+        project: &[u8],
+    ) -> Result<Batch, String> {
+        let schema = self.dag.tables.get(&table_id)
+            .map(|e| e.schema)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+        let result_schema = project_schema(&schema, project);
+        let mut out = Batch::with_schema(result_schema, pks.len());
+        let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
+        for pk in pks {
+            let bytes = pk.pk_bytes();
+            cursor.cursor.seek_bytes(bytes);
+            if !cursor.cursor.valid { continue; }
+            if cursor.cursor.current_pk_bytes() != bytes { continue; }
+            if cursor.cursor.current_weight <= 0 { continue; }
+            copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
+        }
+        Ok(out)
+    }
+
     /// Index-assisted lookup: prefix-scan the index by the leading indexed
     /// column value, reconstruct the source PK from the index PK suffix,
     /// and resolve to the source row.
@@ -377,9 +403,6 @@ impl CatalogEngine {
             .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
 
         let src_pk_stride = entry.schema.pk_stride() as usize;
-        if src_pk_stride > 16 {
-            return Err("wide-PK source not yet supported in seek_by_index".to_string());
-        }
         let idx_key_size = ic.index_schema.columns[0].size() as usize;
 
         let idx_table = ic.table_mut();
@@ -392,13 +415,16 @@ impl CatalogEngine {
         // weight, no source row) would spin.
         let mut hit = cursor.cursor.seek_first_positive_with_prefix(prefix);
         while hit {
+            // Copy the source PK out of the index PK suffix into a fixed buffer
+            // before the `&mut self` resolve below releases the cursor borrow.
+            // Widened to MAX_PK_BYTES so wide (`src_pk_stride > 16`) sources
+            // resolve via `seek_family_bytes`.
             let current_pk = cursor.cursor.current_pk_bytes();
-            let mut src_pk_buf = [0u8; 16];
+            let mut src_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
             src_pk_buf[..src_pk_stride].copy_from_slice(
                 &current_pk[idx_key_size..idx_key_size + src_pk_stride],
             );
-            let src_pk = u128::from_le_bytes(src_pk_buf);
-            if let Some(batch) = self.seek_family(table_id, src_pk)? {
+            if let Some(batch) = self.seek_family_bytes(table_id, &src_pk_buf[..src_pk_stride])? {
                 return Ok(Some(batch));
             }
             cursor.cursor.advance();
