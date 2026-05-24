@@ -270,8 +270,21 @@ impl CatalogEngine {
             if !ic.is_unique { continue; }
             let source_col_idx = ic.col_idx as usize;
             let col_type = schema.columns[source_col_idx].type_code;
-            let payload_col = schema.payload_idx(source_col_idx);
             let col_size = schema.columns[source_col_idx].size() as usize;
+            // A unique index may be on a PK column (e.g. a single member of a
+            // compound PK). Then the value lives in the packed PK, not a payload
+            // column — payload_idx/col_data would panic, and a compound PK must
+            // be sliced to the indexed column.
+            let is_pk_col = schema.is_pk_col(source_col_idx);
+            let pk_is_compound = schema.pk_indices().len() > 1;
+            let pk_field_off = if is_pk_col {
+                schema.pk_byte_offset(source_col_idx) as usize
+            } else { 0 };
+            let payload_col = if is_pk_col {
+                usize::MAX
+            } else {
+                schema.payload_idx(source_col_idx)
+            };
 
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
             let prefix_len = col_size.min(idx_key_size);
@@ -285,8 +298,11 @@ impl CatalogEngine {
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
 
-                let null_word = batch.get_null_word(row);
-                if null_word & (1u64 << payload_col) != 0 { continue; }
+                // PK columns are non-nullable; only payload columns can be NULL.
+                if !is_pk_col {
+                    let null_word = batch.get_null_word(row);
+                    if null_word & (1u64 << payload_col) != 0 { continue; }
+                }
 
                 // UPSERT iff the row's PK already has a live base-table row.
                 let is_upsert = if !entry.unique_pk {
@@ -302,8 +318,17 @@ impl CatalogEngine {
                     entry.handle.has_pk(batch.get_pk(row))
                 };
 
-                let col_data = batch.col_data(payload_col);
-                let key_u128 = promote_to_index_key(col_data, row * col_size, col_size, col_type);
+                let key_u128 = if is_pk_col {
+                    if pk_is_compound {
+                        promote_to_index_key(
+                            batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
+                    } else {
+                        batch.get_pk(row)
+                    }
+                } else {
+                    let col_data = batch.col_data(payload_col);
+                    promote_to_index_key(col_data, row * col_size, col_size, col_type)
+                };
 
                 if !seen.insert(key_u128) {
                     let col_names = self.get_column_names(table_id);

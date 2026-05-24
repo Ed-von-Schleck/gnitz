@@ -652,6 +652,9 @@ impl Batch {
     /// use `empty_with_schema`, `empty_joined`, or `with_schema`.
     #[inline]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
+        debug_assert_eq!(src.len(), self.strides[r] as usize,
+            "extend_region: src len {} != stride {} for region {}",
+            src.len(), self.strides[r], r);
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }

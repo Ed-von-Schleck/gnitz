@@ -803,6 +803,34 @@ class TestIndexIntegrity:
                       indices=[f"{sn}__t__idx_a", f"{sn}__t__idx_b"],
                       tables=["t"])
 
+    def test_unique_upsert_intra_batch_duplicate_new_value(self, client):
+        """Two UPSERT rows (both existing PKs) set the same NEW unique value in
+        one batch. The new value is absent from committed storage, so the
+        per-row holder seek never fires; only the in-batch duplicate check can
+        catch it. Must raise — otherwise the unique index is silently corrupted
+        with two rows holding the same value."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # Both pk=1 and pk=2 already exist; both UPSERT to val=99,
+                # which is not present in storage.
+                client.execute_sql(
+                    "INSERT INTO t VALUES (1, 99), (2, 99) "
+                    "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+                    schema_name=sn,
+                )
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # TestIndexReadBarrier

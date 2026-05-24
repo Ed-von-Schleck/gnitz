@@ -247,6 +247,7 @@ where
 /// Returns `worker_indices[w]` = row indices from `batch` destined for worker `w`.
 /// Use `with_worker_indices` instead when the caller can borrow the routing table
 /// for the duration of the scatter.
+#[cfg(test)]
 pub fn compute_worker_indices(
     batch: &Batch,
     col_indices: &[u32],

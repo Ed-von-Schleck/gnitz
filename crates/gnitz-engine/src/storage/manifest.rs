@@ -73,6 +73,32 @@ pub struct PkBuf {
     pub len: u8,
 }
 
+// Manual Eq/Hash compare and hash only bytes[..len], so a HashSet<PkBuf>
+// touches pk_stride bytes per key rather than the full 80-byte array.
+impl PartialEq for PkBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.bytes[..self.len as usize] == other.bytes[..other.len as usize]
+    }
+}
+impl Eq for PkBuf {}
+
+impl std::hash::Hash for PkBuf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes[..self.len as usize].hash(state);
+    }
+}
+
+// Enables zero-allocation heterogeneous lookup: a raw &[u8] slice can be
+// passed to HashSet<PkBuf>::contains / HashMap<PkBuf, _>::get without
+// constructing a PkBuf. The Hash impl above hashes bytes[..len], matching
+// <[u8] as Hash>, as the Borrow contract requires.
+impl std::borrow::Borrow<[u8]> for PkBuf {
+    fn borrow(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 impl PkBuf {
     /// All-zero `bytes`, `len = stride`. The zero-row / placeholder /
     /// empty-shard form.
@@ -223,7 +249,10 @@ pub fn parse(
         return Err(StorageError::InvalidVersion);
     }
 
-    let expected_data = HEADER_SIZE + count * ENTRY_SIZE_V4;
+    let body = count.checked_mul(ENTRY_SIZE_V4)
+        .ok_or(StorageError::Truncated)?;
+    let expected_data = HEADER_SIZE.checked_add(body)
+        .ok_or(StorageError::Truncated)?;
     if buf.len() < expected_data {
         return Err(StorageError::Truncated);
     }
@@ -433,6 +462,61 @@ mod tests {
             got.bytes[got.len as usize..].iter().all(|&b| b == 0),
             "PkBuf tail must be zero",
         );
+    }
+
+    #[test]
+    fn pkbuf_eq_hash_compare_only_len_window() {
+        use std::collections::HashSet;
+        // Same meaningful bytes, different tail → equal and same hash.
+        let mut a = PkBuf::from_bytes(&7u64.to_le_bytes());
+        let b = PkBuf::from_bytes(&7u64.to_le_bytes());
+        a.bytes[8] = 0xAB; // tail garbage past len; eq/hash must ignore it
+        assert!(a == b);
+        let mut set: HashSet<PkBuf> = HashSet::new();
+        set.insert(b);
+        assert!(set.contains(&a), "tail bytes must not affect membership");
+    }
+
+    #[test]
+    fn pkbuf_borrow_heterogeneous_lookup() {
+        use std::collections::HashSet;
+        let mut set: HashSet<PkBuf> = HashSet::new();
+        set.insert(PkBuf::from_bytes(&123u64.to_le_bytes()));
+        // Raw &[u8] lookup via Borrow<[u8]> — no PkBuf construction.
+        assert!(set.contains(&123u64.to_le_bytes()[..]));
+        assert!(!set.contains(&124u64.to_le_bytes()[..]));
+    }
+
+    #[test]
+    fn pkbuf_wide_differs_past_byte_16() {
+        // Two 24-byte keys identical in the first 16 bytes but differing in the
+        // last 8 must be distinct — the failure mode of any u128-truncating key.
+        let mut x = Vec::new();
+        x.extend_from_slice(&1u64.to_le_bytes());
+        x.extend_from_slice(&2u64.to_le_bytes());
+        x.extend_from_slice(&3u64.to_le_bytes());
+        let mut y = x.clone();
+        y[16..24].copy_from_slice(&999u64.to_le_bytes());
+        let px = PkBuf::from_bytes(&x);
+        let py = PkBuf::from_bytes(&y);
+        assert!(px != py);
+        let mut set = std::collections::HashSet::new();
+        set.insert(px);
+        assert!(!set.contains(&py));
+    }
+
+    #[test]
+    fn parse_rejects_count_overflow() {
+        // A corrupt header whose count * ENTRY_SIZE_V4 overflows usize must be
+        // rejected, not wrap past the length check.
+        let mut buf = vec![0u8; HEADER_SIZE];
+        write_u64_le(&mut buf, 0, MAGIC);
+        write_u64_le(&mut buf, 8, VERSION_V4);
+        write_u64_le(&mut buf, 16, u64::MAX); // count
+        let mut out = [ManifestEntryRaw::zeroed(); 1];
+        let mut max_lsn = 0u64;
+        let r = parse(&buf, &mut out, 1, &mut max_lsn);
+        assert!(matches!(r, Err(StorageError::Truncated)));
     }
 
     fn make_entry(id: u64, name: &str) -> ManifestEntryRaw {

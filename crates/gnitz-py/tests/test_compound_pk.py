@@ -264,6 +264,50 @@ def test_index_on_compound_pk_narrow_source_via_sql(client):
         _cleanup(client, sn, "src")
 
 
+def test_unique_index_on_compound_pk_column(client):
+    """UNIQUE INDEX on a single column of a compound PK. Two rows share that
+    column's value but differ in the rest of the PK (so they are distinct PKs,
+    a legal compound-key insert) — yet they violate UNIQUE on the indexed
+    column. Pre-fix the validation keyed on the whole packed (a, b) key, so the
+    duplicate `a` was silently accepted."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON src (a)", schema_name=sn)
+        # (1,1) and (1,2): distinct PKs, same a=1 → UNIQUE(a) violation.
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql(
+                "INSERT INTO src (a, b) VALUES (1, 1), (1, 2)", schema_name=sn,
+            )
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_unique_index_on_compound_pk_column_distinct_ok(client):
+    """Counterpart to the violation test: distinct values on the indexed PK
+    column must ingest cleanly (no false positive from the byte-slice key)."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON src (a)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO src (a, b) VALUES (1, 1), (2, 1), (3, 9)", schema_name=sn,
+        )
+        tid, _ = client.resolve_table(sn, "src")
+        rows = sorted((row.a, row.b) for row in client.scan(tid) if row.weight > 0)
+        assert rows == [(1, 1), (2, 1), (3, 9)]
+    finally:
+        _cleanup(client, sn, "src")
+
+
 def test_fk_references_compound_pk_rejected(client):
     """A FK targeting a non-UNIQUE column of a compound-PK parent is rejected:
     a compound PK has no lone PK column, so the column qualifies only via its

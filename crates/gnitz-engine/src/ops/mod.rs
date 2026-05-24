@@ -13,9 +13,13 @@ mod bench_secondary_index;
 pub use distinct::op_distinct;
 pub use exchange::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    compute_worker_indices, with_worker_indices,
+    with_worker_indices,
     worker_for_partition,
 };
+// Only the test harness routes via the eager (cloning) variant now; the
+// production scatter paths all borrow via `with_worker_indices`.
+#[cfg(test)]
+pub use exchange::compute_worker_indices;
 pub use index::{AviDesc, GiDesc, op_integrate_with_indexes};
 pub use join::{
     op_anti_join_delta_delta, op_anti_join_delta_trace, op_join_delta_delta,

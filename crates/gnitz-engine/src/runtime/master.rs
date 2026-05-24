@@ -3,10 +3,9 @@
 //! W2M regions. Eventfds provide cross-process signaling.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 thread_local! {
     /// Pooled aggregation map for PK net-weight + positive-count tracking,
@@ -28,10 +27,10 @@ use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
-use crate::storage::{Batch, ConsolidatedBatch, partition_for_key};
+use crate::storage::{Batch, ConsolidatedBatch, partition_for_key, PkBuf};
 use crate::ops::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    worker_for_partition, compute_worker_indices, with_worker_indices,
+    worker_for_partition, with_worker_indices,
 };
 
 
@@ -45,9 +44,11 @@ enum CheckPayload {
     /// Replicate the same batch to every worker; each worker filters
     /// its local partition.
     Broadcast(Batch),
-    /// Pre-partitioned: source batch + per-worker row indices, delivered via
-    /// `scatter_wire_group` without materializing intermediate per-worker `Batch`es.
-    ScatterSource { source: Batch, worker_indices: Vec<Vec<u32>> },
+    /// Pre-partitioned by the schema PK: source batch delivered via
+    /// `scatter_wire_group` without materializing intermediate per-worker
+    /// `Batch`es. `execute_pipeline_async` computes the per-worker routing
+    /// itself from `check.schema.pk_indices()` via `with_worker_indices`.
+    ScatterSource { source: Batch },
 }
 
 /// A single distributed has-pk check queued for pipelined execution.
@@ -84,7 +85,12 @@ enum P2Label {
     Upsert {
         col_idx: u32,
         source_col: usize,
-        upsert_keys: Vec<(u128, u128)>,
+        /// Byte width of the index table's PK (the indexed column). Used to
+        /// look up the u128 index key in the `HashSet<PkBuf>` result set.
+        idx_pk_stride: u8,
+        /// (index-column key, row PK). The index column is always ≤ 16
+        /// bytes (→ `u128`); the row PK is byte-form to support wide PKs.
+        upsert_keys: Vec<(u128, PkBuf)>,
     },
     /// UPDATE retired a referenced UNIQUE value that is still present in a
     /// child index: a non-empty result set is a RESTRICT violation.
@@ -127,23 +133,29 @@ enum P2Label {
 const UNIQUE_FILTER_CAP: usize = 1_000_000;
 
 struct UniqueFilter {
-    values: HashSet<u128>,
+    values: FxHashSet<u128>,
     /// True once the filter has exceeded `UNIQUE_FILTER_CAP`. In that
     /// state `values` is cleared and the filter always reports
     /// "possibly present" (falls through to broadcast).
     capped: bool,
+    /// False until the warmup scan has fully populated `values`. While
+    /// false the filter still accepts ingestion (so keys committed during
+    /// the scan window are not lost) but `unique_filter_all_absent`
+    /// refuses the broadcast-skip shortcut — an empty/partial filter must
+    /// never be trusted to prove absence.
+    warm: bool,
 }
 
 impl UniqueFilter {
     fn new() -> Self {
-        UniqueFilter { values: HashSet::new(), capped: false }
+        UniqueFilter { values: FxHashSet::default(), capped: false, warm: false }
     }
 
     fn insert(&mut self, key: u128) {
         if self.capped { return; }
         self.values.insert(key);
         if self.values.len() > UNIQUE_FILTER_CAP {
-            self.values = HashSet::new();
+            self.values = FxHashSet::default();
             self.capped = true;
         }
     }
@@ -160,6 +172,13 @@ struct UniqueIndexDesc {
     /// `usize::MAX` when `is_pk_col` (value is read from batch PK).
     src_payload_idx: usize,
     col_size: usize,
+    /// Byte offset of this column within the packed PK region. Only
+    /// meaningful when `is_pk_col`.
+    pk_field_off: usize,
+    /// True iff the table's PK spans more than one column. When true, a
+    /// PK-column index value must be sliced out of the packed key rather
+    /// than read as the whole PK.
+    pk_is_compound: bool,
 }
 
 /// Walk every positive-weight, non-null row of `batch` and insert the
@@ -181,7 +200,14 @@ fn extract_into_filter(
             if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
         }
         let key = if d.is_pk_col {
-            batch.get_pk(i)
+            if d.pk_is_compound {
+                // Slice the single indexed column out of the packed PK;
+                // get_pk would hand back the whole compound key.
+                promote_to_index_key(
+                    batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
+            } else {
+                batch.get_pk(i) // single-column PK IS the index key
+            }
         } else {
             let col_data = batch.col_data(d.src_payload_idx, d.col_size);
             promote_to_index_key(col_data, i * d.col_size, d.col_size, d.type_code)
@@ -814,7 +840,7 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         checks: &mut [PipelinedCheck],
-    ) -> Result<Vec<HashSet<u128>>, String> {
+    ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
         let num_checks = checks.len();
         if num_checks == 0 {
             return Ok(Vec::new());
@@ -841,12 +867,19 @@ impl MasterDispatcher {
                                 req_slice, -1, 0, None,
                             )?;
                         }
-                        CheckPayload::ScatterSource { source, worker_indices } => {
-                            disp.sal.scatter_wire_group(
-                                source, worker_indices, &check.schema, None,
-                                check.target_id as u32, lsn, check.flags, 0,
-                                0, check.col_hint, req_slice, -1, None, None,
-                            )?;
+                        CheckPayload::ScatterSource { source } => {
+                            // Routing is always by the schema PK; compute the
+                            // per-worker indices on the fly. No reentrancy: this
+                            // loop body has no `.await`, so the SCATTER_INDICES
+                            // borrow is released before the next iteration.
+                            let pk_cols = check.schema.pk_indices();
+                            with_worker_indices(source, pk_cols, &check.schema, nw, |worker_indices| {
+                                disp.sal.scatter_wire_group(
+                                    source, worker_indices, &check.schema, None,
+                                    check.target_id as u32, lsn, check.flags, 0,
+                                    0, check.col_hint, req_slice, -1, None, None,
+                                )
+                            })?;
                         }
                     }
                 }
@@ -859,12 +892,12 @@ impl MasterDispatcher {
             all_req_ids.iter().map(|&id| reactor.await_reply(id))
         ).await;
 
-        let mut results: Vec<HashSet<u128>> = checks.iter().map(|check| {
+        let mut results: Vec<FxHashSet<PkBuf>> = checks.iter().map(|check| {
             let cap = match &check.payload {
                 CheckPayload::Broadcast(b) => b.count,
-                CheckPayload::ScatterSource { source, .. } => source.count,
+                CheckPayload::ScatterSource { source } => source.count,
             };
-            HashSet::with_capacity(cap)
+            FxHashSet::with_capacity_and_hasher(cap, Default::default())
         }).collect();
 
         if let Some(err) = first_worker_error("pipeline", &decoded_vec) {
@@ -876,7 +909,7 @@ impl MasterDispatcher {
                 if let Some(ref batch) = decoded.data_batch {
                     for j in 0..batch.count {
                         if batch.get_weight(j) == 1 {
-                            results[check_idx].insert(batch.get_pk(j));
+                            results[check_idx].insert(PkBuf::from_bytes(batch.get_pk_bytes(j)));
                         }
                     }
                 }
@@ -910,9 +943,9 @@ impl MasterDispatcher {
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
-        mut pks: Vec<u128>,
+        mut pks: Vec<PkBuf>,
         project: &[u8],
-    ) -> Result<FxHashMap<u128, Vec<Option<u128>>>, String> {
+    ) -> Result<FxHashMap<PkBuf, Vec<Option<u128>>>, String> {
         if pks.is_empty() {
             return Ok(FxHashMap::default());
         }
@@ -920,7 +953,7 @@ impl MasterDispatcher {
         // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
         // order) and `scatter_wire_group` preserves per-worker relative order,
         // so a globally sorted input yields per-worker-sorted sublists.
-        pks.sort_unstable();
+        pks.sort_unstable_by(|a, b| a.pk_bytes().cmp(b.pk_bytes()));
         let col_mask = pack_gather_cols(project)
             .ok_or("gather: more than 8 projected columns")?;
 
@@ -936,18 +969,18 @@ impl MasterDispatcher {
                 let nw = disp.num_workers;
                 let pk_cols = parent_schema.pk_indices();
                 let pooled = disp.pool_pop_batch(target_id);
-                let batch = build_check_batch(&parent_schema, &pks, pooled);
-                let worker_indices =
-                    compute_worker_indices(&batch, pk_cols, &parent_schema, nw);
+                let batch = build_check_batch_pkbuf(&parent_schema, &pks, pooled);
                 let rids: Vec<u64> =
                     (0..nw).map(|_| reactor.alloc_request_id()).collect();
                 let lsn = disp.next_lsn();
-                disp.sal.scatter_wire_group(
-                    &batch, &worker_indices, &parent_schema, None,
-                    target_id as u32, lsn, FLAG_GATHER,
-                    /* wire_flags */ 0, /* seek_pk */ 0, /* seek_col_idx */ col_mask,
-                    &rids, /* unicast_worker */ -1, None, None,
-                )?;
+                with_worker_indices(&batch, pk_cols, &parent_schema, nw, |worker_indices| {
+                    disp.sal.scatter_wire_group(
+                        &batch, worker_indices, &parent_schema, None,
+                        target_id as u32, lsn, FLAG_GATHER,
+                        /* wire_flags */ 0, /* seek_pk */ 0, /* seek_col_idx */ col_mask,
+                        &rids, /* unicast_worker */ -1, None, None,
+                    )
+                })?;
                 disp.signal_all();
                 // The scatter batch is fully consumed by the synchronous
                 // scatter_wire_group above; return it to the pool.
@@ -970,7 +1003,7 @@ impl MasterDispatcher {
             (col.type_code, col.size() as usize)
         }).collect();
 
-        let mut out: FxHashMap<u128, Vec<Option<u128>>> = FxHashMap::default();
+        let mut out: FxHashMap<PkBuf, Vec<Option<u128>>> = FxHashMap::default();
         for d in &decoded {
             if let Some(ref b) = d.data_batch {
                 for j in 0..b.count {
@@ -985,7 +1018,7 @@ impl MasterDispatcher {
                                 col_data, j * col_size, col_size, col_type)));
                         }
                     }
-                    out.insert(b.get_pk(j), vals);
+                    out.insert(PkBuf::from_bytes(b.get_pk_bytes(j)), vals);
                 }
             }
         }
@@ -1093,8 +1126,13 @@ impl MasterDispatcher {
                     schema.payload_idx(source_col)
                 };
                 let col_size = schema.columns[source_col].size() as usize;
+                let pk_is_compound = schema.pk_indices().len() > 1;
+                let pk_field_off = if is_pk_col {
+                    schema.pk_byte_offset(source_col) as usize
+                } else { 0 };
                 out.push(UniqueIndexDesc {
                     col_idx, type_code, is_pk_col, src_payload_idx, col_size,
+                    pk_field_off, pk_is_compound,
                 });
             }
         }
@@ -1112,7 +1150,7 @@ impl MasterDispatcher {
             Some(f) => f,
             None => return false,
         };
-        if filter.capped {
+        if !filter.warm || filter.capped {
             return false;
         }
         keys.iter().all(|k| !filter.values.contains(k))
@@ -1174,7 +1212,7 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, batch: &Batch, mode: WireConflictMode,
     ) -> Result<(), String> {
-        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, num_workers) = unsafe {
+        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = unsafe {
             let disp = &mut *disp_ptr;
             let cat = &mut *disp.catalog;
             let n_fk = cat.get_fk_count(target_id);
@@ -1185,7 +1223,7 @@ impl MasterDispatcher {
             let source_schema = cat.get_schema_desc(target_id)
                 .ok_or_else(|| format!(
                     "validate_all_distributed: no schema for table {}", target_id))?;
-            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema, disp.num_workers)
+            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
         };
 
         let needs_pk_rejection = matches!(mode, WireConflictMode::Error) && unique_pk;
@@ -1194,42 +1232,75 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        // Build PK aggregation using pooled map; release borrow before any `.await`.
-        let pk_lo_hi: Option<Vec<u128>> = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
-            let mut m = cell.borrow_mut();
-            m.clear();
-            if !(has_unique || needs_pk_rejection) {
-                return Ok(None);
-            }
-            m.reserve(batch.count);
-            for i in 0..batch.count {
-                let w = batch.get_weight(i);
-                if w == 0 { continue; }
-                let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
-                entry.0 += w;
-                if w > 0 { entry.1 += 1; }
-            }
-            if needs_pk_rejection {
-                for (&pk, &(_, pos_count)) in m.iter() {
-                    if pos_count > 1 {
-                        let (pk_names, sn, tn) = unsafe {
-                            (*disp_ptr).pk_violation_context(target_id, &source_schema)
-                        };
-                        let key_str = format_pk_value(pk, &source_schema);
-                        return Err(format!(
-                            "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
-                            sn, tn, pk_names, key_str,
-                        ));
+        // Wide PKs (pk_stride > 16) cannot pack into a u128 word; their
+        // aggregation/identification paths key on byte-form `PkBuf` instead.
+        // Narrow paths stay verbatim on u128 to avoid the per-row PkBuf init
+        // cost on the common (large-INSERT) path.
+        let wide = source_schema.pk_is_wide();
+
+        // Build PK aggregation. Narrow path uses the pooled u128 map and yields
+        // `pk_lo_hi`; the wide path uses a local PkBuf-keyed map and yields
+        // `pk_lo_hi_wide`. Both feed the UPSERT PK-identification check below.
+        let mut pk_lo_hi: Option<Vec<u128>> = None;
+        let mut pk_lo_hi_wide: Option<Vec<PkBuf>> = None;
+        if has_unique || needs_pk_rejection {
+            if !wide {
+                pk_lo_hi = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
+                    let mut m = cell.borrow_mut();
+                    m.clear();
+                    m.reserve(batch.count);
+                    for i in 0..batch.count {
+                        let w = batch.get_weight(i);
+                        if w == 0 { continue; }
+                        let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
+                        entry.0 += w;
+                        if w > 0 { entry.1 += 1; }
+                    }
+                    if needs_pk_rejection {
+                        for (&pk, &(_, pos_count)) in m.iter() {
+                            if pos_count > 1 {
+                                let key_str = format_pk_value(pk, &source_schema);
+                                return Err(unsafe {
+                                    (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str)
+                                });
+                            }
+                        }
+                    }
+                    let mut keys: Vec<u128> = Vec::with_capacity(m.len());
+                    for (&pk, &(net_weight, _)) in m.iter() {
+                        if net_weight <= 0 { continue; }
+                        keys.push(pk);
+                    }
+                    Ok(Some(keys))
+                })?;
+            } else {
+                let mut m: FxHashMap<PkBuf, (i64, u32)> =
+                    FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+                for i in 0..batch.count {
+                    let w = batch.get_weight(i);
+                    if w == 0 { continue; }
+                    let entry = m.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert((0, 0));
+                    entry.0 += w;
+                    if w > 0 { entry.1 += 1; }
+                }
+                if needs_pk_rejection {
+                    for (pk, &(_, pos_count)) in m.iter() {
+                        if pos_count > 1 {
+                            let key_str = format_pk_value_bytes(pk.pk_bytes(), &source_schema);
+                            return Err(unsafe {
+                                (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str)
+                            });
+                        }
                     }
                 }
+                let mut keys: Vec<PkBuf> = Vec::with_capacity(m.len());
+                for (pk, &(net_weight, _)) in m.iter() {
+                    if net_weight <= 0 { continue; }
+                    keys.push(*pk);
+                }
+                pk_lo_hi_wide = Some(keys);
             }
-            let mut keys: Vec<u128> = Vec::with_capacity(m.len());
-            for (&pk, &(net_weight, _)) in m.iter() {
-                if net_weight <= 0 { continue; }
-                keys.push(pk);
-            }
-            Ok(Some(keys))
-        })?;
+        }
 
         // ----- Phase 1 plan -----------------------------------------------
         let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
@@ -1253,7 +1324,7 @@ impl MasterDispatcher {
             let payload_col = source_schema.payload_idx(fk_col_idx);
             let col_size = source_schema.columns[fk_col_idx].size() as usize;
 
-            let mut seen: HashSet<u128> = HashSet::new();
+            let mut seen: FxHashSet<u128> = FxHashSet::default();
             let mut keys: Vec<u128> = Vec::new();
 
             for i in 0..batch.count {
@@ -1280,14 +1351,12 @@ impl MasterDispatcher {
             if is_parent_pk {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
                 let check_batch = build_check_batch(&parent_schema, &keys, pooled);
-                let worker_indices = compute_worker_indices(
-                    &check_batch, pk, &parent_schema, num_workers);
                 p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
                     col_hint: 0,
-                    payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
+                    payload: CheckPayload::ScatterSource { source: check_batch },
                     schema: parent_schema,
                 });
             } else {
@@ -1316,14 +1385,29 @@ impl MasterDispatcher {
         // the *referenced parent column's* values of the removed rows, which
         // differ per child (different children may reference different columns).
         if n_children > 0 {
-            let mut net_pk: FxHashMap<u128, i64> = FxHashMap::default();
-            for i in 0..batch.count {
-                let w = batch.get_weight(i);
-                if w == 0 { continue; }
-                *net_pk.entry(batch.get_pk(i)).or_insert(0) += w;
-            }
-            let removed_pks: Vec<u128> =
-                net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect();
+            // net_pk aggregation runs at batch.count scale: stay on u128 for
+            // the narrow path; the wide path keys on byte-form PkBuf. The
+            // *distinct* removed PKs are few, so both produce a uniform
+            // `Vec<PkBuf>` consumed by the gather and per-child key building.
+            let removed_pks: Vec<PkBuf> = if !wide {
+                let mut net_pk: FxHashMap<u128, i64> = FxHashMap::default();
+                for i in 0..batch.count {
+                    let w = batch.get_weight(i);
+                    if w == 0 { continue; }
+                    *net_pk.entry(batch.get_pk(i)).or_insert(0) += w;
+                }
+                let stride = source_schema.pk_stride();
+                net_pk.into_iter().filter(|&(_, w)| w < 0)
+                    .map(|(k, _)| u128_to_pkbuf(k, stride)).collect()
+            } else {
+                let mut net_pk: FxHashMap<PkBuf, i64> = FxHashMap::default();
+                for i in 0..batch.count {
+                    let w = batch.get_weight(i);
+                    if w == 0 { continue; }
+                    *net_pk.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert(0) += w;
+                }
+                net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect()
+            };
 
             if !removed_pks.is_empty() {
                 // Resolve every non-PK referenced parent column in ONE batched
@@ -1365,16 +1449,17 @@ impl MasterDispatcher {
                         let col_type = source_schema.columns[parent_col_idx].type_code;
                         let col_size = source_schema.columns[parent_col_idx].size() as usize;
                         let pk_field_off = source_schema.pk_byte_offset(parent_col_idx) as usize;
-                        removed_pks.iter().map(|&pk| {
-                            promote_to_index_key(&pk.to_le_bytes(), pk_field_off, col_size, col_type)
+                        removed_pks.iter().map(|pk| {
+                            promote_to_index_key(pk.pk_bytes(), pk_field_off, col_size, col_type)
                         }).collect()
                     } else {
                         let proj_pos = project.iter()
                             .position(|&c| c == parent_col_idx as u8)
                             .expect("non-PK referenced column missing from gather projection");
                         let mut vals: Vec<u128> = Vec::with_capacity(removed_pks.len());
-                        for &pk in &removed_pks {
-                            if let Some(row) = gathered.get(&pk) {
+                        for pk in &removed_pks {
+                            // Zero-copy lookup via Borrow<[u8]>.
+                            if let Some(row) = gathered.get(pk.pk_bytes()) {
                                 if let Some(v) = row[proj_pos] {
                                     vals.push(v);
                                 }
@@ -1398,26 +1483,33 @@ impl MasterDispatcher {
             }
         }
 
-        if let Some(keys) = pk_lo_hi {
-            if !keys.is_empty() {
+        // UPSERT PK identification: which incoming PKs already exist in storage.
+        // Routing is computed inside execute_pipeline_async; here we only build
+        // the check batch (narrow u128 keys, or byte-form for wide PKs).
+        let upsert_pk_batch: Option<Batch> = match (&pk_lo_hi, &pk_lo_hi_wide) {
+            (Some(keys), _) if !keys.is_empty() => {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                let check_batch = build_check_batch(&source_schema, &keys, pooled);
-                let pk_col = source_schema.pk_indices();
-                let worker_indices = compute_worker_indices(
-                    &check_batch, pk_col, &source_schema, num_workers);
-                p1_labels.push(P1Label::UpsertPkId);
-                p1_checks.push(PipelinedCheck {
-                    target_id,
-                    flags: FLAG_HAS_PK,
-                    col_hint: 0,
-                    payload: CheckPayload::ScatterSource { source: check_batch, worker_indices },
-                    schema: source_schema,
-                });
+                Some(build_check_batch(&source_schema, keys, pooled))
             }
+            (_, Some(keys)) if !keys.is_empty() => {
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
+                Some(build_check_batch_pkbuf(&source_schema, keys, pooled))
+            }
+            _ => None,
+        };
+        if let Some(check_batch) = upsert_pk_batch {
+            p1_labels.push(P1Label::UpsertPkId);
+            p1_checks.push(PipelinedCheck {
+                target_id,
+                flags: FLAG_HAS_PK,
+                col_hint: 0,
+                payload: CheckPayload::ScatterSource { source: check_batch },
+                schema: source_schema,
+            });
         }
 
         // ----- Phase 1 execute + interpret --------------------------------
-        let mut existing_pks: HashSet<u128> = HashSet::new();
+        let mut existing_pks: FxHashSet<PkBuf> = FxHashSet::default();
         if !p1_checks.is_empty() {
             let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p1_checks).await?;
             unsafe { reclaim_check_batches(&mut *disp_ptr, &mut p1_checks); }
@@ -1457,11 +1549,11 @@ impl MasterDispatcher {
                         if matches!(mode, WireConflictMode::Error)
                             && !existing_pks.is_empty()
                         {
-                            let conflict_pk = *existing_pks.iter().next().unwrap();
+                            let conflict_pk = existing_pks.iter().next().unwrap();
                             let (pk_names, sn, tn) = unsafe {
                                 (*disp_ptr).pk_violation_context(target_id, &source_schema)
                             };
-                            let key_str = format_pk_value(conflict_pk, &source_schema);
+                            let key_str = format_pk_value_bytes(conflict_pk.pk_bytes(), &source_schema);
                             return Err(format!(
                                 "duplicate key value violates unique constraint \"{}_{}_pkey\": Key ({})=({}) already exists",
                                 sn, tn, pk_names, key_str,
@@ -1498,13 +1590,13 @@ impl MasterDispatcher {
                 // re-walking the whole batch and re-checking `existing_pks`.
                 let update_rows: Vec<usize> = (0..batch.count)
                     .filter(|&i| batch.get_weight(i) > 0
-                        && existing_pks.contains(&batch.get_pk(i)))
+                        && existing_pks.contains(batch.get_pk_bytes(i)))
                     .collect();
 
-                let mut updated: Vec<u128> = Vec::new();
-                let mut seen: HashSet<u128> = HashSet::new();
+                let mut updated: Vec<PkBuf> = Vec::new();
+                let mut seen: FxHashSet<PkBuf> = FxHashSet::default();
                 for &i in &update_rows {
-                    let pk = batch.get_pk(i);
+                    let pk = PkBuf::from_bytes(batch.get_pk_bytes(i));
                     if seen.insert(pk) { updated.push(pk); }
                 }
 
@@ -1540,8 +1632,6 @@ impl MasterDispatcher {
 
                     let mut retired: Vec<u128> = Vec::new();
                     for &i in &update_rows {
-                        let pk = batch.get_pk(i);
-
                         let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
                             None
                         } else {
@@ -1549,8 +1639,9 @@ impl MasterDispatcher {
                         };
 
                         // Absent committed row → omitted from the gather map →
-                        // skip (matches the old per-row seek's None).
-                        let old_val = match gathered.get(&pk) {
+                        // skip (matches the old per-row seek's None). Zero-copy
+                        // lookup via Borrow<[u8]>.
+                        let old_val = match gathered.get(batch.get_pk_bytes(i)) {
                             Some(row) => row[proj_pos],
                             None => continue,
                         };
@@ -1602,10 +1693,16 @@ impl MasterDispatcher {
                 source_schema.payload_idx(source_col)
             };
             let col_size = source_schema.columns[source_col].size() as usize;
+            let pk_is_compound = source_schema.pk_indices().len() > 1;
+            let pk_field_off = if is_pk_col {
+                source_schema.pk_byte_offset(source_col) as usize
+            } else { 0 };
 
-            let mut upsert_keys: Vec<(u128, u128)> = Vec::new();
+            // Index-column key is always ≤ 16 bytes → u128. Row PK is byte-form
+            // (PkBuf) to support wide PKs.
+            let mut upsert_keys: Vec<(u128, PkBuf)> = Vec::new();
             let mut check_keys: Vec<u128> = Vec::new();
-            let mut seen: HashSet<u128> = HashSet::new();
+            let mut seen: FxHashSet<u128> = FxHashSet::default();
 
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
@@ -1615,26 +1712,33 @@ impl MasterDispatcher {
                     if null_word & (1u64 << src_payload_idx) != 0 { continue; }
                 }
 
-                let pk_i = batch.get_pk(i);
-
                 let key = if is_pk_col {
-                    pk_i
+                    if pk_is_compound {
+                        promote_to_index_key(
+                            batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
+                    } else {
+                        batch.get_pk(i)
+                    }
                 } else {
                     let col_data = batch.col_data(src_payload_idx);
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
 
-                if existing_pks.contains(&pk_i) {
-                    upsert_keys.push((key, pk_i));
-                    continue;
-                }
-
-                if seen.contains(&key) {
+                // In-batch duplicate detection runs for ALL positive-weight
+                // rows, INCLUDING UPSERTs: two rows setting the same new unique
+                // value in one transaction is a violation regardless of whether
+                // their PKs already exist.
+                if !seen.insert(key) {
                     let col_name = unsafe { (*disp_ptr).get_col_name(target_id, source_col) };
                     return Err(format!(
                         "Unique index violation on column '{}': duplicate in batch", col_name));
                 }
-                seen.insert(key);
+
+                // Zero-copy lookup via Borrow<[u8]>.
+                if existing_pks.contains(batch.get_pk_bytes(i)) {
+                    upsert_keys.push((key, PkBuf::from_bytes(batch.get_pk_bytes(i))));
+                    continue;
+                }
                 check_keys.push(key);
             }
 
@@ -1661,7 +1765,8 @@ impl MasterDispatcher {
                 let u_keys: Vec<u128> = upsert_keys.iter().map(|&(k, _)| k).collect();
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
                 let u_batch = build_check_batch(&idx_schema, &u_keys, pooled);
-                p2_labels.push(P2Label::Upsert { col_idx, source_col, upsert_keys });
+                let idx_pk_stride = idx_schema.pk_stride();
+                p2_labels.push(P2Label::Upsert { col_idx, source_col, idx_pk_stride, upsert_keys });
                 p2_checks.push(PipelinedCheck {
                     target_id,
                     flags: FLAG_HAS_PK,
@@ -1716,14 +1821,27 @@ impl MasterDispatcher {
                         ));
                     }
                 }
-                P2Label::Upsert { col_idx, source_col, upsert_keys } => {
+                P2Label::Upsert { col_idx, source_col, idx_pk_stride, upsert_keys } => {
+                    // Fan out all seeks before collecting: sal_excl is released
+                    // before each reply wait, so the seek futures run
+                    // concurrently rather than serializing one RTT per key.
                     let occupied = &p2_results[idx];
+                    let mut pk_is: Vec<PkBuf> = Vec::new();
+                    let mut futs = Vec::new();
                     for &(key_pk, pk_i) in upsert_keys {
-                        if !occupied.contains(&key_pk) { continue; }
-                        let slot = Self::fan_out_seek_by_index_async(
-                            disp_ptr, reactor, sal_excl, target_id, *col_idx,
-                            key_pk,
-                        ).await?;
+                        // occupied holds index-table PKs (the indexed column) as
+                        // PkBuf; look up the u128 key via Borrow<[u8]>.
+                        let kb = key_pk.to_le_bytes();
+                        if !occupied.contains(&kb[..*idx_pk_stride as usize]) { continue; }
+                        pk_is.push(pk_i);
+                        // async fn futures are !Unpin; box-pin for join_all_unpin.
+                        futs.push(Box::pin(Self::fan_out_seek_by_index_async(
+                            disp_ptr, reactor, sal_excl, target_id, *col_idx, key_pk,
+                        )));
+                    }
+                    let slots = crate::runtime::reactor::join_all_unpin(futs).await;
+                    for (pk_i, slot_result) in pk_is.into_iter().zip(slots) {
+                        let slot = slot_result?;
                         let ctrl = peek_control_block(slot.bytes())
                             .map_err(|e| e.to_string())?;
                         if ctrl.flags & FLAG_HAS_DATA != 0 {
@@ -1731,7 +1849,7 @@ impl MasterDispatcher {
                                 slot.bytes(), ctrl.block_size, ctrl, None,
                             ).map_err(|e| e.to_string())?;
                             if let Some(ref found) = zc.data_batch {
-                                if found.count > 0 && found.get_pk(0) != pk_i {
+                                if found.count > 0 && found.get_pk_bytes(0) != pk_i.pk_bytes() {
                                     let col_name = unsafe {
                                         (*disp_ptr).get_col_name(target_id, *source_col)
                                     };
@@ -1800,52 +1918,77 @@ impl MasterDispatcher {
         // use-after-free. Continuation frames carry no schema; reuse the schema +
         // version saved from the first frame as a hint.
         use crate::schema::SchemaDescriptor;
-        for (w, mut slot) in slots.into_iter().enumerate() {
-            let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
-            loop {
-                let ctrl = peek_control_block(slot.bytes())
-                    .map_err(|e| scan_decode_err(w, e))?;
-                if ctrl.status != 0 {
-                    let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
-                    return Err(format!("worker {}: scan: {}", w, msg));
-                }
-                let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
-                let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-                let ctrl_size = ctrl.block_size;
-                let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-                    descriptor: s, version: *v,
-                });
-                let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                    slot.bytes(), ctrl_size, ctrl, schema_hint,
-                ).map_err(|e| scan_decode_err(w, e))?;
-                if saved_schema.is_none() {
-                    if let Some(ref s) = zc.schema {
-                        saved_schema = Some((*s, server_version));
+        let scan_result: Result<(), String> = async {
+            for (w, mut slot) in slots.into_iter().enumerate() {
+                let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
+                loop {
+                    let ctrl = peek_control_block(slot.bytes())
+                        .map_err(|e| scan_decode_err(w, e))?;
+                    if ctrl.status != 0 {
+                        let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
+                        return Err(format!("worker {}: scan: {}", w, msg));
                     }
-                }
+                    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
+                    let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
+                    let ctrl_size = ctrl.block_size;
+                    let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
+                        descriptor: s, version: *v,
+                    });
+                    let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
+                        slot.bytes(), ctrl_size, ctrl, schema_hint,
+                    ).map_err(|e| scan_decode_err(w, e))?;
+                    if saved_schema.is_none() {
+                        if let Some(ref s) = zc.schema {
+                            saved_schema = Some((*s, server_version));
+                        }
+                    }
 
-                if let Some(ref mb) = zc.data_batch {
-                    if mb.count > 0 {
-                        unsafe {
-                            let disp = &mut *disp_ptr;
-                            for d in &missing {
-                                if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                                    if !filter.capped {
-                                        extract_into_filter(filter, mb, d);
+                    if let Some(ref mb) = zc.data_batch {
+                        if mb.count > 0 {
+                            unsafe {
+                                let disp = &mut *disp_ptr;
+                                for d in &missing {
+                                    if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                                        if !filter.capped {
+                                            extract_into_filter(filter, mb, d);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                drop(zc);
-                drop(slot);
+                    drop(zc);
+                    drop(slot);
 
-                if !has_more { break; }
-                slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+                    if !has_more { break; }
+                    slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+                }
+            }
+            Ok(())
+        }.await;
+
+        // On success the filters are fully populated → mark warm so the
+        // broadcast-skip shortcut may trust them. On failure (worker crash
+        // mid-scan) remove the unwarmed entries so the next validation
+        // retries warmup instead of seeing them present and skipping it
+        // forever (the "already warming" guard filters on key presence).
+        let disp = unsafe { &mut *disp_ptr };
+        match scan_result {
+            Ok(()) => {
+                for d in &missing {
+                    if let Some(f) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                        f.warm = true;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                for d in &missing {
+                    disp.unique_filters.remove(&(table_id, d.col_idx));
+                }
+                Err(e)
             }
         }
-        Ok(())
     }
 
     /// Commit N push batches as a single SAL group write. Called from
@@ -1940,6 +2083,18 @@ impl MasterDispatcher {
             .collect();
         let (sn, tn) = self.get_qualified_name_owned(target_id);
         (names.join(", "), sn, tn)
+    }
+
+    /// Format the "two rows in one batch share a PK" rejection message.
+    /// `key_str` is the already-rendered offending key (narrow or wide).
+    fn batch_dup_pk_err(
+        &mut self, target_id: i64, schema: &SchemaDescriptor, key_str: &str,
+    ) -> String {
+        let (pk_names, sn, tn) = self.pk_violation_context(target_id, schema);
+        format!(
+            "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
+            sn, tn, pk_names, key_str,
+        )
     }
 }
 
@@ -2077,23 +2232,22 @@ fn format_uuid_hyphenated(v: u128) -> String {
         v & 0x0000_ffff_ffff_ffff)
 }
 
-/// Render a PK u128 as a human-readable string for error messages.
+/// Render a PK from its raw little-endian byte form for error messages.
 /// Compound PKs are formatted as comma-separated per-column values in
-/// declaration order; the u128 holds all PK columns concatenated little-
-/// endian, so we slice it column by column.
-fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
-    let pk_bytes = pk.to_le_bytes();
+/// declaration order; `pk_bytes` holds all PK columns concatenated
+/// little-endian, so we slice it column by column. Works for wide PKs
+/// (`pk_stride > 16`) where a `u128` cannot encode the key.
+fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut off = 0usize;
     for &ci in schema.pk_indices() {
         let col = schema.columns[ci as usize];
         let size = col.size() as usize;
-        let slice = &pk_bytes[off..off + size];
         // Reassemble the per-column value into a u128 (LE) and dispatch
-        // on its `type_code`. The slice is always at most 16 bytes wide
-        // and pad with zeros to 16 to reuse the existing scalar format.
+        // on its `type_code`. A single PK column is at most 16 bytes wide;
+        // pad with zeros to 16 to reuse the existing scalar format.
         let mut padded = [0u8; 16];
-        padded[..size].copy_from_slice(slice);
+        padded[..size].copy_from_slice(&pk_bytes[off..off + size]);
         let v = u128::from_le_bytes(padded);
         let s = match col.type_code {
             crate::schema::type_code::U128 => format!("{}", v),
@@ -2110,17 +2264,28 @@ fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
     parts.join(", ")
 }
 
-/// Build a constraint-check batch for `keys`, optionally reusing a
-/// previously-pooled batch from `MasterDispatcher::check_batch_pool`.
+/// Narrow-PK convenience over `format_pk_value_bytes`. Safe because
+/// `pk_stride ≤ 16` keeps the per-column `off + size` within the 16-byte
+/// little-endian image.
+fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
+    format_pk_value_bytes(&pk.to_le_bytes(), schema)
+}
+
+/// Shared scaffold for the check-batch builders: pool-reuse with a schema
+/// staleness guard, then one zero-payload row per key.
 ///
 /// Schema staleness guard: a pooled batch built before a DDL change has
 /// the wrong column layout; populating it would silently corrupt rows or
 /// panic on column writes. When `pooled.schema != Some(schema)`, the
 /// pooled allocation is dropped and a fresh batch is allocated instead.
-fn build_check_batch(
+///
+/// `push_pk` writes the per-row PK region (the only step that differs
+/// between the `u128` and `PkBuf` key forms).
+fn build_check_batch_with<K>(
     schema: &SchemaDescriptor,
-    keys: &[u128],
+    keys: &[K],
     pooled: Option<Batch>,
+    mut push_pk: impl FnMut(&mut Batch, &K),
 ) -> Batch {
     let npc = schema.num_payload_cols();
     let mut batch = match pooled {
@@ -2133,9 +2298,9 @@ fn build_check_batch(
         _ => Batch::with_schema(*schema, keys.len()),
     };
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
-    for &key in keys {
+    for key in keys {
         batch.ensure_row_capacity();
-        batch.extend_pk(key);
+        push_pk(&mut batch, key);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
         for (c, _ci, col) in schema.payload_columns() {
@@ -2144,6 +2309,36 @@ fn build_check_batch(
         batch.count += 1;
     }
     batch
+}
+
+/// Build a constraint-check batch from narrow `u128` PK keys.
+fn build_check_batch(
+    schema: &SchemaDescriptor,
+    keys: &[u128],
+    pooled: Option<Batch>,
+) -> Batch {
+    build_check_batch_with(schema, keys, pooled, |b, &k| b.extend_pk(k))
+}
+
+/// Convert a narrow-PK `u128` to its byte-form `PkBuf` (low `pk_stride`
+/// bytes). Used at gather call sites to feed the unified `Vec<PkBuf>` input
+/// once per call (not per incoming batch row).
+#[inline]
+fn u128_to_pkbuf(pk: u128, pk_stride: u8) -> PkBuf {
+    PkBuf::from_bytes(&pk.to_le_bytes()[..pk_stride as usize])
+}
+
+/// Byte-form sibling of `build_check_batch`, taking `&[PkBuf]` keys. Kept
+/// as a distinct `&[PkBuf]` entry point (rather than converting to `u128`)
+/// because the `pk_lo_hi` → UPSERT PK-check path can have up to
+/// `batch.count` entries and must not pay per-entry `PkBuf` construction;
+/// the gather inputs are bounded by distinct changed rows.
+fn build_check_batch_pkbuf(
+    schema: &SchemaDescriptor,
+    keys: &[PkBuf],
+    pooled: Option<Batch>,
+) -> Batch {
+    build_check_batch_with(schema, keys, pooled, |b, k| b.extend_pk_bytes(k.pk_bytes()))
 }
 
 /// Return `batch` to `disp.check_batch_pool[target_id]` and cap the pool depth.
@@ -2165,7 +2360,7 @@ fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedChe
         let sentinel = Batch::empty_with_schema(&check.schema);
         let batch = match &mut check.payload {
             CheckPayload::Broadcast(b) => std::mem::replace(b, sentinel),
-            CheckPayload::ScatterSource { source, .. } => std::mem::replace(source, sentinel),
+            CheckPayload::ScatterSource { source } => std::mem::replace(source, sentinel),
         };
         recycle_check_batch(disp, target_id, batch);
     }
@@ -2275,6 +2470,8 @@ mod unique_filter_tests {
             is_pk_col: true,
             src_payload_idx: usize::MAX,
             col_size: 8,
+            pk_field_off: 0,
+            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
@@ -2298,6 +2495,8 @@ mod unique_filter_tests {
             is_pk_col: false,
             src_payload_idx: 0, // first payload column
             col_size: 8,
+            pk_field_off: 0,
+            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
@@ -2320,6 +2519,8 @@ mod unique_filter_tests {
             is_pk_col: true,
             src_payload_idx: usize::MAX,
             col_size: 8,
+            pk_field_off: 0,
+            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         filter.capped = true;
@@ -2352,5 +2553,100 @@ mod unique_filter_tests {
         let sa = format_pk_value(uuid_a, &schema);
         let sb = format_pk_value(uuid_b, &schema);
         assert_ne!(sa, sb, "UUIDs differing in high bits must format differently");
+    }
+
+    fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
+        let mut v = Vec::new();
+        for p in parts { v.extend_from_slice(p); }
+        PkBuf::from_bytes(&v)
+    }
+
+    #[test]
+    fn format_pk_value_narrow_compound_agrees_with_bytes() {
+        // (I32, U32) compound PK packed in a u128: A=-5, B=42.
+        let schema = SchemaDescriptor::new(&[
+            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ], &[0, 1]);
+        assert!(!schema.pk_is_wide());
+        let packed = ((-5i32) as u32 as u128) | (42u128 << 32);
+        assert_eq!(format_pk_value(packed, &schema), "-5, 42");
+        // The bytes renderer agrees with the (delegating) u128 renderer.
+        assert_eq!(format_pk_value_bytes(&packed.to_le_bytes(), &schema), "-5, 42");
+    }
+
+    #[test]
+    fn format_pk_value_bytes_wide_compound_u64x3() {
+        // Three U64 columns = 24-byte PK: too wide for a u128, exercising the
+        // byte-form renderer where the old format_pk_value would truncate.
+        let schema = SchemaDescriptor::new(&[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ], &[0, 1, 2]);
+        assert!(schema.pk_is_wide());
+        let pk = compound_pk_bytes(&[
+            &7u64.to_le_bytes(), &8u64.to_le_bytes(), &9u64.to_le_bytes(),
+        ]);
+        assert_eq!(format_pk_value_bytes(pk.pk_bytes(), &schema), "7, 8, 9");
+    }
+
+    #[test]
+    fn extract_into_filter_compound_pk_extracts_single_column() {
+        // (A U32, B U32) both PK, unique index on A. Two rows share A=5 but
+        // differ in B. Pre-fix get_pk(i) returned the packed (A,B) key, so the
+        // filter held two distinct values; the fix slices out A only.
+        let schema = SchemaDescriptor::new(&[
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ], &[0, 1]);
+        assert_eq!(schema.pk_stride(), 8);
+        let keys = [
+            compound_pk_bytes(&[&5u32.to_le_bytes(), &1u32.to_le_bytes()]),
+            compound_pk_bytes(&[&5u32.to_le_bytes(), &2u32.to_le_bytes()]),
+        ];
+        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+        let desc = UniqueIndexDesc {
+            col_idx: 0,
+            type_code: type_code::U32,
+            is_pk_col: true,
+            src_payload_idx: usize::MAX,
+            col_size: 4,
+            pk_field_off: 0,
+            pk_is_compound: true,
+        };
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
+        assert!(filter.values.contains(&5u128), "filter holds column A's value");
+        assert_eq!(filter.values.len(), 1, "the shared A=5 collapses to one entry");
+    }
+
+    #[test]
+    fn extract_into_filter_compound_pk_second_column_offset() {
+        // Unique index on B (the second PK column at byte offset 4). Confirms
+        // pk_field_off slices the right column out of the packed key.
+        let schema = SchemaDescriptor::new(&[
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ], &[0, 1]);
+        let keys = [
+            compound_pk_bytes(&[&5u32.to_le_bytes(), &11u32.to_le_bytes()]),
+            compound_pk_bytes(&[&6u32.to_le_bytes(), &22u32.to_le_bytes()]),
+        ];
+        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+        let desc = UniqueIndexDesc {
+            col_idx: 1,
+            type_code: type_code::U32,
+            is_pk_col: true,
+            src_payload_idx: usize::MAX,
+            col_size: 4,
+            pk_field_off: 4,
+            pk_is_compound: true,
+        };
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
+        assert!(filter.values.contains(&11u128));
+        assert!(filter.values.contains(&22u128));
+        assert_eq!(filter.values.len(), 2);
     }
 }
