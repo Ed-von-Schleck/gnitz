@@ -691,6 +691,13 @@ impl Batch {
                 self.extend_region(REG_PK, &pk.to_le_bytes()[..8]);
             }
             16 => self.extend_region(REG_PK, &pk.to_le_bytes()),
+            n if n > 0 && n < 16 => {
+                // Narrow non-power-of-two strides (e.g. 12 for (U64, U32)): the
+                // caller placed the LE on-disk bytes in the low `n` bytes, the
+                // same contract widen_pk_le relies on for reads.
+                debug_assert!(pk >> (n * 8) == 0, "extend_pk: narrow batch requires high bits == 0");
+                self.extend_region(REG_PK, &pk.to_le_bytes()[..n]);
+            }
             _ => panic!("extend_pk: wide region; use extend_pk_bytes"),
         }
     }
@@ -723,6 +730,11 @@ impl Batch {
             16 => {
                 let off = self.offsets[REG_PK] as usize + row * 16;
                 self.data[off..off + 16].copy_from_slice(&pk.to_le_bytes());
+            }
+            n if n > 0 && n < 16 => {
+                debug_assert!(pk >> (n * 8) == 0, "set_pk_at: narrow batch requires high bits == 0");
+                let off = self.offsets[REG_PK] as usize + row * stride;
+                self.data[off..off + n].copy_from_slice(&pk.to_le_bytes()[..n]);
             }
             _ => panic!("set_pk_at: wide region; use set_pk_at_bytes"),
         }
@@ -1129,18 +1141,10 @@ impl Batch {
                 let src = ptable.found_col_ptr(pi, cs);
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
-                // Inline write_string_from_raw to use field splitting.
-                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_slice);
-                if is_long {
-                    let length = u32::from_le_bytes(src_slice[0..4].try_into().unwrap()) as usize;
-                    let blob_ptr = ptable.found_blob_ptr();
-                    assert!(!blob_ptr.is_null());
-                    let old_offset = u64::from_le_bytes(src_slice[8..16].try_into().unwrap()) as usize;
-                    let src_data = unsafe { std::slice::from_raw_parts(blob_ptr.add(old_offset), length) };
-                    let new_offset = self.blob.len();
-                    self.blob.extend_from_slice(src_data);
-                    dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-                }
+                let src_blob = ptable.found_blob_slice();
+                let dest = crate::schema::relocate_german_string_vec(
+                    src_slice, src_blob, &mut self.blob, None,
+                );
                 self.extend_col(pi, &dest);
             } else {
                 let src = ptable.found_col_ptr(pi, cs);
@@ -1583,6 +1587,29 @@ impl Batch {
 
         let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let n = count as usize;
+
+        // Validate per-region byte sizes against the schema-expected strides.
+        // `from_regions` derives strides by dividing the supplied sizes by
+        // `count`, so a mismatch would silently propagate into the decoded
+        // Batch — and `get_pk` reads `strides[REG_PK]`, which a stride > 16
+        // would make `widen_pk_le` panic on. (Blob region is variable-length.)
+        if n > 0 {
+            let pk_stride = schema.pk_stride() as usize;
+            if sizes[REG_PK] as usize != n * pk_stride {
+                return Err("WAL block PK region size mismatch");
+            }
+            if sizes[REG_WEIGHT] as usize != n * 8 {
+                return Err("WAL block weight region size mismatch");
+            }
+            if sizes[REG_NULL_BMP] as usize != n * 8 {
+                return Err("WAL block null bitmap region size mismatch");
+            }
+            for (pi, _, col) in schema.payload_columns() {
+                if sizes[REG_PAYLOAD_START + pi] as usize != n * col.size() as usize {
+                    return Err("WAL block payload region size mismatch");
+                }
+            }
+        }
 
         let nr_mem = expected_regions;
         let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
@@ -2447,5 +2474,123 @@ mod tests {
         for (i, pk) in pks.iter().enumerate() {
             assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
         }
+    }
+
+    /// Narrow non-power-of-two stride 12 ((U64, U32)) must round-trip through
+    /// the u128-keyed extend_pk path (low 12 bytes verbatim), not panic.
+    #[test]
+    fn extend_pk_stride12_roundtrip() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(schema.pk_stride(), 12);
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(3);
+        // (U64, U32) packed little-endian into the low 12 bytes of a u128.
+        let pks: [u128; 3] = [
+            1u128 | (0u128 << 64),
+            1u128 | ((u32::MAX as u128) << 64),
+            7u128 | (7u128 << 64),
+        ];
+        for &pk in &pks {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        for (i, &pk) in pks.iter().enumerate() {
+            assert_eq!(b.get_pk(i), pk, "stride-12 row {i} roundtrip");
+        }
+        // set_pk_at must also handle stride 12.
+        let new_pk = 9u128 | (123u128 << 64);
+        b.set_pk_at(1, new_pk);
+        assert_eq!(b.get_pk(1), new_pk);
+    }
+
+    /// extend_pk on a stride-12 batch must reject a u128 with bits set above the
+    /// 12-byte (96-bit) window in debug builds (silent truncation guard).
+    #[test]
+    #[should_panic(expected = "narrow batch requires high bits == 0")]
+    fn extend_pk_stride12_high_bits_panics() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(1);
+        // Bit 100 is set — above the 96-bit stride window.
+        b.extend_pk(1u128 << 100);
+    }
+
+    #[test]
+    fn decode_from_wal_block_rejects_mismatched_pk_stride() {
+        let schema = single_col_pk_schema(type_code::U64); // pk_stride = 8
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(42u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &7i64.to_le_bytes());
+        b.count += 1;
+
+        let sz = b.wire_byte_size(1);
+        let mut buf = vec![0u8; sz];
+        b.encode_to_wire(1, &mut buf, 0, false);
+        // Corrupt the REG_PK (region 0) size directory entry: claim 24 bytes.
+        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8 + 4;
+        buf[size_off..size_off + 4].copy_from_slice(&(1u32 * 24).to_le_bytes());
+        let r = Batch::decode_from_wal_block(&buf, &schema, false);
+        assert_eq!(r.err(), Some("WAL block PK region size mismatch"));
+    }
+
+    #[test]
+    fn decode_from_wal_block_rejects_mismatched_weight_region() {
+        let schema = single_col_pk_schema(type_code::U64);
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(42u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &7i64.to_le_bytes());
+        b.count += 1;
+
+        let sz = b.wire_byte_size(1);
+        let mut buf = vec![0u8; sz];
+        b.encode_to_wire(1, &mut buf, 0, false);
+        // Corrupt the REG_WEIGHT (region 1) size: claim 4 bytes instead of 8.
+        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_WEIGHT * 8 + 4;
+        buf[size_off..size_off + 4].copy_from_slice(&4u32.to_le_bytes());
+        let r = Batch::decode_from_wal_block(&buf, &schema, false);
+        assert_eq!(r.err(), Some("WAL block weight region size mismatch"));
+    }
+
+    /// A long-string German cell whose heap region [offset, offset+len) overruns
+    /// the source blob must relocate to an empty string, not read out of bounds.
+    /// This is the safety primitive that `append_row_from_ptable_found` and
+    /// `write_join_row` now rely on instead of the deleted `write_string_from_raw`.
+    #[test]
+    fn relocate_german_string_oob_falls_back_to_empty() {
+        // Build a long-string cell: length=100 (> 12), prefix bytes, and a
+        // heap offset of 0 — but the source blob is empty, so [0, 100) overruns.
+        let mut cell = [0u8; 16];
+        cell[0..4].copy_from_slice(&100u32.to_le_bytes()); // length
+        cell[4..8].copy_from_slice(b"abcd");               // inline prefix
+        cell[8..16].copy_from_slice(&0u64.to_le_bytes());  // heap offset 0
+        let src_blob: &[u8] = &[]; // empty: any long string overruns
+
+        let mut dst_blob: Vec<u8> = Vec::new();
+        let out = crate::schema::relocate_german_string_vec(&cell, src_blob, &mut dst_blob, None);
+        // Fallback: length field zeroed, nothing appended to dst_blob.
+        let out_len = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        assert_eq!(out_len, 0, "OOB long string must relocate to empty");
+        assert!(dst_blob.is_empty(), "no bytes should be copied on overrun");
     }
 }

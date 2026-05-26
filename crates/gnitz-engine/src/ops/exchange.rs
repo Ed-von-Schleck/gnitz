@@ -47,7 +47,11 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
     let pi = schema.payload_idx(col_idx);
     let col = &schema.columns[col_idx];
     let col_size = col.size() as usize;
-    if col.type_code == crate::schema::type_code::STRING {
+    if col.type_code == crate::schema::type_code::STRING
+        || col.type_code == crate::schema::type_code::BLOB
+    {
+        // BLOB shares STRING's 16-byte German-string header layout
+        // (col_size = 16); the generic else-branch's 8-byte buffer would panic.
         let struct_bytes = mb.get_col_ptr(row, pi, 16);
         let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
         if length == 0 {
@@ -788,6 +792,37 @@ mod tests {
 
     fn total_rows(batches: &[Batch]) -> usize {
         batches.iter().map(|b| b.count).sum()
+    }
+
+    /// A BLOB payload column shares STRING's 16-byte German-string header
+    /// (col_size = 16). `extract_col_key` must hash it like a STRING rather
+    /// than falling into the generic 8-byte-buffer branch (which would panic).
+    #[test]
+    fn extract_col_key_handles_blob_column() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::BLOB, 0),
+            ],
+            &[0],
+        );
+        // make_batch_str builds the same German-string encoding for any
+        // 16-byte-struct column; long value (> threshold) exercises the blob spill.
+        let cb = make_batch_str(&schema, &[
+            (1, 1, "short"),
+            (2, 1, "a long blob value well beyond the inline threshold"),
+            (3, 1, ""),
+        ]);
+        let b = cb.into_inner();
+        let mb = b.as_mem_batch();
+        // Must not panic and must distinguish the two non-empty values.
+        let k_short = extract_col_key(&mb, 0, 1, &schema);
+        let k_long  = extract_col_key(&mb, 1, 1, &schema);
+        let k_empty = extract_col_key(&mb, 2, 1, &schema);
+        assert_ne!(k_short, 0);
+        assert_ne!(k_long, 0);
+        assert_eq!(k_empty, 0, "empty blob hashes to 0");
+        assert_ne!(k_short, k_long);
     }
 
     fn make_wide_schema() -> SchemaDescriptor {

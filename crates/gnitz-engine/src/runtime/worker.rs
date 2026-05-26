@@ -194,6 +194,10 @@ pub struct WorkerProcess {
 /// Deduplicate a list of (dev, ino, fd) triples by (dev, ino), returning one fd per
 /// unique directory inode. Both fields are u64 to handle varying ino_t/dev_t widths.
 pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc::c_int> {
+    // The fds are the long-lived `Table::dirfd` borrowed for fsync, NOT owned by
+    // the flush — they must NOT be closed here (doing so breaks the next flush's
+    // openat/renameat). Just deduplicate by (dev, ino) so a shared directory is
+    // fsynced once.
     inodes.sort_unstable_by_key(|&(dev, ino, _)| (dev, ino));
     inodes.dedup_by_key(|&mut (dev, ino, _)| (dev, ino));
     inodes.into_iter().map(|(_, _, fd)| fd).collect()
@@ -611,9 +615,22 @@ impl WorkerProcess {
             }
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::DdlSync) => {
                 if let Some(data) = wire {
-                    if let Ok(decoded) = ipc::decode_wire(data) {
-                        if let Some(batch) = decoded.data_batch {
-                            self.exchange.deferred.push(DeferredDdl { target_id, batch });
+                    match ipc::decode_wire(data) {
+                        Ok(decoded) => {
+                            if let Some(batch) = decoded.data_batch {
+                                self.exchange.deferred.push(DeferredDdl { target_id, batch });
+                            }
+                        }
+                        Err(e) => {
+                            // A dropped DDL permanently diverges this worker's
+                            // catalog from the master — silently wrong results.
+                            // Shut down rather than continue with a stale catalog.
+                            gnitz_warn!(
+                                "W{} FATAL: failed to decode deferred DDL for tid={}: {}",
+                                self.worker_id, target_id, e,
+                            );
+                            self.shutdown();  // calls libc::_exit — does not return
+                            return DispatchOutcome::Shutdown;  // unreachable; satisfies type
                         }
                     }
                 }
@@ -701,6 +718,17 @@ impl WorkerProcess {
             DispatchResult::Continue => DispatchOutcome::Continue,
             DispatchResult::Error(msg) => {
                 self.send_error(&msg, request_id);
+                if kind == SalMessageKind::DdlSync {
+                    // DDL application failure on trusted master→worker IPC means
+                    // memory corruption or an engine bug; continuing would leave
+                    // this worker with a permanently stale catalog.
+                    gnitz_warn!(
+                        "W{} FATAL: DdlSync application failed for tid={}: {}. Shutting down.",
+                        self.worker_id, target_id, msg,
+                    );
+                    self.shutdown();  // calls libc::_exit — does not return
+                    return DispatchOutcome::Shutdown;  // unreachable; satisfies type
+                }
                 DispatchOutcome::Continue
             }
             DispatchResult::Shutdown => DispatchOutcome::Shutdown,
@@ -720,6 +748,11 @@ impl WorkerProcess {
         let client_id = decoded.as_ref().map(|d| d.control.client_id).unwrap_or(0);
         let ctrl_wire_flags = decoded.as_ref().map(|d| d.control.flags).unwrap_or(0);
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
+        // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Must be
+        // extracted before `decoded` is consumed by the `data_batch` take below.
+        let seek_pk_extra: Vec<u8> = decoded.as_ref()
+            .map(|d| d.control.seek_pk_extra.clone())
+            .unwrap_or_default();
 
         // Extract batch (consumes decoded)
         let batch = decoded.and_then(|d| d.data_batch);
@@ -838,8 +871,14 @@ impl WorkerProcess {
                 // `batch_project_index`.
                 let col_size = self.cat()
                     .get_schema_desc(target_id)
-                    .map(|s| s.columns[col_idx as usize].size() as usize)
+                    .and_then(|s| s.columns.get(col_idx as usize).map(|c| c.size() as usize))
                     .unwrap_or(0);
+                if col_size == 0 {
+                    return DispatchResult::Error(format!(
+                        "seek_by_index: invalid column index {} for table {}",
+                        col_idx, target_id,
+                    ));
+                }
                 let key_bytes = seek_pk.to_le_bytes();
                 let prefix = &key_bytes[..col_size.min(16)];
                 match self.cat().seek_by_index(target_id, col_idx, prefix) {
@@ -853,7 +892,26 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Seek => {
-                match self.cat().seek_family(target_id, seek_pk) {
+                // User tables may have a wide PK (stride > 16) whose full key
+                // arrives as seek_pk (low 16 bytes) + seek_pk_extra (16..stride).
+                // System tables (target_id < FIRST_USER_TABLE_ID) always have a
+                // narrow PK, so they stay on the u128 seek_family path.
+                let wide_schema = if target_id >= FIRST_USER_TABLE_ID {
+                    self.cat().get_schema_desc(target_id).filter(|s| s.pk_is_wide())
+                } else {
+                    None
+                };
+                let result = if let Some(s) = wide_schema {
+                    let stride = s.pk_stride() as usize;
+                    let buf = match crate::schema::assemble_wide_pk(seek_pk, &seek_pk_extra, stride) {
+                        Ok(buf) => buf,
+                        Err(e) => return DispatchResult::Error(format!("seek: {e}")),
+                    };
+                    self.cat().seek_family_bytes(target_id, &buf[..stride])
+                } else {
+                    self.cat().seek_family(target_id, seek_pk)
+                };
+                match result {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
@@ -896,11 +954,11 @@ impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
     fn send_ack(&self, target_id: u64, flags: u64, request_id: u64) {
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, target_id, 0, flags,
-                0u128, 0, request_id, STATUS_OK, &[], None, None, None, None,
+                0u128, 0, request_id, STATUS_OK, &[], None, None, None, None, &[],
             );
         });
     }
@@ -938,12 +996,12 @@ impl WorkerProcess {
         let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
         let server_version = if schema.is_some() { self.cat().get_schema_version(tid_key) } else { 0 };
         let flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
-        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt);
+        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, client_id, flags,
                 seek_pk, 0, request_id, STATUS_OK, &[],
-                schema, None, result, prebuilt,
+                schema, None, result, prebuilt, &[],
             );
         });
     }
@@ -997,7 +1055,7 @@ impl WorkerProcess {
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            let wire_sz = ipc::wire_size(STATUS_OK, &[], schema_for_encode, None, Some(&*batch), prebuilt);
+            let wire_sz = ipc::wire_size(STATUS_OK, &[], schema_for_encode, None, Some(&*batch), prebuilt, &[]);
             if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
                 return Some(format!(
                     "scan: batch wire_size={wire_sz} > MAX_W2M_MSG={}; \
@@ -1010,7 +1068,7 @@ impl WorkerProcess {
                 ipc::encode_wire_into(
                     buf, 0, target_id, client_id, flags,
                     0u128, 0, 0, STATUS_OK, &[],
-                    schema_for_encode, None, Some(&*batch), prebuilt,
+                    schema_for_encode, None, Some(&*batch), prebuilt, &[],
                 );
             });
             return None;
@@ -1054,11 +1112,11 @@ impl WorkerProcess {
 
     fn send_error(&self, error_msg: &str, request_id: u64) {
         let msg = error_msg.as_bytes();
-        let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None);
+        let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, 0, 0, 0,
-                0u128, 0, request_id, STATUS_ERROR, msg, None, None, None, None,
+                0u128, 0, request_id, STATUS_ERROR, msg, None, None, None, None, &[],
             );
         });
     }
@@ -1221,6 +1279,7 @@ impl WorkerProcess {
         self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
 
         for fd in dedup_dirfds(dir_inodes) {
+            // `fd` is the Table's persistent dirfd; fsync but do NOT close it.
             if unsafe { libc::fsync(fd) } < 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(format!("dir fsync failed: {}", err));
@@ -1303,12 +1362,12 @@ impl WorkerProcess {
         }
 
         let schema = batch.schema;
-        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None);
+        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None, &[]);
         self.w2m_writer.send_encoded(sz, tick_request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
                 source_id as u128, 0, tick_request_id, STATUS_OK, &[],
-                schema.as_ref(), None, Some(batch), None,
+                schema.as_ref(), None, Some(batch), None, &[],
             );
         });
 
@@ -1393,7 +1452,8 @@ mod tests {
 
     #[test]
     fn test_dedup_dirfds_removes_duplicates() {
-        // Same (dev, ino) keeps only the first fd encountered after sort.
+        // The fds are borrowed Table dirfds, NOT owned by the flush, so
+        // dedup_dirfds must NOT close them — it only deduplicates by (dev, ino).
         let inodes = vec![
             (1u64, 10u64, 3i32),
             (1u64, 10u64, 7i32),  // duplicate of (1,10)

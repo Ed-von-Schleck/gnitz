@@ -44,6 +44,28 @@ impl SchemaColumn {
 /// be handled via the raw-bytes accessors and `compare_pk_bytes`.
 pub const NARROW_PK_MAX_BYTES: usize = 16;
 
+/// Reassemble a wide PK's full byte image from its wire split: the low
+/// `NARROW_PK_MAX_BYTES` carried as a `u128` plus the `extra` tail (PK bytes
+/// `16..stride`). This is the inverse of `PkTuple::split_wire` and the single
+/// home for the seek-path join contract shared by the master partition router
+/// and the worker SEEK handler. Returns a `MAX_PK_BYTES` buffer whose `..stride`
+/// is the key; errors if `extra` is shorter than the wide suffix `stride - 16`.
+/// Callers must only invoke this for wide PKs (`pk_is_wide()`, `stride > 16`).
+pub fn assemble_wide_pk(low: u128, extra: &[u8], stride: usize) -> Result<[u8; MAX_PK_BYTES], String> {
+    debug_assert!(stride > NARROW_PK_MAX_BYTES, "assemble_wide_pk: narrow stride {stride}");
+    let needed = stride - NARROW_PK_MAX_BYTES;
+    if extra.len() < needed {
+        return Err(format!(
+            "wide PK stride {stride} requires {needed} extra bytes, got {}",
+            extra.len()
+        ));
+    }
+    let mut buf = [0u8; MAX_PK_BYTES];
+    buf[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
+    buf[NARROW_PK_MAX_BYTES..stride].copy_from_slice(&extra[..needed]);
+    Ok(buf)
+}
+
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
 /// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
 /// "this slot refers to a PK column, not a payload column". Using
@@ -589,31 +611,6 @@ pub(crate) fn compare_german_strings(
     }
 }
 
-/// Copy a German String from raw 16-byte struct + blob base ptr into the output.
-/// Returns the relocated 16-byte German string struct; the caller must append it
-/// to its column buffer.
-///
-/// # Safety
-/// `src_blob_ptr`, when non-null, must point to valid memory for at least
-/// `old_offset + length` bytes, where `length` and `old_offset` are read from
-/// the first 16 bytes of `src`.
-pub unsafe fn write_string_from_raw(
-    blob: &mut Vec<u8>,
-    src: &[u8],
-    src_blob_ptr: *const u8,
-) -> [u8; 16] {
-    let (mut dest, is_long) = prep_german_string_copy(src);
-    if is_long {
-        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-        assert!(!src_blob_ptr.is_null(), "write_string_from_raw: long string but src_blob_ptr is null");
-        let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
-        let src_data = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(old_offset), length) };
-        let new_offset = blob.len();
-        blob.extend_from_slice(src_data);
-        dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-    }
-    dest
-}
 
 #[cfg(test)]
 mod tests {

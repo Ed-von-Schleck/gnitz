@@ -192,34 +192,57 @@ fn test_compound_pk_five_columns_rejected() {
 }
 
 #[test]
-fn test_compound_pk_stride_12_rejected() {
-    // (U64, U32) → stride 12, not in {1,2,4,8,16}.
+fn test_compound_pk_stride_12_accepted() {
+    // (U64, U32) → stride 12. Narrow (≤ 16) but non-power-of-two: it widens to
+    // a `u128` fast key via `widen_pk_le`'s zero-extend arm, so it is admitted.
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE TABLE pk_stride12 (a BIGINT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))"
-    ));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("stride"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE pk_stride12 (a BIGINT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))"
+        ).unwrap();
     }
+    let s = schema_after_create(&mut client, &sn, "pk_stride12");
+    assert_eq!(s.pk_count(), 2);
+    assert_eq!(s.pk_stride(), 12);
 }
 
 #[test]
-fn test_compound_pk_stride_24_rejected() {
-    // Three U64s → stride 24, not in {1,2,4,8,16}.
+fn test_compound_pk_stride_24_accepted() {
+    // Three U64s → stride 24. Wide (> 16): routes through the byte-path
+    // cursor/merge accessors. This is the first stride the narrow `u128` key
+    // cannot hold, so it is the canonical wide-PK acceptance case.
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE TABLE pk_stride24 (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, \
-         PRIMARY KEY (a, b, c))"
-    ));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("stride"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE pk_stride24 (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, \
+             PRIMARY KEY (a, b, c))"
+        ).unwrap();
     }
+    let s = schema_after_create(&mut client, &sn, "pk_stride24");
+    assert_eq!(s.pk_count(), 3);
+    assert_eq!(s.pk_stride(), 24);
+}
+
+#[test]
+fn test_compound_pk_stride_64_accepted() {
+    // Four U128s → stride 64, the widest a 4-column PK can reach (the count cap
+    // bounds it below MAX_PK_BYTES = 80). Wide byte-path, maximal width.
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE pk_stride64 (a UUID, b UUID, c UUID, d UUID, payload BIGINT, \
+             PRIMARY KEY (a, b, c, d))"
+        ).unwrap();
+    }
+    let s = schema_after_create(&mut client, &sn, "pk_stride64");
+    assert_eq!(s.pk_count(), 4);
+    assert_eq!(s.pk_stride(), 64);
 }
 
 #[test]

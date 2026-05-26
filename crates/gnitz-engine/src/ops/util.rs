@@ -52,20 +52,6 @@ pub(super) fn write_string_from_batch(
     output.extend_col(out_pi, &cell);
 }
 
-/// Copy a German String from raw 16-byte struct + blob base ptr into the output.
-/// Returns the relocated 16-byte German string struct.
-///
-/// # Safety
-/// See [`crate::schema::write_string_from_raw`].
-pub unsafe fn write_string_from_raw(
-    blob: &mut Vec<u8>,
-    src: &[u8],
-    src_blob_ptr: *const u8,
-) -> [u8; 16] {
-    // SAFETY: caller upholds the same pointer validity contract.
-    unsafe { crate::schema::write_string_from_raw(blob, src, src_blob_ptr) }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -793,3 +793,33 @@ fn test_seek_by_index_orphan_entry_terminates() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── UNIQUE index on STRING/BLOB rejected at DDL ──────────────────────────
+
+#[test]
+fn test_create_unique_index_on_string_blob_rejected() {
+    let dir = temp_dir("uidx_string_reject");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let blob_col = ColumnDef {
+        name: "data".into(), type_code: type_code::BLOB,
+        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+    };
+    let cols = vec![u64_col_def("id"), str_col_def("name"), blob_col];
+    engine.create_table("public.t", &cols, &[0], false).unwrap();
+
+    // UNIQUE on STRING/BLOB hits the dedicated unique-index guard first, which
+    // has its own specific message (distinct from the non-unique gate below).
+    let e_str = engine.create_index("public.t", "name", true).unwrap_err();
+    assert!(e_str.contains("UNIQUE index on STRING or BLOB"), "got: {e_str}");
+    let e_blob = engine.create_index("public.t", "data", true).unwrap_err();
+    assert!(e_blob.contains("UNIQUE index on STRING or BLOB"), "got: {e_blob}");
+
+    // Non-unique secondary indexes on STRING/BLOB are also rejected, by the
+    // pre-existing get_index_key_type gate (these column types have no
+    // collision-free u128 key representation for ordered index seeks).
+    assert!(engine.create_index("public.t", "name", false).is_err());
+    assert!(engine.create_index("public.t", "data", false).is_err());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -9,7 +9,7 @@ use crate::storage::{
     compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
 };
 
-use super::util::{write_string_from_batch, write_string_from_raw};
+use super::util::write_string_from_batch;
 
 // ---------------------------------------------------------------------------
 // Anti-join delta-trace
@@ -477,24 +477,25 @@ fn write_join_row(
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns (from cursor public API)
-    let right_blob = right_cursor.blob_ptr();
+    let right_blob = right_cursor.blob_slice();  // &[u8], bounds carried
     for (rpi, ci, col) in right_schema.payload_columns() {
         let cs = col.size() as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
             output.fill_col_zero(out_pi, cs);
-        } else if col.type_code == TYPE_STRING {
+        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
             let ptr = right_cursor.col_ptr(ci, 16);
             if ptr.is_null() {
                 output.fill_col_zero(out_pi, 16);
             } else {
-                // SAFETY: ptr is a valid col_ptr (non-null checked above);
-                // right_blob covers the full blob of the right cursor entry.
-                let dest = unsafe {
-                    let src = std::slice::from_raw_parts(ptr, 16);
-                    write_string_from_raw(&mut output.blob, src, right_blob)
-                };
+                // SAFETY: ptr is a valid col_ptr (non-null checked above) to a
+                // 16-byte German-string struct; relocate_german_string_vec
+                // bounds-checks the blob offset against right_blob.
+                let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
+                let dest = crate::schema::relocate_german_string_vec(
+                    src, right_blob, &mut output.blob, None,
+                );
                 output.extend_col(out_pi, &dest);
             }
         } else {

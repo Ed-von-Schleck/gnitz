@@ -279,16 +279,18 @@ fn execute_create_table(
             )));
         }
     }
-    // Engine cursors project the PK region to `u128` via
-    // `storage::batch::widen_pk_le`, which panics on any stride outside
-    // {1, 2, 4, 8, 16}. Single-PK tables always satisfy this because every
-    // column type's `wire_stride()` is already in that set.
+    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` fast
+    // key; wider compound PKs (stride > 16, e.g. three `U64`s = 24) route
+    // through the byte-path cursor/merge accessors. The 4-column cap above
+    // bounds a valid PK at 64 bytes; MAX_PK_BYTES is the ceiling. The engine
+    // re-validates the same bound in `validate_pk_cols`.
     let pk_stride: usize = pk_indices.iter()
         .map(|&i| cols[i as usize].type_code.wire_stride())
         .sum();
-    if !matches!(pk_stride, 1 | 2 | 4 | 8 | 16) {
+    if pk_stride == 0 || pk_stride > gnitz_core::MAX_PK_BYTES {
         return Err(GnitzSqlError::Unsupported(format!(
-            "Compound PRIMARY KEY stride must be 1/2/4/8/16 bytes, got {pk_stride}"
+            "PRIMARY KEY total stride must be 1..={} bytes, got {pk_stride}",
+            gnitz_core::MAX_PK_BYTES
         )));
     }
 

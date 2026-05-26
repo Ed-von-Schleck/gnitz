@@ -336,12 +336,13 @@ pub(crate) fn encode_ctrl_block_direct(
     request_id: u64,
     status: u32,
     error_msg: &[u8],
+    seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
-    if !error_msg.is_empty() {
+    if !error_msg.is_empty() || !seek_pk_extra.is_empty() {
         return encode_ctrl_block_ipc(
             out, offset, target_id, client_id, wire_flags,
-            seek_pk, seek_col_idx, request_id, status, error_msg, &[], checksum,
+            seek_pk, seek_col_idx, request_id, status, error_msg, seek_pk_extra, checksum,
         );
     }
     let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
@@ -383,13 +384,18 @@ pub fn wire_size(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
     prebuilt_schema_block: Option<&[u8]>,
+    seek_pk_extra: &[u8],
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
-    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+    let err_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
     } else { 0 };
+    let pk_extra_blob = if seek_pk_extra.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+        seek_pk_extra.len()
+    } else { 0 };
+    let ctrl_blob = err_blob + pk_extra_blob;
     let mut total = if ctrl_blob == 0 {
         CTRL_BLOCK_SIZE_NO_BLOB
     } else {
@@ -432,12 +438,12 @@ pub fn encode_wire(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
 ) -> Vec<u8> {
-    let sz = wire_size(status, error_msg, schema, col_names, data_batch, None);
+    let sz = wire_size(status, error_msg, schema, col_names, data_batch, None, &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0, target_id, client_id, flags,
         seek_pk, seek_col_idx, request_id,
-        status, error_msg, schema, col_names, data_batch, None,
+        status, error_msg, schema, col_names, data_batch, None, &[],
     );
     buf
 }
@@ -466,11 +472,12 @@ pub fn encode_wire_into(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
     prebuilt_schema_block: Option<&[u8]>,
+    seek_pk_extra: &[u8],
 ) -> usize {
     encode_wire_into_impl(
         out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
         request_id, status, error_msg, schema, col_names, data_batch,
-        prebuilt_schema_block, true,
+        prebuilt_schema_block, seek_pk_extra, true,
     )
 }
 
@@ -493,11 +500,12 @@ pub fn encode_wire_into_ipc(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
     prebuilt_schema_block: Option<&[u8]>,
+    seek_pk_extra: &[u8],
 ) -> usize {
     encode_wire_into_impl(
         out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
         request_id, status, error_msg, schema, col_names, data_batch,
-        prebuilt_schema_block, false,
+        prebuilt_schema_block, seek_pk_extra, false,
     )
 }
 
@@ -579,7 +587,7 @@ pub fn encode_wire_into_range(
 
     let written = encode_ctrl_block_direct(
         out, offset, target_id, client_id, wire_flags,
-        0u128, 0, request_id, status, &[], false,
+        0u128, 0, request_id, status, &[], &[], false,
     );
     let mut pos = offset + written;
 
@@ -619,6 +627,7 @@ fn encode_wire_into_impl(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&Batch>,
     prebuilt_schema_block: Option<&[u8]>,
+    seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
@@ -634,7 +643,7 @@ fn encode_wire_into_impl(
     }
 
     let written = encode_ctrl_block_direct(out, offset, target_id, client_id, wire_flags,
-                                           seek_pk, seek_col_idx, request_id, status, error_msg, checksum);
+                                           seek_pk, seek_col_idx, request_id, status, error_msg, seek_pk_extra, checksum);
     let mut pos = offset + written;
 
     if has_schema {
@@ -675,10 +684,8 @@ pub struct DecodedControl {
     pub seek_col_idx: u64,
     pub request_id: u64,
     pub error_msg: Vec<u8>,
-    /// PK region bytes `16..` for a wide PK; empty for `pk_stride <= 16`
-    /// (the universal case until a wide-PK send path exists).
-    /// No production reader exists yet; activated by later compound-PK work.
-    #[allow(dead_code)]
+    /// PK region bytes `16..` for a wide PK; empty for `pk_stride <= 16`.
+    /// Read by the worker SEEK dispatch to reconstruct the full wide-PK key.
     pub seek_pk_extra: Vec<u8>,
     /// Total byte length of this control WAL block (read from the WAL size
     /// field at offset WAL_OFF_SIZE). Callers that need to advance past the
@@ -748,7 +755,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // Read a u64 from a fixed-width u64 region (exactly 8 bytes for 1 row).
     let read_u64 = |r: usize| -> Result<u64, &'static str> {
         let (off, sz) = wal_dir_entry(data, r);
-        if sz < 8 || off + 8 > data.len() {
+        if sz < 8 || off.saturating_add(8) > data.len() {
             return Err("control block region out of bounds");
         }
         Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
@@ -757,7 +764,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // Read a u128 from a fixed-width u128 region (exactly 16 bytes for 1 row).
     let read_u128 = |r: usize| -> Result<u128, &'static str> {
         let (off, sz) = wal_dir_entry(data, r);
-        if sz < 16 || off + 16 > data.len() {
+        if sz < 16 || off.saturating_add(16) > data.len() {
             return Err("control block u128 region out of bounds");
         }
         Ok(u128::from_le_bytes(data[off..off + 16].try_into().unwrap()))
@@ -782,7 +789,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // path exists) skip the lookup entirely, preserving the hot-path fast case.
     let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
         let (blob_off, blob_sz) = wal_dir_entry(data, ctrl::REGION_BLOB);
-        if blob_sz > 0 && blob_off + blob_sz <= data.len() {
+        if blob_sz > 0 && blob_off.saturating_add(blob_sz) <= data.len() {
             &data[blob_off..blob_off + blob_sz]
         } else {
             &[]
@@ -795,7 +802,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Vec::new()
     } else {
         let (err_off, err_sz) = wal_dir_entry(data, ctrl::REGION_ERROR_MSG);
-        if err_sz < 16 || err_off + 16 > data.len() {
+        if err_sz < 16 || err_off.saturating_add(16) > data.len() {
             return Err("error_msg region out of bounds");
         }
         let mut st = [0u8; 16];
@@ -808,7 +815,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Vec::new()
     } else {
         let (sx_off, sx_sz) = wal_dir_entry(data, ctrl::REGION_SEEK_PK_EXTRA);
-        if sx_sz < 16 || sx_off + 16 > data.len() {
+        if sx_sz < 16 || sx_off.saturating_add(16) > data.len() {
             return Err("seek_pk_extra region out of bounds");
         }
         let mut st = [0u8; 16];
@@ -879,7 +886,7 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     // physical row position, so an out-of-order/gap/duplicate col_idx
     // would silently re-route columns to the wrong type.
     let (pk_off, pk_sz) = wal_dir_entry(data, 0);
-    if pk_sz < count * 8 || pk_off + pk_sz > data.len() { return Err("schema col_idx region OOB"); }
+    if pk_sz < count * 8 || pk_off.saturating_add(pk_sz) > data.len() { return Err("schema col_idx region OOB"); }
     let pk_data = &data[pk_off..pk_off + count * 8];
     for i in 0..count {
         let v = u64::from_le_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -891,8 +898,8 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     let (tc_off, tc_sz) = wal_dir_entry(data, 3);
     let (fl_off, fl_sz) = wal_dir_entry(data, 4);
 
-    if tc_sz < count * 8 || tc_off + tc_sz > data.len() { return Err("schema type_code region OOB"); }
-    if fl_sz < count * 8 || fl_off + fl_sz > data.len() { return Err("schema flags region OOB"); }
+    if tc_sz < count * 8 || tc_off.saturating_add(tc_sz) > data.len() { return Err("schema type_code region OOB"); }
+    if fl_sz < count * 8 || fl_off.saturating_add(fl_sz) > data.len() { return Err("schema flags region OOB"); }
 
     let type_data  = &data[tc_off..tc_off + count * 8];
     let flags_data = &data[fl_off..fl_off + count * 8];
@@ -967,7 +974,7 @@ pub fn peek_routing_header(data: &[u8]) -> Result<(u64, u64), &'static str> {
 
     let read_u64 = |r: usize| -> Result<u64, &'static str> {
         let (off, sz) = wal_dir_entry(data, r);
-        if sz < 8 || off + 8 > data.len() {
+        if sz < 8 || off.saturating_add(8) > data.len() {
             return Err("control block region out of bounds");
         }
         Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))

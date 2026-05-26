@@ -142,9 +142,9 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         String::new()
     } else {
         match &batch.columns[ctrl::COL_ERROR_MSG] {
-            ColData::Strings(v) => match &v[0] {
-                Some(s) => s.clone(),
-                None    => String::new(),
+            ColData::Strings(v) => match v.get(0) {
+                Some(Some(s)) => s.clone(),
+                _ => String::new(),
             },
             _ => return Err(ProtocolError::DecodeError(
                 "control block error_msg column is not Strings".into()
@@ -157,7 +157,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         Vec::new()
     } else {
         match &batch.columns[ctrl::COL_SEEK_PK_EXTRA] {
-            ColData::Bytes(v) => v[0].clone().unwrap_or_default(),
+            ColData::Bytes(v) => v.get(0).cloned().flatten().unwrap_or_default(),
             _ => return Err(ProtocolError::DecodeError(
                 "control block seek_pk_extra column is not Bytes".into()
             )),

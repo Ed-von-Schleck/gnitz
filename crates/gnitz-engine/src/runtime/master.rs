@@ -27,7 +27,7 @@ use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
-use crate::storage::{Batch, ConsolidatedBatch, partition_for_key, PkBuf};
+use crate::storage::{Batch, ConsolidatedBatch, partition_for_key, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
     worker_for_partition, with_worker_indices,
@@ -58,7 +58,7 @@ struct PipelinedCheck {
     target_id: i64,
     flags: u32,
     col_hint: u64,
-    payload: CheckPayload,
+    payload: Option<CheckPayload>,
     schema: SchemaDescriptor,
 }
 
@@ -358,6 +358,7 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
         unicast_worker: i32,
+        seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         let nw = self.num_workers;
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
@@ -365,6 +366,7 @@ impl MasterDispatcher {
         self.write_group_with_req_ids(
             target_id, lsn, sal_flags, 0, worker_batches, schema, col_names,
             seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0, None,
+            seek_pk_extra,
         )
     }
 
@@ -390,6 +392,7 @@ impl MasterDispatcher {
         unicast_worker: i32,
         client_id: u64,
         prebuilt_schema_block: Option<&[u8]>,
+        seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         let (name_refs, n) = col_names_as_refs(col_names);
         let col_names_opt = if n == 0 || prebuilt_schema_block.is_some() {
@@ -402,7 +405,7 @@ impl MasterDispatcher {
             target_id as u32, lsn, sal_flags, wire_flags, worker_batches,
             schema, col_names_opt,
             seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
-            prebuilt_schema_block,
+            prebuilt_schema_block, seek_pk_extra,
         )
     }
 
@@ -481,7 +484,7 @@ impl MasterDispatcher {
         request_id: u64,
     ) -> Result<(), String> {
         self.write_group(target_id, lsn, flags, worker_batches, schema, col_names,
-                         seek_pk, seek_col_idx, request_id, -1)?;
+                         seek_pk, seek_col_idx, request_id, -1, &[])?;
         self.signal_all();
         Ok(())
     }
@@ -719,13 +722,25 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, pk: u128,
+        target_id: i64, pk: u128, seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
-        let worker = unsafe {
-            worker_for_partition(partition_for_key(pk), (*disp_ptr).num_workers)
+        let num_workers = unsafe { (*disp_ptr).num_workers };
+        let schema = unsafe {
+            (*(*disp_ptr).catalog).get_schema_desc(target_id)
+                .ok_or_else(|| format!("seek: table {} not found", target_id))?
+        };
+        let stride = schema.pk_stride() as usize;
+        let worker = if schema.pk_is_wide() {
+            let full_pk_buf = crate::schema::assemble_wide_pk(pk, seek_pk_extra, stride)
+                .map_err(|e| format!("seek: table {target_id}: {e}"))?;
+            worker_for_partition(partition_for_pk_bytes(&full_pk_buf[..stride]), num_workers)
+        } else {
+            // Narrow path: same partition as partition_for_pk_bytes on the same
+            // bytes (proven by partition_for_pk_bytes_narrow_invariance).
+            worker_for_partition(partition_for_key(pk), num_workers)
         };
         single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
-                            worker, pk, 0, "seek").await
+                            worker, pk, 0, "seek", seek_pk_extra).await
     }
 
     pub async fn fan_out_seek_by_index_async(
@@ -743,7 +758,7 @@ impl MasterDispatcher {
             let worker = cached as usize;
             return single_worker_async(
                 disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK_BY_INDEX,
-                worker, key, col_idx as u64, "seek_by_index",
+                worker, key, col_idx as u64, "seek_by_index", &[],
             ).await;
         }
 
@@ -754,7 +769,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
-                key, col_idx as u64, req_ids, -1, 0, None,
+                key, col_idx as u64, req_ids, -1, 0, None, &[],
             )
         }).await?;
 
@@ -772,6 +787,52 @@ impl MasterDispatcher {
             }
         }
         Ok(slots.swap_remove(data_idx.unwrap_or(0)))
+    }
+
+    /// SELECT-path index lookup: broadcast to ALL workers and MERGE every
+    /// matching base row into one batch.
+    ///
+    /// A non-unique indexed value matches rows scattered across workers (the
+    /// per-key routing cache is only populated for unique indexes), so unlike
+    /// `fan_out_seek_by_index_async` (which returns a single worker's slot, used
+    /// by the UPSERT identity check where the index is unique) this must
+    /// aggregate. Returns the merged base rows, or `None` when no row matches.
+    pub async fn fan_out_seek_by_index_collect_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64, col_idx: u32, key: u128,
+    ) -> Result<Option<Batch>, String> {
+        let (slots, _req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+            let (schema, col_names) = disp.get_schema_and_names(target_id);
+            let lsn = disp.next_lsn();
+            disp.write_group_with_req_ids(
+                target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
+                key, col_idx as u64, req_ids, -1, 0, None, &[],
+            )
+        }).await?;
+
+        let mut acc: Option<Batch> = None;
+        for (w, slot) in slots.iter().enumerate() {
+            let ctrl = peek_control_block(slot.bytes())
+                .map_err(|e| format!("seek_by_index: worker {}: {}", w, e))?;
+            if ctrl.status != 0 {
+                return Err(format!(
+                    "worker {}: seek_by_index: {}",
+                    w, String::from_utf8_lossy(&ctrl.error_msg)));
+            }
+            if ctrl.flags & FLAG_HAS_DATA == 0 { continue; }
+            let decoded = wire::decode_wire_ipc(slot.bytes())
+                .map_err(|e| format!("seek_by_index: worker {}: decode: {}", w, e))?;
+            if let Some(b) = decoded.data_batch {
+                if b.count == 0 { continue; }
+                match acc.as_mut() {
+                    Some(a) => a.append_batch(&b, 0, b.count),
+                    None => acc = Some(b),
+                }
+            }
+        }
+        Ok(acc)
     }
 
     /// Fan out a SCAN to all workers, forward every response frame directly
@@ -798,7 +859,7 @@ impl MasterDispatcher {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
             disp.write_group_with_req_ids(
                 target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
-                0, 0, req_ids, -1, client_id, None,
+                0, 0, req_ids, -1, client_id, None, &[],
             )
         }).await?;
 
@@ -858,13 +919,13 @@ impl MasterDispatcher {
                 for (idx, check) in checks.iter().enumerate() {
                     let lsn = disp.next_lsn();
                     let req_slice = &rids[idx * nw..(idx + 1) * nw];
-                    match &check.payload {
+                    match check.payload.as_ref().expect("payload consumed") {
                         CheckPayload::Broadcast(batch) => {
                             let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
                             disp.write_group_with_req_ids(
                                 check.target_id, lsn, check.flags, 0, &refs,
                                 &check.schema, &[], 0, check.col_hint,
-                                req_slice, -1, 0, None,
+                                req_slice, -1, 0, None, &[],
                             )?;
                         }
                         CheckPayload::ScatterSource { source } => {
@@ -893,7 +954,7 @@ impl MasterDispatcher {
         ).await;
 
         let mut results: Vec<FxHashSet<PkBuf>> = checks.iter().map(|check| {
-            let cap = match &check.payload {
+            let cap = match check.payload.as_ref().expect("payload consumed") {
                 CheckPayload::Broadcast(b) => b.count,
                 CheckPayload::ScatterSource { source } => source.count,
             };
@@ -1063,7 +1124,7 @@ impl MasterDispatcher {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(tid);
         self.write_group_with_req_ids(
             tid, lsn, FLAG_TICK, 0, &[], &schema, &[],
-            0, 0, req_ids, -1, 0, Some(schema_block.as_slice()),
+            0, 0, req_ids, -1, 0, Some(schema_block.as_slice()), &[],
         )
     }
 
@@ -1321,19 +1382,28 @@ impl MasterDispatcher {
                 (fk_col_idx, parent_table_id, parent_col_idx, col_type, parent_schema)
             };
 
-            let payload_col = source_schema.payload_idx(fk_col_idx);
-            let col_size = source_schema.columns[fk_col_idx].size() as usize;
+            // The FK column may itself be a PK column of the child table (e.g.
+            // `id BIGINT PRIMARY KEY REFERENCES parent(pid)`). In that case it
+            // has no payload slot; `payload_idx` would return the PK sentinel
+            // and `col_data(sentinel)` indexes out of bounds. Read the value
+            // from the PK region instead.
+            let is_fk_pk_col = source_schema.is_pk_col(fk_col_idx);
+            let payload_col  = if is_fk_pk_col { usize::MAX } else { source_schema.payload_idx(fk_col_idx) };
+            let pk_field_off = if is_fk_pk_col { source_schema.pk_byte_offset(fk_col_idx) as usize } else { 0 };
+            let col_size     = source_schema.columns[fk_col_idx].size() as usize;
 
             let mut seen: FxHashSet<u128> = FxHashSet::default();
             let mut keys: Vec<u128> = Vec::new();
 
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
-                let null_word = batch.get_null_word(i);
-                if null_word & (1u64 << payload_col) != 0 { continue; }
-
-                let col_data = batch.col_data(payload_col);
-                let fk_key = promote_to_index_key(col_data, i * col_size, col_size, col_type);
+                let fk_key = if is_fk_pk_col {
+                    promote_to_index_key(batch.get_pk_bytes(i), pk_field_off, col_size, col_type)
+                } else {
+                    let null_word = batch.get_null_word(i);
+                    if null_word & (1u64 << payload_col) != 0 { continue; }
+                    promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type)
+                };
                 if seen.insert(fk_key) {
                     keys.push(fk_key);
                 }
@@ -1356,7 +1426,7 @@ impl MasterDispatcher {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
                     col_hint: 0,
-                    payload: CheckPayload::ScatterSource { source: check_batch },
+                    payload: Some(CheckPayload::ScatterSource { source: check_batch }),
                     schema: parent_schema,
                 });
             } else {
@@ -1374,7 +1444,7 @@ impl MasterDispatcher {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
                     col_hint: (parent_col_idx as u64) + 1,
-                    payload: CheckPayload::Broadcast(check_batch),
+                    payload: Some(CheckPayload::Broadcast(check_batch)),
                     schema: idx_schema,
                 });
             }
@@ -1476,7 +1546,7 @@ impl MasterDispatcher {
                         target_id: child_tid,
                         flags: FLAG_HAS_PK,
                         col_hint: (fk_col_idx as u64) + 1,
-                        payload: CheckPayload::Broadcast(check_batch),
+                        payload: Some(CheckPayload::Broadcast(check_batch)),
                         schema: idx_schema,
                     });
                 }
@@ -1503,7 +1573,7 @@ impl MasterDispatcher {
                 target_id,
                 flags: FLAG_HAS_PK,
                 col_hint: 0,
-                payload: CheckPayload::ScatterSource { source: check_batch },
+                payload: Some(CheckPayload::ScatterSource { source: check_batch }),
                 schema: source_schema,
             });
         }
@@ -1755,7 +1825,7 @@ impl MasterDispatcher {
                         target_id,
                         flags: FLAG_HAS_PK,
                         col_hint: (col_idx as u64) + 1,
-                        payload: CheckPayload::Broadcast(chk_batch),
+                        payload: Some(CheckPayload::Broadcast(chk_batch)),
                         schema: idx_schema,
                     });
                 }
@@ -1771,7 +1841,7 @@ impl MasterDispatcher {
                     target_id,
                     flags: FLAG_HAS_PK,
                     col_hint: (col_idx as u64) + 1,
-                    payload: CheckPayload::Broadcast(u_batch),
+                    payload: Some(CheckPayload::Broadcast(u_batch)),
                     schema: idx_schema,
                 });
             }
@@ -1786,7 +1856,7 @@ impl MasterDispatcher {
                 target_id: child_tid,
                 flags: FLAG_HAS_PK,
                 col_hint: (fk_col as u64) + 1,
-                payload: CheckPayload::Broadcast(chk_batch),
+                payload: Some(CheckPayload::Broadcast(chk_batch)),
                 schema: idx_schema,
             });
         }
@@ -1832,7 +1902,15 @@ impl MasterDispatcher {
                         // occupied holds index-table PKs (the indexed column) as
                         // PkBuf; look up the u128 key via Borrow<[u8]>.
                         let kb = key_pk.to_le_bytes();
-                        if !occupied.contains(&kb[..*idx_pk_stride as usize]) { continue; }
+                        if *idx_pk_stride as usize <= 16 {
+                            if !occupied.contains(&kb[..*idx_pk_stride as usize]) { continue; }
+                        } else {
+                            // Wide index PK: kb is only 16 bytes; zero-pad the
+                            // source-PK suffix to the full stride for the lookup.
+                            let mut check_buf = [0u8; crate::schema::MAX_PK_BYTES];
+                            check_buf[..16].copy_from_slice(&kb);
+                            if !occupied.contains(&check_buf[..*idx_pk_stride as usize]) { continue; }
+                        }
                         pk_is.push(pk_i);
                         // async fn futures are !Unpin; box-pin for join_all_unpin.
                         futs.push(Box::pin(Self::fan_out_seek_by_index_async(
@@ -1907,7 +1985,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 table_id, lsn, 0, 0, &[], &schema, &col_names,
-                0, 0, req_ids, -1, 0, None,
+                0, 0, req_ids, -1, 0, None, &[],
             )
         }).await?;
 
@@ -2028,7 +2106,7 @@ impl MasterDispatcher {
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0, None,
+            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0, None, &[],
         )
     }
 
@@ -2199,6 +2277,7 @@ async fn single_worker_async(
     worker: usize,
     seek_pk: u128, seek_col_idx: u64,
     op_name: &'static str,
+    seek_pk_extra: &[u8],
 ) -> Result<W2mSlot, String> {
     let req_id = {
         let _guard = sal_excl.lock().await;
@@ -2208,7 +2287,7 @@ async fn single_worker_async(
             let req_id = reactor.alloc_scan_request_id();
             let lsn = disp.next_lsn();
             disp.write_group(target_id, lsn, flags, &[], &schema, &col_names,
-                             seek_pk, seek_col_idx, req_id, worker as i32)?;
+                             seek_pk, seek_col_idx, req_id, worker as i32, seek_pk_extra)?;
             disp.signal_one(worker);
             req_id
         }
@@ -2317,7 +2396,19 @@ fn build_check_batch(
     keys: &[u128],
     pooled: Option<Batch>,
 ) -> Batch {
-    build_check_batch_with(schema, keys, pooled, |b, &k| b.extend_pk(k))
+    if schema.pk_is_wide() {
+        // Wide index PK (e.g. indexed_col + wide source PK). The keys carry the
+        // indexed column value as a u128; only the first 16 bytes are meaningful
+        // (the source-PK suffix is zero-padded). stride > 16 is guaranteed here.
+        let stride = schema.pk_stride() as usize;
+        build_check_batch_with(schema, keys, pooled, |b, &k| {
+            let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
+            buf[..16].copy_from_slice(&k.to_le_bytes());
+            b.extend_pk_bytes(&buf[..stride])
+        })
+    } else {
+        build_check_batch_with(schema, keys, pooled, |b, &k| b.extend_pk(k))
+    }
 }
 
 /// Convert a narrow-PK `u128` to its byte-form `PkBuf` (low `pk_stride`
@@ -2344,6 +2435,12 @@ fn build_check_batch_pkbuf(
 /// Return `batch` to `disp.check_batch_pool[target_id]` and cap the pool depth.
 fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, batch: Batch) {
     const POOL_MAX_DEPTH: usize = 4;
+    const MAX_RETAIN_BYTES: usize = 512 * 1024;
+    // A single large validation batch (bulk load, large FK check) would pin its
+    // allocation in the pool indefinitely — Batch::clear() doesn't shrink.
+    if batch.total_bytes() > MAX_RETAIN_BYTES {
+        return;  // let the allocator reclaim the oversized buffer
+    }
     let pool = disp.check_batch_pool.entry(target_id).or_default();
     pool.push(batch);
     if pool.len() > POOL_MAX_DEPTH {
@@ -2351,18 +2448,18 @@ fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, batch: Batch
     }
 }
 
-/// Take each `Batch` out of `checks` (leaving a zero-allocation sentinel),
-/// push it into `disp.check_batch_pool[target_id]`, and cap the pool depth.
-/// Called after `execute_pipeline_async` to recycle allocations.
+/// Take each `Batch` out of `checks` via `Option::take` (no pool round-trip for
+/// a sentinel), push it into `disp.check_batch_pool[target_id]`, and cap the
+/// pool depth. Called after `execute_pipeline_async` to recycle allocations.
 fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedCheck]) {
     for check in checks.iter_mut() {
-        let target_id = check.target_id;
-        let sentinel = Batch::empty_with_schema(&check.schema);
-        let batch = match &mut check.payload {
-            CheckPayload::Broadcast(b) => std::mem::replace(b, sentinel),
-            CheckPayload::ScatterSource { source } => std::mem::replace(source, sentinel),
-        };
-        recycle_check_batch(disp, target_id, batch);
+        if let Some(payload) = check.payload.take() {
+            let batch = match payload {
+                CheckPayload::Broadcast(b) => b,
+                CheckPayload::ScatterSource { source } => source,
+            };
+            recycle_check_batch(disp, check.target_id, batch);
+        }
     }
 }
 

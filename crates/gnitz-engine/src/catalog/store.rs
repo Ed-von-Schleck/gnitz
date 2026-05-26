@@ -413,6 +413,13 @@ impl CatalogEngine {
         // `seek_first_positive_with_prefix` inside the loop would re-seek and
         // re-find the same entry forever — an orphaned index entry (positive
         // weight, no source row) would spin.
+        // A non-unique indexed value matches multiple rows; accumulate ALL of
+        // them on this worker, not just the first. (A unique index yields one
+        // match, so this is equivalent there.) Index entries co-locate with
+        // their source rows (partitioned by source PK), so a value's matches can
+        // be spread across workers: this returns one worker's partial set and
+        // the master (`fan_out_seek_by_index_collect_async`) merges across all.
+        let mut result: Option<Batch> = None;
         let mut hit = cursor.cursor.seek_first_positive_with_prefix(prefix);
         while hit {
             // Copy the source PK out of the index PK suffix into a fixed buffer
@@ -425,12 +432,15 @@ impl CatalogEngine {
                 &current_pk[idx_key_size..idx_key_size + src_pk_stride],
             );
             if let Some(batch) = self.seek_family_bytes(table_id, &src_pk_buf[..src_pk_stride])? {
-                return Ok(Some(batch));
+                match result.as_mut() {
+                    Some(acc) => acc.append_batch(&batch, 0, batch.count),
+                    None => result = Some(batch),
+                }
             }
             cursor.cursor.advance();
             hit = cursor.cursor.walk_to_positive_with_prefix(prefix);
         }
-        Ok(None)
+        Ok(result)
     }
 
     /// Flush a table's WAL.
@@ -617,6 +627,17 @@ impl CatalogEngine {
     /// Number of child tables that reference `parent_id` via FK.
     pub fn get_fk_children_count(&self, parent_id: i64) -> usize {
         self.caches.fk_by_parent.get(&parent_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// True if column `col_idx` of `table_id` is covered by a UNIQUE secondary
+    /// index. A unique index yields at most one match for any value, so a
+    /// SEEK_BY_INDEX can be unicast to a single worker; a non-unique index's
+    /// matches scatter across workers and must be merged.
+    pub fn index_col_is_unique(&self, table_id: i64, col_idx: u32) -> bool {
+        self.dag.tables.get(&table_id)
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
+            .map(|ic| ic.is_unique)
+            .unwrap_or(false)
     }
 
     /// True if the table has at least one unique secondary index circuit.
@@ -1032,7 +1053,14 @@ fn copy_cursor_cols_to_batch(
     src_schema: &SchemaDescriptor,
     project: &[u8],
 ) {
-    out.extend_pk(cursor.cursor.current_key);
+    // Wide-PK tables (stride > 16) can't represent the PK as a u128 fast key;
+    // copy the full byte image. Wide gather calls (FK/UPSERT/gather-family) are
+    // routed through *_bytes paths so the cursor holds the full PK bytes.
+    if src_schema.pk_is_wide() {
+        out.extend_pk_bytes(cursor.cursor.current_pk_bytes());
+    } else {
+        out.extend_pk(cursor.cursor.current_key);
+    }
     out.extend_weight(&1i64.to_le_bytes());
 
     let src_null = cursor.cursor.current_null_word;

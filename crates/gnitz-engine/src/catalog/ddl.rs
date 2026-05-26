@@ -246,6 +246,19 @@ impl CatalogEngine {
         let col_idx = col_defs.iter().position(|cd| cd.name == col_name)
             .ok_or("Column not found in owner")?;
 
+        // STRING and BLOB values cannot be reduced to a comparable u128 key
+        // without collision; the distributed uniqueness-check pipeline would
+        // silently bypass or falsely reject rows. (Non-unique FK indices use the
+        // xxhash-based extract_col_key path and are unaffected.)
+        if is_unique {
+            let tc = col_defs[col_idx].type_code;
+            if tc == crate::schema::type_code::STRING || tc == crate::schema::type_code::BLOB {
+                return Err(
+                    "UNIQUE index on STRING or BLOB columns is not supported".into()
+                );
+            }
+        }
+
         let index_name = make_secondary_index_name(schema_name, table_name, col_name);
         let index_id = self.allocate_index_id();
 

@@ -269,10 +269,10 @@ impl MemTable {
         }
     }
 
-    pub fn found_blob_ptr(&self) -> *const u8 {
+    pub fn found_blob_slice(&self) -> &[u8] {
         match self.found_entry() {
-            Some((run, _)) => run.blob.as_ptr(),
-            None => std::ptr::null(),
+            Some((run, _)) => &run.blob,
+            None => &[],
         }
     }
 

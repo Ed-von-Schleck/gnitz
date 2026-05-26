@@ -130,7 +130,7 @@ impl Connection {
             schema = schema.or(msg.schema);
             if let Some(batch) = msg.data_batch {
                 match data.as_mut() {
-                    Some(acc) => acc.extend_from(&batch),
+                    Some(acc) => acc.extend_from_owned(batch),
                     None => data = Some(batch),
                 }
             }
@@ -170,7 +170,9 @@ impl Connection {
         cache:     &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
         let msg = {
-            let hint = cache.peek(&target_id).map(|(s, v)| (s, *v));
+            // `get` (not `peek`) so a frequently-accessed schema refreshes its
+            // LRU recency and isn't evicted under memory pressure.
+            let hint = cache.get(&target_id).map(|(s, v)| (s as &_, *v));
             recv_message(self.sock.as_raw_fd(), hint, self.max_payload_len)?
         };
         // schema_batch is Some only when the schema block was physically in the frame;
@@ -243,7 +245,11 @@ impl Connection {
         key:      u128,
         cache:    &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, FLAG_SEEK_BY_INDEX, key, &[], col_idx, None, None)?;
+        // Embed the cached schema version so the server can omit the schema
+        // block on a warm-cache hit (matching roundtrip_push/scan).
+        let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
+        let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, cached_version);
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, key, &[], col_idx, None, None)?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }
@@ -255,7 +261,9 @@ impl Connection {
         cache:     &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
         let (low_16, extra) = pk.split_wire();
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, FLAG_SEEK, low_16, extra, 0, None, None)?;
+        let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
+        let flags = wire_flags_set_schema_version(FLAG_SEEK, cached_version);
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, low_16, extra, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
     }

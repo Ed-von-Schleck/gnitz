@@ -266,10 +266,10 @@ impl PartitionedTable {
         }
     }
 
-    pub fn found_blob_ptr(&self) -> *const u8 {
+    pub fn found_blob_slice(&self) -> &[u8] {
         match self.last_found_partition {
-            Some(local) => self.tables[local].found_blob_ptr(),
-            None => std::ptr::null(),
+            Some(local) => self.tables[local].found_blob_slice(),
+            None        => &[],
         }
     }
 

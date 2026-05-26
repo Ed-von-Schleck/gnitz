@@ -3008,12 +3008,12 @@ mod tests {
             // any of them under the resulting drain-refresh-arm
             // race pressure.
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
+                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None, &[],
                     );
                 });
             }
@@ -3113,12 +3113,12 @@ mod tests {
         assert!(pid >= 0);
         if pid == 0 {
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
                         buf, 0, 0, 0, 0,
-                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None,
+                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None, &[],
                     );
                 });
             }
@@ -3544,9 +3544,9 @@ mod tests {
 
         let writer   = W2mWriter::new(ptr, CAPACITY as u64);
         let receiver = W2mReceiver::new(vec![ptr]);
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         writer.send_encoded(sz, req_id, |buf| {
-            ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None);
+            ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[]);
         });
         let slot = receiver.try_read_slot(0).expect("scan slot");
         (slot, receiver, ptr, CAPACITY)

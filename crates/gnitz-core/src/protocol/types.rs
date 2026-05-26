@@ -538,6 +538,36 @@ impl ZSetBatch {
         }
     }
 
+    /// Like `extend_from` but consumes `other`, moving its String/Bytes buffers
+    /// instead of deep-cloning each value. O(n) pointer copies, zero heap
+    /// allocation for string/bytes content. Used in scan continuation loops.
+    pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
+        assert_eq!(
+            self.columns.len(), other.columns.len(),
+            "extend_from_owned: column count mismatch",
+        );
+        match (&mut self.pks, &mut other.pks) {
+            (PkColumn::U64s(a), PkColumn::U64s(b)) => a.append(b),
+            (PkColumn::U128s(a), PkColumn::U128s(b)) => a.append(b),
+            (PkColumn::Bytes { stride: sa, buf: a }, PkColumn::Bytes { stride: sb, buf: b }) => {
+                assert_eq!(sa, sb, "extend_from_owned: wide PK stride mismatch");
+                a.append(b);
+            }
+            _ => panic!("extend_from_owned: pk column type mismatch"),
+        }
+        self.weights.append(&mut other.weights);
+        self.nulls.append(&mut other.nulls);
+        for (a, b) in self.columns.iter_mut().zip(other.columns.iter_mut()) {
+            match (a, b) {
+                (ColData::Fixed(a), ColData::Fixed(b)) => a.append(b),
+                (ColData::Strings(a), ColData::Strings(b)) => a.append(b),
+                (ColData::Bytes(a), ColData::Bytes(b)) => a.append(b),
+                (ColData::U128s(a), ColData::U128s(b)) => a.append(b),
+                _ => panic!("extend_from_owned: column type mismatch"),
+            }
+        }
+    }
+
     /// Truncate all per-row vectors back to `n` rows. PK column and
     /// payload columns (including string/blob spill buffers) are kept
     /// consistent — used to roll back partially appended rows.
@@ -1059,6 +1089,40 @@ mod tests {
         let mut a = ZSetBatch::new(&schema1);
         let b = ZSetBatch::new(&schema2);
         a.extend_from(&b);
+    }
+
+    /// `extend_from_owned` (move) must produce byte-identical results to
+    /// `extend_from` (clone) for schemas with String and Bytes columns.
+    #[test]
+    fn test_extend_from_owned_matches_extend_from() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::Blob, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let build = |base: u128| {
+            let mut z = ZSetBatch::new(&schema);
+            {
+                let mut a = BatchAppender::new(&mut z, &schema);
+                a.add_row(base, 1).str_val("hello world is long enough").bytes_val(&[1, 2, 3, 4, 5]);
+                a.add_row(base + 1, -1).str_val("short").bytes_val(&[9, 9]);
+            }
+            z
+        };
+
+        // Reference path: clone-based extend_from.
+        let mut acc_ref = build(1);
+        acc_ref.extend_from(&build(10));
+
+        // Move-based extend_from_owned over identically-built inputs.
+        let mut acc_owned = build(1);
+        acc_owned.extend_from_owned(build(10));
+
+        assert_eq!(acc_ref, acc_owned, "extend_from_owned must match extend_from");
+        assert_eq!(acc_owned.len(), 4);
     }
 
     #[test]

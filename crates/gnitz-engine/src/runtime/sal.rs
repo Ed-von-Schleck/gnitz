@@ -624,6 +624,7 @@ impl SalWriter {
         unicast_worker: i32,
         client_id: u64,
         prebuilt_schema_block: Option<&[u8]>,
+        seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
@@ -641,7 +642,7 @@ impl SalWriter {
             let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
             worker_sizes[w] = wire_size(
                 STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
-                prebuilt_schema_block,
+                prebuilt_schema_block, seek_pk_extra,
             ) as u32;
         }
 
@@ -664,7 +665,7 @@ impl SalWriter {
                     slot, 0, target_id as u64, client_id, wire_flags,
                     seek_pk, seek_col_idx, req_ids[w],
                     STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
-                    prebuilt_schema_block,
+                    prebuilt_schema_block, seek_pk_extra,
                 );
                 debug_assert_eq!(written, wsz);
                 off += align8(wsz);
@@ -740,7 +741,7 @@ impl SalWriter {
             return self.write_group_direct(
                 target_id, lsn, sal_flags, wire_flags, &refs, schema, col_names_opt,
                 seek_pk, seek_col_idx, req_ids, unicast_worker, 0,
-                prebuilt_schema_block,
+                prebuilt_schema_block, &[],
             );
         }
 
@@ -811,7 +812,7 @@ impl SalWriter {
                 slot, 0,
                 target_id as u64, 0, full_wire_flags,
                 seek_pk, seek_col_idx, req_ids[w],
-                STATUS_OK, b"", false,
+                STATUS_OK, b"", &[], false,
             );
 
             off += align8(wsz);
@@ -850,7 +851,7 @@ impl SalWriter {
         );
 
         let wsz = wire_size(
-            STATUS_OK, b"", Some(schema), col_names_opt, batch, prebuilt_schema_block,
+            STATUS_OK, b"", Some(schema), col_names_opt, batch, prebuilt_schema_block, &[],
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for item in worker_sizes.iter_mut().take(nw) { *item = wsz; }
@@ -871,7 +872,7 @@ impl SalWriter {
                 slot0, 0, target_id as u64, 0, wire_flags,
                 seek_pk, seek_col_idx, request_id,
                 STATUS_OK, b"", Some(schema), col_names_opt, batch,
-                prebuilt_schema_block,
+                prebuilt_schema_block, &[],
             );
             debug_assert_eq!(written, wsz);
             let mut off = GROUP_HEADER_SIZE + align8(wsz);

@@ -620,6 +620,29 @@ impl ReadCursor {
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         let copy_len = prefix.len().min(stride);
         key[..copy_len].copy_from_slice(&prefix[..copy_len]);
+
+        // Pad suffix columns with the type's minimum value so the lower-bound
+        // binary search (compare_pk_bytes, type-aware) lands before all real
+        // entries in the suffix range. Zero-padding decodes to 0 for signed
+        // types, which is greater than any negative value — skipping them.
+        let mut offset = 0;
+        for (_, _, col) in self.schema.pk_columns() {
+            let size = col.size() as usize;
+            if offset >= copy_len && offset + size <= stride {
+                match col.type_code {
+                    crate::schema::type_code::I8  => key[offset] = i8::MIN as u8,
+                    crate::schema::type_code::I16 =>
+                        key[offset..offset + 2].copy_from_slice(&i16::MIN.to_le_bytes()),
+                    crate::schema::type_code::I32 =>
+                        key[offset..offset + 4].copy_from_slice(&i32::MIN.to_le_bytes()),
+                    crate::schema::type_code::I64 =>
+                        key[offset..offset + 8].copy_from_slice(&i64::MIN.to_le_bytes()),
+                    _ => {} // unsigned types: 0x00 is already the minimum
+                }
+            }
+            offset += size;
+        }
+
         self.seek_bytes(&key[..stride]);
         self.walk_to_positive_with_prefix(prefix)
     }
@@ -877,6 +900,12 @@ impl ReadCursor {
             return 0;
         }
         self.sources[self.current_entry_idx].blob_slice().len()
+    }
+
+    /// Blob arena slice (bounds-carrying) for the current row's source.
+    pub fn blob_slice(&self) -> &[u8] {
+        if !self.valid { return &[]; }
+        self.sources[self.current_entry_idx].blob_slice()
     }
 
     /// Copy the current row into `batch` with an explicit weight.
@@ -1745,6 +1774,64 @@ mod tests {
         assert_eq!(emitted.len(), 2, "distinct wide PKs must not be folded");
         assert_eq!(emitted[0], (pk_x, 3));
         assert_eq!(emitted[1], (pk_y, 5));
+    }
+
+    /// Secondary-index shape `(U64 indexed_col, I64 source_pk)` (stride 16).
+    /// `seek_first_positive_with_prefix` on the leading column must return ALL
+    /// rows sharing that prefix, including ones whose signed suffix is negative.
+    /// Zero-padding the suffix (the bug) decodes to 0 and skips negatives.
+    #[test]
+    fn seek_first_positive_with_prefix_includes_negative_suffix() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(schema.pk_stride(), 16);
+        let mk = |a: u64, b: i64| -> [u8; 16] {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&a.to_le_bytes());
+            k[8..].copy_from_slice(&b.to_le_bytes());
+            k
+        };
+        // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
+        let rows = [
+            (mk(1, -5), 1i64),
+            (mk(1, -1), 1),
+            (mk(1, 3), 1),
+            (mk(2, -9), 1),
+        ];
+        let mut b = Batch::with_schema(schema, rows.len());
+        for (pk, val) in &rows {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        let batch = Rc::new(b);
+        let mut cursor = create_read_cursor(&[batch], &[], schema);
+
+        let prefix = 1u64.to_le_bytes();
+        let mut found: Vec<[u8; 16]> = Vec::new();
+        if cursor.seek_first_positive_with_prefix(&prefix) {
+            loop {
+                let mut k = [0u8; 16];
+                k.copy_from_slice(cursor.current_pk_bytes());
+                found.push(k);
+                cursor.advance();
+                if !cursor.walk_to_positive_with_prefix(&prefix) { break; }
+            }
+        }
+        assert_eq!(found.len(), 3, "negative-suffix rows must not be skipped");
+        assert_eq!(found[0], mk(1, -5));
+        assert_eq!(found[1], mk(1, -1));
+        assert_eq!(found[2], mk(1, 3));
     }
 
     /// `copy_current_row_into` on an invalid cursor must be a no-op; the

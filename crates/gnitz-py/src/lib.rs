@@ -1929,7 +1929,7 @@ fn recv_scan_response(
         }
         if let Some(batch) = msg.data_batch {
             match data.as_mut() {
-                Some(acc) => acc.extend_from(&batch),
+                Some(acc) => acc.extend_from_owned(batch),
                 None => data = Some(batch),
             }
         }

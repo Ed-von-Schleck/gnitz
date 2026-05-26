@@ -249,13 +249,23 @@ enum HelloOutcome {
     Reject,
 }
 
+/// RAII guard that frees a reactor-allocated receive buffer on any exit path,
+/// including when the enclosing task future is dropped at an `.await` suspension
+/// point (e.g. server shutdown). A bare `libc::free` after `.await` would leak.
+struct MallocGuard(*mut u8);
+impl Drop for MallocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libc::free(self.0 as *mut libc::c_void); }
+        }
+    }
+}
+
 async fn connection_loop(fd: i32, shared: Rc<Shared>) {
     let bound_client_id = match shared.reactor.recv(fd).await {
         Some((ptr, len)) => {
+            let _guard = MallocGuard(ptr);
             let outcome = run_hello_handshake(fd, &shared, ptr, len).await;
-            if !ptr.is_null() {
-                unsafe { libc::free(ptr as *mut libc::c_void); }
-            }
             match outcome {
                 HelloOutcome::Pass(b) => b,
                 HelloOutcome::Reject => {
@@ -271,16 +281,13 @@ async fn connection_loop(fd: i32, shared: Rc<Shared>) {
     };
 
     loop {
-        let next = shared.reactor.recv(fd).await;
-        let (ptr, len) = match next {
+        let (ptr, len) = match shared.reactor.recv(fd).await {
             Some(v) => v,
             None => break,
         };
+        let _guard = MallocGuard(ptr);  // freed on any exit path including cancellation
         let data = unsafe { std::slice::from_raw_parts(ptr, len) };
         handle_message(fd, data, &shared, bound_client_id).await;
-        if !ptr.is_null() {
-            unsafe { libc::free(ptr as *mut libc::c_void); }
-        }
     }
     shared.reactor.close_fd(fd);
 }
@@ -654,7 +661,8 @@ async fn handle_message(
     if flags & FLAG_SEEK != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek(shared, fd, client_id, target_id,
-                    decoded.control.seek_pk, client_version).await;
+                    decoded.control.seek_pk, &decoded.control.seek_pk_extra,
+                    client_version).await;
         return;
     }
     if flags & FLAG_SEEK_BY_INDEX != 0 {
@@ -749,7 +757,7 @@ async fn handle_message(
 
 async fn handle_seek(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, pk: u128, client_version: u16,
+    target_id: i64, pk: u128, seek_pk_extra: &[u8], client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -759,7 +767,7 @@ async fn handle_seek(
     if target_id >= FIRST_USER_TABLE_ID {
         match MasterDispatcher::fan_out_seek_async(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
-            target_id, pk,
+            target_id, pk, seek_pk_extra,
         ).await {
             Ok(slot) => {
                 let rc = shared.reactor.send_slot(fd, slot).await;
@@ -787,13 +795,45 @@ async fn handle_seek_by_index(
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
-        match MasterDispatcher::fan_out_seek_by_index_async(
+        // Reject out-of-range column indices before forwarding to workers, so
+        // the client gets a clean error instead of a worker crash.
+        if let Some(schema) = shared.cat().get_schema_desc(target_id) {
+            if col_idx as usize >= schema.num_columns() {
+                let msg = format!(
+                    "seek_by_index: column index {} out of range for table {}",
+                    col_idx, target_id,
+                );
+                send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+                return;
+            }
+        }
+        if shared.cat().index_col_is_unique(target_id, col_idx) {
+            // Unique index: at most one match, on a single worker. Forward that
+            // worker's slot directly (1 round-trip) instead of broadcasting to
+            // all workers and merging.
+            match MasterDispatcher::fan_out_seek_by_index_async(
+                shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+                target_id, col_idx, key,
+            ).await {
+                Ok(slot) => {
+                    let rc = shared.reactor.send_slot(fd, slot).await;
+                    if rc < 0 { shared.reactor.close_fd(fd); }
+                }
+                Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+            }
+            return;
+        }
+        // Non-unique indexed value matches rows scattered across workers, so
+        // broadcast and merge all matches into one response.
+        match MasterDispatcher::fan_out_seek_by_index_collect_async(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, col_idx, key,
         ).await {
-            Ok(slot) => {
-                let rc = shared.reactor.send_slot(fd, slot).await;
-                if rc < 0 { shared.reactor.close_fd(fd); }
+            Ok(merged) => {
+                send_ok_response(
+                    shared, fd, target_id, merged.as_ref(),
+                    client_id, key, client_version,
+                ).await;
             }
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
@@ -917,14 +957,21 @@ async fn handle_system_dml(
         return;
     }
 
-    // DDL path: drain committer first, then grab write lock.
+    // DDL path: drain the committer barrier BEFORE acquiring the catalog write
+    // lock. The barrier flushes user-table WAL and waits for worker ACKs (tens
+    // of ms under load); holding the write lock across that wait would block
+    // every concurrent SCAN/SEEK read for no reason — no catalog mutation
+    // happens until after the barrier returns. Safe because the executor is
+    // single-threaded: no other DDL can send its own barrier or take the write
+    // lock while this coroutine is parked at rx.await, and concurrent user-table
+    // commits don't touch the catalog schema.
     let t_ddl_start = Instant::now();
-    let _write = shared.catalog_rwlock.write().await;
-    let t_after_write = Instant::now();
     let (tx, rx) = oneshot::channel::<()>();
     shared.committer_tx.send(CommitRequest::Barrier { done: tx });
     let _ = rx.await;
     let t_after_barrier = Instant::now();
+    let _write = shared.catalog_rwlock.write().await;
+    let t_after_write = Instant::now();
 
     let batch = batch.unwrap();
     let t_mut_start = Instant::now();
@@ -1009,10 +1056,10 @@ async fn handle_system_dml(
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {
         gnitz_debug!(
-            "DDL tid={} SLOW total={:?} write_acq={:?} barrier={:?} mutate={:?} broadcast={:?} fsync={:?} send={:?}",
+            "DDL tid={} SLOW total={:?} barrier={:?} write_acq={:?} mutate={:?} broadcast={:?} fsync={:?} send={:?}",
             target_id, total,
-            t_after_write.duration_since(t_ddl_start),
-            t_after_barrier.duration_since(t_after_write),
+            t_after_barrier.duration_since(t_ddl_start),
+            t_after_write.duration_since(t_after_barrier),
             t_mut_done.duration_since(t_mut_start),
             t_bcast_done.duration_since(t_mut_done),
             t_fsync_done.duration_since(t_bcast_done),
@@ -1033,7 +1080,7 @@ fn encode_response_buffer(
     seek_pk: u128,
     flags: u64,
 ) -> PooledSendBuf {
-    let sz = ipc::wire_size(status, error_msg, None, None, result, prebuilt_schema);
+    let sz = ipc::wire_size(status, error_msg, None, None, result, prebuilt_schema, &[]);
     let total = 4 + sz;
     let mut inner = crate::storage::batch_pool::acquire_buf();
     inner.reserve(total.max(8192));
@@ -1048,7 +1095,7 @@ fn encode_response_buffer(
         target_id as u64, client_id,
         flags, seek_pk, 0, 0,
         status, error_msg,
-        None, None, result, prebuilt_schema,
+        None, None, result, prebuilt_schema, &[],
     );
     debug_assert_eq!(written, sz);
     inner.truncate(4 + written);

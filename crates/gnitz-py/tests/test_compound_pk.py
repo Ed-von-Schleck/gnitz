@@ -68,20 +68,45 @@ def test_compound_pk_four_u32_accepted(client):
         _cleanup(client, sn, "t")
 
 
-def test_compound_pk_uuid_plus_companion_rejected_by_stride(client):
-    """`(UUID, U64)` = stride 24, rejected. Sanity check that mixed-width
-    compound PKs trip the stride membership rule."""
+_UUID_1 = "00000000-0000-0000-0000-000000000001"
+_UUID_2 = "00000000-0000-0000-0000-000000000002"
+
+
+def test_compound_pk_uuid_plus_companion_accepted_round_trip(client):
+    """`(UUID, U64)` = stride 24: a wide, mixed-width compound PK. Round-trips
+    through the byte-path accessors. Two rows share the same UUID (the first 16
+    bytes of the packed PK) and differ only in the trailing U64 — this drives
+    the wide `compare_pk_bytes` tie-break past byte 16."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "CREATE TABLE t (a UUID, b BIGINT UNSIGNED, PRIMARY KEY (a, b))",
-                schema_name=sn,
-            )
-        assert "stride" in str(exc.value).lower()
+        client.execute_sql(
+            "CREATE TABLE t (a UUID, b BIGINT UNSIGNED, payload BIGINT, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            f"INSERT INTO t (a, b, payload) VALUES "
+            f"('{_UUID_1}', 1, 10), ('{_UUID_1}', 2, 20), ('{_UUID_2}', 1, 30)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (_UUID_1, 1, 10), (_UUID_1, 2, 20), (_UUID_2, 1, 30),
+        ]
+        # Delete the row sharing UUID_1 but with the trailing-U64 tie-break — the
+        # other UUID_1 row must survive (distinct only past byte 16).
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = '{_UUID_1}' AND b = 2", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(_UUID_1, 1, 10), (_UUID_2, 1, 30)]
     finally:
-        _cleanup(client, sn)
+        _cleanup(client, sn, "t")
 
 
 # ---------------------------------------------------------------------------
@@ -104,35 +129,75 @@ def test_compound_pk_five_columns_rejected(client):
         _cleanup(client, sn)
 
 
-def test_compound_pk_stride_12_rejected(client):
-    """(U64, U32) = stride 12, not in {1,2,4,8,16}."""
+def test_compound_pk_stride_12_accepted_round_trip(client):
+    """(U64, U32) = stride 12: narrow (≤ 16) but non-power-of-two. Widens to a
+    `u128` fast key via `widen_pk_le`'s zero-extend arm. Round-trips, including
+    rows that share the leading U64 and differ only in the trailing U32."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "CREATE TABLE t (a BIGINT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
-                schema_name=sn,
-            )
-        assert "stride" in str(exc.value).lower()
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b INT UNSIGNED, payload BIGINT, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        u32max = 4294967295  # u32::MAX — adversarial trailing value
+        client.execute_sql(
+            f"INSERT INTO t (a, b, payload) VALUES "
+            f"(1, 0, 10), (1, {u32max}, 11), (1, 7, 17), (2, 0, 20)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 0, 10), (1, 7, 17), (1, u32max, 11), (2, 0, 20)]
+        # Delete a row that shares col a but differs only in the trailing U32.
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = 1 AND b = {u32max}", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 0, 10), (1, 7, 17), (2, 0, 20)]
     finally:
-        _cleanup(client, sn)
+        _cleanup(client, sn, "t")
 
 
-def test_compound_pk_stride_24_rejected(client):
-    """Three U64s = stride 24."""
+def test_compound_pk_stride_24_accepted_round_trip(client):
+    """Three U64s = stride 24: wide (> 16), routes through the byte-path
+    accessors. Round-trips, including rows that share the first 16 bytes
+    (cols a, b) and differ only in the trailing U64 (col c) — driving the wide
+    `compare_pk_bytes` tie-break past byte 16."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
-                "PRIMARY KEY (a, b, c))",
-                schema_name=sn,
-            )
-        assert "stride" in str(exc.value).lower()
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES "
+            "(1, 1, 1, 111), (1, 1, 2, 112), (1, 2, 1, 121), (2, 1, 1, 211)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (1, 1, 1, 111), (1, 1, 2, 112), (1, 2, 1, 121), (2, 1, 1, 211),
+        ]
+        # Delete the row that shares (a, b) = (1, 1) with another but differs in
+        # the trailing U64 — only the byte-16+ tie-break distinguishes them.
+        client.execute_sql(
+            "DELETE FROM t WHERE a = 1 AND b = 1 AND c = 2", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 1, 111), (1, 2, 1, 121), (2, 1, 1, 211)]
     finally:
-        _cleanup(client, sn)
+        _cleanup(client, sn, "t")
 
 
 def test_compound_pk_string_column_rejected(client):
@@ -260,6 +325,72 @@ def test_index_on_compound_pk_narrow_source_via_sql(client):
         rows_result = next(r for r in results if r["type"] == "Rows")
         seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
         assert seen == [(1, 2, 200)]
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_index_on_stride24_pk_source_via_sql(client):
+    """Secondary index on a stride-24 (three-U64) compound-PK table. The index
+    PK is `indexed_col + source_pk` = 8 + 24 = 32 bytes, well past the 16-byte
+    narrow cap, so the index table itself uses the wide byte-path accessors.
+    `ops/index.rs` sizes the composite key against MAX_PK_BYTES, so this is
+    reachable once the gate is lifted; the lookup must round-trip correctly."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE INDEX idx ON src (payload)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO src (a, b, c, payload) VALUES "
+            "(1, 1, 1, 100), (1, 1, 2, 200), (3, 4, 5, 100)",
+            schema_name=sn,
+        )
+        # `WHERE payload = 200` resolves via the wide-source secondary index.
+        results = client.execute_sql(
+            "SELECT * FROM src WHERE payload = 200", schema_name=sn,
+        )
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 2, 200)]
+        # A value shared by two distinct wide PKs must return both.
+        results = client.execute_sql(
+            "SELECT * FROM src WHERE payload = 100", schema_name=sn,
+        )
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 1, 100), (3, 4, 5, 100)]
+    finally:
+        _cleanup(client, sn, "src")
+
+
+def test_index_on_uuid_pk_source_via_sql(client):
+    """Secondary index on a single-column 16-byte (UUID) PK table. The source PK
+    is the maximum narrow width (16), so the index PK is `indexed_col + source_pk`
+    = 8 + 16 = 24 bytes — a wide index PK over a narrow source. Guards the wide
+    index-key path for the maximal-narrow-source case."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (id UUID NOT NULL PRIMARY KEY, payload BIGINT)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE INDEX idx ON src (payload)", schema_name=sn)
+        client.execute_sql(
+            f"INSERT INTO src (id, payload) VALUES "
+            f"('{_UUID_1}', 100), ('{_UUID_2}', 200)",
+            schema_name=sn,
+        )
+        results = client.execute_sql(
+            "SELECT * FROM src WHERE payload = 200", schema_name=sn,
+        )
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.id, row.payload) for row in rows_result["rows"])
+        assert seen == [(_UUID_2, 200)]
     finally:
         _cleanup(client, sn, "src")
 
@@ -659,6 +790,91 @@ def test_compound_pk_signed_first_column_adversarial_consolidation(client):
         _cleanup(client, sn, "t")
 
 
+def test_compound_pk_stride24_adversarial_consolidation(client):
+    """Stride-24 (three-U64) ingest consolidation with adversarial high-half
+    values in the second and third columns. The wide byte-path order-preserving
+    key must order column-by-column (a dominates b dominates c); a naive compare
+    treating later columns as more significant would invert the order. DELETE
+    retractions over the wide key must fold cleanly. Scan order isn't globally
+    sorted under multiple workers, so we assert the surviving (a, b, c, payload)
+    *set* — the grouping/folding the consolidation sort owns."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        umax = 18446744073709551615  # u64::MAX in the high columns
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES "
+            f"(2, 0, 0, 200), (1, {umax}, 0, 1900), (1, 0, {umax}, 109), "
+            f"(1, 0, 0, 100), (1, {umax}, {umax}, 1999)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (1, 0, 0, 100), (1, 0, umax, 109), (1, umax, 0, 1900),
+            (1, umax, umax, 1999), (2, 0, 0, 200),
+        ]
+        # Retract the all-max-tail row; the next consolidation must fold it.
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = 1 AND b = {umax} AND c = {umax}", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (1, 0, 0, 100), (1, 0, umax, 109), (1, umax, 0, 1900), (2, 0, 0, 200),
+        ]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_stride24_signed_first_column_adversarial_consolidation(client):
+    """Stride-24 compound PK whose FIRST column is signed (BIGINT) with negative
+    values, the remaining two unsigned. Combines, at full wide width, the signed
+    bias-flip (negatives sort before positives) with the column-by-column walk
+    (a dominates b dominates c). Distinct tuples must round-trip and a DELETE on
+    a negative-a row must fold across consolidation. Asserts the surviving set."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+            "c BIGINT UNSIGNED NOT NULL, payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        umax = 18446744073709551615
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES "
+            f"(2, 0, 0, 200), (-3, {umax}, 0, 1399), (-3, 0, {umax}, 309), "
+            f"(-1, 5, 5, 155), (2, 1, 1, 211)",
+            schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (-3, 0, umax, 309), (-3, umax, 0, 1399), (-1, 5, 5, 155),
+            (2, 0, 0, 200), (2, 1, 1, 211),
+        ]
+        client.execute_sql(
+            f"DELETE FROM t WHERE a = -3 AND b = {umax} AND c = 0", schema_name=sn,
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [
+            (-3, 0, umax, 309), (-1, 5, 5, 155), (2, 0, 0, 200), (2, 1, 1, 211),
+        ]
+    finally:
+        _cleanup(client, sn, "t")
+
+
 def test_compound_pk_insert_duplicate_tuple_rejected(client):
     """Same (a, b) tuple twice → conflict; sharing one column is fine."""
     sn = "cpk" + _uid()
@@ -712,6 +928,35 @@ def test_compound_pk_multi_worker_partition_routing(client):
         results = client.execute_sql("SELECT * FROM t", schema_name=sn)
         rows_result = next(r for r in results if r["type"] == "Rows")
         seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
+        assert seen == sorted(expected)
+    finally:
+        _cleanup(client, sn, "t")
+
+
+@_NEEDS_MULTI
+def test_compound_pk_stride24_multi_worker_partition_routing(client):
+    """Multi-worker correctness for a wide (stride-24) PK: 20 rows distributed
+    across workers via the byte-path partition routing must all survive a scan
+    in the right (a, b, c, payload) shape. Exercises wide-PK hashing/routing,
+    which the narrow stride-16 routing test does not reach."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        expected = [(i, (i * 7) % 11, (i * 13) % 17, i * 100) for i in range(20)]
+        values = ", ".join(f"({a}, {b}, {c}, {p})" for (a, b, c, p) in expected)
+        client.execute_sql(
+            f"INSERT INTO t (a, b, c, payload) VALUES {values}", schema_name=sn
+        )
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted(
+            (row.a, row.b, row.c, row.payload) for row in rows_result["rows"]
+        )
         assert seen == sorted(expected)
     finally:
         _cleanup(client, sn, "t")
@@ -843,6 +1088,39 @@ def test_compound_pk_delete_by_bytes(client):
         _cleanup(client, sn, "t")
 
 
+def test_compound_pk_stride24_delete_by_bytes(client):
+    """`client.delete(...)` on a wide (stride-24, three-U64) PK table accepts
+    a 24-byte packed PK. Exercises the binding's `PkColumn::Bytes` push path at
+    a width past the narrow cap."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES "
+            "(1, 1, 1, 10), (1, 1, 2, 20), (2, 1, 1, 30)",
+            schema_name=sn,
+        )
+        tid, schema = client.resolve_table(sn, "t")
+        # Delete (1, 1, 2): 24 bytes packed (8 || 8 || 8, LE).
+        pk_bytes = (
+            (1).to_bytes(8, "little")
+            + (1).to_bytes(8, "little")
+            + (2).to_bytes(8, "little")
+        )
+        client.delete(tid, schema, [pk_bytes])
+        results = client.execute_sql("SELECT * FROM t", schema_name=sn)
+        rows_result = next(r for r in results if r["type"] == "Rows")
+        seen = sorted((row.a, row.b, row.c, row.payload) for row in rows_result["rows"])
+        assert seen == [(1, 1, 1, 10), (2, 1, 1, 30)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
 # ---------------------------------------------------------------------------
 # Named projection through apply_projection
 # ---------------------------------------------------------------------------
@@ -952,5 +1230,95 @@ def test_compound_pk_no_pk_projection_rejected(client):
         with pytest.raises(gnitz.GnitzError) as exc:
             client.execute_sql("SELECT payload FROM t", schema_name=sn)
         assert "must project at least one PRIMARY KEY column" in str(exc.value)
+    finally:
+        _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# FK / UNIQUE enforcement regressions (wide-PK + signed-PK + PK-as-FK + DDL)
+# ---------------------------------------------------------------------------
+
+
+def test_fk_on_pk_column_enforced(client):
+    """Child table whose FK column is also its own PK column: INSERT with a
+    non-existent parent value must be rejected without crashing the server.
+    An FK column that is also a PK column has no payload slot, so the
+    parent-existence check must read its value from the PK region, not via the
+    payload index."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE c (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES p(pid))",
+            schema_name=sn)
+        client.execute_sql("INSERT INTO p (pid) VALUES (1)", schema_name=sn)
+        client.execute_sql("INSERT INTO c (cid) VALUES (1)", schema_name=sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO c (cid) VALUES (99)", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "p", "c")
+
+
+def test_fk_restrict_with_signed_pk_source(client):
+    """FK RESTRICT must catch references from child rows with negative PK values.
+    The signed-suffix seek bug made negative-PK rows invisible to the parent-delete
+    restriction check, silently creating dangling references."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE parent (pid BIGINT UNSIGNED PRIMARY KEY)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE child ("
+            "  cid BIGINT PRIMARY KEY, "
+            "  fk_val BIGINT UNSIGNED NOT NULL, "
+            "  FOREIGN KEY (fk_val) REFERENCES parent(pid)"
+            ")", schema_name=sn)
+        client.execute_sql("INSERT INTO parent (pid) VALUES (1)", schema_name=sn)
+        client.execute_sql("INSERT INTO child (cid, fk_val) VALUES (-5, 1)", schema_name=sn)
+        client.execute_sql("INSERT INTO child (cid, fk_val) VALUES (-1, 1)", schema_name=sn)
+        # Parent delete must be rejected: child rows with negative PKs reference it.
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("DELETE FROM parent WHERE pid = 1", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "parent", "child")
+
+
+def test_unique_index_enforced_for_negative_pk_source(client):
+    """Unique index seek must find rows with negative source-table PK values.
+    The signed-suffix bug caused them to be skipped, allowing duplicate inserts."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT UNSIGNED)",
+            schema_name=sn)
+        # Explicit CREATE UNIQUE INDEX — the inline UNIQUE column constraint is
+        # not translated into an index by the planner.
+        client.execute_sql("CREATE UNIQUE INDEX ON t (val)", schema_name=sn)
+        client.execute_sql("INSERT INTO t (id, val) VALUES (-5, 42)", schema_name=sn)
+        client.execute_sql("INSERT INTO t (id, val) VALUES (-1, 99)", schema_name=sn)
+        # Duplicate val=42 must be rejected (the existing row has a negative PK).
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO t (id, val) VALUES (1, 42)", schema_name=sn)
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_unique_index_on_string_rejected(client):
+    """Creating a UNIQUE index on a STRING column must be rejected cleanly: the
+    u128 index key cannot represent a variable-length string without collision,
+    so the distributed uniqueness check would silently bypass or falsely reject."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, name VARCHAR(255))",
+            schema_name=sn,
+        )
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("CREATE UNIQUE INDEX ON t (name)", schema_name=sn)
     finally:
         _cleanup(client, sn, "t")

@@ -675,11 +675,11 @@ impl Table {
         }
     }
 
-    pub fn found_blob_ptr(&self) -> *const u8 {
+    pub fn found_blob_slice(&self) -> &[u8] {
         match &self.found_source {
-            FoundSource::MemTable => self.memtable.found_blob_ptr(),
-            FoundSource::Shard(arc, _) => arc.blob_slice().as_ptr(),
-            FoundSource::None => std::ptr::null(),
+            FoundSource::MemTable      => self.memtable.found_blob_slice(),
+            FoundSource::Shard(arc, _) => arc.blob_slice(),
+            FoundSource::None          => &[],
         }
     }
 

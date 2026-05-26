@@ -93,19 +93,22 @@ pub(super) fn validate_pk_cols(
             return Err("Primary Key has duplicate column".into());
         }
     }
-    // Engine cursors project the PK region to `u128` via
-    // `storage::batch::widen_pk_le`, which panics on any stride outside
-    // {1, 2, 4, 8, 16}. Defends the catalog worker against a crafted
-    // `raw_store_ingest` into `TABLE_TAB` that names a compound encoding
-    // the cursor cannot widen (e.g. `(U64, U32)` stride 12 or three
-    // `U64`s stride 24). Single-PK rows always satisfy this — every
-    // column type's `wire_stride()` is already in that set.
+    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` fast
+    // key via `storage::batch::widen_pk_le`; wider compound PKs (stride > 16)
+    // route through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`)
+    // — every narrow `u128` seek is guarded by `pk_is_fast()`. The 4-column cap
+    // above bounds a valid PK at 64 bytes (four `U128`); MAX_PK_BYTES is the
+    // ceiling, defending the catalog worker against a crafted `raw_store_ingest`
+    // into `TABLE_TAB` whose decoded PK list packs an oversized region.
+    // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
+    // eligible type is ≥ 1 byte) but is rejected explicitly as defence in depth.
     let pk_stride: usize = cols.iter()
         .map(|&c| gnitz_wire::wire_stride(col_defs[c as usize].type_code))
         .sum();
-    if !matches!(pk_stride, 1 | 2 | 4 | 8 | 16) {
+    if pk_stride == 0 || pk_stride > gnitz_wire::MAX_PK_BYTES {
         return Err(format!(
-            "Primary Key total stride must be 1/2/4/8/16 bytes, got {pk_stride}"
+            "Primary Key total stride must be 1..={} bytes, got {pk_stride}",
+            gnitz_wire::MAX_PK_BYTES
         ));
     }
     Ok(())

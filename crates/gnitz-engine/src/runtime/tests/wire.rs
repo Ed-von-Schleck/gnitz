@@ -156,14 +156,14 @@ fn test_encode_decode_request_id_with_error() {
 
 #[test]
 fn test_wire_size_includes_request_id() {
-    let sz = wire_size(STATUS_OK, b"", None, None, None, None);
+    let sz = wire_size(STATUS_OK, b"", None, None, None, None, &[]);
     let wire = encode_wire(
         0, 0, 0, 0u128, 0, 0xAAAA_BBBB_CCCC_DDDD,
         STATUS_OK, b"",
         None, None, None,
     );
     assert_eq!(sz, wire.len());
-    let sz2 = wire_size(STATUS_ERROR, b"err", None, None, None, None);
+    let sz2 = wire_size(STATUS_ERROR, b"err", None, None, None, None, &[]);
     let wire2 = encode_wire(
         0, 0, 0, 0u128, 0, u64::MAX,
         STATUS_ERROR, b"err",
@@ -262,22 +262,22 @@ fn test_encode_decode_string_column() {
 
 #[test]
 fn wire_size_matches_encode() {
-    let sz = wire_size(STATUS_OK, b"", None, None, None, None);
+    let sz = wire_size(STATUS_OK, b"", None, None, None, None, &[]);
     let wire = encode_wire(42, 7, 0x100, 10u128 | (20u128 << 64), 3, 0, STATUS_OK, b"", None, None, None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
 
     let sd = simple_schema();
     let names: Vec<&[u8]> = vec![b"id", b"val"];
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), None, None);
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), None, None, &[]);
     let wire = encode_wire(1, 0, 0, 0u128, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (schema only)");
 
     let batch = make_simple_batch(100, 999);
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None);
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None, &[]);
     let wire = encode_wire(5, 0, 0, 0u128, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
     assert_eq!(sz, wire.len(), "wire_size mismatch (with data)");
 
-    let sz = wire_size(STATUS_ERROR, b"something went wrong", None, None, None, None);
+    let sz = wire_size(STATUS_ERROR, b"something went wrong", None, None, None, None, &[]);
     let wire = encode_wire(0, 0, 0, 0u128, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
     assert_eq!(sz, wire.len(), "wire_size mismatch (error msg)");
 }
@@ -288,13 +288,13 @@ fn encode_wire_into_roundtrip() {
     let batch = make_simple_batch(100, 999);
     let names: Vec<&[u8]> = vec![b"id", b"val"];
 
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None);
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None, &[]);
     let mut buf = vec![0u8; sz];
     let written = encode_wire_into(
         &mut buf, 0,
         5, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
-        Some(&sd), Some(&names), Some(&batch), None,
+        Some(&sd), Some(&names), Some(&batch), None, &[],
     );
     assert_eq!(written, sz);
 
@@ -321,13 +321,13 @@ fn encode_wire_into_matches_encode_wire() {
         Some(&sd), Some(&names), Some(&batch),
     );
 
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None);
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch), None, &[]);
     let mut buf = vec![0u8; sz];
     let written = encode_wire_into(
         &mut buf, 0,
         10, 3, 0x200, 5u128 | (6u128 << 64), 7, 0,
         STATUS_OK, b"",
-        Some(&sd), Some(&names), Some(&batch), None,
+        Some(&sd), Some(&names), Some(&batch), None, &[],
     );
     assert_eq!(written, wire.len());
     assert_eq!(buf, wire, "encode_wire_into should produce identical bytes");
@@ -351,13 +351,13 @@ fn prebuilt_schema_block_matches_inline_encode() {
 
     // Prebuilt path.
     let prebuilt = build_schema_wire_block(&sd, &names, target_id as u32);
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), None, Some(&batch), Some(&prebuilt));
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), None, Some(&batch), Some(&prebuilt), &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0,
         target_id, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
-        Some(&sd), None, Some(&batch), Some(&prebuilt),
+        Some(&sd), None, Some(&batch), Some(&prebuilt), &[],
     );
 
     assert_eq!(buf, inline, "prebuilt schema block must produce identical wire bytes");
@@ -368,13 +368,13 @@ fn prebuilt_schema_block_matches_inline_encode() {
 fn prebuilt_schema_block_no_col_names_roundtrips() {
     let sd = simple_schema();
     let prebuilt = build_schema_wire_block(&sd, &[], 5);
-    let sz = wire_size(STATUS_OK, b"", Some(&sd), None, None, Some(&prebuilt));
+    let sz = wire_size(STATUS_OK, b"", Some(&sd), None, None, Some(&prebuilt), &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
         &mut buf, 0,
         5, 0, 0, 0u128, 0, 0,
         STATUS_OK, b"",
-        Some(&sd), None, None, Some(&prebuilt),
+        Some(&sd), None, None, Some(&prebuilt), &[],
     );
     let decoded = decode_wire(&buf).unwrap();
     assert!(decoded.schema.is_some(), "schema block must be present");
@@ -553,7 +553,7 @@ fn encode_ctrl_block_direct_matches_ipc() {
             &mut buf_direct, OFFSET,
             target_id, client_id, wire_flags,
             seek_pk, seek_col_idx, request_id,
-            status, b"", checksum,
+            status, b"", &[], checksum,
         );
         let n_ipc = encode_ctrl_block_ipc(
             &mut buf_ipc, OFFSET,
@@ -694,7 +694,7 @@ fn encode_ctrl_block_direct_error_path_matches_ipc() {
 
     let n_direct = encode_ctrl_block_direct(
         &mut buf_direct, OFFSET,
-        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, true,
+        7, 11, 13, 17u128, 19, 23, STATUS_ERROR, err, &[], true,
     );
     let n_ipc = encode_ctrl_block_ipc(
         &mut buf_ipc, OFFSET,
