@@ -20,6 +20,12 @@ pub unsafe fn write_all_fd(fd: c_int, data: &[u8]) -> i32 {
             }
             return -3;
         }
+        if ret == 0 {
+            // POSIX guarantees regular files never return 0 for a non-zero
+            // count, but some device types can — without this guard the loop
+            // would spin forever at 100% CPU. Treat it as an error.
+            return -3;
+        }
         written += ret as usize;
     }
     0
@@ -73,11 +79,6 @@ pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 #[inline]
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-#[inline]
-pub fn make_pk(lo: u64, hi: u64) -> u128 {
-    ((hi as u128) << 64) | (lo as u128)
 }
 
 pub fn cstr_from_buf(buf: &[u8]) -> &str {
@@ -144,6 +145,27 @@ where F: FnOnce() -> Result<T, String>,
 
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
 /// Called once per process via `std::sync::Once`; safe to invoke from any test.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn test_write_all_fd_roundtrip() {
+        // Guards the happy path of the partial-write loop (and that the new
+        // ret==0 guard does not break a normal full write).
+        let mut f = tempfile::tempfile().unwrap();
+        let data = b"hello write_all_fd partial-write loop";
+        let rc = unsafe { write_all_fd(f.as_raw_fd(), data) };
+        assert_eq!(rc, 0);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, data);
+    }
+}
+
 #[cfg(test)]
 pub fn raise_fd_limit_for_tests() {
     use std::sync::Once;

@@ -1,5 +1,6 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -21,8 +22,11 @@ pub enum StoreHandle {
     /// Owned single Table — used by views in single-worker mode.
     #[allow(dead_code)]
     Single(Box<Table>),
-    /// Owned PartitionedTable — used by base tables and views.
-    Partitioned(Box<PartitionedTable>),
+    /// Owned PartitionedTable — used by base tables and views. Wrapped in
+    /// `UnsafeCell` so the interior-mutable accessors can hand out `&mut`
+    /// through a shared `&self` without violating Stacked Borrows (a raw
+    /// pointer derived from a shared reference may not be used to mutate).
+    Partitioned(UnsafeCell<Box<PartitionedTable>>),
     /// Non-owning pointer to a Table owned elsewhere (system tables).
     Borrowed(*mut Table),
 }
@@ -47,7 +51,7 @@ impl StoreHandle {
     /// Get a raw pointer to the PartitionedTable, or null if not Partitioned.
     pub fn ptable_ptr(&self) -> *mut PartitionedTable {
         match self {
-            StoreHandle::Partitioned(pt) => std::ptr::addr_of!(**pt) as *mut PartitionedTable,
+            StoreHandle::Partitioned(cell) => unsafe { &mut **cell.get() as *mut PartitionedTable },
             _ => std::ptr::null_mut(),
         }
     }
@@ -69,12 +73,9 @@ impl StoreHandle {
     // ------------------------------------------------------------------
 
     /// Get `&mut PartitionedTable` if this handle is Partitioned.
-    #[allow(clippy::mut_from_ref)]
     pub fn as_partitioned_mut(&self) -> Option<&mut PartitionedTable> {
         match self {
-            StoreHandle::Partitioned(pt) => {
-                Some(unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) })
-            }
+            StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() }),
             _ => None,
         }
     }
@@ -136,7 +137,7 @@ impl StoreHandle {
         match self {
             StoreHandle::Single(t) => t.flush(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
-            StoreHandle::Partitioned(pt) => pt.flush(),
+            StoreHandle::Partitioned(cell) => cell.get_mut().flush(),
         }
     }
 
@@ -153,7 +154,7 @@ impl StoreHandle {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
                 FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
             },
-            StoreHandle::Partitioned(pt) => pt.flush_prepare(),
+            StoreHandle::Partitioned(cell) => cell.get_mut().flush_prepare(),
         }
     }
 
@@ -166,7 +167,7 @@ impl StoreHandle {
         let t: &mut Table = match self {
             StoreHandle::Single(t) => t,
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
-            StoreHandle::Partitioned(pt) => return pt.flush_commit_batch(works),
+            StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),
         };
         let mut out = Vec::with_capacity(works.len());
         for (_, w) in works {
@@ -180,7 +181,7 @@ impl StoreHandle {
         match self {
             StoreHandle::Single(t) => t.current_lsn,
             StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
-            StoreHandle::Partitioned(pt) => pt.current_lsn(),
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).current_lsn() },
         }
     }
 }
@@ -188,12 +189,12 @@ impl StoreHandle {
 impl IndexCircuitEntry {
     /// Interior-mutable access to the owned index Table.
     ///
-    /// The boxed Table has stable heap address, so this raw-pointer
-    /// reborrow is race-free on a single thread. Like the StoreHandle
-    /// helpers above, callers must ensure no aliasing &mut is live.
+    /// `index_table` is an `UnsafeCell`, so `get()` yields a `*mut` that is
+    /// legal to mutate through even via `&self`. Single-threaded; callers
+    /// must ensure no aliasing `&mut` into the same Table is live.
     #[allow(clippy::mut_from_ref)]
     pub fn table_mut(&self) -> &mut Table {
-        unsafe { &mut *(std::ptr::addr_of!(*self.index_table) as *mut Table) }
+        unsafe { &mut **self.index_table.get() }
     }
 }
 
@@ -205,7 +206,7 @@ impl IndexCircuitEntry {
 /// Owns the index Table via Box — dropping the entry drops the table.
 pub struct IndexCircuitEntry {
     pub col_idx: u32,
-    pub index_table: Box<Table>,
+    pub index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
     pub is_unique: bool,
 }
@@ -238,11 +239,11 @@ pub struct SysTableRefs {
     pub edges: *mut Table,
     pub node_columns: *mut Table,
     pub dep_tab: *mut Table,
-    // Schemas
+    // Schemas. (dep_tab needs none: get_dep_map reads its compound PK directly
+    // from the cursor's PK bytes.)
     pub nodes_schema: SchemaDescriptor,
     pub edges_schema: SchemaDescriptor,
     pub node_columns_schema: SchemaDescriptor,
-    pub dep_tab_schema: SchemaDescriptor,
 }
 
 // SAFETY: same single-thread guarantee.
@@ -258,7 +259,6 @@ impl SysTableRefs {
             nodes_schema: SchemaDescriptor::default(),
             edges_schema: SchemaDescriptor::default(),
             node_columns_schema: SchemaDescriptor::default(),
-            dep_tab_schema: SchemaDescriptor::default(),
         }
     }
 }
@@ -376,7 +376,7 @@ impl DagEngine {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             entry.index_circuits.push(IndexCircuitEntry {
                 col_idx,
-                index_table,
+                index_table: UnsafeCell::new(index_table),
                 index_schema,
                 is_unique,
             });
@@ -387,6 +387,21 @@ impl DagEngine {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             // retain() drops non-matching entries, which drops Box<Table> automatically.
             entry.index_circuits.retain(|ic| ic.col_idx != col_idx);
+        }
+    }
+
+    /// Release the delta batches pinned in a view's compiled-plan regfile.
+    /// `execute_epoch` only clears deltas at the *start* of an epoch, so after
+    /// a backfill the full scanned source dataset and intermediate deltas stay
+    /// resident until the next evaluation. Call this after backfill to free
+    /// them immediately. Clears both pre-VM and post-VM (aggregation views have
+    /// a post-VM that also accumulates delta registers during backfill).
+    pub fn clear_view_regfile_deltas(&mut self, view_id: i64) {
+        if let Some(plan) = self.cache.get_mut(&view_id) {
+            plan.pre_vm.regfile.clear_delta_batches();
+            if let Some(post) = plan.post_vm.as_mut() {
+                post.regfile.clear_delta_batches();
+            }
         }
     }
 
@@ -428,11 +443,11 @@ impl DagEngine {
                 while ch.cursor.valid {
                     let w = ch.cursor.current_weight;
                     if w > 0 {
-                        // DepTab PK = view_id, dep_table_id is a payload column.
-                        let v_id = (ch.cursor.current_key >> 64) as i64;
-                        let dep_tid = compiler::cursor_read_i64(
-                            &ch.cursor, 3, &self.sys.dep_tab_schema,
-                        );
+                        // DepTab compound PK = (view_id, dep_table_id); both live
+                        // in the 16-byte PK region, view_id in bytes 0..8.
+                        let pk = ch.cursor.current_pk_bytes();
+                        let v_id = u64::from_le_bytes(pk[0..8].try_into().unwrap()) as i64;
+                        let dep_tid = u64::from_le_bytes(pk[8..16].try_into().unwrap()) as i64;
                         if dep_tid > 0 {
                             let views = self.dep_map.entry(dep_tid).or_default();
                             if !views.contains(&v_id) {
@@ -507,17 +522,13 @@ impl DagEngine {
         });
         let scan_nid = match scan_nid { Some(n) => n, None => return Vec::new() };
 
-        // Find the downstream Map(Expression { reindex_col }) node.
-        for &(src, dst, _port) in &loaded.edges {
-            if src == scan_nid {
-                if let Some(gnitz_wire::OpNode::Map(
-                    gnitz_wire::MapKind::Expression { reindex_col: Some(c), .. }
-                )) = loaded.nodes.get(&dst) {
-                    return vec![*c as i32];
-                }
-            }
+        // Find the downstream Map(Expression { reindex_col }) node, walking
+        // through any intervening Filter nodes (planner emits Filter → Map
+        // reindex chains for PK-redistribution views).
+        match crate::compiler::reindex_col_through_filters(&loaded, scan_nid) {
+            Some(c) => vec![c],
+            None => Vec::new(),
         }
-        Vec::new()
     }
 
     /// Get exchange info for a view: (shard_cols, is_trivial, is_co_partitioned).
@@ -807,7 +818,7 @@ impl DagEngine {
         let _ = entry.handle.ingest_owned_batch(source.clone_batch());
         for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
             if idx_batch.count > 0 {
-                let _ = ic.index_table.ingest_owned_batch(idx_batch);
+                let _ = ic.table_mut().ingest_owned_batch(idx_batch);
             }
         }
     }
@@ -824,7 +835,7 @@ impl DagEngine {
             return -1;
         }
         for ic in &mut entry.index_circuits {
-            if ic.index_table.flush().is_err() {
+            if ic.table_mut().flush().is_err() {
                 return -1;
             }
         }
@@ -850,7 +861,7 @@ impl DagEngine {
         for ic in &mut entry.index_circuits {
             // Index tables are non-durable; this is an inline write that
             // returns DoneInline/Empty and resets the memtable. No FlushWork.
-            match ic.index_table.flush_prepare(false) {
+            match ic.table_mut().flush_prepare(false) {
                 Ok(FlushOutcome::Empty) | Ok(FlushOutcome::DoneInline) => {}
                 Ok(FlushOutcome::Pending(_)) => {
                     return Err(format!(
@@ -1743,7 +1754,7 @@ mod tests {
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
             batch.count += 1;
-            entry.index_circuits[0].index_table.ingest_owned_batch(batch).unwrap();
+            entry.index_circuits[0].table_mut().ingest_owned_batch(batch).unwrap();
         }
 
         // With the fix, flush propagates to index circuits and writes a shard.

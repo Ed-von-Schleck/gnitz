@@ -64,7 +64,7 @@ pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_n
                        cursor_read_u64, cursor_read_string,
                        copy_cursor_row_with_weight,
                        retract_single_row,
-                       retract_rows_by_pk_hi,
+                       retract_rows_by_view,
                        retract_rows_in_pk_range};
 pub(crate) use cache::CatalogCacheSet;
 

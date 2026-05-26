@@ -35,7 +35,7 @@ pub struct Message {
 fn control_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| {
-        schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, gnitz_wire::control::COL_MSG_IDX)
+        schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, &[gnitz_wire::control::COL_MSG_IDX])
     })
 }
 

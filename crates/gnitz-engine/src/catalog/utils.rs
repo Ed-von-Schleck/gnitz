@@ -197,8 +197,12 @@ pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
 /// sys_circuit_* and sys_view_deps, which bypass SAL broadcast).
 pub(crate) fn flush_sys_table(table: &mut Table, name: &str) -> Result<(), String> {
     table.flush()
-        .map(|_| ())
-        .map_err(|e| format!("flush {} failed: {:?}", name, e))
+        .map_err(|e| format!("flush {} failed: {:?}", name, e))?;
+    // These tables (sys_circuit_*, sys_view_deps) are flushed only here and
+    // never via flush_family, so without compaction their L0 shards grow
+    // unbounded; they're scanned on every boot and DDL op.
+    table.compact_if_needed()
+        .map_err(|e| format!("compaction {} failed: {:?}", name, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -343,34 +347,20 @@ pub(crate) fn retract_rows_in_pk_range(
     batch
 }
 
-/// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
-/// emitting each as a retraction (weight=-1). Exploits U128 sort order
-/// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
-pub(crate) fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> Batch {
+/// Scan all positive-weight rows for `view_id` and emit each as a retraction
+/// (weight=-1). The circuit/dep catalog tables use a compound `(view_id, sub)`
+/// PK, so all of a view's rows share the `view_id` byte prefix and are
+/// contiguous in compound-PK sort order — `compare_pk_bytes` reproduces the
+/// `(view_id, sub)` ordering natively (no `(pk_hi, pk_lo)` u128 exploit).
+pub(crate) fn retract_rows_by_view(table: &mut Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
+    let prefix = view_id.to_le_bytes();
     let mut cursor = table.open_cursor();
-    cursor.cursor.seek(crate::util::make_pk(0, pk_hi));
-
-    // Bulk path: single consolidated MemBatch source. Consolidated rows always
-    // have positive weight, so the weight>0 filter is trivially satisfied and
-    // we get one copy_from_slice per column instead of one call per row.
-    if let Some((src, start)) = cursor.cursor.single_mem_batch() {
-        let mut end = start;
-        while end < src.count
-            && ((src.get_pk(end) >> 64) as u64) == pk_hi
-        {
-            end += 1;
-        }
-        batch.append_mem_batch_range(&src, start, end, Some(-1));
-        return batch;
-    }
-
-    // Row-at-a-time fallback for multi-source cursors.
-    while cursor.cursor.valid && (cursor.cursor.current_key >> 64) as u64 == pk_hi {
-        if cursor.cursor.current_weight > 0 {
-            copy_cursor_row_with_weight(&cursor, &mut batch, -1);
-        }
+    let mut hit = cursor.cursor.seek_first_positive_with_prefix(&prefix);
+    while hit {
+        copy_cursor_row_with_weight(&cursor, &mut batch, -1);
         cursor.cursor.advance();
+        hit = cursor.cursor.walk_to_positive_with_prefix(&prefix);
     }
     batch
 }

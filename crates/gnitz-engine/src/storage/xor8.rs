@@ -119,9 +119,7 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let pks: Vec<u128> = (0u128..500)
-            .map(|i| crate::util::make_pk(i as u64, 42))
-            .collect();
+        let pks: Vec<u128> = (0u128..500).collect();
         let filter = build(&pks).unwrap();
         let bytes = serialize(&filter);
         let restored = deserialize(&bytes).unwrap();

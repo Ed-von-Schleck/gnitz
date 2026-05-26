@@ -293,7 +293,7 @@ pub fn op_repartition_batches(
     num_workers: usize,
 ) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
-    debug_assert!(sources.len() <= 256, "source index must fit in u8");
+    assert!(sources.len() <= 256, "source index must fit in u8 (got {})", sources.len());
     let w_map = build_w_map(num_workers);
 
     let mem_batches: Vec<Option<MemBatch>> = sources
@@ -427,7 +427,7 @@ fn relay_scatter_merge_walk(
     num_workers: usize,
     worker_rows: &mut Vec<Vec<(u8, u32)>>,
 ) {
-    debug_assert!(mem_batches.len() <= 256, "source index must fit in u8");
+    assert!(mem_batches.len() <= 256, "source index must fit in u8 (got {})", mem_batches.len());
     let w_map = build_w_map(num_workers);
     let cursors = [0u32; 256];
     let mut pk_cache = [0u128; 256];
@@ -713,6 +713,16 @@ pub fn op_multi_scatter(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+
+    #[test]
+    #[should_panic(expected = "source index must fit in u8")]
+    fn test_op_repartition_batches_rejects_over_256_sources() {
+        // The source index is stored in a u8; > 256 sources would truncate it
+        // silently in release builds. The guard must be a hard assert.
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        let sources: Vec<Option<&Batch>> = vec![None; 257];
+        let _ = op_repartition_batches(&sources, &[0], &schema, 4);
+    }
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(

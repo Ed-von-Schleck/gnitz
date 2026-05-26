@@ -69,9 +69,107 @@ fn test_index_live_fanout() {
     // Verify index has 6 entries via DagEngine's index circuit
     let entry = engine.dag.tables.get_mut(&tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
-    let idx_table = &mut *entry.index_circuits[0].index_table;
+    let idx_table = entry.index_circuits[0].table_mut();
     let idx_count = count_records(idx_table);
     assert_eq!(idx_count, 6, "Index fanout: expected 6, got {}", idx_count);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_system_table_flush_compacts_l0() {
+    // Each flush_family on a system table writes an L0 shard; without the
+    // compact_if_needed call they accumulate unbounded. Drive many flushes and
+    // assert the shard count stays bounded.
+    let dir = temp_dir("sys_compact_l0");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let schema = idx_tab_schema();
+    let flushes = 40u64;
+    for i in 0..flushes {
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(0);                 // owner_id
+        bb.put_u64(0);                 // owner_kind
+        bb.put_u64(0);                 // source_col_idx
+        bb.put_string(&format!("idx{}", i));
+        bb.put_u64(0);                 // is_unique
+        bb.put_string("");             // cache_directory
+        bb.end_row();
+        ingest_batch_into(&mut engine.sys_indices, &bb.finish());
+        engine.flush_family(IDX_TAB_ID).unwrap();
+    }
+    let shards = engine.sys_indices.all_shard_arcs().len();
+    assert!(
+        (shards as u64) < flushes / 2,
+        "system catalog L0 must be compacted: {} shards after {} flushes",
+        shards, flushes
+    );
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_create_index_duplicate_rejected() {
+    // Creating the same index twice must fail on the second attempt rather
+    // than silently orphaning the first index circuit.
+    let dir = temp_dir("idx_dup_create");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    engine.create_table("public.t", &cols, &[0], true).unwrap();
+
+    let first = engine.create_index("public.t", "val", false);
+    assert!(first.is_ok(), "first index creation should succeed");
+    assert!(engine.has_index_by_name("public__t__idx_val"));
+
+    let second = engine.create_index("public.t", "val", false);
+    assert!(second.is_err(), "duplicate index creation must be rejected");
+    assert!(
+        second.unwrap_err().contains("already exists"),
+        "error must mention the index already exists"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_failure_no_broadcast_poisoning() {
+    // A failed UNIQUE index creation (duplicate values) must NOT enqueue a
+    // negative-weight IDX_TAB broadcast: the +1 was never broadcast (hook
+    // failed before enqueue), so a broadcast −1 would orphan a row on workers.
+    let dir = temp_dir("idx_broadcast_poison");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Two rows sharing val=42.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(42); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Clear broadcasts accumulated by table/column creation + ingest.
+    let _ = engine.drain_pending_broadcasts();
+
+    // UNIQUE index over duplicate values must fail.
+    let res = engine.create_index("public.t", "val", true);
+    assert!(res.is_err(), "unique index over duplicate values must fail");
+
+    // No IDX_TAB broadcast may carry a negative weight for the failed index.
+    let broadcasts = engine.drain_pending_broadcasts();
+    for (tab, batch) in &broadcasts {
+        if *tab == IDX_TAB_ID {
+            for i in 0..batch.count {
+                assert!(
+                    batch.get_weight(i) >= 0,
+                    "no negative-weight IDX_TAB broadcast may be enqueued on rollback"
+                );
+            }
+        }
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

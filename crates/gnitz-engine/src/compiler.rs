@@ -161,19 +161,15 @@ pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &Schem
     (cursor.current_null_word >> payload_idx) & 1 != 0
 }
 
-/// Create a cursor for a system table, seeked to view_id range.
-/// Returns None if the table handle is null.
-fn open_system_cursor(
-    table: *mut Table,
-    view_id: u64,
-) -> Option<CursorHandle> {
+/// Open a cursor for a system table. Returns None if the table handle is null.
+/// Positioning is done by the caller via `seek_first_positive_with_prefix` on
+/// the `view_id` prefix (the circuit tables use a compound `(view_id, sub)` PK).
+fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
     if table.is_null() {
         return None;
     }
     let t = unsafe { &*table };
-    let mut ch = t.open_cursor();
-    ch.cursor.seek(crate::util::make_pk(0, view_id));
-    Some(ch)
+    Some(t.open_cursor())
 }
 
 /// Decoded `ExprProgram` blob (inline copy of the gnitz-core wire shape so the
@@ -208,6 +204,10 @@ fn decode_expr_blob(blob: &[u8]) -> Option<DecodedExprProgram> {
     }
     let s_count = u32::from_le_bytes(blob[code_end..code_end + 4].try_into().unwrap());
     let mut cur = code_end + 4;
+    // Each string needs at least a 4-byte length prefix. Bound s_count before
+    // reserving so a corrupt blob with a huge count can't trigger an OOM in
+    // Vec::with_capacity before the per-string length checks run.
+    if (s_count as usize) > blob.len().saturating_sub(cur) / 4 { return None; }
     let mut const_strings = Vec::with_capacity(s_count as usize);
     for _ in 0..s_count {
         if blob.len() < cur + 4 { return None; }
@@ -255,21 +255,18 @@ pub(crate) fn load_circuit(
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
     {
-        let mut ch = open_system_cursor(sys_node_cols, view_id)?;
-        let end_hi = view_id + 1;
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let node_id  = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID,  sys_node_cols_schema) as i32;
-                let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema) as u64;
-                let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
-                let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema) as u64;
-                let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema) as u64;
-                cols_by_node.entry(node_id).or_default().push((kind, position, v1, v2));
-            }
+        let prefix = view_id.to_le_bytes();
+        let mut ch = open_system_cursor(sys_node_cols)?;
+        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        while hit {
+            let node_id  = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID,  sys_node_cols_schema) as i32;
+            let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema) as u64;
+            let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
+            let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema) as u64;
+            let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema) as u64;
+            cols_by_node.entry(node_id).or_default().push((kind, position, v1, v2));
             ch.cursor.advance();
-            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-                break;
-            }
+            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
     }
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
@@ -279,62 +276,56 @@ pub(crate) fn load_circuit(
 
     // Phase 2: read CircuitNodes; call decode_op_node for each.
     {
-        let mut ch = open_system_cursor(sys_nodes, view_id)?;
-        let end_hi = view_id + 1;
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
-                let opcode  = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
+        let prefix = view_id.to_le_bytes();
+        let mut ch = open_system_cursor(sys_nodes)?;
+        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        while hit {
+            let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
+            let opcode  = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
 
-                let src_tab: Option<u64> = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
-                    None
-                } else {
-                    Some(cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) as u64)
-                };
-                let reindex: Option<u16> = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
-                    None
-                } else {
-                    Some(cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) as u16)
-                };
-                let expr_blob: Option<Vec<u8>> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
-                    None
-                } else {
-                    let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema);
-                    if b.is_empty() { None } else { Some(b) }
-                };
+            let src_tab: Option<u64> = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
+                None
+            } else {
+                Some(cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) as u64)
+            };
+            let reindex: Option<u16> = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
+                None
+            } else {
+                Some(cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) as u16)
+            };
+            let expr_blob: Option<Vec<u8>> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
+                None
+            } else {
+                let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema);
+                if b.is_empty() { None } else { Some(b) }
+            };
 
-                let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-                if let Ok(op) = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
-                    if matches!(op, gnitz_wire::OpNode::GatherReduce) {
-                        if let Some(c) = cols_by_node.get(&node_id) {
-                            gather_reduce_cols.insert(node_id, c.clone());
-                        }
+            let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
+            if let Ok(op) = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
+                if matches!(op, gnitz_wire::OpNode::GatherReduce) {
+                    if let Some(c) = cols_by_node.get(&node_id) {
+                        gather_reduce_cols.insert(node_id, c.clone());
                     }
-                    nodes.insert(node_id, op);
                 }
+                nodes.insert(node_id, op);
             }
             ch.cursor.advance();
-            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-                break;
-            }
+            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
     }
 
     // Phase 3: read CircuitEdges.
     {
-        let mut ch = open_system_cursor(sys_edges, view_id)?;
-        let end_hi = view_id + 1;
-        while ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 == view_id {
-            if ch.cursor.current_weight > 0 {
-                let dst  = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
-                let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
-                let src  = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
-                edges.push((src, dst, port));
-            }
+        let prefix = view_id.to_le_bytes();
+        let mut ch = open_system_cursor(sys_edges)?;
+        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        while hit {
+            let dst  = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
+            let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
+            let src  = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
+            edges.push((src, dst, port));
             ch.cursor.advance();
-            if ch.cursor.valid && (ch.cursor.current_key >> 64) as u64 >= end_hi {
-                break;
-            }
+            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
     }
 
@@ -405,14 +396,39 @@ fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
 /// Build the join-shard map by inspecting OpNode variants directly.
 /// Maps source_tid → [reindex_col] for ScanDelta → Map(Expression{reindex_col})
 /// chains (equijoin pre-indexing).
+/// Walk forward from `scan_nid` through `Filter` nodes to the first
+/// `Map(Expression { reindex_col })` and return its reindex column. The SQL
+/// planner emits `Filter → Map(reindex)` chains for PK-redistribution views,
+/// so a one-hop `scan → Map` lookup would miss the reindex behind a Filter and
+/// treat the join as local-only. Shared by `compute_join_shard_map` and
+/// `DagEngine::get_join_shard_cols` so the two stay in sync.
+pub(crate) fn reindex_col_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Option<i32> {
+    let mut frontier = vec![scan_nid];
+    // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
+    // edge paths reaching the same Filter) would re-push and re-expand nodes.
+    let mut visited = HashSet::new();
+    while let Some(cur) = frontier.pop() {
+        if !visited.insert(cur) { continue; }
+        for &(src, dst, _port) in &loaded.edges {
+            if src != cur { continue; }
+            match loaded.nodes.get(&dst) {
+                Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                    reindex_col: Some(rc), ..
+                })) => return Some(*rc as i32),
+                Some(gnitz_wire::OpNode::Filter(_)) => frontier.push(dst),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<i32>> {
     let mut join_shard_map = HashMap::new();
-    for &(src, dst, _port) in &loaded.edges {
-        if let Some(gnitz_wire::OpNode::ScanDelta(tid)) = loaded.nodes.get(&src) {
-            if let Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-                reindex_col: Some(rc), ..
-            })) = loaded.nodes.get(&dst) {
-                join_shard_map.insert(*tid as i64, vec![*rc as i32]);
+    for (&nid, op) in &loaded.nodes {
+        if let gnitz_wire::OpNode::ScanDelta(tid) = op {
+            if let Some(rc) = reindex_col_through_filters(loaded, nid) {
+                join_shard_map.insert(*tid as i64, vec![rc]);
             }
         }
     }
@@ -866,6 +882,20 @@ struct EmitState {
     emit_failed: bool,
 }
 
+/// Reject a wide-PK (`pk_stride > 16`) input at compile time, failing the
+/// enclosing `emit_node` early. The runtime delta-trace join / anti-join /
+/// semi-join / seek ops use the narrow u128 seek API and assert
+/// `!pk_is_wide()`; failing the compile turns that would-be worker crash into a
+/// clean `None` from `build_plan`.
+macro_rules! reject_wide_pk {
+    ($state:expr, $schema:expr) => {
+        if $schema.pk_is_wide() {
+            $state.emit_failed = true;
+            return;
+        }
+    };
+}
+
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_node(
     loaded: &LoadedCircuit,
@@ -1089,10 +1119,12 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
+                    reject_wide_pk!(state, a_schema);
                     reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    reject_wide_pk!(state, a_schema);
                     reg_schemas[reg_id as usize] = merge_schemas_for_join_outer(&a_schema, &b_schema);
                     builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
@@ -1110,6 +1142,7 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    reject_wide_pk!(state, reg_schemas[a_reg as usize]);
                     builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
@@ -1125,6 +1158,7 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                    reject_wide_pk!(state, reg_schemas[a_reg as usize]);
                     builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
@@ -1143,14 +1177,20 @@ fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
             let child_name = format!("_int_{}_{}", view_id, nid);
-            if let Ok(t) = create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
-                let table_idx = owned_tables.len();
-                owned_tables.push(Box::new(t));
-                let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-                reg_schemas[reg_id as usize] = in_reg_schema;
-                reg_kinds[reg_id as usize] = 1;
-                owned_trace_regs.push((reg_id as u16, table_idx));
-                emit_simple_integrate(builder, in_reg as u16, table_ptr);
+            match create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
+                Ok(t) => {
+                    let table_idx = owned_tables.len();
+                    owned_tables.push(Box::new(t));
+                    let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
+                    reg_schemas[reg_id as usize] = in_reg_schema;
+                    reg_kinds[reg_id as usize] = 1;
+                    owned_trace_regs.push((reg_id as u16, table_idx));
+                    emit_simple_integrate(builder, in_reg as u16, table_ptr);
+                }
+                // Must fail the compile: emitting the view without the Integrate
+                // would compile a view that never persists its differential
+                // state, leaving its output permanently empty.
+                Err(_) => { state.emit_failed = true; }
             }
         }
 
@@ -1201,6 +1241,7 @@ fn emit_node(
         gnitz_wire::OpNode::SeekTrace => {
             let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             let key_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            reject_wide_pk!(state, reg_schemas[key_reg as usize]);
             builder.add_seek_trace(trace_reg as u16, key_reg as u16);
         }
 
@@ -1597,6 +1638,12 @@ fn build_plan(
     }
 
     let num_regs = (next_reg + extra_regs) as usize;
+    // ProgramBuilder addresses registers with u16. A view complex enough to
+    // need > 65535 registers would wrap the cast and fire a hard assert in
+    // ProgramBuilder::build; reject it as a clean compile failure instead.
+    if num_regs > u16::MAX as usize {
+        return None;
+    }
     let mut reg_schemas = vec![SchemaDescriptor::default(); num_regs];
     let mut reg_kinds = vec![0u8; num_regs];
 
@@ -2206,6 +2253,121 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_expr_blob_rejects_huge_s_count() {
+        // Minimal valid header (16 bytes): [0..4] magic, [4] version, [5] 0,
+        // [6..8] num_regs, [8..10] result_reg, [10]=0, [11]=0, [12..16] n=0.
+        // s_count = u32::MAX with no string bytes must return None, not OOM.
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&EXPR_BLOB_MAGIC.to_le_bytes());
+        header[4] = EXPR_BLOB_VERSION;
+        // n = 0 at [12..16]
+        let mut b = header.to_vec();
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // s_count
+        assert!(decode_expr_blob(&b).is_none(), "huge s_count must be rejected");
+
+        // s_count = 1 but no string length prefix bytes remaining → None.
+        let mut b2 = header.to_vec();
+        b2.extend_from_slice(&1u32.to_le_bytes());
+        assert!(decode_expr_blob(&b2).is_none(), "s_count with too few bytes must be rejected");
+
+        // Sanity: s_count = 0 with a valid header decodes successfully.
+        let mut b3 = header.to_vec();
+        b3.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_expr_blob(&b3).is_some(), "valid empty program must decode");
+    }
+
+    #[test]
+    fn test_build_plan_register_overflow_rejected() {
+        // A circuit producing > u16::MAX registers must compile to None rather
+        // than wrap the u16 cast and panic in ProgramBuilder::build.
+        let n = u16::MAX as i32 + 1; // 65536 nodes → 65536 registers
+        let mut nodes = HashMap::new();
+        for nid in 0..n {
+            nodes.insert(nid, gnitz_wire::OpNode::ClearDeltas);
+        }
+        let loaded = LoadedCircuit {
+            out_schema: SchemaDescriptor::default(),
+            nodes,
+            edges: Vec::new(),
+            ordered: Vec::new(),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            consumers: HashMap::new(),
+            gather_reduce_cols: HashMap::new(),
+        };
+        let ordered: Vec<i32> = (0..n).collect();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &[],
+            "", 0, 1, None, None, vec![],
+        );
+        assert!(result.is_none(), "build_plan must return None when register count exceeds u16::MAX");
+    }
+
+    fn wide_pk_schema() -> SchemaDescriptor {
+        // 3 × U64 = 24-byte PK (pk_is_wide).
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    #[test]
+    fn test_build_plan_wide_pk_join_rejected() {
+        // ScanDelta(wide) --port0--> Join(DT) <--port1-- ScanTrace(wide)
+        // Join(DT) --> IntegrateSink. The delta-side schema is wide; the
+        // runtime op_join_delta_trace would assert, so build_plan must
+        // reject at compile time (emit_failed → None).
+        let schema = wide_pk_schema();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN_A),
+            (1, 2, PORT_TRACE),
+            (2, 3, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            "", 0, 1, Some(2), None, vec![],
+        );
+        assert!(result.is_none(), "wide-PK join must be rejected at compile time");
+    }
+
+    #[test]
+    fn test_build_plan_integrate_trace_child_fail_rejected() {
+        // ScanDelta(99) → IntegrateTrace(1) → IntegrateSink(2). An invalid
+        // view_dir forces create_child_table to fail; the Integrate must
+        // not be silently dropped — build_plan must return None.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            "/nonexistent_gnitz_test_path_integrate_trace",
+            0, 99, None, None, vec![],
+        );
+        assert!(result.is_none(), "IntegrateTrace child-table failure must fail the compile");
+    }
+
+    #[test]
     #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
         use crate::schema::MAX_COLUMNS;
@@ -2403,6 +2565,71 @@ mod tests {
             vec![0],
             "right side (source 20) must map to reindex_col=0"
         );
+    }
+
+    #[test]
+    fn test_compute_join_shard_map_through_filter() {
+        use gnitz_wire::{MapKind, OpNode};
+        // ScanDelta(42) → Filter → Map(reindex_col=1) → Join → IntegrateSink.
+        // The reindex Map is two hops from the scan (a Filter sits between),
+        // so the one-hop lookup misses it; BFS through Filter must find it.
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(42));
+        nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
+        nodes.insert(2, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_col: Some(1),
+        }));
+        nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(4, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),     // ScanDelta → Filter
+            (1, 2, PORT_IN),     // Filter → reindex Map
+            (2, 3, PORT_IN_A),
+            (3, 4, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        // Shared helper used by both compute_join_shard_map and
+        // DagEngine::get_join_shard_cols.
+        assert_eq!(reindex_col_through_filters(&loaded, 0), Some(1));
+
+        let map = compute_join_shard_map(&loaded);
+        assert_eq!(
+            map.get(&42).cloned().unwrap_or_default(),
+            vec![1],
+            "ScanDelta → Filter → Map(reindex) must map source 42 to col 1"
+        );
+    }
+
+    #[test]
+    fn test_reindex_col_through_filters_trivial_and_absent() {
+        use gnitz_wire::{MapKind, OpNode};
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // Trivial: ScanDelta → Map(reindex) directly (no Filter).
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(),
+            reindex_col: Some(3),
+        }));
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN)]);
+        assert_eq!(reindex_col_through_filters(&loaded, 0), Some(3));
+
+        // Absent: ScanDelta → Map with no reindex_col.
+        let mut nodes2 = HashMap::new();
+        nodes2.insert(0, OpNode::ScanDelta(7));
+        nodes2.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_col: None,
+        }));
+        let loaded2 = make_loaded(nodes2, vec![(0, 1, PORT_IN)]);
+        assert_eq!(reindex_col_through_filters(&loaded2, 0), None);
     }
 
     /// Pure ScanTrace sources (Python-API joins) must also appear in the map.

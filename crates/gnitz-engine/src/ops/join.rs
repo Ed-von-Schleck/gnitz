@@ -967,13 +967,22 @@ mod tests {
         )
     }
 
+    /// Pack a compound `(U64, U64)` PK into its 16-byte region: col0 then col1,
+    /// each little-endian — the layout storage stores and orders by.
+    fn compound_pk_bytes(c0: u64, c1: u64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&c0.to_le_bytes());
+        b[8..16].copy_from_slice(&c1.to_le_bytes());
+        b
+    }
+
     fn make_compound_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, u64, i64, i64)],
     ) -> ConsolidatedBatch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(c0, c1, w, val) in rows {
-            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1298,13 +1307,13 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[Rc::clone(&trace)], schema);
         let semi = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         assert_eq!(semi.count, 2, "semi: (1,5) and (2,3) match the trace");
-        assert_eq!(semi.get_pk(0), crate::util::make_pk(1, 5));
-        assert_eq!(semi.get_pk(1), crate::util::make_pk(2, 3));
+        assert_eq!(semi.get_pk_bytes(0), &compound_pk_bytes(1, 5));
+        assert_eq!(semi.get_pk_bytes(1), &compound_pk_bytes(2, 3));
 
         let mut ch2 = CursorHandle::from_owned(&[trace], schema);
         let anti = op_anti_join_delta_trace(&delta, ch2.cursor_mut(), &schema);
         assert_eq!(anti.count, 1, "anti: only (3,1) is absent from the trace");
-        assert_eq!(anti.get_pk(0), crate::util::make_pk(3, 1));
+        assert_eq!(anti.get_pk_bytes(0), &compound_pk_bytes(3, 1));
     }
 
     /// Signed single-column PK: negatives sort first in storage but last in raw

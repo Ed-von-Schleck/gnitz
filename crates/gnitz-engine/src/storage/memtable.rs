@@ -702,14 +702,15 @@ mod tests {
         )
     }
 
-    /// Build a 3-column Batch from (pk_lo, pk_hi, weight, group_val, agg_val) tuples.
-    fn make_reduce_batch(rows: &[(u64, u64, i64, i64, i64)]) -> Batch {
+    /// Build a 3-column Batch from (pk, weight, group_val, agg_val) tuples.
+    /// PK is a single U128 column.
+    fn make_reduce_batch(rows: &[(u128, i64, i64, i64)]) -> Batch {
         let schema = make_reduce_schema();
         let n = rows.len();
         let mut b = Batch::with_schema(schema, n.max(1));
 
-        for &(plo, phi, w, gv, av) in rows {
-            b.extend_pk(crate::util::make_pk(plo, phi));
+        for &(pk, w, gv, av) in rows {
+            b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &gv.to_le_bytes());
@@ -729,16 +730,16 @@ mod tests {
         let schema = make_reduce_schema();
 
         // Tick 1: insert (PK=0, group=0, sum=5000, w=+1)
-        let run1 = make_reduce_batch(&[(0, 0, 1, 0, 5000)]);
+        let run1 = make_reduce_batch(&[(0, 1, 0, 5000)]);
         // Tick 2: retract old, insert new
         let run2 = make_reduce_batch(&[
-            (0, 0, -1, 0, 5000),   // retract sum=5000
-            (0, 0,  1, 0, 10000),  // insert sum=10000
+            (0, -1, 0, 5000),   // retract sum=5000
+            (0,  1, 0, 10000),  // insert sum=10000
         ]);
         // Tick 3: retract old, insert new
         let run3 = make_reduce_batch(&[
-            (0, 0, -1, 0, 10000),  // retract sum=10000
-            (0, 0,  1, 0, 15000),  // insert sum=15000
+            (0, -1, 0, 10000),  // retract sum=10000
+            (0,  1, 0, 15000),  // insert sum=15000
         ]);
 
         let batches: Vec<SortedMemBatch> = vec![

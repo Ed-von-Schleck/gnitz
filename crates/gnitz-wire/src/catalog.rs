@@ -14,9 +14,15 @@ pub struct WireSysCol {
     pub nullable:  bool,
 }
 
+// Circuit catalog tables use a real compound primary key `(view_id, sub)`
+// instead of hand-packing both halves into one U128 column. `sub` is the
+// per-view secondary key (node_id, an (dst_node,dst_port) pack, or a
+// (node_id,kind,position) pack). The remaining columns denormalise the
+// decoded fields as payload so the engine's logical-column readers are
+// unchanged. PK = columns [0, 1].
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "node_pk",      type_code: type_code::U128, nullable: false },
     WireSysCol { name: "view_id",      type_code: type_code::U64,  nullable: false },
+    WireSysCol { name: "sub",          type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "node_id",      type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "opcode",       type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "source_table", type_code: type_code::U64,  nullable: true  },
@@ -25,16 +31,16 @@ pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
 ];
 
 pub const CIRCUIT_EDGES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "edge_pk",  type_code: type_code::U128, nullable: false },
     WireSysCol { name: "view_id",  type_code: type_code::U64,  nullable: false },
+    WireSysCol { name: "sub",      type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "dst_node", type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "dst_port", type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "src_node", type_code: type_code::U64,  nullable: false },
 ];
 
 pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "node_col_pk", type_code: type_code::U128, nullable: false },
     WireSysCol { name: "view_id",     type_code: type_code::U64,  nullable: false },
+    WireSysCol { name: "sub",         type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "node_id",     type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "kind",        type_code: type_code::U64,  nullable: false },
     WireSysCol { name: "position",    type_code: type_code::U64,  nullable: false },

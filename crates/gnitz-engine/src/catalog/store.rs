@@ -85,6 +85,30 @@ impl CatalogEngine {
         }
     }
 
+    /// Like `ingest_to_family` for a system table, but does NOT enqueue the
+    /// batch into `pending_broadcasts`. Used by `create_index`'s rollback: the
+    /// failed +1 was never broadcast (hook_index_register failed before the
+    /// enqueue), so broadcasting the compensating −1 would deliver a phantom
+    /// retraction to workers and leave an orphaned negative-weight row. The
+    /// hooks still fire so the master-side caches (index_by_name/index_by_id)
+    /// are reversed.
+    pub(crate) fn ingest_to_family_no_broadcast(
+        &mut self,
+        table_id: i64,
+        batch: &Batch,
+    ) -> Result<(), String> {
+        // Only valid for system tables.
+        debug_assert!(table_id < FIRST_USER_TABLE_ID);
+        let schema = sys_tab_schema(table_id);
+        let table = self.sys_table_mut(table_id)
+            .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
+        ingest_batch_into(table, batch);
+        let mut batch_for_hooks = batch.clone();
+        batch_for_hooks.set_schema(schema);
+        self.fire_hooks(table_id, &batch_for_hooks)
+        // Deliberately no push to pending_broadcasts.
+    }
+
     /// Reject FK-blocked or view-dep-blocked drops before they hit the WAL.
     /// Only TABLE_TAB and VIEW_TAB retractions have pre-conditions; other
     /// system tables (including cascade targets) are no-ops.
@@ -121,7 +145,7 @@ impl CatalogEngine {
                 }
                 let (owner_id, src_col) = {
                     let mut cursor = self.sys_indices.open_cursor();
-                    cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
+                    cursor.cursor.seek(idx_id as u128);
                     if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
                         continue;
                     }
@@ -448,6 +472,10 @@ impl CatalogEngine {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
                 table.flush().map_err(|e| format!("flush error: {}", e))?;
+                // Compact so L0 shards don't accumulate without bound across
+                // DDL-heavy sessions (system catalog tables are scanned on every
+                // boot and DDL op).
+                table.compact_if_needed().map_err(|e| format!("compaction error: {:?}", e))?;
             }
             Ok(())
         } else {
@@ -469,6 +497,7 @@ impl CatalogEngine {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
                 table.flush().map_err(|e| format!("flush error: {}", e))?;
+                table.compact_if_needed().map_err(|e| format!("compaction error: {:?}", e))?;
             }
             Ok(Vec::new())
         } else {
@@ -613,7 +642,7 @@ impl CatalogEngine {
     pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *const Table {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
-            .map(|ic| std::ptr::addr_of!(*ic.index_table))
+            .map(|ic| ic.table_mut() as *const Table)
             .unwrap_or(std::ptr::null())
     }
 
@@ -761,7 +790,7 @@ impl CatalogEngine {
     pub fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
         self.dag.tables.get(&table_id).and_then(|e| {
             match &e.handle {
-                StoreHandle::Partitioned(ref pt) => Some(std::ptr::addr_of!(**pt) as *mut PartitionedTable),
+                StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() as *mut PartitionedTable }),
                 _ => None,
             }
         })

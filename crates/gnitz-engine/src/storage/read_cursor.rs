@@ -1360,7 +1360,7 @@ mod tests {
         // As u128 the order is reversed: pack(2,3) < pack(1,5).
         let mut b = Batch::with_schema(schema, 2);
         for &(c0, c1, v) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
-            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &v.to_le_bytes());
@@ -1370,12 +1370,12 @@ mod tests {
         b.consolidated = true;
         let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
-        cursor.seek(crate::util::make_pk(2, 3));
+        cursor.seek(u128::from_le_bytes(compound_pk_bytes(2, 3)));
         assert!(cursor.valid);
         assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(2, 3));
 
         // Seek the first group too.
-        cursor.seek(crate::util::make_pk(1, 5));
+        cursor.seek(u128::from_le_bytes(compound_pk_bytes(1, 5)));
         assert!(cursor.valid);
         assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(1, 5));
     }

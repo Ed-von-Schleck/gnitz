@@ -138,9 +138,11 @@ pub(super) const IDXTAB_COL_NAME: usize = 4;
 pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
 pub(super) const IDXTAB_COL_CACHE_DIRECTORY: usize = 6;
 
-pub(super) const DEPTAB_COL_VIEW_ID: usize = 1;
+// Compound-PK layout: view_id (PK0) and dep_table_id (PK1) live in the PK
+// region; dep_view_id is the sole payload column.
+pub(super) const DEPTAB_COL_VIEW_ID: usize = 0;
+pub(super) const DEPTAB_COL_DEP_TABLE_ID: usize = 1;
 pub(super) const DEPTAB_COL_DEP_VIEW_ID: usize = 2;
-pub(super) const DEPTAB_COL_DEP_TABLE_ID: usize = 3;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
 
@@ -179,7 +181,7 @@ pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaD
 
 /// Build a `SchemaDescriptor` from the wire-neutral column slice defined in
 /// `gnitz-wire`. Called at compile time — zero runtime allocation.
-const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u32) -> SchemaDescriptor {
+const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
     let mut buf = [zero_col(); crate::schema::MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
@@ -187,7 +189,7 @@ const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u32) -> Schem
         i += 1;
     }
     let (head, _) = buf.split_at(cols.len());
-    SchemaDescriptor::new(head, &[pk_index])
+    SchemaDescriptor::new(head, pk_indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,19 +212,20 @@ pub(super) const fn idx_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), str_col()], 0)
 }
 pub(super) const fn dep_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u128_col(), u64_col(), u64_col(), u64_col()], 0)
+    // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.
+    SchemaDescriptor::new(&[u64_col(), u64_col(), u64_col()], &[0, 1])
 }
 pub(super) const fn seq_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col()], 0)
 }
 pub(super) const fn circuit_nodes_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, &[0, 1])
 }
 pub(super) const fn circuit_edges_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, &[0, 1])
 }
 pub(super) const fn circuit_node_columns_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, 0)
+    from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, &[0, 1])
 }
 
 // Pre-computed statics — initialised once at program start, never reconstructed.
@@ -245,41 +248,13 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     ((owner_id as u64) << 9) | (col_idx as u64)
 }
 
-pub(super) fn pack_node_pk(view_id: i64, node_id: i64) -> (u64, u64) {
-    (node_id as u64, view_id as u64)
-}
-
-pub(super) fn pack_edge_pk(view_id: i64, edge_id: i64) -> (u64, u64) {
-    (edge_id as u64, view_id as u64)
-}
-
-pub(super) fn pack_param_pk(view_id: i64, node_id: i64, slot: i64) -> (u64, u64) {
-    let lo = ((node_id as u64) << 8) | (slot as u64);
-    (lo, view_id as u64)
-}
-
-pub(super) fn pack_dep_pk(view_id: i64, dep_tid: i64) -> (u64, u64) {
-    (dep_tid as u64, view_id as u64)
-}
-
-pub(super) fn pack_gcol_pk(view_id: i64, node_id: i64, col_idx: i64) -> (u64, u64) {
-    let lo = ((node_id as u64) << 16) | (col_idx as u64);
-    (lo, view_id as u64)
-}
-
-/// Packs a CircuitNodeColumns PK from (view_id, node_id, kind, position).
-///
-/// Encoding: `hi = view_id`, `lo = (node_id << 24) | (kind << 16) | position`.
-/// `kind` fits in 8 bits (values 0–4); `position` fits in 16 bits (≤ 65535
-/// columns per kind per node); `node_id` fits in 40 bits for sequential
-/// allocation. The insertion path enforces these caps via debug_assert!s
-/// at the call site.
-pub(super) fn pack_node_col_pk(view_id: i64, node_id: i64, kind: i64, position: i64) -> (u64, u64) {
-    debug_assert!((position as u64) <= 0xFFFF, "position {} exceeds 16-bit cap", position);
-    debug_assert!((kind as u64) <= 0xFF, "kind {} exceeds 8-bit cap", kind);
-    debug_assert!((node_id as u64) <= 0xFF_FFFF_FFFF, "node_id {} exceeds 40-bit cap", node_id);
-    let lo = ((node_id as u64) << 24) | ((kind as u64) << 16) | (position as u64);
-    (lo, view_id as u64)
+/// Pack a circuit/dep compound PK `(view_id, sub)` into the 16-byte PK region
+/// encoded as a `u128`: low 8 bytes = `view_id`, high 8 bytes = `sub`. The
+/// circuit tables (and `_view_deps`) use this in place of the old hand-packed
+/// single-`u128` key. `sub` is the per-view secondary (node_id, dep_table_id,
+/// or an edge/node-column field pack).
+pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
+    (view_id as u64 as u128) | ((sub as u128) << 64)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,5 +329,30 @@ mod tests {
         let malformed = unpack_pk_cols(PK_LIST_PACKED_FLAG | 15);
         assert_eq!(malformed.decoded_count(), 15);
         assert_eq!(malformed.as_slice(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn circuit_tables_have_compound_view_id_sub_pk() {
+        // from_wire_cols(&[0, 1]) must produce a 2-column PK whose stride is the
+        // sum of the first two columns (U64 + U64 = 16 bytes).
+        for schema in [
+            circuit_nodes_schema(),
+            circuit_edges_schema(),
+            circuit_node_columns_schema(),
+            dep_tab_schema(),
+        ] {
+            assert_eq!(schema.pk_indices(), &[0, 1], "circuit/dep PK must be (col0, col1)");
+            assert_eq!(schema.pk_stride(), 16, "two U64 PK columns pack to 16 bytes");
+            assert!(!schema.pk_is_wide(), "stride 16 must stay narrow");
+        }
+    }
+
+    #[test]
+    fn pack_view_pk_places_view_id_low_sub_high() {
+        // The compound PK region is view_id (low 8 bytes) then sub (high 8).
+        let pk = pack_view_pk(0x1122, 0xAABB);
+        let bytes = pk.to_le_bytes();
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x1122, "view_id in low half");
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0xAABB, "sub in high half");
     }
 }

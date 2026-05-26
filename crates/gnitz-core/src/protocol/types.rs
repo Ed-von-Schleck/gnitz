@@ -231,7 +231,14 @@ impl PkColumn {
         match self {
             PkColumn::U64s(v) => v.push(pk as u64),
             PkColumn::U128s(v) => v.push(pk),
-            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
+            // Compound PK ≤16 bytes packed into a u128 (low `stride` bytes hold
+            // the LE-packed PK columns in order). Used by the catalog circuit
+            // tables whose PK is (view_id, sub).
+            PkColumn::Bytes { stride, buf } => {
+                let s = *stride as usize;
+                debug_assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
+                buf.extend_from_slice(&pk.to_le_bytes()[..s]);
+            }
         }
     }
     pub fn set_u128(&mut self, i: usize, pk: u128) {
@@ -788,15 +795,26 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Map the payload cursor to the actual schema column index, skipping PK.
-    /// Single-PK boundary: BatchAppender's wire/client API is single-PK and
-    /// stays so until the client surface is widened.
+    /// Map the payload cursor to the actual schema column index, skipping every
+    /// PK column. Supports compound PKs (e.g. the catalog circuit tables whose
+    /// PK is (view_id, sub)): payload value N targets the N-th non-PK column.
     fn col_index(&self) -> usize {
-        let pk = self.schema.pk_index_single();
-        if self.cursor < pk {
-            self.cursor
-        } else {
-            self.cursor + 1
+        debug_assert!(
+            self.cursor < self.schema.num_payload_cols(),
+            "BatchAppender: payload cursor {} exceeds {} payload columns (too many *_val calls)",
+            self.cursor, self.schema.num_payload_cols(),
+        );
+        let pk_cols = self.schema.pk_indices();
+        let mut seen_payload = 0;
+        let mut ci = 0;
+        loop {
+            if !pk_cols.contains(&ci) {
+                if seen_payload == self.cursor {
+                    return ci;
+                }
+                seen_payload += 1;
+            }
+            ci += 1;
         }
     }
 }

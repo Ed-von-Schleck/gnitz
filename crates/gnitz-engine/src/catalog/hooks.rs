@@ -153,7 +153,7 @@ impl CatalogEngine {
                 ).map_err(|e| format!("Failed to create table '{}': error {} (dir={})", name, e, directory))?;
 
                 fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
-                self.dag.register_table(tid, StoreHandle::Partitioned(Box::new(pt)), tbl_schema, 0, is_unique, directory);
+                self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, 0, is_unique, directory);
                 if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
             } else if self.dag.tables.contains_key(&tid) {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
@@ -246,7 +246,7 @@ impl CatalogEngine {
                     .max()
                     .unwrap_or(0);
 
-                self.dag.register_table(vid, StoreHandle::Partitioned(Box::new(et)), view_schema, max_depth, false, directory);
+                self.dag.register_table(vid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))), view_schema, max_depth, false, directory);
                 if vid + 1 > self.next_table_id { self.next_table_id = vid + 1; }
 
                 if self.active_part_start != self.active_part_end
@@ -265,7 +265,7 @@ impl CatalogEngine {
     }
 
     fn cascade_retract_circuit_and_deps(&mut self, vid: i64) -> Result<(), String> {
-        let pk_hi = vid as u64;
+        let view_id = vid as u64;
         for tab_id in [
             CIRCUIT_NODES_TAB_ID,
             CIRCUIT_EDGES_TAB_ID,
@@ -275,7 +275,7 @@ impl CatalogEngine {
             let schema = sys_tab_schema(tab_id);
             let batch = {
                 let table = self.sys_table_mut(tab_id).unwrap();
-                retract_rows_by_pk_hi(table, &schema, pk_hi)
+                retract_rows_by_view(table, &schema, view_id)
             };
             if batch.count > 0 {
                 self.ingest_to_family(tab_id, &batch)?;

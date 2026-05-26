@@ -490,10 +490,11 @@ impl GnitzClient {
             {
                 let mut a = BatchAppender::new(&mut dep, dep_s);
                 for &dep_tid in &deps {
-                    a.add_row(dep_tid as u128 | (vid as u128) << 64, 1)
-                        .u64_val(vid)
-                        .u64_val(0)
-                        .u64_val(dep_tid);
+                    // Compound PK (view_id, dep_table_id): low 8 bytes = view_id,
+                    // high 8 bytes = dep_table_id. dep_view_id is the only payload.
+                    let pk = (vid as u128) | ((dep_tid as u128) << 64);
+                    a.add_row(pk, 1)
+                        .u64_val(0); // dep_view_id
                 }
             }
             self.conn.push(DEP_TAB, dep_s, &dep, &mut self.schema_cache)?;
@@ -509,15 +510,17 @@ impl GnitzClient {
             {
                 let mut a = BatchAppender::new(&mut nodes, nodes_s);
                 for (node_id, opcode, src_tab, reindex, expr_blob) in &rows.nodes {
-                    let pk = *node_id as u128 | (vid as u128) << 64;
+                    // Compound PK (view_id, sub=node_id): low 8 bytes = view_id,
+                    // high 8 bytes = node_id.
+                    let pk = (vid as u128) | ((*node_id as u128) << 64);
                     let mut null_mask: u64 = 0;
-                    // Payload column null-bit positions: source_table=3, reindex_col=4, expr_program=5.
-                    if src_tab.is_none()  { null_mask |= 1u64 << 3; }
-                    if reindex.is_none()  { null_mask |= 1u64 << 4; }
-                    if expr_blob.is_none() { null_mask |= 1u64 << 5; }
+                    // Payload columns: node_id=0, opcode=1, source_table=2,
+                    // reindex_col=3, expr_program=4.
+                    if src_tab.is_none()  { null_mask |= 1u64 << 2; }
+                    if reindex.is_none()  { null_mask |= 1u64 << 3; }
+                    if expr_blob.is_none() { null_mask |= 1u64 << 4; }
                     a.add_row(pk, 1)
                         .null_mask(null_mask)
-                        .u64_val(vid)
                         .u64_val(*node_id)
                         .u64_val(*opcode);
                     match src_tab { Some(t) => { a.u64_val(*t); }, None => { a.u64_val(0); } }
@@ -539,10 +542,10 @@ impl GnitzClient {
                 let mut a = BatchAppender::new(&mut edges, edges_s);
                 for (dst_node, dst_port, src_node) in &rows.edges {
                     debug_assert!(*dst_node < (1u64 << 40), "dst_node {} exceeds 40-bit cap", dst_node);
-                    let pk_lo = ((*dst_node as u128) << 8) | (*dst_port as u128);
-                    let pk = pk_lo | (vid as u128) << 64;
+                    // Compound PK (view_id, sub): sub packs (dst_node, dst_port).
+                    let sub = ((*dst_node as u128) << 8) | (*dst_port as u128);
+                    let pk = (vid as u128) | (sub << 64);
                     a.add_row(pk, 1)
-                        .u64_val(vid)
                         .u64_val(*dst_node)
                         .u64_val(*dst_port as u64)
                         .u64_val(*src_node);
@@ -561,12 +564,12 @@ impl GnitzClient {
                     debug_assert!((*position as u64) <= 0xFFFF);
                     debug_assert!((*kind) <= 0xFF);
                     debug_assert!((*node_id) <= 0x00FF_FFFF_FFFF);
-                    let pk_lo = ((*node_id as u128) << 24)
+                    // Compound PK (view_id, sub): sub packs (node_id, kind, position).
+                    let sub = ((*node_id as u128) << 24)
                         | ((*kind as u128) << 16)
                         | (*position as u128);
-                    let pk = pk_lo | (vid as u128) << 64;
+                    let pk = (vid as u128) | (sub << 64);
                     a.add_row(pk, 1)
-                        .u64_val(vid)
                         .u64_val(*node_id)
                         .u64_val(*kind)
                         .u64_val(*position as u64)

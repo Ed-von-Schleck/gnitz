@@ -308,7 +308,6 @@ impl CatalogEngine {
             nodes_schema: circuit_nodes_schema(),
             edges_schema: circuit_edges_schema(),
             node_columns_schema: circuit_node_columns_schema(),
-            dep_tab_schema: dep_tab_schema(),
         });
     }
 
@@ -364,7 +363,7 @@ impl CatalogEngine {
             if tid < FIRST_USER_TABLE_ID { continue; }
             match &mut entry.handle {
                 StoreHandle::Single(t) => { let _ = t.flush(); }
-                StoreHandle::Partitioned(pt) => { let _ = pt.flush(); pt.close(); }
+                StoreHandle::Partitioned(cell) => { let pt = cell.get_mut(); let _ = pt.flush(); pt.close(); }
                 StoreHandle::Borrowed(_) => {} // system tables flushed below
             }
         }

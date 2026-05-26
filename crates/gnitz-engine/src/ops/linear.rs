@@ -163,6 +163,9 @@ fn op_union_merge(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
+    if schema.pk_is_wide() {
+        return op_union_merge_wide(batch_a, batch_b, schema);
+    }
     if schema_is_int_nonnull(schema) {
         op_union_merge_inner(batch_a, batch_b, schema,
             |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi))
@@ -170,6 +173,82 @@ fn op_union_merge(
         op_union_merge_inner(batch_a, batch_b, schema,
             |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi))
     }
+}
+
+/// Wide-PK (`pk_stride > 16`) sorted merge. The narrow path reads the PK as a
+/// `u128` via `get_pk`, which panics for wide keys; this variant compares PK
+/// regions byte-wise through `compare_pk_bytes`.
+fn op_union_merge_wide(
+    batch_a: &Batch,
+    batch_b: &Batch,
+    schema: &SchemaDescriptor,
+) -> Batch {
+    use crate::storage::compare_pk_bytes;
+    let n_a = batch_a.count;
+    let n_b = batch_b.count;
+    let pk_stride = schema.pk_stride() as usize;
+    let mut output = Batch::with_schema(*schema, n_a + n_b);
+    // No `share_blob_from`: `append_batch` relocates STRING/BLOB cells into a
+    // fresh `output.blob` (see `op_union_merge_inner`). Pre-sharing batch_a's
+    // blob would set `output.blob_id` to batch_a's while the content is the
+    // relocated superset, poisoning later `append_batch_no_blob_reloc` callers.
+    let mb_a = batch_a.as_mem_batch();
+    let mb_b = batch_b.as_mem_batch();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < n_a && j < n_b {
+        let ord = compare_pk_bytes(schema, mb_a.get_pk_bytes(i), mb_b.get_pk_bytes(j));
+        match ord {
+            Ordering::Less => {
+                let start = i;
+                i += 1;
+                while i < n_a && mb_a.get_pk_bytes(i) == mb_a.get_pk_bytes(start) { i += 1; }
+                output.append_batch(batch_a, start, i);
+            }
+            Ordering::Greater => {
+                let start = j;
+                j += 1;
+                while j < n_b && mb_b.get_pk_bytes(j) == mb_b.get_pk_bytes(start) { j += 1; }
+                output.append_batch(batch_b, start, j);
+            }
+            Ordering::Equal => {
+                // Copy PK to avoid holding an aliased borrow while scanning.
+                let mut a_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+                a_pk_buf[..pk_stride].copy_from_slice(mb_a.get_pk_bytes(i));
+                let a_pk = &a_pk_buf[..pk_stride];
+                let mut i_end = i + 1;
+                while i_end < n_a && mb_a.get_pk_bytes(i_end) == a_pk { i_end += 1; }
+                let mut b_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+                b_pk_buf[..pk_stride].copy_from_slice(mb_b.get_pk_bytes(j));
+                let b_pk = &b_pk_buf[..pk_stride];
+                let mut j_end = j + 1;
+                while j_end < n_b && mb_b.get_pk_bytes(j_end) == b_pk { j_end += 1; }
+                let mut ia = i;
+                let mut jb = j;
+                while ia < i_end && jb < j_end {
+                    match compare_rows(schema, &mb_a, ia, &mb_b, jb) {
+                        Ordering::Less | Ordering::Equal => {
+                            output.append_batch(batch_a, ia, ia + 1);
+                            ia += 1;
+                        }
+                        Ordering::Greater => {
+                            output.append_batch(batch_b, jb, jb + 1);
+                            jb += 1;
+                        }
+                    }
+                }
+                if ia < i_end { output.append_batch(batch_a, ia, i_end); }
+                if jb < j_end { output.append_batch(batch_b, jb, j_end); }
+                i = i_end;
+                j = j_end;
+            }
+        }
+    }
+    if i < n_a { output.append_batch(batch_a, i, n_a); }
+    if j < n_b { output.append_batch(batch_b, j, n_b); }
+    output.sorted = true;
+    output.consolidated = false;
+    output
 }
 
 #[inline]
@@ -335,6 +414,14 @@ pub fn op_null_extend(
     in_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
+    assert!(
+        in_schema.num_columns() + right_schema.num_payload_cols()
+            <= crate::schema::MAX_COLUMNS,
+        "op_null_extend: combined column count {} + {} exceeds MAX_COLUMNS={}",
+        in_schema.num_columns(), right_schema.num_payload_cols(),
+        crate::schema::MAX_COLUMNS,
+    );
+
     let in_npc = in_schema.num_payload_cols();
     let right_npc = right_schema.num_payload_cols();
     let out_npc = in_npc + right_npc;
@@ -359,6 +446,16 @@ pub fn op_null_extend(
 
     let mut output = Batch::with_schema(out_schema, n);
     output.count = n;
+
+    // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
+    // 16-byte structs are copied verbatim below still resolve against the
+    // shared heap. Without this they would point into an empty blob.
+    let needs_blob = in_schema.payload_columns().any(|(_, _, col)| {
+        col.type_code == type_code::STRING || col.type_code == type_code::BLOB
+    });
+    if needs_blob && !batch.blob.is_empty() {
+        output.share_blob_from(batch);
+    }
 
     // Copy system columns
     output.pk_data_mut().copy_from_slice(batch.pk_data());
@@ -430,7 +527,9 @@ impl PkPromoter {
         let pi = schema.payload_idx(col_idx);
         let kind = match tc {
             type_code::U128 | type_code::UUID => PromoteKind::Wide { pi },
-            type_code::STRING => PromoteKind::String { pi },
+            // BLOB shares the 16-byte German-string struct layout with STRING,
+            // so it must take the same hash path (not the narrow ≤8-byte copy).
+            type_code::STRING | type_code::BLOB => PromoteKind::String { pi },
             // All ≤8-byte integer and float types: zero-extend the little-
             // endian bytes to u128. Float bit patterns are intentionally
             // re-used as-is — identical floats map to identical group keys.
@@ -835,6 +934,184 @@ mod tests {
     // -----------------------------------------------------------------------
     // op_map reindex — end-to-end exercise of the PkPromoter via op_map
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Wide-PK union merge (pk_stride > 16)
+    // -----------------------------------------------------------------------
+
+    fn make_schema_wide_pk_3xu64_i64() -> SchemaDescriptor {
+        // PK = (U64, U64, U64) = 24 bytes (wide); one I64 payload column.
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    fn make_wide_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, u64, i64, i64)],
+    ) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(k0, k1, k2, w, val) in rows {
+            let mut pk = [0u8; 24];
+            pk[0..8].copy_from_slice(&k0.to_le_bytes());
+            pk[8..16].copy_from_slice(&k1.to_le_bytes());
+            pk[16..24].copy_from_slice(&k2.to_le_bytes());
+            b.extend_pk_bytes(&pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    fn wide_pk_triple(b: &Batch, row: usize) -> (u64, u64, u64) {
+        let pk = b.get_pk_bytes(row);
+        (
+            u64::from_le_bytes(pk[0..8].try_into().unwrap()),
+            u64::from_le_bytes(pk[8..16].try_into().unwrap()),
+            u64::from_le_bytes(pk[16..24].try_into().unwrap()),
+        )
+    }
+
+    #[test]
+    fn test_op_union_merge_wide_pk() {
+        // Regression: op_union on wide-PK (pk_stride=24) batches previously
+        // panicked in get_pk -> widen_pk_le. Verify it merges correctly:
+        // sorted by (PK, payload), all rows present, equal-PK groups
+        // payload-sorted, weights not summed (union, not consolidation).
+        let schema = make_schema_wide_pk_3xu64_i64();
+        let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
+        let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
+
+        let out = op_union(&a, Some(&b), &schema);
+        assert_eq!(out.count, 4);
+        assert!(out.sorted);
+        assert!(!out.consolidated);
+
+        assert_eq!(wide_pk_triple(&out, 0), (0, 0, 1));
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(wide_pk_triple(&out, 1), (0, 0, 1));
+        assert_eq!(get_payload_i64(&out, 1), 20);
+        assert_eq!(wide_pk_triple(&out, 2), (0, 0, 2));
+        assert_eq!(get_payload_i64(&out, 2), 200);
+        assert_eq!(wide_pk_triple(&out, 3), (0, 0, 3));
+        assert_eq!(get_payload_i64(&out, 3), 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_null_extend blob propagation + combined-column guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_null_extend_blob_propagation() {
+        // Regression: op_null_extend did not propagate the input blob, so a
+        // long (> 12 byte) string in the output resolved against an empty
+        // blob and returned garbage.
+        let in_schema = make_schema_pk_u64_payload_string();
+        let mut b = Batch::with_schema(in_schema, 1);
+        let long_str: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
+        let heap_off = b.blob.len() as u64;
+        b.blob.extend_from_slice(long_str);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        let mut gs = [0u8; 16];
+        gs[0..4].copy_from_slice(&(long_str.len() as u32).to_le_bytes());
+        gs[4..8].copy_from_slice(&long_str[..4]);
+        gs[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        b.extend_col(0, &gs);
+        b.count += 1;
+
+        // Right side: a single I64 payload column.
+        let right_schema = make_schema_u64_i64();
+        let out = op_null_extend(&b, &in_schema, &right_schema);
+
+        assert!(!out.blob.is_empty(), "output blob must be propagated");
+
+        // Resolve the long string from the output's STRING column (col 0).
+        let struct_bytes = out.col_data(0);
+        let length = u32::from_le_bytes(struct_bytes[0..4].try_into().unwrap()) as usize;
+        let off = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+        let resolved = crate::schema::long_string_bytes(&out.blob, off, length);
+        assert_eq!(resolved, long_str, "long string must resolve to the original");
+    }
+
+    #[test]
+    #[should_panic(expected = "op_null_extend: combined column count")]
+    fn test_op_null_extend_combined_column_guard() {
+        // Regression: op_null_extend wrote in_schema.num_columns() +
+        // right_schema.num_payload_cols() entries into a [_; MAX_COLUMNS]
+        // stack array with no bounds check. Combined > MAX_COLUMNS must
+        // panic with a clear message, not a generic index-out-of-bounds.
+        let mut in_cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..40 {
+            in_cols.push(SchemaColumn::new(type_code::I64, 0));
+        }
+        let in_schema = SchemaDescriptor::new(&in_cols, &[0]);
+
+        let mut right_cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..40 {
+            right_cols.push(SchemaColumn::new(type_code::I64, 0));
+        }
+        let right_schema = SchemaDescriptor::new(&right_cols, &[0]);
+
+        // 41 + 40 = 81 > MAX_COLUMNS (65).
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        for pi in 0..in_schema.num_payload_cols() {
+            b.extend_col(pi, &0i64.to_le_bytes());
+        }
+        b.count += 1;
+        let _ = op_null_extend(&b, &in_schema, &right_schema);
+    }
+
+    // -----------------------------------------------------------------------
+    // PkPromoter BLOB
+    // -----------------------------------------------------------------------
+
+    fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::BLOB, 0),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn test_pk_promoter_blob_no_panic() {
+        // Regression: PkPromoter mapped BLOB to Narrow { cs: 16 }, copying 16
+        // bytes into an 8-byte buffer and panicking. BLOB shares the
+        // German-string layout and must take the String hash path.
+        let schema = make_schema_pk_u64_payload_blob();
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        // Short inline BLOB "abc" in a 16-byte German-string struct.
+        let mut gs = [0u8; 16];
+        gs[0..4].copy_from_slice(&3u32.to_le_bytes());
+        gs[4..7].copy_from_slice(b"abc");
+        b.extend_col(0, &gs);
+        b.count += 1;
+
+        let mb = b.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
+        let pk = promoter.promote(&mb, 0);
+        assert_ne!(pk, 0, "non-empty BLOB must hash to a non-zero key");
+    }
 
     #[test]
     fn test_op_map_with_reindex_promotes_payload_to_pk() {

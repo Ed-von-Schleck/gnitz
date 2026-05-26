@@ -273,13 +273,22 @@ mod tests {
         )
     }
 
+    /// Pack a compound `(U64, U64)` PK into its 16-byte region: col0 then col1,
+    /// each little-endian — the layout storage stores and orders by.
+    fn compound_pk_bytes(c0: u64, c1: u64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&c0.to_le_bytes());
+        b[8..16].copy_from_slice(&c1.to_le_bytes());
+        b
+    }
+
     fn make_compound_batch(
         schema: &SchemaDescriptor,
         rows: &[(u64, u64, i64, i64)],
     ) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(c0, c1, w, val) in rows {
-            b.extend_pk(crate::util::make_pk(c0, c1));
+            b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -314,7 +323,7 @@ mod tests {
         let delta2 = make_compound_batch(&schema, &[(2, 3, 1, 999)]);
         let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
         assert_eq!(out2.count, 1, "compound: a new payload at an existing PK emits +1");
-        assert_eq!(out2.get_pk(0), crate::util::make_pk(2, 3));
+        assert_eq!(out2.get_pk_bytes(0), &compound_pk_bytes(2, 3));
         assert_eq!(out2.get_weight(0), 1);
     }
 

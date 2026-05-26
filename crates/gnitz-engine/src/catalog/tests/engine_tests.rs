@@ -434,17 +434,41 @@ fn test_get_column_names_cached() {
 }
 
 #[test]
+fn test_view_deps_compound_pk_round_trip() {
+    // After the dep_tab compound-PK migration, get_dep_map must extract
+    // (view_id, dep_table_id) from the PK region. Write deps for view 7 →
+    // tables 100 and 200, then verify the rebuilt dep/source maps.
+    let dir = temp_dir("view_deps_compound");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    engine.write_view_deps(7, &[100, 200]);
+    engine.dag.invalidate_dep_map();
+
+    let dep_map = engine.dag.get_dep_map().clone();
+    assert_eq!(dep_map.get(&100), Some(&vec![7]), "table 100 must feed view 7");
+    assert_eq!(dep_map.get(&200), Some(&vec![7]), "table 200 must feed view 7");
+
+    let mut sources = engine.dag.get_source_ids(7);
+    sources.sort_unstable();
+    assert_eq!(sources, vec![100, 200], "view 7 sources extracted from PK");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
-    // Schema layout: node_pk U128, view_id U64, node_id U64, opcode U64,
-    // source_table U64?, reindex_col U64?, expr_program BLOB?.
+    // Compound-PK layout: (view_id U64, sub U64) primary key, then payload
+    // node_id U64, opcode U64, source_table U64?, reindex_col U64?,
+    // expr_program BLOB?.
     let schema = circuit_nodes_schema();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(42u128, 1);
-    bb.put_u64(0);   // view_id
+    let pk = pack_view_pk(0, 42); // view_id=0, sub=node_id=42
+    bb.begin_row(pk, 1);
     bb.put_u64(42);  // node_id
     bb.put_u64(11);  // opcode
     bb.put_null();   // source_table (NULL)
@@ -458,10 +482,12 @@ fn test_circuit_table_surface_introspectable() {
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
     assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
-    let found = engine.seek_family(CIRCUIT_NODES_TAB_ID, 42u128).unwrap();
-    assert!(found.is_some(), "seek_family must find CircuitNodes row by PK");
+    // Compound PK: seek by the 16-byte PK region (view_id ++ sub).
+    let pk_bytes = &pk.to_le_bytes()[..16];
+    let found = engine.seek_family_bytes(CIRCUIT_NODES_TAB_ID, pk_bytes).unwrap();
+    assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
     let found = found.unwrap();
-    assert_eq!(found.count, 1, "seek_family must return exactly one row");
+    assert_eq!(found.count, 1, "seek_family_bytes must return exactly one row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

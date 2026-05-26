@@ -308,6 +308,12 @@ pub fn merge_and_route(
     lsn_tag: u64,
     out_results: &mut [GuardResult],
 ) -> Result<usize, StorageError> {
+    // Empty guard_keys would make find_guard_for_key return 0 (via
+    // saturating_sub(1)) and then index batches[0] out of bounds. Callers
+    // always pass a non-empty list, but don't rely on that silently.
+    if guard_keys.is_empty() {
+        return Err(StorageError::InvalidPath);
+    }
     let num_guards = guard_keys.len();
     let out_dir_str = output_dir.to_str().unwrap_or("");
 
@@ -602,6 +608,18 @@ mod tests {
         assert_eq!(merged.count, 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_and_route_rejects_empty_guards() {
+        // Empty guard_keys would index batches[0] out of bounds inside the
+        // merge loop; the function must reject it up front.
+        let schema = make_test_schema();
+        let cdir = std::ffi::CString::new("/tmp").unwrap();
+        let guards: [u128; 0] = [];
+        let mut results: [GuardResult; 0] = [];
+        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, &mut results);
+        assert!(r.is_err(), "empty guard_keys must return Err, not panic");
     }
 
     #[test]

@@ -1,5 +1,10 @@
 use super::*;
-use crate::util::make_pk;
+
+// Arbitrary fixed 128-bit values for UUID columns; UUID_A is the value the
+// parent stores and a valid child references, UUID_B is a distinct value used
+// to trigger an FK violation.
+const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
+const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
 
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
@@ -381,7 +386,7 @@ fn test_fk_u128() {
     // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(make_pk(0xBBBB, 0xAAAA), 1);
+    pbb.begin_row(UUID_A, 1);
     pbb.end_row();
     engine.dag.ingest_to_family(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
@@ -390,14 +395,14 @@ fn test_fk_u128() {
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
-    cbb.put_u128(make_pk(0xBBBB, 0xAAAA));
+    cbb.put_u128(UUID_A);
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_ok());
 
     // Invalid child FK (no such parent)
     let mut cbb2 = BatchBuilder::new(child_schema);
     cbb2.begin_row(2u128, 1);
-    cbb2.put_u128(make_pk(0xDEAD, 0xBEEF));
+    cbb2.put_u128(UUID_B);
     cbb2.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb2.finish()).is_err());
 

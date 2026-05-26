@@ -87,16 +87,15 @@ pub fn dep_tab_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "dep_pk".into(),       type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "view_id".into(),      type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "dep_view_id".into(),  type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "dep_table_id".into(), type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "dep_view_id".into(),  type_code: TypeCode::U64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
-        pk_cols: vec![0],
+        pk_cols: vec![0, 1],
     })
 }
 
-pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: usize) -> Schema {
+pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_cols: &[usize]) -> Schema {
     Schema {
         columns: cols.iter().map(|c| ColumnDef {
             name:        c.name.into(),
@@ -105,22 +104,22 @@ pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_index: u
             fk_table_id: 0,
             fk_col_idx:  0,
         }).collect(),
-        pk_cols: vec![pk_index],
+        pk_cols: pk_cols.to_vec(),
     }
 }
 
 pub fn circuit_nodes_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, 0))
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, &[0, 1]))
 }
 
 pub fn circuit_edges_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, 0))
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, &[0, 1]))
 }
 
 pub fn circuit_node_columns_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, 0))
+    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, &[0, 1]))
 }
 

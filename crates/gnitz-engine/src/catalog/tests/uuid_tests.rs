@@ -1,5 +1,9 @@
 use super::*;
-use crate::util::make_pk;
+
+// Arbitrary fixed 128-bit values for UUID columns. Distinct from each other;
+// the actual bit pattern is irrelevant to the tests.
+const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
+const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
 
 fn uuid_col_def(name: &str) -> ColumnDef {
     ColumnDef { name: name.into(), type_code: type_code::UUID, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
@@ -41,7 +45,7 @@ fn test_uuid_non_pk_column() {
     // Ingest a row with a UUID payload column
     let mut bb = BatchBuilder::new(s);
     bb.begin_row(1u128, 1);
-    bb.put_u128(make_pk(0xBBBB, 0xAAAA));
+    bb.put_u128(UUID_A);
     bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
@@ -64,7 +68,7 @@ fn test_uuid_secondary_index() {
 
     let mut bb = BatchBuilder::new(s);
     bb.begin_row(1u128, 1);
-    bb.put_u128(make_pk(0xBBBB, 0xAAAA));
+    bb.put_u128(UUID_A);
     bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
@@ -97,7 +101,7 @@ fn test_uuid_fk_valid_single() {
 
     let parent_schema = engine.get_schema(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(make_pk(0xBBBB, 0xAAAA), 1);
+    pbb.begin_row(UUID_A, 1);
     pbb.end_row();
     engine.dag.ingest_to_family(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
@@ -105,7 +109,7 @@ fn test_uuid_fk_valid_single() {
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
-    cbb.put_u128(make_pk(0xBBBB, 0xAAAA));
+    cbb.put_u128(UUID_A);
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_ok());
 
@@ -133,7 +137,7 @@ fn test_uuid_fk_invalid_single() {
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
-    cbb.put_u128(make_pk(0xDEAD, 0xBEEF));
+    cbb.put_u128(UUID_B);
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_err());
 
@@ -209,7 +213,7 @@ fn test_uuid_fk_multiple_children_mixed() {
     cbb.put_u128(0xAAAAu128); // valid
     cbb.end_row();
     cbb.begin_row(2u128, 1);
-    cbb.put_u128(make_pk(0xDEAD, 0xBEEF)); // invalid
+    cbb.put_u128(UUID_B); // invalid
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_err());
 
@@ -238,7 +242,7 @@ fn test_uuid_fk_parent_not_yet_ingested() {
     let child_schema = engine.get_schema(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
-    cbb.put_u128(make_pk(0xBBBB, 0xAAAA));
+    cbb.put_u128(UUID_A);
     cbb.end_row();
     assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_err());
 

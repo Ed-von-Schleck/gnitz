@@ -673,11 +673,21 @@ impl ShardIndex {
             return vec![0];
         }
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
-            self.levels[0]
+            // Always anchor the guard space at 0. `find_guard_for_key` routes a
+            // key below the first guard to guard[0] via `saturating_sub(1)`, but
+            // `find_guard_idx` returns `None` for keys below the first guard
+            // key — so a key inserted after L1 established `guard[0] > 0` would
+            // be written during compaction yet invisible on read. Mirrors the
+            // fix in `compact_guard_vertical`.
+            let mut keys: Vec<u128> = self.levels[0]
                 .guards
                 .iter()
                 .map(|g| g.guard_key)
-                .collect()
+                .collect();
+            if keys.first().copied() != Some(0) {
+                keys.insert(0, 0);
+            }
+            keys
         } else {
             // Guard-key / routing path stays u128. The guard space is the
             // order-preserving `pk_sort_key`: identical to `as_u128_single_pk`
@@ -695,8 +705,8 @@ impl ShardIndex {
                     keys.push(pk);
                 }
             }
-            if keys.is_empty() {
-                keys.push(0);
+            if keys.is_empty() || keys[0] != 0 {
+                keys.insert(0, 0);
             }
             keys
         }
@@ -824,7 +834,6 @@ impl ShardIndex {
 
         let dest_guard_indices =
             self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
-        let mut dest_file_start_indices: Vec<usize> = Vec::new();
         let mut vert_max_lsn = self.levels[src_idx].guards[worst_idx]
             .entries
             .iter()
@@ -834,7 +843,6 @@ impl ShardIndex {
 
         for &di in &dest_guard_indices {
             let dg = &self.levels[dest_idx].guards[di];
-            dest_file_start_indices.push(all_input_files.len());
             for e in &dg.entries {
                 all_input_files.push(e.filename.clone());
                 if e.max_lsn > vert_max_lsn {
@@ -1229,6 +1237,61 @@ mod tests {
             pre_entries,
             "src entries must be unchanged on failure"
         );
+    }
+
+    #[test]
+    fn test_l1_guard_keys_anchored_at_zero() {
+        // Regression: when L1's first guard key is > 0, l1_guard_keys must
+        // still anchor the guard space at 0 so keys below the first guard are
+        // routable and readable.
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Establish L1 with a single guard whose key is 100.
+        idx.ensure_level(1);
+        let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
+        let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+        idx.levels[0].get_or_create_guard(100).entries.push(entry);
+
+        let keys = idx.l1_guard_keys();
+        assert_eq!(keys.first().copied(), Some(0), "guard space must start at 0, got {keys:?}");
+        assert!(keys.contains(&100), "existing guard key 100 must be preserved");
+    }
+
+    #[test]
+    fn test_l1_guard_routing_gap_key_below_first_guard() {
+        // Regression for the find_guard_idx/find_guard_for_key mismatch: a key
+        // inserted below L1's first guard key (100) must remain findable after
+        // an L0→L1 compaction.
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // L1 already has a guard at key 100 (keys 100, 200).
+        idx.ensure_level(1);
+        let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
+        let entry = ShardEntry::open(&path, &schema, 0, 1).unwrap();
+        idx.levels[0].get_or_create_guard(100).entries.push(entry);
+
+        // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
+        let low_keys = [50u64, 60, 70, 80, 90];
+        for (i, &k) in low_keys.iter().enumerate() {
+            let name = format!("l0_{}.db", i);
+            let p = write_test_shard(dir.path(), &name, &[k], &[k as i64 * 10]);
+            idx.add_shard(&p, (i + 2) as u64, (i + 2) as u64).unwrap();
+        }
+        assert!(idx.should_compact());
+        idx.run_compact().unwrap();
+
+        // Every below-first-guard key must be findable, plus the original L1 keys.
+        for k in low_keys.iter().chain([100u64, 200].iter()) {
+            let mut found = false;
+            idx.find_pk(*k as u128, &mut |_, _| found = true);
+            assert!(found, "key {k} not found after compaction (guard routing gap)");
+        }
     }
 
     #[test]

@@ -537,10 +537,14 @@ impl VmHandle {
             #[allow(clippy::disallowed_methods)] // explicit maintenance: owned-trace operator state
             match table.create_cursor_compacting() {
                 Ok(ch) => {
-                    let mut boxed = Box::new(ch);
-                    let ptr = &mut *boxed as *mut CursorHandle;
+                    // Store the Box into its slot first, then derive the
+                    // pointer from the slot — taking the pointer before the
+                    // move raises Stacked Borrows aliasing questions even
+                    // though the heap address is stable across the move.
+                    self.owned_cursor_handles[slot] = Some(Box::new(ch));
+                    let ptr = self.owned_cursor_handles[slot].as_mut().unwrap()
+                        .as_mut() as *mut CursorHandle;
                     self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
-                    self.owned_cursor_handles[slot] = Some(boxed);
                 }
                 Err(_) => {
                     self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
@@ -1099,6 +1103,38 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, type_code};
     use crate::ops::{AggDescriptor, AggOp};
+
+    #[test]
+    fn test_clear_delta_batches_clears_only_delta_registers() {
+        // clear_delta_batches (used by DagEngine::clear_view_regfile_deltas
+        // after backfill) must empty Delta registers while leaving Trace
+        // registers untouched.
+        let schema = schema_1i64();
+        let mut delta_batch = Batch::with_schema(schema, 1);
+        delta_batch.extend_pk(1u128);
+        delta_batch.extend_weight(&1i64.to_le_bytes());
+        delta_batch.extend_null_bmp(&0u64.to_le_bytes());
+        delta_batch.extend_col(0, &10i64.to_le_bytes());
+        delta_batch.count += 1;
+
+        let mut trace_batch = Batch::with_schema(schema, 1);
+        trace_batch.extend_pk(2u128);
+        trace_batch.extend_weight(&1i64.to_le_bytes());
+        trace_batch.extend_null_bmp(&0u64.to_le_bytes());
+        trace_batch.extend_col(0, &20i64.to_le_bytes());
+        trace_batch.count += 1;
+
+        let mut rf = RegisterFile {
+            registers: vec![
+                Register { kind: RegisterKind::Delta, schema, batch: delta_batch, cursor_ptr: std::ptr::null_mut() },
+                Register { kind: RegisterKind::Trace, schema, batch: trace_batch, cursor_ptr: std::ptr::null_mut() },
+            ],
+        };
+        assert_eq!(rf.registers[0].batch.count, 1);
+        rf.clear_delta_batches();
+        assert_eq!(rf.registers[0].batch.count, 0, "Delta register must be cleared");
+        assert_eq!(rf.registers[1].batch.count, 1, "Trace register must be preserved");
+    }
 
     // ── Test helpers ─────────────────────────────────────────────────────
 

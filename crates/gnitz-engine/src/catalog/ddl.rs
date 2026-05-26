@@ -220,6 +220,15 @@ impl CatalogEngine {
 
         self.dag.invalidate(vid);
 
+        // Remove the view's dependency rows from sys_view_deps first. dag.dep_map
+        // is rebuilt by scanning sys_view_deps; ghost entries for a dropped view
+        // would accumulate and force re-evaluation of dead dependencies on every
+        // upstream change.
+        let dep_batch = retract_rows_by_view(&mut self.sys_view_deps, &dep_tab_schema(), vid as u64);
+        if dep_batch.count > 0 {
+            ingest_batch_into(&mut self.sys_view_deps, &dep_batch);
+        }
+
         let schema = view_tab_schema();
         let batch = retract_single_row(&mut self.sys_views, &schema, vid as u128);
         if batch.count == 0 {
@@ -260,6 +269,12 @@ impl CatalogEngine {
         }
 
         let index_name = make_secondary_index_name(schema_name, table_name, col_name);
+        // Reject a duplicate before allocating an index_id. Otherwise
+        // apply_index_by_name silently overwrites the cache entry and orphans
+        // the previous index circuit.
+        if self.caches.index_by_name.contains_key(&index_name) {
+            return Err(format!("Index already exists: {}", index_name));
+        }
         let index_id = self.allocate_index_id();
 
         // Write index record (triggers hook). If the hook fails — most
@@ -279,11 +294,13 @@ impl CatalogEngine {
             bb.end_row();
             let batch = bb.finish();
             if let Err(e) = self.ingest_to_family(IDX_TAB_ID, &batch) {
-                // Route the undo through ingest_to_family so the index_by_name
-                // / index_by_id hooks (which already fired on the +1 before
-                // hook_index_register failed) are reversed by the matching -1.
-                // Writing directly to storage would leave those caches poisoned
-                // with a ghost index that doesn't exist on disk.
+                // The +1 failed in hook_index_register *before* it was enqueued
+                // into pending_broadcasts, so it was never broadcast to workers.
+                // Route the undo through ingest_to_family_no_broadcast: it fires
+                // the cache-reversal hooks (index_by_name / index_by_id) but does
+                // NOT enqueue the −1. Broadcasting the −1 would deliver a phantom
+                // retraction to workers that never saw the +1, leaving an
+                // orphaned negative-weight row in their sys_indices.
                 let mut undo = BatchBuilder::new(schema);
                 undo.begin_row(index_id as u128, -1);
                 undo.put_u64(owner_id as u64);
@@ -294,7 +311,7 @@ impl CatalogEngine {
                 undo.put_string("");
                 undo.end_row();
                 let undo_batch = undo.finish();
-                let _ = self.ingest_to_family(IDX_TAB_ID, &undo_batch);
+                let _ = self.ingest_to_family_no_broadcast(IDX_TAB_ID, &undo_batch);
                 return Err(e);
             }
         }
@@ -311,8 +328,9 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
 
         // Read the full index record from sys_indices to retract it
+        // (sys_indices has a single U64 PK; seek by the zero-extended id).
         let mut cursor = self.sys_indices.open_cursor();
-        cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
+        cursor.cursor.seek(idx_id as u128);
 
         if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
             return Err(format!("Index {} not found in catalog", index_name));
@@ -369,6 +387,11 @@ impl CatalogEngine {
                 }
             }
         }
+
+        // execute_epoch clears deltas only at epoch start, so the scanned
+        // source batch and intermediate delta registers remain pinned in the
+        // view's regfile after the last source. Release them now.
+        self.dag.clear_view_regfile_deltas(vid);
     }
 
     // -- Index backfill (scan source, project into index table) ------------
@@ -459,7 +482,25 @@ impl CatalogEngine {
             // `ingest_to_family` would broadcast IDX_TAB before TABLE_TAB and
             // duplicate the rows the worker already produced.
             ingest_batch_into(&mut self.sys_indices, &batch);
-            self.fire_hooks(IDX_TAB_ID, &batch)?;
+            if let Err(e) = self.fire_hooks(IDX_TAB_ID, &batch) {
+                // The +1 is already in sys_indices but its directory/cache
+                // setup failed. Reverse the storage write and re-fire hooks on
+                // the −1 so any partial cache updates are undone; otherwise the
+                // next boot's replay opens a missing index directory and crashes.
+                let mut ub = BatchBuilder::new(idx_schema);
+                ub.begin_row(index_id as u128, -1);
+                ub.put_u64(table_id as u64);
+                ub.put_u64(OWNER_KIND_TABLE as u64);
+                ub.put_u64(col_idx as u64);
+                ub.put_string(&index_name);
+                ub.put_u64(0);
+                ub.put_string("");
+                ub.end_row();
+                let undo = ub.finish();
+                ingest_batch_into(&mut self.sys_indices, &undo);
+                self.fire_hooks(IDX_TAB_ID, &undo).ok();
+                return Err(e);
+            }
 
             self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
         }
@@ -496,11 +537,9 @@ impl CatalogEngine {
         let schema = dep_tab_schema();
         let mut bb = BatchBuilder::new(schema);
         for &dep_tid in dep_ids {
-            let (pk_lo, pk_hi) = pack_dep_pk(vid, dep_tid);
-            bb.begin_row(crate::util::make_pk(pk_lo, pk_hi), 1);
-            bb.put_u64(vid as u64);
+            // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.
+            bb.begin_row(pack_view_pk(vid, dep_tid as u64), 1);
             bb.put_u64(0); // dep_view_id
-            bb.put_u64(dep_tid as u64);
             bb.end_row();
         }
         let batch = bb.finish();
