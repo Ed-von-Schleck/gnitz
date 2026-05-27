@@ -76,6 +76,7 @@ pub const NODE_COL_KIND_SHARD:    u64 = 1;  // EXCHANGE_SHARD shard columns
 pub const NODE_COL_KIND_PROJ:     u64 = 2;  // MAP projection columns
 pub const NODE_COL_KIND_NULL_EXT: u64 = 3;  // NULL_EXTEND payload type codes
 pub const NODE_COL_KIND_AGG_SPEC: u64 = 4;  // REDUCE aggregate specs (value1=func_id, value2=col_idx)
+pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch discriminator (value1=branch_id)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -142,7 +143,13 @@ pub enum MapKind {
     /// payload, in order), but the synthetic PK is set to a hash of the kept
     /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
     /// decided by the projected row content, not by the source PK.
-    HashRow(Vec<u16>),
+    ///
+    /// The second field is a per-side `branch_id` mixed into the hash so that
+    /// identical payloads on the left vs right branch of a `UNION ALL` get
+    /// distinct synthetic PKs (and therefore accumulate weight +2 rather than
+    /// collapsing). Deduplicating set-ops (UNION/EXCEPT/INTERSECT) use 0 on both
+    /// sides; UNION ALL uses 0 on the left and 1 on the right.
+    HashRow(Vec<u16>, u8),
 }
 
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>`;
@@ -227,7 +234,13 @@ pub fn decode_op_node(
             OpNode::Map(MapKind::Expression { program, reindex_col: reindex })
         }
         x if x == OPCODE_MAP_KEY_ONLY      => OpNode::Map(MapKind::KeyOnly),
-        x if x == OPCODE_MAP_HASH_ROW      => OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ))),
+        x if x == OPCODE_MAP_HASH_ROW      => {
+            let branch_id = cols.iter()
+                .find(|(k, _, _, _)| *k == NODE_COL_KIND_BRANCH_ID)
+                .map(|(_, _, v1, _)| *v1 as u8)
+                .unwrap_or(0);
+            OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ), branch_id))
+        }
         x if x == OPCODE_NEGATE            => OpNode::Negate,
         x if x == OPCODE_UNION             => OpNode::Union,
         x if x == OPCODE_DELAY             => OpNode::Delay,

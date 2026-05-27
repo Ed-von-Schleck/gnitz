@@ -19,7 +19,7 @@ pub enum Instr {
     ScanTrace { trace_reg: u16, out_reg: u16, chunk_limit: i32 },
     SeekTrace { trace_reg: u16, key_reg: u16 },
     Filter { in_reg: u16, out_reg: u16, func_idx: u16 },
-    Map { in_reg: u16, out_reg: u16, func_idx: u16, out_schema_idx: u16, reindex_col: i32 },
+    Map { in_reg: u16, out_reg: u16, func_idx: u16, out_schema_idx: u16, reindex_col: i32, branch_id: u8 },
     Negate { in_reg: u16, out_reg: u16 },
     Union { in_a: u16, in_b: u16, has_b: bool, out_reg: u16 },
     Distinct { in_reg: u16, hist_reg: u16, out_reg: u16, hist_table_idx: i16 },
@@ -200,10 +200,11 @@ impl ProgramBuilder {
     pub fn add_map(
         &mut self, in_reg: u16, out_reg: u16,
         func_ptr: *const ScalarFuncKind, out_schema: SchemaDescriptor, reindex_col: i32,
+        branch_id: u8,
     ) {
         let func_idx = self.func_idx(func_ptr);
         let out_schema_idx = self.schema_idx(out_schema);
-        self.instructions.push(Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col });
+        self.instructions.push(Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col, branch_id });
     }
 
     pub fn add_negate(&mut self, in_reg: u16, out_reg: u16) {
@@ -698,30 +699,55 @@ pub fn execute_epoch(
     cursor_handles: &[*mut libc::c_void],
     owned_trace_reg_ids: &[(u16, usize)],
 ) -> Result<Option<Batch>, i32> {
-    gnitz_debug!("vm: execute_epoch input_count={} input_reg={} output_reg={} instrs={}",
-        input_batch.count, input_reg, output_reg, program.instructions.len());
+    execute_epoch_multi(
+        program, regfile,
+        std::iter::once((input_reg, input_batch)),
+        output_reg, cursor_handles, owned_trace_reg_ids,
+    )
+}
+
+/// Execute one epoch, seeding several input registers before the dispatch loop.
+///
+/// Used by the multi-exchange dispatch: a set-op post phase reads one
+/// exchange-relayed batch per side (left, right), so more than one register must
+/// be loaded after `clear_delta_batches` wipes the delta registers. Each
+/// `(reg, batch)` is moved into place; later seeds win on a duplicate register.
+/// Takes an iterator so the single-input `execute_epoch` (the hot per-epoch
+/// entry) seeds via `iter::once` with no heap allocation.
+pub fn execute_epoch_multi(
+    program: &Program,
+    regfile: &mut RegisterFile,
+    inputs: impl IntoIterator<Item = (u16, Batch)>,
+    output_reg: u16,
+    cursor_handles: &[*mut libc::c_void],
+    owned_trace_reg_ids: &[(u16, usize)],
+) -> Result<Option<Batch>, i32> {
+    gnitz_debug!("vm: execute_epoch output_reg={} instrs={}",
+        output_reg, program.instructions.len());
 
     // 1. Clear delta batches (cursor refresh already done by caller)
     regfile.clear_delta_batches();
 
-    // 2. Bind cursors and input batch
+    // 2. Bind cursors and seed input batches
     regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
-    if input_batch.count > 0 {
-        // Only assert when the batch is non-empty: an empty batch is a
-        // structural no-op (every per-row loop short-circuits) and may
-        // legitimately carry a schema unrelated to the target register
-        // during DAG dispatch (a dep_map view with no matching rows).
-        // A mismatched schema with count>0 means we'd run the program against
-        // the wrong column layout, silently scrambling every downstream read —
-        // fail loudly instead.
-        if let Some(ref s) = input_batch.schema {
-            assert_eq!(
-                s.num_columns(), program.reg_meta[input_reg as usize].schema.num_columns(),
-                "VM register {} schema/batch column-count mismatch", input_reg,
-            );
+    for (input_reg, input_batch) in inputs {
+        if input_batch.count > 0 {
+            // Only assert when the batch is non-empty: an empty batch is a
+            // structural no-op (every per-row loop short-circuits) and may
+            // legitimately carry a schema unrelated to the target register
+            // during DAG dispatch (a dep_map view with no matching rows).
+            // A mismatched schema with count>0 means we'd run the program against
+            // the wrong column layout, silently scrambling every downstream read —
+            // fail loudly instead.
+            if let Some(ref s) = input_batch.schema {
+                assert_eq!(
+                    s.num_columns(), program.reg_meta[input_reg as usize].schema.num_columns(),
+                    "VM register {} schema/batch column-count mismatch", input_reg,
+                );
+            }
         }
+        regfile.registers[input_reg as usize].batch = input_batch;
     }
-    regfile.registers[input_reg as usize].batch = input_batch;
 
     // Raw pointer to the register array.  All instructions access distinct
     // registers (guaranteed by topological sort), so aliased &/&mut access
@@ -808,7 +834,7 @@ pub fn execute_epoch(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col } => {
+            Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col, branch_id } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
                 let in_schema = reg!(*in_reg).schema;
@@ -820,7 +846,7 @@ pub fn execute_epoch(
                     out
                 } else {
                     let func = unsafe { &*func_ptr };
-                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, *reindex_col)
+                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, *reindex_col, *branch_id)
                 };
                 reg_mut!(*out_reg).batch = result;
             }
@@ -1692,7 +1718,7 @@ mod tests {
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, func_ptr, out_schema, -1);
+        builder.add_map(0, 1, func_ptr, out_schema, -1, 0);
         builder.add_halt();
 
         let input = make_batch_2col(in_schema, &[
@@ -2571,7 +2597,7 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, std::ptr::null(), schema, -1);
+        builder.add_map(0, 1, std::ptr::null(), schema, -1, 0);
         builder.add_halt();
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);

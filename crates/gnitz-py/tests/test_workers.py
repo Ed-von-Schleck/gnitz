@@ -753,7 +753,6 @@ def test_cross_table_push_scan_isolation(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_workers_distinct_view(client):
     """SELECT DISTINCT view with GNITZ_WORKERS=4."""
     sn = "s" + _uid()
@@ -784,7 +783,6 @@ def test_workers_distinct_view(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_workers_except_multiworker(client):
     """EXCEPT (anti-join) with multi-worker distribution."""
     sn = "s" + _uid()

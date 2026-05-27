@@ -19,9 +19,12 @@ use crate::vm;
 /// The Borrowed variant holds a non-owning pointer for system tables owned
 /// by CatalogEngine directly.
 pub enum StoreHandle {
-    /// Owned single Table — used by views in single-worker mode.
+    /// Owned single Table — used by views in single-worker mode. Wrapped in
+    /// `UnsafeCell` for the same reason as `Partitioned`: the interior-mutable
+    /// accessors mutate through a pointer derived from a shared `&self`, which
+    /// is UB under Stacked Borrows unless the data sits behind an `UnsafeCell`.
     #[allow(dead_code)]
-    Single(Box<Table>),
+    Single(UnsafeCell<Box<Table>>),
     /// Owned PartitionedTable — used by base tables and views. Wrapped in
     /// `UnsafeCell` so the interior-mutable accessors can hand out `&mut`
     /// through a shared `&self` without violating Stacked Borrows (a raw
@@ -42,7 +45,10 @@ impl StoreHandle {
     /// The caller must ensure no aliasing &mut references exist.
     pub fn table_ptr(&self) -> *mut Table {
         match self {
-            StoreHandle::Single(t) => std::ptr::addr_of!(**t) as *mut Table,
+            StoreHandle::Single(t) => {
+                let bx: &mut Box<Table> = unsafe { &mut *t.get() };
+                bx.as_mut() as *mut Table
+            }
             StoreHandle::Borrowed(ptr) => *ptr,
             StoreHandle::Partitioned(_) => std::ptr::null_mut(),
         }
@@ -135,7 +141,7 @@ impl StoreHandle {
     /// Dispatched flush across all variants.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
         match self {
-            StoreHandle::Single(t) => t.flush(),
+            StoreHandle::Single(t) => t.get_mut().flush(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
             StoreHandle::Partitioned(cell) => cell.get_mut().flush(),
         }
@@ -146,7 +152,7 @@ impl StoreHandle {
     /// work; for Single/Borrowed `partition_idx` is always 0.
     pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
         match self {
-            StoreHandle::Single(t) => match t.flush_prepare(true)? {
+            StoreHandle::Single(t) => match t.get_mut().flush_prepare(true)? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
                 FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
             },
@@ -165,7 +171,7 @@ impl StoreHandle {
         works: Vec<(usize, FlushWork)>,
     ) -> Result<Vec<libc::c_int>, StorageError> {
         let t: &mut Table = match self {
-            StoreHandle::Single(t) => t,
+            StoreHandle::Single(t) => t.get_mut().as_mut(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
             StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),
         };
@@ -179,7 +185,7 @@ impl StoreHandle {
     /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).
     pub fn current_lsn(&self) -> u64 {
         match self {
-            StoreHandle::Single(t) => t.current_lsn,
+            StoreHandle::Single(t) => unsafe { &*t.get() }.current_lsn,
             StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).current_lsn() },
         }
@@ -584,9 +590,17 @@ impl DagEngine {
                 let src_nid = incoming_srcs[0];
                 if !loaded.edges.iter().any(|&(_, dst, _)| dst == src_nid) {
                     is_trivial = true;
-                    if let Some(gnitz_wire::OpNode::ScanTrace(tid)) = loaded.nodes.get(&src_nid) {
-                        if *tid > 0 && shard_cols.len() == 1 {
-                            if let Some(entry) = self.tables.get(&(*tid as i64)) {
+                    // SQL planner views feed the shard from a ScanDelta; Python
+                    // API joins use ScanTrace. Either is co-partitionable when the
+                    // shard key is the source PK.
+                    let tid = match loaded.nodes.get(&src_nid) {
+                        Some(gnitz_wire::OpNode::ScanTrace(t))
+                        | Some(gnitz_wire::OpNode::ScanDelta(t)) => Some(*t),
+                        _ => None,
+                    };
+                    if let Some(tid) = tid {
+                        if tid > 0 && shard_cols.len() == 1 {
+                            if let Some(entry) = self.tables.get(&(tid as i64)) {
                                 if entry.schema.is_pk_col(shard_cols[0] as usize) {
                                     is_co_partitioned = true;
                                 }
@@ -693,6 +707,13 @@ impl DagEngine {
                 gnitz_warn!("dag: execute_epoch — no plan for view_id={}", view_id);
                 return None;
             }
+        }
+
+        // Exchange views (GROUP BY / SELECT DISTINCT / set-ops) need their full
+        // multi-phase pipeline; backfill runs single-worker, so route through the
+        // local path which handles pre→post and two-sided combines.
+        if self.cache.get(&view_id).map(|p| p.post_vm.is_some()).unwrap_or(false) {
+            return self.execute_epoch_for_dag(view_id, input, source_id);
         }
 
         let plan = self.cache.get(&view_id).unwrap();
@@ -1116,7 +1137,12 @@ impl DagEngine {
                 info.is_trivial && info.is_co_partitioned
             };
 
-            let out_delta = if has_exchange {
+            let out_delta = if has_exchange && self.view_has_side_b(view_id) {
+                // Binary set-op: two HashRow→ExchangeShard sides, each scattered
+                // by its hash PK, then combined.
+                self.run_two_sided(view_id, input, src_id,
+                    |pre, side_src| exchange.do_exchange(view_id, &pre, side_src))
+            } else if has_exchange {
                 // Exchange view: pre-plan → exchange IPC → post-plan
                 let exchange_schema = self.get_exchange_schema(view_id)
                     .unwrap_or_else(|| self.tables[&view_id].schema);
@@ -1129,12 +1155,17 @@ impl DagEngine {
                     None => Batch::with_schema(exchange_schema, 0),
                 };
 
-                if skip_exchange {
-                    self.execute_plan_phase(view_id, false, pre_result, 0)
+                // The relayed (or, when skipping IPC, the local pre) batch is
+                // unsorted/unconsolidated after a HashRow reindex or a scatter;
+                // the post phase's distinct/join operators need sorted,
+                // weight-merged input.
+                let post_in = if skip_exchange {
+                    pre_result
                 } else {
-                    let exchanged = exchange.do_exchange(view_id, &pre_result, 0);
-                    self.execute_plan_phase(view_id, false, exchanged, 0)
-                }
+                    exchange.do_exchange(view_id, &pre_result, 0)
+                };
+                let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
+                self.execute_plan_phase(view_id, false, post_in, 0)
             } else if has_join_shard {
                 // Join shard exchange
                 let copart_join = self.plan_source_co_partitioned(view_id, src_id);
@@ -1286,10 +1317,23 @@ impl DagEngine {
         let plan = self.cache.get(&view_id).unwrap();
         let has_post = plan.post_vm.is_some();
 
+        if self.view_has_side_b(view_id) {
+            // Two-sided set-op: single worker owns every shard, so run both
+            // sides locally (no IPC, relay is identity) and combine.
+            return self.run_two_sided(view_id, input, source_id, |pre, _| pre);
+        }
+
         if has_post {
-            // Exchange plan: single-worker runs pre then post sequentially
-            let pre_result = self.execute_plan_phase(view_id, true, input, source_id)?;
-            self.execute_plan_phase(view_id, false, pre_result, 0)
+            // Exchange plan: single-worker runs pre then post sequentially.
+            // The pre output may be hash-reindexed and unsorted (SELECT DISTINCT);
+            // consolidate before the post phase, whose distinct/join operators
+            // assume sorted, weight-merged input.
+            let exchange_schema = self.get_exchange_schema(view_id)
+                .unwrap_or_else(|| self.tables[&view_id].schema);
+            let pre_result = self.execute_plan_phase(view_id, true, input, source_id)
+                .unwrap_or_else(|| Batch::with_schema(exchange_schema, 0));
+            let consolidated = Self::consolidate_exchanged(pre_result, &exchange_schema);
+            self.execute_plan_phase(view_id, false, consolidated, 0)
         } else {
             self.execute_plan_phase(view_id, true, input, source_id)
         }
@@ -1350,6 +1394,150 @@ impl DagEngine {
                 None
             }
         }
+    }
+
+    /// Whether a view's compiled plan carries a second exchange side (binary
+    /// set-op). The plan must already be in the cache.
+    fn view_has_side_b(&self, view_id: i64) -> bool {
+        self.cache.get(&view_id).map(|p| p.side_b.is_some()).unwrap_or(false)
+    }
+
+    /// Run side B's pre-exchange sub-pipeline (the right-hand set-op input).
+    fn execute_side_b_phase(
+        &mut self,
+        view_id: i64,
+        input: Batch,
+        source_id: i64,
+    ) -> Option<Batch> {
+        let plan = self.cache.get_mut(&view_id)?;
+        let sb = plan.side_b.as_ref()?;
+        let (in_reg, out_reg, num_regs) = (sb.in_reg, sb.out_reg, sb.num_regs as usize);
+        let etr = sb.ext_trace_regs.clone();
+
+        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
+
+        let actual_in_reg = if source_id > 0 {
+            self.cache.get(&view_id).unwrap().side_b.as_ref().unwrap()
+                .source_reg_map.get(&source_id).copied().unwrap_or(in_reg)
+        } else {
+            in_reg
+        };
+
+        let plan = self.cache.get_mut(&view_id).unwrap();
+        let vm = &mut plan.side_b.as_mut().unwrap().vm;
+        vm.refresh_owned_cursors();
+
+        match vm::execute_epoch(
+            &vm.program, &mut vm.regfile, input, actual_in_reg, out_reg,
+            &cursor_ptrs, &vm.owned_trace_regs,
+        ) {
+            Ok(Some(batch)) if batch.count > 0 => Some(batch),
+            Ok(_) => None,
+            Err(code) => {
+                gnitz_warn!("dag: side-B execute error {} for view_id={}", code, view_id);
+                None
+            }
+        }
+    }
+
+    /// Run the post phase seeding several exchange-input registers (one per
+    /// set-op side). Used after both sides have been exchanged/consolidated.
+    fn execute_post_multi(
+        &mut self,
+        view_id: i64,
+        inputs: Vec<(u16, Batch)>,
+    ) -> Option<Batch> {
+        let plan = self.cache.get_mut(&view_id)?;
+        let out_reg = plan.post_out_reg;
+        let num_regs = plan.post_num_regs as usize;
+        let etr = plan.post_ext_trace_regs.clone();
+
+        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
+
+        let plan = self.cache.get_mut(&view_id).unwrap();
+        let vm = plan.post_vm.as_mut()?;
+        vm.refresh_owned_cursors();
+
+        match vm::execute_epoch_multi(
+            &vm.program, &mut vm.regfile, inputs, out_reg,
+            &cursor_ptrs, &vm.owned_trace_regs,
+        ) {
+            Ok(Some(batch)) if batch.count > 0 => Some(batch),
+            Ok(_) => None,
+            Err(code) => {
+                gnitz_warn!("dag: post-multi execute error {} for view_id={}", code, view_id);
+                None
+            }
+        }
+    }
+
+    /// Force a real sort+weight-merge of a post-exchange batch. The exchange
+    /// relay concatenates rows from all workers (and a HashRow reindex scrambles
+    /// PK order), so the result is not globally sorted — but its `sorted` /
+    /// `consolidated` flags are not reliably cleared by the relay path. Clearing
+    /// them here guarantees `into_consolidated` actually sorts, which the
+    /// downstream merge-walk join/distinct operators depend on.
+    fn consolidate_exchanged(mut batch: Batch, schema: &SchemaDescriptor) -> Batch {
+        batch.sorted = false;
+        batch.consolidated = false;
+        batch.into_consolidated(schema).into_inner()
+    }
+
+    /// Per-side exchange metadata snapshot: (schema, source_id, post seed reg).
+    fn two_sided_meta(&self, view_id: i64)
+        -> Option<((SchemaDescriptor, i64, u16), (SchemaDescriptor, i64, u16))>
+    {
+        let p = self.cache.get(&view_id)?;
+        let sb = p.side_b.as_ref()?;
+        let a_schema = p.exchange_in_schema.unwrap_or_else(|| self.tables[&view_id].schema);
+        Some((
+            (a_schema, p.side_a_source_id, p.post_in_reg),
+            (sb.exchange_schema, sb.source_id, sb.post_seed_reg),
+        ))
+    }
+
+    /// Execute a two-sided set-op view: run each side's sub-pipeline, hand its
+    /// output through `relay`, consolidate, then run the combine over both.
+    ///
+    /// `relay(pre, side_source)` is the repartition step: multi-worker passes
+    /// `exchange.do_exchange` (keyed by the side's source so the two IPC rounds
+    /// don't collide in the master accumulator); single-worker passes identity
+    /// (one worker owns all shards, so no IPC). The combine (Union / semi /
+    /// anti-join) needs sorted, weight-merged input, hence the consolidate.
+    fn run_two_sided(
+        &mut self,
+        view_id: i64,
+        input: Batch,
+        src_id: i64,
+        mut relay: impl FnMut(Batch, i64) -> Batch,
+    ) -> Option<Batch> {
+        let ((a_schema, a_source, a_seed), (b_schema, b_source, b_seed)) =
+            self.two_sided_meta(view_id)?;
+
+        // Route the incoming delta to whichever side(s) scan its source, moving
+        // it rather than cloning unless both sides need it (e.g. `a UNION a`).
+        let empty = || Batch::with_schema(SchemaDescriptor::default(), 0);
+        let (a_needs, b_needs) = (src_id == a_source, src_id == b_source);
+        let (a_in, b_in) = match (a_needs, b_needs) {
+            (true, true)   => (input.clone_batch(), input),
+            (true, false)  => (input, empty()),
+            (false, true)  => (empty(), input),
+            (false, false) => (empty(), empty()),
+        };
+
+        let mut pre_a = self.execute_plan_phase(
+            view_id, true, a_in, if a_needs { src_id } else { 0 },
+        ).unwrap_or_else(|| Batch::with_schema(a_schema, 0));
+        pre_a.set_schema(a_schema);
+        let cons_a = Self::consolidate_exchanged(relay(pre_a, a_source), &a_schema);
+
+        let mut pre_b = self.execute_side_b_phase(
+            view_id, b_in, if b_needs { src_id } else { 0 },
+        ).unwrap_or_else(|| Batch::with_schema(b_schema, 0));
+        pre_b.set_schema(b_schema);
+        let cons_b = Self::consolidate_exchanged(relay(pre_b, b_source), &b_schema);
+
+        self.execute_post_multi(view_id, vec![(a_seed, cons_a), (b_seed, cons_b)])
     }
 
     /// Enforce unique PK semantics: retract existing rows before inserting.
@@ -1688,7 +1876,7 @@ mod tests {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
         let tbl = make_test_table("reg_unreg");
-        dag.register_table(100, StoreHandle::Single(tbl), schema, 0, false, String::new());
+        dag.register_table(100, StoreHandle::Single(UnsafeCell::new(tbl)), schema, 0, false, String::new());
         assert!(dag.tables.contains_key(&100));
 
         dag.unregister_table(100);
@@ -1725,7 +1913,7 @@ mod tests {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
         let tbl = make_test_table("idx_parent");
-        dag.register_table(50, StoreHandle::Single(tbl), schema, 0, false, String::new());
+        dag.register_table(50, StoreHandle::Single(UnsafeCell::new(tbl)), schema, 0, false, String::new());
         let idx_tbl = make_test_table("idx_child");
         dag.add_index_circuit(50, 2, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
@@ -1764,7 +1952,7 @@ mod tests {
         let mut dag = DagEngine::new();
         let parent_schema = SchemaDescriptor::default();
         let tbl = make_test_table("flush_ic_parent");
-        dag.register_table(70, StoreHandle::Single(tbl), parent_schema, 0, false, String::new());
+        dag.register_table(70, StoreHandle::Single(UnsafeCell::new(tbl)), parent_schema, 0, false, String::new());
 
         // Durable index table: flush writes shard_*.db only if called.
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();

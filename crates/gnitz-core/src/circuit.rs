@@ -124,8 +124,10 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             ((OPCODE_MAP_EXPR, None, reindex_col, Some(program)), Vec::new())
         }
         OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
-        OpNode::Map(MapKind::HashRow(cols)) => {
-            ((OPCODE_MAP_HASH_ROW, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
+        OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
+            let mut kind_rows = encode_col_list(NODE_COL_KIND_PROJ, cols);
+            kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
+            ((OPCODE_MAP_HASH_ROW, None, None, None), kind_rows)
         }
         OpNode::Negate         => ((OPCODE_NEGATE, None, None, None), Vec::new()),
         OpNode::Union          => ((OPCODE_UNION, None, None, None), Vec::new()),
@@ -253,9 +255,13 @@ impl CircuitBuilder {
     /// and set the synthetic PK to a hash of those payload bytes, so set
     /// membership is decided by the projected row content, not by the source PK
     /// (EXCEPT/INTERSECT/DISTINCT).
-    pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
+    ///
+    /// `branch_id` is mixed into the hash; pass distinct ids (0 and 1) to the two
+    /// sides of a `UNION ALL` so identical rows do not collide to one PK, and 0
+    /// to both sides of deduplicating set-ops.
+    pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], branch_id: u8) -> NodeId {
         let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
-        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols)));
+        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols, branch_id)));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }

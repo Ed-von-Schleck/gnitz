@@ -197,7 +197,6 @@ def test_string_group_by_multiworker(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_except_stable_after_update(client):
     """UPDATE on a UNIQUE PK table generates a retraction + insertion with the
     same PK in one delta.  The anti-join DT cursor must re-seek for the second
@@ -219,29 +218,30 @@ def test_except_stable_after_update(client):
         )
         vid, _ = client.resolve_table(sn, "v")
 
-        # b excludes pk=1; pk=2 is free
+        # Full-row identity: b's (1,999) does NOT exclude a's (1,100) — they
+        # differ in payload — so both a rows survive.
         client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
         client.execute_sql("INSERT INTO a VALUES (1, 100), (2, 200)", schema_name=sn)
 
         rows1 = _scan_positive(client, vid)
         pks1 = sorted(r["pk"] for r in rows1)
-        assert pks1 == [2], f"before update: {pks1}"
+        assert pks1 == [1, 2], f"before update: {pks1}"
 
-        # UPDATE pk=2 → delta has (pk=2,val=200,w=-1) and (pk=2,val=300,w=+1)
+        # UPDATE pk=2 → delta has (pk=2,val=200,w=-1) and (pk=2,val=300,w=+1).
         # pk=2 is NOT in b, so both delta rows pass anti-join.
         # Without cursor re-seek: second row misses → pk=2 disappears.
         client.execute_sql("UPDATE a SET val = 300 WHERE pk = 2", schema_name=sn)
 
         rows2 = _scan_positive(client, vid)
         pks2 = sorted(r["pk"] for r in rows2)
-        assert pks2 == [2], f"after update: expected [2], got {pks2}"
-        assert rows2[0]["val"] == 300, f"expected val=300, got {rows2[0]['val']}"
+        assert pks2 == [1, 2], f"after update: expected [1, 2], got {pks2}"
+        val2 = next(r["val"] for r in rows2 if r["pk"] == 2)
+        assert val2 == 300, f"expected pk=2 val=300, got {val2}"
     finally:
         _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_intersect_stable_after_update(client):
     """UPDATE through INTERSECT: the semi-join DT cursor must re-seek so the
     new row (same PK, different payload) still matches the trace."""
@@ -269,15 +269,16 @@ def test_intersect_stable_after_update(client):
         pks1 = sorted(r["pk"] for r in rows1)
         assert pks1 == [1], f"before update: {pks1}"
 
-        # UPDATE pk=1 val=100→500.  Delta: (pk=1,val=100,w=-1), (pk=1,val=500,w=+1).
-        # pk=1 is in b → both delta rows should be semi-join matched.
-        # Without re-seek: second row misses cursor → pk=1 disappears from INTERSECT.
+        # UPDATE pk=1 val=100→500. Delta: (pk=1,val=100,w=-1), (pk=1,val=500,w=+1).
+        # The retraction of (1,100) must drop the intersect row (its semi-join
+        # cursor must re-seek for the retraction, not advance past it). Under
+        # full-row identity the new (1,500) does NOT match b's (1,100), so pk=1
+        # leaves the INTERSECT entirely.
         client.execute_sql("UPDATE a SET val = 500 WHERE pk = 1", schema_name=sn)
 
         rows2 = _scan_positive(client, vid)
         pks2 = sorted(r["pk"] for r in rows2)
-        assert pks2 == [1], f"after update: expected [1], got {pks2}"
-        assert rows2[0]["val"] == 500, f"expected val=500, got {rows2[0]['val']}"
+        assert pks2 == [], f"after update: expected [], got {pks2}"
     finally:
         _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
@@ -288,7 +289,6 @@ def test_intersect_stable_after_update(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_intersect_no_weight_inflation(client):
     """INTERSECT must not duplicate rows when the trace side has multiple
     entries for the same PK.  A large delta triggers the swapped semi-join
@@ -597,7 +597,6 @@ def test_global_max_multiworker_retract_current_max(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_except_update_non_excluded_row(client):
     """UPDATE a row that is NOT excluded by b.  The delta has same-PK
     retraction + insertion; the anti-join DT must process both correctly."""
@@ -638,7 +637,6 @@ def test_except_update_non_excluded_row(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(reason="hash-row set-op/distinct not yet multiworker-correct; see plans/multiworker-hashrow-setops.md", strict=False)
 def test_except_multi_tick_exclusion(client):
     """EXCEPT across multiple ticks: insert b, then a in separate epochs.
     Verifies correct PK-based exclusion with 20 rows across workers."""

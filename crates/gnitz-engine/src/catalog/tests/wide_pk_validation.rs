@@ -57,7 +57,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    engine.dag.register_table(tid, StoreHandle::Single(Box::new(base)), schema, 0, true, dir.to_string());
+    engine.dag.register_table(tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(base))), schema, 0, true, dir.to_string());
     engine.dag.add_index_circuit(tid, 3, Box::new(idx), idx_schema, true);
 }
 
@@ -167,7 +167,7 @@ fn setup_child_with_fk(
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    engine.dag.register_table(child_tid, StoreHandle::Single(Box::new(base)), child_schema, 0, true, dir.to_string());
+    engine.dag.register_table(child_tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(base))), child_schema, 0, true, dir.to_string());
     engine.dag.add_index_circuit(child_tid, 1, Box::new(idx), idx_schema, false);
 
     engine.caches.fk_by_parent.entry(parent_tid).or_default().push(FkParentRef {
@@ -188,7 +188,7 @@ fn wide_fk_restrict_pk_column_target() {
     let parent_tid = engine.next_table_id;
     let parent_schema = SchemaDescriptor::new(&[u64c(), u64c(), u64c()], &[0, 1, 2]);
     let pbase = Table::new(&format!("{dir}/p_base"), "pbase", parent_schema, parent_tid as u32, 256 * 1024, false).unwrap();
-    engine.dag.register_table(parent_tid, StoreHandle::Single(Box::new(pbase)), parent_schema, 0, true, dir.clone());
+    engine.dag.register_table(parent_tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(pbase))), parent_schema, 0, true, dir.clone());
 
     // Child references parent PK col 0; a child row holds fk = 100.
     let child_tid = parent_tid + 100;
@@ -226,7 +226,7 @@ fn wide_fk_restrict_non_pk_unique_target() {
     let mut pbase = Table::new(&format!("{dir}/p_base"), "pbase", parent_schema, parent_tid as u32, 256 * 1024, false).unwrap();
     pbase.ingest_owned_batch(pb).unwrap();
     pbase.flush().unwrap();
-    engine.dag.register_table(parent_tid, StoreHandle::Single(Box::new(pbase)), parent_schema, 0, true, dir.clone());
+    engine.dag.register_table(parent_tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(pbase))), parent_schema, 0, true, dir.clone());
 
     // seek_family_bytes must resolve the committed parent row by full PK bytes.
     let seen = engine.seek_family_bytes(parent_tid, &parent_pk).unwrap();

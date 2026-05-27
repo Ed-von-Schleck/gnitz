@@ -4,20 +4,7 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
 """
 import random
-import pytest
 import gnitz
-
-# Hash-row set-op / distinct views (full-row identity) are correct single-worker
-# but not yet multiworker-correct: the synthetic hash PK is computed in-circuit
-# and is not repartitioned across workers, so output rows land on the wrong
-# worker's shard and collapse on scan. Tracked in
-# plans/multiworker-hashrow-setops.md.
-_XFAIL_MW = pytest.mark.xfail(
-    reason="hash-row set-op/distinct not yet multiworker-correct; "
-           "see plans/multiworker-hashrow-setops.md",
-    strict=False,
-)
-
 
 def _uid():
     return str(random.randint(100000, 999999))
@@ -34,7 +21,6 @@ class TestSetOps:
             schema_name=sn,
         )
 
-    @_XFAIL_MW
     def test_union_all(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -66,7 +52,37 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
+    def test_union_all_identical_rows_keep_both(self, client):
+        """UNION ALL of two tables that each hold the same (pk, val) row keeps
+        both copies (weight +2). The per-side branch discriminator in the
+        synthetic hash PK is what stops the two identical rows from collapsing
+        to one under unique-PK enforcement at the view sink."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_two_tables(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Same content on both sides.
+            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (1, 10), (2, 20)", schema_name=sn)
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            total_weight = sum(r.weight for r in rows)
+            assert total_weight == 4, f"expected total weight 4, got {total_weight}"
+            vals = sorted(r["val"] for r in rows for _ in range(r.weight))
+            assert vals == [10, 10, 20, 20], f"got {vals}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE a", schema_name=sn)
+            client.execute_sql("DROP TABLE b", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_union_distinct(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -102,7 +118,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_union_all_retraction(self, client):
         """Deleting a row from one source retracts it from the UNION ALL view."""
         sn = "s" + _uid()
@@ -138,7 +153,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_except_basic(self, client):
         """EXCEPT view excludes rows whose PK is present in the right table."""
         sn = "s" + _uid()
@@ -171,7 +185,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_except_retraction(self, client):
         """Deleting a row from b adds it back to the EXCEPT view."""
         sn = "s" + _uid()
@@ -209,7 +222,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_intersect_basic(self, client):
         """INTERSECT view contains only rows present in both tables."""
         sn = "s" + _uid()
@@ -242,7 +254,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_select_distinct_view(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -270,7 +281,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_distinct_retraction(self, client):
         """DISTINCT view retracts correctly when a row is deleted."""
         sn = "s" + _uid()
@@ -304,7 +314,6 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @_XFAIL_MW
     def test_distinct_update_view(self, client):
         """UPDATE on a table with a SELECT DISTINCT view reflects the new value."""
         sn = "s" + _uid()

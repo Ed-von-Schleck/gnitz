@@ -308,6 +308,9 @@ impl WorkerProcess {
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
     ) -> Self {
+        // Isolate this worker's scratch operator-state tables from siblings'
+        // (all forked workers share the view directory under one base_dir).
+        crate::compiler::set_worker_rank(worker_id);
         WorkerProcess {
             worker_id,
             num_workers,

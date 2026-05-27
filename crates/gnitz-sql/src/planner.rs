@@ -1617,6 +1617,7 @@ fn compile_set_op_side(
     select:      &sqlparser::ast::Select,
     binder:      &mut Binder<'_>,
     cb:          &mut CircuitBuilder,
+    branch_id:   u8,
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>), GnitzSqlError> {
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(GnitzSqlError::Unsupported(
@@ -1649,8 +1650,15 @@ fn compile_set_op_side(
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
     // not by the source table's PK: two rows from different tables sharing a PK
     // but differing in payload must not match.
-    let reindexed = cb.map_hash_row(filtered, &proj_indices);
-    Ok((reindexed, out_cols))
+    let reindexed = cb.map_hash_row(filtered, &proj_indices, branch_id);
+    // Repartition by the synthetic hash PK (column 0) so that under
+    // multiple workers each row lands on the worker that owns its new PK's
+    // shard, co-locating matching rows for the downstream semi/anti-join and
+    // placing each output row on its owning worker for the sink/scan. The hash
+    // is computed in-circuit, so the master cannot pre-shard the source by it;
+    // this in-circuit exchange is mandatory. Single-worker mode elides the IPC.
+    let sharded = cb.shard(reindexed, &[0]);
+    Ok((sharded, out_cols))
 }
 
 /// Resolve a set-operation side's projection to source column indices plus
@@ -1734,8 +1742,17 @@ fn execute_create_set_op_view(
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
 
-    let (left_node, left_cols) = compile_set_op_side(client, left_select, binder, &mut cb)?;
-    let (right_node, right_cols) = compile_set_op_side(client, right_select, binder, &mut cb)?;
+    // UNION ALL keeps both copies of an identical row (weight +2), so the two
+    // branches must hash to distinct PKs — give the right side branch_id = 1.
+    // Deduplicating set-ops (UNION/EXCEPT/INTERSECT) intentionally coalesce
+    // identical rows, so both sides use branch_id = 0.
+    let right_branch_id = matches!(
+        (op, set_quantifier),
+        (SetOperator::Union, SetQuantifier::All)
+    ) as u8;
+
+    let (left_node, left_cols) = compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
+    let (right_node, right_cols) = compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id)?;
 
     // Schema compatibility check
     if left_cols.len() != right_cols.len() {
@@ -1857,8 +1874,11 @@ fn execute_create_distinct_view(
     // projection, reindexing by the source PK (unique by definition) makes
     // `distinct` a no-op and leaks the unselected columns.
     let (proj_indices, proj_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
-    let reindexed = cb.map_hash_row(filtered, &proj_indices);
-    let distinct_node = cb.distinct(reindexed);
+    let reindexed = cb.map_hash_row(filtered, &proj_indices, 0);
+    // Repartition by the synthetic hash PK so `distinct` deduplicates across
+    // workers: every copy of a projected row must land on the same worker.
+    let sharded = cb.shard(reindexed, &[0]);
+    let distinct_node = cb.distinct(sharded);
 
     cb.sink(distinct_node);
     let circuit = cb.build();

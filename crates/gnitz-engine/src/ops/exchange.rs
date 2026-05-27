@@ -45,6 +45,14 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
         return crate::schema::promote_to_index_key(bytes, offset, col.size() as usize, col.type_code);
     }
     let pi = schema.payload_idx(col_idx);
+    // NULL values shard together. Return 0 without touching the slot: a NULL
+    // string/blob column's German-string length field is uninitialized, and a
+    // garbage length > SHORT_STRING_THRESHOLD would drive a wild heap read. The
+    // null bitmap covers every non-PK payload column, so the bit is always valid.
+    let null_word = mb.get_null_word(row);
+    if (null_word >> pi) & 1 != 0 {
+        return 0u128;
+    }
     let col = &schema.columns[col_idx];
     let col_size = col.size() as usize;
     if col.type_code == crate::schema::type_code::STRING
@@ -62,7 +70,11 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
             let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
             crate::xxh::checksum(crate::schema::long_string_bytes(mb.blob, heap_offset, length)) as u128
         }
-    } else if col.type_code == crate::schema::type_code::U128 {
+    } else if col.type_code == crate::schema::type_code::U128
+        || col.type_code == crate::schema::type_code::UUID
+    {
+        // UUID and U128 are distinct type codes sharing the same 16-byte stride;
+        // UUID must take the wide path or the 8-byte else-branch buffer panics.
         let bytes = mb.get_col_ptr(row, pi, 16);
         u128::from_le_bytes(bytes[0..16].try_into().unwrap())
     } else {

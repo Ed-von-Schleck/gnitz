@@ -9,6 +9,23 @@ use crate::ops::{AggDescriptor, AggOp};
 use crate::storage::{CursorHandle, Table, ReadCursor};
 use crate::vm::{ProgramBuilder, VmHandle};
 
+/// Process-local worker rank, set once per forked worker (and left at 0 in the
+/// master / single-worker mode). Scratch operator-state tables (`Distinct`
+/// history, `IntegrateTrace`) are named under the view directory, which all
+/// forked workers share via the same `base_dir`; embedding the rank keeps each
+/// worker's ephemeral shard isolated so siblings don't clobber each other.
+pub static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the calling process's worker rank. Called post-fork before any view is
+/// compiled, so the scratch tables a worker opens carry its own rank.
+pub fn set_worker_rank(rank: u32) {
+    WORKER_RANK.store(rank, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn worker_rank() -> u32 {
+    WORKER_RANK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // Engine-only port aliases (all equal to wire constants).
 const PORT_IN:    i32 = gnitz_wire::PORT_IN    as i32;
 const PORT_IN_A:  i32 = gnitz_wire::PORT_IN_A  as i32;
@@ -74,7 +91,34 @@ pub struct ExternalTable {
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
+/// A second exchange side, present only for binary set-op views (UNION /
+/// EXCEPT / INTERSECT) which repartition **two** `HashRow`-reindexed inputs.
+/// Side A reuses the `pre_*` fields of [`CompileOutput`]; this struct carries
+/// the parallel right-hand sub-pipeline.
+pub struct SideBPlan {
+    pub vm: Box<VmHandle>,
+    pub num_regs: u32,
+    pub in_reg: u16,
+    pub out_reg: u16,
+    pub source_reg_map: HashMap<i64, u16>,
+    pub ext_trace_regs: Vec<(u16, i64)>,
+    pub exchange_schema: SchemaDescriptor,
+    /// Register in the post VM seeded with this side's relayed/exchanged batch.
+    pub post_seed_reg: u16,
+    /// Source table this side scans — used as the exchange `source_id` so the
+    /// two sides' IPC rounds key distinctly in the master accumulator.
+    pub source_id: i64,
+}
+
 /// Output from `compile_view`, consumed directly by DagEngine to build `CachedPlan`.
+///
+/// Phase model:
+/// * **No exchange** (`post_vm == None`): `pre_vm` is the whole plan.
+/// * **One exchange** (GROUP BY, SELECT DISTINCT): `pre_vm` computes up to the
+///   shard, `post_vm` consumes the relayed batch.
+/// * **Two exchanges** (binary set-ops, `side_b.is_some()`): `pre_vm` is side A,
+///   `side_b` is side B; each is exchanged independently, then `post_vm` runs
+///   the combine over both relayed inputs.
 pub struct CompileOutput {
     pub pre_vm: Box<VmHandle>,
     pub post_vm: Option<Box<VmHandle>>,
@@ -83,12 +127,19 @@ pub struct CompileOutput {
     pub pre_in_reg: u16,
     pub pre_out_reg: u16,
     pub post_num_regs: u32,
+    /// Post-phase seed register for the relayed batch. For two-sided set-ops
+    /// this is side A's seed; side B's lives in [`SideBPlan::post_seed_reg`].
     pub post_in_reg: u16,
     pub post_out_reg: u16,
     pub source_reg_map: HashMap<i64, u16>,
     pub co_partitioned: HashSet<i64>,
     pub pre_ext_trace_regs: Vec<(u16, i64)>,
     pub post_ext_trace_regs: Vec<(u16, i64)>,
+    /// Source table side A (`pre_*`) scans, for exchange keying. 0 when unknown
+    /// (single-exchange views keep passing source_id=0 to the exchange).
+    pub side_a_source_id: i64,
+    /// Right-hand exchange side for binary set-ops; `None` otherwise.
+    pub side_b: Option<SideBPlan>,
 }
 
 
@@ -489,8 +540,11 @@ fn propagate_distinct(loaded: &LoadedCircuit, ann: &mut Annotation) {
                 }
             }
             Some(gnitz_wire::OpNode::Map(mk)) => {
+                // A reindex (equijoin pre-index or full-row HashRow) rewrites the
+                // PK, so upstream distinctness no longer holds at this node.
                 let has_reindex = matches!(mk,
-                    gnitz_wire::MapKind::Expression { reindex_col: Some(_), .. });
+                    gnitz_wire::MapKind::Expression { reindex_col: Some(_), .. }
+                        | gnitz_wire::MapKind::HashRow(..));
                 if !has_reindex {
                     let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
                     if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
@@ -877,7 +931,7 @@ fn create_child_table(
     schema: SchemaDescriptor,
     table_id: u32,
 ) -> Result<Table, crate::storage::StorageError> {
-    let child_dir = format!("{}/scratch_{}", view_dir, child_name);
+    let child_dir = format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank());
     // Track the path before creating so cleanup also removes a partially
     // created directory if Table::new fails.
     state.scratch_dirs.push(child_dir.clone());
@@ -1053,10 +1107,10 @@ fn emit_node(
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
                     let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc, 0);
                 }
 
-                gnitz_wire::MapKind::HashRow(proj_cols) => {
+                gnitz_wire::MapKind::HashRow(proj_cols, branch_id) => {
                     // Keep the listed columns as payload (positions 0..k), like a
                     // Projection, but prepend a synthetic U128 PK that op_map sets
                     // to a hash of those payload columns (HASH_ROW_REINDEX path).
@@ -1076,7 +1130,7 @@ fn emit_node(
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema,
-                        crate::ops::HASH_ROW_REINDEX);
+                        crate::ops::HASH_ROW_REINDEX, *branch_id);
                 }
 
                 gnitz_wire::MapKind::Projection(cols) => {
@@ -1090,7 +1144,7 @@ fn emit_node(
                     );
                     reg_schemas[reg_id as usize] = schema;
                     reg_kinds[reg_id as usize] = 0;
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, schema, -1);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, schema, -1, 0);
                 }
 
                 gnitz_wire::MapKind::KeyOnly => {
@@ -1103,7 +1157,7 @@ fn emit_node(
                     );
                     reg_schemas[reg_id as usize] = s;
                     reg_kinds[reg_id as usize] = 0;
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, -1);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, -1, 0);
                 }
             }
         }
@@ -1665,6 +1719,10 @@ struct PlanBuildResult {
     out_reg: i32,
     ext_trace_regs: Vec<(u16, i64)>,
     source_reg_map: HashMap<i64, i32>,
+    // (exchange-input node id → seed register) for each exchange input this plan
+    // was built with. Lets `compile_view` wire each side's relayed batch to the
+    // correct post-phase register.
+    exchange_input_regs: Vec<(i32, i32)>,
     // Scratch dirs created for this (successful) plan, kept alive by `vm`'s
     // owned tables. Used by `compile_view` to clean up if a *sibling* plan
     // (pre/post split) later fails after this one already succeeded.
@@ -1681,7 +1739,7 @@ fn build_plan(
     view_table_id: u32,
     view_id: u64,
     output_node_id: Option<i32>,
-    exchange_input: Option<(i32, SchemaDescriptor)>,
+    exchange_inputs: &[(i32, SchemaDescriptor)],
     pre_built_expr_progs: Vec<Box<ExprProgram>>,
 ) -> Option<PlanBuildResult> {
     let mut out_reg_of: HashMap<i32, i32> = HashMap::new();
@@ -1712,9 +1770,12 @@ fn build_plan(
         }
     }
 
-    let mut exchange_input_reg_id: i32 = -1;
-    if exchange_input.is_some() {
-        exchange_input_reg_id = next_reg;
+    // One seed register per exchange input (the post phase of an exchange view
+    // reads each side's relayed batch from its own register).
+    let mut exchange_input_regs: Vec<(i32, i32)> = Vec::with_capacity(exchange_inputs.len());
+    let first_exchange_input_reg_id: i32 = if exchange_inputs.is_empty() { -1 } else { next_reg };
+    for (ex_nid, _) in exchange_inputs {
+        exchange_input_regs.push((*ex_nid, next_reg));
         next_reg += 1;
     }
 
@@ -1728,10 +1789,10 @@ fn build_plan(
     let mut reg_schemas = vec![SchemaDescriptor::default(); num_regs];
     let mut reg_kinds = vec![0u8; num_regs];
 
-    if let Some((ex_nid, ex_schema)) = exchange_input {
-        out_reg_of.insert(ex_nid, exchange_input_reg_id);
-        reg_schemas[exchange_input_reg_id as usize] = ex_schema;
-        reg_kinds[exchange_input_reg_id as usize] = 0;
+    for ((ex_nid, ex_schema), &(_, reg)) in exchange_inputs.iter().zip(&exchange_input_regs) {
+        out_reg_of.insert(*ex_nid, reg);
+        reg_schemas[reg as usize] = *ex_schema;
+        reg_kinds[reg as usize] = 0;
     }
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
@@ -1745,7 +1806,7 @@ fn build_plan(
     let mut state = EmitState {
         next_extra_reg: next_reg,
         sink_reg_id: -1,
-        input_delta_reg_id: if exchange_input_reg_id >= 0 { exchange_input_reg_id } else { -1 },
+        input_delta_reg_id: first_exchange_input_reg_id,
         emit_failed: false,
         scratch_dirs: Vec::new(),
     };
@@ -1828,6 +1889,7 @@ fn build_plan(
         out_reg: sink_reg,
         ext_trace_regs,
         source_reg_map,
+        exchange_input_regs,
         scratch_dirs: std::mem::take(&mut state.scratch_dirs),
     })
 }
@@ -1835,6 +1897,46 @@ fn build_plan(
 // ---------------------------------------------------------------------------
 // Top-level compile_view entry point
 // ---------------------------------------------------------------------------
+
+/// All nodes reachable backwards from `start` (inclusive) via incoming edges —
+/// i.e. the sub-pipeline that produces `start`'s value. Used to carve out each
+/// set-op side's independent single-source pipeline.
+fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet<i32> {
+    let mut set = HashSet::new();
+    let mut queue = VecDeque::from([start]);
+    while let Some(cur) = queue.pop_front() {
+        if !set.insert(cur) { continue; }
+        if let Some(ins) = loaded.incoming.get(&cur) {
+            for &(src, _port) in ins { queue.push_back(src); }
+        }
+    }
+    set
+}
+
+/// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition).
+fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> i32 {
+    loaded.incoming.get(&ex_nid)
+        .and_then(|ins| ins.iter().find(|&&(_, port)| port == PORT_IN))
+        .map(|&(src, _)| src)
+        .unwrap_or(-1)
+}
+
+/// `Rewrites` restricted to the nodes of one plan phase. Set-op / distinct
+/// views carry no fold rewrites, so only `skip_nodes` need partitioning;
+/// `fold_finalize`/`folded_maps` index `owned_expr_progs` and are left empty.
+fn phase_rewrites(rw: &Rewrites, nids: &HashSet<i32>) -> Rewrites {
+    Rewrites {
+        skip_nodes: rw.skip_nodes.iter().filter(|n| nids.contains(n)).copied().collect(),
+        fold_finalize: HashMap::new(),
+        folded_maps: HashMap::new(),
+    }
+}
+
+/// Narrow a plan's `source_table_id → register` map to the `u16` register width
+/// the runtime dispatch (`source_reg_map`) uses.
+fn source_reg_map_u16(m: &HashMap<i64, i32>) -> HashMap<i64, u16> {
+    m.iter().map(|(&tid, &reg)| (tid, reg as u16)).collect()
+}
 
 /// Compile a circuit for a single view.
 ///
@@ -1878,117 +1980,236 @@ pub unsafe fn compile_view(
     opt_distinct(&loaded, &ann, &mut rw);
     opt_fold_reduce_map(&loaded, &mut rw, &mut owned_expr_progs_for_rw);
 
-    let mut exchange_nid: Option<i32> = None;
-    for &nid in &loaded.ordered {
-        if matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })) {
-            exchange_nid = Some(nid);
-            break;
-        }
-    }
+    let exchange_nids: Vec<i32> = loaded.ordered.iter().copied()
+        .filter(|&nid| matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })))
+        .collect();
 
-    if let Some(ex_nid) = exchange_nid {
-        let mut pre_ordered = Vec::new();
-        let mut post_ordered = Vec::new();
-        let mut found_exchange = false;
-        for &nid in &loaded.ordered {
-            if nid == ex_nid {
-                found_exchange = true;
-                continue;
+    // Helper: the single source table a sub-plan scans (empty/ambiguous → 0).
+    let single_source = |srm: &HashMap<i64, i32>| -> i64 {
+        if srm.len() == 1 { *srm.keys().next().unwrap() } else { 0 }
+    };
+
+    match exchange_nids.len() {
+        0 => {
+            let ordered = loaded.ordered.clone();
+            let plan = build_plan(
+                &loaded, &rw, &ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                None, &[],
+                owned_expr_progs_for_rw,
+            ).ok_or(-5)?;
+
+            let source_reg_map = source_reg_map_u16(&plan.source_reg_map);
+
+            Ok(CompileOutput {
+                pre_vm: plan.vm,
+                post_vm: None,
+                exchange_in_schema: None,
+                pre_num_regs: plan.num_regs,
+                pre_in_reg: plan.in_reg as u16,
+                pre_out_reg: plan.out_reg as u16,
+                post_num_regs: 0,
+                post_in_reg: 0,
+                post_out_reg: 0,
+                source_reg_map,
+                co_partitioned: ann.co_partitioned,
+                pre_ext_trace_regs: plan.ext_trace_regs,
+                post_ext_trace_regs: Vec::new(),
+                side_a_source_id: 0,
+                side_b: None,
+            })
+        }
+        1 => {
+            let ex_nid = exchange_nids[0];
+            let exchange_input_nid = exchange_input_node(&loaded, ex_nid);
+
+            let mut pre_ordered = Vec::new();
+            let mut post_ordered = Vec::new();
+            let mut found_exchange = false;
+            for &nid in &loaded.ordered {
+                if nid == ex_nid { found_exchange = true; continue; }
+                if found_exchange { post_ordered.push(nid); } else { pre_ordered.push(nid); }
             }
-            if found_exchange {
-                post_ordered.push(nid);
-            } else {
-                pre_ordered.push(nid);
-            }
-        }
 
-        let mut exchange_input_nid: i32 = -1;
-        for &(src, dst, port) in &loaded.edges {
-            if dst == ex_nid && port == PORT_IN {
-                exchange_input_nid = src;
-                break;
-            }
-        }
+            let pre_nids: HashSet<i32> = pre_ordered.iter().copied().collect();
+            let (rw_pre, pre_progs, rw_post, post_progs) =
+                split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
 
-        let pre_nids: HashSet<i32> = pre_ordered.iter().copied().collect();
-        let (rw_pre, pre_progs, rw_post, post_progs) =
-            split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
+            let pre = build_plan(
+                &loaded, &rw_pre, &pre_ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                if exchange_input_nid >= 0 { Some(exchange_input_nid) } else { None },
+                &[],
+                pre_progs,
+            ).ok_or(-3)?;
 
-        let pre = build_plan(
-            &loaded, &rw_pre, &pre_ordered, ext_tables,
-            view_dir, view_table_id, view_id,
-            if exchange_input_nid >= 0 { Some(exchange_input_nid) } else { None },
-            None,
-            pre_progs,
-        ).ok_or(-3)?;
-
-        if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
-            for d in &pre.scratch_dirs { let _ = std::fs::remove_dir_all(d); }
-            return Err(-3);
-        }
-        let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
-
-        let post = match build_plan(
-            &loaded, &rw_post, &post_ordered, ext_tables,
-            view_dir, view_table_id, view_id,
-            None,
-            Some((ex_nid, exchange_schema)),
-            post_progs,
-        ) {
-            Some(p) => p,
-            None => {
-                // `post` cleaned its own scratch dirs; remove `pre`'s too, since
-                // `pre` already succeeded and the whole compile now aborts.
+            if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
                 for d in &pre.scratch_dirs { let _ = std::fs::remove_dir_all(d); }
-                return Err(-4);
+                return Err(-3);
             }
-        };
+            let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
+            let side_a_source_id = single_source(&pre.source_reg_map);
 
-        let source_reg_map = pre.source_reg_map.iter()
-            .map(|(&tid, &reg)| (tid, reg as u16)).collect();
+            let post = match build_plan(
+                &loaded, &rw_post, &post_ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                None,
+                &[(ex_nid, exchange_schema)],
+                post_progs,
+            ) {
+                Some(p) => p,
+                None => {
+                    for d in &pre.scratch_dirs { let _ = std::fs::remove_dir_all(d); }
+                    return Err(-4);
+                }
+            };
 
-        Ok(CompileOutput {
-            pre_vm: pre.vm,
-            post_vm: Some(post.vm),
-            exchange_in_schema: Some(exchange_schema),
-            pre_num_regs: pre.num_regs,
-            pre_in_reg: pre.in_reg as u16,
-            pre_out_reg: pre.out_reg as u16,
-            post_num_regs: post.num_regs,
-            post_in_reg: post.in_reg as u16,
-            post_out_reg: post.out_reg as u16,
-            source_reg_map,
-            co_partitioned: ann.co_partitioned,
-            pre_ext_trace_regs: pre.ext_trace_regs,
-            post_ext_trace_regs: post.ext_trace_regs,
-        })
-    } else {
-        let ordered = loaded.ordered.clone();
-        let plan = build_plan(
-            &loaded, &rw, &ordered, ext_tables,
-            view_dir, view_table_id, view_id,
-            None, None,
-            owned_expr_progs_for_rw,
-        ).ok_or(-5)?;
+            let source_reg_map = source_reg_map_u16(&pre.source_reg_map);
 
-        let source_reg_map = plan.source_reg_map.iter()
-            .map(|(&tid, &reg)| (tid, reg as u16)).collect();
+            Ok(CompileOutput {
+                pre_vm: pre.vm,
+                post_vm: Some(post.vm),
+                exchange_in_schema: Some(exchange_schema),
+                pre_num_regs: pre.num_regs,
+                pre_in_reg: pre.in_reg as u16,
+                pre_out_reg: pre.out_reg as u16,
+                post_num_regs: post.num_regs,
+                post_in_reg: post.in_reg as u16,
+                post_out_reg: post.out_reg as u16,
+                source_reg_map,
+                co_partitioned: ann.co_partitioned,
+                pre_ext_trace_regs: pre.ext_trace_regs,
+                post_ext_trace_regs: post.ext_trace_regs,
+                side_a_source_id,
+                side_b: None,
+            })
+        }
+        2 => {
+            // Binary set-op: two independent HashRow→ExchangeShard sub-pipelines
+            // meeting at a combine (Union / SemiJoin / AntiJoin). Carve each
+            // side out by the ancestors of its exchange input; everything else
+            // (the combine + sink, reading both relayed batches) is the post
+            // phase.
+            let ea = exchange_nids[0];
+            let eb = exchange_nids[1];
+            let ea_in = exchange_input_node(&loaded, ea);
+            let eb_in = exchange_input_node(&loaded, eb);
+            if ea_in < 0 || eb_in < 0 {
+                return Err(-3);
+            }
 
-        Ok(CompileOutput {
-            pre_vm: plan.vm,
-            post_vm: None,
-            exchange_in_schema: None,
-            pre_num_regs: plan.num_regs,
-            pre_in_reg: plan.in_reg as u16,
-            pre_out_reg: plan.out_reg as u16,
-            post_num_regs: 0,
-            post_in_reg: 0,
-            post_out_reg: 0,
-            source_reg_map,
-            co_partitioned: ann.co_partitioned,
-            pre_ext_trace_regs: plan.ext_trace_regs,
-            post_ext_trace_regs: Vec::new(),
-        })
+            let side_a_set = ancestors_inclusive(&loaded, ea_in);
+            let side_b_set = ancestors_inclusive(&loaded, eb_in);
+
+            let side_a_ordered: Vec<i32> = loaded.ordered.iter().copied()
+                .filter(|n| side_a_set.contains(n)).collect();
+            let side_b_ordered: Vec<i32> = loaded.ordered.iter().copied()
+                .filter(|n| side_b_set.contains(n)).collect();
+            let post_ordered: Vec<i32> = loaded.ordered.iter().copied()
+                .filter(|n| !side_a_set.contains(n) && !side_b_set.contains(n)
+                    && *n != ea && *n != eb)
+                .collect();
+
+            let rw_a = phase_rewrites(&rw, &side_a_set);
+            let rw_b = phase_rewrites(&rw, &side_b_set);
+            let post_nids: HashSet<i32> = post_ordered.iter().copied().collect();
+            let rw_post = phase_rewrites(&rw, &post_nids);
+
+            let cleanup = |dirs: &[String]| { for d in dirs { let _ = std::fs::remove_dir_all(d); } };
+
+            let side_a = build_plan(
+                &loaded, &rw_a, &side_a_ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                Some(ea_in), &[], Vec::new(),
+            ).ok_or(-3)?;
+            if side_a.out_reg < 0 || side_a.out_reg as usize >= side_a.vm.program.reg_meta.len() {
+                cleanup(&side_a.scratch_dirs);
+                return Err(-3);
+            }
+            let schema_a = side_a.vm.program.reg_meta[side_a.out_reg as usize].schema;
+            let side_a_source_id = single_source(&side_a.source_reg_map);
+
+            let side_b = match build_plan(
+                &loaded, &rw_b, &side_b_ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                Some(eb_in), &[], Vec::new(),
+            ) {
+                Some(p) => p,
+                None => { cleanup(&side_a.scratch_dirs); return Err(-3); }
+            };
+            if side_b.out_reg < 0 || side_b.out_reg as usize >= side_b.vm.program.reg_meta.len() {
+                cleanup(&side_a.scratch_dirs);
+                cleanup(&side_b.scratch_dirs);
+                return Err(-3);
+            }
+            let schema_b = side_b.vm.program.reg_meta[side_b.out_reg as usize].schema;
+            let side_b_source_id = single_source(&side_b.source_reg_map);
+
+            let post = match build_plan(
+                &loaded, &rw_post, &post_ordered, ext_tables,
+                view_dir, view_table_id, view_id,
+                None,
+                &[(ea, schema_a), (eb, schema_b)],
+                Vec::new(),
+            ) {
+                Some(p) => p,
+                None => {
+                    cleanup(&side_a.scratch_dirs);
+                    cleanup(&side_b.scratch_dirs);
+                    return Err(-4);
+                }
+            };
+
+            // Resolve each side's seed register in the post plan. build_plan
+            // pushes one entry per exchange input, so both lookups must hit; a
+            // miss is a compile bug — panic rather than silently seed register 0
+            // (the delta reg) and corrupt the combine's input.
+            let seed_of = |nid: i32| -> u16 {
+                post.exchange_input_regs.iter()
+                    .find(|&&(n, _)| n == nid).map(|&(_, r)| r as u16)
+                    .expect("post plan must allocate a seed register for each exchange input")
+            };
+            let post_seed_a = seed_of(ea);
+            let post_seed_b = seed_of(eb);
+
+            let source_reg_map_a = source_reg_map_u16(&side_a.source_reg_map);
+            let source_reg_map_b = source_reg_map_u16(&side_b.source_reg_map);
+
+            Ok(CompileOutput {
+                pre_vm: side_a.vm,
+                post_vm: Some(post.vm),
+                exchange_in_schema: Some(schema_a),
+                pre_num_regs: side_a.num_regs,
+                pre_in_reg: side_a.in_reg as u16,
+                pre_out_reg: side_a.out_reg as u16,
+                post_num_regs: post.num_regs,
+                post_in_reg: post_seed_a,
+                post_out_reg: post.out_reg as u16,
+                source_reg_map: source_reg_map_a,
+                co_partitioned: ann.co_partitioned,
+                pre_ext_trace_regs: side_a.ext_trace_regs,
+                post_ext_trace_regs: post.ext_trace_regs,
+                side_a_source_id,
+                side_b: Some(SideBPlan {
+                    vm: side_b.vm,
+                    num_regs: side_b.num_regs,
+                    in_reg: side_b.in_reg as u16,
+                    out_reg: side_b.out_reg as u16,
+                    source_reg_map: source_reg_map_b,
+                    ext_trace_regs: side_b.ext_trace_regs,
+                    exchange_schema: schema_b,
+                    post_seed_reg: post_seed_b,
+                    source_id: side_b_source_id,
+                }),
+            })
+        }
+        _ => {
+            // More than two exchange boundaries is not produced by any current
+            // planner path (set-ops are binary, GROUP BY/DISTINCT are unary).
+            gnitz_warn!("compile_view: view_id={} has {} exchange nodes; unsupported",
+                view_id, exchange_nids.len());
+            Err(-6)
+        }
     }
 }
 
@@ -2355,7 +2576,7 @@ mod tests {
         let result = build_plan(
             &loaded, &rw, &ordered, &ext_tables,
             "/nonexistent_gnitz_test_path_xyz_abc",
-            0, 99, None, None, vec![],
+            0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "build_plan must return None when child table creation fails");
     }
@@ -2406,7 +2627,7 @@ mod tests {
         let ordered: Vec<i32> = (0..n).collect();
         let result = build_plan(
             &loaded, &empty_rw(), &ordered, &[],
-            "", 0, 1, None, None, vec![],
+            "", 0, 1, None, &[], vec![],
         );
         assert!(result.is_none(), "build_plan must return None when register count exceeds u16::MAX");
     }
@@ -2448,7 +2669,7 @@ mod tests {
         let ordered = loaded.ordered.clone();
         let result = build_plan(
             &loaded, &empty_rw(), &ordered, &ext,
-            "", 0, 1, Some(2), None, vec![],
+            "", 0, 1, Some(2), &[], vec![],
         );
         assert!(result.is_none(), "wide-PK join must be rejected at compile time");
     }
@@ -2470,7 +2691,7 @@ mod tests {
         let result = build_plan(
             &loaded, &empty_rw(), &ordered, &ext,
             "/nonexistent_gnitz_test_path_integrate_trace",
-            0, 99, None, None, vec![],
+            0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "IntegrateTrace child-table failure must fail the compile");
     }
@@ -2516,7 +2737,7 @@ mod tests {
         let ext = [ExternalTable { table_id: 99, schema: in_schema }];
         let ordered = loaded.ordered.clone();
         let result = build_plan(
-            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "type-mismatched sink schema must be rejected");
     }
@@ -2541,7 +2762,7 @@ mod tests {
         let ext = [ExternalTable { table_id: 99, schema: in_schema }];
         let ordered = loaded.ordered.clone();
         let result = build_plan(
-            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "corrupt Filter blob must abort compilation");
     }
@@ -2562,7 +2783,7 @@ mod tests {
         let ext = [ExternalTable { table_id: 99, schema: in_schema }];
         let ordered = loaded.ordered.clone();
         let result = build_plan(
-            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "corrupt Map blob must abort compilation");
     }
@@ -2600,7 +2821,7 @@ mod tests {
         ];
         let ordered = loaded.ordered.clone();
         let result = build_plan(
-            &loaded, &empty_rw(), &ordered, &ext, &view_dir, 0, 1, Some(4), None, vec![],
+            &loaded, &empty_rw(), &ordered, &ext, &view_dir, 0, 1, Some(4), &[], vec![],
         );
         assert!(result.is_none(), "wide-PK join must fail the compile");
 
@@ -2819,7 +3040,7 @@ mod tests {
             &loaded, &empty_rw(), &ordered, &ext,
             "", 0, 1,
             Some(2), // bypass out_schema mismatch check; sink_reg already set by IntegrateSink
-            None, vec![],
+            &[], vec![],
         );
         let plan = result.expect("build_plan must succeed for this circuit");
 
@@ -2868,7 +3089,7 @@ mod tests {
             &loaded, &empty_rw(), &ordered, &ext,
             "", 0, 1,
             Some(2), // bypass out_schema mismatch check
-            None, vec![],
+            &[], vec![],
         );
         let plan = result.expect("build_plan must succeed");
 
@@ -3095,7 +3316,7 @@ mod tests {
             &loaded, &empty_rw(), &post_ordered, &[],
             dir.path().to_str().unwrap(), 0, 1,
             Some(2), // GatherReduce(2) is the output node; skips schema mismatch check
-            Some((0, schema)),
+            &[(0, schema)],
             vec![],
         ).expect("post-plan must compile");
 

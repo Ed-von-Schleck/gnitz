@@ -75,6 +75,7 @@ pub fn op_map(
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     reindex_col: i32,
+    branch_id: u8,
 ) -> Batch {
     if batch.count == 0 {
         return Batch::empty_with_schema(out_schema);
@@ -89,7 +90,7 @@ pub fn op_map(
             output.count, batch.count,
             "MAP output row count must equal input row count",
         );
-        reindex_hash_row(out_schema, &mut output);
+        reindex_hash_row(out_schema, &mut output, branch_id);
         output.sorted = false;
         output.consolidated = false;
         gnitz_debug!("op_map: in={} out={} reindex=HASH func={}", batch.count, output.count, func.kind_name());
@@ -542,34 +543,40 @@ pub fn op_null_extend(
 /// distinct rows that collide (~2^-64 birthday-bound) would be treated as the
 /// same element and silently coalesce in DISTINCT/EXCEPT/INTERSECT. This is an
 /// accepted tradeoff for the synthetic-PK set-op path, not a checked error.
-fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch) {
+fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id: u8) {
+    use xxhash_rust::xxh3::Xxh3Default;
     let n = output.count;
     let mut pks: Vec<u128> = Vec::with_capacity(n);
     {
         let mb = output.as_mem_batch();
-        let mut buf: Vec<u8> = Vec::new();
+        // ~280-byte stack-allocated streaming hasher; `reset()` between rows
+        // costs only a handful of word stores, and fixed-width columns are fed
+        // straight from the column slot with no intermediate copy.
+        let mut hasher = Xxh3Default::new();
         for row in 0..n {
-            buf.clear();
+            hasher.reset();
+            // Branch discriminator: distinguishes identical payloads arriving on
+            // the left vs right side of a UNION ALL so they do not collide to a
+            // single PK (which would collapse their +2 weight to +1).
+            hasher.update(&[branch_id]);
             let null_word = mb.get_null_word(row);
             for (pi, _ci, col) in out_schema.payload_columns() {
                 let is_null = (null_word >> pi) & 1 != 0;
-                buf.push(is_null as u8);
+                hasher.update(&[is_null as u8]);
                 if is_null { continue; }
                 let tc = col.type_code;
                 if tc == type_code::STRING || tc == type_code::BLOB {
                     let sb = mb.get_col_ptr(row, pi, 16);
                     let content = crate::schema::german_string_content(sb, mb.blob);
                     // Length-prefix the content so "ab"+"c" can't alias "a"+"bc".
-                    buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(content);
+                    hasher.update(&(content.len() as u32).to_le_bytes());
+                    hasher.update(content);
                 } else {
                     let cs = col.size() as usize;
-                    buf.extend_from_slice(mb.get_col_ptr(row, pi, cs));
+                    hasher.update(mb.get_col_ptr(row, pi, cs));
                 }
             }
-            let h = xxh::checksum(&buf);
-            let h_hi = mix64(h);
-            pks.push(((h_hi as u128) << 64) | (h as u128));
+            pks.push(hasher.digest128());
         }
     }
     for row in 0..n {
@@ -945,7 +952,7 @@ mod tests {
         let func = ScalarFuncKind::Plan(Plan::from_projection(
             &[1], &[type_code::I64], &schema, &schema,
         ));
-        let out = op_map(&empty_batch, &func, &schema, &schema, -1);
+        let out = op_map(&empty_batch, &func, &schema, &schema, -1, 0);
         assert_eq!(out.count, 0);
     }
 
@@ -1476,7 +1483,7 @@ mod tests {
             &[1], &[type_code::I64], &schema, &schema,
         ));
 
-        let out = op_map(&batch, &func, &schema, &schema, /* reindex_col = */ 1);
+        let out = op_map(&batch, &func, &schema, &schema, /* reindex_col = */ 1, 0);
         assert_eq!(out.count, 3);
         // Each output row's PK equals its source payload value.
         assert_eq!(out.get_pk(0) as u64, 200);

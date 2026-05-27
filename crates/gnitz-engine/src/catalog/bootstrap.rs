@@ -362,7 +362,7 @@ impl CatalogEngine {
         for (&tid, entry) in self.dag.tables.iter_mut() {
             if tid < FIRST_USER_TABLE_ID { continue; }
             match &mut entry.handle {
-                StoreHandle::Single(t) => { let _ = t.flush(); }
+                StoreHandle::Single(t) => { let _ = t.get_mut().flush(); }
                 StoreHandle::Partitioned(cell) => { let pt = cell.get_mut(); let _ = pt.flush(); pt.close(); }
                 StoreHandle::Borrowed(_) => {} // system tables flushed below
             }
