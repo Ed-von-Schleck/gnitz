@@ -43,6 +43,8 @@ pub const OPCODE_MAP_PROJ:               u64 = 26;
 pub const OPCODE_MAP_EXPR:               u64 = 27;
 /// MAP sub-variant: drop payload, keep PK only.
 pub const OPCODE_MAP_KEY_ONLY:           u64 = 28;
+/// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
+pub const OPCODE_MAP_HASH_ROW:           u64 = 29;
 /// Read-only trace source for join trace ports; never participates in cascade.
 pub const OPCODE_SCAN_TRACE_TABLE:       u64 = 31;
 
@@ -136,6 +138,11 @@ pub enum MapKind {
     Expression { program: Vec<u8>, reindex_col: Option<u16> },
     /// Drop all payload columns, keep only PK and weight.
     KeyOnly,
+    /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
+    /// payload, in order), but the synthetic PK is set to a hash of the kept
+    /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
+    /// decided by the projected row content, not by the source PK.
+    HashRow(Vec<u16>),
 }
 
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>`;
@@ -220,6 +227,7 @@ pub fn decode_op_node(
             OpNode::Map(MapKind::Expression { program, reindex_col: reindex })
         }
         x if x == OPCODE_MAP_KEY_ONLY      => OpNode::Map(MapKind::KeyOnly),
+        x if x == OPCODE_MAP_HASH_ROW      => OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ))),
         x if x == OPCODE_NEGATE            => OpNode::Negate,
         x if x == OPCODE_UNION             => OpNode::Union,
         x if x == OPCODE_DELAY             => OpNode::Delay,

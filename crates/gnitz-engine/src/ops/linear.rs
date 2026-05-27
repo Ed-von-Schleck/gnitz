@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, long_string_bytes, type_code};
+use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
@@ -22,8 +22,7 @@ pub fn op_filter(
 ) -> Batch {
     let n = batch.count;
     if n == 0 {
-        let npc = schema.num_payload_cols();
-        return Batch::empty(npc, 16);
+        return Batch::empty_with_schema(schema);
     }
 
     let mb = batch.as_mem_batch();
@@ -33,8 +32,10 @@ pub fn op_filter(
     // 16-byte string structs can be copied verbatim (no per-row relocation).
     // Offsets inside the structs remain valid because both blobs are identical.
     let blob_passthrough = !batch.blob.is_empty()
-        && (0..schema.num_columns())
-            .any(|ci| schema.columns[ci].type_code == type_code::STRING);
+        && (0..schema.num_columns()).any(|ci| {
+            let tc = schema.columns[ci].type_code;
+            tc == type_code::STRING || tc == type_code::BLOB
+        });
     if blob_passthrough {
         output.share_blob_from(batch);
     }
@@ -60,8 +61,14 @@ pub fn op_filter(
     output
 }
 
+/// Sentinel `reindex_col` value: set the PK to a hash of the full output row
+/// (all payload columns) rather than from a single source column. Used by
+/// `MapKind::HashRow` for EXCEPT/INTERSECT/DISTINCT full-row set identity.
+pub const HASH_ROW_REINDEX: i32 = -2;
+
 /// Map: transform batch via scalar function.
 /// If reindex_col >= 0, computes new PK from that column value (GROUP BY).
+/// If reindex_col == HASH_ROW_REINDEX, sets PK = hash of the full output row.
 pub fn op_map(
     batch: &Batch,
     func: &ScalarFuncKind,
@@ -73,9 +80,29 @@ pub fn op_map(
         return Batch::empty_with_schema(out_schema);
     }
 
+    if reindex_col == HASH_ROW_REINDEX {
+        // Copy-all map produced the payload; set each PK to a hash of the full
+        // row so rows with identical content collide and distinct content does
+        // not. Rehashing scrambles PK order, so the result is unsorted.
+        let mut output = func.evaluate_map_batch(batch, out_schema);
+        debug_assert_eq!(
+            output.count, batch.count,
+            "MAP output row count must equal input row count",
+        );
+        reindex_hash_row(out_schema, &mut output);
+        output.sorted = false;
+        output.consolidated = false;
+        gnitz_debug!("op_map: in={} out={} reindex=HASH func={}", batch.count, output.count, func.kind_name());
+        return output;
+    }
+
     if reindex_col < 0 {
         // Batch path
         let mut result = func.evaluate_map_batch(batch, out_schema);
+        debug_assert_eq!(
+            result.count, batch.count,
+            "MAP output row count must equal input row count",
+        );
         result.sorted = batch.sorted;
         gnitz_debug!("op_map: in={} out={} reindex=-1 func={}", batch.count, result.count, func.kind_name());
         return result;
@@ -87,15 +114,15 @@ pub fn op_map(
 
     // Evaluate the map batch (without reindex) to get column data
     let mut output = func.evaluate_map_batch(batch, out_schema);
+    debug_assert_eq!(
+        output.count, batch.count,
+        "MAP output row count must equal input row count",
+    );
 
-    // Overwrite PK with promoted values from reindex column. Hoist the
-    // per-row dispatch — column type, payload index, and byte width are
-    // batch-invariants, so the match-on-type-code happens once.
+    // Overwrite PK with promoted values from reindex column. The per-batch
+    // kind dispatch is hoisted out of the row loop by `promote_into`.
     let promoter = PkPromoter::new(in_schema, ri_col);
-    for row in 0..output.count {
-        let pk = promoter.promote(&in_mb, row);
-        output.set_pk_at(row, pk);
-    }
+    promoter.promote_into(&in_mb, &mut output);
 
     output.sorted = false;
     output.consolidated = false;
@@ -106,7 +133,7 @@ pub fn op_map(
 /// Negate: flip the sign of every weight.
 pub fn op_negate(batch: &Batch) -> Batch {
     if batch.count == 0 {
-        return Batch::empty(batch.num_payload_cols(), 16);
+        return Batch::empty(batch.num_payload_cols(), batch.pk_stride());
     }
 
     // clone_batch copies all column regions and the blob verbatim — no
@@ -117,7 +144,7 @@ pub fn op_negate(batch: &Batch) -> Batch {
     for i in 0..batch.count {
         let off = i * 8;
         let w = i64::from_le_bytes(weights[off..off + 8].try_into().unwrap());
-        weights[off..off + 8].copy_from_slice(&(-w).to_le_bytes());
+        weights[off..off + 8].copy_from_slice(&w.wrapping_neg().to_le_bytes());
     }
 
     // clone_batch preserves sorted and consolidated; negating weights does not change element
@@ -129,27 +156,29 @@ pub fn op_negate(batch: &Batch) -> Batch {
 /// Union: algebraic addition of two Z-Set streams.
 /// When both inputs are sorted, performs O(N) merge preserving sort order.
 pub fn op_union(
-    batch_a: &Batch,
+    batch_a: Batch,
     batch_b: Option<&Batch>,
     schema: &SchemaDescriptor,
 ) -> Batch {
     let b = match batch_b {
         Some(b) if b.count > 0 => b,
+        // O(1) pass-through: no allocation, sorted/consolidated preserved.
         _ => {
-            // Identity copy of batch_a; clone_batch preserves sorted and consolidated.
-            let output = batch_a.clone_batch();
             gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
-            return output;
+            return batch_a;
         }
     };
+    if batch_a.count == 0 {
+        return b.clone_batch();
+    }
 
     if batch_a.sorted && b.sorted {
-        return op_union_merge(batch_a, b, schema);
+        return op_union_merge(&batch_a, b, schema);
     }
 
     // Unsorted: concatenate
     let mut output = Batch::with_schema(*schema, batch_a.count + b.count);
-    output.append_batch(batch_a, 0, batch_a.count);
+    output.append_batch(&batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
     output.sorted = false;
     output.consolidated = false;
@@ -163,7 +192,11 @@ fn op_union_merge(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
-    if schema.pk_is_wide() {
+    // Signed single-column and compound PKs are not order-correct as raw
+    // u128 (the narrow inner path's comparison); route them through the
+    // byte-wise, type-aware wide merge. Only single unsigned-column PKs
+    // (`pk_is_fast`) use the narrow path.
+    if schema.pk_is_wide() || !schema.pk_is_fast() {
         return op_union_merge_wide(batch_a, batch_b, schema);
     }
     if schema_is_int_nonnull(schema) {
@@ -428,7 +461,9 @@ pub fn op_null_extend(
     let n = batch.count;
 
     if n == 0 {
-        return Batch::empty(out_npc, 16);
+        // Output PK region is identical to the input PK, so its stride is the
+        // input schema's PK stride (8 for U64, 16 for U128, etc.).
+        return Batch::empty(out_npc, in_schema.pk_stride());
     }
 
     // Build a merged schema for the output batch.
@@ -475,11 +510,10 @@ pub fn op_null_extend(
     } else {
         u64::MAX
     };
-    let shift = in_npc;
     for row in 0..n {
         let off = row * 8;
         let in_null = u64::from_le_bytes(batch.null_bmp_data()[off..off + 8].try_into().unwrap());
-        let out_null = in_null | (right_null_bits << shift);
+        let out_null = super::util::merge_null_words(in_null, right_null_bits, in_npc);
         output.null_bmp_data_mut()[off..off + 8].copy_from_slice(&out_null.to_le_bytes());
     }
 
@@ -492,6 +526,56 @@ pub fn op_null_extend(
 // ---------------------------------------------------------------------------
 // PK promotion for reindex (GROUP BY)
 // ---------------------------------------------------------------------------
+
+/// Set every row's PK to a hash of its full payload content. Identical row
+/// content (including null pattern and string/blob bytes) yields an identical
+/// 128-bit PK; any difference yields a distinct PK. This implements full-row
+/// set membership for EXCEPT/INTERSECT/DISTINCT.
+///
+/// The canonical byte stream per row is, for each payload column in order: a
+/// 1-byte null marker, then (if non-null) the column's content — fixed-width
+/// columns by their raw little-endian bytes, STRING/BLOB by length-prefixed
+/// content following the heap pointer for long strings. This is independent of
+/// physical inline-vs-heap string layout, so equal logical rows hash equally.
+///
+/// Limitation: set membership is keyed on the 128-bit hash, so two logically
+/// distinct rows that collide (~2^-64 birthday-bound) would be treated as the
+/// same element and silently coalesce in DISTINCT/EXCEPT/INTERSECT. This is an
+/// accepted tradeoff for the synthetic-PK set-op path, not a checked error.
+fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch) {
+    let n = output.count;
+    let mut pks: Vec<u128> = Vec::with_capacity(n);
+    {
+        let mb = output.as_mem_batch();
+        let mut buf: Vec<u8> = Vec::new();
+        for row in 0..n {
+            buf.clear();
+            let null_word = mb.get_null_word(row);
+            for (pi, _ci, col) in out_schema.payload_columns() {
+                let is_null = (null_word >> pi) & 1 != 0;
+                buf.push(is_null as u8);
+                if is_null { continue; }
+                let tc = col.type_code;
+                if tc == type_code::STRING || tc == type_code::BLOB {
+                    let sb = mb.get_col_ptr(row, pi, 16);
+                    let content = crate::schema::german_string_content(sb, mb.blob);
+                    // Length-prefix the content so "ab"+"c" can't alias "a"+"bc".
+                    buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(content);
+                } else {
+                    let cs = col.size() as usize;
+                    buf.extend_from_slice(mb.get_col_ptr(row, pi, cs));
+                }
+            }
+            let h = xxh::checksum(&buf);
+            let h_hi = mix64(h);
+            pks.push(((h_hi as u128) << 64) | (h as u128));
+        }
+    }
+    for row in 0..n {
+        output.set_pk_at(row, pks[row]);
+    }
+}
 
 /// Murmur3 64-bit finalizer.
 #[inline]
@@ -539,34 +623,65 @@ impl PkPromoter {
     }
 
     #[inline]
+    fn read_wide(batch: &MemBatch, pi: usize, row: usize) -> u128 {
+        let ptr = batch.get_col_ptr(row, pi, 16);
+        u128::from_le_bytes(ptr[0..16].try_into().unwrap())
+    }
+
+    #[inline]
+    fn read_string(batch: &MemBatch, pi: usize, row: usize) -> u128 {
+        let struct_bytes = batch.get_col_ptr(row, pi, 16);
+        let content = crate::schema::german_string_content(struct_bytes, batch.blob);
+        if content.is_empty() {
+            return 0;
+        }
+        let h = xxh::checksum(content);
+        let h_hi = mix64(h);
+        ((h_hi as u128) << 64) | (h as u128)
+    }
+
+    #[inline]
+    fn read_narrow(batch: &MemBatch, pi: usize, cs: usize, row: usize) -> u128 {
+        let ptr = batch.get_col_ptr(row, pi, cs);
+        let mut buf = [0u8; 8];
+        buf[..cs].copy_from_slice(ptr);
+        u64::from_le_bytes(buf) as u128
+    }
+
+    #[cfg(test)]
+    #[inline]
     pub(super) fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
         match self.kind {
             PromoteKind::Pk => batch.get_pk(row),
+            PromoteKind::Wide { pi } => Self::read_wide(batch, pi, row),
+            PromoteKind::String { pi } => Self::read_string(batch, pi, row),
+            PromoteKind::Narrow { pi, cs } => Self::read_narrow(batch, pi, cs, row),
+        }
+    }
+
+    /// Promote every row of `output` from `batch`, hoisting the per-batch
+    /// kind dispatch out of the row loop (the kind is a batch-invariant).
+    pub(super) fn promote_into(&self, batch: &MemBatch, output: &mut Batch) {
+        match self.kind {
+            PromoteKind::Pk => {
+                for row in 0..output.count {
+                    output.set_pk_at(row, batch.get_pk(row));
+                }
+            }
             PromoteKind::Wide { pi } => {
-                let ptr = batch.get_col_ptr(row, pi, 16);
-                u128::from_le_bytes(ptr[0..16].try_into().unwrap())
+                for row in 0..output.count {
+                    output.set_pk_at(row, Self::read_wide(batch, pi, row));
+                }
             }
             PromoteKind::String { pi } => {
-                let struct_bytes = batch.get_col_ptr(row, pi, 16);
-                let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-                if length == 0 {
-                    return 0;
+                for row in 0..output.count {
+                    output.set_pk_at(row, Self::read_string(batch, pi, row));
                 }
-                let h = if length <= SHORT_STRING_THRESHOLD {
-                    xxh::checksum(&struct_bytes[4..4 + length])
-                } else {
-                    let heap_offset =
-                        u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                    xxh::checksum(long_string_bytes(batch.blob, heap_offset, length))
-                };
-                let h_hi = mix64(h);
-                ((h_hi as u128) << 64) | (h as u128)
             }
             PromoteKind::Narrow { pi, cs } => {
-                let ptr = batch.get_col_ptr(row, pi, cs);
-                let mut buf = [0u8; 8];
-                buf[..cs].copy_from_slice(ptr);
-                u64::from_le_bytes(buf) as u128
+                for row in 0..output.count {
+                    output.set_pk_at(row, Self::read_narrow(batch, pi, cs, row));
+                }
             }
         }
     }
@@ -624,7 +739,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20)]);
         let b = make_batch(&schema, &[(1, 1, 10)]);
-        let out = op_union(&a, Some(&b), &schema);
+        let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 2);
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -637,7 +752,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20), (1, 1, 30)]);
         let b = make_batch(&schema, &[(1, 1, 10), (1, 1, 25)]);
-        let out = op_union(&a, Some(&b), &schema);
+        let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -653,7 +768,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20), (3, 1, 300)]);
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 200)]);
-        let out = op_union(&a, Some(&b), &schema);
+        let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
         assert!(out.sorted);
         assert_eq!((out.get_pk(0) as u64), 1);
@@ -672,7 +787,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10)]);
         let b = make_batch(&schema, &[(1, -1, 10)]);
-        let out = op_union(&a, Some(&b), &schema);
+        let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 2);
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -992,7 +1107,7 @@ mod tests {
         let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
         let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
 
-        let out = op_union(&a, Some(&b), &schema);
+        let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
         assert!(out.sorted);
         assert!(!out.consolidated);
@@ -1005,6 +1120,102 @@ mod tests {
         assert_eq!(get_payload_i64(&out, 2), 200);
         assert_eq!(wide_pk_triple(&out, 3), (0, 0, 3));
         assert_eq!(get_payload_i64(&out, 3), 300);
+    }
+
+    #[test]
+    fn test_op_union_empty_a_returns_b() {
+        // batch_a empty, batch_b non-empty → result equals batch_b content.
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[]);
+        let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let out = op_union(a, Some(&b), &schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk(0) as u64, 1);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(out.get_pk(1) as u64, 2);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+    }
+
+    #[test]
+    fn test_op_union_b_none_passthrough() {
+        // batch_b None → batch_a returned verbatim (sorted/consolidated kept).
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10)]);
+        let out = op_union(a, None, &schema);
+        assert_eq!(out.count, 1);
+        assert!(out.sorted && out.consolidated);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_union_merge signed I64 PK ordering (item 33)
+    // -----------------------------------------------------------------------
+
+    fn make_schema_i64pk_i64() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk((pk as u64) as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_op_union_merge_signed_i64_pk() {
+        // Signed PK has high bit set for negatives. Raw-u128 comparison (narrow
+        // path) would sort negatives after positives. The merge must produce
+        // signed ascending order.
+        let schema = make_schema_i64pk_i64();
+        let a = make_batch_i64pk(&schema, &[(-5, 1, 100), (0, 1, 200), (7, 1, 300)]);
+        let b = make_batch_i64pk(&schema, &[(-1, 1, 400), (3, 1, 500)]);
+        let out = op_union(a, Some(&b), &schema);
+        assert_eq!(out.count, 5);
+        assert!(out.sorted);
+        let pks: Vec<i64> = (0..out.count).map(|i| out.get_pk(i) as u64 as i64).collect();
+        assert_eq!(pks, vec![-5, -1, 0, 3, 7], "signed ascending PK order");
+    }
+
+    // -----------------------------------------------------------------------
+    // PkPromoter::promote_into matches per-row promote across all variants (item 31)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pk_promoter_promote_into_matches_per_row() {
+        // Narrow (U32) variant.
+        let schema = make_schema_pk_u64_payload_u32();
+        let rows: Vec<(u64, u32)> = (0..1000).map(|i| (i, (i * 7 + 1) as u32)).collect();
+        let batch = build_batch_u32_payload(&schema, &rows);
+        let mb = batch.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1);
+
+        let mut out = batch.clone_batch();
+        promoter.promote_into(&mb, &mut out);
+        for row in 0..batch.count {
+            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {} narrow", row);
+        }
+
+        // Pk variant (reindex on PK column itself).
+        let promoter_pk = PkPromoter::new(&schema, 0);
+        let mut out_pk = batch.clone_batch();
+        promoter_pk.promote_into(&mb, &mut out_pk);
+        for row in 0..batch.count {
+            assert_eq!(out_pk.get_pk(row), promoter_pk.promote(&mb, row), "row {} pk", row);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1091,6 +1302,39 @@ mod tests {
     }
 
     #[test]
+    fn test_op_filter_blob_passthrough_long_value() {
+        // op_filter over a batch with a BLOB payload column holding a long
+        // (> 12 byte) value. The output BLOB must resolve to the original.
+        let schema = make_schema_pk_u64_payload_blob();
+        let mut b = Batch::with_schema(schema, 2);
+        let long_blob: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
+        let heap_off = b.blob.len() as u64;
+        b.blob.extend_from_slice(long_blob);
+        // Row 0: long blob, val passes always-true filter.
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        let mut gs = [0u8; 16];
+        gs[0..4].copy_from_slice(&(long_blob.len() as u32).to_le_bytes());
+        gs[4..8].copy_from_slice(&long_blob[..4]);
+        gs[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        b.extend_col(0, &gs);
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+
+        let func = always_true_func(&schema);
+        let out = op_filter(&b, &func, &schema);
+        assert_eq!(out.count, 1);
+        assert!(!out.blob.is_empty(), "BLOB filter output must carry the blob buffer");
+        let struct_bytes = out.col_data(0);
+        let length = u32::from_le_bytes(struct_bytes[0..4].try_into().unwrap()) as usize;
+        let off = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+        let resolved = crate::schema::long_string_bytes(&out.blob, off, length);
+        assert_eq!(resolved, long_blob, "long BLOB must resolve to the original bytes");
+    }
+
+    #[test]
     fn test_pk_promoter_blob_no_panic() {
         // Regression: PkPromoter mapped BLOB to Narrow { cs: 16 }, copying 16
         // bytes into an 8-byte buffer and panicking. BLOB shares the
@@ -1111,6 +1355,102 @@ mod tests {
         let promoter = PkPromoter::new(&schema, 1);
         let pk = promoter.promote(&mb, 0);
         assert_ne!(pk, 0, "non-empty BLOB must hash to a non-zero key");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stride consistency on early-exit empty batches (item 3)
+    // -----------------------------------------------------------------------
+
+    fn always_true_func(schema: &SchemaDescriptor) -> ScalarFuncKind {
+        use crate::expr::{ExprProgram, Plan};
+        let code = vec![3i64, 0, 1, 0]; // LOAD_CONST r0 = 1
+        let prog = ExprProgram::new(code, 1, 0, vec![]);
+        ScalarFuncKind::Plan(Plan::from_predicate(prog, schema))
+    }
+
+    #[test]
+    fn test_op_filter_empty_stride_u64() {
+        // U64 PK → stride 8. Early-exit empty batch must carry the schema
+        // stride, not a hardcoded 16.
+        let schema = make_schema_u64_i64();
+        let empty = make_batch(&schema, &[]);
+        assert_eq!(empty.count, 0);
+        let func = always_true_func(&schema);
+        let out = op_filter(&empty, &func, &schema);
+        assert_eq!(out.count, 0);
+        assert_eq!(out.pk_stride(), 8, "op_filter empty must use schema stride 8 for U64 PK");
+    }
+
+    #[test]
+    fn test_op_negate_empty_stride_u64() {
+        let schema = make_schema_u64_i64();
+        let empty = make_batch(&schema, &[]);
+        let out = op_negate(&empty);
+        assert_eq!(out.count, 0);
+        assert_eq!(out.pk_stride(), 8, "op_negate empty must use schema stride 8 for U64 PK");
+    }
+
+    #[test]
+    fn test_op_null_extend_empty_stride_u64() {
+        let in_schema = make_schema_u64_i64();
+        let right_schema = make_schema_u64_i64();
+        let empty = make_batch(&in_schema, &[]);
+        let out = op_null_extend(&empty, &in_schema, &right_schema);
+        assert_eq!(out.count, 0);
+        assert_eq!(out.pk_stride(), 8, "op_null_extend empty must use combined-schema stride 8");
+    }
+
+    // -----------------------------------------------------------------------
+    // op_null_extend shift guard (item 4a)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_null_extend_shift_guard_64_payload_cols() {
+        // in_npc == 64 (65-column schema, 1 PK col) and right_npc == 0.
+        // shift == 64 makes `right_null_bits << 64` panic in debug builds even
+        // though right_null_bits is 0.
+        let mut in_cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..64 {
+            in_cols.push(SchemaColumn::new(type_code::I64, 0));
+        }
+        let in_schema = SchemaDescriptor::new(&in_cols, &[0]);
+        assert_eq!(in_schema.num_payload_cols(), 64);
+
+        // Right schema: PK only, no payload columns → right_npc == 0.
+        let right_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        assert_eq!(right_schema.num_payload_cols(), 0);
+
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        for pi in 0..in_schema.num_payload_cols() {
+            b.extend_col(pi, &0i64.to_le_bytes());
+        }
+        b.count += 1;
+
+        // Must not panic.
+        let out = op_null_extend(&b, &in_schema, &right_schema);
+        assert_eq!(out.count, 1);
+        let in_null = u64::from_le_bytes(b.null_bmp_data()[0..8].try_into().unwrap());
+        let out_null = u64::from_le_bytes(out.null_bmp_data()[0..8].try_into().unwrap());
+        assert_eq!(out_null, in_null, "no right cols → output null word equals input");
+    }
+
+    // -----------------------------------------------------------------------
+    // op_negate i64::MIN (item 46)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_negate_i64_min_no_panic() {
+        // -i64::MIN overflows; debug builds panic, release wraps silently.
+        // wrapping_neg must leave i64::MIN unchanged without panicking.
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[(1, i64::MIN, 10), (2, 5, 20)]);
+        let out = op_negate(&batch);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_weight(0), i64::MIN, "wrapping_neg(i64::MIN) == i64::MIN");
+        assert_eq!(out.get_weight(1), -5);
     }
 
     #[test]

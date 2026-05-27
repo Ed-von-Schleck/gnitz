@@ -124,6 +124,9 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             ((OPCODE_MAP_EXPR, None, reindex_col, Some(program)), Vec::new())
         }
         OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
+        OpNode::Map(MapKind::HashRow(cols)) => {
+            ((OPCODE_MAP_HASH_ROW, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
+        }
         OpNode::Negate         => ((OPCODE_NEGATE, None, None, None), Vec::new()),
         OpNode::Union          => ((OPCODE_UNION, None, None, None), Vec::new()),
         OpNode::Delay          => ((OPCODE_DELAY, None, None, None), Vec::new()),
@@ -242,6 +245,17 @@ impl CircuitBuilder {
             program: blob,
             reindex_col: Some(reindex_col as u16),
         }));
+        self.connect(input, nid, gnitz_wire::PORT_IN);
+        nid
+    }
+
+    /// Full-row-identity reindex: keep the listed columns as payload (in order)
+    /// and set the synthetic PK to a hash of those payload bytes, so set
+    /// membership is decided by the projected row content, not by the source PK
+    /// (EXCEPT/INTERSECT/DISTINCT).
+    pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
+        let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
+        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols)));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }

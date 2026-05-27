@@ -78,14 +78,83 @@ fn reject_compound_pk_view_source(schema: &Schema) -> Result<(), GnitzSqlError> 
 /// column or it carries its own active UNIQUE index. Validates that
 /// fk_col_type is compatible with the referenced column type and returns that
 /// type so the caller can widen the child column.
+/// Resolve a self-referencing FK against the in-flight column list (the table
+/// is not yet registered in the catalog). The referenced column must be the
+/// table's lone PK column; returns table id 0 — the sentinel the FK
+/// registration path uses for "same table".
+fn resolve_fk_target_inline(
+    current_cols:     &[ColumnDef],
+    current_pk_cols:  &[u32],
+    ref_table:        &str,
+    referred_columns: &[sqlparser::ast::Ident],
+    fk_col_type:      TypeCode,
+) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
+    if referred_columns.len() > 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "multi-column FOREIGN KEY references are not supported".into()
+        ));
+    }
+    let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
+        current_cols.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+            .ok_or_else(|| GnitzSqlError::Bind(format!(
+                "FK references column '{}' not found in table '{}'",
+                ident.value, ref_table,
+            )))?
+    } else if current_pk_cols.len() == 1 {
+        current_pk_cols[0] as usize
+    } else {
+        return Err(GnitzSqlError::Bind(format!(
+            "self-referencing FK against '{}' must name the referenced column",
+            ref_table,
+        )));
+    };
+
+    if !(current_pk_cols.len() == 1 && current_pk_cols[0] as usize == ref_col_idx) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "self-referencing FK must reference the primary key of '{}'; \
+             column '{}' is not the lone PK",
+            ref_table, current_cols[ref_col_idx].name,
+        )));
+    }
+
+    let parent_col_type = current_cols[ref_col_idx].type_code;
+    let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_col_type) {
+        true
+    } else {
+        fk_col_type == parent_col_type
+    };
+    if !is_compat {
+        return Err(GnitzSqlError::Bind(format!(
+            "FK type mismatch: column type {:?} is not compatible with referenced \
+             column type {:?}",
+            fk_col_type, parent_col_type,
+        )));
+    }
+    Ok((0, ref_col_idx as u64, parent_col_type))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_fk_target(
     client:           &mut GnitzClient,
     schema_name:      &str,
     foreign_table:    &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
     fk_col_type:      TypeCode,
+    current_table_name: &str,
+    current_cols:       &[ColumnDef],
+    current_pk_cols:    &[u32],
 ) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
+
+    // Self-referencing FK: the table being created is not yet in the catalog,
+    // so resolve the referenced column against the in-flight column list.
+    if ref_table.eq_ignore_ascii_case(current_table_name) {
+        return resolve_fk_target_inline(
+            current_cols, current_pk_cols, &ref_table, referred_columns, fk_col_type,
+        );
+    }
+
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
 
@@ -159,6 +228,18 @@ fn execute_create_table(
 
     let sql_cols = &create.columns;
 
+    // Reject duplicate column names up front: the PK binder's name->index
+    // lookup silently binds to the first match, so a duplicate would produce a
+    // schema with two identically-named columns that bind ambiguously later.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for col in sql_cols.iter() {
+        if !seen.insert(col.name.value.to_lowercase()) {
+            return Err(GnitzSqlError::Plan(format!(
+                "duplicate column name '{}' in table definition", col.name.value
+            )));
+        }
+    }
+
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
     for col in sql_cols.iter() {
@@ -219,6 +300,7 @@ fn execute_create_table(
                 ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
                     let (tid, idx, parent_pk_type) = resolve_fk_target(
                         client, schema_name, foreign_table, referred_columns, cols[i].type_code,
+                        &table_name, &cols, &pk_indices,
                     )?;
                     cols[i].fk_table_id = tid;
                     cols[i].fk_col_idx  = idx;
@@ -245,6 +327,7 @@ fn execute_create_table(
                 )))?;
             let (tid, idx, parent_pk_type) = resolve_fk_target(
                 client, schema_name, foreign_table, referred_columns, cols[col_idx].type_code,
+                &table_name, &cols, &pk_indices,
             )?;
             cols[col_idx].fk_table_id = tid;
             cols[col_idx].fk_col_idx  = idx;
@@ -347,6 +430,13 @@ fn execute_create_view(
     if query.order_by.is_some() {
         return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
     }
+    // An incremental circuit has no meaningful LIMIT/OFFSET semantics; a silently
+    // ignored LIMIT would stream the full table.
+    if query.limit_clause.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "LIMIT and OFFSET are not supported in VIEW definitions".into(),
+        ));
+    }
 
     let sql_text = format!("{}", stmt);
 
@@ -375,9 +465,56 @@ fn execute_create_view(
                 &cte_select.from[0].relation,
                 &format!("CTE '{}'", cte_name),
             )?;
-            // Resolve the CTE's source table and cache the CTE name as an alias
-            let resolved = binder.resolve(client, &cte_table_name)?;
-            binder.cache_alias(cte_name, resolved);
+            // Resolve the CTE's source table and cache the CTE name as an alias.
+            let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
+            // A CTE is inlined only as a plain column pass-through of its source
+            // table. Anything that changes the row set or shape (WHERE, GROUP BY,
+            // HAVING, DISTINCT, ORDER BY, LIMIT, or a non-identity projection)
+            // would be silently discarded by the alias mechanism and return wrong
+            // rows, so reject it explicitly. (Compiling an arbitrary CTE body as a
+            // sub-plan is a separate, unimplemented feature.)
+            let proj_is_identity = cte_select.projection.iter()
+                    .all(|p| matches!(p, SelectItem::Wildcard(_)))
+                || (cte_select.projection.len() == cte_schema.columns.len()
+                    && cte_select.projection.iter().enumerate().all(|(i, item)| {
+                        matches!(item, SelectItem::UnnamedExpr(Expr::Identifier(id))
+                            if cte_schema.columns[i].name.eq_ignore_ascii_case(&id.value))
+                    }));
+            let has_group_by = matches!(&cte_select.group_by,
+                GroupByExpr::Expressions(e, _) if !e.is_empty());
+            if cte_select.selection.is_some()
+                || cte_select.having.is_some()
+                || cte_select.distinct.is_some()
+                || has_group_by
+                || cte.query.order_by.is_some()
+                || cte.query.limit_clause.is_some()
+                || !proj_is_identity
+            {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "CTE '{}': only a plain column pass-through of a single table is \
+                     supported; WHERE, a subset/reordered/computed projection, GROUP BY, \
+                     HAVING, DISTINCT, ORDER BY and LIMIT inside a CTE are not yet supported",
+                    cte_name
+                )));
+            }
+            // Apply CTE column aliases (`WITH cte(a, b) AS ...`): rename the
+            // resolved columns so outer references to the aliases bind.
+            let cte_schema = if !cte.alias.columns.is_empty() {
+                if cte.alias.columns.len() != cte_schema.columns.len() {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "CTE '{}' defines {} column aliases but query returns {} columns",
+                        cte_name, cte.alias.columns.len(), cte_schema.columns.len()
+                    )));
+                }
+                let mut s = (*cte_schema).clone();
+                for (col, alias) in s.columns.iter_mut().zip(&cte.alias.columns) {
+                    col.name = alias.name.value.clone();
+                }
+                std::rc::Rc::new(s)
+            } else {
+                cte_schema
+            };
+            binder.cache_alias(cte_name, (cte_tid, cte_schema));
         }
     }
 
@@ -576,13 +713,23 @@ fn build_projection(
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let bound = binder.bind_expr(expr, source_schema)?;
-                let out_type = bound.infer_type(source_schema);
-                items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
-                out_cols.push(ColumnDef {
-                    name: alias.value.clone(),
-                    type_code: out_type,
-                    is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
-                });
+                // A direct column reference with an alias is a PassThrough with a
+                // renamed output column, not a computation — otherwise an aliased
+                // PK column would trip the "PK cannot be computed" guard below.
+                if let BoundExpr::ColRef(ci) = bound {
+                    items.push(ProjectionItem::PassThrough { src_col: ci });
+                    let mut col = source_schema.columns[ci].clone();
+                    col.name = alias.value.clone();
+                    out_cols.push(col);
+                } else {
+                    let out_type = bound.infer_type(source_schema);
+                    items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
+                    out_cols.push(ColumnDef {
+                        name: alias.value.clone(),
+                        type_code: out_type,
+                        is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
+                    });
+                }
             }
             SelectItem::UnnamedExpr(expr) => {
                 // Try as column reference first (already handled above for Identifier),
@@ -610,9 +757,12 @@ fn build_projection(
     match pk_pos {
         Some(0) => { /* already first, good */ }
         Some(pos) => {
-            // Move PK to front
-            items.swap(0, pos);
-            out_cols.swap(0, pos);
+            // Move PK to front. A swap would relocate the old column-0 to `pos`,
+            // scrambling the remaining order; remove+insert shifts the rest left.
+            let pk_item = items.remove(pos);
+            items.insert(0, pk_item);
+            let pk_col = out_cols.remove(pos);
+            out_cols.insert(0, pk_col);
         }
         None => {
             // PK not present — check if any computed item would shadow it
@@ -692,6 +842,26 @@ fn execute_create_join_view(
     reject_compound_pk_view_source(&left_schema)?;
     let (right_tid, right_schema) = binder.resolve(client, &right_name)?;
     reject_compound_pk_view_source(&right_schema)?;
+
+    // The 2-term DBSP join formula assumes the left and right input deltas are
+    // never simultaneously active. A self-join feeds the same delta to both
+    // sides in one epoch, dropping the bilinear ΔT⋈ΔT cross-term — silent data
+    // loss whenever same-key rows arrive in one batch.
+    if left_tid == right_tid {
+        return Err(GnitzSqlError::Unsupported(
+            "self-join (joining a table with itself) is not supported".into()
+        ));
+    }
+
+    // The merged join output is [_join_pk, left cols..., right cols...]. Reject
+    // before the server's schema build hits its hard column-count assertion.
+    let combined_cols = 1 + left_schema.columns.len() + right_schema.columns.len();
+    if combined_cols > gnitz_core::MAX_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN view output has {} columns, exceeding the {}-column limit",
+            combined_cols, gnitz_core::MAX_COLUMNS,
+        )));
+    }
 
     // Build alias map for qualified column resolution
     let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
@@ -931,10 +1101,27 @@ fn resolve_join_col_ref(
 /// Tracks how a user-level aggregate maps to reduce agg_specs.
 struct AggMapping {
     specs_start: usize,     // index into agg_specs
-    specs_count: usize,     // 1 for normal, 2 for AVG
     is_avg: bool,
     output_name: String,
     output_type: TypeCode,
+    agg_func: AggFunc,
+    arg_col: Option<usize>,
+}
+
+/// Mirror the engine's `agg_output_type`: SUM/MIN/MAX over a float column
+/// resolve to F64, COUNT/COUNT_NON_NULL to I64. A planner/compiler mismatch
+/// silently scrambles the view's output column positions.
+fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
+    match func {
+        AggFunc::Count | AggFunc::CountNonNull => TypeCode::I64,
+        AggFunc::Avg => TypeCode::F64,
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+            match src_col {
+                Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
+                _ => TypeCode::I64,
+            }
+        }
+    }
 }
 
 /// What each SELECT item represents in a GROUP BY query.
@@ -1014,40 +1201,82 @@ fn execute_create_group_by_view(
                     },
                     None => None,
                 };
+                // SUM/MIN/MAX/COUNT_NON_NULL/AVG require an argument column. The
+                // binder normally rejects no-argument calls, but guard against a
+                // None reaching the unwraps below (panic → dead server thread).
+                if matches!(func, AggFunc::Sum | AggFunc::Min | AggFunc::Max
+                        | AggFunc::CountNonNull | AggFunc::Avg)
+                    && src_col.is_none()
+                {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "{:?} requires an argument column", func
+                    )));
+                }
+                // Reject aggregates whose source column type is meaningless for
+                // the function: numeric aggregates need a numeric column, and
+                // MIN/MAX need an orderable column (the engine's decode_signed
+                // marks U128/UUID unreachable and reads STRING/BLOB as garbage).
+                if let Some(c) = src_col {
+                    let tc = source_schema.columns[c].type_code;
+                    let is_numeric = is_integer_type(tc) || tc.is_float();
+                    match func {
+                        AggFunc::Sum | AggFunc::Avg | AggFunc::CountNonNull => {
+                            // CountNonNull only counts presence, but SUM/AVG need numbers.
+                            if matches!(func, AggFunc::Sum | AggFunc::Avg) && !is_numeric {
+                                return Err(GnitzSqlError::Bind(format!(
+                                    "{:?} requires a numeric column, got {:?} ('{}')",
+                                    func, tc, source_schema.columns[c].name,
+                                )));
+                            }
+                        }
+                        AggFunc::Min | AggFunc::Max => {
+                            if matches!(tc, TypeCode::String | TypeCode::Blob
+                                | TypeCode::U128 | TypeCode::UUID) {
+                                return Err(GnitzSqlError::Bind(format!(
+                                    "{:?} is not supported on column type {:?} ('{}')",
+                                    func, tc, source_schema.columns[c].name,
+                                )));
+                            }
+                        }
+                        AggFunc::Count => {}
+                    }
+                }
+
+                let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
-                let (out_name, out_type, is_avg) = match func {
+                let (out_name, is_avg) = match func {
                     AggFunc::Count => {
                         agg_specs.push((AGG_COUNT, 0));
-                        (alias.unwrap_or_else(|| format!("_count{}", idx)), TypeCode::I64, false)
+                        (alias.unwrap_or_else(|| format!("_count{}", idx)), false)
                     }
                     AggFunc::CountNonNull => {
                         agg_specs.push((AGG_COUNT_NON_NULL, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_count{}", idx)), TypeCode::I64, false)
+                        (alias.unwrap_or_else(|| format!("_count{}", idx)), false)
                     }
                     AggFunc::Sum => {
                         agg_specs.push((AGG_SUM, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_sum{}", idx)), TypeCode::I64, false)
+                        (alias.unwrap_or_else(|| format!("_sum{}", idx)), false)
                     }
                     AggFunc::Min => {
                         agg_specs.push((AGG_MIN, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_min{}", idx)), TypeCode::I64, false)
+                        (alias.unwrap_or_else(|| format!("_min{}", idx)), false)
                     }
                     AggFunc::Max => {
                         agg_specs.push((AGG_MAX, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_max{}", idx)), TypeCode::I64, false)
+                        (alias.unwrap_or_else(|| format!("_max{}", idx)), false)
                     }
                     AggFunc::Avg => {
                         let col = src_col.unwrap();
                         agg_specs.push((AGG_SUM, col));
                         agg_specs.push((AGG_COUNT_NON_NULL, col));
-                        (alias.unwrap_or_else(|| format!("_avg{}", idx)), TypeCode::F64, true)
+                        (alias.unwrap_or_else(|| format!("_avg{}", idx)), true)
                     }
                 };
-                let count = agg_specs.len() - start;
                 agg_mappings.push(AggMapping {
-                    specs_start: start, specs_count: count, is_avg,
+                    specs_start: start, is_avg,
                     output_name: out_name, output_type: out_type,
+                    agg_func: *func, arg_col: src_col,
                 });
                 select_items.push(GroupBySelectItem::Aggregate { agg_idx });
             }
@@ -1103,9 +1332,18 @@ fn execute_create_group_by_view(
     } else {
         1 + group_col_indices.len()
     };
-    for _ in 0..agg_specs.len() {
+    for &(op, col) in &agg_specs {
+        // Mirror the engine's agg_output_type so the planner's virtual schema
+        // matches the compiler's physical reduce schema (F64 for float SUM/MIN/MAX).
+        let type_code = if (op == AGG_SUM || op == AGG_MIN || op == AGG_MAX)
+            && source_schema.columns[col].type_code.is_float()
+        {
+            TypeCode::F64
+        } else {
+            TypeCode::I64
+        };
         reduce_schema_cols.push(ColumnDef {
-            name: "_agg".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+            name: "_agg".into(), type_code, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
     let reduce_schema = Schema { columns: reduce_schema_cols, pk_cols: reduce_pk_cols };
@@ -1169,9 +1407,19 @@ fn execute_create_group_by_view(
                     // AVG = SUM / COUNT: two agg_specs were pushed (SUM, COUNT)
                     let sum_col = (agg_col_offset + m.specs_start) as u32;
                     let cnt_col = (agg_col_offset + m.specs_start + 1) as u32;
-                    let sum_reg = post_map_eb.load_col_int(sum_col as usize);
+                    // For a float source, the SUM accumulator stores IEEE-754
+                    // bits; loading those as an int and casting numerically would
+                    // produce a wildly wrong value. Load them directly as float.
+                    let is_float_src = m.arg_col
+                        .map(|c| source_schema.columns[c].type_code.is_float())
+                        .unwrap_or(false);
+                    let sum_f = if is_float_src {
+                        post_map_eb.load_col_float(sum_col as usize)
+                    } else {
+                        let sum_reg = post_map_eb.load_col_int(sum_col as usize);
+                        post_map_eb.int_to_float(sum_reg)
+                    };
                     let cnt_reg = post_map_eb.load_col_int(cnt_col as usize);
-                    let sum_f = post_map_eb.int_to_float(sum_reg);
                     let cnt_f = post_map_eb.int_to_float(cnt_reg);
                     let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
                     post_map_eb.emit_col(avg_reg, payload_idx);
@@ -1263,13 +1511,21 @@ fn bind_having_expr(
             for si in select_items {
                 if let GroupBySelectItem::Aggregate { agg_idx } = si {
                     let m = &agg_mappings[*agg_idx];
-                    // Match by output name and type
-                    let matches = match (agg_func, m.is_avg) {
-                        (AggFunc::Avg, true) => true,
-                        (AggFunc::Count, false) if m.output_type == TypeCode::I64 => {
-                            m.specs_count == 1
-                        }
-                        _ => !m.is_avg,
+                    // Match the function type AND the argument column; the prior
+                    // `_ => !m.is_avg` fallthrough bound any non-AVG aggregate to
+                    // the first non-AVG mapping regardless of which column it
+                    // aggregated, so HAVING MAX(c2) could silently read SUM(c1).
+                    let matches = match agg_func {
+                        AggFunc::Avg => m.is_avg,
+                        AggFunc::Count => m.agg_func == AggFunc::Count,
+                        AggFunc::CountNonNull =>
+                            m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
+                        AggFunc::Sum =>
+                            m.agg_func == AggFunc::Sum && m.arg_col == arg_col,
+                        AggFunc::Min =>
+                            m.agg_func == AggFunc::Min && m.arg_col == arg_col,
+                        AggFunc::Max =>
+                            m.agg_func == AggFunc::Max && m.arg_col == arg_col,
                     };
                     if matches {
                         // Find this agg's position in the output schema
@@ -1384,13 +1640,73 @@ fn compile_set_op_side(
         inp
     };
 
-    // Reindex by PK column with all columns as payload
-    let prog = build_reindex_program(&source_schema);
-    let reindexed = cb.map_reindex(filtered, source_schema.pk_index_single(), prog);
+    // Resolve the projection to a set of source column indices (in SELECT
+    // order). Unlike `build_projection`, the source PK is NOT force-included:
+    // set membership is over exactly the projected columns.
+    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
 
-    // Determine output columns (from projection)
-    let out_cols: Vec<ColumnDef> = source_schema.columns.clone();
+    // Reindex by a hash of the projected columns, so set membership
+    // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
+    // not by the source table's PK: two rows from different tables sharing a PK
+    // but differing in payload must not match.
+    let reindexed = cb.map_hash_row(filtered, &proj_indices);
     Ok((reindexed, out_cols))
+}
+
+/// Resolve a set-operation side's projection to source column indices plus
+/// output column definitions. Supports `SELECT *`, bare column references, and
+/// aliased column references; rejects computed expressions (which have no
+/// meaningful set identity here) with a clean error rather than silently
+/// dropping them.
+fn resolve_set_projection(
+    projection:    &[SelectItem],
+    source_schema: &Schema,
+    binder:        &Binder<'_>,
+) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
+    if projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_))) {
+        let indices: Vec<usize> = (0..source_schema.columns.len()).collect();
+        return Ok((indices, source_schema.columns.clone()));
+    }
+    let mut indices: Vec<usize> = Vec::new();
+    let mut out_cols: Vec<ColumnDef> = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for i in 0..source_schema.columns.len() {
+                    indices.push(i);
+                    out_cols.push(source_schema.columns[i].clone());
+                }
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                match binder.bind_expr(expr, source_schema)? {
+                    BoundExpr::ColRef(ci) => {
+                        indices.push(ci);
+                        out_cols.push(source_schema.columns[ci].clone());
+                    }
+                    _ => return Err(GnitzSqlError::Unsupported(
+                        "set operation: computed expressions in a SELECT side are not supported".into()
+                    )),
+                }
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                match binder.bind_expr(expr, source_schema)? {
+                    BoundExpr::ColRef(ci) => {
+                        indices.push(ci);
+                        let mut col = source_schema.columns[ci].clone();
+                        col.name = alias.value.clone();
+                        out_cols.push(col);
+                    }
+                    _ => return Err(GnitzSqlError::Unsupported(
+                        "set operation: computed expressions in a SELECT side are not supported".into()
+                    )),
+                }
+            }
+            _ => return Err(GnitzSqlError::Unsupported(
+                "set operation: unsupported SELECT item".into()
+            )),
+        }
+    }
+    Ok((indices, out_cols))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1427,6 +1743,17 @@ fn execute_create_set_op_view(
             "set operation: column count mismatch ({} vs {})", left_cols.len(), right_cols.len()
         )));
     }
+    // The merge operators read payload bytes using the left schema's column
+    // sizes; a STRING column read as an 8-byte integer (or vice versa) produces
+    // garbage, so both sides must agree on column types.
+    for (i, (l, r)) in left_cols.iter().zip(&right_cols).enumerate() {
+        if l.type_code != r.type_code {
+            return Err(GnitzSqlError::Plan(format!(
+                "set operation: column {} type mismatch ({:?} vs {:?})",
+                i, l.type_code, r.type_code,
+            )));
+        }
+    }
 
     let out_node = match (op, set_quantifier) {
         (SetOperator::Union, SetQuantifier::All) => {
@@ -1438,21 +1765,31 @@ fn execute_create_set_op_view(
             cb.distinct(merged)
         }
         (SetOperator::Intersect, _) => {
-            // INTERSECT: integrate both sides, bidirectional semi-join
+            // INTERSECT: integrate both sides, bidirectional semi-join. The semi
+            // inputs are lifted through `distinct` so a key that is inserted
+            // multiple times (same projected content, different source PKs)
+            // changes set membership exactly once — otherwise duplicate inserts
+            // would emit the intersect row more than once.
             let trace_l = cb.integrate_trace(left_node);
             let trace_r = cb.integrate_trace(right_node);
-            let semi_lr = cb.semi_join_with_trace_node(left_node, trace_r);
-            let semi_rl = cb.semi_join_with_trace_node(right_node, trace_l);
+            let distinct_l = cb.distinct(left_node);
+            let distinct_r = cb.distinct(right_node);
+            let semi_lr = cb.semi_join_with_trace_node(distinct_l, trace_r);
+            let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
             cb.union(semi_lr, semi_rl)
         }
         (SetOperator::Except, _) => {
-            // EXCEPT: bidirectional anti-join
+            // EXCEPT: bidirectional anti-join.
             let trace_l = cb.integrate_trace(left_node);
             let trace_r = cb.integrate_trace(right_node);
             // ΔA path: left rows not in I(B)
             let except_lr = cb.anti_join_with_trace_node(left_node, trace_r);
-            // ΔB path: when B row appears/disappears, retract/emit matching left rows
-            let semi_rl = cb.semi_join_with_trace_node(right_node, trace_l);
+            // ΔB path: when B's *set membership* changes, retract/emit matching
+            // left rows. Feeding ΔD(B) (the distinct delta) — not the raw ΔB —
+            // ensures a second insert of an already-present projected B row is a
+            // no-op, instead of driving the EXCEPT weight below zero.
+            let distinct_r = cb.distinct(right_node);
+            let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
             let correction = cb.negate(semi_rl);
             cb.union(except_lr, correction)
         }
@@ -1515,22 +1852,23 @@ fn execute_create_distinct_view(
         inp
     };
 
-    // Reindex by PK → distinct
-    let prog = build_reindex_program(&source_schema);
-    let reindexed = cb.map_reindex(filtered, source_schema.pk_index_single(), prog);
+    // Project the requested columns, then reindex by a hash of just those
+    // columns so `distinct` deduplicates on the projected content. Without the
+    // projection, reindexing by the source PK (unique by definition) makes
+    // `distinct` a no-op and leaks the unselected columns.
+    let (proj_indices, proj_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
+    let reindexed = cb.map_hash_row(filtered, &proj_indices);
     let distinct_node = cb.distinct(reindexed);
 
     cb.sink(distinct_node);
     let circuit = cb.build();
 
-    // Output schema: U128 PK + all source columns
-    let mut out_cols: Vec<ColumnDef> = Vec::new();
+    // Output schema: synthetic U128 PK + the projected columns.
+    let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(proj_cols.len() + 1);
     out_cols.push(ColumnDef {
         name: "_distinct_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
-    for col in &source_schema.columns {
-        out_cols.push(col.clone());
-    }
+    out_cols.extend(proj_cols);
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols)
         .map_err(GnitzSqlError::Exec)?;

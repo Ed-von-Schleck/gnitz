@@ -488,6 +488,12 @@ impl Batch {
     pub fn num_payload_cols(&self) -> usize {
         self.num_regions as usize - REG_PAYLOAD_START
     }
+    /// Byte width of the PK region (8 for U64 PK, 16 for U128/wide-narrow,
+    /// `> 16` for compound wide PKs). Exposed for stride-consistency checks.
+    #[inline]
+    pub fn pk_stride(&self) -> u8 {
+        self.strides[REG_PK]
+    }
 
     // ── Mutable slice accessors ─────────────────────────────────────────
 

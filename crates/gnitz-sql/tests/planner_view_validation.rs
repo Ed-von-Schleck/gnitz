@@ -1,0 +1,135 @@
+#![cfg(feature = "integration")]
+
+use gnitz_core::GnitzClient;
+use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_test_harness::ServerHandle;
+
+fn must_err(r: Result<Vec<SqlResult>, GnitzSqlError>) -> GnitzSqlError {
+    match r {
+        Ok(_)  => panic!("expected error, got Ok"),
+        Err(e) => e,
+    }
+}
+
+fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let sn = format!("vv{}", SEQ.fetch_add(1, Ordering::Relaxed));
+    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
+    client.create_schema(&sn).unwrap();
+    (client, sn)
+}
+
+// ── item 21: LIMIT/OFFSET in VIEW definitions ────────────────────────
+
+#[test]
+fn test_view_limit_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
+    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM t LIMIT 10"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(
+            s.to_uppercase().contains("LIMIT"), "got: {}", s),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+    // The rejected view must not be registered.
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_err(),
+        "LIMIT view must not be registered");
+}
+
+// ── item 22: set operation column type mismatch ──────────────────────
+
+#[test]
+fn test_set_op_type_mismatch_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, val BIGINT)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, val TEXT)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(
+            s.contains("type mismatch"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+// ── item 23: duplicate column names in CREATE TABLE ──────────────────
+
+#[test]
+fn test_duplicate_column_name_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE dup (a BIGINT, a BIGINT, PRIMARY KEY(a))"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(
+            s.to_lowercase().contains("duplicate column"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+    assert!(client.resolve_table_id(&sn, "dup").is_err(),
+        "table with duplicate column must not be registered");
+}
+
+// ── item 24: self-join rejection ─────────────────────────────────────
+
+#[test]
+fn test_self_join_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v AS SELECT t1.id FROM t AS t1 JOIN t AS t2 ON t1.fk = t2.fk"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(
+            s.to_lowercase().contains("self-join"), "got: {}", s),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+}
+
+// ── item 26: self-referencing foreign key ────────────────────────────
+
+#[test]
+fn test_self_referencing_fk_accepted() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE hier (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES hier(id))"
+        ).unwrap();
+    }
+    let (_, s) = client.resolve_table_id(&sn, "hier").unwrap();
+    let fk = s.columns.iter().find(|c| c.name.eq_ignore_ascii_case("parent_id")).unwrap();
+    // Self-reference encodes the target table id as 0 (sentinel for "same table").
+    assert_eq!(fk.fk_table_id, 0, "self-ref FK encodes same-table sentinel");
+}
+
+// ── item 17: wide-join combined column count > MAX_COLUMNS ────────────
+
+#[test]
+fn test_wide_join_column_count_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    // Two tables of 33 columns each: join output = 1 (_join_pk) + 33 + 33 = 67 > 65.
+    let mk = |name: &str| {
+        let mut cols: Vec<String> = vec!["id BIGINT PRIMARY KEY".into(), "fk BIGINT NOT NULL".into()];
+        for i in 0..31 { cols.push(format!("c{} BIGINT", i)); }
+        format!("CREATE TABLE {} ({})", name, cols.join(", "))
+    };
+    p.execute(&mk("wl")).unwrap();
+    p.execute(&mk("wr")).unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v AS SELECT * FROM wl JOIN wr ON wl.fk = wr.fk"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(
+            s.contains("column") || s.contains("MAX_COLUMNS"), "got: {}", s),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+}

@@ -427,20 +427,24 @@ class TestFkMultiChild:
 class TestFkSelfReferenceSQL:
     """Self-referential FK via SQL is not supported (table doesn't exist yet)."""
 
-    def test_self_referential_fk_fails(self, client):
+    def test_self_referential_fk_supported(self, client):
+        # Self-referencing FKs are now resolved against the in-flight column
+        # list during CREATE TABLE (the referenced table is the one being
+        # created), so the table is created successfully rather than failing
+        # with "table not found".
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            with pytest.raises(gnitz.GnitzError, match="(?i)not found"):
-                client.execute_sql(
-                    "CREATE TABLE tree ("
-                    "  id BIGINT NOT NULL PRIMARY KEY,"
-                    "  parent_id BIGINT REFERENCES tree(id)"
-                    ")",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE TABLE tree ("
+                "  id BIGINT NOT NULL PRIMARY KEY,"
+                "  parent_id BIGINT REFERENCES tree(id)"
+                ")",
+                schema_name=sn,
+            )
+            assert client.resolve_table(sn, "tree")[0] > 0
         finally:
-            _cleanup(client, sn)
+            _cleanup(client, sn, "tree")
 
 
 # ---------------------------------------------------------------------------

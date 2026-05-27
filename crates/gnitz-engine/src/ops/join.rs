@@ -6,17 +6,60 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{
     write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
-    compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
+    compare_pk_bytes, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
 };
 
-use super::util::write_string_from_batch;
+use super::util::{merge_null_words, write_string_from_batch};
 
 // ---------------------------------------------------------------------------
 // Anti-join delta-trace
 // ---------------------------------------------------------------------------
 
-/// Emit delta rows whose key has NO positive-weight match in the trace.
+/// Merge-walk a sorted delta's PKs against the trace `cursor` (positioned by an
+/// internal `seek` to the first PK), returning the indices of delta rows to
+/// emit. `emit_when_present` selects semi-join (emit rows whose key is in the
+/// trace) vs anti-join (emit rows whose key is absent). A key is "present" iff
+/// some trace entry for it has positive weight — an uncompacted trace may hold a
+/// tombstone (weight ≤ 0) before a live row, so every entry for the PK is
+/// scanned. Consecutive duplicate PKs reuse the previous presence result instead
+/// of re-seeking (which would be O(log N) per duplicate).
 #[allow(clippy::needless_range_loop)]
+fn dt_emit_indices(cursor: &mut ReadCursor, pks: &[u128], emit_when_present: bool) -> Vec<u32> {
+    let n = pks.len();
+    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
+    let mut prev_pk = pks[0];
+    let mut prev_in_trace = false;
+    cursor.seek(prev_pk);
+
+    for i in 0..n {
+        let d_pk = pks[i];
+
+        let in_trace = if i > 0 && d_pk == prev_pk {
+            prev_in_trace
+        } else {
+            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
+                cursor.advance();
+            }
+            let mut found = false;
+            while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
+                if cursor.current_weight > 0 { found = true; }
+                cursor.advance();
+            }
+            found
+        };
+
+        if in_trace == emit_when_present {
+            emit_indices.push(i as u32);
+        }
+
+        prev_pk = d_pk;
+        prev_in_trace = in_trace;
+    }
+
+    emit_indices
+}
+
+/// Emit delta rows whose key has NO positive-weight match in the trace.
 pub fn op_anti_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -29,39 +72,14 @@ pub fn op_anti_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
-    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
     let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
-    let mut prev_pk = pks[0];
-    cursor.seek(prev_pk);
-
-    for i in 0..n {
-        let d_pk = pks[i];
-
-        if i > 0 && d_pk == prev_pk {
-            // Same PK as previous row (different payload) — re-seek cursor.
-            cursor.seek(d_pk);
-        } else {
-            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
-                cursor.advance();
-            }
-        }
-
-        let in_trace = cursor.valid
-            && cursor.current_pk_cmp(d_pk) == Ordering::Equal
-            && cursor.current_weight > 0;
-
-        if !in_trace {
-            emit_indices.push(i as u32);
-        }
-
-        prev_pk = d_pk;
-    }
+    let emit_indices = dt_emit_indices(cursor, &pks, false);
 
     if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -80,7 +98,6 @@ pub fn op_anti_join_delta_trace(
 // ---------------------------------------------------------------------------
 
 /// Emit delta rows whose key HAS a positive-weight match in the trace.
-#[allow(clippy::needless_range_loop)]
 pub fn op_semi_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -93,7 +110,7 @@ pub fn op_semi_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
     // Reset cursor to position 0 for the same reason as op_join_delta_trace:
@@ -107,36 +124,11 @@ pub fn op_semi_join_delta_trace(
     }
 
     // Merge-walk
-    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
     let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
-    let mut prev_pk = pks[0];
-    cursor.seek(prev_pk);
-
-    for i in 0..n {
-        let d_pk = pks[i];
-
-        if i > 0 && d_pk == prev_pk {
-            // Same PK as previous row (different payload) — re-seek cursor.
-            cursor.seek(d_pk);
-        } else {
-            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
-                cursor.advance();
-            }
-        }
-
-        let in_trace = cursor.valid
-            && cursor.current_pk_cmp(d_pk) == Ordering::Equal
-            && cursor.current_weight > 0;
-
-        if in_trace {
-            emit_indices.push(i as u32);
-        }
-
-        prev_pk = d_pk;
-    }
+    let emit_indices = dt_emit_indices(cursor, &pks, true);
 
     if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, 16));
+        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
     let mb = consolidated.as_mem_batch();
@@ -199,7 +191,7 @@ fn semi_join_dt_swapped(
     }
 
     if emit_indices.is_empty() {
-        return Batch::empty(npc, 16);
+        return Batch::empty(npc, schema.pk_stride());
     }
 
     let mb = consolidated.as_mem_batch();
@@ -236,7 +228,7 @@ pub fn op_join_delta_trace(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(out_npc, 16);
+        return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
     // The same trace register may be reused by multiple join ops in one tick
@@ -265,7 +257,7 @@ fn join_dt_merge_walk(
     let out_npc = left_npc + right_npc;
     let n = delta.count;
     if n == 0 {
-        return Batch::empty(out_npc, 16);
+        return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
     let delta_mb = delta.as_mem_batch();
@@ -375,7 +367,7 @@ pub fn op_join_delta_trace_outer(
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(out_npc, 16);
+        return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
     let delta_mb = consolidated.as_mem_batch();
@@ -397,16 +389,22 @@ pub fn op_join_delta_trace_outer(
             }
         }
 
+        // `matched` reflects membership in Distinct(trace): set it on any
+        // positive-weight entry, not merely a non-zero join product. An
+        // uncompacted trace may present a tombstone (weight ≤ 0) for the PK;
+        // a tombstone alone must NOT suppress the null-fill.
         let mut matched = false;
         while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
             let w_trace = cursor.current_weight;
+            if w_trace > 0 {
+                matched = true;
+            }
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
                 write_join_row(
                     &mut output, &delta_mb, i, cursor, w_out,
                     left_schema, right_schema,
                 );
-                matched = true;
             }
             cursor.advance();
         }
@@ -443,7 +441,7 @@ fn write_left_payload(
         let is_null = (left_null >> pi) & 1 != 0;
         if is_null {
             output.fill_col_zero(pi, cs);
-        } else if col.type_code == TYPE_STRING {
+        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
             write_string_from_batch(output, pi, left_batch, left_row, pi);
         } else {
             output.extend_col(pi, left_batch.get_col_ptr(left_row, pi, cs));
@@ -468,7 +466,7 @@ fn write_join_row(
     let right_null = right_cursor.current_null_word;
 
     let left_npc = left_schema.num_payload_cols();
-    let null_word = left_null | (right_null << left_npc);
+    let null_word = merge_null_words(left_null, right_null, left_npc);
 
     output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
@@ -530,7 +528,7 @@ fn write_join_row_null_right(
     } else {
         u64::MAX
     };
-    let null_word = left_null | (right_null_bits << left_npc);
+    let null_word = merge_null_words(left_null, right_null_bits, left_npc);
 
     output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
@@ -605,13 +603,17 @@ where
     let n_b = cb.count;
 
     if n_a == 0 {
-        return Batch::empty(npc, 16);
+        return Batch::empty(npc, schema.pk_stride());
     }
 
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
+    // u128-packed PKs are injective for narrow keys, so equality tests are
+    // sound. Their *ordering* is only correct for single unsigned-column PKs;
+    // signed/compound PKs must compare bytes.
+    let fast = schema.pk_is_fast();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -619,43 +621,69 @@ where
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
 
-        while idx_b < n_b && pks_b[idx_b] < key_a {
-            idx_b += 1;
+        // Advance B past every PK group ordered before key_a. Hoist the
+        // fast/slow dispatch (batch-invariant) out of the inner loop, and the
+        // loop-invariant A-side PK bytes out of the slow comparison.
+        if fast {
+            while idx_b < n_b && pks_b[idx_b] < key_a {
+                idx_b += 1;
+            }
+        } else {
+            let a_pk = ca.get_pk_bytes(idx_a);
+            while idx_b < n_b
+                && compare_pk_bytes(schema, cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
+            {
+                idx_b += 1;
+            }
         }
 
-        // Find extent of B's PK group
+        // Extent of B's PK group matching key_a.
         let b_group_start = idx_b;
         let mut b_group_end = idx_b;
-        if idx_b < n_b && pks_b[idx_b] == key_a {
-            b_group_end = idx_b;
-            while b_group_end < n_b && pks_b[b_group_end] == key_a {
-                b_group_end += 1;
-            }
+        while b_group_end < n_b && pks_b[b_group_end] == key_a {
+            b_group_end += 1;
         }
 
+        // Extent of A's PK group.
+        let a_group_start = idx_a;
+        let mut a_group_end = idx_a;
+        while a_group_end < n_a && pks_a[a_group_end] == key_a {
+            a_group_end += 1;
+        }
+
+        // Both groups are payload-sorted (consolidated), so a single B cursor
+        // advances monotonically across all A rows — O(N+M) per group, not
+        // O(N×M).
+        let mut scan_b = b_group_start;
         let mut unmatched_start: Option<usize> = None;
-        while idx_a < n_a && pks_a[idx_a] == key_a {
-            let mut matched = false;
-            for scan_b in b_group_start..b_group_end {
-                if cb.get_weight(scan_b) > 0
-                    && row_cmp(schema, &mb_a, idx_a, &mb_b, scan_b) == Ordering::Equal
-                {
-                    matched = true;
+        for idx_a_row in a_group_start..a_group_end {
+            // Reuse the comparison that ends the advance: when the loop breaks
+            // with scan_b in range, `ord` already holds the (≥ Equal) result for
+            // the current B row, so the match test needs no second row_cmp.
+            let mut ord = Ordering::Greater;
+            while scan_b < b_group_end {
+                ord = row_cmp(schema, &mb_b, scan_b, &mb_a, idx_a_row);
+                if ord != Ordering::Less {
                     break;
                 }
+                scan_b += 1;
             }
+            let matched = scan_b < b_group_end
+                && ord == Ordering::Equal
+                && cb.get_weight(scan_b) > 0;
             if !matched {
                 if unmatched_start.is_none() {
-                    unmatched_start = Some(idx_a);
+                    unmatched_start = Some(idx_a_row);
                 }
             } else if let Some(rs) = unmatched_start.take() {
-                output.append_batch(ca, rs, idx_a);
+                output.append_batch(ca, rs, idx_a_row);
             }
-            idx_a += 1;
         }
         if let Some(rs) = unmatched_start.take() {
-            output.append_batch(ca, rs, idx_a);
+            output.append_batch(ca, rs, a_group_end);
         }
+
+        idx_a = a_group_end;
     }
 
     output.sorted = true;
@@ -682,11 +710,14 @@ fn filter_join_dd(
     let n_b = cb.count;
 
     if n_a == 0 {
-        return Batch::empty(npc, 16);
+        return Batch::empty(npc, schema.pk_stride());
     }
 
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
+    // u128 equality is injective for narrow PKs; ordering is only correct for
+    // single unsigned-column PKs — signed/compound PKs compare bytes.
+    let fast = schema.pk_is_fast();
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -694,8 +725,19 @@ fn filter_join_dd(
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
 
-        while idx_b < n_b && pks_b[idx_b] < key_a {
-            idx_b += 1;
+        // Hoist the fast/slow dispatch out of the inner loop; the slow path's
+        // A-side PK bytes are loop-invariant.
+        if fast {
+            while idx_b < n_b && pks_b[idx_b] < key_a {
+                idx_b += 1;
+            }
+        } else {
+            let a_pk = ca.get_pk_bytes(idx_a);
+            while idx_b < n_b
+                && compare_pk_bytes(schema, cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
+            {
+                idx_b += 1;
+            }
         }
 
         let mut has_match = false;
@@ -753,13 +795,16 @@ pub fn op_join_delta_delta(
 
     if n_a == 0 || n_b == 0 {
         gnitz_debug!("op_join_dd: a={} b={} out=0", n_a, n_b);
-        return Batch::empty(out_npc, 16);
+        return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
+    // u128 equality is injective for narrow PKs; ordering is only correct for
+    // single unsigned-column PKs — signed/compound PKs compare bytes.
+    let fast = left_schema.pk_is_fast();
     let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let mut idx_a = 0usize;
@@ -769,9 +814,14 @@ pub fn op_join_delta_delta(
         let key_a = pks_a[idx_a];
         let key_b = pks_b[idx_b];
 
-        if key_a < key_b {
+        let ord = if fast {
+            key_a.cmp(&key_b)
+        } else {
+            compare_pk_bytes(left_schema, mb_a.get_pk_bytes(idx_a), mb_b.get_pk_bytes(idx_b))
+        };
+        if ord == Ordering::Less {
             idx_a += 1;
-        } else if key_b < key_a {
+        } else if ord == Ordering::Greater {
             idx_b += 1;
         } else {
             let match_pk = key_a;
@@ -830,7 +880,7 @@ fn write_join_row_from_batches(
     let right_null = right_batch.get_null_word(right_row);
 
     let left_npc = left_schema.num_payload_cols();
-    let null_word = left_null | (right_null << left_npc);
+    let null_word = merge_null_words(left_null, right_null, left_npc);
 
     output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
     output.extend_weight(&weight.to_le_bytes());
@@ -845,7 +895,7 @@ fn write_join_row_from_batches(
         let out_pi = left_npc + rpi;
         if is_null {
             output.fill_col_zero(out_pi, cs);
-        } else if col.type_code == TYPE_STRING {
+        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
             write_string_from_batch(output, out_pi, right_batch, right_row, rpi);
         } else {
             output.extend_col(out_pi, right_batch.get_col_ptr(right_row, rpi, cs));
@@ -1585,5 +1635,346 @@ mod tests {
         let out = op_semi_join_delta_delta(&a, &b, &schema);
         // PK-only: both A rows match B's PK → 2 rows
         assert_eq!(out.count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOB payload copy in join writers (item 2)
+    // -----------------------------------------------------------------------
+
+    fn make_schema_u64_blob() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::BLOB, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, bytes) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            let length = bytes.len() as u32;
+            let mut gs = [0u8; 16];
+            gs[0..4].copy_from_slice(&length.to_le_bytes());
+            if bytes.len() <= SHORT_STRING_THRESHOLD {
+                gs[4..4 + bytes.len()].copy_from_slice(bytes);
+            } else {
+                gs[4..8].copy_from_slice(&bytes[..4]);
+                let offset = b.blob.len() as u64;
+                gs[8..16].copy_from_slice(&offset.to_le_bytes());
+                b.blob.extend_from_slice(bytes);
+            }
+            b.extend_col(0, &gs);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    #[test]
+    fn test_join_dd_blob_left_and_right_payload() {
+        // BLOB payload columns on both sides of a DD join. write_left_payload
+        // (left) and the right-side copy in write_join_row_from_batches must
+        // relocate the blob, not copy the 16-byte struct verbatim.
+        let left_schema = make_schema_u64_blob();
+        let right_schema = make_schema_u64_blob();
+        let left_blob: &[u8] = b"left-long-blob-value-beyond-twelve";
+        let right_blob: &[u8] = b"right-long-blob-value-beyond-twelve";
+        let a = make_batch_blob(&left_schema, &[(1, 1, left_blob)]);
+        let b = make_batch_blob(&right_schema, &[(1, 1, right_blob)]);
+        let out = op_join_delta_delta(&a, &b, &left_schema, &right_schema);
+        assert_eq!(out.count, 1);
+        assert!(!out.blob.is_empty(), "join output must carry blob buffer");
+        // Left BLOB at out col 0, right BLOB at out col 1.
+        let resolve = |col: usize| -> Vec<u8> {
+            let gs = &out.col_data(col)[0..16];
+            let len = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
+            let off = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
+            crate::schema::long_string_bytes(&out.blob, off, len).to_vec()
+        };
+        assert_eq!(resolve(0), left_blob, "left BLOB must resolve correctly");
+        assert_eq!(resolve(1), right_blob, "right BLOB must resolve correctly");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stride consistency on early-exit empty join batches (item 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_join_dd_empty_stride_u64() {
+        let ls = make_schema_u64_i64();
+        let rs = make_schema_u64_i64();
+        let out = op_join_delta_delta(&make_batch(&ls, &[]), &make_batch(&rs, &[(1, 1, 1)]), &ls, &rs);
+        assert_eq!(out.count, 0);
+        assert_eq!(out.pk_stride(), 8, "empty join output must use schema PK stride 8");
+    }
+
+    #[test]
+    fn test_anti_join_dd_empty_stride_u64() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[]);
+        let b = make_batch(&schema, &[(1, 1, 1)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 0);
+        assert_eq!(out.pk_stride(), 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shift guards for 64-payload-column left schema (items 4b, 4c, 4d)
+    // -----------------------------------------------------------------------
+
+    fn make_wide_left_schema_64() -> SchemaDescriptor {
+        let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..64 {
+            cols.push(SchemaColumn::new(type_code::I64, 0));
+        }
+        SchemaDescriptor::new(&cols, &[0])
+    }
+
+    fn pk_only_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
+    }
+
+    fn build_wide_left_row(left_schema: &SchemaDescriptor, pk: u64) -> Batch {
+        let mut b = Batch::with_schema(*left_schema, 1);
+        b.extend_pk(pk as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        for pi in 0..left_schema.num_payload_cols() {
+            b.extend_col(pi, &0i64.to_le_bytes());
+        }
+        b.count += 1;
+        b
+    }
+
+    #[test]
+    fn test_write_join_row_from_batches_shift_guard_64() {
+        // left_npc == 64, right_npc == 0: `right_null << 64` panics in debug.
+        let left_schema = make_wide_left_schema_64();
+        assert_eq!(left_schema.num_payload_cols(), 64);
+        let right_schema = pk_only_schema();
+        let left = build_wide_left_row(&left_schema, 1);
+        let mut right = Batch::with_schema(right_schema, 1);
+        right.extend_pk(1u128);
+        right.extend_weight(&1i64.to_le_bytes());
+        right.extend_null_bmp(&0u64.to_le_bytes());
+        right.count += 1;
+
+        let mut output = Batch::with_schema(left_schema, 1); // PK + 64 payload = 65 cols
+        write_join_row_from_batches(
+            &mut output, &left.as_mem_batch(), 0, &right.as_mem_batch(), 0,
+            1, &left_schema, &right_schema,
+        );
+        assert_eq!(output.count, 1);
+    }
+
+    #[test]
+    fn test_write_join_row_null_right_shift_guard_64() {
+        let left_schema = make_wide_left_schema_64();
+        let right_schema = pk_only_schema();
+        let left = build_wide_left_row(&left_schema, 1);
+        let mut output = Batch::with_schema(left_schema, 1);
+        write_join_row_null_right(
+            &mut output, &left.as_mem_batch(), 0, 1, &left_schema, &right_schema,
+        );
+        assert_eq!(output.count, 1);
+    }
+
+    #[test]
+    fn test_write_join_row_shift_guard_64() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let left_schema = make_wide_left_schema_64();
+        let right_schema = pk_only_schema();
+        let left = build_wide_left_row(&left_schema, 1);
+
+        let mut trace = Batch::with_schema(right_schema, 1);
+        trace.extend_pk(1u128);
+        trace.extend_weight(&1i64.to_le_bytes());
+        trace.extend_null_bmp(&0u64.to_le_bytes());
+        trace.count += 1;
+        trace.sorted = true;
+        trace.consolidated = true;
+        let trace = Rc::new(trace);
+        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
+        let cursor = ch.cursor_mut();
+        cursor.seek(1u128);
+
+        let mut output = Batch::with_schema(left_schema, 1);
+        write_join_row(
+            &mut output, &left.as_mem_batch(), 0, cursor, 1, &left_schema, &right_schema,
+        );
+        assert_eq!(output.count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Anti-join DT uncompacted multi-entry trace (item 18)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dt_uncompacted_tombstone_then_live() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let schema = make_schema_u64_i64();
+        // Trace for PK=1 has two entries (sorted by payload): a tombstone
+        // (payload 100, w=-1) then a live row (payload 200, w=+1). Net: PK=1
+        // is present. Anti-join must NOT emit the delta row for PK=1.
+        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        let delta = make_batch(&schema, &[(1, 1, 5)]);
+        let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "PK=1 is in trace (net positive via second entry)");
+    }
+
+    #[test]
+    fn test_semi_join_dt_uncompacted_tombstone_then_live() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let schema = make_schema_u64_i64();
+        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        let delta = make_batch(&schema, &[(1, 1, 5)]);
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 1, "PK=1 has a positive-weight trace entry → emitted");
+    }
+
+    #[test]
+    fn test_anti_join_dt_duplicate_pk_cached_no_reseek() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let schema = make_schema_u64_i64();
+        // Trace: PK=1 present (positive).
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        // Two consolidated delta rows with same PK=1, distinct payloads.
+        let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20)]);
+        let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "both PK=1 rows excluded");
+    }
+
+    // -----------------------------------------------------------------------
+    // Outer join uncompacted trace (item 25)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_outer_join_uncompacted_no_positive_entry() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let left_schema = make_schema_u64_i64();
+        let right_schema = make_schema_u64_i64();
+        // Trace has a single tombstone entry for PK=1 (w=-1). No positive
+        // entry → the key is NOT in Distinct(trace) → null-fill must be emitted.
+        let trace = Rc::new(make_batch(&right_schema, &[(1, -1, 100)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
+        let delta = make_batch(&left_schema, &[(1, 1, 10)]);
+        let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
+        // Expect: one inner row (w = 1 * -1 = -1) AND one null-extended row (w=+1).
+        assert_eq!(out.count, 2, "inner row for the tombstone + null-fill (no positive match)");
+        let mut weights: Vec<i64> = (0..out.count).map(|i| out.get_weight(i)).collect();
+        weights.sort();
+        assert_eq!(weights, vec![-1, 1]);
+        // The null-filled row must have the right payload column null.
+        let null_filled = (0..out.count).find(|&i| {
+            let nw = u64::from_le_bytes(out.null_bmp_data()[i * 8..i * 8 + 8].try_into().unwrap());
+            nw & 2 != 0
+        });
+        assert!(null_filled.is_some(), "a null-extended row must be present");
+    }
+
+    #[test]
+    fn test_outer_join_uncompacted_positive_entry_no_null_fill() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        let left_schema = make_schema_u64_i64();
+        let right_schema = make_schema_u64_i64();
+        // Trace for PK=1: a live entry (w=+1) and a tombstone (w=-1). The key
+        // IS in Distinct(trace) → no null-fill.
+        let trace = Rc::new(make_batch(&right_schema, &[(1, 1, 100), (1, -1, 200)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
+        let delta = make_batch(&left_schema, &[(1, 1, 10)]);
+        let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
+        assert_eq!(out.count, 2, "two inner rows, no null-fill");
+        for i in 0..out.count {
+            let nw = u64::from_le_bytes(out.null_bmp_data()[i * 8..i * 8 + 8].try_into().unwrap());
+            assert_eq!(nw & 2, 0, "no row should have a null right column");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Delta-delta join signed PK ordering (item 39)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_join_dd_signed_pk_match_found() {
+        // left=[2], right sorted signed [-3, 2]. Shared key = 2. Raw-u128
+        // comparison advances the left pointer past 2 (since 2 < (-3 as u128))
+        // and misses the match. compare_pk_bytes dispatch must find it.
+        let ls = make_schema_signed();
+        let rs = make_schema_signed();
+        let a = make_signed_batch(&ls, &[(2, 1, 10)]);
+        let b = make_signed_batch(&rs, &[(-3, 1, 30), (2, 1, 20)]);
+        let out = op_join_delta_delta(&a, &b, &ls, &rs);
+        assert_eq!(out.count, 1, "key 2 is shared and must join");
+        assert_eq!(out.get_pk(0) as i64, 2);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+    }
+
+    #[test]
+    fn test_semi_anti_join_dd_signed_pk() {
+        let schema = make_schema_signed();
+        // a sorted signed: -3, 2. b sorted signed: -3.
+        let a = make_signed_batch(&schema, &[(-3, 1, 1), (2, 1, 2)]);
+        let b = make_signed_batch(&schema, &[(-3, 1, 1)]);
+        let semi = op_semi_join_delta_delta(&a, &b, &schema);
+        assert_eq!(semi.count, 1, "only -3 shares a PK");
+        assert_eq!(semi.get_pk(0) as i64, -3);
+        let anti = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(anti.count, 1, "2 is not in b");
+        assert_eq!(anti.get_pk(0) as i64, 2);
+    }
+
+    #[test]
+    fn test_join_dd_compound_pk_match_found() {
+        // Compound (c0,c1). left=[(1,0)], right sorted [(0,1),(1,0)]. Shared
+        // key (1,0). Raw-u128 packs c1 high, so (1,0)=1 < (0,1)=1<<64; the
+        // walk would advance left past the match. Byte dispatch finds it.
+        let schema = make_schema_compound();
+        let a = make_compound_batch(&schema, &[(1, 0, 1, 10)]);
+        let b = make_compound_batch(&schema, &[(0, 1, 1, 30), (1, 0, 1, 20)]);
+        let out = op_join_delta_delta(&a, &b, &schema, &schema);
+        assert_eq!(out.count, 1, "compound key (1,0) is shared");
+        assert_eq!(out.get_pk_bytes(0), &compound_pk_bytes(1, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Anti-join DD monotonic scan_b correctness (item 30)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dd_large_same_pk_group() {
+        // Single PK group with many payloads. A's payloads 0..50 even; B's
+        // payloads 0..50 even with positive weight. Anti-join keeps A rows
+        // whose payload is NOT in B. Build A = payloads {0,2,4,...,98},
+        // B = payloads {0,4,8,...,96}. Survivors: payloads in A not in B.
+        let schema = make_schema_u64_i64();
+        let a_rows: Vec<(u64, i64, i64)> = (0..50).map(|k| (1u64, 1i64, (k * 2) as i64)).collect();
+        let b_rows: Vec<(u64, i64, i64)> = (0..25).map(|k| (1u64, 1i64, (k * 4) as i64)).collect();
+        let a = make_batch(&schema, &a_rows);
+        let b = make_batch(&schema, &b_rows);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        // Reference: A payload p survives iff p not in B (multiples of 4).
+        let expected: Vec<i64> = (0..50)
+            .map(|k| (k * 2) as i64)
+            .filter(|p| p % 4 != 0)
+            .collect();
+        assert_eq!(out.count, expected.len());
+        for (i, &p) in expected.iter().enumerate() {
+            assert_eq!(get_payload_i64(&out, i), p, "row {}", i);
+        }
     }
 }

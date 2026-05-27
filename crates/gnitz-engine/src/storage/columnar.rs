@@ -67,12 +67,27 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
                 let ptr_b = src_b.get_col_ptr(row_b, payload_col, 16);
                 compare_german_strings(ptr_a, src_a.blob_slice(), ptr_b, src_b.blob_slice())
             }
-            TYPE_U128 => {
+            TYPE_U128 | TYPE_UUID => {
                 let ba = src_a.get_col_ptr(row_a, payload_col, 16);
                 let bb = src_b.get_col_ptr(row_b, payload_col, 16);
                 let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
                 let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
                 va.cmp(&vb)
+            }
+            TYPE_U64 => {
+                let ba = src_a.get_col_ptr(row_a, payload_col, 8);
+                let bb = src_b.get_col_ptr(row_b, payload_col, 8);
+                read_u64_le(ba, 0).cmp(&read_u64_le(bb, 0))
+            }
+            TYPE_U32 | TYPE_U16 | TYPE_U8 => {
+                let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
+                let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
+                // Zero-extend little-endian bytes to u64 for unsigned comparison.
+                let mut buf_a = [0u8; 8];
+                let mut buf_b = [0u8; 8];
+                buf_a[..col_size].copy_from_slice(raw_a);
+                buf_b[..col_size].copy_from_slice(raw_b);
+                u64::from_le_bytes(buf_a).cmp(&u64::from_le_bytes(buf_b))
             }
             TYPE_F64 => {
                 let ba = src_a.get_col_ptr(row_a, payload_col, 8);
@@ -452,6 +467,66 @@ mod tests {
         let batch = single_col_batch(&[0, 0], col0);
         // 1 < (1 << 64)
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
+    }
+
+    // Item 10: distinct UUID payloads must not collapse to Equal. The wildcard
+    // arm's read_signed returns 0 for col_size=16, making all UUIDs compare
+    // Equal and silently dropping rows in consolidation/compaction.
+    #[test]
+    fn test_compare_rows_uuid_distinct() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::UUID, 0),
+            ],
+            &[0],
+        );
+
+        let mut col0 = Vec::new();
+        // Row 0: lo=1, hi=0
+        col0.extend_from_slice(&1u64.to_le_bytes());
+        col0.extend_from_slice(&0u64.to_le_bytes());
+        // Row 1: lo=0, hi=1
+        col0.extend_from_slice(&0u64.to_le_bytes());
+        col0.extend_from_slice(&1u64.to_le_bytes());
+        let batch = single_col_batch(&[0, 0], col0);
+        assert_ne!(
+            compare_rows(&schema, &batch, 0, &batch, 1),
+            Ordering::Equal,
+            "distinct UUID payloads must not compare Equal",
+        );
+        assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
+    }
+
+    // Item 38: unsigned payloads with the high bit set (u64::MAX) must not be
+    // read as negative by the wildcard read_signed arm, which would reverse
+    // sort order. 0 < u64::MAX must hold for U64/U32/U16/U8.
+    #[test]
+    fn test_compare_rows_unsigned_high_bit() {
+        for (tc, size) in [
+            (type_code::U64, 8usize),
+            (type_code::U32, 4),
+            (type_code::U16, 2),
+            (type_code::U8, 1),
+        ] {
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(tc, 0),
+                ],
+                &[0],
+            );
+            let max = u64::MAX >> (64 - size * 8);
+            let mut col0 = Vec::new();
+            col0.extend_from_slice(&0u64.to_le_bytes()[..size]);
+            col0.extend_from_slice(&max.to_le_bytes()[..size]);
+            let batch = single_col_batch(&[0, 0], col0);
+            assert_eq!(
+                compare_rows(&schema, &batch, 0, &batch, 1),
+                Ordering::Less,
+                "0 must be less than the max unsigned value for type {tc}",
+            );
+        }
     }
 
     /// Test that NaN values produce a stable total order (not all-Equal, which

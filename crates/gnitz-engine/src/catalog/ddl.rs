@@ -218,6 +218,11 @@ impl CatalogEngine {
         let vid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("View does not exist: {}", qualified))?;
 
+        // Capture the physical directory before invalidating the DAG entry;
+        // once the catalog rows are gone no later DROP could reach it, so the
+        // on-disk scratch tables would leak inodes and disk space forever.
+        let view_dir = self.dag.tables.get(&vid).map(|e| e.directory.clone());
+
         self.dag.invalidate(vid);
 
         // Remove the view's dependency rows from sys_view_deps first. dag.dep_map
@@ -234,7 +239,13 @@ impl CatalogEngine {
         if batch.count == 0 {
             return Err(format!("View does not exist: {}", qualified));
         }
-        self.ingest_to_family(VIEW_TAB_ID, &batch)
+        self.ingest_to_family(VIEW_TAB_ID, &batch)?;
+
+        // Remove physical state after the catalog update succeeds.
+        if let Some(dir) = view_dir {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
     }
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------

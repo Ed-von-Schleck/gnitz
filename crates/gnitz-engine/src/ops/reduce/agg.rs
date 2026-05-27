@@ -187,7 +187,10 @@ impl Accumulator {
             AggOp::Min => {
                 if is_f {
                     let v = decode_float(bytes, tc);
-                    if first || v < f64::from_bits(self.acc as u64) {
+                    if first
+                        || v.total_cmp(&f64::from_bits(self.acc as u64))
+                            == std::cmp::Ordering::Less
+                    {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
@@ -208,7 +211,10 @@ impl Accumulator {
             AggOp::Max => {
                 if is_f {
                     let v = decode_float(bytes, tc);
-                    if first || v > f64::from_bits(self.acc as u64) {
+                    if first
+                        || v.total_cmp(&f64::from_bits(self.acc as u64))
+                            == std::cmp::Ordering::Greater
+                    {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
@@ -381,9 +387,13 @@ fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
 /// Shared between `compiler::build_reduce_output_schema` and
 /// `op_reduce` to keep schema construction and execution in lockstep.
 pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[u32]) -> bool {
-    group_cols.len() == 1
+    if group_cols.len() != 1 {
+        return false;
+    }
+    let col = &schema.columns[group_cols[0] as usize];
+    col.nullable == 0
         && matches!(
-            TypeCode::from_validated_u8(schema.columns[group_cols[0] as usize].type_code),
+            TypeCode::from_validated_u8(col.type_code),
             TypeCode::U64 | TypeCode::U128 | TypeCode::UUID,
         )
 }
@@ -423,4 +433,102 @@ pub(super) fn apply_agg_from_value_index(
     }
     acc.reset();
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::storage::Batch;
+
+    // Item 5: a nullable single group column must NOT be promoted to the
+    // natural PK; the PK region has no null bitmap.
+    #[test]
+    fn nullable_group_col_is_not_natural_pk() {
+        let nullable = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 1),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[1],
+        );
+        assert!(
+            !is_single_col_natural_pk(&nullable, &[0]),
+            "nullable U64 group column must not be a natural PK",
+        );
+
+        let non_nullable = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        assert!(
+            is_single_col_natural_pk(&non_nullable, &[0]),
+            "non-nullable U64 group column should be a natural PK",
+        );
+    }
+
+    /// Single-row batch with a U64 PK and one F64 payload column carrying `val`.
+    fn f64_batch(val: f64) -> Batch {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
+            &[0],
+        );
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+        b
+    }
+
+    fn f64_acc(agg_op: AggOp) -> Accumulator {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
+            &[0],
+        );
+        let desc = AggDescriptor {
+            col_idx: 1,
+            agg_op,
+            col_type_code: TypeCode::F64,
+            _pad: [0; 2],
+        };
+        Accumulator::new(&desc, &schema)
+    }
+
+    // Item 19: a NaN seen first must not poison MIN. A subsequent finite value
+    // is smaller under the total order and must replace it.
+    #[test]
+    fn min_nan_first_does_not_poison() {
+        let nan = f64_batch(f64::NAN);
+        let finite = f64_batch(5.0);
+        let mut acc = f64_acc(AggOp::Min);
+        acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
+        acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
+        let got = f64::from_bits(acc.get_value_bits());
+        assert_eq!(got, 5.0, "finite value must displace a leading NaN in MIN");
+    }
+
+    // Item 19 mirror: MAX must use the total order consistently. Under
+    // total_cmp a quiet (positive) NaN is the greatest value, so once seen it
+    // is retained as the max regardless of arrival order.
+    #[test]
+    fn max_uses_total_order_for_nan() {
+        let finite = f64_batch(5.0);
+        let nan = f64_batch(f64::NAN);
+        let mut acc = f64_acc(AggOp::Max);
+        acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
+        acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
+        let got = f64::from_bits(acc.get_value_bits());
+        assert!(got.is_nan(), "MAX must adopt NaN as the greatest under total order");
+    }
 }

@@ -1,6 +1,6 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, TypeCode, long_string_bytes, type_code};
+use crate::schema::{SchemaDescriptor, TypeCode, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use crate::xxh;
@@ -59,6 +59,20 @@ pub(super) fn write_string_from_batch(
 #[inline]
 pub(super) fn signum(x: i64) -> i64 {
     if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
+}
+
+/// Merge a right-side null bitmap into a left-side bitmap for a composite output
+/// row laid out as `[left payload..., right payload...]`. The right bits shift
+/// up by `left_npc` (the left payload-column count). `right << 64` panics in
+/// debug builds; `left_npc` reaches 64 only when the right side has no payload
+/// columns, in which case `right` is 0 and the shift is a no-op.
+#[inline]
+pub(super) fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
+    if left_npc < 64 {
+        left | (right << left_npc)
+    } else {
+        left
+    }
 }
 
 
@@ -397,16 +411,8 @@ pub(super) fn extract_group_key(
             }
             if tc == TYPE_STRING {
                 let struct_bytes = mb.get_col_ptr(row, pi, 16);
-                let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-                if length == 0 {
-                    0u64
-                } else if length <= SHORT_STRING_THRESHOLD {
-                    xxh::checksum(&struct_bytes[4..4 + length])
-                } else {
-                    let heap_offset =
-                        u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-                    xxh::checksum(long_string_bytes(mb.blob, heap_offset, length))
-                }
+                let content = crate::schema::german_string_content(struct_bytes, mb.blob);
+                if content.is_empty() { 0u64 } else { xxh::checksum(content) }
             } else if tc == type_code::U128 || tc == type_code::UUID {
                 let ptr = mb.get_col_ptr(row, pi, 16);
                 let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());

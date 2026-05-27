@@ -301,14 +301,16 @@ pub(crate) fn load_circuit(
             };
 
             let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-            if let Ok(op) = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols) {
-                if matches!(op, gnitz_wire::OpNode::GatherReduce) {
-                    if let Some(c) = cols_by_node.get(&node_id) {
-                        gather_reduce_cols.insert(node_id, c.clone());
-                    }
+            // A node that fails to decode must abort the whole load: silently
+            // skipping it leaves any edge referencing it dangling, which yields
+            // an invalid topological order or silent output corruption.
+            let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols).ok()?;
+            if matches!(op, gnitz_wire::OpNode::GatherReduce) {
+                if let Some(c) = cols_by_node.get(&node_id) {
+                    gather_reduce_cols.insert(node_id, c.clone());
                 }
-                nodes.insert(node_id, op);
             }
+            nodes.insert(node_id, op);
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
@@ -329,6 +331,17 @@ pub(crate) fn load_circuit(
         }
     }
 
+    // Every edge must reference nodes that exist in the circuit. A dangling
+    // endpoint (node failed to decode, or a partial schema flush) would create
+    // phantom in_degree entries in topo_sort: a missing src strands its dst
+    // (never emitted), a missing dst reaches degree 0 and emit_node is called
+    // with an absent node ID. Surface the inconsistency as a clean load failure.
+    for &(src, dst, _port) in &edges {
+        if !nodes.contains_key(&src) || !nodes.contains_key(&dst) {
+            return None;
+        }
+    }
+
     Some(LoadedCircuit {
         out_schema,
         nodes,
@@ -342,7 +355,7 @@ pub(crate) fn load_circuit(
 // Topological sort (Kahn's algorithm)
 // ---------------------------------------------------------------------------
 
-fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
+pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
     let mut in_degree: HashMap<i32, i32> = HashMap::new();
     for &nid in loaded.nodes.keys() {
         in_degree.insert(nid, 0);
@@ -396,39 +409,50 @@ fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
 /// Build the join-shard map by inspecting OpNode variants directly.
 /// Maps source_tid → [reindex_col] for ScanDelta → Map(Expression{reindex_col})
 /// chains (equijoin pre-indexing).
-/// Walk forward from `scan_nid` through `Filter` nodes to the first
-/// `Map(Expression { reindex_col })` and return its reindex column. The SQL
-/// planner emits `Filter → Map(reindex)` chains for PK-redistribution views,
-/// so a one-hop `scan → Map` lookup would miss the reindex behind a Filter and
-/// treat the join as local-only. Shared by `compute_join_shard_map` and
-/// `DagEngine::get_join_shard_cols` so the two stay in sync.
-pub(crate) fn reindex_col_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Option<i32> {
-    let mut frontier = vec![scan_nid];
+/// Walk forward from `scan_nid` through `Filter` nodes and collect the reindex
+/// column of every `Map(Expression { reindex_col })` reached. The SQL planner
+/// emits `Filter → Map(reindex)` chains for PK-redistribution views, so a
+/// one-hop `scan → Map` lookup would miss the reindex behind a Filter and treat
+/// the join as local-only. A table that participates in multiple joins on
+/// different keys (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b = t2.y`) fans out
+/// into several reindex Maps; returning only the first would let
+/// `compute_co_partitioned` approve a co-partition valid for one key but not the
+/// other, so collect them all. Uses `loaded.outgoing` (populated by `topo_sort`)
+/// for O(V+E) traversal instead of rescanning the flat edge list per node.
+/// Shared by `compute_join_shard_map` and `DagEngine::get_join_shard_cols`.
+pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<i32> {
+    let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
     let mut visited = HashSet::new();
-    while let Some(cur) = frontier.pop() {
+    let mut cols: Vec<i32> = Vec::new();
+    while let Some(cur) = queue.pop_front() {
         if !visited.insert(cur) { continue; }
-        for &(src, dst, _port) in &loaded.edges {
-            if src != cur { continue; }
-            match loaded.nodes.get(&dst) {
-                Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-                    reindex_col: Some(rc), ..
-                })) => return Some(*rc as i32),
-                Some(gnitz_wire::OpNode::Filter(_)) => frontier.push(dst),
-                _ => {}
+        if let Some(outs) = loaded.outgoing.get(&cur) {
+            for &(dst, _port) in outs {
+                match loaded.nodes.get(&dst) {
+                    Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                        reindex_col: Some(rc), ..
+                    })) => {
+                        let v = *rc as i32;
+                        if !cols.contains(&v) { cols.push(v); }
+                    }
+                    Some(gnitz_wire::OpNode::Filter(_)) => queue.push_back(dst),
+                    _ => {}
+                }
             }
         }
     }
-    None
+    cols
 }
 
 fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<i32>> {
     let mut join_shard_map = HashMap::new();
     for (&nid, op) in &loaded.nodes {
         if let gnitz_wire::OpNode::ScanDelta(tid) = op {
-            if let Some(rc) = reindex_col_through_filters(loaded, nid) {
-                join_shard_map.insert(*tid as i64, vec![rc]);
+            let rcs = reindex_cols_through_filters(loaded, nid);
+            if !rcs.is_empty() {
+                join_shard_map.insert(*tid as i64, rcs);
             }
         }
     }
@@ -847,12 +871,16 @@ fn null_func_ptr() -> *const ScalarFuncKind {
 
 /// Create a child table in a subdirectory of the view's directory.
 fn create_child_table(
+    state: &mut EmitState,
     view_dir: &str,
     child_name: &str,
     schema: SchemaDescriptor,
     table_id: u32,
 ) -> Result<Table, crate::storage::StorageError> {
     let child_dir = format!("{}/scratch_{}", view_dir, child_name);
+    // Track the path before creating so cleanup also removes a partially
+    // created directory if Table::new fails.
+    state.scratch_dirs.push(child_dir.clone());
     Table::new(&child_dir, child_name, schema, table_id, 256 * 1024, false)
 }
 
@@ -880,6 +908,11 @@ struct EmitState {
     sink_reg_id: i32,
     input_delta_reg_id: i32,
     emit_failed: bool,
+    // Scratch directories created via `create_child_table` during this build.
+    // On a compile failure they are removed (see `build_plan`/`compile_view`) so
+    // probing unsupported queries can't permanently leak inodes; on success the
+    // VM's owned tables keep them alive.
+    scratch_dirs: Vec<String>,
 }
 
 /// Reject a wide-PK (`pk_stride > 16`) input at compile time, failing the
@@ -959,14 +992,19 @@ fn emit_node(
             reg_schemas[reg_id as usize] = in_schema;
             reg_kinds[reg_id as usize] = 0;
             let func_ptr = if let Some(blob) = blob {
-                if let Some(dep) = decode_expr_blob(blob) {
-                    let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                    create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
-                        &in_schema, owned_expr_progs, owned_funcs)
-                } else {
-                    null_func_ptr()
+                match decode_expr_blob(blob) {
+                    Some(dep) => {
+                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+                        create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
+                            &in_schema, owned_expr_progs, owned_funcs)
+                    }
+                    // A present-but-corrupt blob is catalog corruption. Falling
+                    // back to null_func_ptr (pass-all) would silently turn a
+                    // WHERE into WHERE TRUE; abort the compile instead.
+                    None => { state.emit_failed = true; return; }
                 }
             } else {
+                // Absent blob = no WHERE clause; pass-all is intentional.
                 null_func_ptr()
             };
             builder.add_filter(in_reg as u16, reg_id as u16, func_ptr);
@@ -977,18 +1015,22 @@ fn emit_node(
             let in_reg_schema = reg_schemas[in_reg as usize];
             match mk {
                 gnitz_wire::MapKind::Expression { program, reindex_col } => {
-                    let dep = decode_expr_blob(program);
+                    // A corrupt MAP blob would otherwise be skipped, leaving the
+                    // output register at the default empty schema and silently
+                    // producing wrong/empty downstream results. Abort the compile.
+                    let dep = match decode_expr_blob(program) {
+                        Some(d) => d,
+                        None => { state.emit_failed = true; return; }
+                    };
                     // Identity MAP: if no reindex and schemas match, skip if sequential copy.
                     if reindex_col.is_none()
                         && schemas_physically_identical(&in_reg_schema, &loaded.out_schema)
                     {
-                        if let Some(ref d) = dep {
-                            let code: Vec<i64> = d.code.iter().map(|&w| w as i64).collect();
-                            let prog = ExprProgram::new(code, d.num_regs, 0, Vec::new());
-                            if prog.is_sequential_copy_projection() {
-                                out_reg_of.insert(nid, in_reg);
-                                return;
-                            }
+                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+                        let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
+                        if prog.is_sequential_copy_projection() {
+                            out_reg_of.insert(nid, in_reg);
+                            return;
                         }
                     }
                     // Folded MAP (absorbed into upstream REDUCE's finalize program).
@@ -996,24 +1038,45 @@ fn emit_node(
                         out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
                         return;
                     }
-                    if let Some(dep) = dep {
-                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                        let node_schema = if reindex_col.is_some() {
-                            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-                            cols[0] = SchemaColumn::new(type_code::U128, 0);
-                            let n = in_reg_schema.num_columns();
-                            cols[1..n + 1].copy_from_slice(&in_reg_schema.columns[..n]);
-                            SchemaDescriptor::new(&cols[..n + 1], &[0])
-                        } else {
-                            loaded.out_schema
-                        };
-                        let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
-                            &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
-                        reg_schemas[reg_id as usize] = node_schema;
-                        reg_kinds[reg_id as usize] = 0;
-                        let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
-                        builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc);
+                    let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
+                    let node_schema = if reindex_col.is_some() {
+                        let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+                        cols[0] = SchemaColumn::new(type_code::U128, 0);
+                        let n = in_reg_schema.num_columns();
+                        cols[1..n + 1].copy_from_slice(&in_reg_schema.columns[..n]);
+                        SchemaDescriptor::new(&cols[..n + 1], &[0])
+                    } else {
+                        loaded.out_schema
+                    };
+                    let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
+                        &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
+                    reg_schemas[reg_id as usize] = node_schema;
+                    reg_kinds[reg_id as usize] = 0;
+                    let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc);
+                }
+
+                gnitz_wire::MapKind::HashRow(proj_cols) => {
+                    // Keep the listed columns as payload (positions 0..k), like a
+                    // Projection, but prepend a synthetic U128 PK that op_map sets
+                    // to a hash of those payload columns (HASH_ROW_REINDEX path).
+                    let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
+                    let src_types: Vec<u8> = src_indices.iter()
+                        .map(|&i| in_reg_schema.columns[i as usize].type_code)
+                        .collect();
+                    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+                    cols[0] = SchemaColumn::new(type_code::U128, 0);
+                    for (j, &i) in src_indices.iter().enumerate() {
+                        cols[1 + j] = in_reg_schema.columns[i as usize];
                     }
+                    let node_schema = SchemaDescriptor::new(&cols[..1 + src_indices.len()], &[0]);
+                    let fp = create_universal_projection(
+                        &src_indices, &src_types, &in_reg_schema, &node_schema, owned_funcs,
+                    );
+                    reg_schemas[reg_id as usize] = node_schema;
+                    reg_kinds[reg_id as usize] = 0;
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema,
+                        crate::ops::HASH_ROW_REINDEX);
                 }
 
                 gnitz_wire::MapKind::Projection(cols) => {
@@ -1082,7 +1145,7 @@ fn emit_node(
             }
             let child_name = format!("_hist_{}_{}", view_id, nid);
             let hist_table = match create_child_table(
-                view_dir, &child_name, in_reg_schema, view_table_id,
+                state, view_dir, &child_name, in_reg_schema, view_table_id,
             ) {
                 Ok(t) => t,
                 Err(_) => { state.emit_failed = true; return; }
@@ -1177,7 +1240,7 @@ fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
             let child_name = format!("_int_{}_{}", view_id, nid);
-            match create_child_table(view_dir, &child_name, in_reg_schema, view_table_id) {
+            match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => {
                     let table_idx = owned_tables.len();
                     owned_tables.push(Box::new(t));
@@ -1334,7 +1397,7 @@ fn emit_reduce(
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs);
 
     let trace_table = match create_child_table(
-        view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id,
+        state, view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id,
     ) {
         Ok(t) => t,
         Err(_) => { state.emit_failed = true; return; }
@@ -1380,7 +1443,7 @@ fn emit_reduce(
         tr_in_reg_id = existing;
     } else if !all_linear && !will_use_avi {
         let tr_in = match create_child_table(
-            view_dir, &format!("_reduce_in_{}_{}", view_id, nid), in_reg_schema, view_table_id,
+            state, view_dir, &format!("_reduce_in_{}_{}", view_id, nid), in_reg_schema, view_table_id,
         ) {
             Ok(t) => t,
             Err(_) => { state.emit_failed = true; return; }
@@ -1435,7 +1498,7 @@ fn emit_reduce(
         avi_group_cols = gcols_u32.clone();
         let avi_child = format!("_avidx_{}_{}", view_id, nid);
         if let Ok(av_table) = create_child_table(
-            view_dir, &avi_child,
+            state, view_dir, &avi_child,
             crate::ops::index::make_avi_schema(&in_reg_schema, &gcols_u32),
             view_table_id,
         ) {
@@ -1503,6 +1566,45 @@ fn emit_reduce(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
+/// Build the per-aggregate descriptors for a GATHER_REDUCE node from its
+/// partial-aggregate schema. The aggregate columns occupy the final
+/// `agg_specs.len()` columns of the partial schema (the leading columns are the
+/// group key). Each descriptor's `col_idx` must point at the aggregate column's
+/// position in that partial schema (`agg_col_in_partial`) — using 0 would make
+/// `Accumulator::new` derive a PK offset and corrupt gather-reduce results if
+/// the gather path ever calls `step_from_batch`.
+fn build_gather_agg_descs(
+    partial_schema: &SchemaDescriptor,
+    agg_specs: &[(u64, u64)],
+) -> Vec<AggDescriptor> {
+    let num_out_cols = partial_schema.num_columns();
+    let agg_count = agg_specs.len();
+    let mut agg_descs: Vec<AggDescriptor> = Vec::new();
+    if agg_count > 0 {
+        assert!(
+            num_out_cols >= agg_count,
+            "GATHER_REDUCE: agg_count ({}) exceeds partial schema column count ({})",
+            agg_count, num_out_cols,
+        );
+        for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
+            let agg_op = AggOp::try_from(func_id as u8)
+                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
+            let agg_col_in_partial = num_out_cols - agg_count + ai;
+            let col_type = TypeCode::from_validated_u8(
+                partial_schema.columns[agg_col_in_partial].type_code,
+            );
+            agg_descs.push(AggDescriptor {
+                col_idx: agg_col_in_partial as u32, agg_op, col_type_code: col_type, _pad: [0; 2],
+            });
+        }
+    } else {
+        agg_descs.push(AggDescriptor {
+            col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
+        });
+    }
+    agg_descs
+}
+
 fn emit_gather_reduce(
     raw_cols: &[(u64, u16, u64, u64)],
     nid: i32,
@@ -1521,40 +1623,15 @@ fn emit_gather_reduce(
 ) {
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let partial_schema = reg_schemas[in_reg_id as usize];
-    let num_out_cols = partial_schema.num_columns();
 
     let agg_specs: Vec<(u64, u64)> = raw_cols.iter()
         .filter(|(k, _, _, _)| *k == gnitz_wire::NODE_COL_KIND_AGG_SPEC)
         .map(|(_, _, v1, v2)| (*v1, *v2))
         .collect();
-    let agg_count = agg_specs.len();
-    let mut agg_descs: Vec<AggDescriptor> = Vec::new();
-
-    if agg_count > 0 {
-        assert!(
-            num_out_cols >= agg_count,
-            "GATHER_REDUCE node {}: agg_count ({}) exceeds partial schema column count ({})",
-            nid, agg_count, num_out_cols,
-        );
-        for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
-            let agg_op = AggOp::try_from(func_id as u8)
-                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-            let agg_col_in_partial = num_out_cols - agg_count + ai;
-            let col_type = TypeCode::from_validated_u8(
-                partial_schema.columns[agg_col_in_partial].type_code,
-            );
-            agg_descs.push(AggDescriptor {
-                col_idx: 0, agg_op, col_type_code: col_type, _pad: [0; 2],
-            });
-        }
-    } else {
-        agg_descs.push(AggDescriptor {
-            col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
-        });
-    }
+    let agg_descs = build_gather_agg_descs(&partial_schema, &agg_specs);
 
     let trace_table = match create_child_table(
-        view_dir, &format!("_gather_{}_{}", view_id, nid), partial_schema, view_table_id,
+        state, view_dir, &format!("_gather_{}_{}", view_id, nid), partial_schema, view_table_id,
     ) {
         Ok(t) => t,
         Err(_) => { state.emit_failed = true; return; }
@@ -1588,6 +1665,10 @@ struct PlanBuildResult {
     out_reg: i32,
     ext_trace_regs: Vec<(u16, i64)>,
     source_reg_map: HashMap<i64, i32>,
+    // Scratch dirs created for this (successful) plan, kept alive by `vm`'s
+    // owned tables. Used by `compile_view` to clean up if a *sibling* plan
+    // (pre/post split) later fails after this one already succeeded.
+    scratch_dirs: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
@@ -1666,6 +1747,7 @@ fn build_plan(
         sink_reg_id: -1,
         input_delta_reg_id: if exchange_input_reg_id >= 0 { exchange_input_reg_id } else { -1 },
         emit_failed: false,
+        scratch_dirs: Vec::new(),
     };
 
     for &nid in ordered {
@@ -1683,7 +1765,17 @@ fn build_plan(
         );
     }
 
+    // On any post-emit failure, remove the scratch directories created during
+    // this build so a rejected compile leaks no inodes. On success the dirs are
+    // handed to the caller in PlanBuildResult (kept alive by the VM's tables).
+    let cleanup = |dirs: &[String]| {
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    };
+
     if state.emit_failed {
+        cleanup(&state.scratch_dirs);
         return None;
     }
 
@@ -1704,16 +1796,22 @@ fn build_plan(
     }
 
     if input_delta_reg_id == -1 {
+        cleanup(&state.scratch_dirs);
         return None;
     }
     if sink_reg == -1 {
+        cleanup(&state.scratch_dirs);
         return None;
     }
 
     if output_node_id.is_none() && sink_reg >= 0 {
         let sink_schema = &reg_schemas[sink_reg as usize];
         let out_schema = &loaded.out_schema;
-        if sink_schema.num_columns() > 0 && sink_schema.num_columns() != out_schema.num_columns() {
+        // A column-count match is not enough: two schemas with equal column
+        // counts but mismatched types (e.g. I64 vs German-string) let the client
+        // read a 16-byte string descriptor out of 8-byte integer storage.
+        if sink_schema.num_columns() > 0 && !schemas_physically_identical(sink_schema, out_schema) {
+            cleanup(&state.scratch_dirs);
             return None;
         }
     }
@@ -1730,6 +1828,7 @@ fn build_plan(
         out_reg: sink_reg,
         ext_trace_regs,
         source_reg_map,
+        scratch_dirs: std::mem::take(&mut state.scratch_dirs),
     })
 }
 
@@ -1824,17 +1923,26 @@ pub unsafe fn compile_view(
         ).ok_or(-3)?;
 
         if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
+            for d in &pre.scratch_dirs { let _ = std::fs::remove_dir_all(d); }
             return Err(-3);
         }
         let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
 
-        let post = build_plan(
+        let post = match build_plan(
             &loaded, &rw_post, &post_ordered, ext_tables,
             view_dir, view_table_id, view_id,
             None,
             Some((ex_nid, exchange_schema)),
             post_progs,
-        ).ok_or(-4)?;
+        ) {
+            Some(p) => p,
+            None => {
+                // `post` cleaned its own scratch dirs; remove `pre`'s too, since
+                // `pre` already succeeded and the whole compile now aborts.
+                for d in &pre.scratch_dirs { let _ = std::fs::remove_dir_all(d); }
+                return Err(-4);
+            }
+        };
 
         let source_reg_map = pre.source_reg_map.iter()
             .map(|(&tid, &reg)| (tid, reg as u16)).collect();
@@ -2367,6 +2475,265 @@ mod tests {
         assert!(result.is_none(), "IntegrateTrace child-table failure must fail the compile");
     }
 
+    // ── Item 6: GATHER_REDUCE col_idx ───────────────────────────────────────
+
+    #[test]
+    fn test_build_gather_agg_descs_col_idx_is_agg_column() {
+        // Partial schema = group key (col 0, U64) + one SUM aggregate (col 1, I64).
+        // The aggregate descriptor's col_idx must point at the aggregate column
+        // (1), not the PK (0).
+        let partial = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        let descs = build_gather_agg_descs(&partial, &[(AggOp::Sum as u64, 0)]);
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].col_idx, 1, "agg col_idx must be the aggregate column, not the PK");
+        assert_eq!(descs[0].agg_op, AggOp::Sum);
+    }
+
+    // ── Item 32: sink schema type validation ────────────────────────────────
+
+    #[test]
+    fn test_build_plan_sink_schema_type_mismatch_rejected() {
+        // ScanDelta(99) → IntegrateSink. The source schema is [U64 pk, I64];
+        // the view's declared out_schema is [U64 pk, STRING]. Same column count,
+        // different physical layout → must be rejected (item 32), else the client
+        // reads a 16-byte string descriptor out of 8-byte integer storage.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN)];
+        let mut loaded = make_loaded(nodes, edges);
+        loaded.out_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::STRING, 0)],
+            &[0],
+        );
+        let in_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+        );
+        assert!(result.is_none(), "type-mismatched sink schema must be rejected");
+    }
+
+    // ── Item 35: corrupt Filter/Map blob aborts compilation ─────────────────
+
+    #[test]
+    fn test_build_plan_corrupt_filter_blob_aborts() {
+        // ScanDelta(99) → Filter(corrupt blob) → IntegrateSink. A present blob
+        // that fails to decode must abort, not silently degrade to WHERE TRUE.
+        let corrupt = vec![0xFFu8; 16]; // valid length, invalid magic
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::Filter(Some(corrupt)));
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let mut loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        // Match out_schema to the sink so the item-32 column-count check passes;
+        // the only thing that can fail this compile is the corrupt-blob abort.
+        loaded.out_schema = in_schema;
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+        );
+        assert!(result.is_none(), "corrupt Filter blob must abort compilation");
+    }
+
+    #[test]
+    fn test_build_plan_corrupt_map_blob_aborts() {
+        // ScanDelta(99) → Map(Expression{corrupt blob}) → IntegrateSink.
+        let corrupt = vec![0xFFu8; 16];
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+            program: corrupt, reindex_col: None,
+        }));
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, None, vec![],
+        );
+        assert!(result.is_none(), "corrupt Map blob must abort compilation");
+    }
+
+    // ── Item 29: scratch dir cleanup on compile failure ─────────────────────
+
+    #[test]
+    fn test_build_plan_cleans_scratch_dirs_on_failure() {
+        // ScanDelta(wide) → Distinct → Join(DT, wide) → Sink. Distinct creates a
+        // scratch dir, then the wide-PK Join fails the compile. The scratch dir
+        // must be removed so probing unsupported queries can't leak inodes.
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{}/scratch_cleanup_test_{}", base, std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+
+        let schema = wide_pk_schema();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::Distinct);
+        nodes.insert(2, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (1, 3, PORT_IN_A),
+            (2, 3, PORT_TRACE),
+            (3, 4, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, &view_dir, 0, 1, Some(4), None, vec![],
+        );
+        assert!(result.is_none(), "wide-PK join must fail the compile");
+
+        let leftover: Vec<String> = std::fs::read_dir(&view_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("scratch_"))
+            .collect();
+        let _ = std::fs::remove_dir_all(&view_dir);
+        assert!(
+            leftover.is_empty(),
+            "scratch dirs must be removed on compile failure, found: {:?}", leftover,
+        );
+    }
+
+    // ── Items 16 & 28: load_circuit robustness (real system tables) ─────────
+
+    fn wire_sys_schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
+        let mut buf = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        for (i, c) in cols.iter().enumerate() {
+            buf[i] = SchemaColumn::new(c.type_code, if c.nullable { 1 } else { 0 });
+        }
+        SchemaDescriptor::new(&buf[..cols.len()], &[0, 1])
+    }
+
+    fn load_circuit_test_dir(tag: &str) -> String {
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = format!("{}/load_circuit_{}_{}", base, tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_load_circuit_aborts_on_undecodable_node() {
+        // A single CircuitNodes row with an opcode decode_op_node rejects (item
+        // 16). Previously the node was silently skipped; load_circuit must now
+        // return None rather than emit a partial circuit.
+        use crate::catalog::BatchBuilder;
+        let dir = load_circuit_test_dir("baddecode");
+        let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
+        let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
+        let cols_schema  = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
+
+        let view_id: u64 = 1;
+        let pk = |sub: u64| -> u128 { (view_id as u128) | ((sub as u128) << 64) };
+
+        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
+        {
+            let mut bb = BatchBuilder::new(nodes_schema);
+            bb.begin_row(pk(1), 1);
+            bb.put_u64(1);     // node_id
+            bb.put_u64(9999);  // opcode — unknown → decode_op_node Err
+            bb.put_null();     // source_table
+            bb.put_null();     // reindex_col
+            bb.put_null();     // expr_program
+            bb.end_row();
+            nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
+        }
+        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, false).unwrap();
+        let _ = &mut edges_tab; // empty
+        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, false).unwrap();
+        let _ = &mut cols_tab; // empty
+
+        let result = load_circuit(
+            &mut nodes_tab, &nodes_schema,
+            &mut edges_tab, &edges_schema,
+            &mut cols_tab,  &cols_schema,
+            view_id, SchemaDescriptor::default(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_none(), "an undecodable node must abort load_circuit");
+    }
+
+    #[test]
+    fn test_load_circuit_aborts_on_orphan_edge() {
+        // Two valid nodes plus an edge whose dst (node 7) does not exist (item
+        // 28). load_circuit must return None rather than create a phantom node.
+        use crate::catalog::BatchBuilder;
+        let dir = load_circuit_test_dir("orphanedge");
+        let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
+        let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
+        let cols_schema  = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
+
+        let view_id: u64 = 1;
+        let pk = |sub: u64| -> u128 { (view_id as u128) | ((sub as u128) << 64) };
+
+        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
+        {
+            let mut bb = BatchBuilder::new(nodes_schema);
+            // node 0: ScanDelta(source 99)
+            bb.begin_row(pk(0), 1);
+            bb.put_u64(0);
+            bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
+            bb.put_u64(99);  // source_table
+            bb.put_null();
+            bb.put_null();
+            bb.end_row();
+            // node 1: IntegrateSink
+            bb.begin_row(pk(1), 1);
+            bb.put_u64(1);
+            bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
+            bb.put_null();
+            bb.put_null();
+            bb.put_null();
+            bb.end_row();
+            nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
+        }
+        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, false).unwrap();
+        {
+            let mut bb = BatchBuilder::new(edges_schema);
+            // Edge 0 → 7, but node 7 does not exist.
+            bb.begin_row(pk(0), 1);
+            bb.put_u64(7);          // dst_node (orphan)
+            bb.put_u64(PORT_IN as u64);
+            bb.put_u64(0);          // src_node
+            bb.end_row();
+            edges_tab.ingest_owned_batch(bb.finish()).unwrap();
+        }
+        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, false).unwrap();
+        let _ = &mut cols_tab;
+
+        let result = load_circuit(
+            &mut nodes_tab, &nodes_schema,
+            &mut edges_tab, &edges_schema,
+            &mut cols_tab,  &cols_schema,
+            view_id, SchemaDescriptor::default(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_none(), "an edge to a non-existent node must abort load_circuit");
+    }
+
     #[test]
     #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
@@ -2595,7 +2962,7 @@ mod tests {
 
         // Shared helper used by both compute_join_shard_map and
         // DagEngine::get_join_shard_cols.
-        assert_eq!(reindex_col_through_filters(&loaded, 0), Some(1));
+        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![1]);
 
         let map = compute_join_shard_map(&loaded);
         assert_eq!(
@@ -2619,7 +2986,7 @@ mod tests {
             reindex_col: Some(3),
         }));
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN)]);
-        assert_eq!(reindex_col_through_filters(&loaded, 0), Some(3));
+        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![3]);
 
         // Absent: ScanDelta → Map with no reindex_col.
         let mut nodes2 = HashMap::new();
@@ -2629,7 +2996,37 @@ mod tests {
             reindex_col: None,
         }));
         let loaded2 = make_loaded(nodes2, vec![(0, 1, PORT_IN)]);
-        assert_eq!(reindex_col_through_filters(&loaded2, 0), None);
+        assert!(reindex_cols_through_filters(&loaded2, 0).is_empty());
+    }
+
+    /// Multi-join: a single ScanDelta fans out through two reindex Maps on
+    /// different columns. Both column IDs must be collected, not just the first.
+    #[test]
+    fn test_reindex_cols_through_filters_multi_join() {
+        use gnitz_wire::{MapKind, OpNode};
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // ScanDelta(0) ──► Map(reindex_col=2)
+        //              └──► Filter ──► Map(reindex_col=5)
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(42));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(), reindex_col: Some(2),
+        }));
+        nodes.insert(2, OpNode::Filter(Some(dummy_blob.clone())));
+        nodes.insert(3, OpNode::Map(MapKind::Expression {
+            program: dummy_blob, reindex_col: Some(5),
+        }));
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (0, 2, PORT_IN),
+            (2, 3, PORT_IN),
+        ];
+        let loaded = make_loaded(nodes, edges);
+        let mut got = reindex_cols_through_filters(&loaded, 0);
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 5], "both reindex columns must be collected");
     }
 
     /// Pure ScanTrace sources (Python-API joins) must also appear in the map.

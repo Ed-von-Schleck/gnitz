@@ -301,6 +301,7 @@ pub struct DagEngine {
     source_map: FxHashMap<i64, Vec<i64>>,    // view_id → [source_table_ids]
     dep_map_valid: bool,
     shard_cols_cache: FxHashMap<i64, Vec<i32>>,
+    join_shard_cols_cache: FxHashMap<(i64, i64), Vec<i32>>,
     exchange_info_cache: FxHashMap<i64, ExchangeInfo>,
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
@@ -324,6 +325,7 @@ impl DagEngine {
             source_map: FxHashMap::default(),
             dep_map_valid: false,
             shard_cols_cache: FxHashMap::default(),
+            join_shard_cols_cache: FxHashMap::default(),
             exchange_info_cache: FxHashMap::default(),
             tables: FxHashMap::default(),
             sys: SysTableRefs::null(),
@@ -361,6 +363,7 @@ impl DagEngine {
         self.tables.remove(&table_id);
         self.cache.remove(&table_id);
         self.shard_cols_cache.remove(&table_id);
+        self.join_shard_cols_cache.retain(|&(v, s), _| v != table_id && s != table_id);
         self.exchange_info_cache.remove(&table_id);
         self.dep_map_valid = false;
     }
@@ -410,6 +413,7 @@ impl DagEngine {
     pub fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
         self.shard_cols_cache.remove(&view_id);
+        self.join_shard_cols_cache.retain(|&(v, _), _| v != view_id);
         self.exchange_info_cache.remove(&view_id);
         self.dep_map_valid = false;
     }
@@ -417,6 +421,7 @@ impl DagEngine {
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
         self.shard_cols_cache.clear();
+        self.join_shard_cols_cache.clear();
         self.exchange_info_cache.clear();
         self.dep_map_valid = false;
     }
@@ -478,13 +483,19 @@ impl DagEngine {
     /// Load typed circuit nodes/edges for metadata queries. Cheaper than full
     /// compilation: no topo sort, no optimization passes, no code emission.
     fn load_meta_circuit(&self, view_id: i64) -> compiler::LoadedCircuit {
-        compiler::load_circuit(
+        let mut loaded = compiler::load_circuit(
             self.sys.nodes, &self.sys.nodes_schema,
             self.sys.edges, &self.sys.edges_schema,
             self.sys.node_columns, &self.sys.node_columns_schema,
             view_id as u64,
             SchemaDescriptor::default(),
-        ).unwrap_or_else(compiler::LoadedCircuit::empty)
+        ).unwrap_or_else(compiler::LoadedCircuit::empty);
+        // Populate `outgoing`/`incoming` adjacency so annotation helpers like
+        // `reindex_cols_through_filters` can traverse the graph. (`load_circuit`
+        // returns a circuit with empty adjacency maps; only `compile_view` runs
+        // topo_sort itself.) Ignore cycle errors — adjacency is filled regardless.
+        let _ = compiler::topo_sort(&mut loaded);
+        loaded
     }
 
     /// Extract shard columns for a view without full compilation.
@@ -508,6 +519,18 @@ impl DagEngine {
 
     /// Get join shard columns for a specific source within a view.
     pub fn get_join_shard_cols(&mut self, view_id: i64, source_id: i64) -> Vec<i32> {
+        // Called once per join source per tick on the master's serialized
+        // exchange-relay path; cache the result so the hot path skips the
+        // full load_circuit + topo_sort (O(V+E) with several allocations).
+        if let Some(cols) = self.join_shard_cols_cache.get(&(view_id, source_id)) {
+            return cols.clone();
+        }
+        let cols = self.compute_join_shard_cols(view_id, source_id);
+        self.join_shard_cols_cache.insert((view_id, source_id), cols.clone());
+        cols
+    }
+
+    fn compute_join_shard_cols(&self, view_id: i64, source_id: i64) -> Vec<i32> {
         let loaded = self.load_meta_circuit(view_id);
 
         // Find the scan node (ScanTrace or ScanDelta) for this source.
@@ -525,10 +548,7 @@ impl DagEngine {
         // Find the downstream Map(Expression { reindex_col }) node, walking
         // through any intervening Filter nodes (planner emits Filter → Map
         // reindex chains for PK-redistribution views).
-        match crate::compiler::reindex_col_through_filters(&loaded, scan_nid) {
-            Some(c) => vec![c],
-            None => Vec::new(),
-        }
+        crate::compiler::reindex_cols_through_filters(&loaded, scan_nid)
     }
 
     /// Get exchange info for a view: (shard_cols, is_trivial, is_co_partitioned).
@@ -996,9 +1016,13 @@ impl DagEngine {
 
                     if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
                         if existing_idx < pending.len() {
-                            let schema = pending[existing_idx].batch.schema.unwrap_or(dep_schema);
+                            let existing = std::mem::replace(
+                                &mut pending[existing_idx].batch,
+                                Batch::empty_with_schema(&dep_schema),
+                            );
+                            let schema = existing.schema.unwrap_or(dep_schema);
                             let merged = ops::op_union(
-                                &pending[existing_idx].batch,
+                                existing,
                                 Some(&out_delta),
                                 &schema,
                             );
@@ -1159,9 +1183,13 @@ impl DagEngine {
 
                 if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
                     if existing_idx < pending.len() && has_output {
-                        let schema = pending[existing_idx].batch.schema.unwrap_or(dep_schema);
+                        let existing = std::mem::replace(
+                            &mut pending[existing_idx].batch,
+                            Batch::empty_with_schema(&dep_schema),
+                        );
+                        let schema = existing.schema.unwrap_or(dep_schema);
                         let merged = ops::op_union(
-                            &pending[existing_idx].batch,
+                            existing,
                             out_delta.as_ref(),
                             &schema,
                         );
@@ -1619,6 +1647,7 @@ impl DagEngine {
         self.cache.clear();
         self.tables.clear();
         self.shard_cols_cache.clear();
+        self.join_shard_cols_cache.clear();
         self.exchange_info_cache.clear();
         self.dep_map.clear();
         self.source_map.clear();

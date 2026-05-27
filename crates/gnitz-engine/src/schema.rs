@@ -557,6 +557,25 @@ pub(crate) fn long_string_bytes(blob: &[u8], heap_offset: usize, length: usize) 
     }
 }
 
+/// Full logical content bytes of a German string struct `s` (16-byte layout:
+/// `[0..4]` = length, then inline-or-heap content). Short strings
+/// (len ≤ SHORT_STRING_THRESHOLD) store content inline at `[4..4+length]`;
+/// long strings live in `blob` at the heap offset. Unlike `german_string_tail`,
+/// this returns the complete content with no prefix skip — for hashing or
+/// whole-value equality. A zero-length string yields `&[]`.
+#[inline]
+pub(crate) fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
+    let length = read_u32_le(s, 0) as usize;
+    if length == 0 {
+        &[]
+    } else if length <= SHORT_STRING_THRESHOLD {
+        &s[4..4 + length]
+    } else {
+        let heap_offset = read_u64_le(s, 8) as usize;
+        long_string_bytes(blob, heap_offset, length)
+    }
+}
+
 /// Returns bytes [4..end] of a German string as a contiguous slice.
 /// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
 /// Long strings: full string is in blob at heap_offset; skip first 4 bytes

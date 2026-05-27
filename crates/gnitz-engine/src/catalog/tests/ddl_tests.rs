@@ -499,3 +499,53 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── test_drop_view_removes_directory ─────────────────────────────────
+// DROP VIEW must delete the view's on-disk scratch directory, not just the
+// logical catalog rows. Once the catalog entry is gone no later DROP could
+// target the leaked directory, so the cleanup has to happen inside drop_view.
+
+#[test]
+fn test_drop_view_removes_directory() {
+    let dir = temp_dir("drop_view_dir");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // A view needs a base table to reference.
+    let base_cols = vec![u64_col_def("id")];
+    engine.create_table("public.base", &base_cols, &[0], true).unwrap();
+
+    // Register a view via the raw system-table path (create_view was removed).
+    // Column records must precede the VIEW_TAB row (hook invariant).
+    let vid = engine.next_table_id;
+    let view_cols = vec![u64_col_def("id")];
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
+
+    let mut bb = BatchBuilder::new(view_tab_schema());
+    bb.begin_row(vid as u128, 1);
+    bb.put_u64(PUBLIC_SCHEMA_ID as u64);  // schema_id
+    bb.put_string("myview");              // name
+    bb.put_string("SELECT id FROM base"); // sql
+    bb.put_string("");                    // cache_directory (hook computes real path)
+    bb.put_u64(0);                        // created_lsn
+    bb.end_row();
+    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+
+    // The register hook created the physical view directory on disk.
+    let view_dir = engine.dag.tables.get(&vid)
+        .expect("view registered in dag")
+        .directory.clone();
+    assert!(std::path::Path::new(&view_dir).exists(),
+        "view dir should exist after create: {}", view_dir);
+
+    // Drop removes both catalog metadata and the physical directory.
+    engine.drop_view("public.myview").unwrap();
+    assert!(!std::path::Path::new(&view_dir).exists(),
+        "view dir must be deleted on drop: {}", view_dir);
+
+    // No double-drop: the view is gone from the catalog.
+    assert!(engine.drop_view("public.myview").is_err(),
+        "second drop must error");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
