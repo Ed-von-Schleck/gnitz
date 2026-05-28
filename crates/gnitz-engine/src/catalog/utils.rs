@@ -299,7 +299,7 @@ pub(crate) fn copy_cursor_row_with_weight(
 
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
-pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
+pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = table.open_cursor();
     cursor.cursor.seek(pk);
@@ -317,7 +317,7 @@ pub(crate) fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, p
 /// owner share a packed PK prefix (e.g. `sys_columns` keyed by
 /// `pack_column_id(owner, col)`).
 pub(crate) fn retract_rows_in_pk_range(
-    table: &mut Table,
+    table: &Table,
     schema: &SchemaDescriptor,
     start: u128,
     pk_end: u128,
@@ -352,7 +352,7 @@ pub(crate) fn retract_rows_in_pk_range(
 /// PK, so all of a view's rows share the `view_id` byte prefix and are
 /// contiguous in compound-PK sort order — `compare_pk_bytes` reproduces the
 /// `(view_id, sub)` ordering natively (no `(pk_hi, pk_lo)` u128 exploit).
-pub(crate) fn retract_rows_by_view(table: &mut Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
+pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
     let prefix = view_id.to_le_bytes();
     let mut cursor = table.open_cursor();

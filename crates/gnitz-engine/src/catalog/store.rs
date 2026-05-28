@@ -25,6 +25,22 @@ impl CatalogEngine {
     // -- System table accessor -----------------------------------------------
 
     /// Map a system table ID to a mutable reference. Returns None for unknown IDs.
+    pub(crate) fn sys_table(&self, table_id: i64) -> Option<&Table> {
+        match table_id {
+            SCHEMA_TAB_ID => Some(&self.sys_schemas),
+            TABLE_TAB_ID => Some(&self.sys_tables),
+            VIEW_TAB_ID => Some(&self.sys_views),
+            COL_TAB_ID => Some(&self.sys_columns),
+            IDX_TAB_ID => Some(&self.sys_indices),
+            DEP_TAB_ID => Some(&self.sys_view_deps),
+            SEQ_TAB_ID => Some(&self.sys_sequences),
+            CIRCUIT_NODES_TAB_ID => Some(&self.sys_circuit_nodes),
+            CIRCUIT_EDGES_TAB_ID => Some(&self.sys_circuit_edges),
+            CIRCUIT_NODE_COLUMNS_TAB_ID => Some(&self.sys_circuit_node_columns),
+            _ => None,
+        }
+    }
+
     pub(crate) fn sys_table_mut(&mut self, table_id: i64) -> Option<&mut Table> {
         match table_id {
             SCHEMA_TAB_ID => Some(&mut self.sys_schemas),

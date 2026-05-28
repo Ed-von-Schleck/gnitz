@@ -182,7 +182,7 @@ impl CatalogEngine {
         self.cascading_drop = true;
         let result = (|| {
             for idx_id in idx_ids {
-                let batch = retract_single_row(&mut self.sys_indices, &schema, idx_id as u128);
+                let batch = retract_single_row(&self.sys_indices, &schema, idx_id as u128);
                 if batch.count > 0 {
                     self.ingest_to_family(IDX_TAB_ID, &batch)?;
                 }
@@ -196,7 +196,7 @@ impl CatalogEngine {
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(COL_TAB_ID);
         let batch = retract_rows_in_pk_range(
-            &mut self.sys_columns, &schema,
+            &self.sys_columns, &schema,
             pack_column_id(owner_id, 0) as u128,
             pack_column_id(owner_id + 1, 0) as u128,
         );
@@ -274,7 +274,7 @@ impl CatalogEngine {
         ] {
             let schema = sys_tab_schema(tab_id);
             let batch = {
-                let table = self.sys_table_mut(tab_id).unwrap();
+                let table = self.sys_table(tab_id).unwrap();
                 retract_rows_by_view(table, &schema, view_id)
             };
             if batch.count > 0 {
