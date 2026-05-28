@@ -537,8 +537,12 @@ fn test_drop_view_removes_directory() {
     assert!(std::path::Path::new(&view_dir).exists(),
         "view dir should exist after create: {}", view_dir);
 
-    // Drop removes both catalog metadata and the physical directory.
+    // Drop removes catalog metadata and queues the physical directory into
+    // pending_dir_deletions (deferred so the rmdir can't race the WAL fsync).
+    // In production the DDL executor drains the queue once the zone is durable;
+    // drive that step directly here.
     engine.drop_view("public.myview").unwrap();
+    engine.drain_pending_dir_deletions();
     assert!(!std::path::Path::new(&view_dir).exists(),
         "view dir must be deleted on drop: {}", view_dir);
 

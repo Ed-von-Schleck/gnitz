@@ -884,12 +884,14 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     // exactly [0, 1, ..., count-1] — every malformed-schema test relies
     // on this ordering, and downstream consumers index columns by the
     // physical row position, so an out-of-order/gap/duplicate col_idx
-    // would silently re-route columns to the wrong type.
+    // would silently re-route columns to the wrong type. The col_idx is
+    // an unsigned U64 PK column stored OPK (big-endian) at rest, so decode
+    // it big-endian to recover the native index.
     let (pk_off, pk_sz) = wal_dir_entry(data, 0);
     if pk_sz < count * 8 || pk_off.saturating_add(pk_sz) > data.len() { return Err("schema col_idx region OOB"); }
     let pk_data = &data[pk_off..pk_off + count * 8];
     for i in 0..count {
-        let v = u64::from_le_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap());
+        let v = u64::from_be_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap());
         if v != i as u64 {
             return Err("schema col_idx not in monotonic order");
         }

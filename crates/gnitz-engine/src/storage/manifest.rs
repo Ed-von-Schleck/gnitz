@@ -29,7 +29,7 @@ use super::error::StorageError;
 // single-PK only and out of scope here.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION_V4: u64 = 4;
+const VERSION_V5: u64 = 5;
 const HEADER_SIZE: usize = 64;
 const ENTRY_SIZE_V4: usize = 338;
 
@@ -118,20 +118,13 @@ impl PkBuf {
         PkBuf { bytes, len: slice.len() as u8 }
     }
 
-    /// `&self.bytes[..len]` — the compound / generic-comparison path
-    /// uses this so the `len`-window logic lives in one place.
+    /// `&self.bytes[..len]` — the OPK bytes of this bound. After the
+    /// OPK-at-rest flip all PK comparison and range logic operates on these
+    /// raw order-preserving bytes (`compare_pk_bytes` / `pack_pk_be`), so this
+    /// is the single PK accessor.
     #[inline]
     pub fn pk_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
-    }
-
-    /// Widens a single-PK `PkBuf` to its u128 fast-path key. Delegates
-    /// to `batch::widen_pk_le`, which panics (not silently
-    /// zero-extends) on an unexpected width so a misrouted compound key
-    /// reaching this path is caught at its source.
-    #[inline(always)]
-    pub fn as_u128_single_pk(&self) -> u128 {
-        super::batch::widen_pk_le(&self.bytes, self.len as usize)
     }
 }
 
@@ -191,7 +184,7 @@ pub fn serialize(
 
     // Write header
     write_u64_le(out_buf, 0, MAGIC);
-    write_u64_le(out_buf, 8, VERSION_V4);
+    write_u64_le(out_buf, 8, VERSION_V5);
     write_u64_le(out_buf, 16, count as u64);
     write_u64_le(out_buf, 24, global_max_lsn);
 
@@ -245,7 +238,7 @@ pub fn parse(
     let count = read_u64_le(buf, 16) as usize;
     *out_global_max_lsn = read_u64_le(buf, 24);
 
-    if version != VERSION_V4 {
+    if version != VERSION_V5 {
         return Err(StorageError::InvalidVersion);
     }
 
@@ -350,6 +343,10 @@ pub struct PreparedManifest {
     pub fd: Option<libc::c_int>,
     pub tmp_path: std::ffi::CString,
     pub final_path: std::ffi::CString,
+    /// Set true once the `.tmp` has been renamed into place. Until then, Drop
+    /// unlinks the `.tmp` so a panic or early return between `prepare_file` and
+    /// the rename never leaks the temporary file.
+    pub committed: bool,
 }
 
 impl Drop for PreparedManifest {
@@ -357,6 +354,25 @@ impl Drop for PreparedManifest {
         if let Some(fd) = self.fd.take() {
             unsafe { libc::close(fd); }
         }
+        if !self.committed {
+            unsafe { libc::unlink(self.tmp_path.as_ptr()); }
+        }
+    }
+}
+
+/// fsync the directory containing `path`, so the renamed directory entry
+/// survives a crash (fdatasync on the file does not flush the parent inode).
+unsafe fn fsync_parent_dir(path: &std::ffi::CStr) {
+    let bytes = path.to_bytes();
+    let dir = match bytes.iter().rposition(|&b| b == b'/') {
+        Some(0) => std::ffi::CString::new("/").unwrap(),
+        Some(i) => std::ffi::CString::new(&bytes[..i]).unwrap(),
+        None => std::ffi::CString::new(".").unwrap(),
+    };
+    let fd = libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+    if fd >= 0 {
+        libc::fsync(fd);
+        libc::close(fd);
     }
 }
 
@@ -391,11 +407,12 @@ pub fn prepare_file(
             return Err(StorageError::Io);
         }
 
-        Ok(PreparedManifest { fd: Some(fd), tmp_path, final_path })
+        Ok(PreparedManifest { fd: Some(fd), tmp_path, final_path, committed: false })
     }
 }
 
 /// Serialize entries and write atomically (prepare, fdatasync, close, rename).
+/// On any error before the rename, `PreparedManifest::drop` unlinks the `.tmp`.
 pub fn write_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
@@ -406,14 +423,15 @@ pub fn write_file(
     unsafe {
         if libc::fdatasync(fd) < 0 {
             libc::close(fd);
-            libc::unlink(prepared.tmp_path.as_ptr());
             return Err(StorageError::Io);
         }
         libc::close(fd);
         if libc::rename(prepared.tmp_path.as_ptr(), prepared.final_path.as_ptr()) < 0 {
-            libc::unlink(prepared.tmp_path.as_ptr());
             return Err(StorageError::Io);
         }
+        prepared.committed = true;
+        // Flush the directory inode so the rename survives a power loss.
+        fsync_parent_dir(&prepared.final_path);
     }
     Ok(())
 }
@@ -511,7 +529,7 @@ mod tests {
         // rejected, not wrap past the length check.
         let mut buf = vec![0u8; HEADER_SIZE];
         write_u64_le(&mut buf, 0, MAGIC);
-        write_u64_le(&mut buf, 8, VERSION_V4);
+        write_u64_le(&mut buf, 8, VERSION_V5);
         write_u64_le(&mut buf, 16, u64::MAX); // count
         let mut out = [ManifestEntryRaw::zeroed(); 1];
         let mut max_lsn = 0u64;

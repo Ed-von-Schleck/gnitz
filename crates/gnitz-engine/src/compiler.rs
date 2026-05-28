@@ -306,7 +306,7 @@ pub(crate) fn load_circuit(
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
     {
-        let prefix = view_id.to_le_bytes();
+        let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_node_cols)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
@@ -327,7 +327,7 @@ pub(crate) fn load_circuit(
 
     // Phase 2: read CircuitNodes; call decode_op_node for each.
     {
-        let prefix = view_id.to_le_bytes();
+        let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_nodes)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
@@ -369,7 +369,7 @@ pub(crate) fn load_circuit(
 
     // Phase 3: read CircuitEdges.
     {
-        let prefix = view_id.to_le_bytes();
+        let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_edges)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
@@ -2388,7 +2388,10 @@ mod tests {
     #[test]
     fn test_sequential_copy_projection() {
         use crate::expr::ExprProgram;
-        let make = |code: Vec<i64>| ExprProgram::new(code, 4, 0, vec![]);
+        // num_regs covers the largest register index in the synthetic programs
+        // below (9) so ExprProgram::new's register-bounds assert passes; this
+        // test exercises is_sequential_copy_projection, not register limits.
+        let make = |code: Vec<i64>| ExprProgram::new(code, 16, 0, vec![]);
         // COPY_COL has opcode 34
         assert!(make(vec![34, 9, 1, 0, 34, 9, 2, 1]).is_sequential_copy_projection());
         assert!(!make(vec![34, 9, 2, 0, 34, 9, 1, 1]).is_sequential_copy_projection()); // wrong order
@@ -2868,7 +2871,9 @@ mod tests {
         let cols_schema  = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
 
         let view_id: u64 = 1;
-        let pk = |sub: u64| -> u128 { (view_id as u128) | ((sub as u128) << 64) };
+        // Match pack_view_pk: view_id in the high half so its at-rest OPK
+        // (big-endian) image leads the PK region (where load_circuit seeks).
+        let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
         let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
         {
@@ -2908,7 +2913,9 @@ mod tests {
         let cols_schema  = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
 
         let view_id: u64 = 1;
-        let pk = |sub: u64| -> u128 { (view_id as u128) | ((sub as u128) << 64) };
+        // Match pack_view_pk: view_id in the high half so its at-rest OPK
+        // (big-endian) image leads the PK region (where load_circuit seeks).
+        let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
         let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
         {

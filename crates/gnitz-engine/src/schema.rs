@@ -48,10 +48,19 @@ pub const NARROW_PK_MAX_BYTES: usize = 16;
 /// `NARROW_PK_MAX_BYTES` carried as a `u128` plus the `extra` tail (PK bytes
 /// `16..stride`). This is the inverse of `PkTuple::split_wire` and the single
 /// home for the seek-path join contract shared by the master partition router
-/// and the worker SEEK handler. Returns a `MAX_PK_BYTES` buffer whose `..stride`
-/// is the key; errors if `extra` is shorter than the wide suffix `stride - 16`.
-/// Callers must only invoke this for wide PKs (`pk_is_wide()`, `stride > 16`).
-pub fn assemble_wide_pk(low: u128, extra: &[u8], stride: usize) -> Result<[u8; MAX_PK_BYTES], String> {
+/// and the worker SEEK handler. The client transmits seek keys as native LE
+/// column bytes (the seek frame bypasses `append_pk_region`, so unlike the DML
+/// path the bytes are not yet OPK), so this reassembles the native image and
+/// then OPK-encodes it — the returned `..stride` is the OPK key that
+/// `seek_bytes`/`partition_for_pk_bytes` compare against OPK storage. Errors if
+/// `extra` is shorter than the wide suffix `stride - 16`. Callers must only
+/// invoke this for wide PKs (`pk_is_wide()`, `stride > 16`).
+pub fn assemble_wide_pk(
+    schema: &SchemaDescriptor,
+    low: u128,
+    extra: &[u8],
+    stride: usize,
+) -> Result<[u8; MAX_PK_BYTES], String> {
     debug_assert!(stride > NARROW_PK_MAX_BYTES, "assemble_wide_pk: narrow stride {stride}");
     let needed = stride - NARROW_PK_MAX_BYTES;
     if extra.len() < needed {
@@ -60,10 +69,12 @@ pub fn assemble_wide_pk(low: u128, extra: &[u8], stride: usize) -> Result<[u8; M
             extra.len()
         ));
     }
-    let mut buf = [0u8; MAX_PK_BYTES];
-    buf[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
-    buf[NARROW_PK_MAX_BYTES..stride].copy_from_slice(&extra[..needed]);
-    Ok(buf)
+    let mut le = [0u8; MAX_PK_BYTES];
+    le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
+    le[NARROW_PK_MAX_BYTES..stride].copy_from_slice(&extra[..needed]);
+    let mut opk = [0u8; MAX_PK_BYTES];
+    crate::storage::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
+    Ok(opk)
 }
 
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
@@ -201,6 +212,13 @@ impl SchemaDescriptor {
             stride_acc <= u8::MAX as u16,
             "new: pk_stride exceeds u8 width",
         );
+        // `assemble_wide_pk` and other wide-path routines allocate
+        // `[0u8; MAX_PK_BYTES]` and index up to `stride`; a stride in
+        // (MAX_PK_BYTES, 255] would construct here but panic at runtime.
+        assert!(
+            stride_acc as usize <= MAX_PK_BYTES,
+            "new: pk_stride exceeds MAX_PK_BYTES",
+        );
         let pk_stride = stride_acc as u8;
         let (payload_mapping, payload_to_ci) =
             compute_mappings(cols.len(), pk_indices);
@@ -261,23 +279,20 @@ impl SchemaDescriptor {
         self.pk_stride as usize > NARROW_PK_MAX_BYTES
     }
 
-    /// True iff the PK is a single unsigned column — its packed `pack_pk_le`
-    /// u128 is already order-correct (packed u128 order == native unsigned
-    /// order), so it can serve directly as the order-preserving sort key.
-    /// Signed and compound PKs are not order-correct in raw LE form and are
-    /// re-encoded by `pk_sort_key` (the order-preserving twin of `pack_pk_le`).
+    /// True iff the PK is a single signed column (I8/I16/I32/I64). Its OPK
+    /// encoding flips the sign bit of the leading byte, so the `extend_pk` /
+    /// `set_pk_at` u128 fast paths — which write right-aligned big-endian bytes
+    /// with no sign flip — are wrong for it. Such callers must use
+    /// `extend_pk_bytes`. Only the `#[cfg(test)]` `append_row` guard needs this
+    /// today, so it is gated to test builds to keep the production API minimal.
+    #[cfg(test)]
     #[inline]
-    pub const fn pk_is_fast(&self) -> bool {
+    pub const fn pk_is_signed_single_col(&self) -> bool {
         if self.pk_count != 1 {
             return false;
         }
-        let pk_col_idx = self.pk_indices[0] as usize;
-        let tc = self.columns[pk_col_idx].type_code;
-        matches!(
-            tc,
-            type_code::U8 | type_code::U16 | type_code::U32
-                | type_code::U64 | type_code::U128 | type_code::UUID,
-        )
+        let tc = self.columns[self.pk_indices[0] as usize].type_code;
+        matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
     }
 
     /// The single PK column index. Use only at boundaries that have not yet
@@ -426,9 +441,40 @@ pub(crate) fn read_unsigned(bytes: &[u8], size: usize) -> u64 {
     }
 }
 
-/// Promote raw column data at `offset` to a u128 key for index lookups.
+// Two distinct key spaces derive a `u128` from a column. They coincide for
+// unsigned types and differ for signed:
+//
+// * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
+//   flipped for signed. Used by exchange/`extract_group_key`, matching
+//   `partition_for_pk_bytes`, which is schema-less and *cannot* decode, so it
+//   must hash the OPK bytes' widened value. Both sides of a distributed join
+//   agree only in this space.
+// * INDEX (`*_native_key`): the native value (signed integers keep their
+//   two's-complement bits, zero-extended). Used by FK validation, unique-index
+//   maintenance, `has_pk`, and `seek_by_index`, which all re-encode native →
+//   OPK at the storage boundary (`Table::opk_key`, `batch_project_index`), so
+//   they need the native value back, not the sign-flipped one.
+
+/// ROUTING key for one PK column's OPK bytes (canonical / sign-flipped).
+/// `col_size` is the addressed column's width (≤ 16); `offset` its byte offset
+/// within the PK region (0 for a lone PK).
 #[inline]
-pub(crate) fn promote_to_index_key(
+pub(crate) fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
+    debug_assert!(
+        pk_bytes.len() >= offset + col_size,
+        "pk_route_key: buffer too short ({} < {})",
+        pk_bytes.len(), offset + col_size,
+    );
+    gnitz_wire::widen_pk_be(&pk_bytes[offset..offset + col_size], col_size)
+}
+
+/// ROUTING key for one native little-endian payload column (canonical). Integer
+/// columns are OPK-encoded (signed sign-flip) then widened, so a payload FK
+/// column routes to the same partition as the same value stored as a PK column.
+/// U128/UUID are unsigned (OPK == native). Float/String/Blob have no PK
+/// counterpart; they keep a zero-extended low-8-byte key.
+#[inline]
+pub(crate) fn payload_route_key(
     col_data: &[u8],
     offset: usize,
     col_size: usize,
@@ -436,23 +482,90 @@ pub(crate) fn promote_to_index_key(
 ) -> u128 {
     debug_assert!(
         col_data.len() >= offset + col_size,
-        "promote_to_index_key: buffer too short ({} < {})",
+        "payload_route_key: buffer too short ({} < {})",
+        col_data.len(), offset + col_size,
+    );
+    let src = &col_data[offset..offset + col_size];
+    match TypeCode::from_validated_u8(type_code_val) {
+        TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
+        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16
+        | TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 => {
+            let mut opk = [0u8; 16];
+            gnitz_wire::encode_pk_column(src, type_code_val, &mut opk[..col_size]);
+            gnitz_wire::widen_pk_be(&opk[..col_size], col_size)
+        }
+        TypeCode::F32 | TypeCode::F64 | TypeCode::String | TypeCode::Blob => {
+            let mut bytes = [0u8; 8];
+            let copy_len = col_size.min(8);
+            bytes[..copy_len].copy_from_slice(&src[..copy_len]);
+            u64::from_le_bytes(bytes) as u128
+        }
+    }
+}
+
+/// INDEX key for one PK column's OPK bytes: decode back to the native value
+/// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
+/// `seek_by_index`, which re-encode native → OPK to hit the OPK-stored index.
+#[inline]
+pub(crate) fn pk_native_key(
+    pk_bytes: &[u8],
+    offset: usize,
+    col_size: usize,
+    type_code_val: u8,
+) -> u128 {
+    debug_assert!(
+        pk_bytes.len() >= offset + col_size,
+        "pk_native_key: buffer too short ({} < {})",
+        pk_bytes.len(), offset + col_size,
+    );
+    let mut le = [0u8; 16];
+    gnitz_wire::decode_pk_column(&pk_bytes[offset..offset + col_size], type_code_val, &mut le[..col_size]);
+    u128::from_le_bytes(le)
+}
+
+/// INDEX key for one native little-endian payload column: the native value,
+/// zero-extended. U128/UUID read all 16 bytes; narrower types zero-extend the
+/// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
+#[inline]
+pub(crate) fn payload_native_key(
+    col_data: &[u8],
+    offset: usize,
+    col_size: usize,
+    type_code_val: u8,
+) -> u128 {
+    debug_assert!(
+        col_data.len() >= offset + col_size,
+        "payload_native_key: buffer too short ({} < {})",
         col_data.len(), offset + col_size,
     );
     match TypeCode::from_validated_u8(type_code_val) {
         TypeCode::U128 | TypeCode::UUID => {
             u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
         }
-        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
-        TypeCode::U32 | TypeCode::I32 | TypeCode::F32 |
-        TypeCode::U64 | TypeCode::I64 | TypeCode::F64 |
-        TypeCode::String | TypeCode::Blob => {
+        _ => {
             let mut bytes = [0u8; 8];
             let copy_len = col_size.min(8);
             bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
             u64::from_le_bytes(bytes) as u128
         }
     }
+}
+
+/// OPK-encode a native index-key value into the index's leading-column bytes,
+/// for a prefix seek or a check-batch composite PK. The leading index column is
+/// the promoted key type (`idx_key_type`, width `idx_key_size`); the index PK
+/// region is OPK-at-rest, so the prefix must be order-preserving to match the
+/// entries `batch_project_index` writes. Bytes beyond `idx_key_size` stay zero
+/// (the source-PK suffix is not part of the leading-column prefix).
+#[inline]
+pub(crate) fn index_opk_prefix(
+    native: u128,
+    idx_key_type: u8,
+    idx_key_size: usize,
+) -> [u8; MAX_PK_BYTES] {
+    let mut opk = [0u8; MAX_PK_BYTES];
+    gnitz_wire::encode_pk_column(&native.to_le_bytes()[..idx_key_size], idx_key_type, &mut opk[..idx_key_size]);
+    opk
 }
 
 /// Prepare the 16-byte German string output struct for a copy operation.

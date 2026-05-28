@@ -39,7 +39,7 @@ pub fn op_distinct(
         let w_delta = consolidated.get_weight(i);
 
         if key != prev_key {
-            cursor.seek(key);
+            cursor.seek_bytes(consolidated.get_pk_bytes(i));
         }
         prev_key = key;
 

@@ -17,7 +17,8 @@ thread_local! {
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
-use crate::schema::promote_to_index_key;
+use crate::schema::{pk_native_key, payload_native_key};
+
 use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL, FLAG_GATHER,
@@ -203,14 +204,14 @@ fn extract_into_filter(
             if d.pk_is_compound {
                 // Slice the single indexed column out of the packed PK;
                 // get_pk would hand back the whole compound key.
-                promote_to_index_key(
+                pk_native_key(
                     batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
             } else {
                 batch.get_pk(i) // single-column PK IS the index key
             }
         } else {
             let col_data = batch.col_data(d.src_payload_idx, d.col_size);
-            promote_to_index_key(col_data, i * d.col_size, d.col_size, d.type_code)
+            payload_native_key(col_data, i * d.col_size, d.col_size, d.type_code)
         };
         filter.insert(key);
     }
@@ -731,7 +732,7 @@ impl MasterDispatcher {
         };
         let stride = schema.pk_stride() as usize;
         let worker = if schema.pk_is_wide() {
-            let full_pk_buf = crate::schema::assemble_wide_pk(pk, seek_pk_extra, stride)
+            let full_pk_buf = crate::schema::assemble_wide_pk(&schema, pk, seek_pk_extra, stride)
                 .map_err(|e| format!("seek: table {target_id}: {e}"))?;
             worker_for_partition(partition_for_pk_bytes(&full_pk_buf[..stride]), num_workers)
         } else {
@@ -1075,7 +1076,7 @@ impl MasterDispatcher {
                             vals.push(None);
                         } else {
                             let col_data = b.col_data(k);
-                            vals.push(Some(promote_to_index_key(
+                            vals.push(Some(payload_native_key(
                                 col_data, j * col_size, col_size, col_type)));
                         }
                     }
@@ -1398,11 +1399,11 @@ impl MasterDispatcher {
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
                 let fk_key = if is_fk_pk_col {
-                    promote_to_index_key(batch.get_pk_bytes(i), pk_field_off, col_size, col_type)
+                    pk_native_key(batch.get_pk_bytes(i), pk_field_off, col_size, col_type)
                 } else {
                     let null_word = batch.get_null_word(i);
                     if null_word & (1u64 << payload_col) != 0 { continue; }
-                    promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type)
+                    payload_native_key(batch.col_data(payload_col), i * col_size, col_size, col_type)
                 };
                 if seen.insert(fk_key) {
                     keys.push(fk_key);
@@ -1520,7 +1521,7 @@ impl MasterDispatcher {
                         let col_size = source_schema.columns[parent_col_idx].size() as usize;
                         let pk_field_off = source_schema.pk_byte_offset(parent_col_idx) as usize;
                         removed_pks.iter().map(|pk| {
-                            promote_to_index_key(pk.pk_bytes(), pk_field_off, col_size, col_type)
+                            pk_native_key(pk.pk_bytes(), pk_field_off, col_size, col_type)
                         }).collect()
                     } else {
                         let proj_pos = project.iter()
@@ -1705,7 +1706,7 @@ impl MasterDispatcher {
                         let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
                             None
                         } else {
-                            Some(promote_to_index_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
+                            Some(payload_native_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
                         };
 
                         // Absent committed row → omitted from the gather map →
@@ -1784,14 +1785,14 @@ impl MasterDispatcher {
 
                 let key = if is_pk_col {
                     if pk_is_compound {
-                        promote_to_index_key(
+                        pk_native_key(
                             batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
                     } else {
                         batch.get_pk(i)
                     }
                 } else {
                     let col_data = batch.col_data(src_payload_idx);
-                    promote_to_index_key(col_data, i * col_size, col_size, type_code)
+                    payload_native_key(col_data, i * col_size, col_size, type_code)
                 };
 
                 // In-batch duplicate detection runs for ALL positive-weight
@@ -2396,19 +2397,19 @@ fn build_check_batch(
     keys: &[u128],
     pooled: Option<Batch>,
 ) -> Batch {
-    if schema.pk_is_wide() {
-        // Wide index PK (e.g. indexed_col + wide source PK). The keys carry the
-        // indexed column value as a u128; only the first 16 bytes are meaningful
-        // (the source-PK suffix is zero-padded). stride > 16 is guaranteed here.
-        let stride = schema.pk_stride() as usize;
-        build_check_batch_with(schema, keys, pooled, |b, &k| {
-            let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
-            buf[..16].copy_from_slice(&k.to_le_bytes());
-            b.extend_pk_bytes(&buf[..stride])
-        })
-    } else {
-        build_check_batch_with(schema, keys, pooled, |b, &k| b.extend_pk(k))
-    }
+    // The index PK composite is `(indexed-value, src_pk_cols)` and is OPK-at-
+    // rest. `keys` carry the indexed value (native u128); OPK-encode it into the
+    // leading promoted key column and leave the source-PK suffix zero — only the
+    // leading column is prefix-matched for the existence check. Narrow and wide
+    // composites share this layout (the suffix width differs, the leading does
+    // not), so there is no narrow/wide split.
+    let stride = schema.pk_stride() as usize;
+    let idx_key_size = schema.columns[0].size() as usize;
+    let idx_key_type = schema.columns[0].type_code;
+    build_check_batch_with(schema, keys, pooled, |b, &k| {
+        let buf = crate::schema::index_opk_prefix(k, idx_key_type, idx_key_size);
+        b.extend_pk_bytes(&buf[..stride]);
+    })
 }
 
 /// Convert a narrow-PK `u128` to its byte-form `PkBuf` (low `pk_stride`
@@ -2698,9 +2699,11 @@ mod unique_filter_tests {
             SchemaColumn::new(type_code::U32, 0),
         ], &[0, 1]);
         assert_eq!(schema.pk_stride(), 8);
+        // PK region is OPK; for unsigned U32 that is big-endian. extract_into_filter
+        // decodes OPK→native via pk_native_key, so the fixture must be OPK.
         let keys = [
-            compound_pk_bytes(&[&5u32.to_le_bytes(), &1u32.to_le_bytes()]),
-            compound_pk_bytes(&[&5u32.to_le_bytes(), &2u32.to_le_bytes()]),
+            compound_pk_bytes(&[&5u32.to_be_bytes(), &1u32.to_be_bytes()]),
+            compound_pk_bytes(&[&5u32.to_be_bytes(), &2u32.to_be_bytes()]),
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
         let desc = UniqueIndexDesc {
@@ -2726,9 +2729,10 @@ mod unique_filter_tests {
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::U32, 0),
         ], &[0, 1]);
+        // OPK PK region: unsigned U32 columns are stored big-endian.
         let keys = [
-            compound_pk_bytes(&[&5u32.to_le_bytes(), &11u32.to_le_bytes()]),
-            compound_pk_bytes(&[&6u32.to_le_bytes(), &22u32.to_le_bytes()]),
+            compound_pk_bytes(&[&5u32.to_be_bytes(), &11u32.to_be_bytes()]),
+            compound_pk_bytes(&[&6u32.to_be_bytes(), &22u32.to_be_bytes()]),
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
         let desc = UniqueIndexDesc {

@@ -48,6 +48,29 @@ fn fill_cleared_batch(
     batch.consolidated = false;
 }
 
+/// Byte key to seek `trace_out` for a group, reproducing the PK that
+/// [`emit_reduce_row`]'s `emit_pk` writes. Compound output PKs are the verbatim
+/// source PK bytes; single output PKs are the OPK encoding of `group_key`
+/// (`extend_pk` writes `group_key.to_be_bytes()[16 - stride..]`). The retraction
+/// read must seek by the *output* PK, not the input row's PK — for payload
+/// GROUP BY they differ (the output PK is the synthetic group key).
+#[inline]
+fn trace_out_seek_key<'a>(
+    output_schema: &SchemaDescriptor,
+    src_pk_bytes: &'a [u8],
+    group_key: u128,
+    buf: &'a mut [u8; crate::schema::MAX_PK_BYTES],
+) -> &'a [u8] {
+    if output_schema.pk_indices().len() > 1 {
+        src_pk_bytes
+    } else {
+        let stride = output_schema.pk_stride() as usize;
+        let be = group_key.to_be_bytes();
+        buf[..stride].copy_from_slice(&be[16 - stride..]);
+        &buf[..stride]
+    }
+}
+
 /// Check if a cursor's current row matches the group columns of an exemplar row.
 pub(super) fn cursor_matches_group(
     cursor: &ReadCursor,
@@ -266,10 +289,16 @@ pub fn op_reduce(
             idx += 1;
         }
 
-        // Retraction: read old value from trace_out, keyed by the group's PK.
-        trace_out_cursor.seek_group(group_key, group_pk_bytes);
+        // Retraction: read old value from trace_out, keyed by the group's
+        // *output* PK (synthetic group key for payload GROUP BY, source PK
+        // for natural-PK grouping). `group_pk_bytes` is the input row's PK,
+        // which only coincides with the output PK for natural-PK grouping.
+        let mut trace_out_key_buf = [0u8; crate::schema::MAX_PK_BYTES];
+        let trace_out_key =
+            trace_out_seek_key(output_schema, group_pk_bytes, group_key, &mut trace_out_key_buf);
+        trace_out_cursor.seek_group(trace_out_key);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_pk_eq(group_key, group_pk_bytes);
+            && trace_out_cursor.current_pk_eq(trace_out_key);
 
         if has_old {
             // Read old agg values from trace_out
@@ -326,14 +355,19 @@ pub fn op_reduce(
 
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {
-                        ti_cursor.seek_group(group_key, group_pk_bytes);
+                        ti_cursor.seek_group(group_pk_bytes);
                         while ti_cursor.valid
-                            && ti_cursor.current_pk_eq(group_key, group_pk_bytes)
+                            && ti_cursor.current_pk_eq(group_pk_bytes)
                         {
                             ti_cursor.push_current_row(&mut trace_rows);
                             ti_cursor.advance();
                         }
                     } else if let Some(gi_c) = gi.as_deref_mut() {
+                        // The GI key is `[gc(LE) ‖ src_pk(OPK)]`. gc is stored
+                        // and probed in the same LE encoding (the GI is only
+                        // point-probed by an exact gc prefix, never numeric
+                        // range, so it need not be OPK); src_pk is the source
+                        // table's OPK bytes, so it seeks the OPK trace directly.
                         let gc_u64_val = gc_extractor.extract(&mb, group_start_idx);
                         let mut prefix = [0u8; crate::ops::index::GI_GC_BYTES];
                         prefix.copy_from_slice(&gc_u64_val.to_le_bytes());
@@ -341,25 +375,12 @@ pub fn op_reduce(
                         while hit {
                             let k = gi_c.current_pk_bytes();
                             let src_pk_bytes = &k[crate::ops::index::GI_GC_BYTES..];
-                            // Canonical packing — the same `pack_pk_le` the
-                            // loser-tree heap key and `ReadCursor::current_pk`
-                            // use. For a single unsigned source PK (pk_is_fast)
-                            // this u128 drives the trace seek; seek_group/
-                            // current_pk_eq ignore it for compound, signed, or
-                            // wide (> 16) schemas and compare bytes instead, so
-                            // the low-16 prefix pack_pk_le returns for a wide PK
-                            // is never read as a key.
-                            let src_pk_u128 = crate::storage::pack_pk_le(src_pk_bytes);
-                            // ti_cursor traversal is non-monotonic for signed
-                            // sources: GI orders within a gc prefix by the
-                            // remapped *unsigned* source PK, ti_cursor by the
-                            // original *signed* PK, so consecutive re-seeks can
-                            // move backward. seek/seek_bytes are absolute binary
-                            // searches, so a backward seek is O(log N) and
-                            // correct; do not turn this into a forward walk.
-                            ti_cursor.seek_group(src_pk_u128, src_pk_bytes);
+                            // ti_cursor traversal is non-monotonic across GI
+                            // entries; `seek_group` is an absolute binary search
+                            // so a backward re-seek is O(log N) and correct.
+                            ti_cursor.seek_group(src_pk_bytes);
                             while ti_cursor.valid
-                                && ti_cursor.current_pk_eq(src_pk_u128, src_pk_bytes)
+                                && ti_cursor.current_pk_eq(src_pk_bytes)
                             {
                                 ti_cursor.push_current_row(&mut trace_rows);
                                 ti_cursor.advance();

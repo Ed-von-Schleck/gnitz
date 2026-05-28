@@ -68,9 +68,10 @@ fn test_eval_batch_add() {
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mb = batch.as_mem_batch();
 
-    // r0 = pk (LOAD_PK_INT), r1 = col[1] (LOAD_PAYLOAD_INT), r2 = r0 + r1
+    // r0 = pk (LOAD_COL_INT col 0 → resolves to LOAD_PK_*_INT), r1 = col[1]
+    // (LOAD_PAYLOAD_INT), r2 = r0 + r1
     let code = vec![
-        expr::EXPR_LOAD_PK_INT, 0, 0, 0,
+        expr::EXPR_LOAD_COL_INT, 0, 0, 0,
         expr::EXPR_LOAD_PAYLOAD_INT, 1, 0, 0,  // pi=0 (first payload)
         expr::EXPR_INT_ADD, 2, 0, 1,
     ];

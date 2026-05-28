@@ -482,8 +482,10 @@ fn test_circuit_table_surface_introspectable() {
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
     assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
-    // Compound PK: seek by the 16-byte PK region (view_id ++ sub).
-    let pk_bytes = &pk.to_le_bytes()[..16];
+    // Compound PK: seek by the 16-byte at-rest PK region. begin_row writes
+    // extend_pk(pk) = pk.to_be_bytes(), the OPK image (view_id_BE ++ sub_BE).
+    let pk_be = pk.to_be_bytes();
+    let pk_bytes = &pk_be[..16];
     let found = engine.seek_family_bytes(CIRCUIT_NODES_TAB_ID, pk_bytes).unwrap();
     assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
     let found = found.unwrap();

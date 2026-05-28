@@ -325,6 +325,9 @@ impl MappedShard {
         self.mmap.as_slice()
     }
 
+    // The value accessor: production reads PK regions as raw OPK bytes
+    // (`get_pk_bytes`); only tests recover the native value via `get_pk`.
+    #[cfg(test)]
     #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
@@ -332,14 +335,16 @@ impl MappedShard {
         match &self.pk {
             RegionView::Raw { offset, .. } => {
                 let src = &data[offset + row * stride..offset + row * stride + stride];
-                super::batch::widen_pk_le(src, stride)
+                gnitz_wire::widen_pk_be(src, stride)
             }
-            RegionView::Constant { value, .. } => u128::from_le_bytes(*value),
+            // The Constant region stores the OPK bytes left-aligned at
+            // `value[..stride]`. `widen_pk_be` right-aligns the active bytes,
+            // recovering the native unsigned value (sign-flipped for signed).
+            RegionView::Constant { value, .. } => gnitz_wire::widen_pk_be(&value[..stride], stride),
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.pk_stride as usize;
@@ -475,8 +480,10 @@ impl MappedShard {
         }
     }
 
-    /// Binary search for the first row where PK >= key.
+    /// Test-only u128 oracle that cross-checks `find_lower_bound_bytes` (the
+    /// production path): binary search for the first row where PK >= key.
     /// Returns `count` if no such row exists.
+    #[cfg(test)]
     pub fn find_lower_bound(&self, key: u128) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
@@ -491,33 +498,15 @@ impl MappedShard {
         lo
     }
 
-    /// Byte-addressed sibling of [`find_lower_bound`]. Runs the same binary
-    /// search but orders rows with the column-aware `compare_pk_bytes`, so it
-    /// is correct for compound and wide (`pk_stride > 16`) PKs. `MappedShard`
-    /// stores only `pk_stride`, not a `SchemaDescriptor`, so the schema is
-    /// passed explicitly by the caller.
-    ///
-    /// `key` must be exactly `pk_stride` bytes — identical width to the stored
-    /// PK regions. In a release build the length contract is unchecked; a
-    /// wrong-length slice silently misreads or panics with no diagnostic.
-    /// Uphold it at the call site.
-    ///
-    /// Single unsigned-column PKs (`pk_is_fast`) should keep using
-    /// [`find_lower_bound`] — its single `u128` compare is strictly faster than
-    /// the per-probe column walk. Reached in production by the cursor byte-seek
-    /// path and `shard_index::probe_pk` for compound/signed PKs.
-    pub fn find_lower_bound_bytes(
-        &self,
-        key: &[u8],
-        schema: &crate::schema::SchemaDescriptor,
-    ) -> usize {
+    /// First row whose OPK bytes are `>= key`. After the OPK-at-rest flip this
+    /// is a raw `memcmp` binary search — correct at every PK width with no
+    /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if super::columnar::compare_pk_bytes(schema, self.get_pk_bytes(mid), key)
-                == std::cmp::Ordering::Less
-            {
+            if self.get_pk_bytes(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -526,8 +515,9 @@ impl MappedShard {
         lo
     }
 
-    /// Binary search for an exact PK match. Returns the row index, or `None`
-    /// if `key` is not present.
+    /// Test-only u128 oracle (exact-match point lookup) cross-checking the
+    /// production byte path. Returns the row index, or `None` if absent.
+    #[cfg(test)]
     pub fn find_row_index(&self, key: u128) -> Option<usize> {
         let idx = self.find_lower_bound(key);
         if idx < self.count && self.get_pk(idx) == key {
@@ -662,8 +652,9 @@ mod tests {
         let path = dir.join("test.db");
         let count = rows.len() as u32;
 
+        // PK region holds OPK (order-preserving big-endian) bytes at rest.
         let pk_bytes: Vec<u8> = rows.iter()
-            .flat_map(|&(pk, _)| pk.to_le_bytes())
+            .flat_map(|&(pk, _)| pk.to_be_bytes())
             .collect();
         let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
         let null_bm: Vec<u64> = rows.iter().map(|_| 0u64).collect();
@@ -693,7 +684,8 @@ mod tests {
     ) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
+        // PK region holds OPK (order-preserving big-endian) bytes at rest.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
 
@@ -773,8 +765,9 @@ mod tests {
 
         let ptr = shard.col_ptr_by_logical(0, 0, 8);
         assert!(!ptr.is_null());
-        let val = unsafe { *(ptr as *const u64) };
-        assert_eq!(val, 1);
+        // PK column holds OPK (big-endian) bytes at rest.
+        let pk_be = unsafe { std::slice::from_raw_parts(ptr, 8) };
+        assert_eq!(u64::from_be_bytes(pk_be.try_into().unwrap()), 1);
 
         let ptr = shard.col_ptr_by_logical(0, 1, 8);
         assert!(!ptr.is_null());
@@ -1200,7 +1193,8 @@ mod tests {
     fn build_test_shard_u128(dir: &std::path::Path, name: &str, pks: &[u128], vals: &[i64]) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
+        // PK region holds OPK (order-preserving big-endian) bytes at rest.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
         let weights: Vec<i64> = vec![1; pks.len()];
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
@@ -1233,7 +1227,8 @@ mod tests {
             let bytes = shard.get_pk_bytes(i);
             assert_eq!(bytes.len(), 8, "row {i} stride");
             let pk_u128 = shard.get_pk(i);
-            assert_eq!(bytes, &pk_u128.to_le_bytes()[..8], "row {i} le bytes");
+            // PK region is OPK (big-endian); the low 8 bytes of the BE u128.
+            assert_eq!(bytes, &pk_u128.to_be_bytes()[8..], "row {i} opk bytes");
         }
     }
 
@@ -1252,7 +1247,8 @@ mod tests {
         for (i, &pk) in pks.iter().enumerate() {
             let bytes = shard.get_pk_bytes(i);
             assert_eq!(bytes.len(), 16, "row {i} stride");
-            assert_eq!(bytes, &pk.to_le_bytes(), "row {i} le bytes");
+            // PK region is OPK (order-preserving big-endian) at rest.
+            assert_eq!(bytes, &pk.to_be_bytes(), "row {i} opk bytes");
             assert_eq!(shard.get_pk(i), pk, "row {i} u128");
         }
     }
@@ -1272,7 +1268,8 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert!(matches!(shard.pk, RegionView::Constant { .. }), "expected Constant PK region");
         assert_eq!(shard.pk_stride, 16);
-        let expected = pk_value.to_le_bytes();
+        // PK region is OPK (order-preserving big-endian) at rest.
+        let expected = pk_value.to_be_bytes();
         for i in 0..n {
             assert_eq!(shard.get_pk_bytes(i), &expected, "row {i} bytes");
             assert_eq!(shard.get_pk(i), pk_value, "row {i} u128");
@@ -1290,7 +1287,8 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 41, u64::MAX] {
             let by_u128 = shard.find_lower_bound(probe as u128);
-            let by_bytes = shard.find_lower_bound_bytes(&probe.to_le_bytes(), &schema);
+            // OPK bytes for a U64 PK are big-endian; raw memcmp binary search.
+            let by_bytes = shard.find_lower_bound_bytes(&probe.to_be_bytes());
             assert_eq!(by_u128, by_bytes, "probe={probe}");
         }
     }
@@ -1319,13 +1317,24 @@ mod tests {
         );
         assert_eq!(schema.pk_stride(), 24);
 
+        // OPK for a 3xU64 compound PK: each column big-endian, concatenated in
+        // pk-list order. memcmp of the bytes then equals (col0, col1, col2)
+        // lexicographic order.
+        let opk3 = |a: u64, b: u64, c: u64| -> [u8; 24] {
+            let mut out = [0u8; 24];
+            out[0..8].copy_from_slice(&a.to_be_bytes());
+            out[8..16].copy_from_slice(&b.to_be_bytes());
+            out[16..24].copy_from_slice(&c.to_be_bytes());
+            out
+        };
+
         // Five rows, sorted in compare_pk_bytes order (col0, then col1, col2).
         let pks: [[u8; 24]; 5] = [
-            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
-            [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
-            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
-            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
-            [2,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+            opk3(0, 0, 0),
+            opk3(1, 0, 0),
+            opk3(1, 5, 0),
+            opk3(1, 5, 9),
+            opk3(2, 0, 0),
         ];
         let count = pks.len() as u32;
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|r| r.iter().copied()).collect();
@@ -1353,19 +1362,19 @@ mod tests {
             "distinct PKs must keep PK region Raw");
 
         // Probe keys covering before, between, and after each row.
-        let probes: &[[u8; 24]] = &[
-            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  1,0,0,0,0,0,0,0],
-            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  9,0,0,0,0,0,0,0],
-            [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  10,0,0,0,0,0,0,0],
-            [3,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
+        let probes: [[u8; 24]; 5] = [
+            opk3(0, 0, 0),
+            opk3(0, 0, 1),
+            opk3(1, 5, 9),
+            opk3(1, 5, 10),
+            opk3(3, 0, 0),
         ];
-        for key in probes {
+        for key in &probes {
             let expected = (0..shard.count).find(|&i| {
-                super::super::columnar::compare_pk_bytes(&schema, shard.get_pk_bytes(i), key)
+                super::super::columnar::compare_pk_bytes(shard.get_pk_bytes(i), key)
                     != std::cmp::Ordering::Less
             }).unwrap_or(shard.count);
-            let got = shard.find_lower_bound_bytes(key, &schema);
+            let got = shard.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");
         }
     }

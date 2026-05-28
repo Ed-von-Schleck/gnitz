@@ -40,37 +40,6 @@ pub(super) const REG_PAYLOAD_START: usize = 3;
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
-/// LE-widen a PK region slice to its u128 fast-path key. Any width `≤ 16` is
-/// valid (zero-extended for non-power-of-two strides, e.g. a 9/10/12/14-byte
-/// byte-form composite key); a stride `> 16` is a wide region that cannot fit a
-/// u128 and reaching this path with one is a routing bug, so panic to surface
-/// the misroute at its source.
-///
-/// `stride` is taken explicitly rather than read from `src.len()`
-/// because the fixed-array callers (`PkBuf::as_u128_single_pk`) pass a
-/// constant-length backing array (`&PkBuf::bytes`, len 80) whose length
-/// carries no width information — only `stride` can detect their
-/// misroutes. Contract: `src.len() >= stride`.
-///
-/// Wide-PK siblings: see `merge::pack_pk_le` for the comparator path,
-/// which prefix-truncates instead of panicking.
-#[inline(always)]
-pub(super) fn widen_pk_le(src: &[u8], stride: usize) -> u128 {
-    match stride {
-        1  => src[0] as u128,
-        2  => u16::from_le_bytes(src[..2].try_into().unwrap()) as u128,
-        4  => u32::from_le_bytes(src[..4].try_into().unwrap()) as u128,
-        8  => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
-        16 => u128::from_le_bytes(src[..16].try_into().unwrap()),
-        n if n < 16 => {
-            let mut b = [0u8; 16];
-            b[..n].copy_from_slice(&src[..n]);
-            u128::from_le_bytes(b)
-        }
-        n => panic!("widen_pk_le: wide PK region (stride {n}); caller must use get_pk_bytes/pk_bytes instead"),
-    }
-}
-
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
 /// For sizes >= HUGEPAGE_THRESHOLD, calls `calloc` (via `vec!`) which for large
@@ -89,10 +58,19 @@ fn alloc_large_zeroed(size: usize) -> Vec<u8> {
 }
 
 /// Compute byte offsets for each region given strides and row capacity.
+///
+/// Every region start is padded up to an 8-byte boundary. The null-bitmap and
+/// weight regions are read/written as `*mut u64` (e.g. `plan.rs` casts
+/// `null_bmp_data_mut()`), which is UB on an unaligned pointer; an odd
+/// `capacity * pk_stride` (small catalog batches, a final partial morsel) would
+/// otherwise misalign the following region. MORSEL=256 batches are already
+/// aligned, but smaller batches are not. Total allocation grows by at most 7
+/// bytes per region boundary.
 pub(super) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([u32; MAX_BATCH_REGIONS], usize) {
     let mut offsets = [0u32; MAX_BATCH_REGIONS];
     let mut off = 0usize;
     for i in 0..num_regions {
+        off = (off + 7) & !7;
         offsets[i] = off as u32;
         off += capacity * strides[i] as usize;
     }
@@ -546,7 +524,7 @@ impl Batch {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] as usize + row * stride;
-        widen_pk_le(&self.data[off..off + stride], stride)
+        gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
     }
 
     /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Returns exactly
@@ -685,27 +663,22 @@ impl Batch {
     /// zero-extension). The high
     /// `16 - stride` bytes are dropped on truncation, which is correct
     /// under that contract for every PK type GnitzDB allows.
+    /// Append a narrow PK from a `u128`, writing **right-aligned big-endian**
+    /// bytes (the low `stride` bytes of `pk.to_be_bytes()`). For UNSIGNED PKs
+    /// this is the correct OPK encoding (OPK == BE for unsigned), and
+    /// `widen_pk_be(extend_pk(v))` round-trips. SIGNED or compound PKs are NOT
+    /// sign-flipped here and must use `extend_pk_opk` / `extend_pk_bytes`.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
-        match stride {
-            1 => self.extend_region(REG_PK, &pk.to_le_bytes()[..1]),
-            2 => self.extend_region(REG_PK, &pk.to_le_bytes()[..2]),
-            4 => self.extend_region(REG_PK, &pk.to_le_bytes()[..4]),
-            8 => {
-                debug_assert!(pk >> 64 == 0, "extend_pk: U64 batch requires high bits == 0");
-                self.extend_region(REG_PK, &pk.to_le_bytes()[..8]);
-            }
-            16 => self.extend_region(REG_PK, &pk.to_le_bytes()),
-            n if n > 0 && n < 16 => {
-                // Narrow non-power-of-two strides (e.g. 12 for (U64, U32)): the
-                // caller placed the LE on-disk bytes in the low `n` bytes, the
-                // same contract widen_pk_le relies on for reads.
-                debug_assert!(pk >> (n * 8) == 0, "extend_pk: narrow batch requires high bits == 0");
-                self.extend_region(REG_PK, &pk.to_le_bytes()[..n]);
-            }
-            _ => panic!("extend_pk: wide region; use extend_pk_bytes"),
+        if stride > 16 {
+            panic!("extend_pk: wide region; use extend_pk_bytes");
         }
+        debug_assert!(
+            stride >= 16 || (pk >> (stride * 8)) == 0,
+            "narrow batch requires high bits == 0",
+        );
+        self.extend_region(REG_PK, &pk.to_be_bytes()[16 - stride..]);
     }
 
     #[inline]
@@ -718,35 +691,45 @@ impl Batch {
         self.extend_region(REG_PK, bytes);
     }
 
-    /// Overwrite the PK at `row` with a new 128-bit value. Narrow-stride
-    /// truncation mirrors `extend_pk`'s low-bytes contract.
+    /// Append a row's PK from native per-column values, OPK-encoding them
+    /// (big-endian, with the sign-bit flip for signed columns) before the
+    /// bytes are written. `native_col_vals` holds one native value per PK
+    /// column in `pk_columns()` order. Use for signed or compound PK test
+    /// tables where `extend_pk` (no sign flip) writes incorrect OPK bytes.
+    #[cfg(test)]
+    pub fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
+        let stride = self.strides[REG_PK] as usize;
+        let mut le = [0u8; schema::MAX_PK_BYTES];
+        let mut off = 0;
+        for ((_o, _ci, col), &v) in schema.pk_columns().zip(native_col_vals) {
+            let cs = col.size() as usize;
+            le[off..off + cs].copy_from_slice(&v.to_le_bytes()[..cs]);
+            off += cs;
+        }
+        let mut opk = [0u8; schema::MAX_PK_BYTES];
+        super::columnar::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
+        self.extend_pk_bytes(&opk[..stride]);
+    }
+
+    /// Overwrite the narrow PK at `row` with a `u128`, writing right-aligned
+    /// big-endian bytes — matching `extend_pk` / `widen_pk_be`. Unsigned-only
+    /// (no sign flip); signed/compound callers use `set_pk_at_bytes`.
+    /// Test-only: production reindex paths write OPK via `set_pk_at_bytes`.
+    #[cfg(test)]
     #[inline]
     pub fn set_pk_at(&mut self, row: usize, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
-        match stride {
-            1 | 2 | 4 => {
-                let off = self.offsets[REG_PK] as usize + row * stride;
-                self.data[off..off + stride].copy_from_slice(&pk.to_le_bytes()[..stride]);
-            }
-            8 => {
-                debug_assert!(pk >> 64 == 0, "set_pk_at: U64 batch requires high bits == 0");
-                let off = self.offsets[REG_PK] as usize + row * 8;
-                self.data[off..off + 8].copy_from_slice(&pk.to_le_bytes()[..8]);
-            }
-            16 => {
-                let off = self.offsets[REG_PK] as usize + row * 16;
-                self.data[off..off + 16].copy_from_slice(&pk.to_le_bytes());
-            }
-            n if n > 0 && n < 16 => {
-                debug_assert!(pk >> (n * 8) == 0, "set_pk_at: narrow batch requires high bits == 0");
-                let off = self.offsets[REG_PK] as usize + row * stride;
-                self.data[off..off + n].copy_from_slice(&pk.to_le_bytes()[..n]);
-            }
-            _ => panic!("set_pk_at: wide region; use set_pk_at_bytes"),
+        if stride > 16 {
+            panic!("set_pk_at: wide region; use set_pk_at_bytes");
         }
+        debug_assert!(
+            stride >= 16 || (pk >> (stride * 8)) == 0,
+            "narrow batch requires high bits == 0",
+        );
+        let off = self.offsets[REG_PK] as usize + row * stride;
+        self.data[off..off + stride].copy_from_slice(&pk.to_be_bytes()[16 - stride..]);
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]) {
         let stride = self.strides[REG_PK] as usize;
@@ -759,8 +742,9 @@ impl Batch {
         self.data[off..off + stride].copy_from_slice(bytes);
     }
 
-    /// Iterate PKs as `u128`.
-    #[allow(dead_code)]
+    /// Iterate PKs as `u128`. Test-only (the only caller is a batch round-trip
+    /// test); production reads PK regions as OPK bytes via `get_pk_bytes`.
+    #[cfg(test)]
     #[inline]
     pub fn pk_iter(&self) -> impl Iterator<Item = u128> + '_ {
         (0..self.count).map(|row| self.get_pk(row))
@@ -957,45 +941,18 @@ impl Batch {
         (data, blob)
     }
 
-    pub fn find_lower_bound(&self, key: u128) -> usize {
+    /// Binary search for the first row whose OPK bytes are `>= key`. After the
+    /// OPK-at-rest flip this is a raw `memcmp` search with no schema dependency,
+    /// correct for compound, signed, and wide (`pk_stride > 16`) PKs alike.
+    ///
+    /// `key` must be exactly `pk_stride` OPK bytes — identical width to the
+    /// stored regions it is compared against.
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.get_pk(mid) < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    /// Byte-addressed sibling of [`find_lower_bound`]. Runs the same binary
-    /// search but orders rows with the column-aware [`compare_pk_bytes`]
-    /// against the supplied `schema`, so it is correct for compound, signed,
-    /// and wide (`pk_stride > 16`) PKs as well as single-column ones.
-    ///
-    /// `schema` is passed in rather than read from `self.schema`, which is
-    /// unset (`None`) on the intermediate batches that join/cursor ops wrap.
-    ///
-    /// `key` must be exactly `pk_stride` bytes — identical width to the
-    /// stored regions it is compared against. In a release build the length
-    /// contract is unchecked; a wrong-length slice silently misreads or
-    /// panics with no diagnostic. Uphold it at the call site; do not rely
-    /// on the debug assert in `compare_pk_bytes`.
-    ///
-    /// Single unsigned-column PKs (`pk_is_fast`) should keep using
-    /// [`find_lower_bound`] — its single `u128` compare is strictly faster than
-    /// the per-probe column walk here for a bit-identical result.
-    pub fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
-        let mut lo = 0usize;
-        let mut hi = self.count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if super::columnar::compare_pk_bytes(schema, self.get_pk_bytes(mid), key)
-                == std::cmp::Ordering::Less
-            {
+            if self.get_pk_bytes(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -1182,6 +1139,13 @@ impl Batch {
         col_sizes: &[u32],
         blob_src: &[u8],
     ) {
+        // extend_pk writes right-aligned BE (correct OPK only for unsigned PKs).
+        // A signed single-col PK needs the sign flip — use extend_pk_opk.
+        debug_assert!(
+            self.schema.map_or(true, |s| !s.pk_is_signed_single_col()),
+            "append_row: signed single-col PK requires extend_pk_bytes (extend_pk \
+             writes right-aligned BE without the sign flip)",
+        );
         self.ensure_row_capacity();
         self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
@@ -1594,6 +1558,15 @@ impl Batch {
         let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let n = count as usize;
 
+        // Zero-row block: `from_regions` would hard-code pk_stride=16; use the
+        // schema-correct empty batch so callers never observe a stale stride
+        // (e.g. empty transaction boundaries in the SAL).
+        if n == 0 {
+            let mut batch = Batch::empty_with_schema(schema);
+            batch.set_schema(*schema);
+            return Ok((batch, bytes_consumed));
+        }
+
         // Validate per-region byte sizes against the schema-expected strides.
         // `from_regions` derives strides by dividing the supplied sizes by
         // `count`, so a mismatch would silently propagate into the decoded
@@ -1826,184 +1799,6 @@ pub fn write_to_batch(
     }
 }
 
-/// Byte count of the WAL block needed to encode `batches` as one combined data block.
-#[allow(dead_code)]
-pub fn wire_byte_size_multi(batches: &[Batch]) -> usize {
-    let first = match batches.iter().find(|b| b.count > 0) {
-        Some(b) => b,
-        None => {
-            if batches.is_empty() { return 0; }
-            let b = &batches[0];
-            let nr = b.num_regions_total();
-            return super::wal::block_size(nr, &[0u32; MAX_BATCH_REGIONS + 1][..nr]);
-        }
-    };
-    let nr = first.num_regions_total();
-    let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-    for batch in batches {
-        for (i, size) in sizes[..nr].iter_mut().enumerate() {
-            *size += batch.region_size(i) as u32;
-        }
-    }
-    super::wal::block_size(nr, &sizes[..nr])
-}
-
-/// Encode `batches` into one WAL-format data block at `out[offset..]`.
-///
-/// STRING payload columns have their long-string blob offsets adjusted per
-/// batch so offsets are correct in the concatenated output blob.
-/// Short strings (≤ SHORT_STRING_THRESHOLD bytes) are copied verbatim.
-/// Returns bytes written.
-#[allow(dead_code)]
-pub fn encode_multi_to_wire(
-    batches: &[Batch],
-    table_id: u32,
-    out: &mut [u8],
-    offset: usize,
-    checksum: bool,
-) -> usize {
-    use crate::util::{align8, write_u32_le, write_u64_le};
-    use crate::schema::SHORT_STRING_THRESHOLD;
-
-    let first = match batches.iter().find(|b| b.count > 0) {
-        Some(b) => b,
-        None => {
-            if batches.is_empty() { return 0; }
-            let b = &batches[0];
-            let nr = b.num_regions_total();
-            let ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-            let sizes = [0u32; MAX_BATCH_REGIONS + 1];
-            return super::wal::encode(out, offset, 0, table_id, 0,
-                &ptrs[..nr], &sizes[..nr], 0, checksum)
-                .expect("WAL encode failed") - offset;
-        }
-    };
-
-    let nr = first.num_regions_total();
-    let npc = first.num_payload_cols();
-    let blob_idx = REG_PAYLOAD_START + npc;
-
-    let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-    let mut total_count: u32 = 0;
-    for batch in batches {
-        debug_assert_eq!(
-            batch.num_regions_total(),
-            nr,
-            "encode_multi_to_wire: batch schema mismatch in multi-encode payload"
-        );
-        total_count += batch.count as u32;
-        for (i, size) in sizes[..nr].iter_mut().enumerate() {
-            *size += batch.region_size(i) as u32;
-        }
-    }
-    let total_blob: u64 = sizes[blob_idx] as u64;
-
-    let total_block_size = super::wal::block_size(nr, &sizes[..nr]);
-    assert!(
-        offset + total_block_size <= out.len(),
-        "encode_multi_to_wire: buffer too small ({} + {} > {})",
-        offset, total_block_size, out.len()
-    );
-
-    let block = &mut out[offset..offset + total_block_size];
-    block[..super::wal::HEADER_SIZE].fill(0);
-
-    let dir_size = nr * 8;
-    let mut positions = [0usize; MAX_BATCH_REGIONS + 1];
-    let mut pos = super::wal::HEADER_SIZE + dir_size;
-    for i in 0..nr {
-        pos = align8(pos);
-        positions[i] = pos;
-        let dir_off = super::wal::HEADER_SIZE + i * 8;
-        write_u32_le(block, dir_off, pos as u32);
-        write_u32_le(block, dir_off + 4, sizes[i]);
-        pos += sizes[i] as usize;
-    }
-
-    let mut is_string = [false; MAX_BATCH_REGIONS + 1];
-    if let Some(ref schema) = first.schema {
-        for (pi, _ci, col) in schema.payload_columns() {
-            let is_string_like = col.type_code == crate::schema::type_code::STRING
-                || col.type_code == crate::schema::type_code::BLOB;
-            if is_string_like && col.size() == 16 {
-                is_string[REG_PAYLOAD_START + pi] = true;
-            }
-        }
-    }
-
-    for i in 0..nr {
-        let mut dst_pos = positions[i];
-
-        if i == blob_idx {
-            for batch in batches {
-                let len = batch.blob.len();
-                if len > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            batch.blob.as_ptr(),
-                            block[dst_pos..].as_mut_ptr(),
-                            len,
-                        );
-                    }
-                    dst_pos += len;
-                }
-            }
-        } else if is_string[i] {
-            let mut cum_blob: u64 = 0;
-            for batch in batches {
-                let n = batch.count;
-                if n > 0 {
-                    let base = batch.offsets[i] as usize;
-                    for row in 0..n {
-                        let src_off = base + row * 16;
-                        let src = &batch.data[src_off..src_off + 16];
-                        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-                        block[dst_pos..dst_pos + 8].copy_from_slice(&src[0..8]);
-                        if length > SHORT_STRING_THRESHOLD {
-                            let old_off = u64::from_le_bytes(src[8..16].try_into().unwrap());
-                            block[dst_pos + 8..dst_pos + 16]
-                                .copy_from_slice(&(old_off + cum_blob).to_le_bytes());
-                        } else {
-                            block[dst_pos + 8..dst_pos + 16].copy_from_slice(&src[8..16]);
-                        }
-                        dst_pos += 16;
-                    }
-                }
-                cum_blob += batch.blob.len() as u64;
-            }
-        } else {
-            for batch in batches {
-                let sz = batch.region_size(i);
-                if sz > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            batch.region_ptr(i),
-                            block[dst_pos..].as_mut_ptr(),
-                            sz,
-                        );
-                    }
-                    dst_pos += sz;
-                }
-            }
-        }
-    }
-
-    write_u64_le(block, 0, 0u64); // lsn placeholder; not meaningful on wire
-    write_u32_le(block, 8, table_id);
-    write_u32_le(block, 12, total_count);
-    write_u32_le(block, 16, total_block_size as u32);
-    write_u32_le(block, 20, super::wal::FORMAT_VERSION);
-    write_u32_le(block, 32, nr as u32);
-    write_u64_le(block, 40, total_blob);
-
-    if checksum && total_block_size > super::wal::HEADER_SIZE {
-        let cs = crate::xxh::checksum(&block[super::wal::HEADER_SIZE..total_block_size]);
-        write_u64_le(block, 24, cs);
-    }
-
-    total_block_size
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2020,70 +1815,42 @@ mod tests {
     }
 
     #[test]
-    fn widen_pk_le_width_8_and_16() {
-        let mut src = [0u8; 16];
-        src[..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
-        assert_eq!(widen_pk_le(&src[..8], 8), 0x1122_3344_5566_7788u128);
+    fn widen_pk_be_recovers_unsigned_value() {
+        // OPK bytes of an unsigned PK are its big-endian image; widen_pk_be
+        // right-aligns them and recovers the native value. A left-align bug
+        // would return value·2^k — assert it does not.
+        let v: u64 = 0x1122_3344_5566_7788;
+        assert_eq!(gnitz_wire::widen_pk_be(&v.to_be_bytes(), 8), v as u128);
 
         let key = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10u128;
-        assert_eq!(widen_pk_le(&key.to_le_bytes(), 16), key);
-    }
+        assert_eq!(gnitz_wire::widen_pk_be(&key.to_be_bytes(), 16), key);
 
-    #[test]
-    fn widen_pk_le_wider_than_stride_matches_exact_slice() {
-        // Exercises the PkBuf::as_u128_single_pk calling convention:
-        // a fixed 80-byte backing array with stride < src.len().
-        let mut backing = [0u8; 80];
-        backing[..8].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
-        assert_eq!(
-            widen_pk_le(&backing, 8),
-            widen_pk_le(&backing[..8], 8),
-        );
-
-        let key = 0x1111_2222_3333_4444_5555_6666_7777_8888u128;
-        let mut backing16 = [0u8; 80];
-        backing16[..16].copy_from_slice(&key.to_le_bytes());
-        assert_eq!(
-            widen_pk_le(&backing16, 16),
-            widen_pk_le(&backing16[..16], 16),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "wide PK region")]
-    fn widen_pk_le_rejects_width_above_16() {
-        widen_pk_le(&[0u8; 24], 24);
-    }
-
-    #[test]
-    fn widen_pk_le_narrow_strides_round_trip() {
-        // Stride 1: read the single byte verbatim.
-        assert_eq!(widen_pk_le(&[0xFFu8], 1), 0xFFu128);
-        assert_eq!(widen_pk_le(&[0x01u8], 1), 0x01u128);
-        // Stride 2/4: LE bytes widen via from_le_bytes.
-        assert_eq!(widen_pk_le(&0xFFFEu16.to_le_bytes(), 2), 0xFFFEu128);
-        assert_eq!(widen_pk_le(&0xCAFE_BABEu32.to_le_bytes(), 4), 0xCAFE_BABEu128);
-        // The slice may be longer than `stride` — only the first `stride`
-        // bytes are read. Mirrors the PkBuf::as_u128_single_pk convention.
-        let mut backing = [0u8; 80];
-        backing[..2].copy_from_slice(&0x1234u16.to_le_bytes());
-        assert_eq!(widen_pk_le(&backing, 2), 0x1234u128);
-
-        // Non-power-of-two byte-form composite strides (group_stride + 8 for a
-        // single narrow group column): zero-extended to u128 verbatim.
-        for &n in &[9usize, 10, 12, 14] {
-            let mut src = [0u8; 16];
-            for (i, b) in src.iter_mut().enumerate().take(n) {
-                *b = (0xA0 + i) as u8;
-            }
-            let mut expect = [0u8; 16];
-            expect[..n].copy_from_slice(&src[..n]);
-            assert_eq!(
-                widen_pk_le(&src[..n], n),
-                u128::from_le_bytes(expect),
-                "stride {n} must zero-extend",
-            );
+        for &v in &[1u64, 5, 42] {
+            assert_eq!(gnitz_wire::widen_pk_be(&v.to_be_bytes(), 8), v as u128);
         }
+        for &v in &[0u32, 0xFFFF_FFFE, 0xFFFF_FFFF] {
+            assert_eq!(gnitz_wire::widen_pk_be(&v.to_be_bytes(), 4), v as u128);
+        }
+        // Narrow non-power-of-two stride: right-aligned recovery.
+        let mut opk12 = [0u8; 12];
+        opk12[11] = 0x2A; // value 42 in the low byte of a 12-byte OPK region
+        assert_eq!(gnitz_wire::widen_pk_be(&opk12, 12), 42u128);
+    }
+
+    #[test]
+    fn widen_pk_be_extend_pk_round_trips() {
+        // extend_pk writes right-aligned BE; get_pk_bytes is the stored OPK and
+        // get_pk recovers the value. extend_pk(widen_pk_be(bytes)) == bytes.
+        let schema = single_col_pk_schema(type_code::U64);
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(1);
+        b.extend_pk(42);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &0i64.to_le_bytes());
+        b.count += 1;
+        assert_eq!(b.get_pk_bytes(0), &42u64.to_be_bytes());
+        assert_eq!(b.get_pk(0), 42u128);
     }
 
     #[test]
@@ -2243,7 +2010,7 @@ mod tests {
         }
         for (i, pk) in pks.iter().enumerate() {
             assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
-            assert_eq!(b.get_pk(i), u64::from_le_bytes(*pk) as u128, "row {i} u128");
+            assert_eq!(b.get_pk(i), u64::from_be_bytes(*pk) as u128, "row {i} u128");
         }
     }
 
@@ -2269,7 +2036,7 @@ mod tests {
         }
         for (i, pk) in pks.iter().enumerate() {
             assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
-            assert_eq!(b.get_pk(i), u128::from_le_bytes(*pk), "row {i} u128");
+            assert_eq!(b.get_pk(i), u128::from_be_bytes(*pk), "row {i} u128");
         }
     }
 
@@ -2291,7 +2058,7 @@ mod tests {
         b.set_pk_at_bytes(1, &new_pk_bytes);
         assert_eq!(b.get_pk(0), 10);
         assert_eq!(b.get_pk_bytes(1), &new_pk_bytes);
-        assert_eq!(b.get_pk(1), u128::from_le_bytes(new_pk_bytes));
+        assert_eq!(b.get_pk(1), u128::from_be_bytes(new_pk_bytes));
         assert_eq!(b.get_pk(2), 30);
     }
 
@@ -2317,27 +2084,27 @@ mod tests {
     }
 
     #[test]
-    fn find_lower_bound_bytes_narrow_matches_find_lower_bound() {
-        // Narrow single-PK equivalence: find_lower_bound (u128) and
-        // find_lower_bound_bytes must land on the same row. Single-column
-        // PKs keep the u128 fast path in prod (compare_pk_bytes is strictly
-        // slower for a bit-identical result); this guards equivalence.
+    fn find_lower_bound_bytes_narrow_opk() {
+        // Narrow single-PK: find_lower_bound_bytes is now a raw memcmp search
+        // over OPK bytes. For an unsigned U64 PK the OPK is big-endian, so the
+        // probe key is `to_be_bytes()`. Validate against a linear reference.
         let schema = minimal_u64_with_i64_schema();
         let mut b = Batch::empty_with_schema(&schema);
         let pks: [u64; 5] = [10, 20, 30, 40, 50];
         b.reserve_rows(pks.len());
         for &pk in &pks {
-            b.extend_pk(pk as u128);
+            b.extend_pk(pk as u128); // stored as OPK (BE) for unsigned
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
         }
         for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 50, 51, u64::MAX] {
-            let key_bytes = probe.to_le_bytes();
-            let by_u128 = b.find_lower_bound(probe as u128);
-            let by_bytes = b.find_lower_bound_bytes(&key_bytes, &schema);
-            assert_eq!(by_u128, by_bytes, "probe={probe}");
+            let key = probe.to_be_bytes();
+            let expected = (0..b.count)
+                .find(|&i| b.get_pk_bytes(i) >= &key[..])
+                .unwrap_or(b.count);
+            assert_eq!(b.find_lower_bound_bytes(&key), expected, "probe={probe}");
         }
     }
 
@@ -2386,10 +2153,10 @@ mod tests {
         for key in probes {
             // Expected: first row where compare_pk_bytes(row, key) is not Less.
             let expected = (0..b.count).find(|&i| {
-                super::super::columnar::compare_pk_bytes(&schema, b.get_pk_bytes(i), key)
+                super::super::columnar::compare_pk_bytes(b.get_pk_bytes(i), key)
                     != std::cmp::Ordering::Less
             }).unwrap_or(b.count);
-            let got = b.find_lower_bound_bytes(key, &schema);
+            let got = b.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");
         }
     }
@@ -2432,7 +2199,8 @@ mod tests {
         assert!(found);
 
         let mut dst = Batch::with_schema(schema, 1);
-        let pk_bytes = pk_val.to_le_bytes();
+        // PK region is OPK (big-endian) at rest; the lookup key must match.
+        let pk_bytes = pk_val.to_be_bytes();
         dst.append_row_from_ptable_found(&pt, &pk_bytes, -1);
         assert_eq!(dst.count, 1);
         assert_eq!(dst.get_pk_bytes(0), &pk_bytes);

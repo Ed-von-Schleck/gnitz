@@ -34,15 +34,15 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
 /// STRING columns are hashed to u64 (stored as u128); all others use the full value.
 fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
     if schema.is_pk_col(col_idx) {
-        if schema.pk_indices().len() == 1 {
-            return mb.get_pk(row);
-        }
-        // get_pk() returns all PK bytes packed; for a compound PK we need
-        // only this column's slice, not the concatenated region.
+        // PK region holds OPK bytes. `widen_pk_be` here matches
+        // `partition_for_pk_bytes` (which also calls `widen_pk_be`), giving the
+        // native value for unsigned and the sign-flipped value for signed.
+        // Decoding to native LE would disagree with `partition_for_pk_bytes` on
+        // signed PKs (it has no schema and cannot decode).
         let offset = schema.pk_byte_offset(col_idx) as usize;
         let bytes = mb.get_pk_bytes(row);
-        let col = &schema.columns[col_idx];
-        return crate::schema::promote_to_index_key(bytes, offset, col.size() as usize, col.type_code);
+        let col_size = schema.columns[col_idx].size() as usize;
+        return gnitz_wire::widen_pk_be(&bytes[offset..offset + col_size], col_size);
     }
     let pi = schema.payload_idx(col_idx);
     // NULL values shard together. Return 0 without touching the slot: a NULL
@@ -78,10 +78,14 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
         let bytes = mb.get_col_ptr(row, pi, 16);
         u128::from_le_bytes(bytes[0..16].try_into().unwrap())
     } else {
+        // Integer payload column (e.g. an FK joining to an integer PK): the
+        // value is native LE. OPK-encode it, then `widen_pk_be`, so the result
+        // agrees with `partition_for_pk_bytes(OPK)` on the PK side — including
+        // signed columns, where a raw LE read would route to the wrong worker.
         let bytes = mb.get_col_ptr(row, pi, col_size);
-        let mut buf = [0u8; 8];
-        buf[..col_size].copy_from_slice(bytes);
-        u64::from_le_bytes(buf) as u128
+        let mut opk = [0u8; 16];
+        gnitz_wire::encode_pk_column(&bytes[..col_size], col.type_code, &mut opk[..col_size]);
+        gnitz_wire::widen_pk_be(&opk[..col_size], col_size)
     }
 }
 
@@ -157,7 +161,9 @@ impl PartitionRouter {
 
     /// Scan every row in `batch` and record or retract its index key → worker mapping.
     /// Rows with negative weight retract; non-negative weight records.
-    #[allow(dead_code)]
+    /// Test-only today: no production path populates the router cache yet (the
+    /// master unicast-seek optimisation it backs is not wired up).
+    #[cfg(test)]
     pub fn record_routing(
         &mut self,
         batch: &Batch,
@@ -213,18 +219,14 @@ fn fill_worker_indices(
         out.resize_with(num_workers, Vec::new);
     }
     out[..num_workers].iter_mut().for_each(Vec::clear);
-    // Hoist the wide-PK discriminator out of the per-row loop: when the
-    // single routing column is a wide PK, `hash_row_for_partition`'s
-    // `get_pk` fast path would panic, so route the raw PK bytes instead.
-    // For compound-PK routing, `extract_group_key`'s hash-combine would
-    // produce a different partition than the worker's
-    // `PartitionedTable::local_index` (which keys on the raw u128 PK),
-    // so PK existence checks would miss data in the actual data
-    // partition; route compound PKs by their bytes too.
-    let is_single_pk = is_single_pk_col(schema, col_indices);
-    let is_wide = schema.pk_is_wide();
-    let is_compound_pk = !is_single_pk && schema.group_cols_eq_pk(col_indices);
-    if (is_single_pk && is_wide) || is_compound_pk {
+    // Strict sequence equality: route by PK bytes only when `col_indices` is
+    // exactly `pk_indices()` in order. Set equality (`group_cols_eq_pk`) would
+    // accept a permuted compound PK and disagree with `partition_for_pk_bytes`,
+    // which always hashes the OPK bytes in schema order — silently dropping
+    // join rows. `partition_for_pk_bytes` is the universal PK router at every
+    // width (it calls `widen_pk_be`), so narrow PKs take it too.
+    let is_pk_routing = col_indices == schema.pk_indices();
+    if is_pk_routing {
         for i in 0..batch.count {
             let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
             out[w_map[partition]].push(i as u32);
@@ -330,12 +332,10 @@ pub fn op_repartition_batches(
         // so the partition matches `PartitionedTable::local_index`. Mixing
         // the hash-combine path with PK-existence checks would route rows
         // to the wrong worker.
-        let is_single_pk = is_single_pk_col(schema, col_indices);
-        let is_wide = schema.pk_is_wide();
-        let is_compound_pk = !is_single_pk && schema.group_cols_eq_pk(col_indices);
+        let is_pk_routing = col_indices == schema.pk_indices();
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt { Some(m) => m, None => continue };
-            if (is_single_pk && is_wide) || is_compound_pk {
+            if is_pk_routing {
                 for i in 0..mb.count {
                     let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
@@ -385,7 +385,7 @@ fn relay_walk_inner<'a, const DO_REFILL: bool, Sel, Route>(
     worker_rows: &mut [Vec<(u8, u32)>],
     pk_cache: &mut [u128; 256],
     order_cache: &mut [u128; 256],
-    schema: &SchemaDescriptor,
+    _schema: &SchemaDescriptor,
     mut cursors: [u32; 256],
     mut active_sources: [u8; 256],
     mut num_active: usize,
@@ -424,7 +424,7 @@ fn relay_walk_inner<'a, const DO_REFILL: bool, Sel, Route>(
             active_sources[best_pos] = active_sources[num_active];
         } else if DO_REFILL {
             pk_cache[best_si] = mb.get_pk(new_cur);
-            order_cache[best_si] = pk_sort_key(schema, mb.get_pk_bytes(new_cur));
+            order_cache[best_si] = pk_sort_key(mb.get_pk_bytes(new_cur));
         }
     }
 }
@@ -463,7 +463,7 @@ fn relay_scatter_merge_walk(
             if mb.count > 0 {
                 if !is_wide {
                     pk_cache[si] = mb.get_pk(0);
-                    order_cache[si] = pk_sort_key(schema, mb.get_pk_bytes(0));
+                    order_cache[si] = pk_sort_key(mb.get_pk_bytes(0));
                 }
                 active_sources[num_active] = si as u8;
                 num_active += 1;
@@ -471,14 +471,13 @@ fn relay_scatter_merge_walk(
         }
     }
 
-    // Discriminators selected once, outside the hot loop. `is_pk_routing`
-    // matches `fill_worker_indices`: for narrow PKs, partition_for_key on
-    // the packed u128 equals partition_for_pk_bytes on the same bytes
-    // (proven by partition_for_pk_bytes_narrow_invariance), so both
-    // single-PK and compound-PK-set route through partition_for_key.
-    let is_single_pk = is_single_pk_col(schema, col_indices);
-    let is_compound_pk = !is_single_pk && schema.group_cols_eq_pk(col_indices);
-    let is_pk_routing = is_single_pk || is_compound_pk;
+    // Strict sequence equality (see `fill_worker_indices`): set equality would
+    // route a permuted compound PK to a different worker than the schema-order
+    // `partition_for_pk_bytes` on the other join side. For narrow PKs,
+    // `partition_for_key(get_pk value)` equals `partition_for_pk_bytes(OPK)`
+    // (both reduce to `partition_for_key(widen_pk_be)`), so the value-cache
+    // route path stays consistent.
+    let is_pk_routing = col_indices == schema.pk_indices();
 
     // Route closures — 3-arg form. pk_val is the cached PK in the K-way
     // path and `get_pk(row)` in the bulk-drain (both narrow only).
@@ -552,7 +551,7 @@ fn relay_scatter_merge_walk(
                     .as_ref()
                     .unwrap()
                     .get_pk_bytes(cursors[si_idx] as usize);
-                let ord = compare_pk_bytes(schema, pk, best_pk_bytes);
+                let ord = compare_pk_bytes(pk, best_pk_bytes);
                 if ord == Ordering::Less || (ord == Ordering::Equal && si < best_si_u8) {
                     best_pos = pos;
                     best_si_u8 = si;
@@ -661,12 +660,10 @@ pub fn op_multi_scatter(
         }
         for slot in flat_indices[..needed].iter_mut() { slot.clear(); }
 
-        let is_wide = schema.pk_is_wide();
         for si in 0..n_specs {
             let spec = col_specs[si];
-            let is_single_pk = is_single_pk_col(schema, spec);
-            let is_compound_pk = !is_single_pk && schema.group_cols_eq_pk(spec);
-            if (is_single_pk && is_wide) || is_compound_pk {
+            let is_pk_routing = spec == schema.pk_indices();
+            if is_pk_routing {
                 for i in 0..n {
                     let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
                     flat_indices[si * num_workers + w_map[partition]].push(i as u32);
@@ -695,7 +692,7 @@ pub fn op_multi_scatter(
         // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
         for si in 0..n_specs {
             let spec = col_specs[si];
-            if schema.group_cols_eq_pk(spec) {
+            if spec == schema.pk_indices() {
                 if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
                     for batch in results[si].iter_mut().take(num_workers) {
                         if batch.count > 0 {
@@ -916,7 +913,7 @@ mod tests {
                 let prev = sb.get_pk_bytes(r - 1);
                 let cur = sb.get_pk_bytes(r);
                 assert_ne!(
-                    compare_pk_bytes(&schema, prev, cur),
+                    compare_pk_bytes(prev, cur),
                     std::cmp::Ordering::Greater,
                     "worker {w} row {r} out of order",
                 );
@@ -956,7 +953,13 @@ mod tests {
     ) -> ConsolidatedBatch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk(pk);
+            // `mk_compound_pk` packs c0 in the low 8 bytes and c1 in the high 8.
+            // The compound PK at rest is OPK = col0_BE ++ col1_BE, so encode the
+            // two native column values through extend_pk_opk rather than writing
+            // the raw u128 (which would byte-reverse the column order).
+            let c0 = pk as u64 as u128;
+            let c1 = (pk >> 64) as u64 as u128;
+            b.extend_pk_opk(schema, &[c0, c1]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -975,7 +978,7 @@ mod tests {
         // (1, 10) < (2, 0). Likewise (1, 5) < (1, 10) < (1, 15) lexicographically.
         let schema = make_narrow_compound_schema();
         assert!(!schema.pk_is_wide(), "pk_stride must be 16 (narrow)");
-        assert!(!schema.pk_is_fast(), "compound PK must take slow path");
+        assert!(schema.pk_indices().len() > 1, "compound PK must take slow path");
         let num_workers = 4;
         let b0 = make_narrow_compound_batch(&schema, &[
             (mk_compound_pk(1, 10), 1, 11),
@@ -1004,7 +1007,7 @@ mod tests {
                 let prev = sb.get_pk_bytes(r - 1);
                 let cur = sb.get_pk_bytes(r);
                 assert_ne!(
-                    compare_pk_bytes(&schema, prev, cur),
+                    compare_pk_bytes(prev, cur),
                     Ordering::Greater,
                     "worker {w} row {r} out of order (compound PK)",
                 );
@@ -1032,9 +1035,10 @@ mod tests {
     fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> ConsolidatedBatch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            // I64 PK stored as u64 bit pattern in u128 low bytes; mirrors
-            // extract_pk_value's `(v as u64) as u128` for I64.
-            b.extend_pk((pk as u64) as u128);
+            // Signed PK at rest is OPK (big-endian, sign-bit flipped), so
+            // memcmp == signed order. Encode through extend_pk_opk, not the
+            // raw right-aligned `extend_pk` (which would store native bytes).
+            b.extend_pk_opk(schema, &[(pk as u64) as u128]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1074,7 +1078,7 @@ mod tests {
                 let prev = sb.get_pk(r - 1);
                 let cur  = sb.get_pk(r);
                 assert_ne!(
-                    compare_pk_bytes(&schema, sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
+                    compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
                     Ordering::Greater,
                     "worker {w} row {r}: signed pks out of order (prev={prev:#x} cur={cur:#x})",
                 );
@@ -1344,7 +1348,11 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), vals.len());
 
         for &v in &vals {
-            let expected_partition = partition_for_key(v as u128);
+            // Routing by a payload column uses the canonical route key (signed
+            // columns are sign-flipped via payload_route_key) so a payload FK
+            // routes identically to the same value stored as a PK column.
+            let route_key = crate::schema::payload_route_key(&v.to_le_bytes(), 0, 8, type_code::I64);
+            let expected_partition = partition_for_key(route_key);
             let expected_worker = worker_for_partition(expected_partition, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {
                 i64::from_le_bytes(

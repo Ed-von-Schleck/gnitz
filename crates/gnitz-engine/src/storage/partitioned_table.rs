@@ -416,19 +416,18 @@ pub fn partition_for_key(pk: u128) -> usize {
     mix(pk)
 }
 
-/// Route a raw PK region (any width) to a partition. For `len ≤ 16` this
-/// is exactly `partition_for_key` of the same bytes zero-extended to
-/// `u128` — the narrow-PK hash invariance every narrow caller relies on.
-/// For wide regions (`len > 16`) it takes the top 8 bits of xxh3 directly:
-/// xxh3 is already uniformly distributed, so funnelling it back through
-/// `mix` (whose `hi·M2` term is a dead zero for a zero-extended `u64`)
-/// would add an instruction without adding entropy.
+/// Route an OPK PK region (any width) to a partition. For `len ≤ 16` the OPK
+/// bytes are big-endian, so `widen_pk_be` right-aligns them to recover the
+/// native unsigned value (sign-flipped for signed); `mix` of that equals
+/// `partition_for_key(widen_pk_be(bytes))`. This is the invariant the join
+/// router relies on: `extract_col_key` (both PK and OPK-encoded payload paths)
+/// also funnels through `widen_pk_be`, so the two sides of a distributed join
+/// agree. For wide regions (`len > 16`) it takes the top 8 bits of xxh3 of the
+/// OPK bytes directly (uniformly distributed already).
 #[inline]
 pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
     if bytes.len() <= 16 {
-        let mut b = [0u8; 16];
-        b[..bytes.len()].copy_from_slice(bytes);
-        mix(u128::from_le_bytes(b))
+        mix(gnitz_wire::widen_pk_be(bytes, bytes.len()))
     } else {
         (crate::xxh::checksum(bytes) >> 56) as usize
     }
@@ -574,22 +573,21 @@ mod tests {
 
     #[test]
     fn partition_for_pk_bytes_narrow_invariance() {
-        // For every narrow width, routing the physically-stored bytes must
-        // equal partition_for_key of the same value zero-extended to u128.
+        // For every narrow width, routing the physically-stored OPK
+        // (big-endian) bytes must equal partition_for_key of the same value.
         let vals: [u128; 9] = [
             0, 1, 7, 42, 255, 65537, 0x0123_4567_89ab_cdef,
             u64::MAX as u128, u128::MAX,
         ];
         for &v in &vals {
             for &len in &[1usize, 2, 4, 8, 16] {
-                let full = v.to_le_bytes();
-                let bytes = &full[..len];
-                let mut z = [0u8; 16];
-                z[..len].copy_from_slice(bytes);
-                let zext = u128::from_le_bytes(z);
+                // Truncate v to the column width, then OPK-encode (big-endian).
+                let value = if len == 16 { v } else { v & ((1u128 << (len * 8)) - 1) };
+                let be = value.to_be_bytes();
+                let opk = &be[16 - len..];
                 assert_eq!(
-                    partition_for_pk_bytes(bytes),
-                    partition_for_key(zext),
+                    partition_for_pk_bytes(opk),
+                    partition_for_key(value),
                     "len={len} v={v:#x}",
                 );
             }

@@ -56,6 +56,7 @@ impl CatalogEngine {
             sys_circuit_edges,
             sys_circuit_node_columns,
             pending_broadcasts: Vec::new(),
+            pending_dir_deletions: Vec::new(),
             ddl_zone_lsn: 0,
             cascading_drop: false,
         };

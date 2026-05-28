@@ -6,10 +6,9 @@
 use std::cmp::Ordering;
 
 use crate::schema::{
-    compare_german_strings, read_signed, read_unsigned, SchemaDescriptor,
+    compare_german_strings, read_signed, SchemaDescriptor,
     type_code::{
         BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64,
-        I8 as TYPE_I8, I16 as TYPE_I16, I32 as TYPE_I32, I64 as TYPE_I64,
         STRING as TYPE_STRING,
         U8 as TYPE_U8, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64,
         U128 as TYPE_U128, UUID as TYPE_UUID,
@@ -124,108 +123,24 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
 // Column-aware PK byte-region comparator
 // ---------------------------------------------------------------------------
 
-/// Column-aware byte-wise comparator for PK regions.
+/// Raw byte comparator for PK regions.
 ///
-/// `a` and `b` are concatenated LE bytes of every PK column in
-/// `schema.pk_indices()` order — the format produced by
-/// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`. The walk
-/// slices each column's `size()` bytes off the front and dispatches
-/// on the column's `type_code`. PK columns are non-nullable, so no
-/// null-bit handling. Unsigned narrow types use `read_unsigned`
-/// (zero-extension); signed narrow types use `read_signed`
-/// (sign-extension).
-///
-/// Single-column PKs do not reach this function: the merge entry
-/// points truncate the packed `u128` key back to the native type and
-/// compare directly. It is the column-walk comparator for compound
-/// (`pk_count >= 2`) PKs.
-#[inline]
-pub fn compare_pk_bytes(
-    schema: &SchemaDescriptor,
-    a: &[u8],
-    b: &[u8],
-) -> Ordering {
-    debug_assert!(
-        !schema.pk_indices().is_empty(),
-        "compare_pk_bytes: schema has no PK columns",
-    );
-    debug_assert_eq!(
-        a.len(), schema.pk_stride() as usize,
-        "compare_pk_bytes: a.len() must equal pk_stride",
-    );
-    debug_assert_eq!(
-        b.len(), schema.pk_stride() as usize,
-        "compare_pk_bytes: b.len() must equal pk_stride",
-    );
-    let mut off = 0usize;
-    for (_ord, _ci, col) in schema.pk_columns() {
-        let cs = col.size() as usize;
-        let ord = match col.type_code {
-            TYPE_U128 | TYPE_UUID => {
-                let va = u128::from_le_bytes(a[off..off + 16].try_into().unwrap());
-                let vb = u128::from_le_bytes(b[off..off + 16].try_into().unwrap());
-                va.cmp(&vb)
-            }
-            TYPE_U64 | TYPE_U32 | TYPE_U16 | TYPE_U8 => {
-                let va = read_unsigned(&a[off..], cs);
-                let vb = read_unsigned(&b[off..], cs);
-                va.cmp(&vb)
-            }
-            TYPE_I64 | TYPE_I32 | TYPE_I16 | TYPE_I8 => {
-                let va = read_signed(&a[off..], cs);
-                let vb = read_signed(&b[off..], cs);
-                va.cmp(&vb)
-            }
-            other => panic!(
-                "compare_pk_bytes: type_code {other} is not PK-eligible",
-            ),
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-        off += cs;
-    }
-    Ordering::Equal
+/// After the OPK-at-rest flip every PK region at rest holds order-preserving
+/// big-endian bytes, so unsigned lexicographic byte comparison is numerically
+/// identical to the typed comparison of the PK columns for any width. `a.cmp(b)`
+/// compiles to an optimal `memcmp` (vectorised for long slices, a single
+/// instruction for 8/16-byte keys). `a` and `b` are the OPK bytes produced by
+/// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`.
+#[inline(always)]
+pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    a.cmp(b)
 }
 
-/// Order-preserving big-endian encoding of one PK column.
-///
-/// `src` and `dst` are both exactly `cs = col.size()` bytes. The result is the
-/// order-twin of the matching arm in `compare_pk_bytes`: unsigned lexicographic
-/// comparison of `dst` equals the numeric comparison `compare_pk_bytes` performs
-/// for this column. Panics on the same non-PK-eligible type codes (floats) so a
-/// float PK — already rejected at the catalog, wire, and `SchemaDescriptor::new`
-/// layers — fails loudly here too rather than producing silent misorder.
-#[inline]
-fn encode_pk_column(src: &[u8], type_code: u8, dst: &mut [u8]) {
-    debug_assert_eq!(dst.len(), src.len());
-    // U128/UUID compare as `u128::from_le_bytes`; U8..U64 via `read_unsigned`
-    // (zero-extension); signed via `read_signed`. All are pure magnitude once the
-    // sign bit is handled below, so big-endian == reversed LE. The byte-swap is
-    // identical bit-work regardless of signedness, so the width arms read as the
-    // unsigned type. Width-specialised so each arm folds to a single
-    // `bswap`/`movbe` (a runtime-length byte loop would not), mirroring
-    // `pack_pk_le`.
-    let signed = match type_code {
-        TYPE_U128 | TYPE_UUID | TYPE_U64 | TYPE_U32 | TYPE_U16 | TYPE_U8 => false,
-        TYPE_I64 | TYPE_I32 | TYPE_I16 | TYPE_I8 => true,
-        other => panic!("encode_pk_column: type_code {other} is not PK-eligible"),
-    };
-    match dst.len() {
-        16 => dst.copy_from_slice(&u128::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        8 => dst.copy_from_slice(&u64::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        4 => dst.copy_from_slice(&u32::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        2 => dst.copy_from_slice(&u16::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        1 => dst[0] = src[0],
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
-    // Signed: biasing by 2^(bits-1) maps the signed range monotonically onto the
-    // unsigned range (negatives first). After the BE reversal that bias is a flip
-    // of the sign bit, which is the top bit of the leading byte.
-    if signed {
-        dst[0] ^= 0x80;
-    }
-}
+// The order-preserving column encoder/decoder primitives live in `gnitz-wire`
+// so the client write path (`gnitz-core`) and the server read path share one
+// implementation. Re-exported here so engine modules can spell them
+// `columnar::encode_pk_column` / `columnar::decode_pk_column`.
+use gnitz_wire::encode_pk_column;
 
 /// Encode a full PK region (`schema.pk_stride()` bytes, columns in pk-list
 /// order) into an order-preserving big-endian key. `pk_bytes` and `out` are both
@@ -248,6 +163,22 @@ pub(crate) fn encode_order_preserving_pk(
         encode_pk_column(&pk_bytes[off..off + cs], col.type_code, &mut out[off..off + cs]);
         off += cs;
     }
+}
+
+/// OPK-encode a **native** PK value `key` (handling signed/compound columns)
+/// into a stack buffer, returning the buffer and its `pk_stride`. The narrow-PK
+/// entry points encode once here and delegate to a byte-addressed sibling that
+/// runs the universal OPK lookup. Wide PKs (`pk_stride > 16`) cannot fit a
+/// `u128` and must take the byte path directly.
+#[inline]
+pub(crate) fn opk_key(
+    schema: &SchemaDescriptor,
+    key: u128,
+) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
+    let stride = schema.pk_stride() as usize;
+    let mut opk = [0u8; crate::schema::MAX_PK_BYTES];
+    encode_order_preserving_pk(schema, &key.to_le_bytes()[..stride], &mut opk[..stride]);
+    (opk, stride)
 }
 
 // ---------------------------------------------------------------------------
@@ -797,21 +728,49 @@ mod tests {
         SchemaDescriptor::new(&cols, &pk)
     }
 
-    /// The load-bearing OPK property: the order-preserving key's
-    /// byte-lexicographic order equals `compare_pk_bytes` order, column for
-    /// column. Both the narrow `u128::from_be_bytes(buf)` sort key and the wide
-    /// 16-byte prefix are order-equivalent to this byte-lexicographic compare
-    /// for a fixed per-batch stride, so validating the byte form validates both.
-    fn assert_opk_equivalence(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) {
+    /// Independent typed reference comparator over native-LE PK bytes. This is
+    /// the per-column column-walk that `compare_pk_bytes` used *before* the OPK
+    /// flip; kept here as the test oracle for "OPK byte order == typed order".
+    fn typed_cmp_pk_le(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
+        let mut off = 0usize;
+        for (_ord, _ci, col) in schema.pk_columns() {
+            let cs = col.size() as usize;
+            let ord = match col.type_code {
+                type_code::U128 | type_code::UUID => {
+                    let va = u128::from_le_bytes(a[off..off + 16].try_into().unwrap());
+                    let vb = u128::from_le_bytes(b[off..off + 16].try_into().unwrap());
+                    va.cmp(&vb)
+                }
+                type_code::U64 | type_code::U32 | type_code::U16 | type_code::U8 => {
+                    use crate::schema::read_unsigned;
+                    read_unsigned(&a[off..], cs).cmp(&read_unsigned(&b[off..], cs))
+                }
+                _ => read_signed(&a[off..], cs).cmp(&read_signed(&b[off..], cs)),
+            };
+            if ord != Ordering::Equal { return ord; }
+            off += cs;
+        }
+        Ordering::Equal
+    }
+
+    /// Compare two native-LE PK tuples the way storage now does: encode each to
+    /// OPK, then `compare_pk_bytes` (a raw memcmp). Mirrors the read path.
+    fn cmp_pk_le(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
         let stride = schema.pk_stride() as usize;
         let mut opk_a = vec![0u8; stride];
         let mut opk_b = vec![0u8; stride];
         encode_order_preserving_pk(schema, a, &mut opk_a);
         encode_order_preserving_pk(schema, b, &mut opk_b);
+        compare_pk_bytes(&opk_a, &opk_b)
+    }
+
+    /// The load-bearing OPK property: a raw memcmp of the order-preserving keys
+    /// equals the typed lexicographic comparison of the PK columns.
+    fn assert_opk_equivalence(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) {
         assert_eq!(
-            opk_a.cmp(&opk_b),
-            compare_pk_bytes(schema, a, b),
-            "OPK order disagrees with compare_pk_bytes for a={a:?} b={b:?}",
+            cmp_pk_le(schema, a, b),
+            typed_cmp_pk_le(schema, a, b),
+            "OPK order disagrees with typed comparison for a={a:?} b={b:?}",
         );
     }
 
@@ -824,7 +783,7 @@ mod tests {
                 let a = vals[i].to_le_bytes();
                 let b = vals[j].to_le_bytes();
                 assert_eq!(
-                    compare_pk_bytes(&s, &a, &b),
+                    cmp_pk_le(&s, &a, &b),
                     vals[i].cmp(&vals[j]),
                     "U64 mismatch at ({i}, {j})",
                 );
@@ -833,7 +792,7 @@ mod tests {
         }
         // Pin the LE-bytes vs lex-bytes regression: 1 < 256.
         assert_eq!(
-            compare_pk_bytes(&s, &1u64.to_le_bytes(), &256u64.to_le_bytes()),
+            cmp_pk_le(&s, &1u64.to_le_bytes(), &256u64.to_le_bytes()),
             Ordering::Less,
         );
     }
@@ -844,15 +803,15 @@ mod tests {
         let lo = u64::MAX as u128;
         let hi = lo + 1;
         assert_eq!(
-            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
             Ordering::Less,
         );
         assert_eq!(
-            compare_pk_bytes(&s, &hi.to_le_bytes(), &lo.to_le_bytes()),
+            cmp_pk_le(&s, &hi.to_le_bytes(), &lo.to_le_bytes()),
             Ordering::Greater,
         );
         assert_eq!(
-            compare_pk_bytes(&s, &lo.to_le_bytes(), &lo.to_le_bytes()),
+            cmp_pk_le(&s, &lo.to_le_bytes(), &lo.to_le_bytes()),
             Ordering::Equal,
         );
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
@@ -866,7 +825,7 @@ mod tests {
         let high: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000;
         // High-bit-set sorts above small value (u128 LE numerical order).
         assert_eq!(
-            compare_pk_bytes(&s, &low.to_le_bytes(), &high.to_le_bytes()),
+            cmp_pk_le(&s, &low.to_le_bytes(), &high.to_le_bytes()),
             Ordering::Less,
         );
         assert_opk_equivalence(&s, &low.to_le_bytes(), &high.to_le_bytes());
@@ -881,7 +840,7 @@ mod tests {
                 let a = [vals[i] as u8];
                 let b = [vals[j] as u8];
                 assert_eq!(
-                    compare_pk_bytes(&s, &a, &b),
+                    cmp_pk_le(&s, &a, &b),
                     vals[i].cmp(&vals[j]),
                     "I8 mismatch at ({i}, {j})",
                 );
@@ -889,7 +848,7 @@ mod tests {
             }
         }
         // Sign-extension regression: -1 (0xFF) < 1 (0x01).
-        assert_eq!(compare_pk_bytes(&s, &[0xFF], &[0x01]), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &[0xFF], &[0x01]), Ordering::Less);
     }
 
     #[test]
@@ -901,7 +860,7 @@ mod tests {
                 let a = vals[i].to_le_bytes();
                 let b = vals[j].to_le_bytes();
                 assert_eq!(
-                    compare_pk_bytes(&s, &a, &b),
+                    cmp_pk_le(&s, &a, &b),
                     vals[i].cmp(&vals[j]),
                     "I16 mismatch at ({i}, {j})",
                 );
@@ -919,7 +878,7 @@ mod tests {
                 let a = vals[i].to_le_bytes();
                 let b = vals[j].to_le_bytes();
                 assert_eq!(
-                    compare_pk_bytes(&s, &a, &b),
+                    cmp_pk_le(&s, &a, &b),
                     vals[i].cmp(&vals[j]),
                     "I32 mismatch at ({i}, {j})",
                 );
@@ -937,7 +896,7 @@ mod tests {
                 let a = vals[i].to_le_bytes();
                 let b = vals[j].to_le_bytes();
                 assert_eq!(
-                    compare_pk_bytes(&s, &a, &b),
+                    cmp_pk_le(&s, &a, &b),
                     vals[i].cmp(&vals[j]),
                     "I64 mismatch at ({i}, {j})",
                 );
@@ -950,8 +909,8 @@ mod tests {
     fn compare_pk_bytes_single_unsigned_u8() {
         let s = pk_only_schema(&[type_code::U8]);
         // High-bit-set vs small: 0xFF > 0x01 numerically as unsigned.
-        assert_eq!(compare_pk_bytes(&s, &[0xFFu8], &[0x01u8]), Ordering::Greater);
-        assert_eq!(compare_pk_bytes(&s, &[0x00u8], &[0xFFu8]), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &[0xFFu8], &[0x01u8]), Ordering::Greater);
+        assert_eq!(cmp_pk_le(&s, &[0x00u8], &[0xFFu8]), Ordering::Less);
         assert_opk_equivalence(&s, &[0xFFu8], &[0x01u8]);
         assert_opk_equivalence(&s, &[0x00u8], &[0xFFu8]);
     }
@@ -963,7 +922,7 @@ mod tests {
         let hi: u16 = 0xFFFE;
         // Zero-extension: hi > lo. Sign-extension would invert.
         assert_eq!(
-            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
             Ordering::Less,
         );
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
@@ -975,7 +934,7 @@ mod tests {
         let lo: u32 = 1;
         let hi: u32 = 0xFFFF_FFFE;
         assert_eq!(
-            compare_pk_bytes(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
+            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
             Ordering::Less,
         );
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
@@ -994,10 +953,10 @@ mod tests {
         let r1 = mk(1, 9);
         let r2 = mk(2, 1);
         // Same first column, second column tiebreaks ascending.
-        assert_eq!(compare_pk_bytes(&s, &r0, &r1), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &r0, &r1), Ordering::Less);
         // First column dominates (would be Greater under a u128 LE compare,
         // which would treat the second column as the high-order bits).
-        assert_eq!(compare_pk_bytes(&s, &r1, &r2), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &r1, &r2), Ordering::Less);
         assert_opk_equivalence(&s, &r0, &r1);
         assert_opk_equivalence(&s, &r1, &r2);
         assert_opk_equivalence(&s, &r0, &r2);
@@ -1016,7 +975,7 @@ mod tests {
         let zero = mk(1, 0);
         // Per-column dispatch picks read_signed for col 1 even though col 0
         // is unsigned: -5 < 0.
-        assert_eq!(compare_pk_bytes(&s, &neg, &zero), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &neg, &zero), Ordering::Less);
         assert_opk_equivalence(&s, &neg, &zero);
     }
 
@@ -1039,7 +998,7 @@ mod tests {
         let mut b = Vec::with_capacity(16);
         b.extend_from_slice(&2u64.to_le_bytes()); // col1
         b.extend_from_slice(&0u64.to_le_bytes()); // col0
-        assert_eq!(compare_pk_bytes(&s, &a, &b), Ordering::Less);
+        assert_eq!(cmp_pk_le(&s, &a, &b), Ordering::Less);
         // Encoder iterates pk-list order [1,0], same as the comparator.
         assert_opk_equivalence(&s, &a, &b);
     }
@@ -1055,7 +1014,7 @@ mod tests {
             let stride = s.pk_stride() as usize;
             let buf = vec![0xABu8; stride];
             assert_eq!(
-                compare_pk_bytes(&s, &buf, &buf),
+                cmp_pk_le(&s, &buf, &buf),
                 Ordering::Equal,
                 "equal-buffer mismatch for type_code {tc}",
             );
@@ -1063,7 +1022,7 @@ mod tests {
         // Compound (U64, U64) equal buffers.
         let s = pk_only_schema(&[type_code::U64, type_code::U64]);
         let buf = vec![0x7Fu8; 16];
-        assert_eq!(compare_pk_bytes(&s, &buf, &buf), Ordering::Equal);
+        assert_eq!(cmp_pk_le(&s, &buf, &buf), Ordering::Equal);
         assert_opk_equivalence(&s, &buf, &buf);
     }
 

@@ -782,6 +782,11 @@ impl WorkerProcess {
                         if let Err(msg) = self.cat().ddl_sync(target_id, batch) {
                             return DispatchResult::Error(msg);
                         }
+                        // Drop hooks queue the entity's directory, but the master
+                        // (which shares this on-disk tree) physically removes it
+                        // after the DDL zone is durable. Discard the worker's
+                        // redundant queue so it cannot grow unbounded.
+                        self.cat().discard_pending_dir_deletions();
                         gnitz_debug!("W{} ddl_sync tid={}", self.worker_id, target_id);
                     }
                 }
@@ -869,9 +874,9 @@ impl WorkerProcess {
                 let col_idx = seek_col_idx as u32;
                 // The indexed source column is at most 16 bytes (UUID/U128) and
                 // we never need `seek_pk_extra` here — index keys are always
-                // promoted to ≤16 bytes. Prefix length = source column size,
-                // matching the leading zero-padded bytes written by
-                // `batch_project_index`.
+                // promoted to ≤16 bytes. We pass the value's native source-width
+                // bytes; `seek_by_index` zero-extends and OPK-encodes them to the
+                // promoted index key before seeking the OPK-at-rest index.
                 let col_size = self.cat()
                     .get_schema_desc(target_id)
                     .and_then(|s| s.columns.get(col_idx as usize).map(|c| c.size() as usize))
@@ -906,7 +911,7 @@ impl WorkerProcess {
                 };
                 let result = if let Some(s) = wide_schema {
                     let stride = s.pk_stride() as usize;
-                    let buf = match crate::schema::assemble_wide_pk(seek_pk, &seek_pk_extra, stride) {
+                    let buf = match crate::schema::assemble_wide_pk(&s, seek_pk, &seek_pk_extra, stride) {
                         Ok(buf) => buf,
                         Err(e) => return DispatchResult::Error(format!("seek: {e}")),
                     };
@@ -1210,26 +1215,17 @@ impl WorkerProcess {
                 // is already in the index. `open_cursor` avoids letting a
                 // compaction Io/InvalidShard failure silently turn a present
                 // key into "absent".
-                let owner_schema = self.cat().get_schema_desc(target_id)
-                    .ok_or_else(|| format!("no owner schema for tid={}", target_id))?;
-                let src_col_size = owner_schema.columns[col_idx as usize].size() as usize;
                 let table = unsafe { &*index_handle };
                 let mut cursor = table.open_cursor();
-                // The check batch's PK is the index composite
-                // `(indexed-value, src_pk_cols)`, which can itself be wide.
-                // Either way the indexed prefix is the leading `src_col_size`
-                // bytes of the PK; route wide composites through the byte path
-                // (the narrow `get_pk` would panic for a wide composite).
-                let result = if schema.pk_is_wide() {
-                    filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                        cursor.cursor.seek_first_positive_with_prefix(&pkb[..src_col_size])
-                    })
-                } else {
-                    filter_by_pk(&batch, schema, n, |pk_u128| {
-                        let key_bytes = pk_u128.to_le_bytes();
-                        cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..src_col_size])
-                    })
-                };
+                // The check batch's PK is the OPK index composite
+                // `(indexed-value, src_pk_cols)`; the leading `idx_key_size`
+                // bytes are the OPK-encoded indexed value. Prefix-match that
+                // whole leading column — OPK puts the distinguishing bytes last,
+                // so a source-width prefix would match only the zero high bytes.
+                let idx_key_size = schema.columns[0].size() as usize;
+                let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
+                    cursor.cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
+                });
                 (schema, result)
             }
             HasPkLookup::PrimaryKey => {
@@ -1344,6 +1340,9 @@ impl WorkerProcess {
         for ddl in std::mem::take(&mut self.exchange.deferred) {
             let _ = self.cat().ddl_sync(ddl.target_id, ddl.batch);
         }
+        // See the DdlSync dispatch arm: the master owns physical directory
+        // removal for the shared tree; the worker only discards its queue.
+        self.cat().discard_pending_dir_deletions();
     }
 
     /// Send FLAG_EXCHANGE to the master and block until its FLAG_EXCHANGE_RELAY

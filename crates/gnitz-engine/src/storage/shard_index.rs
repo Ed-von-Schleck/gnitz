@@ -13,20 +13,14 @@ use crate::schema::SchemaDescriptor;
 use super::manifest::{self, ManifestEntryRaw, PkBuf, PreparedManifest};
 use super::shard_reader::MappedShard;
 
-/// Non-fast PK range check (compound `pk_count >= 2`, or a single signed
-/// column). The `probe_pk` caller hoists the raw-`u128` compare out for
-/// `pk_is_fast` (single unsigned) keys, so this column-aware path runs only
-/// when the packed u128 order diverges from storage order. `&[u8]` key so the
-/// `sort_by`/probe closures never copy the 81-byte `PkBuf` by value.
+/// PK range check over OPK bytes: `min <= key <= max`. After the OPK-at-rest
+/// flip the stored `pk_min`/`pk_max` and `key` are all order-preserving big-
+/// endian, so this is a raw `memcmp` at every PK width — no schema. `&[u8]` key
+/// so the `sort_by`/probe closures never copy the 81-byte `PkBuf` by value.
 #[inline]
-fn pk_in_range(
-    schema: &SchemaDescriptor,
-    min: &PkBuf,
-    max: &PkBuf,
-    key: &[u8],
-) -> bool {
-    compare_pk_bytes(schema, min.pk_bytes(), key) != Ordering::Greater
-        && compare_pk_bytes(schema, key, max.pk_bytes()) != Ordering::Greater
+fn pk_in_range(min: &PkBuf, max: &PkBuf, key: &[u8]) -> bool {
+    compare_pk_bytes(min.pk_bytes(), key) != Ordering::Greater
+        && compare_pk_bytes(key, max.pk_bytes()) != Ordering::Greater
 }
 
 /// A shard that has been written and mmap'd at its `.tmp` path but not yet
@@ -104,82 +98,29 @@ impl ShardEntry {
         })
     }
 
-    fn probe_pk(
-        &self,
-        key: u128,
-        schema: &SchemaDescriptor,
-    ) -> Option<(Rc<MappedShard>, usize)> {
+    /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
+    /// wide). Universal across all PK widths after the OPK-at-rest flip: range
+    /// check, XOR8 fingerprint, and the binary search are all raw byte ops. The
+    /// XOR8 fingerprint matches `build_xor8_from_pk_region`: `widen_pk_be` of
+    /// the OPK bytes for narrow (`≤16`), `xxh::checksum` for wide.
+    fn probe_pk_bytes(&self, key: &[u8]) -> Option<(Rc<MappedShard>, usize)> {
         if self.is_empty() {
             return None;
         }
-        let in_range = if schema.pk_is_fast() {
-            // Single unsigned column. Raw u128 range check, behaviourally and
-            // cost-identical to the pre-PkBuf `pk_min <= key <= pk_max`.
-            debug_assert!(schema.pk_stride() == 8 || schema.pk_stride() == 16);
-            self.pk_min.as_u128_single_pk() <= key
-                && key <= self.pk_max.as_u128_single_pk()
-        } else {
-            // Compound (pk_count >= 2) or single signed column: the raw u128
-            // order diverges from storage order, so range-check via
-            // `compare_pk_bytes`. The u128 entry point can only carry a region
-            // that fits in 16 bytes, so a wider pk_stride here is a routing bug.
-            let stride = schema.pk_stride() as usize;
-            assert!(
-                stride <= 16,
-                "probe_pk: PK region wider than 16 bytes reached \
-                 the u128 entry point (routing bug)",
-            );
-            // `key` is the faithful narrow encoding (LE concatenation for
-            // compound, zero-extended for signed); slice it to the region width.
-            let key_le = key.to_le_bytes();
-            pk_in_range(schema, &self.pk_min, &self.pk_max, &key_le[..stride])
-        };
-        if in_range {
-            if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
+        if !pk_in_range(&self.pk_min, &self.pk_max, key) {
+            return None;
+        }
+        if self.shard.has_xor8() {
+            let fp = if key.len() > 16 {
+                crate::xxh::checksum(key) as u128
+            } else {
+                gnitz_wire::widen_pk_be(key, key.len())
+            };
+            if !self.shard.xor8_may_contain(fp) {
                 return None;
             }
-            // `find_row_index` binary-searches by raw u128 (storage order only
-            // for `pk_is_fast`); compound/signed PKs must look up by bytes.
-            let row = if schema.pk_is_fast() {
-                self.shard.find_row_index(key)
-            } else {
-                let stride = schema.pk_stride() as usize;
-                let key_le = key.to_le_bytes();
-                let k = &key_le[..stride];
-                let idx = self.shard.find_lower_bound_bytes(k, schema);
-                (idx < self.shard.count && self.shard.get_pk_bytes(idx) == k).then_some(idx)
-            };
-            if let Some(row) = row {
-                return Some((Rc::clone(&self.shard), row));
-            }
         }
-        None
-    }
-
-    /// Wide-only (`pk_stride > 16`) byte-keyed probe. `key` is the raw PK
-    /// bytes (exactly `pk_stride` wide). The XOR8 filter on a wide shard was
-    /// built from `xxh::checksum(pk_bytes) as u128` (see
-    /// `shard_file::build_xor8_from_pk_region`), so the probe queries it the
-    /// same way — unconditionally, since this entry point only ever sees wide
-    /// shards.
-    fn probe_pk_bytes(
-        &self,
-        key: &[u8],
-        schema: &SchemaDescriptor,
-    ) -> Option<(Rc<MappedShard>, usize)> {
-        debug_assert!(schema.pk_is_wide());
-        if self.is_empty() {
-            return None;
-        }
-        if !pk_in_range(schema, &self.pk_min, &self.pk_max, key) {
-            return None;
-        }
-        if self.shard.has_xor8()
-            && !self.shard.xor8_may_contain(crate::xxh::checksum(key) as u128)
-        {
-            return None;
-        }
-        let idx = self.shard.find_lower_bound_bytes(key, schema);
+        let idx = self.shard.find_lower_bound_bytes(key);
         if idx < self.shard.count && self.shard.get_pk_bytes(idx) == key {
             return Some((Rc::clone(&self.shard), idx));
         }
@@ -302,29 +243,15 @@ impl ShardIndex {
     }
 
     fn sort_l0(&mut self) {
-        // The single-PK gate is loop-invariant for a given table;
-        // evaluate it once and branch the whole sort call (not a
-        // per-comparison branch).
-        if self.schema.pk_indices().len() == 1 {
-            // Every table today. `false < true` sinks is_empty entries
-            // to the end (matching the old u128::MAX sentinel position);
-            // non-empty numeric order is identical, so L0 ordering is
-            // byte-for-byte unchanged and the cost is today's sort_by_key.
-            self.l0.sort_by_key(|e| {
-                let empty = e.is_empty();
-                (empty, if empty { 0 } else { e.pk_min.as_u128_single_pk() })
-            });
-        } else {
-            let schema = self.schema;
-            self.l0.sort_by(|a, b| match (a.is_empty(), b.is_empty()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => {
-                    compare_pk_bytes(&schema, a.pk_min.pk_bytes(), b.pk_min.pk_bytes())
-                }
-            });
-        }
+        // OPK bytes are order-preserving, so a single byte-wise comparison of
+        // `pk_min` sorts L0 at every PK width. `false < true` sinks is_empty
+        // entries to the end.
+        self.l0.sort_by(|a, b| match (a.is_empty(), b.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => a.pk_min.pk_bytes().cmp(b.pk_min.pk_bytes()),
+        });
     }
 
     fn update_flags(&mut self) {
@@ -341,62 +268,34 @@ impl ShardIndex {
             .collect()
     }
 
+    /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
+    /// signed/compound columns) and delegates to [`find_pk_bytes`], the
+    /// production path. Wide PKs cannot fit a u128.
+    #[cfg(test)]
     pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+        let (opk, stride) = super::columnar::opk_key(&self.schema, key);
+        self.find_pk_bytes(&opk[..stride], visitor);
+    }
+
+    /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is
+    /// scanned (range-rejected per entry); each L1+ level routes by the guard
+    /// key `pack_pk_be(key)` (the same order-preserving space `l1_guard_keys`
+    /// builds), restoring O(log N) routing for wide PKs too.
+    pub fn find_pk_bytes(&self, key: &[u8], visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         for e in &self.l0 {
-            if let Some((arc, idx)) = e.probe_pk(key, &self.schema) {
+            if let Some((arc, idx)) = e.probe_pk_bytes(key) {
                 visitor(arc, idx);
             }
         }
-
-        // The guard-key space is order-preserving (`pk_sort_key`): identical to
-        // the raw key for `pk_is_fast`, re-encoded for compound/signed so the
-        // read-side routing matches `l1_guard_keys` and the compaction merge
-        // order. Route by the same OPK key the guards were built in.
-        let route_key = self.guard_route_key(key);
+        let route_key = super::merge::pack_pk_be(key);
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(route_key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some((arc, idx)) = e.probe_pk(key, &self.schema) {
+                    if let Some((arc, idx)) = e.probe_pk_bytes(key) {
                         visitor(arc, idx);
                     }
                 }
             }
-        }
-    }
-
-    /// Wide-only (`pk_stride > 16`) byte-keyed point lookup. Wide PKs route all
-    /// compaction to guard 0 (see `l1_guard_keys`), so the per-level guard
-    /// index is meaningless — scan every entry; `probe_pk_bytes` range-rejects
-    /// cheaply via `pk_in_range`.
-    pub fn find_pk_bytes(&self, key: &[u8], visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        debug_assert!(self.schema.pk_is_wide());
-        for e in &self.l0 {
-            if let Some((arc, idx)) = e.probe_pk_bytes(key, &self.schema) {
-                visitor(arc, idx);
-            }
-        }
-        for level in &self.levels {
-            for guard in &level.guards {
-                for e in &guard.entries {
-                    if let Some((arc, idx)) = e.probe_pk_bytes(key, &self.schema) {
-                        visitor(arc, idx);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Map a narrow PK `u128` to its guard-routing key. `pk_is_fast` schemas
-    /// route by the raw key (raw LE == OPK). Compound/signed narrow PKs route
-    /// by `pk_sort_key`, the same order-preserving encoding `l1_guard_keys`
-    /// uses, so read routing and compaction merge order agree.
-    #[inline]
-    fn guard_route_key(&self, key: u128) -> u128 {
-        if self.schema.pk_is_fast() {
-            key
-        } else {
-            let stride = self.schema.pk_stride() as usize;
-            super::merge::pk_sort_key(&self.schema, &key.to_le_bytes()[..stride])
         }
     }
 
@@ -465,6 +364,13 @@ impl ShardIndex {
             if raw.level == 0 {
                 self.l0.push(entry);
             } else {
+                // Bound the level before `get_or_create_level` (which calls
+                // `ensure_level`): a corrupted manifest with an arbitrary level
+                // would otherwise allocate thousands of empty FLSMLevels and
+                // crash the engine at startup.
+                if raw.level >= MAX_LEVELS as u64 {
+                    return Err(StorageError::InvalidVersion);
+                }
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
                 level
@@ -664,14 +570,11 @@ impl ShardIndex {
     }
 
     fn l1_guard_keys(&self) -> Vec<u128> {
-        // Wide PKs (`pk_stride > 16`) cannot be packed into a guard `u128`;
-        // `as_u128_single_pk()` would panic. Route all wide compaction to a
-        // single guard 0 — `find_guard_for_key(&[0], k)` returns 0 for any
-        // `k >= 0`, so `merge_and_route`'s `&[u128]` contract is preserved
-        // without a byte-keyed router (the read side scans every entry).
-        if self.schema.pk_is_wide() {
-            return vec![0];
-        }
+        // After the OPK-at-rest flip, `pack_pk_be` (left-aligned OPK MSBs) is a
+        // universal order-preserving guard key for every PK width — including
+        // wide (`pk_stride > 16`), whose leading-16 prefix is order-preserving.
+        // This restores O(log N) wide-PK L1+ point lookups that previously
+        // collapsed all wide compaction to a single guard 0 (O(N) reads).
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
             // Always anchor the guard space at 0. `find_guard_for_key` routes a
             // key below the first guard to guard[0] via `saturating_sub(1)`, but
@@ -689,18 +592,17 @@ impl ShardIndex {
             }
             keys
         } else {
-            // Guard-key / routing path stays u128. The guard space is the
-            // order-preserving `pk_sort_key`: identical to `as_u128_single_pk`
-            // for `pk_is_fast`, re-encoded for compound/signed so routing and
-            // the compaction merge order (now keyed by `pk_sort_key` via
-            // `peek_key`) agree. Skip empty shards; dedup consecutive keys
-            // (L0 is sorted by pk_min, so equal OPK keys are adjacent).
+            // The guard space is the order-preserving `pk_sort_key`
+            // (= `pack_pk_be` of the OPK pk_min bytes), the same key the read
+            // router (`find_pk_bytes`) and the compaction merge order use. Skip
+            // empty shards; dedup consecutive keys (L0 is sorted by pk_min, so
+            // equal OPK keys are adjacent).
             let mut keys: Vec<u128> = Vec::new();
             for e in &self.l0 {
                 if e.is_empty() {
                     continue;
                 }
-                let pk = super::merge::pk_sort_key(&self.schema, e.pk_min.pk_bytes());
+                let pk = super::merge::pk_sort_key(e.pk_min.pk_bytes());
                 if keys.last().copied() != Some(pk) {
                     keys.push(pk);
                 }
@@ -990,7 +892,8 @@ mod tests {
     }
 
     /// LE concatenation of a (U64, U64) compound key, as the u128 the
-    /// probe_pk entry point carries.
+    /// probe_pk entry point carries. This is the *native* tuple value used
+    /// to drive a test; the on-disk / probe-key form is OPK (see `opk2`).
     fn pack2(a: u64, b: u64) -> u128 {
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&a.to_le_bytes());
@@ -998,7 +901,18 @@ mod tests {
         u128::from_le_bytes(buf)
     }
 
-    /// Write a shard whose PK region is the LE concatenation of two
+    /// OPK (order-preserving) encoding of a (U64, U64) compound key: each
+    /// column big-endian, concatenated in pk-list order. memcmp of these
+    /// bytes equals the typed (col0, col1) comparison. This is what the PK
+    /// region stores and what `probe_pk_bytes`/`pk_in_range` expect.
+    fn opk2(a: u64, b: u64) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&a.to_be_bytes());
+        buf[8..].copy_from_slice(&b.to_be_bytes());
+        buf
+    }
+
+    /// Write a shard whose PK region is the OPK concatenation of two
     /// U64 columns (16 bytes/row), with one I64 payload column. Rows
     /// must be passed in compound-sorted order.
     fn write_compound_shard(
@@ -1008,10 +922,11 @@ mod tests {
         values: &[i64],
     ) -> String {
         let n = pks.len();
+        // PK region holds OPK (per-column big-endian) bytes at rest.
         let mut pk_bytes: Vec<u8> = Vec::with_capacity(n * 16);
         for &(a, b) in pks {
-            pk_bytes.extend_from_slice(&a.to_le_bytes());
-            pk_bytes.extend_from_slice(&b.to_le_bytes());
+            pk_bytes.extend_from_slice(&a.to_be_bytes());
+            pk_bytes.extend_from_slice(&b.to_be_bytes());
         }
         let weights = vec![1i64; n];
         let nulls = vec![0u64; n];
@@ -1040,7 +955,8 @@ mod tests {
         values: &[i64],
     ) -> String {
         let n = pks.len();
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_le_bytes()).collect();
+        // PK region holds OPK (order-preserving big-endian) bytes at rest.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
         let weights = vec![1i64; n];
         let nulls = vec![0u64; n];
         let blob: Vec<u8> = Vec::new();
@@ -1584,11 +1500,11 @@ mod tests {
         let e_hi = ShardEntry::open(&p_hi, &schema, 0, 1).unwrap();
 
         // Range gate: in-range key passes (and resolves), out-of-range
-        // key is pruned.
-        assert!(e_lo.probe_pk(10, &schema).is_some());
-        assert!(e_lo.probe_pk(20, &schema).is_some());
-        assert!(e_lo.probe_pk(25, &schema).is_none(), "25 outside [10,20]");
-        assert!(e_hi.probe_pk(5, &schema).is_none(), "5 below [30,40]");
+        // key is pruned. OPK for a U64 PK is the value's big-endian bytes.
+        assert!(e_lo.probe_pk_bytes(&10u64.to_be_bytes()).is_some());
+        assert!(e_lo.probe_pk_bytes(&20u64.to_be_bytes()).is_some());
+        assert!(e_lo.probe_pk_bytes(&25u64.to_be_bytes()).is_none(), "25 outside [10,20]");
+        assert!(e_hi.probe_pk_bytes(&5u64.to_be_bytes()).is_none(), "5 below [30,40]");
 
         // L0 sort orders by pk_min, empty entries last (golden order).
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1597,12 +1513,13 @@ mod tests {
         idx.add_shard(&p_lo, 0, 1).unwrap();
         idx.add_shard(&p_empty, 0, 1).unwrap();
         let order: Vec<bool> = idx.l0.iter().map(|e| e.is_empty()).collect();
-        assert_eq!(
-            idx.l0[0].pk_min.as_u128_single_pk(),
-            10,
-            "lowest pk_min sorts first",
-        );
-        assert_eq!(idx.l0[1].pk_min.as_u128_single_pk(), 30);
+        // pk_min holds OPK bytes; widen_pk_be recovers the native U64 value.
+        let pk_min_val = |e: &ShardEntry| {
+            let b = e.pk_min.pk_bytes();
+            gnitz_wire::widen_pk_be(b, b.len())
+        };
+        assert_eq!(pk_min_val(&idx.l0[0]), 10, "lowest pk_min sorts first");
+        assert_eq!(pk_min_val(&idx.l0[1]), 30);
         assert_eq!(order, vec![false, false, true], "empty entry sinks last");
     }
 
@@ -1618,8 +1535,8 @@ mod tests {
         let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
         let e = ShardEntry::open(&p, &single, 0, 0).unwrap();
         assert!(e.is_empty());
-        assert!(e.probe_pk(0, &single).is_none());
-        assert!(e.probe_pk(u128::MAX, &single).is_none());
+        assert!(e.probe_pk_bytes(&0u64.to_be_bytes()).is_none());
+        assert!(e.probe_pk_bytes(&u64::MAX.to_be_bytes()).is_none());
 
         let compound = compound_schema();
         let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
@@ -1627,7 +1544,7 @@ mod tests {
         assert!(ec.is_empty());
         assert_eq!(ec.pk_min.len, compound.pk_stride());
         // Short-circuits before the stride assert / pk_in_range.
-        assert!(ec.probe_pk(pack2(1, 1), &compound).is_none());
+        assert!(ec.probe_pk_bytes(&opk2(1, 1)).is_none());
     }
 
     /// Compound range-prune correctness: pk_min is numerically greater
@@ -1637,36 +1554,39 @@ mod tests {
     #[test]
     fn test_compound_range_prune() {
         let schema = compound_schema();
-        // Rows in compound order: (1,5) < (1,9) < (2,3).
-        let min = PkBuf::from_bytes(&pack2(1, 5).to_le_bytes());
-        let max = PkBuf::from_bytes(&pack2(2, 3).to_le_bytes());
+        // Rows in compound order: (1,5) < (1,9) < (2,3). pk_min/pk_max and the
+        // probe key are all OPK (per-column big-endian) bytes; pk_in_range is a
+        // raw memcmp over them.
+        let min = PkBuf::from_bytes(&opk2(1, 5));
+        let max = PkBuf::from_bytes(&opk2(2, 3));
 
-        // Naive u128 compare of the concatenation is inverted here:
-        // pack2(1,5) = 5·2^64 + 1  >  pack2(2,3) = 3·2^64 + 2.
+        // Why OPK is needed: a naive u128 compare of the *LE* concatenation is
+        // inverted here — pack2(1,5) = 5·2^64 + 1 > pack2(2,3) = 3·2^64 + 2 —
+        // so memcmp must operate on OPK bytes, not the native concatenation.
         assert!(
             pack2(1, 5) > pack2(2, 3),
-            "test premise: u128 order is inverted vs compound order",
+            "test premise: u128 order of LE concat is inverted vs compound order",
         );
 
-        let inside = pack2(1, 9).to_le_bytes(); // (1,9): >= (1,5), <= (2,3)
-        let below = pack2(1, 1).to_le_bytes(); // (1,1): col0 == min, col1 < 5
-        let above = pack2(3, 0).to_le_bytes(); // (3,0): col0 > 2
+        let inside = opk2(1, 9); // (1,9): >= (1,5), <= (2,3)
+        let below = opk2(1, 1); // (1,1): col0 == min, col1 < 5
+        let above = opk2(3, 0); // (3,0): col0 > 2
 
         assert!(
-            pk_in_range(&schema, &min, &max, &inside),
+            pk_in_range(&min, &max, &inside),
             "key inside the true compound range must not be pruned",
         );
         assert!(
-            !pk_in_range(&schema, &min, &max, &below),
+            !pk_in_range(&min, &max, &below),
             "key below the true compound range must be pruned",
         );
         assert!(
-            !pk_in_range(&schema, &min, &max, &above),
+            !pk_in_range(&min, &max, &above),
             "key above the true compound range must be pruned",
         );
 
-        // probe_pk's compound arm prunes an out-of-range key (exercises
-        // the stride assert + key_le slice + pk_in_range wiring).
+        // probe_pk_bytes's compound arm prunes an out-of-range key (exercises
+        // the stride assert + pk_in_range wiring).
         let dir = tempfile::tempdir().unwrap();
         crate::util::raise_fd_limit_for_tests();
         let p = write_compound_shard(
@@ -1676,16 +1596,16 @@ mod tests {
             &[10, 20, 30],
         );
         let entry = ShardEntry::open(&p, &schema, 0, 1).unwrap();
-        assert_eq!(entry.pk_min.pk_bytes(), &pack2(1, 5).to_le_bytes());
-        assert_eq!(entry.pk_max.pk_bytes(), &pack2(2, 3).to_le_bytes());
+        assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
+        assert_eq!(entry.pk_max.pk_bytes(), &opk2(2, 3));
         assert!(
-            entry.probe_pk(pack2(3, 0), &schema).is_none(),
-            "out-of-range compound key must be pruned by probe_pk",
+            entry.probe_pk_bytes(&opk2(3, 0)).is_none(),
+            "out-of-range compound key must be pruned by probe_pk_bytes",
         );
     }
 
-    /// Wide (`pk_stride > 16`) 3×U64 schema. `as_u128_single_pk` would panic
-    /// for this width, so `l1_guard_keys` must short-circuit to guard 0.
+    /// Wide (`pk_stride > 16`) 3×U64 schema. Guard keys are derived from the
+    /// OPK pk_min bytes via `pack_pk_be`, so this width is handled uniformly.
     fn wide_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
@@ -1697,8 +1617,8 @@ mod tests {
         )
     }
 
-    /// A wide-PK table routes all compaction to guard 0. `l1_guard_keys` must
-    /// return `vec![0]` without panicking in `as_u128_single_pk`.
+    /// An empty wide-PK table has no L0 shards, so `l1_guard_keys` returns the
+    /// anchor guard `vec![0]` for every PK width, wide included.
     #[test]
     fn test_l1_guard_keys_wide_bypass() {
         crate::util::raise_fd_limit_for_tests();

@@ -145,17 +145,26 @@ pub(super) fn emit_finalized_row(
 
         if fpi < out_cols.len() {
             match out_cols[fpi] {
-                OutputColKind::CopyCol(src_pi_byte) => {
-                    // After resolve_column_indices, COPY_COL.a1 carries the
-                    // resolved payload byte: SENTINEL for the PK column,
-                    // otherwise the dense payload index.
-                    if src_pi_byte == PAYLOAD_MAPPING_PK_SENTINEL as usize {
-                        // Source is the PK column — slice from the full 16-byte
-                        // little-endian PK so 8- and 16-byte column sizes both work.
-                        let pk = raw_mb.get_pk(raw_row);
-                        fin_output.extend_col(fpi, &pk.to_le_bytes()[..cs]);
+                OutputColKind::CopyCol { src_pi, pk_off } => {
+                    // After resolve_column_indices, COPY_COL addresses either a
+                    // dense payload index or (SENTINEL) a PK column at byte
+                    // offset `pk_off` within the OPK PK region.
+                    if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
+                        // PK source: decode the addressed OPK column back to
+                        // native LE (raw copy is wrong for signed / big-endian
+                        // columns). The fin column type equals the source PK
+                        // column type for a verbatim copy.
+                        let opk = raw_mb.get_pk_bytes(raw_row);
+                        let off = pk_off as usize;
+                        let mut le = [0u8; crate::schema::MAX_PK_BYTES];
+                        gnitz_wire::decode_pk_column(
+                            &opk[off..off + cs],
+                            col.type_code,
+                            &mut le[..cs],
+                        );
+                        fin_output.extend_col(fpi, &le[..cs]);
                     } else {
-                        let src_pi = src_pi_byte;
+                        let src_pi = src_pi as usize;
                         let src_ci = raw_schema.payload_col_idx(src_pi);
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;

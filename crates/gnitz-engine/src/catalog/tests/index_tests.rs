@@ -471,30 +471,39 @@ fn test_seek_by_index_u16_column() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Regression: signed key encoding consistency (bug #2) ────────────
+// ── Regression: native index key space, payload == PK (signed) ──────
 
 #[test]
-fn test_promote_to_index_key_matches_batch_project_for_signed() {
-    // promote_to_index_key (multi-worker path) must produce the same
-    // key as batch_project_index (storage path) for negative signed values.
-    use crate::schema::promote_to_index_key;
+fn index_native_key_payload_matches_pk_signed() {
+    // The FK/index key space is NATIVE (zero-extended bits, signedness erased
+    // by the U64 promotion). A value derived from a native-LE payload column
+    // must equal the value decoded from the same value stored OPK in a PK
+    // column, so FK existence checks agree. has_pk/seek_by_index then re-encode
+    // this native value to OPK to hit the order-preserving index.
+    use crate::schema::{pk_native_key, payload_native_key};
+    use gnitz_wire::encode_pk_column;
 
-    // I32 value -1 stored as little-endian 0xFFFFFFFF
-    let data: [u8; 4] = (-1i32).to_le_bytes();
-    let key = promote_to_index_key(&data, 0, 4, type_code::I32);
+    for &(tc, sz) in &[
+        (type_code::I8, 1usize), (type_code::I16, 2),
+        (type_code::I32, 4), (type_code::I64, 8),
+    ] {
+        for v in [i64::MIN >> (64 - sz * 8), -1i64, 0, 1, i64::MAX >> (64 - sz * 8)] {
+            let le = &v.to_le_bytes()[..sz];
+            let from_payload = payload_native_key(le, 0, sz, tc);
+            let mut opk_col = vec![0u8; sz];
+            encode_pk_column(le, tc, &mut opk_col);
+            let from_pk = pk_native_key(&opk_col, 0, sz, tc);
+            assert_eq!(
+                from_payload, from_pk,
+                "tc={tc} v={v}: payload (native LE) and PK (decoded OPK) index keys must agree",
+            );
+        }
+    }
 
-    // batch_project_index reads u32::from_le_bytes() as u64 → 0x00000000FFFFFFFF
-    assert_eq!(key, 0xFFFFFFFFu128, "I32 -1 must zero-extend, not sign-extend");
-
-    // I16 value -1 stored as little-endian 0xFFFF
-    let data16: [u8; 2] = (-1i16).to_le_bytes();
-    let key16 = promote_to_index_key(&data16, 0, 2, type_code::I16);
-    assert_eq!(key16, 0xFFFFu128);
-
-    // I8 value -1 stored as 0xFF
-    let data8: [u8; 1] = [0xFF];
-    let key8 = promote_to_index_key(&data8, 0, 1, type_code::I8);
-    assert_eq!(key8, 0xFFu128);
+    // I32 -1 → zero-extended native bits 0xFFFFFFFF (NOT sign-extended).
+    assert_eq!(payload_native_key(&(-1i32).to_le_bytes(), 0, 4, type_code::I32), 0xFFFF_FFFFu128);
+    assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, type_code::I16), 0xFFFFu128);
+    assert_eq!(payload_native_key(&[0xFFu8], 0, 1, type_code::I8), 0xFFu128);
 }
 
 #[test]

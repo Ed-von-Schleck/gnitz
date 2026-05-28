@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1df4d8090a106b6429a28ff037a0c2269b5fa0485942b662bc9771591bd69c3f # shrinks to original = ArbSchema { pk_indices: [0], types: [1, 1], nullable: [0, 0] }

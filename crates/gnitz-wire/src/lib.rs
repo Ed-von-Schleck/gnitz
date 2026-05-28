@@ -37,6 +37,7 @@ mod expr;
 mod flags;
 mod german_string;
 mod handshake;
+mod pk;
 mod types;
 mod wal;
 
@@ -48,6 +49,7 @@ pub use expr::*;
 pub use flags::*;
 pub use german_string::*;
 pub use handshake::*;
+pub use pk::*;
 pub use types::*;
 pub use wal::*;
 

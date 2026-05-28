@@ -71,10 +71,10 @@ pub fn op_gather_reduce(
         // PKs from the exemplar row's bytes and ignores it.
         let group_pk: u128 = if partial_schema.pk_is_wide() { 0 } else { smb.get_pk(exemplar_row) };
 
-        // Read old global from trace_out, keyed by the group PK.
-        trace_out_cursor.seek_group(group_pk, group_pk_bytes);
+        // Read old global from trace_out, keyed by the group's OPK bytes.
+        trace_out_cursor.seek_group(group_pk_bytes);
         let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_pk_eq(group_pk, group_pk_bytes);
+            && trace_out_cursor.current_pk_eq(group_pk_bytes);
 
         if has_old {
             for k in 0..num_aggs {

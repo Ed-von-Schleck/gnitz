@@ -41,39 +41,58 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// Serialize a `PkColumn` into `buf` at 8-byte alignment.
-/// The U64 variant writes `pk_stride` bytes/row (1/2/4/8) — narrow single-PK
-/// types (I8/I16/I32/U8/U16/U32/F32) store the value in u64 but the wire
-/// region carries only `pk_stride` low bytes per row to match the
-/// decoder's `count * pk_stride` expectation. U128 variant writes
-/// 16 bytes/row; wide compound PK writes the pre-packed buffer verbatim.
-/// Correct on little-endian (x86_64).
-fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize) -> (u32, u32) {
+/// Serialize a `PkColumn` into `buf` at 8-byte alignment, encoding the PK
+/// region as **order-preserving big-endian** (OPK) at rest. The in-memory
+/// `PkColumn` holds native LE values; this is the single client-side encode
+/// point (the server stores the region verbatim and `decode_wal_block` does the
+/// inverse). `schema` supplies per-column type codes for signed sign-flipping.
+fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema: &Schema) -> (u32, u32) {
     match pks {
         PkColumn::U64s(v) => {
-            if pk_stride == 8 {
-                // SAFETY: u64 is 8 bytes; native LE layout matches to_le_bytes() on x86_64.
-                let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
-                append_region(buf, src)
-            } else {
-                debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
-                let aligned = align8(buf.len());
-                buf.resize(aligned, 0);
-                buf.reserve(v.len() * pk_stride);
-                for &x in v {
-                    buf.extend_from_slice(&x.to_le_bytes()[..pk_stride]);
-                }
-                (aligned as u32, (v.len() * pk_stride) as u32)
+            debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
+            let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
+            let aligned = align8(buf.len());
+            buf.resize(aligned, 0);
+            buf.reserve(v.len() * pk_stride);
+            let mut opk = [0u8; 8];
+            for &x in v {
+                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut opk[..pk_stride]);
+                buf.extend_from_slice(&opk[..pk_stride]);
             }
+            (aligned as u32, (v.len() * pk_stride) as u32)
         }
         PkColumn::U128s(v) => {
             debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
-            // SAFETY: u128 is 16 bytes; native LE layout matches to_le_bytes() on x86_64.
-            let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 16) };
-            append_region(buf, src)
+            // U128 and UUID are always unsigned; OPK == big-endian, no sign flip.
+            let aligned = align8(buf.len());
+            buf.resize(aligned, 0);
+            buf.reserve(v.len() * 16);
+            for &x in v {
+                buf.extend_from_slice(&x.to_be_bytes());
+            }
+            (aligned as u32, (v.len() * 16) as u32)
         }
-        // Wide compound PK: buffer is already the on-wire LE layout.
-        PkColumn::Bytes { buf: pk_buf, .. } => append_region(buf, pk_buf),
+        // Wide compound PK: encode each column of each row to OPK in pk-list order.
+        PkColumn::Bytes { buf: pk_buf, stride } => {
+            let row_stride = *stride as usize;
+            let row_count = if row_stride == 0 { 0 } else { pk_buf.len() / row_stride };
+            let aligned = align8(buf.len());
+            buf.resize(aligned, 0);
+            buf.reserve(pk_buf.len());
+            // Collect (col_size, type_code) once; avoids schema re-iteration per row.
+            let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
+            let mut opk = [0u8; gnitz_wire::MAX_PK_BYTES];
+            for row in 0..row_count {
+                let src = &pk_buf[row * row_stride..(row + 1) * row_stride];
+                let mut off = 0;
+                for &(cs, tc) in &col_info {
+                    gnitz_wire::encode_pk_column(&src[off..off + cs], tc, &mut opk[off..off + cs]);
+                    off += cs;
+                }
+                buf.extend_from_slice(&opk[..row_stride]);
+            }
+            (aligned as u32, pk_buf.len() as u32)
+        }
     }
 }
 
@@ -224,7 +243,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_pk_region(&mut buf, &batch.pks, schema.pk_stride()));
+    dir_entries.push(append_pk_region(&mut buf, &batch.pks, schema.pk_stride(), schema));
     dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
     dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 
@@ -368,11 +387,11 @@ pub fn decode_wal_block(
     // Gate on PK column count, not stride: single-PK stays on the existing
     // numeric fast arms (byte-for-byte unchanged); a compound key never
     // decodes to a numeric variant.
+    // The PK region at rest is OPK (order-preserving big-endian). Decode each
+    // variant back to the native LE values the in-memory `PkColumn` holds, so a
+    // subsequent `append_pk_region` (which OPK-encodes assuming LE input) does
+    // not double-encode.
     let pks: PkColumn = if schema.pk_count() >= 2 {
-        // Raw bytes, no numeric reinterpretation. pk_sz is the
-        // directory-validated region size, already == count * pk_stride (the
-        // expected_pk_sz guard above) and bounds-checked against total_size by
-        // the directory parse, so no extra per-row check is needed.
         // `stride` is a u8: reject (rather than silently truncate) any wire
         // schema whose packed PK region exceeds the field width.
         if pk_stride > u8::MAX as usize {
@@ -380,15 +399,23 @@ pub fn decode_wal_block(
                 "compound pk_stride {} exceeds 255", pk_stride
             )));
         }
-        let mut b = Vec::with_capacity(pk_sz);
-        b.extend_from_slice(&data[pk_off .. pk_off + pk_sz]);
-        PkColumn::Bytes { stride: pk_stride as u8, buf: b }
+        let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
+        let mut decoded = Vec::with_capacity(pk_sz);
+        let mut le_row = [0u8; gnitz_wire::MAX_PK_BYTES];
+        for row in 0..count {
+            let base = pk_off + row * pk_stride;
+            let src = &data[base..base + pk_stride];
+            let mut off = 0;
+            for &(cs, tc) in &col_info {
+                gnitz_wire::decode_pk_column(&src[off..off + cs], tc, &mut le_row[off..off + cs]);
+                off += cs;
+            }
+            decoded.extend_from_slice(&le_row[..pk_stride]);
+        }
+        PkColumn::Bytes { stride: pk_stride as u8, buf: decoded }
     } else if pk_stride <= 8 {
-        // Narrow PK (1/2/4/8 bytes): match the encoder's `U64s` variant so
-        // narrow types round-trip without variant drift. The low `pk_stride`
-        // bytes carry the column's native LE value; high bytes stay zero
-        // (pk_buf is reset to zero on init, then `[..pk_stride]` is the only
-        // overwritten range — pk_stride is invariant across rows).
+        // Narrow single-column PK: OPK → native LE via decode_pk_column.
+        let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
         let mut pk_buf = [0u8; 8];
         for i in 0..count {
@@ -396,20 +423,20 @@ pub fn decode_wal_block(
             if base + pk_stride > total_size {
                 return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
             }
-            pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
+            gnitz_wire::decode_pk_column(&data[base..base + pk_stride], pk_tc, &mut pk_buf[..pk_stride]);
+            pk_buf[pk_stride..].fill(0);
             v.push(u64::from_le_bytes(pk_buf));
         }
         PkColumn::U64s(v)
     } else {
+        // U128 / UUID: always unsigned, OPK == big-endian. Swap back to native LE.
         let mut v = Vec::with_capacity(count);
-        let mut pk_buf = [0u8; 16];
         for i in 0..count {
-            let base = pk_off + i * pk_stride;
-            if base + pk_stride > total_size {
+            let base = pk_off + i * 16;
+            if base + 16 > total_size {
                 return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
             }
-            pk_buf[..pk_stride].copy_from_slice(&data[base..base + pk_stride]);
-            v.push(u128::from_le_bytes(pk_buf));
+            v.push(u128::from_be_bytes(data[base..base + 16].try_into().unwrap()));
         }
         PkColumn::U128s(v)
     };
@@ -821,8 +848,8 @@ mod tests {
         let (pk_off, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 8, "U64 PK region must be 8B/row");
 
-        // First PK value in the region is 1u64 LE.
-        let expected_first = 1u64.to_le_bytes();
+        // PK region is OPK-at-rest: an unsigned U64 encodes to big-endian.
+        let expected_first = 1u64.to_be_bytes();
         assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
         let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();

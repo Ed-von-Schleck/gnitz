@@ -93,11 +93,11 @@ pub(super) fn validate_pk_cols(
             return Err("Primary Key has duplicate column".into());
         }
     }
-    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` fast
-    // key via `storage::batch::widen_pk_le`; wider compound PKs (stride > 16)
-    // route through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`)
-    // — every narrow `u128` seek is guarded by `pk_is_fast()`. The 4-column cap
-    // above bounds a valid PK at 64 bytes (four `U128`); MAX_PK_BYTES is the
+    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` value
+    // via `storage::batch::widen_pk_be`; wider compound PKs (stride > 16) route
+    // through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`). The
+    // 4-column cap above bounds a valid PK at 64 bytes (four `U128`); MAX_PK_BYTES
+    // is the
     // ceiling, defending the catalog worker against a crafted `raw_store_ingest`
     // into `TABLE_TAB` whose decoded PK list packs an oversized region.
     // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
@@ -248,13 +248,15 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     ((owner_id as u64) << 9) | (col_idx as u64)
 }
 
-/// Pack a circuit/dep compound PK `(view_id, sub)` into the 16-byte PK region
-/// encoded as a `u128`: low 8 bytes = `view_id`, high 8 bytes = `sub`. The
-/// circuit tables (and `_view_deps`) use this in place of the old hand-packed
-/// single-`u128` key. `sub` is the per-view secondary (node_id, dep_table_id,
-/// or an edge/node-column field pack).
+/// Pack a circuit/dep compound PK `(view_id, sub)` into a `u128` whose
+/// `extend_pk` (big-endian) at-rest image is OPK column order: `view_id_BE`
+/// (bytes 0..8) then `sub_BE` (bytes 8..16). `view_id` is PK column 0, so it
+/// must occupy the high `u128` half to land in the leading at-rest bytes — the
+/// prefix that `retract_rows_by_view` / `load_circuit` / `get_dep_map` seek and
+/// decode. `sub` is the per-view secondary (node_id, dep_table_id, or an
+/// edge/node-column field pack).
 pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
-    (view_id as u64 as u128) | ((sub as u128) << 64)
+    ((view_id as u64 as u128) << 64) | (sub as u128)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,11 +350,18 @@ mod tests {
     }
 
     #[test]
-    fn pack_view_pk_places_view_id_low_sub_high() {
-        // The compound PK region is view_id (low 8 bytes) then sub (high 8).
+    fn pack_view_pk_at_rest_is_view_id_leading_opk() {
+        // The at-rest OPK image (extend_pk → big-endian) is view_id_BE then
+        // sub_BE, so a view_id prefix seek lands on the leading bytes.
         let pk = pack_view_pk(0x1122, 0xAABB);
-        let bytes = pk.to_le_bytes();
-        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x1122, "view_id in low half");
-        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0xAABB, "sub in high half");
+        let at_rest = pk.to_be_bytes();
+        assert_eq!(
+            u64::from_be_bytes(at_rest[0..8].try_into().unwrap()), 0x1122,
+            "view_id (PK col 0) must lead the at-rest OPK region",
+        );
+        assert_eq!(
+            u64::from_be_bytes(at_rest[8..16].try_into().unwrap()), 0xAABB,
+            "sub (PK col 1) follows view_id",
+        );
     }
 }

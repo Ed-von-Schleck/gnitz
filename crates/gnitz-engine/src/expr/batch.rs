@@ -9,14 +9,17 @@ use std::cmp::Ordering;
 
 use super::program::{
     ExprProgram,
-    EXPR_LOAD_CONST, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PK_INT,
+    EXPR_LOAD_CONST, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT,
+    EXPR_LOAD_PK_UNSIGNED_INT, EXPR_LOAD_PK_SIGNED_INT,
     EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_NEG,
+    EXPR_UDIV, EXPR_UMOD,
     EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
     EXPR_CMP_EQ, EXPR_CMP_NE, EXPR_CMP_GT, EXPR_CMP_GE, EXPR_CMP_LT, EXPR_CMP_LE,
+    EXPR_UCMP_GT, EXPR_UCMP_GE, EXPR_UCMP_LT, EXPR_UCMP_LE,
     EXPR_FCMP_EQ, EXPR_FCMP_NE, EXPR_FCMP_GT, EXPR_FCMP_GE, EXPR_FCMP_LT, EXPR_FCMP_LE,
     EXPR_BOOL_AND, EXPR_BOOL_OR, EXPR_BOOL_NOT,
     EXPR_IS_NULL, EXPR_IS_NOT_NULL,
-    EXPR_INT_TO_FLOAT,
+    EXPR_INT_TO_FLOAT, EXPR_UINT_TO_FLOAT,
     EXPR_COPY_COL, EXPR_EMIT_NULL, EXPR_EMIT,
     EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
     EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
@@ -427,6 +430,19 @@ pub(in crate::expr) fn eval_batch(
             maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
+    // Unsigned variant of cmp_int: reinterpret the i64 register bit pattern as
+    // u64 so values >= 2^63 compare as the large positives they represent.
+    macro_rules! cmp_uint {
+        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
+            let ai = $a as usize; let bi = $b as usize;
+            {
+                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
+                for i in 0..m { rd[i] = ((ra[i] as u64) $op (rb[i] as u64)) as i64; }
+            }
+            null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
+        }};
+    }
     macro_rules! bin_float {
         ($a:expr, $b:expr, $d:expr, $op:tt) => {{
             let ai = $a as usize; let bi = $b as usize;
@@ -580,10 +596,47 @@ pub(in crate::expr) fn eval_batch(
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            EXPR_LOAD_PK_INT => {
+            // a1 packs (pk_byte_offset << 16) | (col_size << 8) | type_code.
+            // Unsigned: the addressed OPK column is big-endian, so right-align
+            // into a 16-byte buffer and from_be_bytes recovers the native value.
+            EXPR_LOAD_PK_UNSIGNED_INT => {
+                let packed = a1 as u64;
+                let byte_offset = (packed >> 16) as usize;
+                let col_size = ((packed >> 8) & 0xFF) as usize;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    scratch.regs[base_d + i] = mb.get_pk(morsel_start + i) as i64;
+                    let opk = mb.get_pk_bytes(morsel_start + i);
+                    let mut buf = [0u8; 16];
+                    buf[16 - col_size..].copy_from_slice(&opk[byte_offset..byte_offset + col_size]);
+                    scratch.regs[base_d + i] = u128::from_be_bytes(buf) as i64;
+                }
+                scratch.clear_null_reg(dst, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
+            }
+            // Signed: decode the OPK column back to native LE (un-flips the sign
+            // bit), then sign-extend to i64 at the exact column width. Padding a
+            // narrow type before from_le_bytes would destroy sign extension.
+            EXPR_LOAD_PK_SIGNED_INT => {
+                let packed = a1 as u64;
+                let byte_offset = (packed >> 16) as usize;
+                let col_size = ((packed >> 8) & 0xFF) as usize;
+                let type_code = (packed & 0xFF) as u8;
+                let base_d = dst * MORSEL;
+                for i in 0..m {
+                    let opk = mb.get_pk_bytes(morsel_start + i);
+                    let mut le = [0u8; 8];
+                    gnitz_wire::decode_pk_column(
+                        &opk[byte_offset..byte_offset + col_size],
+                        type_code,
+                        &mut le[..col_size],
+                    );
+                    scratch.regs[base_d + i] = match col_size {
+                        8 => i64::from_le_bytes(le),
+                        4 => i32::from_le_bytes(le[..4].try_into().unwrap()) as i64,
+                        2 => i16::from_le_bytes(le[..2].try_into().unwrap()) as i64,
+                        1 => le[0] as i8 as i64,
+                        _ => unreachable!("signed PK column size {col_size}"),
+                    };
                 }
                 scratch.clear_null_reg(dst, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -612,6 +665,19 @@ pub(in crate::expr) fn eval_batch(
                 let is_zero = b == 0;
                 let d = if is_zero { 1 } else { b };
                 (a.wrapping_rem(d), is_zero)
+            }),
+            // Unsigned (U64) division/modulo: reinterpret operands as u64 so the
+            // quotient/remainder is correct for dividends >= 2^63. Zero divisor
+            // marks the row NULL, matching the signed INT_DIV/INT_MOD path.
+            EXPR_UDIV => div_like!(a1, a2, dst, |a, b| {
+                let is_zero = b == 0;
+                let d = if is_zero { 1u64 } else { b as u64 };
+                (((a as u64) / d) as i64, is_zero)
+            }),
+            EXPR_UMOD => div_like!(a1, a2, dst, |a, b| {
+                let is_zero = b == 0;
+                let d = if is_zero { 1u64 } else { b as u64 };
+                (((a as u64) % d) as i64, is_zero)
             }),
             EXPR_INT_NEG => {
                 let ai = a1 as usize;
@@ -658,6 +724,12 @@ pub(in crate::expr) fn eval_batch(
             EXPR_CMP_GE => cmp_int!(a1, a2, dst, >=),
             EXPR_CMP_LT => cmp_int!(a1, a2, dst, <),
             EXPR_CMP_LE => cmp_int!(a1, a2, dst, <=),
+
+            // Unsigned (U64) integer comparisons
+            EXPR_UCMP_GT => cmp_uint!(a1, a2, dst, >),
+            EXPR_UCMP_GE => cmp_uint!(a1, a2, dst, >=),
+            EXPR_UCMP_LT => cmp_uint!(a1, a2, dst, <),
+            EXPR_UCMP_LE => cmp_uint!(a1, a2, dst, <=),
 
             // ----------------------------------------------------------------
             // Float comparisons
@@ -785,6 +857,19 @@ pub(in crate::expr) fn eval_batch(
                 for i in 0..m {
                     scratch.regs[base_d + i] =
                         f64::to_bits(scratch.regs[base_a + i] as f64) as i64;
+                }
+                null_or1(scratch, dst, ai, m);
+                maybe_pack_bool_bits(scratch, prog, dst, m);
+            }
+            // Unsigned (U64) → float: reinterpret the register as u64 first so
+            // values >= 2^63 cast to the correct large positive float.
+            EXPR_UINT_TO_FLOAT => {
+                let ai = a1 as usize;
+                let base_a = ai * MORSEL;
+                let base_d = dst * MORSEL;
+                for i in 0..m {
+                    scratch.regs[base_d + i] =
+                        f64::to_bits(scratch.regs[base_a + i] as u64 as f64) as i64;
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);

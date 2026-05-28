@@ -455,10 +455,11 @@ impl DagEngine {
                     let w = ch.cursor.current_weight;
                     if w > 0 {
                         // DepTab compound PK = (view_id, dep_table_id); both live
-                        // in the 16-byte PK region, view_id in bytes 0..8.
+                        // in the 16-byte PK region as OPK (big-endian for these
+                        // unsigned columns): view_id_BE in bytes 0..8, dep_BE in 8..16.
                         let pk = ch.cursor.current_pk_bytes();
-                        let v_id = u64::from_le_bytes(pk[0..8].try_into().unwrap()) as i64;
-                        let dep_tid = u64::from_le_bytes(pk[8..16].try_into().unwrap()) as i64;
+                        let v_id = u64::from_be_bytes(pk[0..8].try_into().unwrap()) as i64;
+                        let dep_tid = u64::from_be_bytes(pk[8..16].try_into().unwrap()) as i64;
                         if dep_tid > 0 {
                             let views = self.dep_map.entry(dep_tid).or_default();
                             if !views.contains(&v_id) {
@@ -1771,19 +1772,21 @@ impl DagEngine {
             src_schema.payload_idx(source_col)
         };
         let src_col_size = src_schema.columns[source_col].size() as usize;
+        let src_col_type = src_schema.columns[source_col].type_code;
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_stride = idx_schema.pk_stride() as usize;
         let idx_key_size = idx_schema.columns[0].size() as usize;
+        let idx_key_type = idx_schema.columns[0].type_code;
         // If the indexed value is in the PK, find its byte offset once.
         let src_pk_field_off = if is_pk_col {
             src_schema.pk_byte_offset(source_col) as usize
         } else { 0 };
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
-        // `vec![0u8; idx_stride]` zero-fills once. The leading `[..src_col_size]`
-        // and trailing `[idx_key_size..]` slots are fully overwritten per row;
-        // the middle `[src_col_size..idx_key_size]` zero-pad stays zero across
-        // rows, so no per-row re-zero is needed.
+        // `vec![0u8; idx_stride]` zero-fills once. The leading `[..idx_key_size]`
+        // (the OPK-encoded indexed value) and trailing `[idx_key_size..]` (the
+        // source PK suffix) slots are both fully overwritten per row, so no
+        // per-row re-zero is needed.
         let mut idx_pk_buf = vec![0u8; idx_stride];
 
         for row in 0..src.count {
@@ -1799,19 +1802,24 @@ impl DagEngine {
             }
 
             let src_pk_bytes = src.get_pk_bytes(row);
-            // Leading index-key slot: indexed value LE bytes.
-            if is_pk_col {
-                idx_pk_buf[..src_col_size]
-                    .copy_from_slice(&src_pk_bytes[src_pk_field_off..src_pk_field_off + src_col_size]);
+            // Leading index-key slot: the indexed value's native u128 (decoded
+            // from the source OPK PK column, or read from the native-LE payload),
+            // re-encoded OPK into the promoted index key type across the full
+            // idx_key_size. The index table's PK region is order-preserving like
+            // any other; seeks (has_pk / seek_by_index) encode the same way.
+            let native = if is_pk_col {
+                crate::schema::pk_native_key(src_pk_bytes, src_pk_field_off, src_col_size, src_col_type)
             } else {
                 let col_data = src.col_data(src_payload_idx);
-                let offset = row * src_col_size;
-                idx_pk_buf[..src_col_size]
-                    .copy_from_slice(&col_data[offset..offset + src_col_size]);
-            }
+                crate::schema::payload_native_key(col_data, row * src_col_size, src_col_size, src_col_type)
+            };
+            gnitz_wire::encode_pk_column(
+                &native.to_le_bytes()[..idx_key_size], idx_key_type, &mut idx_pk_buf[..idx_key_size],
+            );
 
             // The source PK region is laid out in pk_indices order, so the
-            // index's trailing PK suffix is byte-identical to the source's PK.
+            // index's trailing PK suffix is byte-identical to the source's PK
+            // (already OPK).
             idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride]
                 .copy_from_slice(src_pk_bytes);
 

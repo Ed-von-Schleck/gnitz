@@ -8,7 +8,7 @@ use super::bloom::BloomFilter;
 use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::merge::{self, SortedMemBatch};
+use super::merge::{self, pack_pk_be, SortedMemBatch};
 
 // Accessible to the tests submodule (private items are visible to descendants).
 #[cfg(test)]
@@ -17,44 +17,20 @@ use super::batch::relocate_string_cell;
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
 
-/// Lower-bound index of `key` in `run`, or `run.count` when `key` lies outside
-/// the run's `[min, max]` range (so the caller's `get_pk(lo) == key` loop runs
-/// zero times). Dispatches on `pk_is_fast`: a single unsigned column uses the
-/// raw-u128 binary search, whose order matches storage order. Compound and
-/// signed PKs order via `compare_pk_bytes` — their packed u128 order diverges
-/// (compound is last-column-major; signed sorts negatives last), so the raw
-/// search would mislocate and the range-reject would wrongly skip live runs.
-/// `key` is the faithful narrow encoding: `to_le_bytes()[..stride]` reproduces
-/// the stored PK bytes.
-fn run_lower_bound(run: &Batch, key: u128, schema: &SchemaDescriptor) -> usize {
-    if schema.pk_is_fast() {
-        if run.count == 0 {
-            return 0;
-        }
-        if key < run.get_pk(0) || key > run.get_pk(run.count - 1) {
-            return run.count;
-        }
-        return run.find_lower_bound(key);
-    }
-    let stride = schema.pk_stride() as usize;
-    run_lower_bound_bytes(run, &key.to_le_bytes()[..stride], schema)
-}
-
-/// Raw-PK-bytes lower-bound search: the `compare_pk_bytes` (compound/signed/
-/// wide) arm of [`run_lower_bound`]. `key` is the raw PK bytes (exactly
-/// `pk_stride` wide). Wide (`pk_stride > 16`) PKs can only enter here, since
-/// the packed `u128` can't represent them; [`run_lower_bound`] routes narrow
-/// non-fast PKs here too.
-fn run_lower_bound_bytes(run: &Batch, key: &[u8], schema: &SchemaDescriptor) -> usize {
+/// Lower-bound index of OPK `key` in `run`, or `run.count` when `key` lies
+/// outside the run's `[min, max]` range (so the caller's
+/// `get_pk_bytes(lo) == key` loop runs zero times). After the OPK-at-rest flip
+/// this is a raw `memcmp` binary search at every PK width — no schema, no
+/// pk_is_fast dispatch. `key` is exactly `pk_stride` OPK bytes.
+fn run_lower_bound_bytes(run: &Batch, key: &[u8]) -> usize {
     if run.count == 0 {
         return 0;
     }
-    if columnar::compare_pk_bytes(schema, key, run.get_pk_bytes(0)) == Ordering::Less
-        || columnar::compare_pk_bytes(schema, key, run.get_pk_bytes(run.count - 1)) == Ordering::Greater
-    {
+    // O(1) range reject before the binary search (cache-miss avoidance).
+    if key < run.get_pk_bytes(0) || key > run.get_pk_bytes(run.count - 1) {
         return run.count;
     }
-    run.find_lower_bound_bytes(key, schema)
+    run.find_lower_bound_bytes(key)
 }
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
@@ -117,13 +93,14 @@ impl MemTable {
             return Ok(());
         }
         self.check_capacity()?;
-        // The bloom filter takes u128; wide-PK (`pk_stride > 16`) batches
-        // can't feed it directly. Skip on wide PKs — `may_contain_pk` is
-        // only ever called for narrow tables today, and a missing bloom
-        // just falls through to the sorted-run search.
+        // The bloom is keyed by the OPK bytes (via `pack_pk_be`), the same
+        // derivation `may_contain_pk` uses — consistent for signed PKs too,
+        // where `get_pk`'s sign-flipped value would not be. Wide-PK
+        // (`pk_stride > 16`) batches can't pack into a u128, so skip them; a
+        // missing bloom just falls through to the sorted-run search.
         if !self.schema.pk_is_wide() {
             for i in 0..batch.count {
-                self.bloom.add(batch.get_pk(i));
+                self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
             }
         }
         self.total_row_count += batch.count;
@@ -133,8 +110,11 @@ impl MemTable {
         Ok(())
     }
 
-    pub fn may_contain_pk(&self, key: u128) -> bool {
-        self.bloom.may_contain(key)
+    /// Bloom probe for a PK by its OPK bytes. Keyed identically to the
+    /// insert side (`pack_pk_be` of the OPK region), so it never produces a
+    /// false negative for any PK type. `opk_key` is exactly `pk_stride` bytes.
+    pub fn may_contain_pk(&self, opk_key: &[u8]) -> bool {
+        self.bloom.may_contain(pack_pk_be(opk_key))
     }
 
     pub fn should_flush(&self) -> bool {
@@ -198,40 +178,17 @@ impl MemTable {
     ///
     /// Returns `(net_weight, has_found, row_count)` where `row_count` is the
     /// number of memtable rows matching `key` (across all runs).
-    pub fn lookup_pk(&mut self, key: u128) -> (i64, bool, usize) {
-        let mut total_w: i64 = 0;
-        let mut row_count: usize = 0;
-        self.has_found = false;
-        let schema = self.schema;
-
-        for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound(run, key, &schema);
-            while lo < run.count && run.get_pk(lo) == key {
-                total_w += run.get_weight(lo);
-                if !self.has_found {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
-                }
-                row_count += 1;
-                lo += 1;
-            }
-        }
-
-        (total_w, self.has_found, row_count)
-    }
-
-    /// Byte-keyed sibling of [`lookup_pk`] for wide (`pk_stride > 16`) PKs.
-    /// `key` is the raw PK bytes. The bloom is never populated for wide PKs
-    /// (see `upsert_sorted_batch`), so this path goes straight to the runs.
+    /// Look up a PK across all sorted runs by its OPK `key` bytes. Returns
+    /// `(net_weight, has_found, row_count)`. The universal lookup at every PK
+    /// width — `find_lower_bound_bytes` is a raw memcmp search on the OPK
+    /// regions. `key` is exactly `pk_stride` OPK bytes.
     pub fn lookup_pk_bytes(&mut self, key: &[u8]) -> (i64, bool, usize) {
         let mut total_w: i64 = 0;
         let mut row_count: usize = 0;
         self.has_found = false;
-        let schema = self.schema;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound_bytes(run, key, &schema);
+            let mut lo = run_lower_bound_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 total_w += run.get_weight(lo);
                 if !self.has_found {
@@ -276,32 +233,8 @@ impl MemTable {
         }
     }
 
-    /// Find the net weight for rows matching both PK and full payload.
-    pub fn find_weight_for_row<S: super::columnar::ColumnarSource>(
-        &self,
-        key: u128,
-        ref_source: &S,
-        ref_row: usize,
-    ) -> i64 {
-        let mut total_w: i64 = 0;
-
-        for run in &self.runs {
-            let mut lo = run_lower_bound(run, key, &self.schema);
-            while lo < run.count && run.get_pk(lo) == key {
-                let ord = columnar::compare_rows(
-                    &self.schema, run.as_ref(), lo, ref_source, ref_row,
-                );
-                if ord == Ordering::Equal {
-                    total_w += run.get_weight(lo);
-                }
-                lo += 1;
-            }
-        }
-
-        total_w
-    }
-
-    /// Byte-keyed sibling of [`find_weight_for_row`] for wide PKs.
+    /// Find the net weight for rows matching both PK (OPK `key` bytes) and
+    /// full payload. `key` is exactly `pk_stride` OPK bytes.
     pub fn find_weight_for_row_bytes<S: super::columnar::ColumnarSource>(
         &self,
         key: &[u8],
@@ -311,7 +244,7 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            let mut lo = run_lower_bound_bytes(run, key, &self.schema);
+            let mut lo = run_lower_bound_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, run.as_ref(), lo, ref_source, ref_row,
@@ -333,30 +266,12 @@ impl MemTable {
     /// Used by `Table::retract_pk` to locate the live row for an UPDATE+DELETE
     /// sequence where the old payload has been cancelled but the new payload
     /// is still positive.
-    pub fn find_positive_payload_row(&mut self, key: u128) -> bool {
-        let schema = self.schema;
-        for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound(run, key, &schema);
-            while lo < run.count && run.get_pk(lo) == key {
-                let net_w = self.find_weight_for_row(key, run.as_ref(), lo);
-                if net_w > 0 {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
-                    return true;
-                }
-                lo += 1;
-            }
-        }
-        self.has_found = false;
-        false
-    }
-
-    /// Byte-keyed sibling of [`find_positive_payload_row`] for wide PKs.
+    /// Find the first memtable row whose (PK, payload) has positive net weight
+    /// across all runs, keyed by OPK `key` bytes. Sets
+    /// `found_run`/`found_row`/`has_found` on success.
     pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
-        let schema = self.schema;
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound_bytes(run, key, &schema);
+            let mut lo = run_lower_bound_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
                 if net_w > 0 {
@@ -510,11 +425,12 @@ mod tests {
         mt.upsert_sorted_batch(b1).unwrap();
         mt.upsert_sorted_batch(b2).unwrap();
 
-        let (w, found, _) = mt.lookup_pk(20);
+        // OPK bytes for a U64 PK are the value's big-endian bytes.
+        let (w, found, _) = mt.lookup_pk_bytes(&20u64.to_be_bytes());
         assert_eq!(w, 3); // 1 + 2
         assert!(found);
 
-        let (w, found, _) = mt.lookup_pk(99);
+        let (w, found, _) = mt.lookup_pk_bytes(&99u64.to_be_bytes());
         assert_eq!(w, 0);
         assert!(!found);
     }
@@ -527,8 +443,8 @@ mod tests {
         let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
         mt.upsert_sorted_batch(b1).unwrap();
 
-        assert!(mt.may_contain_pk(10));
-        assert!(mt.may_contain_pk(20));
+        assert!(mt.may_contain_pk(&10u64.to_be_bytes()));
+        assert!(mt.may_contain_pk(&20u64.to_be_bytes()));
         // 99 might be a false positive, but definitely not in data
     }
 
@@ -598,19 +514,22 @@ mod tests {
         mt.upsert_sorted_batch(b1).unwrap();
         mt.upsert_sorted_batch(b2).unwrap();
 
+        // OPK bytes for a U64 PK are the value's big-endian bytes.
+        let pk10 = 10u64.to_be_bytes();
+
         // Search for PK 10, payload 100 — should find weight 1
         let ref_batch = make_batch(&schema, &[(10, 1, 100)]);
-        let w = mt.find_weight_for_row(10, &*ref_batch, 0);
+        let w = mt.find_weight_for_row_bytes(&pk10, &*ref_batch, 0);
         assert_eq!(w, 1);
 
         // Search for PK 10, payload 200 — should find weight 1
         let ref_batch2 = make_batch(&schema, &[(10, 1, 200)]);
-        let w2 = mt.find_weight_for_row(10, &*ref_batch2, 0);
+        let w2 = mt.find_weight_for_row_bytes(&pk10, &*ref_batch2, 0);
         assert_eq!(w2, 1);
 
         // Search for PK 10, payload 999 — should find weight 0
         let ref_batch3 = make_batch(&schema, &[(10, 1, 999)]);
-        let w3 = mt.find_weight_for_row(10, &*ref_batch3, 0);
+        let w3 = mt.find_weight_for_row_bytes(&pk10, &*ref_batch3, 0);
         assert_eq!(w3, 0);
     }
 
@@ -992,7 +911,8 @@ mod tests {
         mt.upsert_sorted_batch(b2).unwrap();
 
         // Net weights: val=100 → 1-1=0, val=200 → 1 (positive)
-        let found = mt.find_positive_payload_row(10);
+        // OPK bytes for a U64 PK are the value's big-endian bytes.
+        let found = mt.find_positive_payload_row_bytes(&10u64.to_be_bytes());
         assert!(found, "should find a live row");
         assert!(mt.has_found);
 
@@ -1005,7 +925,7 @@ mod tests {
         assert_eq!(val, 200, "found row should be the live val=200 row, not the retracted val=100");
 
         // PK with no rows at all → not found
-        let found2 = mt.find_positive_payload_row(99);
+        let found2 = mt.find_positive_payload_row_bytes(&99u64.to_be_bytes());
         assert!(!found2);
         assert!(!mt.has_found);
     }
@@ -1023,7 +943,7 @@ mod tests {
         mt.upsert_sorted_batch(make_batch(&schema, &[(42, -1, 100)])).unwrap();
         mt.upsert_sorted_batch(make_batch(&schema, &[(42, -1, 200)])).unwrap();
 
-        assert!(!mt.find_positive_payload_row(42));
+        assert!(!mt.find_positive_payload_row_bytes(&42u64.to_be_bytes()));
         assert!(!mt.has_found);
     }
 
@@ -1186,8 +1106,8 @@ mod tests {
             let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
             mt.upsert_sorted_batch(b).unwrap();
         }
-        // lookup_pk sets has_found
-        let (w, found, _) = mt.lookup_pk(5);
+        // lookup_pk_bytes sets has_found
+        let (w, found, _) = mt.lookup_pk_bytes(&5u64.to_be_bytes());
         assert_eq!(w, 1);
         assert!(found);
         assert!(mt.has_found);

@@ -978,7 +978,10 @@ async fn handle_system_dml(
 
     let cat_ptr_raw = shared.catalog;
     // Discard any stale queue entries from a prior failed DDL so they don't
-    // piggyback on this one.
+    // piggyback on this one. (pending_dir_deletions is NOT discarded here: a
+    // failed DDL already clears it on the error path, and recovery legitimately
+    // queues drops here that must be drained — not discarded — by this DDL's
+    // post-fsync drain.)
     let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
 
     // Reserve the zone LSN but do NOT publish it yet. ingest_lsn becomes
@@ -998,6 +1001,8 @@ async fn handle_system_dml(
         // A partial cascade may have pushed entries before the failing hook;
         // clear them so the next DDL doesn't inherit half-applied broadcasts.
         let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
+        // The drop did not durably commit; keep the entities' files on disk.
+        unsafe { (*cat_ptr_raw).discard_pending_dir_deletions(); }
         unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
@@ -1051,6 +1056,9 @@ async fn handle_system_dml(
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
     unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
+    // Drop is now durable — physically remove the directories the drop hooks
+    // queued (the catalog analog of ShardIndex::pending_deletions cleanup).
+    unsafe { (*cat_ptr_raw).drain_pending_dir_deletions(); }
     send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);

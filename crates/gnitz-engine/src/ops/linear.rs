@@ -193,13 +193,6 @@ fn op_union_merge(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
-    // Signed single-column and compound PKs are not order-correct as raw
-    // u128 (the narrow inner path's comparison); route them through the
-    // byte-wise, type-aware wide merge. Only single unsigned-column PKs
-    // (`pk_is_fast`) use the narrow path.
-    if schema.pk_is_wide() || !schema.pk_is_fast() {
-        return op_union_merge_wide(batch_a, batch_b, schema);
-    }
     if schema_is_int_nonnull(schema) {
         op_union_merge_inner(batch_a, batch_b, schema,
             |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi))
@@ -207,82 +200,6 @@ fn op_union_merge(
         op_union_merge_inner(batch_a, batch_b, schema,
             |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi))
     }
-}
-
-/// Wide-PK (`pk_stride > 16`) sorted merge. The narrow path reads the PK as a
-/// `u128` via `get_pk`, which panics for wide keys; this variant compares PK
-/// regions byte-wise through `compare_pk_bytes`.
-fn op_union_merge_wide(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> Batch {
-    use crate::storage::compare_pk_bytes;
-    let n_a = batch_a.count;
-    let n_b = batch_b.count;
-    let pk_stride = schema.pk_stride() as usize;
-    let mut output = Batch::with_schema(*schema, n_a + n_b);
-    // No `share_blob_from`: `append_batch` relocates STRING/BLOB cells into a
-    // fresh `output.blob` (see `op_union_merge_inner`). Pre-sharing batch_a's
-    // blob would set `output.blob_id` to batch_a's while the content is the
-    // relocated superset, poisoning later `append_batch_no_blob_reloc` callers.
-    let mb_a = batch_a.as_mem_batch();
-    let mb_b = batch_b.as_mem_batch();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < n_a && j < n_b {
-        let ord = compare_pk_bytes(schema, mb_a.get_pk_bytes(i), mb_b.get_pk_bytes(j));
-        match ord {
-            Ordering::Less => {
-                let start = i;
-                i += 1;
-                while i < n_a && mb_a.get_pk_bytes(i) == mb_a.get_pk_bytes(start) { i += 1; }
-                output.append_batch(batch_a, start, i);
-            }
-            Ordering::Greater => {
-                let start = j;
-                j += 1;
-                while j < n_b && mb_b.get_pk_bytes(j) == mb_b.get_pk_bytes(start) { j += 1; }
-                output.append_batch(batch_b, start, j);
-            }
-            Ordering::Equal => {
-                // Copy PK to avoid holding an aliased borrow while scanning.
-                let mut a_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-                a_pk_buf[..pk_stride].copy_from_slice(mb_a.get_pk_bytes(i));
-                let a_pk = &a_pk_buf[..pk_stride];
-                let mut i_end = i + 1;
-                while i_end < n_a && mb_a.get_pk_bytes(i_end) == a_pk { i_end += 1; }
-                let mut b_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-                b_pk_buf[..pk_stride].copy_from_slice(mb_b.get_pk_bytes(j));
-                let b_pk = &b_pk_buf[..pk_stride];
-                let mut j_end = j + 1;
-                while j_end < n_b && mb_b.get_pk_bytes(j_end) == b_pk { j_end += 1; }
-                let mut ia = i;
-                let mut jb = j;
-                while ia < i_end && jb < j_end {
-                    match compare_rows(schema, &mb_a, ia, &mb_b, jb) {
-                        Ordering::Less | Ordering::Equal => {
-                            output.append_batch(batch_a, ia, ia + 1);
-                            ia += 1;
-                        }
-                        Ordering::Greater => {
-                            output.append_batch(batch_b, jb, jb + 1);
-                            jb += 1;
-                        }
-                    }
-                }
-                if ia < i_end { output.append_batch(batch_a, ia, i_end); }
-                if jb < j_end { output.append_batch(batch_b, jb, j_end); }
-                i = i_end;
-                j = j_end;
-            }
-        }
-    }
-    if i < n_a { output.append_batch(batch_a, i, n_a); }
-    if j < n_b { output.append_batch(batch_b, j, n_b); }
-    output.sorted = true;
-    output.consolidated = false;
-    output
 }
 
 #[inline]
@@ -313,10 +230,11 @@ where
     let mut run_src = RunSrc::None;
 
     while i < n_a && j < n_b {
-        let a_pk = batch_a.get_pk(i);
-        let b_pk = batch_b.get_pk(j);
+        // OPK bytes are order-preserving for all PK widths, so a raw byte
+        // compare replaces the former `get_pk(u128)` (narrow-only) comparison.
+        let ord = mb_a.get_pk_bytes(i).cmp(mb_b.get_pk_bytes(j));
 
-        if a_pk < b_pk {
+        if ord == Ordering::Less {
             match run_src {
                 RunSrc::A { .. } => {}
                 RunSrc::B { start } => {
@@ -328,7 +246,7 @@ where
                 }
             }
             i += 1;
-        } else if b_pk < a_pk {
+        } else if ord == Ordering::Greater {
             match run_src {
                 RunSrc::B { .. } => {}
                 RunSrc::A { start } => {
@@ -351,16 +269,17 @@ where
             }
             run_src = RunSrc::None;
 
-            // Find the end of the equal-PK run in each batch.
+            // Find the end of the equal-PK run in each batch (byte-wise; `i`/`j`
+            // stay fixed as the reference row until `i = i_end; j = j_end`).
             let mut i_end = i + 1;
             while i_end < n_a
-                && batch_a.get_pk(i_end) == a_pk
+                && mb_a.get_pk_bytes(i_end) == mb_a.get_pk_bytes(i)
             {
                 i_end += 1;
             }
             let mut j_end = j + 1;
             while j_end < n_b
-                && batch_b.get_pk(j_end) == b_pk
+                && mb_b.get_pk_bytes(j_end) == mb_b.get_pk_bytes(j)
             {
                 j_end += 1;
             }
@@ -580,7 +499,8 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
         }
     }
     for row in 0..n {
-        output.set_pk_at(row, pks[row]);
+        // The reindex output PK is a synthetic U128 (unsigned), so OPK == BE.
+        output.set_pk_at_bytes(row, &pks[row].to_be_bytes());
     }
 }
 
@@ -647,6 +567,9 @@ impl PkPromoter {
         ((h_hi as u128) << 64) | (h as u128)
     }
 
+    // Only the test-only `promote` oracle reads a narrow column's native value;
+    // production `promote_into` OPK-encodes the column bytes via `encode_pk_column`.
+    #[cfg(test)]
     #[inline]
     fn read_narrow(batch: &MemBatch, pi: usize, cs: usize, row: usize) -> u128 {
         let ptr = batch.get_col_ptr(row, pi, cs);
@@ -662,7 +585,7 @@ impl PkPromoter {
             PromoteKind::Pk => batch.get_pk(row),
             PromoteKind::Wide { pi } => Self::read_wide(batch, pi, row),
             PromoteKind::String { pi } => Self::read_string(batch, pi, row),
-            PromoteKind::Narrow { pi, cs } => Self::read_narrow(batch, pi, cs, row),
+            PromoteKind::Narrow { pi, cs, .. } => Self::read_narrow(batch, pi, cs, row),
         }
     }
 
@@ -671,23 +594,40 @@ impl PkPromoter {
     pub(super) fn promote_into(&self, batch: &MemBatch, output: &mut Batch) {
         match self.kind {
             PromoteKind::Pk => {
+                // Verbatim OPK byte copy — input PK is already OPK and this is
+                // width-safe (get_pk panics for wide PKs).
                 for row in 0..output.count {
-                    output.set_pk_at(row, batch.get_pk(row));
+                    output.set_pk_at_bytes(row, batch.get_pk_bytes(row));
                 }
             }
             PromoteKind::Wide { pi } => {
+                // Output PK is U128/UUID (unsigned); OPK == BE of the value.
                 for row in 0..output.count {
-                    output.set_pk_at(row, Self::read_wide(batch, pi, row));
+                    let v = Self::read_wide(batch, pi, row);
+                    output.set_pk_at_bytes(row, &v.to_be_bytes());
                 }
             }
             PromoteKind::String { pi } => {
+                // Output PK is a synthetic U128 hash (unsigned); OPK == BE.
                 for row in 0..output.count {
-                    output.set_pk_at(row, Self::read_string(batch, pi, row));
+                    let h = Self::read_string(batch, pi, row);
+                    output.set_pk_at_bytes(row, &h.to_be_bytes());
                 }
             }
             PromoteKind::Narrow { pi, cs } => {
+                // The reindex output PK is a synthetic unsigned (U128, or a
+                // narrower unsigned in unit schemas), so its OPK is the BE of
+                // the value. Zero-extend the column's native LE bytes to the
+                // output PK width and write right-aligned BE — matching the
+                // Wide/String arms (native value, no signed sign-flip) and the
+                // `promote` oracle's `read_narrow`.
+                let stride = output.pk_stride() as usize;
                 for row in 0..output.count {
-                    output.set_pk_at(row, Self::read_narrow(batch, pi, cs, row));
+                    let ptr = batch.get_col_ptr(row, pi, cs);
+                    let mut buf = [0u8; 8];
+                    buf[..cs].copy_from_slice(ptr);
+                    let v = u64::from_le_bytes(buf) as u128;
+                    output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
                 }
             }
         }
@@ -1171,7 +1111,7 @@ mod tests {
     fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk((pk as u64) as u128);
+            b.extend_pk_opk(schema, &[(pk as u64) as u128]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1193,7 +1133,13 @@ mod tests {
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 5);
         assert!(out.sorted);
-        let pks: Vec<i64> = (0..out.count).map(|i| out.get_pk(i) as u64 as i64).collect();
+        let pks: Vec<i64> = (0..out.count)
+            .map(|i| {
+                let mut le = [0u8; 8];
+                gnitz_wire::decode_pk_column(out.get_pk_bytes(i), type_code::I64, &mut le);
+                i64::from_le_bytes(le)
+            })
+            .collect();
         assert_eq!(pks, vec![-5, -1, 0, 3, 7], "signed ascending PK order");
     }
 

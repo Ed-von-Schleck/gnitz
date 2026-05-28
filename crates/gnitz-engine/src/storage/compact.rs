@@ -83,9 +83,9 @@ impl ShardCursor {
     /// diverges from `compare_pk_bytes` — the order the input shards are
     /// physically written in.
     #[inline]
-    fn peek_key(&self, shard: &MappedShard, schema: &SchemaDescriptor) -> u128 {
+    fn peek_key(&self, shard: &MappedShard) -> u128 {
         debug_assert!(self.is_valid());
-        super::merge::pk_sort_key(schema, shard.get_pk_bytes(self.position))
+        super::merge::pk_sort_key(shard.get_pk_bytes(self.position))
     }
 }
 
@@ -207,8 +207,8 @@ fn open_and_merge_wide_with<RowCmp>(
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Greater => false,
             std::cmp::Ordering::Equal => {
-                match columnar::compare_pk_bytes(schema, shards[a.source_idx].get_pk_bytes(a.row),
-                                                         shards[b.source_idx].get_pk_bytes(b.row)) {
+                match shards[a.source_idx].get_pk_bytes(a.row)
+                    .cmp(shards[b.source_idx].get_pk_bytes(b.row)) {
                     std::cmp::Ordering::Less => true,
                     std::cmp::Ordering::Greater => false,
                     std::cmp::Ordering::Equal => row_cmp(schema, &shards[a.source_idx], a.row,
@@ -219,9 +219,7 @@ fn open_and_merge_wide_with<RowCmp>(
         }
     };
     let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        columnar::compare_pk_bytes(schema, shards[a_src].get_pk_bytes(a_row),
-                                           shards[b_src].get_pk_bytes(b_row))
-            == std::cmp::Ordering::Equal
+        shards[a_src].get_pk_bytes(a_row) == shards[b_src].get_pk_bytes(b_row)
         && row_cmp(schema, &shards[a_src], a_row,
                            &shards[b_src], b_row) == std::cmp::Ordering::Equal
     };
@@ -235,7 +233,7 @@ fn open_and_merge_wide_with<RowCmp>(
 fn open_and_merge_inner<L, EQ>(
     shards: &[MappedShard],
     mut cursors: Vec<ShardCursor>,
-    schema: &SchemaDescriptor,
+    _schema: &SchemaDescriptor,
     mut emit: impl FnMut(u128, i64, &MappedShard, usize),
     less: L,
     eq_payload: EQ,
@@ -247,7 +245,7 @@ fn open_and_merge_inner<L, EQ>(
         cursors.len(),
         |i| {
             if cursors[i].is_valid() {
-                Some((cursors[i].peek_key(&shards[i], schema), cursors[i].position))
+                Some((cursors[i].peek_key(&shards[i]), cursors[i].position))
             } else {
                 None
             }
@@ -260,7 +258,7 @@ fn open_and_merge_inner<L, EQ>(
         |src| {
             cursors[src].advance(&shards[src]);
             if cursors[src].is_valid() {
-                Some((cursors[src].peek_key(&shards[src], schema), cursors[src].position))
+                Some((cursors[src].peek_key(&shards[src]), cursors[src].position))
             } else {
                 None
             }
@@ -639,8 +637,13 @@ mod tests {
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str()];
 
-        // Two guards: [0, 100)  and [100, ∞)
-        let guards: [u128; 2] = [0, 100];
+        // Two guards: [0, 100)  and [100, ∞). Guard keys live in the same
+        // order-preserving pack_pk_be space as the router's sort key, so derive
+        // them from the OPK bytes of the boundary values (not native u128s).
+        let guards: [u128; 2] = [
+            crate::storage::merge::pk_sort_key(&0u64.to_be_bytes()),
+            crate::storage::merge::pk_sort_key(&100u64.to_be_bytes()),
+        ];
         let mut results = [
             GuardResult::zeroed(),
             GuardResult::zeroed(),
@@ -1186,19 +1189,20 @@ mod tests {
         batch.write_as_shard(&cpath, 0).unwrap();
     }
 
-    fn assert_compare_pk_bytes_sorted(shard: &MappedShard, schema: &SchemaDescriptor) {
+    fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
         for i in 1..shard.count {
             assert_ne!(
-                columnar::compare_pk_bytes(schema, shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
+                columnar::compare_pk_bytes(shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
                 std::cmp::Ordering::Greater,
                 "merged shard not compare_pk_bytes-sorted at row {i}",
             );
         }
     }
 
+    /// OPK bytes for a `(U64, U64)` compound PK: each column big-endian.
     fn pk2(a: u64, b: u64) -> Vec<u8> {
-        let mut v = a.to_le_bytes().to_vec();
-        v.extend_from_slice(&b.to_le_bytes());
+        let mut v = a.to_be_bytes().to_vec();
+        v.extend_from_slice(&b.to_be_bytes());
         v
     }
 
@@ -1251,7 +1255,7 @@ mod tests {
         // (2,3) cancels (+1 -1 = 0). The cross-shard duplicate must fold, which
         // requires the two (2,3) entries to be adjacent at the heap root.
         assert_eq!(merged.count, 3, "expected 3 surviving rows (the (2,3) pair cancels)");
-        assert_compare_pk_bytes_sorted(&merged, &schema);
+        assert_compare_pk_bytes_sorted(&merged);
 
         let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
         assert_eq!(present, vec![pk2(1, 5), pk2(1, 9), pk2(3, 0)]);
@@ -1276,7 +1280,12 @@ mod tests {
             ],
             &[0],
         );
-        let k = |v: i64| v.to_le_bytes().to_vec();
+        // OPK bytes for a single I64 PK column (big-endian, sign bit flipped).
+        let k = |v: i64| {
+            let mut out = [0u8; 8];
+            gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut out);
+            out.to_vec()
+        };
 
         // Shard 1 (signed order): -5, 3.
         let s1 = dir.join("s1.db");
@@ -1298,9 +1307,14 @@ mod tests {
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 4);
-        assert_compare_pk_bytes_sorted(&merged, &schema);
+        assert_compare_pk_bytes_sorted(&merged);
+        // PK region is OPK; decode each column back to its native I64 value.
         let present: Vec<i64> = (0..merged.count)
-            .map(|i| i64::from_le_bytes(merged.get_pk_bytes(i).try_into().unwrap()))
+            .map(|i| {
+                let mut le = [0u8; 8];
+                gnitz_wire::decode_pk_column(merged.get_pk_bytes(i), type_code::I64, &mut le);
+                i64::from_le_bytes(le)
+            })
             .collect();
         assert_eq!(present, vec![-5, -2, 3, 10], "must be signed-sorted, not raw-LE");
 
@@ -1329,10 +1343,11 @@ mod tests {
             &[0, 1, 2],
         );
         assert_eq!(schema.pk_stride(), 24);
+        // OPK bytes for a 3×U64 compound PK: each column big-endian.
         let pk3 = |a: u64, b: u64, c: u64| {
-            let mut v = a.to_le_bytes().to_vec();
-            v.extend_from_slice(&b.to_le_bytes());
-            v.extend_from_slice(&c.to_le_bytes());
+            let mut v = a.to_be_bytes().to_vec();
+            v.extend_from_slice(&b.to_be_bytes());
+            v.extend_from_slice(&c.to_be_bytes());
             v
         };
 
@@ -1350,7 +1365,7 @@ mod tests {
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2, "prefix-colliding distinct wide PKs must not fold");
-        assert_compare_pk_bytes_sorted(&merged, &schema);
+        assert_compare_pk_bytes_sorted(&merged);
         let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
         assert_eq!(present, vec![pk3(1, 1, 100), pk3(1, 1, 200)]);
 

@@ -11,6 +11,25 @@ use crate::storage::{
 
 use super::util::{merge_null_words, write_string_from_batch};
 
+/// True iff the PK is a single unsigned column, so its `get_pk` u128
+/// (right-aligned big-endian of the OPK region) is *order*-correct and the
+/// merge-walk can compare packed u128 keys directly instead of `get_pk_bytes`.
+/// Signed and compound PKs are not u128-order-correct and must compare bytes.
+///
+/// This is the last surviving dual-path consumer of the "fast PK" concept;
+/// it lives here (not on `SchemaDescriptor`) so the Phase-1 join byte-
+/// enablement that removes the dual path removes this predicate with it.
+fn pk_is_fast(schema: &SchemaDescriptor) -> bool {
+    use crate::schema::type_code;
+    let pk = schema.pk_indices();
+    pk.len() == 1
+        && matches!(
+            schema.columns[pk[0] as usize].type_code,
+            type_code::U8 | type_code::U16 | type_code::U32
+                | type_code::U64 | type_code::U128 | type_code::UUID,
+        )
+}
+
 // ---------------------------------------------------------------------------
 // Anti-join delta-trace
 // ---------------------------------------------------------------------------
@@ -24,24 +43,25 @@ use super::util::{merge_null_words, write_string_from_batch};
 /// scanned. Consecutive duplicate PKs reuse the previous presence result instead
 /// of re-seeking (which would be O(log N) per duplicate).
 #[allow(clippy::needless_range_loop)]
-fn dt_emit_indices(cursor: &mut ReadCursor, pks: &[u128], emit_when_present: bool) -> Vec<u32> {
-    let n = pks.len();
+fn dt_emit_indices(cursor: &mut ReadCursor, batch: &Batch, emit_when_present: bool) -> Vec<u32> {
+    let n = batch.count;
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
-    let mut prev_pk = pks[0];
     let mut prev_in_trace = false;
-    cursor.seek(prev_pk);
+    // Seek/compare by the batch row's OPK bytes directly — no native-value
+    // round-trip, correct at every PK width/signedness.
+    cursor.seek_bytes(batch.get_pk_bytes(0));
 
     for i in 0..n {
-        let d_pk = pks[i];
+        let pk = batch.get_pk_bytes(i);
 
-        let in_trace = if i > 0 && d_pk == prev_pk {
+        let in_trace = if i > 0 && pk == batch.get_pk_bytes(i - 1) {
             prev_in_trace
         } else {
-            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
+            while cursor.valid && cursor.current_pk_cmp_bytes(pk).is_lt() {
                 cursor.advance();
             }
             let mut found = false;
-            while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
+            while cursor.valid && cursor.current_pk_cmp_bytes(pk) == Ordering::Equal {
                 if cursor.current_weight > 0 { found = true; }
                 cursor.advance();
             }
@@ -52,7 +72,6 @@ fn dt_emit_indices(cursor: &mut ReadCursor, pks: &[u128], emit_when_present: boo
             emit_indices.push(i as u32);
         }
 
-        prev_pk = d_pk;
         prev_in_trace = in_trace;
     }
 
@@ -75,8 +94,7 @@ pub fn op_anti_join_delta_trace(
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
-    let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
-    let emit_indices = dt_emit_indices(cursor, &pks, false);
+    let emit_indices = dt_emit_indices(cursor, consolidated, false);
 
     if emit_indices.is_empty() {
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
@@ -124,8 +142,7 @@ pub fn op_semi_join_delta_trace(
     }
 
     // Merge-walk
-    let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
-    let emit_indices = dt_emit_indices(cursor, &pks, true);
+    let emit_indices = dt_emit_indices(cursor, consolidated, true);
 
     if emit_indices.is_empty() {
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
@@ -153,12 +170,11 @@ fn semi_join_dt_swapped(
 
     let con_pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut last_pk: Option<u128> = None;
-    let fast = schema.pk_is_fast();
 
     while cursor.valid {
-        // Packed u128 of the trace PK. Injective for narrow PKs, so it works
-        // as an equality/dedup token; the ORDERED binary search below routes
-        // through bytes when the packed order is unsound (compound/signed).
+        // `current_key` is the trace PK's native value (narrow) — injective, so
+        // it works as the equality/dedup token. The ordered binary search below
+        // routes through the OPK bytes, which order correctly at every width.
         let t_pk = cursor.current_key;
 
         if cursor.current_weight <= 0 {
@@ -173,14 +189,8 @@ fn semi_join_dt_swapped(
             continue;
         }
 
-        // Binary search in consolidated delta. `find_lower_bound` orders by
-        // raw u128 (storage order only for `pk_is_fast`); non-fast PKs must use
-        // the column-aware `find_lower_bound_bytes`.
-        let pos = if fast {
-            consolidated.find_lower_bound(t_pk)
-        } else {
-            consolidated.find_lower_bound_bytes(cursor.current_pk_bytes(), schema)
-        };
+        // Binary search in consolidated delta by the OPK bytes (raw memcmp).
+        let pos = consolidated.find_lower_bound_bytes(cursor.current_pk_bytes());
         let mut j = pos;
         while j < n && con_pks[j] == t_pk {
             emit_indices.push(j as u32);
@@ -265,7 +275,8 @@ fn join_dt_merge_walk(
 
     let pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
     let mut prev_pk = pks[0];
-    cursor.seek(prev_pk);
+    // Seek/compare by the delta row's OPK bytes directly (correct at every width).
+    cursor.seek_bytes(delta.get_pk_bytes(0));
 
     for i in 0..n {
         let d_pk = pks[i];
@@ -273,14 +284,14 @@ fn join_dt_merge_walk(
 
         if i > 0 && prev_pk == d_pk {
             // Multiset delta: same PK, different payload — re-seek trace.
-            cursor.seek(d_pk);
+            cursor.seek_bytes(delta.get_pk_bytes(i));
         } else {
-            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
+            while cursor.valid && cursor.current_pk_cmp_bytes(delta.get_pk_bytes(i)).is_lt() {
                 cursor.advance();
             }
         }
 
-        while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
+        while cursor.valid && cursor.current_pk_cmp_bytes(delta.get_pk_bytes(i)) == Ordering::Equal {
             let w_trace = cursor.current_weight;
             let w_out = w_delta.wrapping_mul(w_trace);
             if w_out != 0 {
@@ -311,21 +322,15 @@ fn join_dt_swapped(
     let delta_mb = delta.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
     let delta_pks: Vec<u128> = (0..n).map(|i| delta.get_pk(i)).collect();
-    let fast = left_schema.pk_is_fast();
 
     while cursor.valid {
-        // Packed u128 trace PK: injective for narrow PKs, valid as an equality
-        // token; the ordered search below dispatches to bytes when unsound.
+        // `current_key` is the trace PK's native value (narrow) — injective, a
+        // valid equality token. The ordered search below goes by OPK bytes.
         let t_pk = cursor.current_key;
         let w_trace = cursor.current_weight;
 
-        // Binary search in consolidated delta. Raw-u128 `find_lower_bound`
-        // matches storage order only for `pk_is_fast`; otherwise go by bytes.
-        let pos = if fast {
-            delta.find_lower_bound(t_pk)
-        } else {
-            delta.find_lower_bound_bytes(cursor.current_pk_bytes(), left_schema)
-        };
+        // Binary search in consolidated delta by the OPK bytes (raw memcmp).
+        let pos = delta.find_lower_bound_bytes(cursor.current_pk_bytes());
         let mut j = pos;
         while j < n && delta_pks[j] == t_pk {
             let w_delta = delta.get_weight(j);
@@ -375,16 +380,16 @@ pub fn op_join_delta_trace_outer(
 
     let pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut prev_pk = pks[0];
-    cursor.seek(prev_pk);
+    cursor.seek_bytes(consolidated.get_pk_bytes(0));
 
     for i in 0..n {
         let d_pk = pks[i];
         let w_delta = consolidated.get_weight(i);
 
         if i > 0 && prev_pk == d_pk {
-            cursor.seek(d_pk);
+            cursor.seek_bytes(consolidated.get_pk_bytes(i));
         } else {
-            while cursor.valid && cursor.current_pk_cmp(d_pk).is_lt() {
+            while cursor.valid && cursor.current_pk_cmp_bytes(consolidated.get_pk_bytes(i)).is_lt() {
                 cursor.advance();
             }
         }
@@ -394,7 +399,7 @@ pub fn op_join_delta_trace_outer(
         // uncompacted trace may present a tombstone (weight ≤ 0) for the PK;
         // a tombstone alone must NOT suppress the null-fill.
         let mut matched = false;
-        while cursor.valid && cursor.current_pk_cmp(d_pk) == Ordering::Equal {
+        while cursor.valid && cursor.current_pk_cmp_bytes(consolidated.get_pk_bytes(i)) == Ordering::Equal {
             let w_trace = cursor.current_weight;
             if w_trace > 0 {
                 matched = true;
@@ -613,7 +618,7 @@ where
     // u128-packed PKs are injective for narrow keys, so equality tests are
     // sound. Their *ordering* is only correct for single unsigned-column PKs;
     // signed/compound PKs must compare bytes.
-    let fast = schema.pk_is_fast();
+    let fast = pk_is_fast(schema);
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -631,7 +636,7 @@ where
         } else {
             let a_pk = ca.get_pk_bytes(idx_a);
             while idx_b < n_b
-                && compare_pk_bytes(schema, cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
+                && compare_pk_bytes(cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
             {
                 idx_b += 1;
             }
@@ -717,7 +722,7 @@ fn filter_join_dd(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     // u128 equality is injective for narrow PKs; ordering is only correct for
     // single unsigned-column PKs — signed/compound PKs compare bytes.
-    let fast = schema.pk_is_fast();
+    let fast = pk_is_fast(schema);
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -734,7 +739,7 @@ fn filter_join_dd(
         } else {
             let a_pk = ca.get_pk_bytes(idx_a);
             while idx_b < n_b
-                && compare_pk_bytes(schema, cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
+                && compare_pk_bytes(cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
             {
                 idx_b += 1;
             }
@@ -804,7 +809,7 @@ pub fn op_join_delta_delta(
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
     // u128 equality is injective for narrow PKs; ordering is only correct for
     // single unsigned-column PKs — signed/compound PKs compare bytes.
-    let fast = left_schema.pk_is_fast();
+    let fast = pk_is_fast(left_schema);
     let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let mut idx_a = 0usize;
@@ -817,7 +822,7 @@ pub fn op_join_delta_delta(
         let ord = if fast {
             key_a.cmp(&key_b)
         } else {
-            compare_pk_bytes(left_schema, mb_a.get_pk_bytes(idx_a), mb_b.get_pk_bytes(idx_b))
+            compare_pk_bytes(mb_a.get_pk_bytes(idx_a), mb_b.get_pk_bytes(idx_b))
         };
         if ord == Ordering::Less {
             idx_a += 1;
@@ -1059,7 +1064,10 @@ mod tests {
     ) -> ConsolidatedBatch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk((pk as u64) as u128);
+            // Signed PK at rest is OPK (big-endian, sign-bit flipped) so the
+            // join's compare_pk_bytes merge orders it correctly; the raw
+            // `extend_pk` would store non-order-preserving native bytes.
+            b.extend_pk_opk(schema, &[(pk as u64) as u128]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1068,6 +1076,13 @@ mod tests {
         b.sorted = true;
         b.consolidated = true;
         ConsolidatedBatch::new_unchecked(b)
+    }
+
+    /// Decode a single signed-I64 PK at `row` from its OPK bytes to native.
+    fn signed_pk_i64(b: &Batch, row: usize) -> i64 {
+        let mut le = [0u8; 8];
+        gnitz_wire::decode_pk_column(b.get_pk_bytes(row), type_code::I64, &mut le);
+        i64::from_le_bytes(le)
     }
 
     // -----------------------------------------------------------------------
@@ -1383,13 +1398,13 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[Rc::clone(&trace)], schema);
         let semi = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         assert_eq!(semi.count, 2, "semi: -3 and -1 match the trace");
-        assert_eq!(semi.get_pk(0) as i64, -3);
-        assert_eq!(semi.get_pk(1) as i64, -1);
+        assert_eq!(signed_pk_i64(&semi, 0), -3);
+        assert_eq!(signed_pk_i64(&semi, 1), -1);
 
         let mut ch2 = CursorHandle::from_owned(&[trace], schema);
         let anti = op_anti_join_delta_trace(&delta, ch2.cursor_mut(), &schema);
         assert_eq!(anti.count, 1, "anti: only 2 is absent from the trace");
-        assert_eq!(anti.get_pk(0) as i64, 2);
+        assert_eq!(signed_pk_i64(&anti, 0), 2);
     }
 
     #[test]
@@ -1803,7 +1818,7 @@ mod tests {
         let trace = Rc::new(trace);
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
         let cursor = ch.cursor_mut();
-        cursor.seek(1u128);
+        cursor.seek_bytes(&1u64.to_be_bytes());
 
         let mut output = Batch::with_schema(left_schema, 1);
         write_join_row(
@@ -1920,7 +1935,7 @@ mod tests {
         let b = make_signed_batch(&rs, &[(-3, 1, 30), (2, 1, 20)]);
         let out = op_join_delta_delta(&a, &b, &ls, &rs);
         assert_eq!(out.count, 1, "key 2 is shared and must join");
-        assert_eq!(out.get_pk(0) as i64, 2);
+        assert_eq!(signed_pk_i64(&out, 0), 2);
         assert_eq!(get_payload_i64(&out, 0), 10);
     }
 
@@ -1932,10 +1947,10 @@ mod tests {
         let b = make_signed_batch(&schema, &[(-3, 1, 1)]);
         let semi = op_semi_join_delta_delta(&a, &b, &schema);
         assert_eq!(semi.count, 1, "only -3 shares a PK");
-        assert_eq!(semi.get_pk(0) as i64, -3);
+        assert_eq!(signed_pk_i64(&semi, 0), -3);
         let anti = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(anti.count, 1, "2 is not in b");
-        assert_eq!(anti.get_pk(0) as i64, 2);
+        assert_eq!(signed_pk_i64(&anti, 0), 2);
     }
 
     #[test]

@@ -808,9 +808,10 @@ pub fn execute_epoch_multi(
                     "SeekTrace: wide PK trace is unsupported (narrow u128 seek API)");
                 let kb = &reg!(*key_reg).batch;
                 if kb.count > 0 {
-                    let key = kb.get_pk(0);
+                    // The key batch's PK region is already OPK at rest; seek by
+                    // its bytes directly (no native-value round-trip).
                     if let Some(cursor) = cursor_mut!(*trace_reg) {
-                        cursor.seek(key);
+                        cursor.seek_bytes(kb.get_pk_bytes(0));
                     }
                 }
             }

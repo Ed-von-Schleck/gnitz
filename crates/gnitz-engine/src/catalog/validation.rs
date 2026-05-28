@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::promote_to_index_key;
+use crate::schema::{pk_native_key, payload_native_key};
 
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
@@ -95,16 +95,21 @@ impl CatalogEngine {
                 let col_type = schema.columns[col_idx].type_code;
                 let col_size = schema.columns[col_idx].size() as usize;
                 let col_data = batch.col_data(payload_col);
-                let fk_key = promote_to_index_key(col_data, row * col_size, col_size, col_type);
+                let fk_key = payload_native_key(col_data, row * col_size, col_size, col_type);
 
                 let found = if is_lone_pk {
                     target_entry.handle.has_pk(fk_key)
                 } else {
                     let ic = idx_ic.unwrap();
-                    let prefix_len = col_size.min(idx_key_size.unwrap());
-                    let key_bytes = fk_key.to_le_bytes();
+                    let ks = idx_key_size.unwrap();
+                    // OPK-encode the native FK value into the leading index key
+                    // column; the index PK is OPK-at-rest, so prefix-match the
+                    // whole leading column (idx_key_size), not a source-width LE
+                    // prefix.
+                    let opk = crate::schema::index_opk_prefix(
+                        fk_key, ic.index_schema.columns[0].type_code, ks);
                     ic.table_mut().open_cursor().cursor
-                        .seek_first_positive_with_prefix(&key_bytes[..prefix_len])
+                        .seek_first_positive_with_prefix(&opk[..ks])
                 };
                 if !found {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
@@ -165,11 +170,18 @@ impl CatalogEngine {
                 let off = parent_schema.pk_byte_offset(parent_col_idx) as usize;
                 if wide {
                     removed_wide.chunks_exact(parent_pk_stride)
-                        .map(|pk| promote_to_index_key(pk, off, col_size, col_type))
+                        .map(|pk| pk_native_key(pk, off, col_size, col_type))
                         .collect()
                 } else {
                     removed_narrow.iter()
-                        .map(|&pk| promote_to_index_key(&pk.to_le_bytes(), off, col_size, col_type))
+                        .map(|&pk| {
+                            // get_pk returned widen_pk_be(region); the low
+                            // `parent_pk_stride` bytes of its BE image are the OPK
+                            // region, from which pk_native_key decodes the column
+                            // back to its native value.
+                            let be = pk.to_be_bytes();
+                            pk_native_key(&be[16 - parent_pk_stride..], off, col_size, col_type)
+                        })
                         .collect()
                 }
             } else {
@@ -184,14 +196,14 @@ impl CatalogEngine {
                     for pk in removed_wide.chunks_exact(parent_pk_stride) {
                         if let Some(row) = self.seek_family_bytes(table_id, pk)? {
                             if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
-                            v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                            v.push(payload_native_key(row.col_data(payload_col), 0, col_size, col_type));
                         }
                     }
                 } else {
                     for &pk in &removed_narrow {
                         if let Some(row) = self.seek_family(table_id, pk)? {
                             if row.get_null_word(0) & (1u64 << payload_col) != 0 { continue; }
-                            v.push(promote_to_index_key(row.col_data(payload_col), 0, col_size, col_type));
+                            v.push(payload_native_key(row.col_data(payload_col), 0, col_size, col_type));
                         }
                     }
                 }
@@ -215,15 +227,17 @@ impl CatalogEngine {
                 }
             };
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
-            let prefix_len = col_size.min(idx_key_size);
+            let idx_key_type = ic.index_schema.columns[0].type_code;
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
 
             for fk_key in keys {
-                // Prefix-scan the child's FK index for any positive-weight
-                // entry whose leading column matches the referenced value.
-                let key_bytes = fk_key.to_le_bytes();
-                if cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..prefix_len]) {
+                // Prefix-scan the child's FK index for any positive-weight entry
+                // whose leading column matches the referenced value. The index PK
+                // is OPK-at-rest, so OPK-encode the native value and match the
+                // whole leading column.
+                let opk = crate::schema::index_opk_prefix(fk_key, idx_key_type, idx_key_size);
+                if cursor.cursor.seek_first_positive_with_prefix(&opk[..idx_key_size]) {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id)
                         .cloned().unwrap_or_default();
                     let (csn, ctn) = self.caches.entity_by_id.get(&child_tid)
@@ -287,12 +301,12 @@ impl CatalogEngine {
             };
 
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
-            let prefix_len = col_size.min(idx_key_size);
+            let idx_key_type = ic.index_schema.columns[0].type_code;
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
 
-            // Promoted u128 key uniquely identifies the indexed value for
-            // every type we accept (promote_to_index_key widens to ≤16 bytes).
+            // The canonical u128 key uniquely identifies the indexed value for
+            // every type we accept (pk_native_key/payload_native_key map to ≤16 bytes).
             let mut seen: HashSet<u128> = HashSet::with_capacity(batch.count);
 
             for row in 0..batch.count {
@@ -320,14 +334,14 @@ impl CatalogEngine {
 
                 let key_u128 = if is_pk_col {
                     if pk_is_compound {
-                        promote_to_index_key(
+                        pk_native_key(
                             batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
                     } else {
                         batch.get_pk(row)
                     }
                 } else {
                     let col_data = batch.col_data(payload_col);
-                    promote_to_index_key(col_data, row * col_size, col_size, col_type)
+                    payload_native_key(col_data, row * col_size, col_size, col_type)
                 };
 
                 if !seen.insert(key_u128) {
@@ -338,11 +352,12 @@ impl CatalogEngine {
                     ));
                 }
 
-                // Index PK layout: indexed-key field (col_size LE bytes,
-                // zero-padded to idx_key_size) followed by the full source PK
-                // bytes — always idx_key_size + src_pk_stride wide.
-                let key_bytes = key_u128.to_le_bytes();
-                if !cursor.cursor.seek_first_positive_with_prefix(&key_bytes[..prefix_len]) {
+                // Index PK layout: leading indexed-key column (OPK-encoded,
+                // idx_key_size bytes) followed by the full source PK bytes —
+                // always idx_key_size + src_pk_stride wide. OPK-encode the native
+                // value and prefix-match the whole leading column.
+                let opk = crate::schema::index_opk_prefix(key_u128, idx_key_type, idx_key_size);
+                if !cursor.cursor.seek_first_positive_with_prefix(&opk[..idx_key_size]) {
                     continue;
                 }
                 let pk_bytes = cursor.cursor.current_pk_bytes();

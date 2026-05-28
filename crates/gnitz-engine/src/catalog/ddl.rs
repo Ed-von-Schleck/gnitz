@@ -218,11 +218,6 @@ impl CatalogEngine {
         let vid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("View does not exist: {}", qualified))?;
 
-        // Capture the physical directory before invalidating the DAG entry;
-        // once the catalog rows are gone no later DROP could reach it, so the
-        // on-disk scratch tables would leak inodes and disk space forever.
-        let view_dir = self.dag.tables.get(&vid).map(|e| e.directory.clone());
-
         self.dag.invalidate(vid);
 
         // Remove the view's dependency rows from sys_view_deps first. dag.dep_map
@@ -240,11 +235,9 @@ impl CatalogEngine {
             return Err(format!("View does not exist: {}", qualified));
         }
         self.ingest_to_family(VIEW_TAB_ID, &batch)?;
-
-        // Remove physical state after the catalog update succeeds.
-        if let Some(dir) = view_dir {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+        // hook_view_register queues the view's directory into
+        // pending_dir_deletions; the executor removes it after the DDL zone is
+        // durable. (No synchronous delete: that would race the WAL fdatasync.)
         Ok(())
     }
 
@@ -341,7 +334,8 @@ impl CatalogEngine {
         // Read the full index record from sys_indices to retract it
         // (sys_indices has a single U64 PK; seek by the zero-extended id).
         let mut cursor = self.sys_indices.open_cursor();
-        cursor.cursor.seek(idx_id as u128);
+        // sys_indices has a single U64 PK; OPK == big-endian.
+        cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
 
         if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
             return Err(format!("Index {} not found in catalog", index_name));

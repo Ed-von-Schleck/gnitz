@@ -161,7 +161,8 @@ impl CatalogEngine {
                 }
                 let (owner_id, src_col) = {
                     let mut cursor = self.sys_indices.open_cursor();
-                    cursor.cursor.seek(idx_id as u128);
+                    // sys_indices has a single U64 PK; OPK == big-endian.
+                    cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
                     if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
                         continue;
                     }
@@ -179,7 +180,13 @@ impl CatalogEngine {
 
         if table_id == TABLE_TAB_ID {
             for &tid in &drop_ids {
-                if let Some(r) = self.fk_children_of(tid).first() {
+                // A FK child being co-dropped in this same batch is
+                // self-resolving — only a child *outside* the batch blocks the
+                // drop. Mirrors the view-dependency binary_search filter below.
+                let blocking = self.fk_children_of(tid)
+                    .iter()
+                    .find(|r| drop_ids.binary_search(&r.child_tid).is_err());
+                if let Some(r) = blocking {
                     let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid)
                         .cloned().unwrap_or_default();
                     return Err(format!(
@@ -214,6 +221,25 @@ impl CatalogEngine {
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub fn drain_pending_broadcasts(&mut self) -> Vec<(i64, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
+    }
+
+    /// Physically remove the directories queued by table/view/index drop
+    /// hooks. The executor calls this only after the DDL zone's fdatasync
+    /// confirms the drop is durable — see `pending_dir_deletions`. An existence
+    /// guard keeps a re-queued path (drop applied, dir already gone) quiet.
+    pub fn drain_pending_dir_deletions(&mut self) {
+        for dir in std::mem::take(&mut self.pending_dir_deletions) {
+            if std::path::Path::new(&dir).exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    /// Drop the queued directory paths *without* deleting them. Used when a DDL
+    /// fails or to clear stale entries left by a prior failed DDL — the entity
+    /// did not durably drop, so its files must survive.
+    pub fn discard_pending_dir_deletions(&mut self) {
+        self.pending_dir_deletions.clear();
     }
 
     /// Pin all system-table writes in the current DDL to `lsn`. Must be
@@ -316,9 +342,10 @@ impl CatalogEngine {
             self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
         };
 
-        cursor.cursor.seek(pk);
+        let (opk, stride) = crate::storage::opk_key(&schema, pk);
+        cursor.cursor.seek_bytes(&opk[..stride]);
         if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_key != pk {
+        if cursor.cursor.current_pk_bytes() != &opk[..stride] {
             return Ok(None);
         }
         if cursor.cursor.current_weight <= 0 { return Ok(None); }
@@ -388,9 +415,10 @@ impl CatalogEngine {
         let mut out = Batch::with_schema(result_schema, pks.len());
         let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
         for &pk in pks {
-            cursor.cursor.seek(pk);
+            let (opk, stride) = crate::storage::opk_key(&schema, pk);
+            cursor.cursor.seek_bytes(&opk[..stride]);
             if !cursor.cursor.valid { continue; }
-            if cursor.cursor.current_key != pk { continue; }
+            if cursor.cursor.current_pk_bytes() != &opk[..stride] { continue; }
             if cursor.cursor.current_weight <= 0 { continue; }
             copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
         }
@@ -444,6 +472,18 @@ impl CatalogEngine {
 
         let src_pk_stride = entry.schema.pk_stride() as usize;
         let idx_key_size = ic.index_schema.columns[0].size() as usize;
+        let idx_key_type = ic.index_schema.columns[0].type_code;
+
+        // `prefix` is the indexed value in native little-endian bytes (source-
+        // column width). The index PK region is OPK-at-rest, so zero-extend to
+        // the promoted index key width and OPK-encode to match stored entries.
+        let mut native_le = [0u8; 16];
+        let n = prefix.len().min(idx_key_size);
+        native_le[..n].copy_from_slice(&prefix[..n]);
+        let opk = crate::schema::index_opk_prefix(
+            u128::from_le_bytes(native_le), idx_key_type, idx_key_size,
+        );
+        let opk_prefix = &opk[..idx_key_size];
 
         let idx_table = ic.table_mut();
         let mut cursor = idx_table.open_cursor();
@@ -460,7 +500,7 @@ impl CatalogEngine {
         // be spread across workers: this returns one worker's partial set and
         // the master (`fan_out_seek_by_index_collect_async`) merges across all.
         let mut result: Option<Batch> = None;
-        let mut hit = cursor.cursor.seek_first_positive_with_prefix(prefix);
+        let mut hit = cursor.cursor.seek_first_positive_with_prefix(opk_prefix);
         while hit {
             // Copy the source PK out of the index PK suffix into a fixed buffer
             // before the `&mut self` resolve below releases the cursor borrow.
@@ -478,7 +518,7 @@ impl CatalogEngine {
                 }
             }
             cursor.cursor.advance();
-            hit = cursor.cursor.walk_to_positive_with_prefix(prefix);
+            hit = cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
         }
         Ok(result)
     }
@@ -907,7 +947,8 @@ impl CatalogEngine {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_columns.open_cursor();
-        cursor.cursor.seek(start_pk as u128);
+        // sys_columns has a single U64 PK; OPK == big-endian.
+        cursor.cursor.seek_bytes(&(start_pk as u64).to_be_bytes());
 
         let mut defs = Vec::new();
         while cursor.cursor.valid {

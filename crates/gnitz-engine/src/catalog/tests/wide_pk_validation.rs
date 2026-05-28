@@ -18,10 +18,13 @@ fn wide_unique_schema() -> SchemaDescriptor {
 }
 
 fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
+    // Compound PK of unsigned U64 columns: OPK == big-endian per column, which
+    // is what the wide-PK write path stores and what the FK RESTRICT check
+    // decodes (pk_native_key) when resolving a referenced PK column.
     let mut p = [0u8; 24];
-    p[0..8].copy_from_slice(&a.to_le_bytes());
-    p[8..16].copy_from_slice(&b.to_le_bytes());
-    p[16..24].copy_from_slice(&c.to_le_bytes());
+    p[0..8].copy_from_slice(&a.to_be_bytes());
+    p[8..16].copy_from_slice(&b.to_be_bytes());
+    p[16..24].copy_from_slice(&c.to_be_bytes());
     p
 }
 
@@ -295,9 +298,11 @@ fn seek_family_bytes_matches_seek_family_narrow() {
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {
-        let bytes = (key as u128).to_le_bytes();
+        // seek_family_bytes takes the at-rest OPK bytes; for an unsigned U64 PK
+        // that is big-endian. seek_family takes the native u128 and OPK-encodes.
+        let bytes = key.to_be_bytes();
         let via_u128 = engine.seek_family(tid, key as u128).unwrap();
-        let via_bytes = engine.seek_family_bytes(tid, &bytes[..8]).unwrap();
+        let via_bytes = engine.seek_family_bytes(tid, &bytes).unwrap();
         assert_eq!(
             via_u128.is_some(), via_bytes.is_some(),
             "seek presence diverged for key {key}",

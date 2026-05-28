@@ -150,8 +150,17 @@ impl Accumulator {
         // !is_pk_col. COUNT skips the null check entirely because it
         // counts rows regardless of value-column nullness.
         let slot = self.pi_or_pk_off as usize;
+        // PK regions hold OPK (order-preserving big-endian) bytes; the
+        // decoders below read native little-endian, so decode the addressed
+        // PK column back to native before aggregating.
+        let mut pk_le_buf = [0u8; 8];
         let bytes: &[u8] = if self.is_pk_col {
-            &mb.get_pk_bytes(row)[slot..slot + cs]
+            gnitz_wire::decode_pk_column(
+                &mb.get_pk_bytes(row)[slot..slot + cs],
+                tc as u8,
+                &mut pk_le_buf[..cs],
+            );
+            &pk_le_buf[..cs]
         } else {
             if self.agg_op != AggOp::Count {
                 let null_word = mb.get_null_word(row);

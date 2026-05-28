@@ -42,11 +42,14 @@ pub(super) fn compare_by_group_cols(
             // whole PK region (the previous `mb.get_pk(row)` widen) splits
             // compound-PK groups that share the addressed column but differ
             // in other PK columns.
+            // PK region holds OPK bytes, which are order-preserving — compare
+            // them raw. (A `cmp_typed_le` LE decode would invert order for
+            // big-endian/sign-flipped OPK bytes.)
             let off = desc.pk_off as usize;
             let cs = desc.cs as usize;
             let a = &mb.get_pk_bytes(row_a)[off..off + cs];
             let b = &mb.get_pk_bytes(row_b)[off..off + cs];
-            let ord = cmp_typed_le(a, b, desc.tc);
+            let ord = a.cmp(b);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -178,12 +181,12 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch, schema: &SchemaDescriptor) -> 
         // pk_sort_key is only a 16-byte prefix here; settle prefix collisions
         // (and order col-major compound keys) with the authoritative walk.
         idx.sort_unstable_by(|&a, &b| {
-            compare_pk_bytes(schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
+            compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
         });
     } else {
         // Order-preserving narrow key: raw `u128` ascending == canonical PK
         // order for unsigned, signed, and compound alike.
-        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(schema, mb.get_pk_bytes(i))).collect();
+        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(mb.get_pk_bytes(i))).collect();
         idx.sort_unstable_by_key(|&i| pks[i as usize]);
     }
     idx
@@ -227,13 +230,13 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
         // the row comparator once, outside the sort, exactly as the narrow arm.
         if schema_is_int_nonnull(schema) {
             indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
-                schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
                 Ordering::Equal => row_int(a as usize, b as usize),
                 ord => ord,
             });
         } else {
             indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
-                schema, mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
                 Ordering::Equal => row_full(a as usize, b as usize),
                 ord => ord,
             });
@@ -241,7 +244,7 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     } else {
         // Narrow: order-preserving raw-`u128` key (unsigned/signed/compound),
         // payload tiebreak. The PK axis is a single primitive compare.
-        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(schema, mb.get_pk_bytes(i))).collect();
+        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(mb.get_pk_bytes(i))).collect();
         if schema_is_int_nonnull(schema) {
             sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_int);
         } else {

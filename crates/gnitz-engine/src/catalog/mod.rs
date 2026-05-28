@@ -111,6 +111,18 @@ pub struct CatalogEngine {
     // drain this (no broadcast channel), so it stays empty there.
     pub(crate) pending_broadcasts: Vec<(i64, Batch)>,
 
+    // --- Deferred physical directory deletions ---
+    //
+    // A table/view/index drop hook queues the entity's on-disk directory here
+    // instead of deleting it synchronously. `fire_hooks` runs during DAG
+    // evaluation, which overlaps the WAL fdatasync; a synchronous delete would
+    // open a window where the directory is gone but the DROP is not yet durably
+    // committed (a crash there leaves the catalog showing the entity as still
+    // existing while its files are permanently absent). The executor drains
+    // this only after the DDL zone's fdatasync confirms durability — the
+    // catalog analog of `ShardIndex::pending_deletions`.
+    pub(crate) pending_dir_deletions: Vec<String>,
+
     // 0 means "no zone active". The executor sets this before the DDL
     // mutate phase and clears it after fsync so every hook in the same
     // zone writes the same `current_lsn`. Recovery's dedup filter then

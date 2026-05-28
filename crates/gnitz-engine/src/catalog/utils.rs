@@ -302,9 +302,11 @@ pub(crate) fn copy_cursor_row_with_weight(
 pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = table.open_cursor();
-    cursor.cursor.seek(pk);
+    // OPK-encode the native PK; correct for single-column and compound system PKs.
+    let (opk, stride) = crate::storage::opk_key(schema, pk);
+    cursor.cursor.seek_bytes(&opk[..stride]);
     if cursor.cursor.valid
-        && cursor.cursor.current_key == pk
+        && cursor.cursor.current_pk_bytes() == &opk[..stride]
         && cursor.cursor.current_weight > 0
     {
         copy_cursor_row_with_weight(&cursor, &mut batch, -1);
@@ -324,7 +326,9 @@ pub(crate) fn retract_rows_in_pk_range(
 ) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = table.open_cursor();
-    cursor.cursor.seek(start);
+    // U64-PK system table: OPK == big-endian; the native-value range
+    // comparisons below (`current_key`/`get_pk` vs `pk_end`) stay valid.
+    cursor.cursor.seek_bytes(&(start as u64).to_be_bytes());
 
     // Bulk path: single consolidated MemBatch source.
     if let Some((src, start_idx)) = cursor.cursor.single_mem_batch() {
@@ -354,7 +358,9 @@ pub(crate) fn retract_rows_in_pk_range(
 /// `(view_id, sub)` ordering natively (no `(pk_hi, pk_lo)` u128 exploit).
 pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
-    let prefix = view_id.to_le_bytes();
+    // The (view_id, sub) PK is OPK-at-rest; the leading view_id column (U64) is
+    // big-endian, so the prefix must be OPK (BE), not native LE.
+    let prefix = view_id.to_be_bytes();
     let mut cursor = table.open_cursor();
     let mut hit = cursor.cursor.seek_first_positive_with_prefix(&prefix);
     while hit {

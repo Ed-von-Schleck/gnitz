@@ -738,7 +738,7 @@ fn test_resolve_column_indices_pk_at_col0() {
     let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0]; // col 0 = pk
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
     prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
+    assert_eq!(prog.code[0], EXPR_LOAD_PK_UNSIGNED_INT);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 42);
     assert!(!is_null);
@@ -782,7 +782,7 @@ fn test_resolve_column_indices_pk_at_middle() {
     let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
     let mut prog = ExprProgram::new(code, 1, 0, vec![]);
     prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PK_INT);
+    assert_eq!(prog.code[0], EXPR_LOAD_PK_UNSIGNED_INT);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 99);
 

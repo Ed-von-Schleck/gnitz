@@ -16,6 +16,15 @@ use super::op_gather::op_gather_reduce;
 use super::op_reduce::{cursor_matches_group, op_reduce};
 use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols, sort_owned};
 
+/// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
+/// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
+#[allow(dead_code)]
+fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
+    let mut le = [0u8; 8];
+    gnitz_wire::decode_pk_column(&opk_bytes[..8], type_code::I64, &mut le);
+    i64::from_le_bytes(le)
+}
+
 
 fn make_schema_u64_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -132,8 +141,11 @@ fn make_gi_batch(src: &SchemaDescriptor, rows: &[(u64, u64)]) -> ConsolidatedBat
 
     let mut key = [0u8; 16];
     for &(source_pk, gc_u64) in rows {
+        // GI key = gc(LE, matching index.rs population) ++ source_pk OPK bytes.
+        // The source_pk half is OPK at rest so the trace re-seek (which keys on
+        // the OPK trace PK region) matches.
         key[..8].copy_from_slice(&gc_u64.to_le_bytes());
-        key[8..].copy_from_slice(&source_pk.to_le_bytes());
+        key[8..].copy_from_slice(&source_pk.to_be_bytes());
         b.extend_pk_bytes(&key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -263,10 +275,11 @@ fn reduce_trace_seek_wide_pk() {
     assert!(in_schema.pk_is_wide(), "test invariant: stride 24 is wide");
 
     let pk = |a: u64, b: u64, c: u64| -> [u8; 24] {
+        // Compound PK of unsigned U64 columns: OPK == BE per column.
         let mut k = [0u8; 24];
-        k[0..8].copy_from_slice(&a.to_le_bytes());
-        k[8..16].copy_from_slice(&b.to_le_bytes());
-        k[16..24].copy_from_slice(&c.to_le_bytes());
+        k[0..8].copy_from_slice(&a.to_be_bytes());
+        k[8..16].copy_from_slice(&b.to_be_bytes());
+        k[16..24].copy_from_slice(&c.to_be_bytes());
         k
     };
 
@@ -356,13 +369,14 @@ fn reduce_trace_seek_compound_pk() {
         ],
         &[0, 1],
     );
-    assert!(!in_schema.pk_is_fast(), "test invariant: compound PK is not fast");
+    assert!(in_schema.pk_indices().len() > 1, "test invariant: compound PK");
     assert!(!in_schema.pk_is_wide(), "test invariant: stride 16 is narrow");
 
     let pk = |a: u64, b: u64| -> [u8; 16] {
+        // Compound PK of unsigned U64 columns: OPK == BE per column.
         let mut k = [0u8; 16];
-        k[0..8].copy_from_slice(&a.to_le_bytes());
-        k[8..16].copy_from_slice(&b.to_le_bytes());
+        k[0..8].copy_from_slice(&a.to_be_bytes());
+        k[8..16].copy_from_slice(&b.to_be_bytes());
         k
     };
     let agg = AggDescriptor {
@@ -450,7 +464,7 @@ fn reduce_trace_seek_signed_pk() {
         ],
         &[0],
     );
-    assert!(!in_schema.pk_is_fast(), "test invariant: signed PK is not fast");
+    assert!(in_schema.pk_is_signed_single_col(), "test invariant: single signed PK");
 
     let agg = AggDescriptor {
         col_idx: 1, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
@@ -463,7 +477,7 @@ fn reduce_trace_seek_signed_pk() {
     let delta1 = {
         let mut b = Batch::with_schema(in_schema, 2);
         for &(k, val) in &[(-1i64, 200i64), (2, 100)] {
-            b.extend_pk((k as u64) as u128);
+            b.extend_pk_opk(&in_schema, &[(k as u64) as u128]);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -479,7 +493,7 @@ fn reduce_trace_seek_signed_pk() {
         None, false, TypeCode::U64, None, 0, None, None,
     );
     assert_eq!(out1.count, 2, "two groups (-1 sorts before 2)");
-    assert_eq!(out1.get_pk(0) as i64, -1);
+    assert_eq!(opk_pk_i64(out1.get_pk_bytes(0)), -1);
     assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 200);
 
     // Tick 2: insert key=-1 -> 50. SUM goes 200 → 250: retract + insert.
@@ -487,7 +501,7 @@ fn reduce_trace_seek_signed_pk() {
     let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
     let delta2 = {
         let mut b = Batch::with_schema(in_schema, 1);
-        b.extend_pk(((-1i64) as u64) as u128);
+        b.extend_pk_opk(&in_schema, &[((-1i64) as u64) as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &50i64.to_le_bytes());
@@ -503,7 +517,7 @@ fn reduce_trace_seek_signed_pk() {
     );
     assert_eq!(out2.count, 2,
         "signed-PK retraction must read trace_out and emit retract+insert");
-    assert_eq!(out2.get_pk(0) as i64, -1);
+    assert_eq!(opk_pk_i64(out2.get_pk_bytes(0)), -1);
     assert_eq!(out2.get_weight(0), -1);
     assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
     assert_eq!(out2.get_weight(1), 1);
@@ -1386,9 +1400,10 @@ fn test_reduce_gi_wide_source_pk_stride24() {
         let mut b = Batch::with_schema(in_schema, rows.len().max(1));
         for &(pk, grp, val) in rows {
             let mut kb = [0u8; 24];
-            kb[0..8].copy_from_slice(&pk[0].to_le_bytes());
-            kb[8..16].copy_from_slice(&pk[1].to_le_bytes());
-            kb[16..24].copy_from_slice(&pk[2].to_le_bytes());
+            // Compound PK of unsigned U64 columns: OPK == BE per column.
+            kb[0..8].copy_from_slice(&pk[0].to_be_bytes());
+            kb[8..16].copy_from_slice(&pk[1].to_be_bytes());
+            kb[16..24].copy_from_slice(&pk[2].to_be_bytes());
             b.extend_pk_bytes(&kb);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1409,10 +1424,13 @@ fn test_reduce_gi_wide_source_pk_stride24() {
         let mut gib = Batch::with_schema(gi_schema, 2);
         for &(pk, gc) in &[([1u64, 2, 3], 9u64), ([4, 5, 6], 9)] {
             let mut key = [0u8; 32];
+            // GI key = gc(LE) ++ source PK (OPK bytes). The source table stores
+            // its compound U64 PK as OPK == BE per column, so the GI's source-PK
+            // segment must match those bytes for the trace re-seek to land.
             key[0..8].copy_from_slice(&gc.to_le_bytes());
-            key[8..16].copy_from_slice(&pk[0].to_le_bytes());
-            key[16..24].copy_from_slice(&pk[1].to_le_bytes());
-            key[24..32].copy_from_slice(&pk[2].to_le_bytes());
+            key[8..16].copy_from_slice(&pk[0].to_be_bytes());
+            key[16..24].copy_from_slice(&pk[1].to_be_bytes());
+            key[24..32].copy_from_slice(&pk[2].to_be_bytes());
             gib.extend_pk_bytes(&key);
             gib.extend_weight(&1i64.to_le_bytes());
             gib.extend_null_bmp(&0u64.to_le_bytes());
@@ -1846,8 +1864,9 @@ fn make_batch_compound_2xu64(
     let mut b = Batch::with_schema(*schema, n.max(1));
     for &(pk0, pk1, w, val) in rows {
         let mut pk_bytes = [0u8; 16];
-        pk_bytes[0..8].copy_from_slice(&pk0.to_le_bytes());
-        pk_bytes[8..16].copy_from_slice(&pk1.to_le_bytes());
+        // 2×U64 compound PK: both unsigned, OPK == BE per column.
+        pk_bytes[0..8].copy_from_slice(&pk0.to_be_bytes());
+        pk_bytes[8..16].copy_from_slice(&pk1.to_be_bytes());
         b.extend_pk_bytes(&pk_bytes);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1897,9 +1916,10 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     );
 
     assert_eq!(output.count, 1);
+    // Source PK region is OPK (big-endian); the verbatim copy preserves it.
     let mut expected = [0u8; 16];
-    expected[0..8].copy_from_slice(&pk0.to_le_bytes());
-    expected[8..16].copy_from_slice(&pk1.to_le_bytes());
+    expected[0..8].copy_from_slice(&pk0.to_be_bytes());
+    expected[8..16].copy_from_slice(&pk1.to_be_bytes());
     assert_eq!(output.get_pk_bytes(0), &expected[..],
         "compound natural-PK output must copy source row's PK bytes verbatim");
 }
@@ -2044,10 +2064,10 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
     assert_eq!(out.count, 2);
     let row0_pk = out.get_pk_bytes(0);
     let row1_pk = out.get_pk_bytes(1);
-    let p0_col0 = u64::from_le_bytes(row0_pk[0..8].try_into().unwrap());
-    let p0_col1 = u64::from_le_bytes(row0_pk[8..16].try_into().unwrap());
-    let p1_col0 = u64::from_le_bytes(row1_pk[0..8].try_into().unwrap());
-    let p1_col1 = u64::from_le_bytes(row1_pk[8..16].try_into().unwrap());
+    let p0_col0 = u64::from_be_bytes(row0_pk[0..8].try_into().unwrap());
+    let p0_col1 = u64::from_be_bytes(row0_pk[8..16].try_into().unwrap());
+    let p1_col0 = u64::from_be_bytes(row1_pk[0..8].try_into().unwrap());
+    let p1_col1 = u64::from_be_bytes(row1_pk[8..16].try_into().unwrap());
     assert_eq!((p0_col0, p0_col1), (1, 2),
         "first emitted row must be (1, 2) in pk_indices order");
     assert_eq!((p1_col0, p1_col1), (2, 1),
@@ -2153,7 +2173,7 @@ fn test_cursor_matches_group_pk_sentinel_compound_subset() {
 
     let mut cursor_handle = CursorHandle::from_owned(&[cursor_batch], schema);
     let cursor = cursor_handle.cursor_mut();
-    cursor.seek(0u128);
+    cursor.rewind();
     assert!(cursor.valid, "cursor must be positioned on the single row");
 
     let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
@@ -2255,7 +2275,8 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
     let mut entries: Vec<(u64, i64)> = (0..out.count)
         .map(|i| {
             let pk_bytes = out.get_pk_bytes(i);
-            let pk = u64::from_le_bytes(pk_bytes.try_into().unwrap());
+            // Output group-key PK is unsigned U64, OPK == BE at rest.
+            let pk = u64::from_be_bytes(pk_bytes.try_into().unwrap());
             let cnt = crate::util::read_i64_le(out.col_data(0), i * 8);
             (pk, cnt)
         })
@@ -2819,7 +2840,8 @@ fn make_batch_raw_pk<T: Copy>(
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
     for &(pk, w, val) in rows {
-        b.extend_pk(pk_encode(pk));
+        // pk_encode yields the native value; OPK-encode (sign-flip for signed).
+        b.extend_pk_opk(schema, &[pk_encode(pk)]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
@@ -2887,8 +2909,8 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     assert_eq!(out.count, 2, "one row per distinct PK");
     let pk0 = out.get_pk_bytes(0);
     let pk1 = out.get_pk_bytes(1);
-    let pk0_val = u128::from_le_bytes(pk0.try_into().unwrap());
-    let pk1_val = u128::from_le_bytes(pk1.try_into().unwrap());
+    let pk0_val = u128::from_be_bytes(pk0.try_into().unwrap());
+    let pk1_val = u128::from_be_bytes(pk1.try_into().unwrap());
     assert_eq!(pk0_val, 3, "PK-sorted: 3 precedes 5");
     assert_eq!(pk1_val, 5);
     let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
@@ -2928,8 +2950,8 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
     );
 
     assert_eq!(out.count, 2);
-    let pk0 = u128::from_le_bytes(out.get_pk_bytes(0).try_into().unwrap());
-    let pk1 = u128::from_le_bytes(out.get_pk_bytes(1).try_into().unwrap());
+    let pk0 = u128::from_be_bytes(out.get_pk_bytes(0).try_into().unwrap());
+    let pk1 = u128::from_be_bytes(out.get_pk_bytes(1).try_into().unwrap());
     assert_eq!((pk0, pk1), (3, 5));
     let c0 = crate::util::read_i64_le(out.col_data(0), 0);
     let c1 = crate::util::read_i64_le(out.col_data(0), 8);
@@ -2968,8 +2990,8 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     );
 
     assert_eq!(out.count, 2);
-    let pk0 = u128::from_le_bytes(out.get_pk_bytes(0).try_into().unwrap());
-    let pk1 = u128::from_le_bytes(out.get_pk_bytes(1).try_into().unwrap());
+    let pk0 = u128::from_be_bytes(out.get_pk_bytes(0).try_into().unwrap());
+    let pk1 = u128::from_be_bytes(out.get_pk_bytes(1).try_into().unwrap());
     assert_eq!((pk0, pk1), (3, 5));
     let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
     let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
@@ -3018,10 +3040,10 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
     assert_eq!(out.count, 2);
     let pk0 = out.get_pk_bytes(0);
     let pk1 = out.get_pk_bytes(1);
-    let p0_col0 = u64::from_le_bytes(pk0[0..8].try_into().unwrap());
-    let p0_col1 = u64::from_le_bytes(pk0[8..16].try_into().unwrap());
-    let p1_col0 = u64::from_le_bytes(pk1[0..8].try_into().unwrap());
-    let p1_col1 = u64::from_le_bytes(pk1[8..16].try_into().unwrap());
+    let p0_col0 = u64::from_be_bytes(pk0[0..8].try_into().unwrap());
+    let p0_col1 = u64::from_be_bytes(pk0[8..16].try_into().unwrap());
+    let p1_col0 = u64::from_be_bytes(pk1[0..8].try_into().unwrap());
+    let p1_col1 = u64::from_be_bytes(pk1[8..16].try_into().unwrap());
     // Canonical pk_indices order is [col0, col1] ascending — (1,2) first.
     // A u128.cmp on the widened PK region would put (2,1) first because
     // col1 dominates the high bytes.
@@ -3072,9 +3094,10 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
     assert_eq!(out.count, 3, "one row per distinct signed PK");
     let pks: Vec<i64> = (0..out.count)
         .map(|i| {
+            // U128 output PK = group_key widened right-aligned, so the I64's
+            // OPK bytes sit in the low 8 bytes; decode them back to native.
             let bytes = out.get_pk_bytes(i);
-            let low = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            low as i64
+            opk_pk_i64(&bytes[8..16])
         })
         .collect();
     let sums: Vec<i64> = (0..out.count)
@@ -3133,7 +3156,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
 
     let mut by_pk_w: Vec<(u128, i64, i64)> = (0..out.count)
         .map(|i| {
-            let pk = u128::from_le_bytes(out.get_pk_bytes(i).try_into().unwrap());
+            let pk = u128::from_be_bytes(out.get_pk_bytes(i).try_into().unwrap());
             let w = out.get_weight(i);
             let sum = crate::util::read_i64_le(out.col_data(0), i * 8);
             (pk, w, sum)
@@ -3170,10 +3193,7 @@ fn test_sort_owned_signed_pk_canonical_order() {
     assert!(sorted.sorted, "sort_owned must set the sorted flag");
     assert_eq!(sorted.count, 3);
     let pks: Vec<i64> = (0..sorted.count)
-        .map(|i| {
-            let b = sorted.get_pk_bytes(i);
-            u64::from_le_bytes(b[0..8].try_into().unwrap()) as i64
-        })
+        .map(|i| opk_pk_i64(sorted.get_pk_bytes(i)))
         .collect();
     assert_eq!(pks, vec![-3, -1, 2],
         "signed PK rows must come out in signed-ascending order");
@@ -3193,10 +3213,11 @@ fn test_sort_owned_compound_pk_canonical_order() {
     assert_eq!(sorted.count, 2);
     let p0 = sorted.get_pk_bytes(0);
     let p1 = sorted.get_pk_bytes(1);
-    let p0_c0 = u64::from_le_bytes(p0[0..8].try_into().unwrap());
-    let p0_c1 = u64::from_le_bytes(p0[8..16].try_into().unwrap());
-    let p1_c0 = u64::from_le_bytes(p1[0..8].try_into().unwrap());
-    let p1_c1 = u64::from_le_bytes(p1[8..16].try_into().unwrap());
+    // Compound PK columns are OPK (big-endian) at rest.
+    let p0_c0 = u64::from_be_bytes(p0[0..8].try_into().unwrap());
+    let p0_c1 = u64::from_be_bytes(p0[8..16].try_into().unwrap());
+    let p1_c0 = u64::from_be_bytes(p1[0..8].try_into().unwrap());
+    let p1_c1 = u64::from_be_bytes(p1[8..16].try_into().unwrap());
     assert_eq!((p0_c0, p0_c1), (1, 2),
         "compound-PK canonical sort follows pk_indices order, not u128 LE byte order");
     assert_eq!((p1_c0, p1_c1), (2, 1));
@@ -3222,7 +3243,7 @@ fn test_gather_reduce_signed_pk_output_sorted_flag() {
     // Unsorted partial-reduce input with negative PKs interleaved.
     let mut partial = Batch::with_schema(schema, 3);
     for &(pk, sum) in &[(-1i64, 10i64), (2i64, 20i64), (-3i64, 30i64)] {
-        partial.extend_pk((pk as u64) as u128);
+        partial.extend_pk_opk(&schema, &[(pk as u64) as u128]);
         partial.extend_weight(&1i64.to_le_bytes());
         partial.extend_null_bmp(&0u64.to_le_bytes());
         partial.extend_col(0, &sum.to_le_bytes());
@@ -3239,10 +3260,7 @@ fn test_gather_reduce_signed_pk_output_sorted_flag() {
 
     assert_eq!(out.count, 3);
     let pks: Vec<i64> = (0..out.count)
-        .map(|i| {
-            let b = out.get_pk_bytes(i);
-            u64::from_le_bytes(b[0..8].try_into().unwrap()) as i64
-        })
+        .map(|i| opk_pk_i64(out.get_pk_bytes(i)))
         .collect();
     assert_eq!(pks, vec![-3, -1, 2],
         "gather-reduce output must be in canonical signed-PK order for output.sorted=true to be truthful");
@@ -3982,18 +4000,26 @@ fn avi_wide_two_u64_groups_match_reference() {
     // AVI post-state: one entry per group holding its MIN, sorted by
     // compare_pk_bytes order (ascending a, then b — both unsigned).
     let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32, 2u32]);
-    let mut sorted: Vec<(u64, u64, i64)> =
-        reference.iter().map(|(&(a, b), &m)| (a, b, m)).collect();
-    sorted.sort_by_key(|x| (x.0, x.1));
     let avi_batch = {
-        let mut bt = Batch::with_schema(avi_schema, sorted.len());
-        for &(a, b, m) in &sorted {
-            let mut key = [0u8; 24];
-            key[0..8].copy_from_slice(&a.to_le_bytes());
-            key[8..16].copy_from_slice(&b.to_le_bytes());
-            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-            key[16..24].copy_from_slice(&av.to_le_bytes());
-            bt.extend_pk_bytes(&key);
+        let mut keys: Vec<[u8; 24]> = reference
+            .iter()
+            .map(|(&(a, b), &m)| {
+                let mut key = [0u8; 24];
+                key[0..8].copy_from_slice(&a.to_le_bytes());
+                key[8..16].copy_from_slice(&b.to_le_bytes());
+                let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+                key[16..24].copy_from_slice(&av.to_le_bytes());
+                key
+            })
+            .collect();
+        // Production's ingest sorts the AVI by memcmp of the composite key
+        // (the group prefix is point-probed, never numeric-range-scanned), so
+        // the hand-built fixture must be in byte order — not numeric (a, b)
+        // order, which diverges from memcmp under little-endian storage.
+        keys.sort();
+        let mut bt = Batch::with_schema(avi_schema, keys.len());
+        for key in &keys {
+            bt.extend_pk_bytes(key);
             bt.extend_weight(&1i64.to_le_bytes());
             bt.extend_null_bmp(&0u64.to_le_bytes());
             bt.count += 1;
@@ -4184,18 +4210,26 @@ fn avi_wide_mixed_signed_unsigned_key() {
         b
     };
 
-    // AVI rows in compare_pk_bytes order: a ascending (signed), then b.
+    // AVI rows in memcmp (compare_pk_bytes) order of the composite key. The
+    // group prefix is point-probed, never numeric-range-scanned, so a signed
+    // column stored little-endian sorts by bytes, not by signed value — which
+    // is what production's ingest produces.
     let avi_batch = {
         let mut b = Batch::with_schema(avi_schema, 3);
-        let mut sorted = groups.to_vec();
-        sorted.sort_by_key(|x| (x.0, x.1));
-        for &(a, bb, m) in &sorted {
-            let mut key = [0u8; 24];
-            key[0..8].copy_from_slice(&a.to_le_bytes());
-            key[8..16].copy_from_slice(&bb.to_le_bytes());
-            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-            key[16..24].copy_from_slice(&av.to_le_bytes());
-            b.extend_pk_bytes(&key);
+        let mut keys: Vec<[u8; 24]> = groups
+            .iter()
+            .map(|&(a, bb, m)| {
+                let mut key = [0u8; 24];
+                key[0..8].copy_from_slice(&a.to_le_bytes());
+                key[8..16].copy_from_slice(&bb.to_le_bytes());
+                let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+                key[16..24].copy_from_slice(&av.to_le_bytes());
+                key
+            })
+            .collect();
+        keys.sort();
+        for key in &keys {
+            b.extend_pk_bytes(key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;

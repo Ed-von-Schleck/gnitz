@@ -477,21 +477,19 @@ impl Table {
 
     /// Check if a PK exists with positive net weight.
     pub fn has_pk(&mut self, key: u128) -> bool {
-        let mut total_w: i64 = 0;
-        if self.memtable.may_contain_pk(key) {
-            let (w, _, _) = self.memtable.lookup_pk(key);
-            total_w = w;
-        }
-        let (shard_w, _) = self.scan_shards_for_pk(key, false);
-        total_w += shard_w;
-        total_w > 0
+        let (opk, n) = columnar::opk_key(&self.schema, key);
+        self.has_pk_bytes(&opk[..n])
     }
 
-    /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
-    /// The memtable bloom is never populated for wide PKs, so the lookup goes
-    /// straight to the sorted runs and shard index (binary search, no cursor).
+    /// Byte-keyed PK existence check. The memtable bloom (keyed by the OPK
+    /// bytes) gates the sorted-run lookup for narrow PKs; wide PKs are never
+    /// bloom-populated, so they go straight to the runs and shard index.
     pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
-        let (mt_w, _, _) = self.memtable.lookup_pk_bytes(key);
+        let mut mt_w: i64 = 0;
+        if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+            let (w, _, _) = self.memtable.lookup_pk_bytes(key);
+            mt_w = w;
+        }
         let (shard_w, _) = self.scan_shards_for_pk_bytes(key, false);
         mt_w + shard_w > 0
     }
@@ -503,64 +501,23 @@ impl Table {
     /// old-payload rows with net weight 0 in the memtable), the found row is
     /// the live (PK, new_payload) entry, not the cancelled old one.
     pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
-        self.found_source = FoundSource::None;
-
-        // Step 1: memtable weight and row count.
-        let (mt_w, _, mt_row_count) = if self.memtable.may_contain_pk(key) {
-            self.memtable.lookup_pk(key)
-        } else {
-            (0, false, 0)
-        };
-
-        // Only collect shard candidates when Fast Path A won't apply.
-        // When mt_row_count == 1 && mt_w > 0 the memtable row is definitively
-        // live; shard candidates are not needed.
-        let need_candidates = !(mt_row_count == 1 && mt_w > 0);
-        let mut total_w = mt_w;
-        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key, need_candidates);
-        total_w += shard_w;
-
-        if total_w <= 0 {
-            return (total_w, false);
-        }
-
-        // Step 2: find the live (PK, payload) row.
-        // Fast path A: lookup_pk already set found_run/found_row; no payload scan.
-        // Multi-row path: scan memtable for positive-weight (PK, payload) row.
-        let in_memtable = if mt_row_count == 1 && mt_w > 0 {
-            true
-        } else if mt_row_count > 1 {
-            self.memtable.find_positive_payload_row(key)
-        } else {
-            false
-        };
-
-        if in_memtable {
-            self.found_source = FoundSource::MemTable;
-        } else if shard_candidates.len() == 1 {
-            // Fast path B: single shard candidate must be the live row.
-            let (rc, idx) = &shard_candidates[0];
-            self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
-        } else {
-            for (rc, idx) in &shard_candidates {
-                let net_w = self.get_weight_for_row(key, rc.as_ref(), *idx);
-                if net_w > 0 {
-                    self.found_source = FoundSource::Shard(Rc::clone(rc), *idx);
-                    break;
-                }
-            }
-        }
-
-        (total_w, true)
+        let (opk, n) = columnar::opk_key(&self.schema, key);
+        self.retract_pk_bytes(&opk[..n])
     }
 
-    /// Byte-keyed sibling of [`retract_pk`] for wide PKs. Read-only (the DBSP
-    /// retraction is the `-1` row appended downstream); sets `found_source`
-    /// so the `found_*` accessors expose the live row's payload.
+    /// Look up a PK for retraction by its OPK `key` bytes. Returns
+    /// `(net_weight, found)`; on a hit sets `found_source` so the `found_*`
+    /// accessors expose the live (PK, payload) row. The memtable bloom (keyed
+    /// by OPK bytes) gates the run lookup for narrow PKs.
     pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
         self.found_source = FoundSource::None;
 
-        let (mt_w, _, mt_row_count) = self.memtable.lookup_pk_bytes(key);
+        let (mt_w, _, mt_row_count) =
+            if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+                self.memtable.lookup_pk_bytes(key)
+            } else {
+                (0, false, 0)
+            };
 
         let need_candidates = !(mt_row_count == 1 && mt_w > 0);
         let mut total_w = mt_w;
@@ -597,38 +554,8 @@ impl Table {
         (total_w, true)
     }
 
-    /// Get net weight for a specific (PK, payload) row.
-    pub fn get_weight_for_row<S: columnar::ColumnarSource>(
-        &mut self,
-        key: u128,
-        ref_source: &S,
-        ref_row: usize,
-    ) -> i64 {
-        let mut total_w: i64 = 0;
-
-        // MemTable
-        if self.memtable.may_contain_pk(key) {
-            total_w += self.memtable.find_weight_for_row(key, ref_source, ref_row);
-        }
-
-        // Shards
-        self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
-            let mut idx = start_idx;
-            while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
-                let ord = columnar::compare_rows(
-                    &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
-                );
-                if ord == Ordering::Equal {
-                    total_w += shard_rc.get_weight(idx);
-                }
-                idx += 1;
-            }
-        });
-
-        total_w
-    }
-
-    /// Byte-keyed sibling of [`get_weight_for_row`] for wide PKs.
+    /// Net weight for a specific (PK, payload) row, keyed by OPK `key` bytes.
+    /// The memtable bloom (keyed by OPK bytes) gates the run scan for narrow PKs.
     pub fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
         &mut self,
         key: &[u8],
@@ -637,7 +564,9 @@ impl Table {
     ) -> i64 {
         let mut total_w: i64 = 0;
 
-        total_w += self.memtable.find_weight_for_row_bytes(key, ref_source, ref_row);
+        if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+            total_w += self.memtable.find_weight_for_row_bytes(key, ref_source, ref_row);
+        }
 
         self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
@@ -719,29 +648,7 @@ impl Table {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    fn scan_shards_for_pk(
-        &self,
-        key: u128,
-        need_candidates: bool,
-    ) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
-        let mut total_w: i64 = 0;
-        let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
-
-        self.shard_index.find_pk(key, &mut |shard_rc, start_idx| {
-            let mut idx = start_idx;
-            while idx < shard_rc.count && shard_rc.get_pk(idx) == key {
-                total_w += shard_rc.get_weight(idx);
-                if need_candidates {
-                    candidates.push((Rc::clone(&shard_rc), idx));
-                }
-                idx += 1;
-            }
-        });
-
-        (total_w, candidates)
-    }
-
-    /// Byte-keyed sibling of [`scan_shards_for_pk`] for wide PKs.
+    /// Scan shards for a PK by its OPK `key` bytes.
     fn scan_shards_for_pk_bytes(
         &self,
         key: &[u8],

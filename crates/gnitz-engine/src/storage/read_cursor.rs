@@ -12,7 +12,7 @@ use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::{pack_pk_le, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
+use super::merge::{pack_pk_be, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
 thread_local! {
@@ -142,22 +142,13 @@ impl CursorSource {
         }
     }
 
-    fn find_lower_bound(&self, key: u128) -> usize {
+    /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search
+    /// over the order-preserving PK regions — correct at every PK width with no
+    /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
+    fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         match self {
-            CursorSource::Batch(b) => b.find_lower_bound(key),
-            CursorSource::Shard(s) => s.find_lower_bound(key),
-        }
-    }
-
-    /// Byte-addressed sibling of [`find_lower_bound`]. Both arms order rows by
-    /// the cursor's `schema` via [`compare_pk_bytes`] — the `Batch` arm does NOT
-    /// read the batch's own `schema` field, which is unset for the intermediate
-    /// batches a cursor often wraps. (A `MappedShard` has no `SchemaDescriptor`
-    /// at all, only `pk_stride`.) `key` must be exactly `pk_stride` bytes.
-    fn find_lower_bound_bytes(&self, key: &[u8], schema: &SchemaDescriptor) -> usize {
-        match self {
-            CursorSource::Batch(b) => b.find_lower_bound_bytes(key, schema),
-            CursorSource::Shard(s) => s.find_lower_bound_bytes(key, schema),
+            CursorSource::Batch(b) => b.find_lower_bound_bytes(key),
+            CursorSource::Shard(s) => s.find_lower_bound_bytes(key),
         }
     }
 
@@ -176,8 +167,8 @@ impl CursorSource {
     /// `compare_pk_bytes` on the full `get_pk_bytes` slice). Decoupled from the
     /// public `current_key` field, which keeps the raw `pack_pk_le` value.
     #[inline]
-    fn get_pk_prefix(&self, row: usize, schema: &SchemaDescriptor) -> u128 {
-        pk_sort_key(schema, self.get_pk_bytes(row))
+    fn get_pk_prefix(&self, row: usize) -> u128 {
+        pk_sort_key(self.get_pk_bytes(row))
     }
 
     /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
@@ -316,16 +307,10 @@ impl CursorState {
         }
     }
 
-    fn seek(&mut self, src: &CursorSource, key: u128) {
-        self.position = src.find_lower_bound(key);
-        self.skip_ghosts(src);
-    }
-
-    /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
-    /// bytes; `schema` is forwarded to the `Shard` arm of
-    /// [`CursorSource::find_lower_bound_bytes`].
-    fn seek_bytes(&mut self, src: &CursorSource, key: &[u8], schema: &SchemaDescriptor) {
-        self.position = src.find_lower_bound_bytes(key, schema);
+    /// Seek to the first row whose OPK bytes are `>= key`. `key` must be exactly
+    /// `pk_stride` OPK bytes.
+    fn seek_bytes(&mut self, src: &CursorSource, key: &[u8]) {
+        self.position = src.find_lower_bound_bytes(key);
         self.skip_ghosts(src);
     }
 
@@ -389,7 +374,7 @@ impl ReadCursor {
         // panics on wide.
         let init = |i: usize| {
             if states[i].is_valid() {
-                Some((sources[i].get_pk_prefix(states[i].position, schema), states[i].position))
+                Some((sources[i].get_pk_prefix(states[i].position), states[i].position))
             } else {
                 None
             }
@@ -407,7 +392,6 @@ impl ReadCursor {
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => match columnar::compare_pk_bytes(
-                        schema,
                         sources[a.source_idx].get_pk_bytes(a.row),
                         sources[b.source_idx].get_pk_bytes(b.row),
                     ) {
@@ -486,32 +470,6 @@ impl ReadCursor {
         cursor
     }
 
-    pub fn seek(&mut self, key: u128) {
-        // Narrow-PK only: a u128 key cannot carry a `pk_stride > 16` PK. Every
-        // caller either guards the schema (op_join/op_distinct/vm SeekTrace) or
-        // operates on a fixed narrow-PK system table; wide-PK traces seek via
-        // `seek_bytes`/`seek_group`. Debug-only fail-stop if that ever breaks.
-        debug_assert!(!self.schema.pk_is_wide(), "ReadCursor::seek: wide PK; use seek_bytes");
-        // Raw u128 binary search (`find_lower_bound`) orders by the packed key,
-        // which equals storage order only for a single unsigned column
-        // (`pk_is_fast`). Compound and signed-single PKs sort via
-        // `compare_pk_bytes`, and their packed u128 order differs: a compound
-        // key packs col_0 in the low bytes, so u128 order is last-column-major;
-        // a signed key zero-extends, so negatives sort after positives. Route
-        // those through the byte path. The narrow u128 encoding is faithful, so
-        // `key.to_le_bytes()[..stride]` reproduces the stored PK bytes exactly.
-        if !self.schema.pk_is_fast() {
-            let stride = self.schema.pk_stride() as usize;
-            let kb = key.to_le_bytes();
-            self.seek_bytes(&kb[..stride]);
-            return;
-        }
-        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.seek(src, key);
-        }
-        self.rebuild_and_drive();
-    }
-
     /// Rebuild the loser tree (when multi-source) after the per-source
     /// positions have been moved, then drive to the first live row. Shared
     /// tail of [`seek`], [`seek_bytes`], and [`rewind`]: repositioning a source
@@ -546,7 +504,7 @@ impl ReadCursor {
     /// wide), so this survives `pk_stride > 16` where the u128 `seek` cannot.
     pub fn seek_bytes(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.seek_bytes(src, key, &self.schema);
+            state.seek_bytes(src, key);
         }
         self.rebuild_and_drive();
     }
@@ -557,53 +515,40 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
-    /// Seek to a group's PK, dispatching on whether the packed u128 key orders
-    /// like storage. `key` and `key_bytes` must encode the same PK. A single
-    /// unsigned column (`pk_is_fast`) takes the u128 `key` (its single-word
-    /// `find_lower_bound` compare beats the per-probe column walk); every other
-    /// shape — compound, signed-single, or wide (`pk_stride > 16`) — takes the
-    /// byte-addressed `seek_bytes`, whose `compare_pk_bytes` order matches the
-    /// storage sort.
-    pub fn seek_group(&mut self, key: u128, key_bytes: &[u8]) {
-        if self.schema.pk_is_fast() {
-            self.seek(key);
-        } else {
-            self.seek_bytes(key_bytes);
-        }
+    /// Seek to a group's PK by its OPK `key_bytes` (the bytes from
+    /// `get_pk_bytes`/`current_pk_bytes`, already order-preserving at rest).
+    /// Correct at every PK width and PK signedness.
+    pub fn seek_group(&mut self, key_bytes: &[u8]) {
+        self.seek_bytes(key_bytes);
     }
 
-    /// Whether the current row's PK equals the group key — dispatch sibling of
-    /// [`seek_group`] for bounding a per-group scan. A single unsigned column
-    /// (`pk_is_fast`) compares the cached u128 `current_key`; every other shape
-    /// compares the full PK bytes. Callers must gate on `valid` first: the
-    /// byte arm reads the current row's bytes, which is undefined on an
-    /// unpositioned cursor.
+    /// Whether the current row's PK equals the group's OPK `key_bytes`. Callers
+    /// must gate on `valid` first — this reads the current row's bytes, which is
+    /// undefined on an unpositioned cursor.
     #[inline]
-    pub fn current_pk_eq(&self, key: u128, key_bytes: &[u8]) -> bool {
-        if self.schema.pk_is_fast() {
-            self.current_key == key
-        } else {
-            self.current_pk_bytes() == key_bytes
-        }
+    pub fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
+        self.current_pk_bytes() == key_bytes
     }
 
-    /// Storage-order comparison of the current row's PK against `key`.
-    /// Dispatches like [`seek`]: the fast (single unsigned column) arm compares
-    /// the packed u128 `current_key`; every other narrow PK compares via
-    /// `compare_pk_bytes` on the row's stored bytes, since the packed u128 order
-    /// is unsound for compound/signed keys. `key` is the same faithful narrow
-    /// u128 encoding `seek` accepts. Callers must gate on `valid` first — the
-    /// non-fast arm reads the current row.
+    /// Storage-order comparison of the current row's PK against an OPK `key`
+    /// (already-encoded bytes). Universal byte path; correct at every PK width.
+    /// Callers must gate on `valid` first.
     #[inline]
-    pub fn current_pk_cmp(&self, key: u128) -> Ordering {
-        if self.schema.pk_is_fast() {
-            self.current_key.cmp(&key)
+    pub fn current_pk_cmp_bytes(&self, key: &[u8]) -> Ordering {
+        self.current_pk_bytes().cmp(key)
+    }
+
+    /// Compute the `current_key` field from a row's OPK bytes. Narrow PKs
+    /// (`stride ≤ 16`) recover the native (unsigned) value via right-aligned BE
+    /// — the form catalog readers expect (`current_key as u64`). Wide PKs
+    /// (`stride > 16`) get a non-authoritative left-aligned OPK prefix; wide
+    /// consumers must read `current_pk_bytes()` instead.
+    #[inline]
+    fn current_key_from_bytes(bytes: &[u8]) -> u128 {
+        if bytes.len() <= 16 {
+            gnitz_wire::widen_pk_be(bytes, bytes.len())
         } else {
-            debug_assert!(!self.schema.pk_is_wide(),
-                "current_pk_cmp: wide PK; a u128 key cannot encode it");
-            let stride = self.schema.pk_stride() as usize;
-            let kb = key.to_le_bytes();
-            columnar::compare_pk_bytes(&self.schema, self.current_pk_bytes(), &kb[..stride])
+            pack_pk_be(bytes)
         }
     }
 
@@ -615,34 +560,15 @@ impl ReadCursor {
     /// Centralises the seek-pad-walk dance used by the compound-PK secondary
     /// index: zero-pads `prefix` to `pk_stride` for `seek_bytes`, then walks
     /// forward until the prefix terminates or a positive-weight match appears.
+    /// `prefix` is the OPK image of the leading PK column(s).
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride() as usize;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         let copy_len = prefix.len().min(stride);
         key[..copy_len].copy_from_slice(&prefix[..copy_len]);
-
-        // Pad suffix columns with the type's minimum value so the lower-bound
-        // binary search (compare_pk_bytes, type-aware) lands before all real
-        // entries in the suffix range. Zero-padding decodes to 0 for signed
-        // types, which is greater than any negative value — skipping them.
-        let mut offset = 0;
-        for (_, _, col) in self.schema.pk_columns() {
-            let size = col.size() as usize;
-            if offset >= copy_len && offset + size <= stride {
-                match col.type_code {
-                    crate::schema::type_code::I8  => key[offset] = i8::MIN as u8,
-                    crate::schema::type_code::I16 =>
-                        key[offset..offset + 2].copy_from_slice(&i16::MIN.to_le_bytes()),
-                    crate::schema::type_code::I32 =>
-                        key[offset..offset + 4].copy_from_slice(&i32::MIN.to_le_bytes()),
-                    crate::schema::type_code::I64 =>
-                        key[offset..offset + 8].copy_from_slice(&i64::MIN.to_le_bytes()),
-                    _ => {} // unsigned types: 0x00 is already the minimum
-                }
-            }
-            offset += size;
-        }
-
+        // Suffix stays zero: 0x00 is the OPK minimum for every PK type (signed
+        // MIN maps to all-zeros after the sign flip), so the zero-padded key is
+        // the correct lower bound for the suffix columns at every type.
         self.seek_bytes(&key[..stride]);
         self.walk_to_positive_with_prefix(prefix)
     }
@@ -713,9 +639,10 @@ impl ReadCursor {
             let pos = state.position;
             let src = &self.sources[0];
             self.valid = true;
-            // Heap key is the OPK; `current_key` keeps its raw `pack_pk_le`
-            // contract (op_distinct / ddl / current_pk_eq/cmp read it raw).
-            self.current_key = pack_pk_le(src.get_pk_bytes(pos));
+            // current_key carries the native value for narrow PKs (the form
+            // catalog readers and op_distinct expect); a non-authoritative OPK
+            // prefix for wide (wide consumers read current_pk_bytes()).
+            self.current_key = Self::current_key_from_bytes(src.get_pk_bytes(pos));
             self.current_weight = src.get_weight(pos);
             self.current_null_word = src.get_null_word(pos);
             self.current_entry_idx = 0;
@@ -737,7 +664,7 @@ impl ReadCursor {
         heap: &mut LoserTree,
         sources: &[CursorSource],
         states: &mut [CursorState],
-        schema: &SchemaDescriptor,
+        _schema: &SchemaDescriptor,
         less: L,
         eq_payload: EQ,
     ) -> Option<(i64, usize, usize)>
@@ -751,7 +678,7 @@ impl ReadCursor {
             |src| {
                 states[src].advance(&sources[src]);
                 if states[src].is_valid() {
-                    Some((sources[src].get_pk_prefix(states[src].position, schema), states[src].position))
+                    Some((sources[src].get_pk_prefix(states[src].position), states[src].position))
                 } else {
                     None
                 }
@@ -801,7 +728,7 @@ impl ReadCursor {
                 match a.key.cmp(&b.key) {
                     Ordering::Less => true,
                     Ordering::Greater => false,
-                    Ordering::Equal => match columnar::compare_pk_bytes(schema,
+                    Ordering::Equal => match columnar::compare_pk_bytes(
                         sources[a.source_idx].get_pk_bytes(a.row),
                         sources[b.source_idx].get_pk_bytes(b.row)) {
                         Ordering::Less => true,
@@ -812,9 +739,7 @@ impl ReadCursor {
                 }
             };
             let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-                columnar::compare_pk_bytes(schema, sources[a_src].get_pk_bytes(a_row),
-                                                   sources[b_src].get_pk_bytes(b_row))
-                    == Ordering::Equal
+                sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
                 && row_cmp(schema, &sources[a_src], a_row,
                                    &sources[b_src], b_row) == Ordering::Equal
             };
@@ -836,12 +761,11 @@ impl ReadCursor {
             };
             Self::drive_inner(heap, sources, states, schema, less, eq_payload)
         };
-        // Heap key is the OPK; recompute the raw `pack_pk_le` here so
-        // `current_key` keeps its raw-value contract (op_distinct, ddl,
-        // current_pk_eq/cmp). One pack per emitted group, off the comparator.
+        // Heap key is the OPK; recompute current_key (narrow native value /
+        // wide prefix) here, off the comparator. One pack per emitted group.
         if let Some((weight, idx, row)) = emitted {
             self.valid = true;
-            self.current_key = pack_pk_le(self.sources[idx].get_pk_bytes(row));
+            self.current_key = Self::current_key_from_bytes(self.sources[idx].get_pk_bytes(row));
             self.current_weight = weight;
             self.current_entry_idx = idx;
             self.current_row = row;
@@ -1316,18 +1240,18 @@ mod tests {
         let batch = make_batch(&[(1, 1, 10), (5, 1, 50), (10, 1, 100)]);
         let mut cursor = create_read_cursor(&[batch], &[], schema);
 
-        // Seek to pk >= 5
-        cursor.seek(5);
+        // Seek to pk >= 5. OPK for a U128 PK is the value's big-endian bytes.
+        cursor.seek_bytes(&5u128.to_be_bytes());
         assert!(cursor.valid);
         assert_eq!(cursor.current_key, 5);
 
         // Seek to pk >= 7 → lands on 10
-        cursor.seek(7);
+        cursor.seek_bytes(&7u128.to_be_bytes());
         assert!(cursor.valid);
         assert_eq!(cursor.current_key, 10);
 
         // Seek past end
-        cursor.seek(100);
+        cursor.seek_bytes(&100u128.to_be_bytes());
         assert!(!cursor.valid);
     }
 
@@ -1343,16 +1267,18 @@ mod tests {
         )
     }
 
+    /// OPK bytes for a `(U64, U64)` compound PK: each column big-endian,
+    /// concatenated in pk-list order (the at-rest form).
     fn compound_pk_bytes(col0: u64, col1: u64) -> [u8; 16] {
         let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&col0.to_le_bytes());
-        b[8..].copy_from_slice(&col1.to_le_bytes());
+        b[..8].copy_from_slice(&col0.to_be_bytes());
+        b[8..].copy_from_slice(&col1.to_be_bytes());
         b
     }
 
-    /// A compound `(U64, U64)` PK packs col0 in the low 64 bits, so raw u128
-    /// order is last-column-major while storage sorts first-column-major.
-    /// `seek` must land on the exact row, not the u128-nearest one.
+    /// A compound `(U64, U64)` PK's raw u128 order is last-column-major while
+    /// storage (OPK memcmp) sorts first-column-major. `seek_bytes` must land on
+    /// the exact row, not the u128-nearest one.
     #[test]
     fn test_seek_compound_pk_lands_on_exact_row() {
         let schema = make_schema_compound_u64();
@@ -1370,12 +1296,12 @@ mod tests {
         b.consolidated = true;
         let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
-        cursor.seek(u128::from_le_bytes(compound_pk_bytes(2, 3)));
+        cursor.seek_bytes(&compound_pk_bytes(2, 3));
         assert!(cursor.valid);
         assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(2, 3));
 
         // Seek the first group too.
-        cursor.seek(u128::from_le_bytes(compound_pk_bytes(1, 5)));
+        cursor.seek_bytes(&compound_pk_bytes(1, 5));
         assert!(cursor.valid);
         assert_eq!(cursor.current_pk_bytes(), &compound_pk_bytes(1, 5));
     }
@@ -1391,16 +1317,23 @@ mod tests {
         )
     }
 
-    /// A signed single-column PK zero-extends into the u128 key, so negative
-    /// keys sort *after* positives in raw u128 order while storage sorts them
-    /// first. `seek` to a negative key must land on the matching row.
+    /// OPK bytes for a single I64 PK column (big-endian, sign bit flipped).
+    fn i64_opk(v: i64) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut out);
+        out
+    }
+
+    /// A signed single-column PK's negative keys sort *after* positives in raw
+    /// u128 order, while OPK (BE + sign-bit flip) sorts them first. `seek_bytes`
+    /// on the OPK key must land on the matching row.
     #[test]
     fn test_seek_signed_pk_lands_on_negative_row() {
         let schema = make_schema_signed_i64();
         // Storage (signed) order: -3, -1, 2.
         let mut b = Batch::with_schema(schema, 3);
         for &(pk, v) in &[(-3i64, 30i64), (-1, 10), (2, 20)] {
-            b.extend_pk((pk as u64) as u128);
+            b.extend_pk_bytes(&i64_opk(pk));
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &v.to_le_bytes());
@@ -1410,18 +1343,18 @@ mod tests {
         b.consolidated = true;
         let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
-        cursor.seek(((-1i64) as u64) as u128);
+        cursor.seek_bytes(&i64_opk(-1));
         assert!(cursor.valid);
-        assert_eq!(cursor.current_pk_bytes(), &(-1i64).to_le_bytes());
+        assert_eq!(cursor.current_pk_bytes(), &i64_opk(-1));
 
-        cursor.seek(((-3i64) as u64) as u128);
+        cursor.seek_bytes(&i64_opk(-3));
         assert!(cursor.valid);
-        assert_eq!(cursor.current_pk_bytes(), &(-3i64).to_le_bytes());
+        assert_eq!(cursor.current_pk_bytes(), &i64_opk(-3));
 
         // A positive key still lands correctly.
-        cursor.seek(2u128);
+        cursor.seek_bytes(&i64_opk(2));
         assert!(cursor.valid);
-        assert_eq!(cursor.current_pk_bytes(), &2i64.to_le_bytes());
+        assert_eq!(cursor.current_pk_bytes(), &i64_opk(2));
     }
 
     #[test]
@@ -1563,7 +1496,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_i64();
 
-        let pk_bytes: Vec<u8> = 42u128.to_le_bytes().to_vec();
+        // PK region holds OPK (order-preserving big-endian) bytes at rest.
+        let pk_bytes: Vec<u8> = 42u128.to_be_bytes().to_vec();
         let weights: Vec<i64> = vec![1i64];
         let null_bm: Vec<u64> = vec![0u64];
         let col_data: Vec<i64> = vec![999i64];
@@ -1594,29 +1528,28 @@ mod tests {
     /// previously fell through to the row-major scatter.  Now the column-major
     /// path handles any number of sources.
     #[test]
-    fn seek_bytes_matches_seek_narrow() {
-        // Narrow single-PK (U128, stride 16): seek_bytes and seek must land
-        // on the same row. seek_bytes is correct for compound/wide PKs but
-        // narrow inputs must remain bit-identical with the u128 fast path.
+    fn seek_bytes_lands_on_lower_bound_narrow() {
+        // Narrow single-PK (U128, stride 16): seek_bytes lands on the first row
+        // whose PK >= the (OPK) key — the lower bound. OPK for a U128 PK is the
+        // value's big-endian bytes.
         let schema = make_schema_i64();
+        let keys: &[u128] = &[10, 20, 30, 40];
         let batch = make_batch(&[(10u128, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]);
         let probes: &[u128] = &[0u128, 5, 10, 15, 20, 25, 30, 35, 40, 41];
         for &key in probes {
-            let mut c_u128 = create_read_cursor(&[Rc::clone(&batch)], &[], schema);
-            c_u128.seek(key);
+            let mut c = create_read_cursor(&[Rc::clone(&batch)], &[], schema);
+            c.seek_bytes(&key.to_be_bytes());
 
-            let mut c_bytes = create_read_cursor(&[Rc::clone(&batch)], &[], schema);
-            c_bytes.seek_bytes(&key.to_le_bytes());
-
-            assert_eq!(c_u128.valid, c_bytes.valid, "key={key}");
-            if c_u128.valid {
-                assert_eq!(c_u128.current_key, c_bytes.current_key, "key={key}");
-                // current_pk_bytes mirrors current_key for narrow PKs.
-                assert_eq!(
-                    c_bytes.current_pk_bytes(),
-                    &c_bytes.current_key.to_le_bytes()[..],
-                    "key={key}",
-                );
+            // Independent oracle: first stored key >= probe.
+            let expected = keys.iter().copied().find(|&k| k >= key);
+            match expected {
+                Some(k) => {
+                    assert!(c.valid, "key={key} should land on {k}");
+                    assert_eq!(c.current_key, k, "key={key}");
+                    // current_pk_bytes is OPK (BE) of the native value.
+                    assert_eq!(c.current_pk_bytes(), &k.to_be_bytes()[..], "key={key}");
+                }
+                None => assert!(!c.valid, "key={key} past end must be invalid"),
             }
         }
     }
@@ -1649,6 +1582,16 @@ mod tests {
         )
     }
 
+    /// OPK bytes for a `(U64, U64)` compound PK: col_A big-endian ++ col_B
+    /// big-endian (the at-rest form). memcmp of these equals (col_A, col_B)
+    /// order, the inverse of the raw-u128 (col_B, col_A) order.
+    fn compound_opk(a: u64, b: u64) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[..8].copy_from_slice(&a.to_be_bytes());
+        k[8..].copy_from_slice(&b.to_be_bytes());
+        k
+    }
+
     /// Multi-source merge over a compound `(col_A, col_B)` PK must order by
     /// `(col_A, col_B)`. As a raw `u128`, col_B occupies the high 64 bits, so
     /// the integer-comparison shortcut would (wrongly) order by `(col_B,
@@ -1656,10 +1599,9 @@ mod tests {
     #[test]
     fn test_compound_pk_multi_source_merge_order() {
         let schema = make_compound_pk_schema();
-        let pack = |a: u64, b: u64| (a as u128) | ((b as u128) << 64);
         let make = |a: u64, b: u64, val: i64| -> Rc<Batch> {
             let mut bt = Batch::with_schema(schema, 1);
-            bt.extend_pk(pack(a, b));
+            bt.extend_pk_bytes(&compound_opk(a, b));
             bt.extend_weight(&1i64.to_le_bytes());
             bt.extend_null_bmp(&0u64.to_le_bytes());
             bt.extend_col(0, &val.to_le_bytes());
@@ -1673,10 +1615,12 @@ mod tests {
         let b2 = make(2, 1, 200);
         let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
 
+        // current_key for a stride-16 PK is widen_pk_be of the OPK bytes: the
+        // BE reading places col_A in the high 64 bits and col_B in the low.
         let mut emitted = Vec::new();
         while cursor.valid {
-            let a = cursor.current_key as u64;
-            let b = (cursor.current_key >> 64) as u64;
+            let a = (cursor.current_key >> 64) as u64;
+            let b = cursor.current_key as u64;
             emitted.push((a, b));
             cursor.advance();
         }
@@ -1702,11 +1646,13 @@ mod tests {
         )
     }
 
+    /// OPK bytes for a 3×U64 compound PK: each column big-endian, concatenated
+    /// in pk-list order (the at-rest form).
     fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
         let mut k = [0u8; 24];
-        k[0..8].copy_from_slice(&a.to_le_bytes());
-        k[8..16].copy_from_slice(&b.to_le_bytes());
-        k[16..24].copy_from_slice(&c.to_le_bytes());
+        k[0..8].copy_from_slice(&a.to_be_bytes());
+        k[8..16].copy_from_slice(&b.to_be_bytes());
+        k[16..24].copy_from_slice(&c.to_be_bytes());
         k
     }
 
@@ -1791,10 +1737,11 @@ mod tests {
             &[0, 1],
         );
         assert_eq!(schema.pk_stride(), 16);
+        // OPK: U64 column big-endian; I64 column big-endian with sign bit flipped.
         let mk = |a: u64, b: i64| -> [u8; 16] {
             let mut k = [0u8; 16];
-            k[..8].copy_from_slice(&a.to_le_bytes());
-            k[8..].copy_from_slice(&b.to_le_bytes());
+            k[..8].copy_from_slice(&a.to_be_bytes());
+            gnitz_wire::encode_pk_column(&b.to_le_bytes(), type_code::I64, &mut k[8..]);
             k
         };
         // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
@@ -1817,7 +1764,8 @@ mod tests {
         let batch = Rc::new(b);
         let mut cursor = create_read_cursor(&[batch], &[], schema);
 
-        let prefix = 1u64.to_le_bytes();
+        // Prefix is the OPK image of the leading U64 column (big-endian).
+        let prefix = 1u64.to_be_bytes();
         let mut found: Vec<[u8; 16]> = Vec::new();
         if cursor.seek_first_positive_with_prefix(&prefix) {
             loop {

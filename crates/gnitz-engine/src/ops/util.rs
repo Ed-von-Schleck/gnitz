@@ -189,7 +189,14 @@ impl IndexColExtractor {
 
     #[inline]
     pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
-        crate::schema::read_unsigned(self.loc.bytes(mb, row), self.loc.size)
+        let bytes = self.loc.bytes(mb, row);
+        if self.loc.is_pk {
+            // PK columns hold OPK (big-endian) bytes at rest; widen to the
+            // canonical value (native for unsigned, sign-flipped for signed).
+            gnitz_wire::widen_pk_be(bytes, self.loc.size) as u64
+        } else {
+            crate::schema::read_unsigned(bytes, self.loc.size)
+        }
     }
 }
 
@@ -344,29 +351,29 @@ pub(super) fn extract_group_key(
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u128 {
-    // Single PK group column: isolate the addressed column's bytes from
-    // neighbouring PK columns. For single-PK schemas this equals
-    // `mb.get_pk(row)` bit-for-bit (off == 0, cs == pk_stride).
+    // Single PK group column: the addressed column's canonical key (native for
+    // unsigned, sign-flipped for signed) via `pk_route_key` — identical to
+    // `partition_for_pk_bytes` and `mb.get_pk(row)`, so a join key routes the
+    // same whether it is a (sub-)PK column here or a single PK / payload FK on
+    // the join's other side. For a single-PK schema this equals `mb.get_pk(row)`.
     if group_by_cols.len() == 1 && schema.is_pk_col(group_by_cols[0] as usize) {
         let c_idx = group_by_cols[0] as usize;
         let off = schema.pk_byte_offset(c_idx) as usize;
-        let col = &schema.columns[c_idx];
-        return crate::schema::promote_to_index_key(
-            mb.get_pk_bytes(row), off, col.size() as usize, col.type_code,
-        );
+        let cs = schema.columns[c_idx].size() as usize;
+        return crate::schema::pk_route_key(mb.get_pk_bytes(row), off, cs);
     }
 
     if group_by_cols.len() == 1 {
         let c_idx = group_by_cols[0] as usize;
         let col = &schema.columns[c_idx];
         let tc = col.type_code;
-        // Skip fast path for nullable — hash loop handles NULL distinctly.
-        // Any fixed-width integer (1/2/4/8 bytes, signed or unsigned) or 16-byte
-        // U128/UUID widens through the same `promote_to_index_key` the PK-column
-        // branch above uses, so a value routes to the same partition whether it
-        // is the PK on one side of a join or a non-PK column on the other.
-        // STRING/BLOB/F32/F64 deliberately fall through to the hash loop: a
-        // zero-extended content prefix is not a valid routing key for them.
+        // Skip fast path for nullable — the hash loop handles NULL distinctly.
+        // A value routes to the same partition whether it is the PK on one side
+        // of a join (OPK bytes, widened above) or a payload FK column on the
+        // other: `payload_route_key` OPK-encodes+widens to the canonical value
+        // (sign-flipped for signed), matching the PK side. STRING/BLOB/F32/F64
+        // fall through to the hash loop — a zero-extended content prefix is not
+        // a valid routing key for them.
         if col.nullable == 0
             && matches!(tc,
                 type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
@@ -376,7 +383,7 @@ pub(super) fn extract_group_key(
             let cs = col.size() as usize;
             let pi = schema.payload_idx(c_idx);
             let ptr = mb.get_col_ptr(row, pi, cs);
-            return crate::schema::promote_to_index_key(ptr, 0, cs, tc);
+            return crate::schema::payload_route_key(ptr, 0, cs, tc);
         }
     }
 
@@ -386,21 +393,19 @@ pub(super) fn extract_group_key(
         let c_idx = c_idx_u32 as usize;
         let tc = schema.columns[c_idx].type_code;
         let col_hash = if schema.is_pk_col(c_idx) {
-            // Hash only the addressed PK column's bytes. The previous
-            // `mb.get_pk(row)` widen mixed the whole PK region, colliding
-            // distinct compound PKs whose addressed column shared bytes.
+            // Canonical per-column key from the addressed PK column's OPK bytes,
+            // so it hashes identically whether stored as a PK column here or a
+            // native-LE payload FK on the join's other side (the payload arm
+            // below applies the matching encode+widen).
             let off = schema.pk_byte_offset(c_idx) as usize;
             let cs = schema.columns[c_idx].size() as usize;
-            let pk_bytes = mb.get_pk_bytes(row);
-            let col_bytes = &pk_bytes[off..off + cs];
+            let key = crate::schema::pk_route_key(mb.get_pk_bytes(row), off, cs);
             if tc == type_code::U128 || tc == type_code::UUID {
-                let lo = u64::from_le_bytes(col_bytes[0..8].try_into().unwrap());
-                let hi = u64::from_le_bytes(col_bytes[8..16].try_into().unwrap());
+                let lo = key as u64;
+                let hi = (key >> 64) as u64;
                 mix64(lo ^ mix64(hi))
             } else {
-                let mut buf = [0u8; 8];
-                buf[..cs].copy_from_slice(col_bytes);
-                mix64(u64::from_le_bytes(buf))
+                mix64(key as u64)
             }
         } else {
             let pi = schema.payload_idx(c_idx);
@@ -419,11 +424,12 @@ pub(super) fn extract_group_key(
                 let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
                 mix64(lo ^ mix64(hi))
             } else {
+                // Native-LE payload int: encode+widen (payload_route_key) so a
+                // payload FK column hashes like the same value stored as a PK
+                // column (sign-flipped for signed), matching the PK arm above.
                 let cs = schema.columns[c_idx].size() as usize;
                 let ptr = mb.get_col_ptr(row, pi, cs);
-                let mut buf = [0u8; 8];
-                buf[..cs].copy_from_slice(ptr);
-                mix64(u64::from_le_bytes(buf))
+                mix64(crate::schema::payload_route_key(ptr, 0, cs, tc) as u64)
             }
         };
         h = mix64(h ^ col_hash ^ (i as u64));
@@ -454,8 +460,8 @@ mod index_col_extractor_tests {
 
         let (c0, c1): (u32, u32) = (0x1111_2222, 0xAAAA_BBBB);
         let mut b = Batch::with_schema(schema, 1);
-        // Packed LE slot: col0 in bytes [0..4], col1 in bytes [4..8].
-        b.extend_pk(((c1 as u128) << 32) | c0 as u128);
+        // OPK slot: col0 OPK in bytes [0..4], col1 OPK in bytes [4..8].
+        b.extend_pk_opk(&schema, &[c0 as u128, c1 as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.count += 1;
@@ -508,53 +514,54 @@ mod index_col_extractor_tests {
         assert_eq!(ex.extract(&mb, 0), 0xBEEFu64);
     }
 
-    // Co-partition invariant: a single narrow-int routing/group column must
-    // yield the RAW zero-extended value — bit-identical to `widen_pk_le`/
-    // `get_pk` — so a join key routes to the same worker whether it is the PK
-    // on one side or a non-PK column on the other. Regression guard for the
-    // multi-worker join-drop where narrow ints fell into the `mix64` hash loop.
+    // Co-partition invariant (bug #2 regression): a single narrow-int
+    // routing/group column must yield the canonical OPK key — the value an
+    // OPK PK column produces via `widen_pk_be` (native for unsigned, sign-
+    // flipped for signed). Pre-OPK both PK and payload sides used the raw
+    // native value; after the flip the PK side is sign-flipped, so a signed
+    // payload FK must match it or a distributed join silently drops rows.
     #[test]
-    fn extract_group_key_single_narrow_int_is_raw_widen() {
+    fn extract_group_key_single_narrow_int_canonical_widen() {
         use super::extract_group_key;
         use crate::storage::Batch as B;
 
-        // I32 payload column.
-        let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I32, 0)],
-            &[0],
-        );
-        let pi = schema.payload_idx(1);
-        for v in [1i32, -1, 2, 100, i32::MIN, i32::MAX] {
+        // Group key for `le` (native LE bytes) stored as a payload column at
+        // idx 1 (U64 PK + tested column), routed by col 1.
+        let key_as_payload = |tc: u8, le: &[u8]| -> u128 {
+            let schema = SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)],
+                &[0],
+            );
+            let pi = schema.payload_idx(1);
             let mut b = B::with_schema(schema, 1);
             b.extend_pk(0u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(pi, &v.to_le_bytes());
+            b.extend_col(pi, le);
             b.count += 1;
-            let mb = b.as_mem_batch();
-            // Zero-extended raw value (matches widen_pk_le of an I32 PK slot).
+            extract_group_key(&b.as_mem_batch(), 0, &schema, &[1])
+        };
+
+        // Signed I32: canonical key is the sign-flipped value (top bit toggled
+        // on the native bits), NOT the old zero-extended native value.
+        for (v, expected) in [
+            (1i32, 0x8000_0001u128),
+            (-1, 0x7FFF_FFFF),
+            (2, 0x8000_0002),
+            (100, 0x8000_0064),
+            (i32::MIN, 0x0000_0000),
+            (i32::MAX, 0xFFFF_FFFF),
+        ] {
             assert_eq!(
-                extract_group_key(&mb, 0, &schema, &[1]),
-                (v as u32) as u128,
-                "I32 group key must be the raw zero-extended value (v={v})",
+                key_as_payload(type_code::I32, &v.to_le_bytes()),
+                expected,
+                "I32 v={v}: canonical sign-flipped key",
             );
         }
 
-        // U16 payload column.
-        let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::U16, 0)],
-            &[0],
-        );
-        let pi = schema.payload_idx(1);
+        // Unsigned U16: canonical key equals the native value (OPK == native).
         for v in [0u16, 1, 0xBEEF, u16::MAX] {
-            let mut b = B::with_schema(schema, 1);
-            b.extend_pk(0u128);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(pi, &v.to_le_bytes());
-            b.count += 1;
-            let mb = b.as_mem_batch();
-            assert_eq!(extract_group_key(&mb, 0, &schema, &[1]), v as u128);
+            assert_eq!(key_as_payload(type_code::U16, &v.to_le_bytes()), v as u128);
         }
     }
 }

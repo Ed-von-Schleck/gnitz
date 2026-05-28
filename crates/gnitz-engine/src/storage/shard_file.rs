@@ -105,8 +105,8 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
     }
     let stride = pk_sz / n;
     let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-    let pks: Vec<u128> = if stride > 16 {
-        // Compound PK region wider than a u128: collapse the row's PK
+    let mut pks: Vec<u128> = if stride > 16 {
+        // Compound PK region wider than a u128: collapse the row's OPK
         // bytes with the same xxh3-64 used by partition_for_pk_bytes's
         // wide branch. The filter wants the full 64 bits of entropy
         // zero-extended to u128 (NOT the top-8-bit bucket index that
@@ -116,20 +116,19 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
             .map(|c| crate::xxh::checksum(c) as u128)
             .collect()
     } else {
-        // stride <= 16: zero-pad to 16 and read LE as u128 — the same
-        // narrow-key zero-extension as partition_for_pk_bytes. For
-        // stride 8/16 this is bit-identical to a direct u64-as-u128 /
-        // u128 read, so the single-PK fast paths share this arm. Build
-        // runs once per shard flush/compaction, not per row.
+        // stride <= 16: the row's OPK bytes are big-endian, so right-align
+        // them into a u128 via `widen_pk_be` — identical to the value the
+        // narrow probe derives and to partition_for_pk_bytes's narrow branch.
         pk_bytes
             .chunks_exact(stride)
-            .map(|c| {
-                let mut b = [0u8; 16];
-                b[..stride].copy_from_slice(c);
-                u128::from_le_bytes(b)
-            })
+            .map(|c| gnitz_wire::widen_pk_be(c, stride))
             .collect()
     };
+    // The XOR filter's hypergraph peeling fails (hang/panic) on duplicate
+    // fingerprints. The PK region is sorted, so rows that share a PK but
+    // differ in payload (valid under (PK, payload) element identity) produce
+    // adjacent identical fingerprints; dedup collapses them in O(n).
+    pks.dedup();
     xor8::build(&pks)
 }
 
@@ -353,6 +352,11 @@ pub fn write_shard_streaming(
         if libc::renameat(dirfd, prepared.tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
             libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
             return Err(StorageError::Io);
+        }
+        // Flush the directory inode so the renamed entry survives a power loss
+        // (fdatasync on the file alone does not flush the parent directory).
+        if durable {
+            libc::fsync(dirfd);
         }
     }
     Ok(())
@@ -610,7 +614,8 @@ mod tests {
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
 
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
         let null_bytes: Vec<u8> = nulls.iter().flat_map(|n| n.to_le_bytes()).collect();
         let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -652,7 +657,8 @@ mod tests {
         let weights: Vec<i64> = vec![1, 1];
         let nulls: Vec<u64> = vec![0, 0];
         let vals: Vec<i64> = vec![42, 99];
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
@@ -713,7 +719,8 @@ mod tests {
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
         let vals: Vec<i64> = vec![100, 200, 300];
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
@@ -754,7 +761,8 @@ mod tests {
         let weights: Vec<i64> = vec![1; n as usize];
         let nulls: Vec<u64> = vec![0; n as usize];
         let vals: Vec<i64> = vec![10, 20, 30, 40, 50];
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         assert_eq!(pk_bytes.len(), n as usize * 8, "U64 PK region must be 8B/row");
         let blob: Vec<u8> = vec![];
 
@@ -796,7 +804,8 @@ mod tests {
         let weights: Vec<i64> = vec![1; n as usize];
         let nulls: Vec<u64> = vec![0; n as usize];
         let vals: Vec<i64> = (1..=n as i64).collect();
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
@@ -830,7 +839,8 @@ mod tests {
         let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
         let nulls: Vec<u64> = vec![0, 0, 0, 0];   // all-zero → Constant encoding
         let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
         let regions: Vec<(*const u8, usize)> = vec![
@@ -883,10 +893,10 @@ mod tests {
             build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
                 .expect("narrow compound region must build a filter");
         for row in &rows {
-            let mut b = [0u8; 16];
-            b[..stride].copy_from_slice(row);
+            // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
+            // the probe must derive the same value.
             assert!(
-                xor8::may_contain(&f, u128::from_le_bytes(b)),
+                xor8::may_contain(&f, gnitz_wire::widen_pk_be(row, stride)),
                 "no false negative for narrow-compound row"
             );
         }
@@ -895,7 +905,8 @@ mod tests {
     #[test]
     fn build_xor8_single_pk_regression() {
         let pks64: Vec<u64> = vec![10, 20, 30, 40];
-        let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // OPK at rest: U64 region is big-endian.
+        let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
         let f64 = build_xor8_from_pk_region(b64.as_ptr(), b64.len(), pks64.len())
             .expect("8-byte region must build a filter");
         for p in &pks64 {
@@ -903,7 +914,8 @@ mod tests {
         }
 
         let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
-        let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_le_bytes()).collect();
+        // OPK at rest: U128 region is big-endian.
+        let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
         let f128 = build_xor8_from_pk_region(b128.as_ptr(), b128.len(), pks128.len())
             .expect("16-byte region must build a filter");
         for p in &pks128 {

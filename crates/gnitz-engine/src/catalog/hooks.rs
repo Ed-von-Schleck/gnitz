@@ -158,9 +158,13 @@ impl CatalogEngine {
             } else if self.dag.tables.contains_key(&tid) {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
+                let directory = self.dag.tables.get(&tid).map(|e| e.directory.clone());
                 self.cascade_retract_indices(tid)?;
                 self.cascade_retract_columns(tid)?;
                 self.dag.unregister_table(tid);
+                if let Some(dir) = directory {
+                    self.pending_dir_deletions.push(dir);
+                }
             }
         }
         Ok(())
@@ -256,9 +260,13 @@ impl CatalogEngine {
                     self.backfill_view(vid);
                 }
             } else if self.dag.tables.contains_key(&vid) {
+                let directory = self.dag.tables.get(&vid).map(|e| e.directory.clone());
                 self.cascade_retract_circuit_and_deps(vid)?;
                 self.cascade_retract_columns(vid)?;
                 self.dag.unregister_table(vid);
+                if let Some(dir) = directory {
+                    self.pending_dir_deletions.push(dir);
+                }
             }
         }
         Ok(())
@@ -328,7 +336,10 @@ impl CatalogEngine {
                     .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
                     .unwrap_or(false);
                 if is_registered {
+                    let owner_dir = self.dag.tables.get(&owner_id)
+                        .map(|e| e.directory.clone()).unwrap_or_default();
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
+                    self.pending_dir_deletions.push(format!("{}/idx_{}", owner_dir, idx_id));
                 }
             }
         }

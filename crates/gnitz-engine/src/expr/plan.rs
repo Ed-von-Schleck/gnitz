@@ -73,11 +73,20 @@ fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
     let stride = cm.stride as usize;
 
     if cm.src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
+        // PK region holds OPK bytes; decode the addressed column back to native
+        // LE before writing it into the payload. A raw byte copy would be wrong
+        // for signed (sign-flipped) and big-endian-encoded columns.
         let dst = output.col_data_mut(cm.dst_payload);
+        let pk_off = cm.pk_byte_offset as usize;
         for row in 0..n {
-            let pk = in_batch.get_pk(row);
-            let bytes = pk.to_le_bytes();
-            dst[row * stride..row * stride + stride].copy_from_slice(&bytes[..stride]);
+            let opk = in_batch.get_pk_bytes(row);
+            let mut le = [0u8; crate::schema::MAX_PK_BYTES];
+            gnitz_wire::decode_pk_column(
+                &opk[pk_off..pk_off + stride],
+                cm.type_code,
+                &mut le[..stride],
+            );
+            dst[row * stride..row * stride + stride].copy_from_slice(&le[..stride]);
         }
     } else if cm.type_code == type_code::STRING {
         let in_pi = cm.src_pi as usize;
@@ -170,13 +179,17 @@ struct ColMove {
     src_pi: u8,
     /// Dense payload index in the output batch.
     dst_payload: usize,
-    /// Type code of the column (used to dispatch the string path).
+    /// Type code of the column (used to dispatch the string path and to decode
+    /// the OPK bytes of a PK source column).
     type_code: u8,
     /// Precomputed byte width of the destination column. For non-PK copies
     /// this equals the input column's stride (same type). For PK→payload
     /// copies, the destination may be wider (e.g. U64→U128 reindex), so the
     /// stride must come from the *output* schema.
     stride: u8,
+    /// Byte offset of this column within the OPK PK region. Valid only when
+    /// `src_pi == PAYLOAD_MAPPING_PK_SENTINEL`; 0 for single-column PKs.
+    pk_byte_offset: u8,
 }
 
 enum FilterKernel {
@@ -259,15 +272,24 @@ impl Plan {
             .iter()
             .map(|&ci| in_schema.payload_mapping_byte(ci as usize))
             .collect();
-        let col_moves: Vec<ColMove> = src_pi_bytes
+        let col_moves: Vec<ColMove> = src_indices
             .iter()
+            .zip(src_pi_bytes.iter())
             .zip(src_types.iter())
             .enumerate()
-            .map(|(i, (&src_pi, &tc))| ColMove {
-                src_pi,
-                dst_payload: i,
-                type_code: tc,
-                stride: col_move_stride(src_pi, i, in_schema, out_schema),
+            .map(|(i, ((&ci, &src_pi), &tc))| {
+                let pk_byte_offset = if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
+                    in_schema.pk_byte_offset(ci as usize)
+                } else {
+                    0u8
+                };
+                ColMove {
+                    src_pi,
+                    dst_payload: i,
+                    type_code: tc,
+                    stride: col_move_stride(src_pi, i, in_schema, out_schema),
+                    pk_byte_offset,
+                }
             })
             .collect();
         let null_perm = NullPerm::from_projection(&src_pi_bytes);
@@ -290,6 +312,7 @@ impl Plan {
         // After resolve_column_indices, EXPR_COPY_COL.a1 already holds the
         // resolved payload byte (SENTINEL for PK, dense payload index otherwise).
         let mut copy_src_pi_bytes: Vec<u8> = Vec::new();
+        let mut copy_pk_byte_offsets: Vec<u8> = Vec::new();
         let mut copy_out_payloads: Vec<u32> = Vec::new();
         let mut copy_type_codes: Vec<u8> = Vec::new();
         let mut null_payloads: Vec<u32> = Vec::new();
@@ -305,7 +328,15 @@ impl Plan {
             let a2 = prog.code[base + 3];
 
             if op == expr::EXPR_COPY_COL {
-                copy_src_pi_bytes.push(a1 as u8);
+                // After resolve, a1 is a payload index (>= 0) or, for a PK
+                // source column, `-(pk_byte_offset) - 1` (negative sentinel).
+                let (src_pi, pk_off) = if a1 < 0 {
+                    (PAYLOAD_MAPPING_PK_SENTINEL, (-a1 - 1) as u8)
+                } else {
+                    (a1 as u8, 0u8)
+                };
+                copy_src_pi_bytes.push(src_pi);
+                copy_pk_byte_offsets.push(pk_off);
                 copy_out_payloads.push(a2 as u32);
                 copy_type_codes.push(dst as u8);
             } else if op == expr::EXPR_EMIT_NULL {
@@ -323,11 +354,13 @@ impl Plan {
             .iter()
             .zip(copy_out_payloads.iter())
             .zip(copy_type_codes.iter())
-            .map(|((&src, &dst), &tc)| ColMove {
+            .zip(copy_pk_byte_offsets.iter())
+            .map(|(((&src, &dst), &tc), &pk_off)| ColMove {
                 src_pi: src,
                 dst_payload: dst as usize,
                 type_code: tc,
                 stride: col_move_stride(src, dst as usize, in_schema, out_schema),
+                pk_byte_offset: pk_off,
             })
             .collect();
 
@@ -483,16 +516,14 @@ impl Plan {
         let mut output = Batch::with_schema(*out_schema, n);
         output.count = n;
 
-        // PK copy: bulk when strides match, row-by-row when they differ
-        // (e.g. U64 input table → U128 synthetic PK in reindex maps).
+        // PK copy: bulk when strides match. When they differ (reindex maps,
+        // e.g. U64 input → U128 synthetic PK), the PK region is left zero-
+        // initialized here; `op_map` then overwrites it via `PkPromoter::
+        // promote_into` or `reindex_hash_row`, both of which emit OPK bytes.
         let in_pk = in_batch.pk_data();
         let out_pk = output.pk_data_mut();
         if in_pk.len() == out_pk.len() {
             out_pk.copy_from_slice(in_pk);
-        } else {
-            for r in 0..n {
-                output.set_pk_at(r, in_batch.get_pk(r));
-            }
         }
         output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 

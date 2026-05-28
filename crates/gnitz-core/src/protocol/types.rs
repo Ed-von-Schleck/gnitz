@@ -96,6 +96,17 @@ impl Schema {
             .sum()
     }
 
+    /// Per-PK-column `(wire_stride, type_code)` in compound-key order, for the
+    /// OPK encode/decode column walk. Collect once and reuse across rows so the
+    /// per-row loop never re-iterates the schema.
+    #[inline]
+    pub fn pk_col_codes(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
+        self.pk_cols.iter().map(move |&ci| {
+            let tc = self.columns[ci].type_code;
+            (tc.wire_stride(), tc as u8)
+        })
+    }
+
     /// Map a logical column index to its dense payload index. Caller must
     /// ensure `col_idx` is not the PK column.
     #[inline]
@@ -602,6 +613,12 @@ impl ZSetBatch {
             if *stride == 0 {
                 return Err("wide PK stride must be non-zero".into());
             }
+            if *stride as usize != schema.pk_stride() {
+                return Err(format!(
+                    "mismatched PK stride: expected {}, got {}",
+                    schema.pk_stride(), stride
+                ));
+            }
             if buf.len() % (*stride as usize) != 0 {
                 return Err(format!(
                     "wide PK buffer length {} is not a multiple of stride {}",
@@ -690,8 +707,12 @@ impl<'a> BatchAppender<'a> {
 
     /// Override the null mask for the current row (must be called after `add_row`).
     pub fn null_mask(&mut self, mask: u64) -> &mut Self {
-        let last = self.batch.nulls.len() - 1;
-        self.batch.nulls[last] = mask;
+        // `last_mut()` instead of `len() - 1`: a call before any `add_row` would
+        // otherwise wrap to usize::MAX and OOB-panic in release.
+        match self.batch.nulls.last_mut() {
+            Some(last) => *last = mask,
+            None => panic!("BatchAppender: null_mask called before add_row"),
+        }
         self
     }
 
@@ -799,23 +820,26 @@ impl<'a> BatchAppender<'a> {
     /// PK column. Supports compound PKs (e.g. the catalog circuit tables whose
     /// PK is (view_id, sub)): payload value N targets the N-th non-PK column.
     fn col_index(&self) -> usize {
-        debug_assert!(
+        // Hard assert (not debug-only) + bounded `for`: in release an
+        // unbounded `loop` past `num_columns()` returns an OOB index that
+        // panics at the `columns[ci]` call site. A misbehaving caller gets a
+        // clear panic here instead.
+        assert!(
             self.cursor < self.schema.num_payload_cols(),
-            "BatchAppender: payload cursor {} exceeds {} payload columns (too many *_val calls)",
+            "BatchAppender: payload cursor {} exceeds {} payload columns",
             self.cursor, self.schema.num_payload_cols(),
         );
         let pk_cols = self.schema.pk_indices();
         let mut seen_payload = 0;
-        let mut ci = 0;
-        loop {
+        for ci in 0..self.schema.num_columns() {
             if !pk_cols.contains(&ci) {
                 if seen_payload == self.cursor {
                     return ci;
                 }
                 seen_payload += 1;
             }
-            ci += 1;
         }
+        panic!("BatchAppender: col_index resolution failed (cursor {})", self.cursor);
     }
 }
 
