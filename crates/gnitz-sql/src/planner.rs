@@ -1250,34 +1250,17 @@ fn execute_create_group_by_view(
                 let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
-                let (out_name, is_avg) = match func {
-                    AggFunc::Count => {
-                        agg_specs.push((AGG_COUNT, 0));
-                        (alias.unwrap_or_else(|| format!("_count{}", idx)), false)
-                    }
-                    AggFunc::CountNonNull => {
-                        agg_specs.push((AGG_COUNT_NON_NULL, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_count{}", idx)), false)
-                    }
-                    AggFunc::Sum => {
-                        agg_specs.push((AGG_SUM, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_sum{}", idx)), false)
-                    }
-                    AggFunc::Min => {
-                        agg_specs.push((AGG_MIN, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_min{}", idx)), false)
-                    }
-                    AggFunc::Max => {
-                        agg_specs.push((AGG_MAX, src_col.unwrap()));
-                        (alias.unwrap_or_else(|| format!("_max{}", idx)), false)
-                    }
-                    AggFunc::Avg => {
-                        let col = src_col.unwrap();
-                        agg_specs.push((AGG_SUM, col));
-                        agg_specs.push((AGG_COUNT_NON_NULL, col));
-                        (alias.unwrap_or_else(|| format!("_avg{}", idx)), true)
-                    }
-                };
+                let is_avg = push_agg_specs(*func, src_col, &mut agg_specs);
+                let out_name = alias.unwrap_or_else(|| {
+                    let prefix = match func {
+                        AggFunc::Count | AggFunc::CountNonNull => "_count",
+                        AggFunc::Sum => "_sum",
+                        AggFunc::Min => "_min",
+                        AggFunc::Max => "_max",
+                        AggFunc::Avg => "_avg",
+                    };
+                    format!("{}{}", prefix, idx)
+                });
                 agg_mappings.push(AggMapping {
                     specs_start: start, is_avg,
                     output_name: out_name, output_type: out_type,
@@ -1468,10 +1451,13 @@ fn execute_create_group_by_view(
     //    HAVING reference group columns by their source name (unaffected by
     //    SELECT aliases or omission) and aggregates that are not projected.
     let filtered_reduced = if let Some(having_expr) = &select.having {
-        let bound = bind_having_expr(
-            having_expr, &reduce_schema, &source_schema,
-            &group_col_indices, use_natural_pk, &agg_mappings, agg_col_offset,
-        )?;
+        let bound = bind_having_expr(having_expr, &HavingCtx {
+            source_schema:     &source_schema,
+            group_col_indices: &group_col_indices,
+            use_natural_pk,
+            agg_mappings:      &agg_mappings,
+            agg_col_offset,
+        })?;
         let mut heb = ExprBuilder::new();
         let (result_reg, _) = compile_bound_expr(&bound, &reduce_schema, &mut heb)?;
         let prog = heb.build(result_reg);
@@ -1528,21 +1514,18 @@ fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>
     }
 }
 
-/// Push the agg_specs + AggMapping for one HAVING-only aggregate (one absent
-/// from the SELECT list). Mirrors the spec layout of the SELECT projection so
-/// the reduce-output column positions line up. Returns nothing — the mapping is
-/// found later by `agg_mapping_matches`.
-fn append_having_agg(
+/// Push the engine `agg_specs` for one aggregate and return whether it is an
+/// AVG (which materialises two specs — SUM then COUNT_NON_NULL). The single
+/// source of truth for the spec layout, shared by the SELECT projection and the
+/// HAVING-only materialisation so the two stay in lockstep — notably the
+/// AVG-emits-two-specs invariant, on which the reduce-output column positions
+/// and `AggMapping::specs_start` both depend.
+fn push_agg_specs(
     agg_func: AggFunc,
     arg_col: Option<usize>,
-    source_schema: &Schema,
     agg_specs: &mut Vec<(u64, usize)>,
-    agg_mappings: &mut Vec<AggMapping>,
-) {
-    let out_type = agg_result_type(agg_func, arg_col, source_schema);
-    let agg_idx = agg_mappings.len();
-    let start = agg_specs.len();
-    let is_avg = match agg_func {
+) -> bool {
+    match agg_func {
         AggFunc::Count => { agg_specs.push((AGG_COUNT, 0)); false }
         AggFunc::CountNonNull => { agg_specs.push((AGG_COUNT_NON_NULL, arg_col.unwrap())); false }
         AggFunc::Sum => { agg_specs.push((AGG_SUM, arg_col.unwrap())); false }
@@ -1554,7 +1537,24 @@ fn append_having_agg(
             agg_specs.push((AGG_COUNT_NON_NULL, c));
             true
         }
-    };
+    }
+}
+
+/// Push the agg_specs + AggMapping for one HAVING-only aggregate (one absent
+/// from the SELECT list). Reuses `push_agg_specs` so the reduce-output column
+/// positions line up with the SELECT projection. The mapping is found later by
+/// `agg_mapping_matches`.
+fn append_having_agg(
+    agg_func: AggFunc,
+    arg_col: Option<usize>,
+    source_schema: &Schema,
+    agg_specs: &mut Vec<(u64, usize)>,
+    agg_mappings: &mut Vec<AggMapping>,
+) {
+    let out_type = agg_result_type(agg_func, arg_col, source_schema);
+    let agg_idx = agg_mappings.len();
+    let start = agg_specs.len();
+    let is_avg = push_agg_specs(agg_func, arg_col, agg_specs);
     agg_mappings.push(AggMapping {
         specs_start: start, is_avg,
         output_name: format!("_having_agg{}", agg_idx),
@@ -1588,20 +1588,25 @@ fn collect_having_aggs(
     }
 }
 
+/// Invariant context for `bind_having_expr`'s recursion: everything needed to
+/// resolve a HAVING identifier or aggregate call against the reduce-output
+/// (grouped) relation. Bundled so the recursion threads one `&self` instead of
+/// re-passing five unchanging arguments at every node. (The reduce schema
+/// itself is not needed for binding — the caller compiles the bound expression
+/// against it separately.)
+struct HavingCtx<'a> {
+    source_schema:     &'a Schema,
+    group_col_indices: &'a [usize],
+    use_natural_pk:    bool,
+    agg_mappings:      &'a [AggMapping],
+    agg_col_offset:    usize,
+}
+
 /// Bind a HAVING expression against the reduce-output (grouped) relation —
 /// before the SELECT projection, as standard SQL specifies. Group-column
 /// identifiers resolve by their source name (unaffected by SELECT aliases or
 /// omission); aggregate calls resolve to their reduce-output column.
-#[allow(clippy::too_many_arguments)]
-fn bind_having_expr(
-    expr:              &Expr,
-    reduce_schema:     &Schema,
-    source_schema:     &Schema,
-    group_col_indices: &[usize],
-    use_natural_pk:    bool,
-    agg_mappings:      &[AggMapping],
-    agg_col_offset:    usize,
-) -> Result<BoundExpr, GnitzSqlError> {
+fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlError> {
     match expr {
         Expr::Identifier(ident) => {
             // HAVING references the grouped relation by source column name. Map
@@ -1609,33 +1614,33 @@ fn bind_having_expr(
             // (natural-PK grouping puts the lone group col at the PK index 0; the
             // synthetic path lays group cols out after the U128 _group_pk).
             let col_name = &ident.value;
-            let src = source_schema.columns.iter()
+            let src = ctx.source_schema.columns.iter()
                 .position(|c| c.name.eq_ignore_ascii_case(col_name))
                 .ok_or_else(|| GnitzSqlError::Bind(
                     format!("HAVING: column '{}' not found", col_name)
                 ))?;
-            let gpos = group_col_indices.iter().position(|&gi| gi == src)
+            let gpos = ctx.group_col_indices.iter().position(|&gi| gi == src)
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
                     "HAVING: column '{}' must appear in GROUP BY or an aggregate function",
                     col_name,
                 )))?;
-            let reduce_col = if use_natural_pk { 0 } else { 1 + gpos };
+            let reduce_col = if ctx.use_natural_pk { 0 } else { 1 + gpos };
             Ok(BoundExpr::ColRef(reduce_col))
         }
         Expr::Function(func) => {
-            let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
-            let m = agg_mappings.iter()
+            let (agg_func, arg_col) = having_agg_func(func, ctx.source_schema)?;
+            let m = ctx.agg_mappings.iter()
                 .find(|m| agg_mapping_matches(m, agg_func, arg_col))
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
                     "HAVING: aggregate {:?}({}) could not be resolved", agg_func,
-                    arg_col.map_or("*".to_string(), |c| source_schema.columns[c].name.clone()),
+                    arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c].name.clone()),
                 )))?;
             if m.is_avg {
                 // AVG = SUM / COUNT, both materialised as reduce columns. Force
                 // float division (an int-source SUM/COUNT would otherwise
                 // truncate) by lifting SUM to float via `* 1.0`.
-                let sum_col = agg_col_offset + m.specs_start;
-                let cnt_col = agg_col_offset + m.specs_start + 1;
+                let sum_col = ctx.agg_col_offset + m.specs_start;
+                let cnt_col = ctx.agg_col_offset + m.specs_start + 1;
                 let sum_f = BoundExpr::BinOp(
                     Box::new(BoundExpr::ColRef(sum_col)),
                     BinOp::Mul,
@@ -1645,14 +1650,12 @@ fn bind_having_expr(
                     Box::new(sum_f), BinOp::Div, Box::new(BoundExpr::ColRef(cnt_col)),
                 ))
             } else {
-                Ok(BoundExpr::ColRef(agg_col_offset + m.specs_start))
+                Ok(BoundExpr::ColRef(ctx.agg_col_offset + m.specs_start))
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = bind_having_expr(left, reduce_schema, source_schema,
-                group_col_indices, use_natural_pk, agg_mappings, agg_col_offset)?;
-            let r = bind_having_expr(right, reduce_schema, source_schema,
-                group_col_indices, use_natural_pk, agg_mappings, agg_col_offset)?;
+            let l = bind_having_expr(left, ctx)?;
+            let r = bind_having_expr(right, ctx)?;
             let bop = match op {
                 sqlparser::ast::BinaryOperator::Plus  => BinOp::Add,
                 sqlparser::ast::BinaryOperator::Minus => BinOp::Sub,
@@ -1684,10 +1687,7 @@ fn bind_having_expr(
                 _ => Err(GnitzSqlError::Unsupported("HAVING: unsupported value type".to_string())),
             }
         }
-        Expr::Nested(inner) => bind_having_expr(
-            inner, reduce_schema, source_schema,
-            group_col_indices, use_natural_pk, agg_mappings, agg_col_offset,
-        ),
+        Expr::Nested(inner) => bind_having_expr(inner, ctx),
         _ => Err(GnitzSqlError::Unsupported(
             format!("HAVING: unsupported expression {:?}", expr)
         )),

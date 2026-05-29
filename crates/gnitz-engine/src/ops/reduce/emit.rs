@@ -85,8 +85,7 @@ pub(super) fn emit_reduce_row(
                     // signed and wide columns).
                     let opk = input_mb.get_pk_bytes(exemplar_row);
                     let off = input_schema.pk_byte_offset(src_ci) as usize;
-                    let mut le = [0u8; 16];
-                    gnitz_wire::decode_pk_column(&opk[off..off + cs], col.type_code, &mut le[..cs]);
+                    let le = gnitz_wire::decode_pk_column_owned(&opk[off..off + cs], col.type_code);
                     output.extend_col(out_pi, &le[..cs]);
                 } else {
                     let src_pi = input_schema.payload_idx(src_ci);
@@ -164,12 +163,7 @@ pub(super) fn emit_finalized_row(
                         let off = pk_off as usize;
                         // A single PK column is decoded here, never the whole
                         // compound region; 16 bytes (widest scalar PK) suffices.
-                        let mut le = [0u8; 16];
-                        gnitz_wire::decode_pk_column(
-                            &opk[off..off + cs],
-                            col.type_code,
-                            &mut le[..cs],
-                        );
+                        let le = gnitz_wire::decode_pk_column_owned(&opk[off..off + cs], col.type_code);
                         fin_output.extend_col(fpi, &le[..cs]);
                     } else {
                         let src_pi = src_pi as usize;

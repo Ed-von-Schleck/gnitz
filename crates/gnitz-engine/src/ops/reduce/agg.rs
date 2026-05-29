@@ -185,11 +185,9 @@ impl Accumulator {
 
         // PK regions hold OPK (order-preserving big-endian) bytes; decode the
         // addressed PK column back to native little-endian before aggregating.
-        let mut pk_le_buf = [0u8; 16];
+        let pk_le_buf;
         let bytes: &[u8] = if self.is_pk_col {
-            gnitz_wire::decode_pk_column(
-                &mb.get_pk_bytes(row)[slot..slot + cs], tc as u8, &mut pk_le_buf[..cs],
-            );
+            pk_le_buf = gnitz_wire::decode_pk_column_owned(&mb.get_pk_bytes(row)[slot..slot + cs], tc as u8);
             &pk_le_buf[..cs]
         } else {
             mb.get_col_ptr(row, slot, cs)

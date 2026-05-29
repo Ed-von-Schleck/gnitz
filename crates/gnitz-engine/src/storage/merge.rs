@@ -160,21 +160,21 @@ impl<'a> MemBatch<'a> {
     /// PK region as a contiguous slice (`count * pk_stride` bytes).
     #[inline]
     pub fn pk(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PK] as usize;
+        let off = self.offsets[super::batch::REG_PK];
         &self.data[off..off + self.count * self.pk_stride as usize]
     }
 
     /// Weight region as a contiguous slice (`count * 8` bytes).
     #[inline]
     pub fn weight(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_WEIGHT] as usize;
+        let off = self.offsets[super::batch::REG_WEIGHT];
         &self.data[off..off + self.count * 8]
     }
 
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
     #[inline]
     pub fn null_bmp(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_NULL_BMP] as usize;
+        let off = self.offsets[super::batch::REG_NULL_BMP];
         &self.data[off..off + self.count * 8]
     }
 
@@ -182,35 +182,35 @@ impl<'a> MemBatch<'a> {
     /// Caller supplies the stride from the schema (see `payload_columns`).
     #[inline]
     pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PAYLOAD_START + pi] as usize;
+        let off = self.offsets[super::batch::REG_PAYLOAD_START + pi];
         &self.data[off..off + self.count * stride]
     }
 
     #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
-        let off = self.offsets[super::batch::REG_PK] as usize + row * stride;
+        let off = self.offsets[super::batch::REG_PK] + row * stride;
         gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
     }
 
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
         let stride = self.pk_stride as usize;
-        let off = self.offsets[super::batch::REG_PK] as usize + row * stride;
+        let off = self.offsets[super::batch::REG_PK] + row * stride;
         &self.data[off..off + stride]
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
-        let off = self.offsets[super::batch::REG_WEIGHT] as usize + row * 8;
+        let off = self.offsets[super::batch::REG_WEIGHT] + row * 8;
         i64::from_le_bytes(self.data[off..off + 8].try_into().unwrap())
     }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.offsets[super::batch::REG_NULL_BMP] as usize + row * 8)
+        read_u64_le(self.data, self.offsets[super::batch::REG_NULL_BMP] + row * 8)
     }
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PAYLOAD_START + payload_col] as usize + row * col_size;
+        let off = self.offsets[super::batch::REG_PAYLOAD_START + payload_col] + row * col_size;
         &self.data[off..off + col_size]
     }
 }
@@ -969,13 +969,13 @@ fn scatter_mb_pk_wt_nbm<const PKS: usize>(
         let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
         let row = ri as usize;
         let dst_row = base + out;
-        let pk_off = src.offsets[super::batch::REG_PK] as usize + row * PKS;
+        let pk_off = src.offsets[super::batch::REG_PK] + row * PKS;
         writer.pk[dst_row * PKS..][..PKS]
             .copy_from_slice(&src.data[pk_off..pk_off + PKS]);
-        let w_off = src.offsets[super::batch::REG_WEIGHT] as usize + row * FB;
+        let w_off = src.offsets[super::batch::REG_WEIGHT] + row * FB;
         writer.weight[dst_row * FB..][..FB]
             .copy_from_slice(&src.data[w_off..w_off + FB]);
-        let n_off = src.offsets[super::batch::REG_NULL_BMP] as usize + row * FB;
+        let n_off = src.offsets[super::batch::REG_NULL_BMP] + row * FB;
         writer.null_bmp[dst_row * FB..][..FB]
             .copy_from_slice(&src.data[n_off..n_off + FB]);
     }
@@ -998,13 +998,13 @@ fn scatter_mb_pk_dynamic(
         debug_assert_eq!(src.pk_stride as usize, pks);
         let row = ri as usize;
         let dst_row = base + out;
-        let pk_off = src.offsets[super::batch::REG_PK] as usize + row * pks;
+        let pk_off = src.offsets[super::batch::REG_PK] + row * pks;
         writer.pk[dst_row * pks..][..pks]
             .copy_from_slice(&src.data[pk_off..pk_off + pks]);
-        let w_off = src.offsets[super::batch::REG_WEIGHT] as usize + row * FB;
+        let w_off = src.offsets[super::batch::REG_WEIGHT] + row * FB;
         writer.weight[dst_row * FB..][..FB]
             .copy_from_slice(&src.data[w_off..w_off + FB]);
-        let n_off = src.offsets[super::batch::REG_NULL_BMP] as usize + row * FB;
+        let n_off = src.offsets[super::batch::REG_NULL_BMP] + row * FB;
         writer.null_bmp[dst_row * FB..][..FB]
             .copy_from_slice(&src.data[n_off..n_off + FB]);
     }
@@ -1030,7 +1030,7 @@ fn gather_mb_col_dispatch(
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
                 let row = ri as usize;
-                let src_off = src.offsets[super::batch::REG_PAYLOAD_START + pi] as usize + row * cs;
+                let src_off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + row * cs;
                 dst[out * cs..][..cs].copy_from_slice(&src.data[src_off..src_off + cs]);
             }
         }
@@ -1046,7 +1046,7 @@ fn gather_mb_col<const N: usize>(
 ) {
     for (out, &(si, ri)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-        let off = src.offsets[super::batch::REG_PAYLOAD_START + pi] as usize + ri as usize * N;
+        let off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + ri as usize * N;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.data.as_ptr().add(off),
@@ -1988,13 +1988,13 @@ mod tests {
         // entries are zero-stride placeholders so any accidental read
         // returns deterministic bytes.
         let pk_base = mb.data.as_ptr().wrapping_add(
-            mb.offsets[super::super::batch::REG_PK] as usize,
+            mb.offsets[super::super::batch::REG_PK],
         );
         let nbm_base = mb.data.as_ptr().wrapping_add(
-            mb.offsets[super::super::batch::REG_NULL_BMP] as usize,
+            mb.offsets[super::super::batch::REG_NULL_BMP],
         );
         let col0_base = mb.data.as_ptr().wrapping_add(
-            mb.offsets[super::super::batch::REG_PAYLOAD_START] as usize,
+            mb.offsets[super::super::batch::REG_PAYLOAD_START],
         );
         let zero: u8 = 0;
         let mut cols = [ColPtr { base: &zero as *const u8, stride: 0 };

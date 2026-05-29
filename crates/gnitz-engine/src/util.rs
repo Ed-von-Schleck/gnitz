@@ -146,6 +146,19 @@ where F: FnOnce() -> Result<T, String>,
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
 /// Called once per process via `std::sync::Once`; safe to invoke from any test.
 #[cfg(test)]
+pub fn raise_fd_limit_for_tests() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
@@ -164,17 +177,4 @@ mod tests {
         f.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, data);
     }
-}
-
-#[cfg(test)]
-pub fn raise_fd_limit_for_tests() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        let mut rlim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
-            rlim.rlim_cur = rlim.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
-        }
-    });
 }

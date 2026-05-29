@@ -75,7 +75,7 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
         // Wide compound PK: encode each column of each row to OPK in pk-list order.
         PkColumn::Bytes { buf: pk_buf, stride } => {
             let row_stride = *stride as usize;
-            let row_count = if row_stride == 0 { 0 } else { pk_buf.len() / row_stride };
+            let row_count = pk_buf.len().checked_div(row_stride).unwrap_or(0);
             let aligned = align8(buf.len());
             buf.resize(aligned, 0);
             buf.reserve(pk_buf.len());

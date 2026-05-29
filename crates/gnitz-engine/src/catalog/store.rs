@@ -923,7 +923,7 @@ impl CatalogEngine {
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_columns.open_cursor();
         // sys_columns has a single U64 PK; OPK == big-endian.
-        cursor.cursor.seek_bytes(&(start_pk as u64).to_be_bytes());
+        cursor.cursor.seek_bytes(&start_pk.to_be_bytes());
 
         let mut defs = Vec::new();
         while cursor.cursor.valid {

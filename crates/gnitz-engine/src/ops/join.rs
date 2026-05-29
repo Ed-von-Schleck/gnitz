@@ -211,7 +211,7 @@ fn semi_join_dt_swapped(
     let blob_cap = mb.blob.len().max(1);
     let mut output =
         write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            scatter_copy(&mb, &emit_indices, &[], writer);
+            scatter_copy(&mb, emit_indices, &[], writer);
         });
     // Swapped order: output is in trace key order, which is sorted.
     // Rows come from the consolidated delta so (PK, payload) pairs are unique.

@@ -79,6 +79,10 @@ impl StoreHandle {
     // ------------------------------------------------------------------
 
     /// Get `&mut PartitionedTable` if this handle is Partitioned.
+    // Interior mutability through UnsafeCell: the `&mut` is handed out under the
+    // SAFETY contract documented above (no live aliasing &mut), not derived from
+    // `&self` by reborrow — so clippy's mut_from_ref does not apply.
+    #[allow(clippy::mut_from_ref)]
     pub fn as_partitioned_mut(&self) -> Option<&mut PartitionedTable> {
         match self {
             StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() }),
@@ -216,7 +220,7 @@ impl IndexCircuitEntry {
     /// must ensure no aliasing `&mut` into the same Table is live.
     #[allow(clippy::mut_from_ref)]
     pub fn table_mut(&self) -> &mut Table {
-        unsafe { &mut **self.index_table.get() }
+        unsafe { &mut *self.index_table.get() }
     }
 }
 
@@ -338,6 +342,9 @@ struct PendingEntry {
 
 // SAFETY: DagEngine is only accessed from a single thread.
 unsafe impl Send for DagEngine {}
+
+/// Per-side exchange metadata snapshot: (schema, source_id, post seed reg).
+type ExchangeSideMeta = (SchemaDescriptor, i64, u16);
 
 impl DagEngine {
     pub fn new() -> Self {
@@ -1507,9 +1514,9 @@ impl DagEngine {
         batch.into_consolidated(schema).into_inner()
     }
 
-    /// Per-side exchange metadata snapshot: (schema, source_id, post seed reg).
+    /// Per-side exchange metadata snapshot for both sides of a two-sided join.
     fn two_sided_meta(&self, view_id: i64)
-        -> Option<((SchemaDescriptor, i64, u16), (SchemaDescriptor, i64, u16))>
+        -> Option<(ExchangeSideMeta, ExchangeSideMeta)>
     {
         let p = self.cache.get(&view_id)?;
         let sb = p.side_b.as_ref()?;

@@ -184,10 +184,10 @@ impl CursorSource {
                 let mb = b.as_mem_batch();
                 let data_ptr = mb.data.as_ptr();
                 let pk_stride = mb.pk_stride as usize;
-                let pk_off = mb.offsets[super::batch::REG_PK] as usize;
-                let nbm_off = mb.offsets[super::batch::REG_NULL_BMP] as usize;
+                let pk_off = mb.offsets[super::batch::REG_PK];
+                let nbm_off = mb.offsets[super::batch::REG_NULL_BMP];
                 for (pi, _ci, col) in schema.payload_columns() {
-                    let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi] as usize;
+                    let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi];
                     cols[pi] = ColPtr {
                         base: unsafe { data_ptr.add(off) },
                         stride: col.size() as usize,

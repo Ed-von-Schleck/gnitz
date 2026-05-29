@@ -142,7 +142,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         String::new()
     } else {
         match &batch.columns[ctrl::COL_ERROR_MSG] {
-            ColData::Strings(v) => match v.get(0) {
+            ColData::Strings(v) => match v.first() {
                 Some(Some(s)) => s.clone(),
                 _ => String::new(),
             },
@@ -157,7 +157,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         Vec::new()
     } else {
         match &batch.columns[ctrl::COL_SEEK_PK_EXTRA] {
-            ColData::Bytes(v) => v.get(0).cloned().flatten().unwrap_or_default(),
+            ColData::Bytes(v) => v.first().cloned().flatten().unwrap_or_default(),
             _ => return Err(ProtocolError::DecodeError(
                 "control block seek_pk_extra column is not Bytes".into()
             )),

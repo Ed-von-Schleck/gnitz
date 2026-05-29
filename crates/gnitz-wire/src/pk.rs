@@ -58,6 +58,17 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     }
 }
 
+/// [`decode_pk_column`] into an owned 16-byte buffer: the decoded native
+/// little-endian value occupies the leading `src.len()` bytes (the column size,
+/// which must be ≤ 16). For callers that want an owned scratch buffer rather
+/// than threading one through; slice the result with `&buf[..src.len()]`.
+#[inline]
+pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    decode_pk_column(src, tc, &mut buf[..src.len()]);
+    buf
+}
+
 /// BE value widener for an OPK region slice. Right-aligns (left-zero-pads) the
 /// `stride` bytes into a `u128` and reads big-endian, recovering the native
 /// value for UNSIGNED PKs (OPK == BE for unsigned). Signed PKs return the OPK

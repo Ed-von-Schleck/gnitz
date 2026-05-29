@@ -502,9 +502,9 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
             pks.push(hasher.digest128());
         }
     }
-    for row in 0..n {
+    for (row, pk) in pks.iter().enumerate() {
         // The reindex output PK is a synthetic U128 (unsigned), so OPK == BE.
-        output.set_pk_at_bytes(row, &pks[row].to_be_bytes());
+        output.set_pk_at_bytes(row, &pk.to_be_bytes());
     }
 }
 
@@ -1263,6 +1263,9 @@ mod tests {
         promoter_pk.promote_into(&mb, &mut out_pk);
         promoter_narrow.promote_into(&mb, &mut out_narrow);
 
+        // `row` indexes out_pk, out_narrow, and vals together — enumerate over
+        // any one would not cover the others.
+        #[allow(clippy::needless_range_loop)]
         for row in 0..batch.count {
             assert_eq!(
                 out_pk.get_pk_bytes(row), out_narrow.get_pk_bytes(row),

@@ -582,13 +582,13 @@ impl MappedShard {
 
         let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
-        expand_into(&self.pk, pk_stride, &mut data[offsets[0] as usize..][..row_count * pk_stride]);
-        expand_into(&self.weight,   8,  &mut data[offsets[1] as usize..][..sz8]);
-        expand_into(&self.null_bmp, 8,  &mut data[offsets[2] as usize..][..sz8]);
+        expand_into(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
+        expand_into(&self.weight,   8,  &mut data[offsets[1]..][..sz8]);
+        expand_into(&self.null_bmp, 8,  &mut data[offsets[2]..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
             let stride = col.size() as usize;
-            let off = offsets[3 + pi] as usize;
+            let off = offsets[3 + pi];
             let sz = row_count * stride;
             expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }

@@ -379,7 +379,7 @@ impl Batch {
         for i in 0..nr {
             let sz = sizes[i] as usize;
             if sz > 0 && !ptrs[i].is_null() {
-                let off = offsets[i] as usize;
+                let off = offsets[i];
                 std::ptr::copy_nonoverlapping(ptrs[i], data.as_mut_ptr().add(off), sz);
             }
         }
@@ -474,23 +474,23 @@ impl Batch {
 
     #[inline]
     pub fn pk_data(&self) -> &[u8] {
-        let off = self.offsets[REG_PK] as usize;
+        let off = self.offsets[REG_PK];
         &self.data[off..off + self.count * self.strides[REG_PK] as usize]
     }
     #[inline]
     pub fn weight_data(&self) -> &[u8] {
-        let off = self.offsets[REG_WEIGHT] as usize;
+        let off = self.offsets[REG_WEIGHT];
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn null_bmp_data(&self) -> &[u8] {
-        let off = self.offsets[REG_NULL_BMP] as usize;
+        let off = self.offsets[REG_NULL_BMP];
         &self.data[off..off + self.count * 8]
     }
     #[inline]
     pub fn col_data(&self, pi: usize) -> &[u8] {
         let r = REG_PAYLOAD_START + pi;
-        let off = self.offsets[r] as usize;
+        let off = self.offsets[r];
         &self.data[off..off + self.count * self.strides[r] as usize]
     }
     #[inline]
@@ -508,26 +508,26 @@ impl Batch {
 
     #[inline]
     pub fn pk_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[REG_PK] as usize;
+        let off = self.offsets[REG_PK];
         let end = off + self.count * self.strides[REG_PK] as usize;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn weight_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[REG_WEIGHT] as usize;
+        let off = self.offsets[REG_WEIGHT];
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn null_bmp_data_mut(&mut self) -> &mut [u8] {
-        let off = self.offsets[REG_NULL_BMP] as usize;
+        let off = self.offsets[REG_NULL_BMP];
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
     pub fn col_data_mut(&mut self, pi: usize) -> &mut [u8] {
         let r = REG_PAYLOAD_START + pi;
-        let off = self.offsets[r] as usize;
+        let off = self.offsets[r];
         let end = off + self.count * self.strides[r] as usize;
         &mut self.data[off..end]
     }
@@ -554,7 +554,7 @@ impl Batch {
     #[inline(always)]
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
-        let off = self.offsets[REG_PK] as usize + row * stride;
+        let off = self.offsets[REG_PK] + row * stride;
         gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
     }
 
@@ -565,20 +565,20 @@ impl Batch {
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.strides[REG_PK] as usize;
-        let off = self.offsets[REG_PK] as usize + row * stride;
+        let off = self.offsets[REG_PK] + row * stride;
         &self.data[off..off + stride]
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
-        read_i64_le(&self.data[self.offsets[REG_WEIGHT] as usize..], row * 8)
+        read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * 8)
     }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[REG_NULL_BMP] as usize..], row * 8)
+        read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * 8)
     }
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        let off = self.offsets[REG_PAYLOAD_START + payload_col] as usize + row * col_size;
+        let off = self.offsets[REG_PAYLOAD_START + payload_col] + row * col_size;
         &self.data[off..off + col_size]
     }
 
@@ -626,8 +626,8 @@ impl Batch {
             for i in 0..nr {
                 let len = self.count * self.strides[i] as usize;
                 if len == 0 { continue; }
-                let old_off = self.offsets[i] as usize;
-                let new_off = new_offsets[i] as usize;
+                let old_off = self.offsets[i];
+                let new_off = new_offsets[i];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         self.data.as_ptr().add(old_off),
@@ -645,8 +645,8 @@ impl Batch {
             unsafe {
                 self.data.set_len(new_total);
                 for i in (0..nr).rev() {
-                    let old_start = self.offsets[i] as usize;
-                    let new_start = new_offsets[i] as usize;
+                    let old_start = self.offsets[i];
+                    let new_start = new_offsets[i];
                     let data_len = self.count * self.strides[i] as usize;
                     if old_start != new_start && data_len > 0 {
                         std::ptr::copy(
@@ -673,7 +673,7 @@ impl Batch {
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
-        let off = self.offsets[r] as usize + self.count * self.strides[r] as usize;
+        let off = self.offsets[r] + self.count * self.strides[r] as usize;
         self.data[off..off + src.len()].copy_from_slice(src);
     }
 
@@ -757,7 +757,7 @@ impl Batch {
             stride >= 16 || (pk >> (stride * 8)) == 0,
             "narrow batch requires high bits == 0",
         );
-        let off = self.offsets[REG_PK] as usize + row * stride;
+        let off = self.offsets[REG_PK] + row * stride;
         self.data[off..off + stride].copy_from_slice(&pk.to_be_bytes()[16 - stride..]);
     }
 
@@ -769,7 +769,7 @@ impl Batch {
             stride,
             "set_pk_at_bytes: length must equal pk_stride",
         );
-        let off = self.offsets[REG_PK] as usize + row * stride;
+        let off = self.offsets[REG_PK] + row * stride;
         self.data[off..off + stride].copy_from_slice(bytes);
     }
 
@@ -788,7 +788,7 @@ impl Batch {
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
-        let off = self.offsets[r] as usize + self.count * self.strides[r] as usize;
+        let off = self.offsets[r] + self.count * self.strides[r] as usize;
         self.data[off..off + nbytes].fill(0);
     }
 
@@ -796,7 +796,7 @@ impl Batch {
     fn bulk_copy_region(&mut self, r: usize, src_region_data: &[u8], start: usize, end: usize) {
         let stride = self.strides[r] as usize;
         let n = end - start;
-        let dst_off = self.offsets[r] as usize + self.count * stride;
+        let dst_off = self.offsets[r] + self.count * stride;
         let src_off = start * stride;
         self.data[dst_off..dst_off + n * stride]
             .copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
@@ -830,7 +830,7 @@ impl Batch {
         self.bulk_copy_region(REG_PK, src.pk(), start, end);
         match weight_override {
             Some(w) => {
-                let dst_off = self.offsets[REG_WEIGHT] as usize + self.count * 8;
+                let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
                 let w_bytes = w.to_le_bytes();
                 let dest = &mut self.data[dst_off..dst_off + n * 8];
                 for chunk in dest.chunks_exact_mut(8) {
@@ -856,7 +856,7 @@ impl Batch {
             if is_str && cs == 16 {
                 for row in start..end {
                     let src_struct = src.get_col_ptr(row, pi, 16);
-                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi]
                         + (self.count + row - start) * 16;
                     relocate_string_cell(src_struct, src.blob,
                         &mut self.data[dst_off..dst_off + 16], &mut self.blob);
@@ -935,8 +935,8 @@ impl Batch {
             for i in 0..nr {
                 let stride = self.strides[i] as usize;
                 let len = self.count * stride;
-                let src_off = self.offsets[i] as usize;
-                let dst_off = packed_offsets[i] as usize;
+                let src_off = self.offsets[i];
+                let dst_off = packed_offsets[i];
                 if len > 0 {
                     std::ptr::copy_nonoverlapping(
                         self.data.as_ptr().add(src_off),
@@ -1035,14 +1035,14 @@ impl Batch {
         let n = end - start;
         self.reserve_rows(n);
         // All three system regions
-        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK] as usize..], start, end);
-        self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT] as usize..], start, end);
-        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP] as usize..], start, end);
+        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK]..], start, end);
+        self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT]..], start, end);
+        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP]..], start, end);
         // Payload columns — string structs copied verbatim (blob already shared)
         let npc = self.num_payload_cols();
         for pi in 0..npc {
             if self.strides[REG_PAYLOAD_START + pi] > 0 {
-                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi] as usize..], start, end);
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi]..], start, end);
             }
         }
         self.count += n;
@@ -1056,17 +1056,17 @@ impl Batch {
         self.reserve_rows(n);
 
         // Fixed columns: bulk copy from src's data buffer.
-        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK] as usize..], start, end);
+        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK]..], start, end);
         if negate {
-            let w_off = self.offsets[REG_WEIGHT] as usize;
+            let w_off = self.offsets[REG_WEIGHT];
             for i in start..end {
                 let dst = w_off + (self.count + i - start) * 8;
                 self.data[dst..dst + 8].copy_from_slice(&(-src.get_weight(i)).to_le_bytes());
             }
         } else {
-            self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT] as usize..], start, end);
+            self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT]..], start, end);
         }
-        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP] as usize..], start, end);
+        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP]..], start, end);
 
         // Payload columns.  When the schema is installed, we need to know
         // which payload positions hold STRING values so the blob can be
@@ -1088,13 +1088,13 @@ impl Batch {
             let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
             if is_string_at[pi] && cs == 16 {
                 for row in start..end {
-                    let src_off = src.offsets[REG_PAYLOAD_START + pi] as usize + row * 16;
+                    let src_off = src.offsets[REG_PAYLOAD_START + pi] + row * 16;
                     let src_struct = &src.data[src_off..src_off + 16];
-                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] as usize + (self.count + row - start) * 16;
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] + (self.count + row - start) * 16;
                     relocate_string_cell(src_struct, &src.blob, &mut self.data[dst_off..dst_off + 16], &mut self.blob);
                 }
             } else if cs > 0 {
-                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi] as usize..], start, end);
+                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi]..], start, end);
             }
         }
 
@@ -1173,7 +1173,7 @@ impl Batch {
         // extend_pk writes right-aligned BE (correct OPK only for unsigned PKs).
         // A signed single-col PK needs the sign flip — use extend_pk_opk.
         debug_assert!(
-            self.schema.map_or(true, |s| !s.pk_is_signed_single_col()),
+            self.schema.is_none_or(|s| !s.pk_is_signed_single_col()),
             "append_row: signed single-col PK requires extend_pk_bytes (extend_pk \
              writes right-aligned BE without the sign flip)",
         );
@@ -1311,7 +1311,7 @@ impl Batch {
     pub fn region_ptr(&self, idx: usize) -> *const u8 {
         let blob_idx = REG_PAYLOAD_START + self.num_payload_cols();
         if idx < blob_idx {
-            self.data[self.offsets[idx] as usize..].as_ptr()
+            self.data[self.offsets[idx]..].as_ptr()
         } else if idx == blob_idx {
             self.blob.as_ptr()
         } else {
@@ -1333,7 +1333,7 @@ impl Batch {
         let npc = self.num_payload_cols();
         let mut r = Vec::with_capacity(REG_PAYLOAD_START + npc + 1);
         for i in 0..REG_PAYLOAD_START + npc {
-            let off = self.offsets[i] as usize;
+            let off = self.offsets[i];
             let len = self.count * self.strides[i] as usize;
             r.push((self.data[off..].as_ptr(), len));
         }
@@ -2353,7 +2353,9 @@ mod tests {
         assert_eq!(schema.pk_stride(), 12);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(3);
-        // (U64, U32) packed little-endian into the low 12 bytes of a u128.
+        // (U64, U32) packed little-endian into the low 12 bytes of a u128. The
+        // `| (0 << 64)` keeps the (low, high) structure visible across all three.
+        #[allow(clippy::identity_op)]
         let pks: [u128; 3] = [
             1u128 | (0u128 << 64),
             1u128 | ((u32::MAX as u128) << 64),
@@ -2409,7 +2411,7 @@ mod tests {
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_PK (region 0) size directory entry: claim 24 bytes.
         let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8 + 4;
-        buf[size_off..size_off + 4].copy_from_slice(&(1u32 * 24).to_le_bytes());
+        buf[size_off..size_off + 4].copy_from_slice(&24u32.to_le_bytes());
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
         assert_eq!(r.err(), Some("WAL block PK region size mismatch"));
     }

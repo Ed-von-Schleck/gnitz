@@ -1670,6 +1670,11 @@ fn build_gather_agg_descs(
     agg_descs
 }
 
+// Vecs are grown in place (push); `Vec<Box<Table>>` is load-bearing — a raw
+// pointer is taken into an element below, so the Box keeps the Table at a stable
+// address across Vec reallocation. Same signature shape as the sibling emit_*
+// helpers above.
+#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_gather_reduce(
     raw_cols: &[(u64, u16, u64, u64)],
     nid: i32,

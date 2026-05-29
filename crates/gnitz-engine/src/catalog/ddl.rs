@@ -203,7 +203,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
         let schema = table_tab_schema();
-        let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u128);
+        let batch = retract_single_row(&self.sys_tables, &schema, tid as u128);
         if batch.count == 0 {
             return Err(format!("Table does not exist: {}", qualified));
         }
@@ -224,13 +224,13 @@ impl CatalogEngine {
         // is rebuilt by scanning sys_view_deps; ghost entries for a dropped view
         // would accumulate and force re-evaluation of dead dependencies on every
         // upstream change.
-        let dep_batch = retract_rows_by_view(&mut self.sys_view_deps, &dep_tab_schema(), vid as u64);
+        let dep_batch = retract_rows_by_view(&self.sys_view_deps, &dep_tab_schema(), vid as u64);
         if dep_batch.count > 0 {
             ingest_batch_into(&mut self.sys_view_deps, &dep_batch);
         }
 
         let schema = view_tab_schema();
-        let batch = retract_single_row(&mut self.sys_views, &schema, vid as u128);
+        let batch = retract_single_row(&self.sys_views, &schema, vid as u128);
         if batch.count == 0 {
             return Err(format!("View does not exist: {}", qualified));
         }
