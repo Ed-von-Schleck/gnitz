@@ -506,6 +506,8 @@ pub(crate) fn payload_route_key(
 /// INDEX key for one PK column's OPK bytes: decode back to the native value
 /// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
 /// `seek_by_index`, which re-encode native → OPK to hit the OPK-stored index.
+/// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
+/// mismatched `col_size` slices past the column and panics.
 #[inline]
 pub(crate) fn pk_native_key(
     pk_bytes: &[u8],

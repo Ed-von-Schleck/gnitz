@@ -167,17 +167,17 @@ pub(super) fn argsort_delta(
     indices
 }
 
-/// Argsort indices into canonical PK order — `pk_indices` order as defined
-/// by `compare_pk_bytes`. Narrow PKs (`pk_stride ≤ 16`) materialise an
-/// order-preserving `pk_sort_key` once and sort by a raw `u128` compare; the
-/// fast single-col-unsigned schema reuses `pack_pk_le` (byte-identical) inside
-/// the same key. Wide PKs (`pk_stride > 16`) sort off the authoritative
-/// `compare_pk_bytes` walk, since `pk_sort_key` is only a non-authoritative
-/// 16-byte prefix there and this argsort has no payload tiebreak.
-pub(super) fn argsort_pk_canonical(mb: &MemBatch, schema: &SchemaDescriptor) -> Vec<u32> {
+/// Argsort indices into canonical PK order (`pk_indices` order as defined by
+/// `compare_pk_bytes`). Narrow PKs (`pk_stride ≤ 16`) materialise an order-
+/// preserving `pk_sort_key` (`pack_pk_be`) once and sort by a raw `u128`
+/// compare — ascending `u128` equals canonical PK order for unsigned, signed,
+/// and compound alike. Wide PKs sort off the authoritative `compare_pk_bytes`
+/// byte walk, since `pk_sort_key` is only a non-authoritative 16-byte prefix
+/// there and this argsort has no payload tiebreak.
+pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
     let n = mb.count;
     let mut idx: Vec<u32> = (0..n as u32).collect();
-    if schema.pk_is_wide() {
+    if mb.pk_stride as usize > 16 {
         // pk_sort_key is only a 16-byte prefix here; settle prefix collisions
         // (and order col-major compound keys) with the authoritative walk.
         idx.sort_unstable_by(|&a, &b| {

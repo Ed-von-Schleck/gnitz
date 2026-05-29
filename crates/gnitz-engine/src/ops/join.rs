@@ -6,28 +6,18 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{
     write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
-    compare_pk_bytes, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
+    compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
 };
 
 use super::util::{merge_null_words, write_string_from_batch};
 
-/// True iff the PK is a single unsigned column, so its `get_pk` u128
-/// (right-aligned big-endian of the OPK region) is *order*-correct and the
-/// merge-walk can compare packed u128 keys directly instead of `get_pk_bytes`.
-/// Signed and compound PKs are not u128-order-correct and must compare bytes.
-///
-/// This is the last surviving dual-path consumer of the "fast PK" concept;
-/// it lives here (not on `SchemaDescriptor`) so the Phase-1 join byte-
-/// enablement that removes the dual path removes this predicate with it.
-fn pk_is_fast(schema: &SchemaDescriptor) -> bool {
-    use crate::schema::type_code;
-    let pk = schema.pk_indices();
-    pk.len() == 1
-        && matches!(
-            schema.columns[pk[0] as usize].type_code,
-            type_code::U8 | type_code::U16 | type_code::U32
-                | type_code::U64 | type_code::U128 | type_code::UUID,
-        )
+thread_local! {
+    /// Reused emit-index scratch for the delta-trace anti/semi joins. Cleared
+    /// per operator call rather than allocating a fresh `Vec<u32>` each tick —
+    /// same hold-across-work, no-cap shape as exchange.rs's pools. The borrow is
+    /// confined to one operator body; `scatter_copy` does not re-enter.
+    static JOIN_EMIT_INDICES: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -43,9 +33,13 @@ fn pk_is_fast(schema: &SchemaDescriptor) -> bool {
 /// scanned. Consecutive duplicate PKs reuse the previous presence result instead
 /// of re-seeking (which would be O(log N) per duplicate).
 #[allow(clippy::needless_range_loop)]
-fn dt_emit_indices(cursor: &mut ReadCursor, batch: &Batch, emit_when_present: bool) -> Vec<u32> {
+fn dt_emit_indices(
+    cursor: &mut ReadCursor,
+    batch: &Batch,
+    emit_when_present: bool,
+    emit_indices: &mut Vec<u32>,
+) {
     let n = batch.count;
-    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
     let mut prev_in_trace = false;
     // Seek/compare by the batch row's OPK bytes directly — no native-value
     // round-trip, correct at every PK width/signedness.
@@ -74,8 +68,6 @@ fn dt_emit_indices(cursor: &mut ReadCursor, batch: &Batch, emit_when_present: bo
 
         prev_in_trace = in_trace;
     }
-
-    emit_indices
 }
 
 /// Emit delta rows whose key has NO positive-weight match in the trace.
@@ -94,21 +86,25 @@ pub fn op_anti_join_delta_trace(
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
-    let emit_indices = dt_emit_indices(cursor, consolidated, false);
+    JOIN_EMIT_INDICES.with(|pool| {
+        let mut emit_indices = pool.borrow_mut();
+        emit_indices.clear();
+        dt_emit_indices(cursor, consolidated, false, &mut emit_indices);
 
-    if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
-    }
+        if emit_indices.is_empty() {
+            return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+        }
 
-    let mb = consolidated.as_mem_batch();
-    let blob_cap = mb.blob.len().max(1);
-    let mut output =
-        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            scatter_copy(&mb, &emit_indices, &[], writer);
-        });
-    output.sorted = true;
-    output.consolidated = true;
-    ConsolidatedBatch::new_unchecked(output)
+        let mb = consolidated.as_mem_batch();
+        let blob_cap = mb.blob.len().max(1);
+        let mut output =
+            write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
+                scatter_copy(&mb, &emit_indices, &[], writer);
+            });
+        output.sorted = true;
+        output.consolidated = true;
+        ConsolidatedBatch::new_unchecked(output)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -136,37 +132,44 @@ pub fn op_semi_join_delta_trace(
     cursor.rewind();
 
     let trace_len = cursor.estimated_length();
-    if n > trace_len {
-        // Adaptive swap: iterate trace, binary-search delta
-        return ConsolidatedBatch::new_unchecked(semi_join_dt_swapped(consolidated, cursor, schema));
-    }
 
-    // Merge-walk
-    let emit_indices = dt_emit_indices(cursor, consolidated, true);
+    JOIN_EMIT_INDICES.with(|pool| {
+        let mut emit_indices = pool.borrow_mut();
+        emit_indices.clear();
 
-    if emit_indices.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
-    }
+        if n > trace_len {
+            // Adaptive swap: iterate trace, binary-search delta
+            return ConsolidatedBatch::new_unchecked(
+                semi_join_dt_swapped(consolidated, cursor, schema, &mut emit_indices));
+        }
 
-    let mb = consolidated.as_mem_batch();
-    let blob_cap = mb.blob.len().max(1);
-    let mut output =
-        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            scatter_copy(&mb, &emit_indices, &[], writer);
-        });
-    output.sorted = true;
-    output.consolidated = true;
-    ConsolidatedBatch::new_unchecked(output)
+        // Merge-walk
+        dt_emit_indices(cursor, consolidated, true, &mut emit_indices);
+
+        if emit_indices.is_empty() {
+            return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+        }
+
+        let mb = consolidated.as_mem_batch();
+        let blob_cap = mb.blob.len().max(1);
+        let mut output =
+            write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
+                scatter_copy(&mb, &emit_indices, &[], writer);
+            });
+        output.sorted = true;
+        output.consolidated = true;
+        ConsolidatedBatch::new_unchecked(output)
+    })
 }
 
 fn semi_join_dt_swapped(
     consolidated: &Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
+    emit_indices: &mut Vec<u32>,
 ) -> Batch {
     let npc = schema.num_payload_cols();
     let n = consolidated.count;
-    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
 
     let con_pks: Vec<u128> = (0..n).map(|i| consolidated.get_pk(i)).collect();
     let mut last_pk: Option<u128> = None;
@@ -611,14 +614,15 @@ where
         return Batch::empty(npc, schema.pk_stride());
     }
 
+    assert!(!schema.pk_is_wide(),
+        "filter_join_dd: wide PK join is unsupported (narrow u128 key path)");
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
+    // `get_pk` (widen_pk_be) is order-preserving for any narrow PK — unsigned,
+    // signed, and compound alike — so the raw `u128` compare equals the typed
+    // lexicographic PK order. Equality is injective for narrow keys.
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
-    // u128-packed PKs are injective for narrow keys, so equality tests are
-    // sound. Their *ordering* is only correct for single unsigned-column PKs;
-    // signed/compound PKs must compare bytes.
-    let fast = pk_is_fast(schema);
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -626,20 +630,9 @@ where
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
 
-        // Advance B past every PK group ordered before key_a. Hoist the
-        // fast/slow dispatch (batch-invariant) out of the inner loop, and the
-        // loop-invariant A-side PK bytes out of the slow comparison.
-        if fast {
-            while idx_b < n_b && pks_b[idx_b] < key_a {
-                idx_b += 1;
-            }
-        } else {
-            let a_pk = ca.get_pk_bytes(idx_a);
-            while idx_b < n_b
-                && compare_pk_bytes(cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
-            {
-                idx_b += 1;
-            }
+        // Advance B past every PK group ordered before key_a.
+        while idx_b < n_b && pks_b[idx_b] < key_a {
+            idx_b += 1;
         }
 
         // Extent of B's PK group matching key_a.
@@ -718,11 +711,12 @@ fn filter_join_dd(
         return Batch::empty(npc, schema.pk_stride());
     }
 
+    assert!(!schema.pk_is_wide(),
+        "filter_join_dd: wide PK join is unsupported (narrow u128 key path)");
+    // `get_pk` is order-preserving for any narrow PK, so the raw `u128` compare
+    // equals canonical PK order; equality is injective for narrow keys.
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
-    // u128 equality is injective for narrow PKs; ordering is only correct for
-    // single unsigned-column PKs — signed/compound PKs compare bytes.
-    let fast = pk_is_fast(schema);
     let mut idx_a = 0usize;
     let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
@@ -730,19 +724,9 @@ fn filter_join_dd(
     while idx_a < n_a {
         let key_a = pks_a[idx_a];
 
-        // Hoist the fast/slow dispatch out of the inner loop; the slow path's
-        // A-side PK bytes are loop-invariant.
-        if fast {
-            while idx_b < n_b && pks_b[idx_b] < key_a {
-                idx_b += 1;
-            }
-        } else {
-            let a_pk = ca.get_pk_bytes(idx_a);
-            while idx_b < n_b
-                && compare_pk_bytes(cb.get_pk_bytes(idx_b), a_pk) == Ordering::Less
-            {
-                idx_b += 1;
-            }
+        // Advance B past every PK group ordered before key_a.
+        while idx_b < n_b && pks_b[idx_b] < key_a {
+            idx_b += 1;
         }
 
         let mut has_match = false;
@@ -803,13 +787,15 @@ pub fn op_join_delta_delta(
         return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
+    assert!(!left_schema.pk_is_wide(),
+        "op_join_delta_delta: wide PK join is unsupported (narrow u128 key path)");
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
+    // `get_pk` is order-preserving for any narrow PK (equi-join keys share a
+    // width on both sides), so the raw `u128` compare equals canonical PK order;
+    // equality is injective for narrow keys.
     let pks_a: Vec<u128> = (0..n_a).map(|i| ca.get_pk(i)).collect();
     let pks_b: Vec<u128> = (0..n_b).map(|i| cb.get_pk(i)).collect();
-    // u128 equality is injective for narrow PKs; ordering is only correct for
-    // single unsigned-column PKs — signed/compound PKs compare bytes.
-    let fast = pk_is_fast(left_schema);
     let mut output = Batch::empty_joined(left_schema, right_schema);
 
     let mut idx_a = 0usize;
@@ -819,45 +805,40 @@ pub fn op_join_delta_delta(
         let key_a = pks_a[idx_a];
         let key_b = pks_b[idx_b];
 
-        let ord = if fast {
-            key_a.cmp(&key_b)
-        } else {
-            compare_pk_bytes(mb_a.get_pk_bytes(idx_a), mb_b.get_pk_bytes(idx_b))
-        };
-        if ord == Ordering::Less {
-            idx_a += 1;
-        } else if ord == Ordering::Greater {
-            idx_b += 1;
-        } else {
-            let match_pk = key_a;
+        match key_a.cmp(&key_b) {
+            Ordering::Less => idx_a += 1,
+            Ordering::Greater => idx_b += 1,
+            Ordering::Equal => {
+                let match_pk = key_a;
 
-            let start_a = idx_a;
-            idx_a += 1;
-            while idx_a < n_a && pks_a[idx_a] == match_pk {
+                let start_a = idx_a;
                 idx_a += 1;
-            }
-
-            let start_b = idx_b;
-            idx_b += 1;
-            while idx_b < n_b && pks_b[idx_b] == match_pk {
-                idx_b += 1;
-            }
-
-            for i in start_a..idx_a {
-                let wa = ca.get_weight(i);
-                if wa == 0 {
-                    continue;
+                while idx_a < n_a && pks_a[idx_a] == match_pk {
+                    idx_a += 1;
                 }
-                for j in start_b..idx_b {
-                    let wb = cb.get_weight(j);
-                    let w_out = wa.wrapping_mul(wb);
-                    if w_out != 0 {
-                        write_join_row_from_batches(
-                            &mut output,
-                            &mb_a, i, &mb_b, j,
-                            w_out,
-                            left_schema, right_schema,
-                        );
+
+                let start_b = idx_b;
+                idx_b += 1;
+                while idx_b < n_b && pks_b[idx_b] == match_pk {
+                    idx_b += 1;
+                }
+
+                for i in start_a..idx_a {
+                    let wa = ca.get_weight(i);
+                    if wa == 0 {
+                        continue;
+                    }
+                    for j in start_b..idx_b {
+                        let wb = cb.get_weight(j);
+                        let w_out = wa.wrapping_mul(wb);
+                        if w_out != 0 {
+                            write_join_row_from_batches(
+                                &mut output,
+                                &mb_a, i, &mb_b, j,
+                                w_out,
+                                left_schema, right_schema,
+                            );
+                        }
                     }
                 }
             }
@@ -1250,6 +1231,35 @@ mod tests {
         let out = op_join_delta_delta(&a, &b, &ls, &rs);
         // b consolidates to empty (1 + -1 = 0 for same pk+payload) → no match
         assert_eq!(out.count, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "wide PK join is unsupported")]
+    fn test_join_dd_wide_pk_panics() {
+        // Wide PK: 3× U64 compound = stride 24 (> 16). The delta-delta join's
+        // `get_pk` precompute can't widen it; the `!pk_is_wide()` guard turns the
+        // would-be slice-underflow into a clear diagnostic.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        let mut a = Batch::with_schema(schema, 1);
+        let mut pk = [0u8; 24];
+        pk[0..8].copy_from_slice(&1u64.to_le_bytes());
+        a.extend_pk_bytes(&pk);
+        a.extend_weight(&1i64.to_le_bytes());
+        a.extend_null_bmp(&0u64.to_le_bytes());
+        a.extend_col(0, &7i64.to_le_bytes());
+        a.count += 1;
+        a.sorted = true;
+        a.consolidated = true;
+        let a = ConsolidatedBatch::new_unchecked(a);
+        let _ = op_join_delta_delta(&a, &a, &schema, &schema);
     }
 
     #[test]

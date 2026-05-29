@@ -523,7 +523,13 @@ pub(super) struct PkPromoter {
 }
 
 enum PromoteKind {
-    Pk,
+    /// Reindex on a PK column. `off`/`cs`/`tc` locate and type the column
+    /// within the OPK PK region so it can be decoded to its native value —
+    /// matching the Narrow/Wide arms, which build the synthetic key from the
+    /// native value. (A verbatim OPK byte copy would mis-encode signed columns
+    /// and panic when the reindex output stride differs from the source PK
+    /// stride, e.g. an 8-byte PK reindexed into a 16-byte join key.)
+    Pk { off: usize, cs: usize, tc: u8 },
     Wide { pi: usize },
     String { pi: usize },
     Narrow { pi: usize, cs: usize },
@@ -532,7 +538,10 @@ enum PromoteKind {
 impl PkPromoter {
     pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
         if schema.is_pk_col(col_idx) {
-            return PkPromoter { kind: PromoteKind::Pk };
+            let off = schema.pk_byte_offset(col_idx) as usize;
+            let cs = schema.columns[col_idx].size() as usize;
+            let tc = schema.columns[col_idx].type_code;
+            return PkPromoter { kind: PromoteKind::Pk { off, cs, tc } };
         }
         let tc = schema.columns[col_idx].type_code;
         let pi = schema.payload_idx(col_idx);
@@ -582,7 +591,9 @@ impl PkPromoter {
     #[inline]
     pub(super) fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
         match self.kind {
-            PromoteKind::Pk => batch.get_pk(row),
+            PromoteKind::Pk { off, cs, tc } => {
+                crate::schema::pk_native_key(batch.get_pk_bytes(row), off, cs, tc)
+            }
             PromoteKind::Wide { pi } => Self::read_wide(batch, pi, row),
             PromoteKind::String { pi } => Self::read_string(batch, pi, row),
             PromoteKind::Narrow { pi, cs, .. } => Self::read_narrow(batch, pi, cs, row),
@@ -593,11 +604,17 @@ impl PkPromoter {
     /// kind dispatch out of the row loop (the kind is a batch-invariant).
     pub(super) fn promote_into(&self, batch: &MemBatch, output: &mut Batch) {
         match self.kind {
-            PromoteKind::Pk => {
-                // Verbatim OPK byte copy — input PK is already OPK and this is
-                // width-safe (get_pk panics for wide PKs).
+            PromoteKind::Pk { off, cs, tc } => {
+                // Decode the source PK column (OPK at rest) to its native value,
+                // then write the synthetic reindex key big-endian at the output
+                // stride — exactly as the Narrow/Wide arms do. A verbatim OPK
+                // byte copy panics when the output stride differs from the source
+                // PK stride and would mis-encode signed columns relative to the
+                // other (Narrow) join side.
+                let stride = output.pk_stride() as usize;
                 for row in 0..output.count {
-                    output.set_pk_at_bytes(row, batch.get_pk_bytes(row));
+                    let v = crate::schema::pk_native_key(batch.get_pk_bytes(row), off, cs, tc);
+                    output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
                 }
             }
             PromoteKind::Wide { pi } => {

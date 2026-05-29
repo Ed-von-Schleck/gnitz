@@ -199,7 +199,7 @@ pub fn op_reduce(
     let sorted_indices: Vec<u32> = if group_by_pk && working.sorted {
         (0..n as u32).collect()
     } else if group_by_pk {
-        argsort_pk_canonical(&mb, input_schema)
+        argsort_pk_canonical(&mb)
     } else {
         argsort_delta(working, input_schema, group_by_cols)
     };

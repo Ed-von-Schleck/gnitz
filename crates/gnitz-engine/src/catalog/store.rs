@@ -388,11 +388,11 @@ impl CatalogEngine {
     }
 
     /// Batched point lookup. Open one cursor on `table_id` and seek each PK in
-    /// `pks`, appending the stored row (weight 1) for every present, live key
-    /// into a result batch projected to `project`. Each `seek` re-probes every
-    /// source independently, so order is not required for correctness; passing
-    /// `pks` ascending keeps the per-source binary-search probes monotonic for
-    /// better cache locality.
+    /// `pks` (verbatim OPK bytes), appending the stored row (weight 1) for every
+    /// present, live key into a result batch projected to `project`. Each `seek`
+    /// re-probes every source independently, so order is not required for
+    /// correctness; passing `pks` ascending keeps the per-source binary-search
+    /// probes monotonic for better cache locality.
     /// Absent / retracted keys are skipped — identical to `seek_family`'s
     /// single-key `None` — so a removed PK with no committed row contributes
     /// nothing. `project` lists the parent column indices to return (all
@@ -401,33 +401,8 @@ impl CatalogEngine {
     /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
     /// each of which re-opens a cursor). Projection keeps the result scalar-
     /// only — FK-referenced columns are never STRING/BLOB — so the blob arena
-    /// is never touched.
-    pub fn gather_family(
-        &mut self,
-        table_id: i64,
-        pks: &[u128],
-        project: &[u8],
-    ) -> Result<Batch, String> {
-        let schema = self.dag.tables.get(&table_id)
-            .map(|e| e.schema)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
-        let result_schema = project_schema(&schema, project);
-        let mut out = Batch::with_schema(result_schema, pks.len());
-        let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
-        for &pk in pks {
-            let (opk, stride) = crate::storage::opk_key(&schema, pk);
-            cursor.cursor.seek_bytes(&opk[..stride]);
-            if !cursor.cursor.valid { continue; }
-            if cursor.cursor.current_pk_bytes() != &opk[..stride] { continue; }
-            if cursor.cursor.current_weight <= 0 { continue; }
-            copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
-        }
-        Ok(out)
-    }
-
-    /// Byte-keyed sibling of [`gather_family`] for wide (`pk_stride > 16`) PKs.
-    /// Reuses one cursor and matches `seek_family_bytes`'s confirm sequence
-    /// (`seek_bytes` → `current_pk_bytes() == key` → `current_weight > 0`).
+    /// is never touched. Works for both narrow and wide PKs: the OPK bytes are
+    /// seeked verbatim, with no native→OPK re-encode.
     pub fn gather_family_bytes(
         &mut self,
         table_id: i64,
@@ -1139,14 +1114,11 @@ fn copy_cursor_cols_to_batch(
     src_schema: &SchemaDescriptor,
     project: &[u8],
 ) {
-    // Wide-PK tables (stride > 16) can't represent the PK as a u128 fast key;
-    // copy the full byte image. Wide gather calls (FK/UPSERT/gather-family) are
-    // routed through *_bytes paths so the cursor holds the full PK bytes.
-    if src_schema.pk_is_wide() {
-        out.extend_pk_bytes(cursor.cursor.current_pk_bytes());
-    } else {
-        out.extend_pk(cursor.cursor.current_key);
-    }
+    // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
+    // read cursor always tracks it regardless of stride. For narrow PKs it is
+    // byte-identical to the old `extend_pk(current_key)` round-trip
+    // (`current_key == widen_pk_be(current_pk_bytes)`), so one path serves both.
+    out.extend_pk_bytes(cursor.cursor.current_pk_bytes());
     out.extend_weight(&1i64.to_le_bytes());
 
     let src_null = cursor.cursor.current_null_word;

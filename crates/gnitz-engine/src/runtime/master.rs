@@ -28,7 +28,7 @@ use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
-use crate::storage::{Batch, ConsolidatedBatch, partition_for_key, partition_for_pk_bytes, PkBuf};
+use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
     worker_for_partition, with_worker_indices,
@@ -86,8 +86,14 @@ enum P2Label {
     Upsert {
         col_idx: u32,
         source_col: usize,
+        /// Type and byte width of the leading index column, used to reproduce
+        /// the OPK probe bytes (`index_opk_prefix`) the workers echoed into the
+        /// `occupied` result set — the native lookup key must be encoded the
+        /// same way before the membership test.
+        idx_key_type: u8,
+        idx_key_size: usize,
         /// Byte width of the index table's PK (the indexed column). Used to
-        /// look up the u128 index key in the `HashSet<PkBuf>` result set.
+        /// look up the index key in the `HashSet<PkBuf>` result set.
         idx_pk_stride: u8,
         /// (index-column key, row PK). The index column is always ≤ 16
         /// bytes (→ `u128`); the row PK is byte-form to support wide PKs.
@@ -176,10 +182,6 @@ struct UniqueIndexDesc {
     /// Byte offset of this column within the packed PK region. Only
     /// meaningful when `is_pk_col`.
     pk_field_off: usize,
-    /// True iff the table's PK spans more than one column. When true, a
-    /// PK-column index value must be sliced out of the packed key rather
-    /// than read as the whole PK.
-    pk_is_compound: bool,
 }
 
 /// Walk every positive-weight, non-null row of `batch` and insert the
@@ -201,14 +203,14 @@ fn extract_into_filter(
             if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
         }
         let key = if d.is_pk_col {
-            if d.pk_is_compound {
-                // Slice the single indexed column out of the packed PK;
-                // get_pk would hand back the whole compound key.
-                pk_native_key(
-                    batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
-            } else {
-                batch.get_pk(i) // single-column PK IS the index key
-            }
+            // Slice the single indexed column out of the packed PK and decode
+            // OPK→native. `get_pk` would return the OPK-widened value — correct
+            // only for an unsigned single-column PK; for a signed PK it is the
+            // sign-flipped OPK value, which `index_opk_prefix` then flips again,
+            // seeking the wrong index key. `pk_native_key` is correct for every
+            // width and signedness, and equals `get_pk` for unsigned single PKs.
+            pk_native_key(
+                batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
         } else {
             let col_data = batch.col_data(d.src_payload_idx, d.col_size);
             payload_native_key(col_data, i * d.col_size, d.col_size, d.type_code)
@@ -736,9 +738,12 @@ impl MasterDispatcher {
                 .map_err(|e| format!("seek: table {target_id}: {e}"))?;
             worker_for_partition(partition_for_pk_bytes(&full_pk_buf[..stride]), num_workers)
         } else {
-            // Narrow path: same partition as partition_for_pk_bytes on the same
-            // bytes (proven by partition_for_pk_bytes_narrow_invariance).
-            worker_for_partition(partition_for_key(pk), num_workers)
+            // Narrow path: `pk` is the native seek key, but ingestion routes on
+            // the OPK bytes (partition_for_key(get_pk) == partition_for_pk_bytes(opk)).
+            // Encode native → OPK and route on those bytes; hashing the native
+            // value misroutes signed/compound narrow PKs to the wrong worker.
+            let (opk, _) = crate::storage::opk_key(&schema, pk);
+            worker_for_partition(partition_for_pk_bytes(&opk[..stride]), num_workers)
         };
         single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
                             worker, pk, 0, "seek", seek_pk_extra).await
@@ -750,10 +755,17 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, col_idx: u32, key: u128,
     ) -> Result<W2mSlot, String> {
+        // The routing cache is keyed by `extract_col_key` (OPK-widened for
+        // integer columns, XXH3 for STRING/BLOB), but `key` is the native seek
+        // value. Transform it into the stored representation before probing;
+        // a raw native query always misses for signed integers (and could
+        // spuriously hit a different value's OPK-widened key).
         let cached = unsafe {
-            (*disp_ptr).router.worker_for_index_key(
-                target_id as u32, col_idx, key,
-            )
+            let schema = (*(*disp_ptr).catalog).get_schema_desc(target_id);
+            match schema.and_then(|s| index_route_key(&s, col_idx, key)) {
+                Some(rk) => (*disp_ptr).router.worker_for_index_key(target_id as u32, col_idx, rk),
+                None => -1,
+            }
         };
         if cached >= 0 {
             let worker = cached as usize;
@@ -1188,13 +1200,12 @@ impl MasterDispatcher {
                     schema.payload_idx(source_col)
                 };
                 let col_size = schema.columns[source_col].size() as usize;
-                let pk_is_compound = schema.pk_indices().len() > 1;
                 let pk_field_off = if is_pk_col {
                     schema.pk_byte_offset(source_col) as usize
                 } else { 0 };
                 out.push(UniqueIndexDesc {
                     col_idx, type_code, is_pk_col, src_payload_idx, col_size,
-                    pk_field_off, pk_is_compound,
+                    pk_field_off,
                 });
             }
         }
@@ -1560,7 +1571,13 @@ impl MasterDispatcher {
         let upsert_pk_batch: Option<Batch> = match (&pk_lo_hi, &pk_lo_hi_wide) {
             (Some(keys), _) if !keys.is_empty() => {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                Some(build_check_batch(&source_schema, keys, pooled))
+                // `keys` are get_pk (OPK-widened) main-table PK values — write
+                // their OPK bytes verbatim. `build_check_batch` is the *index*
+                // builder: it would re-OPK-encode column 0 (double sign-flip for
+                // signed) and zero the compound suffix, mangling the main-table PK
+                // probe. This branch is narrow-only (`pk_lo_hi` is Some only when
+                // `!source_schema.pk_is_wide()`), so `extend_pk` is valid.
+                Some(build_check_batch_with(&source_schema, keys, pooled, |b, &k| b.extend_pk(k)))
             }
             (_, Some(keys)) if !keys.is_empty() => {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
@@ -1764,7 +1781,6 @@ impl MasterDispatcher {
                 source_schema.payload_idx(source_col)
             };
             let col_size = source_schema.columns[source_col].size() as usize;
-            let pk_is_compound = source_schema.pk_indices().len() > 1;
             let pk_field_off = if is_pk_col {
                 source_schema.pk_byte_offset(source_col) as usize
             } else { 0 };
@@ -1783,13 +1799,14 @@ impl MasterDispatcher {
                     if null_word & (1u64 << src_payload_idx) != 0 { continue; }
                 }
 
+                // Decode the indexed PK column OPK→native. `get_pk` yields the
+                // OPK-widened value (sign-flipped for signed), which the
+                // downstream `index_opk_prefix` would re-OPK-encode — seeking the
+                // wrong key for a signed single PK. `pk_native_key` is correct for
+                // every width/signedness and equals `get_pk` for unsigned singles.
                 let key = if is_pk_col {
-                    if pk_is_compound {
-                        pk_native_key(
-                            batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
-                    } else {
-                        batch.get_pk(i)
-                    }
+                    pk_native_key(
+                        batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
                 } else {
                     let col_data = batch.col_data(src_payload_idx);
                     payload_native_key(col_data, i * col_size, col_size, type_code)
@@ -1837,7 +1854,11 @@ impl MasterDispatcher {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
                 let u_batch = build_check_batch(&idx_schema, &u_keys, pooled);
                 let idx_pk_stride = idx_schema.pk_stride();
-                p2_labels.push(P2Label::Upsert { col_idx, source_col, idx_pk_stride, upsert_keys });
+                let idx_key_type = idx_schema.columns[0].type_code;
+                let idx_key_size = idx_schema.columns[0].size() as usize;
+                p2_labels.push(P2Label::Upsert {
+                    col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride, upsert_keys,
+                });
                 p2_checks.push(PipelinedCheck {
                     target_id,
                     flags: FLAG_HAS_PK,
@@ -1892,7 +1913,7 @@ impl MasterDispatcher {
                         ));
                     }
                 }
-                P2Label::Upsert { col_idx, source_col, idx_pk_stride, upsert_keys } => {
+                P2Label::Upsert { col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride, upsert_keys } => {
                     // Fan out all seeks before collecting: sal_excl is released
                     // before each reply wait, so the seek futures run
                     // concurrently rather than serializing one RTT per key.
@@ -1900,18 +1921,14 @@ impl MasterDispatcher {
                     let mut pk_is: Vec<PkBuf> = Vec::new();
                     let mut futs = Vec::new();
                     for &(key_pk, pk_i) in upsert_keys {
-                        // occupied holds index-table PKs (the indexed column) as
-                        // PkBuf; look up the u128 key via Borrow<[u8]>.
-                        let kb = key_pk.to_le_bytes();
-                        if *idx_pk_stride as usize <= 16 {
-                            if !occupied.contains(&kb[..*idx_pk_stride as usize]) { continue; }
-                        } else {
-                            // Wide index PK: kb is only 16 bytes; zero-pad the
-                            // source-PK suffix to the full stride for the lookup.
-                            let mut check_buf = [0u8; crate::schema::MAX_PK_BYTES];
-                            check_buf[..16].copy_from_slice(&kb);
-                            if !occupied.contains(&check_buf[..*idx_pk_stride as usize]) { continue; }
-                        }
+                        // occupied holds index-table PKs as the probe wrote them:
+                        // index_opk_prefix(native key) ++ zero suffix — i.e. OPK
+                        // bytes, not native LE. Reproduce that encoding exactly
+                        // before the membership test (the returned buf is zero-
+                        // filled past idx_key_size, so one slice covers narrow and
+                        // wide index PKs).
+                        let buf = crate::schema::index_opk_prefix(key_pk, *idx_key_type, *idx_key_size);
+                        if !occupied.contains(&buf[..*idx_pk_stride as usize]) { continue; }
                         pk_is.push(pk_i);
                         // async fn futures are !Unpin; box-pin for join_all_unpin.
                         futs.push(Box::pin(Self::fan_out_seek_by_index_async(
@@ -2312,23 +2329,24 @@ fn format_uuid_hyphenated(v: u128) -> String {
         v & 0x0000_ffff_ffff_ffff)
 }
 
-/// Render a PK from its raw little-endian byte form for error messages.
+/// Render a PK from its raw OPK byte form for error messages.
 /// Compound PKs are formatted as comma-separated per-column values in
-/// declaration order; `pk_bytes` holds all PK columns concatenated
-/// little-endian, so we slice it column by column. Works for wide PKs
-/// (`pk_stride > 16`) where a `u128` cannot encode the key.
+/// declaration order; `pk_bytes` holds all PK columns concatenated as OPK
+/// (big-endian, sign-flipped for signed), so we slice and decode each column
+/// back to native before rendering. Works for wide PKs (`pk_stride > 16`)
+/// where a `u128` cannot encode the key.
 fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut off = 0usize;
     for &ci in schema.pk_indices() {
         let col = schema.columns[ci as usize];
         let size = col.size() as usize;
-        // Reassemble the per-column value into a u128 (LE) and dispatch
-        // on its `type_code`. A single PK column is at most 16 bytes wide;
-        // pad with zeros to 16 to reuse the existing scalar format.
-        let mut padded = [0u8; 16];
-        padded[..size].copy_from_slice(&pk_bytes[off..off + size]);
-        let v = u128::from_le_bytes(padded);
+        // pk_bytes are OPK; decode each column back to native LE before reading
+        // its scalar value. Reading OPK as native LE would render garbage for
+        // signed columns (flipped sign bit) and any multi-byte unsigned column.
+        let mut le = [0u8; 16];
+        gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
+        let v = u128::from_le_bytes(le);
         let s = match col.type_code {
             crate::schema::type_code::U128 => format!("{}", v),
             crate::schema::type_code::UUID => format_uuid_hyphenated(v),
@@ -2344,11 +2362,13 @@ fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
     parts.join(", ")
 }
 
-/// Narrow-PK convenience over `format_pk_value_bytes`. Safe because
-/// `pk_stride ≤ 16` keeps the per-column `off + size` within the 16-byte
-/// little-endian image.
+/// Narrow-PK convenience over `format_pk_value_bytes`. `pk` is a `get_pk`
+/// (OPK-widened) value, whose OPK bytes at rest are the trailing `pk_stride`
+/// bytes of its big-endian image.
 fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
-    format_pk_value_bytes(&pk.to_le_bytes(), schema)
+    let stride = schema.pk_stride() as usize;
+    let be = pk.to_be_bytes();
+    format_pk_value_bytes(&be[16 - stride..], schema)
 }
 
 /// Shared scaffold for the check-batch builders: pool-reuse with a schema
@@ -2412,12 +2432,36 @@ fn build_check_batch(
     })
 }
 
-/// Convert a narrow-PK `u128` to its byte-form `PkBuf` (low `pk_stride`
-/// bytes). Used at gather call sites to feed the unified `Vec<PkBuf>` input
-/// once per call (not per incoming batch row).
+/// Convert a narrow-PK `get_pk` (OPK-widened) value to its byte-form `PkBuf`.
+/// `pk`'s OPK bytes at rest are the trailing `pk_stride` bytes of its big-endian
+/// image (exactly what `extend_pk` writes); `to_le_bytes` would reverse them and
+/// probe a key matching no stored row. Used at gather call sites to feed the
+/// unified `Vec<PkBuf>` input once per call (not per incoming batch row).
 #[inline]
 fn u128_to_pkbuf(pk: u128, pk_stride: u8) -> PkBuf {
-    PkBuf::from_bytes(&pk.to_le_bytes()[..pk_stride as usize])
+    PkBuf::from_bytes(&pk.to_be_bytes()[16 - pk_stride as usize..])
+}
+
+/// Encode a native index-seek key into the routing-cache representation
+/// `extract_col_key` stores: OPK-widened for integer / U128 / UUID columns.
+/// Returns `None` for STRING/BLOB, whose cache keys are XXH3 of the bytes and
+/// cannot be rebuilt from a `u128` — those seeks fall through to the broadcast
+/// path (which is already correct). `extract_col_key`'s PK-column and integer-
+/// payload arms both reduce to `widen_pk_be(encode_pk_column(native))`, so one
+/// encoder covers both regardless of whether the column is itself a PK column.
+fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u128) -> Option<u128> {
+    use crate::schema::type_code;
+    let col = schema.columns[col_idx as usize];
+    match col.type_code {
+        type_code::STRING | type_code::BLOB => None,
+        type_code::U128 | type_code::UUID => Some(native),
+        _ => {
+            let sz = col.size() as usize;
+            let mut opk = [0u8; 16];
+            gnitz_wire::encode_pk_column(&native.to_le_bytes()[..sz], col.type_code, &mut opk[..sz]);
+            Some(gnitz_wire::widen_pk_be(&opk[..sz], sz))
+        }
+    }
 }
 
 /// Byte-form sibling of `build_check_batch`, taking `&[PkBuf]` keys. Kept
@@ -2569,13 +2613,65 @@ mod unique_filter_tests {
             src_payload_idx: usize::MAX,
             col_size: 8,
             pk_field_off: 0,
-            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&10u128));
         assert!(filter.values.contains(&20u128));
         assert!(!filter.values.contains(&30u128), "negative weight skipped");
+    }
+
+    #[test]
+    fn extract_into_filter_signed_pk_col_uses_native_key() {
+        // Single signed I64 PK. The OPK bytes at rest are sign-bit-flipped, so
+        // `get_pk` (OPK-widened) differs from the native value. The extraction
+        // must yield the *native* key (`pk_native_key`) — feeding the OPK value
+        // would make `index_opk_prefix` flip the sign bit again and seek a wrong
+        // key, hiding genuine duplicates.
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&(-5i64).to_le_bytes(), type_code::I64, &mut opk);
+        let keys = [PkBuf::from_bytes(&opk)];
+        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+
+        let native = (-5i64) as u64 as u128;
+        let opk_widened = gnitz_wire::widen_pk_be(&opk, 8);
+        assert_ne!(native, opk_widened, "signed OPK value must differ from native");
+
+        let desc = UniqueIndexDesc {
+            col_idx: 0,
+            type_code: type_code::I64,
+            is_pk_col: true,
+            src_payload_idx: usize::MAX,
+            col_size: 8,
+            pk_field_off: 0,
+        };
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
+        assert!(filter.values.contains(&native), "filter holds native signed key");
+        assert!(!filter.values.contains(&opk_widened), "must not hold OPK-widened key");
+    }
+
+    #[test]
+    fn index_route_key_hits_signed_routing_cache() {
+        // The routing cache stores `extract_col_key` (OPK-widened) keys, but
+        // seeks arrive with the native value. For a signed column the two differ,
+        // so a raw native query misses; `index_route_key` must transform it to hit.
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&(-7i64).to_le_bytes(), type_code::I64, &mut opk);
+        let keys = [PkBuf::from_bytes(&opk)];
+        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+
+        let mut router = PartitionRouter::new();
+        router.record_routing(&batch, &schema, 1, 0, 2);
+
+        let native = (-7i64) as u64 as u128;
+        // Raw native query misses: native != OPK-widened for a signed column.
+        assert_eq!(router.worker_for_index_key(1, 0, native), -1);
+        // Transformed query hits.
+        let rk = index_route_key(&schema, 0, native).expect("integer column has a route key");
+        assert_eq!(router.worker_for_index_key(1, 0, rk), 2);
     }
 
     #[test]
@@ -2594,7 +2690,6 @@ mod unique_filter_tests {
             src_payload_idx: 0, // first payload column
             col_size: 8,
             pk_field_off: 0,
-            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
@@ -2618,7 +2713,6 @@ mod unique_filter_tests {
             src_payload_idx: usize::MAX,
             col_size: 8,
             pk_field_off: 0,
-            pk_is_compound: false,
         };
         let mut filter = UniqueFilter::new();
         filter.capped = true;
@@ -2661,22 +2755,28 @@ mod unique_filter_tests {
 
     #[test]
     fn format_pk_value_narrow_compound_agrees_with_bytes() {
-        // (I32, U32) compound PK packed in a u128: A=-5, B=42.
+        // (I32, U32) compound PK: A=-5, B=42. The renderer consumes OPK bytes,
+        // so build the fixture as OPK (per-column encode, then widen for the
+        // u128 arg). Reading raw native LE would mangle the signed column.
         let schema = SchemaDescriptor::new(&[
             SchemaColumn::new(type_code::I32, 0),
             SchemaColumn::new(type_code::U32, 0),
         ], &[0, 1]);
         assert!(!schema.pk_is_wide());
-        let packed = ((-5i32) as u32 as u128) | (42u128 << 32);
-        assert_eq!(format_pk_value(packed, &schema), "-5, 42");
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&(-5i32).to_le_bytes(), type_code::I32, &mut opk[0..4]);
+        gnitz_wire::encode_pk_column(&42u32.to_le_bytes(), type_code::U32, &mut opk[4..8]);
+        let widened = gnitz_wire::widen_pk_be(&opk, 8);
+        assert_eq!(format_pk_value(widened, &schema), "-5, 42");
         // The bytes renderer agrees with the (delegating) u128 renderer.
-        assert_eq!(format_pk_value_bytes(&packed.to_le_bytes(), &schema), "-5, 42");
+        assert_eq!(format_pk_value_bytes(&opk, &schema), "-5, 42");
     }
 
     #[test]
     fn format_pk_value_bytes_wide_compound_u64x3() {
         // Three U64 columns = 24-byte PK: too wide for a u128, exercising the
         // byte-form renderer where the old format_pk_value would truncate.
+        // OPK for unsigned U64 is big-endian.
         let schema = SchemaDescriptor::new(&[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
@@ -2684,7 +2784,7 @@ mod unique_filter_tests {
         ], &[0, 1, 2]);
         assert!(schema.pk_is_wide());
         let pk = compound_pk_bytes(&[
-            &7u64.to_le_bytes(), &8u64.to_le_bytes(), &9u64.to_le_bytes(),
+            &7u64.to_be_bytes(), &8u64.to_be_bytes(), &9u64.to_be_bytes(),
         ]);
         assert_eq!(format_pk_value_bytes(pk.pk_bytes(), &schema), "7, 8, 9");
     }
@@ -2713,7 +2813,6 @@ mod unique_filter_tests {
             src_payload_idx: usize::MAX,
             col_size: 4,
             pk_field_off: 0,
-            pk_is_compound: true,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
@@ -2742,7 +2841,6 @@ mod unique_filter_tests {
             src_payload_idx: usize::MAX,
             col_size: 4,
             pk_field_off: 4,
-            pk_is_compound: true,
         };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);

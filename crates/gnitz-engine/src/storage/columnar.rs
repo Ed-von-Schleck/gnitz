@@ -176,6 +176,7 @@ pub(crate) fn opk_key(
     key: u128,
 ) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
     let stride = schema.pk_stride() as usize;
+    debug_assert!(stride <= 16, "opk_key: wide PK (stride {stride}); use the byte path");
     let mut opk = [0u8; crate::schema::MAX_PK_BYTES];
     encode_order_preserving_pk(schema, &key.to_le_bytes()[..stride], &mut opk[..stride]);
     (opk, stride)

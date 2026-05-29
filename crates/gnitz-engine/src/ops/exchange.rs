@@ -289,7 +289,11 @@ pub fn op_repartition_batch(
     gnitz_debug!("op_repartition_batch: count={} num_workers={}", batch.count, num_workers);
     let worker_indices = compute_worker_indices(batch, col_indices, schema, num_workers);
     let mb = batch.as_mem_batch();
-    worker_indices.into_iter()
+    // Single source by definition; mirror the production single-source rule.
+    // `compute_worker_indices` does not return the routing decision, so recompute
+    // `is_pk_routing` here (a cheap slice compare).
+    let is_pk_routing = col_indices == schema.pk_indices();
+    let mut out: Vec<Batch> = worker_indices.into_iter()
         .map(|indices| {
             if !indices.is_empty() {
                 Batch::from_indexed_rows(&mb, &indices, schema)
@@ -297,7 +301,16 @@ pub fn op_repartition_batch(
                 Batch::empty_with_schema(schema)
             }
         })
-        .collect()
+        .collect();
+    if is_pk_routing {
+        for b in out.iter_mut() {
+            if b.count > 0 {
+                b.sorted = batch.sorted;
+                b.consolidated = batch.consolidated;
+            }
+        }
+    }
+    out
 }
 
 pub fn op_repartition_batches(
@@ -349,7 +362,7 @@ pub fn op_repartition_batches(
         }
 
         let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
-        (0..num_workers)
+        let mut out: Vec<Batch> = (0..num_workers)
             .map(|w| {
                 if worker_rows[w].is_empty() {
                     return Batch::empty_with_schema(schema);
@@ -359,7 +372,25 @@ pub fn op_repartition_batches(
                     scatter_multi_source(&mem_batches, &worker_rows[w], writer);
                 })
             })
-            .collect()
+            .collect();
+
+        // PK-routed, single-source repartition preserves source order and
+        // distinctness per worker (a PK group never splits across workers, so a
+        // worker's sub-batch is an in-order subset of one sorted source).
+        // Multi-source scatter is per-source-concatenated — not globally sorted
+        // — so it propagates nothing, and non-PK routing destroys PK order.
+        if is_pk_routing {
+            let mut contributing = sources.iter().filter_map(|s| *s).filter(|b| b.count > 0);
+            if let (Some(src), None) = (contributing.next(), contributing.next()) {
+                for b in out.iter_mut() {
+                    if b.count > 0 {
+                        b.sorted = src.sorted;
+                        b.consolidated = src.consolidated;
+                    }
+                }
+            }
+        }
+        out
     })
 }
 
@@ -600,6 +631,13 @@ pub fn op_relay_scatter_consolidated(
     }
     let total_blob: usize = mem_batch_blob_cap(&mem_batches);
 
+    // The merge-walk yields globally sorted output across all sources. With
+    // exactly one contributing source no cross-source duplicate PK is possible,
+    // so the per-worker output is also consolidated; with ≥2 sources the same PK
+    // can appear in two sources (e.g. an insert in one, a retraction in another),
+    // so consolidated stays false.
+    let single_source = mem_batches.iter().filter(|o| o.is_some()).count() == 1;
+
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
         relay_scatter_merge_walk(&mem_batches, col_indices, schema, num_workers, &mut worker_rows);
@@ -615,6 +653,9 @@ pub fn op_relay_scatter_consolidated(
                     scatter_multi_source(&mem_batches, &worker_rows[w], writer);
                 });
                 b.sorted = true;
+                if single_source {
+                    b.consolidated = true;
+                }
                 b
             })
             .collect()
@@ -1241,17 +1282,61 @@ mod tests {
     }
 
     #[test]
-    fn test_repartition_batch_no_consolidation() {
-        let schema = make_schema_u64_i64();
+    fn test_repartition_batch_pk_routing_propagates_flags() {
+        let schema = make_schema_u64_i64(); // PK = col 0 (U64), payload = col 1 (I64)
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         assert!(b.sorted && b.consolidated);
 
-        let sub_batches = op_repartition_batch(&b, &[0u32], &schema, 4);
-        for sb in &sub_batches {
-            if sb.count > 0 {
-                assert!(!sb.consolidated, "repartition must not propagate consolidated");
-                assert!(!sb.sorted, "repartition must not propagate sorted");
-            }
+        // PK routing (col 0 == pk_indices()): single source ⇒ flags propagate.
+        let pk_routed = op_repartition_batch(&b, &[0u32], &schema, 4);
+        for sb in pk_routed.iter().filter(|s| s.count > 0) {
+            assert!(sb.sorted, "PK-routed sub-batch must inherit sorted");
+            assert!(sb.consolidated, "PK-routed sub-batch must inherit consolidated");
+        }
+
+        // Non-PK routing (col 1): hash distribution destroys PK order ⇒ no flags.
+        let hash_routed = op_repartition_batch(&b, &[1u32], &schema, 4);
+        for sb in hash_routed.iter().filter(|s| s.count > 0) {
+            assert!(!sb.sorted, "non-PK-routed sub-batch must not claim sorted");
+            assert!(!sb.consolidated, "non-PK-routed sub-batch must not claim consolidated");
+        }
+    }
+
+    #[test]
+    fn test_repartition_batches_pk_routing_single_vs_multi_source() {
+        let schema = make_schema_u64_i64();
+        // Single contributing source, PK routing: propagate both flags.
+        let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        let single: Vec<Option<&Batch>> = vec![Some(&b0)];
+        let out = op_repartition_batches(&single, &[0u32], &schema, 4);
+        for sb in out.iter().filter(|s| s.count > 0) {
+            assert!(sb.sorted, "single-source PK-routed must inherit sorted");
+            assert!(sb.consolidated, "single-source PK-routed must inherit consolidated");
+        }
+
+        // Two contributing sources, PK routing: per-source-concatenated output is
+        // not globally sorted, so nothing propagates.
+        let b1 = make_batch(&schema, &[(4, 1, 40), (5, 1, 50), (6, 1, 60)]);
+        let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
+        let out = op_repartition_batches(&multi, &[0u32], &schema, 4);
+        for sb in out.iter().filter(|s| s.count > 0) {
+            assert!(!sb.sorted, "multi-source scatter must not claim sorted");
+            assert!(!sb.consolidated, "multi-source scatter must not claim consolidated");
+        }
+    }
+
+    #[test]
+    fn test_repartition_batch_sorted_not_consolidated_pk_routing() {
+        let schema = make_schema_u64_i64();
+        let mut b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).into_inner();
+        // Sorted but not consolidated source: only `sorted` may propagate.
+        b.consolidated = false;
+        assert!(b.sorted && !b.consolidated);
+
+        let out = op_repartition_batch(&b, &[0u32], &schema, 4);
+        for sb in out.iter().filter(|s| s.count > 0) {
+            assert!(sb.sorted, "PK-routed sub-batch inherits sorted");
+            assert!(!sb.consolidated, "must not invent consolidated");
         }
     }
 
@@ -1271,6 +1356,16 @@ mod tests {
                 assert!(!sb.consolidated, "merged path uses PK-only comparison, must not claim consolidated");
                 assert!(sb.sorted, "merged path output must be sorted");
             }
+        }
+
+        // Single contributing source: no cross-source duplicate PK possible, so
+        // the output is consolidated as well as sorted.
+        let single: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
+        let result = op_relay_scatter_consolidated(&single, &[0u32], &schema, num_workers);
+        assert_eq!(total_rows(&result), 3);
+        for sb in result.iter().filter(|s| s.count > 0) {
+            assert!(sb.sorted, "single-source merge output must be sorted");
+            assert!(sb.consolidated, "single-source merge output must be consolidated");
         }
     }
 

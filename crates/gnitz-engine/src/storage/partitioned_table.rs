@@ -3,6 +3,7 @@
 //! User tables have 256 partitions; system tables have 1.  The partition
 //! index is `xxh3(pk_lo, pk_hi) & 0xFF`.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::schema::{NARROW_PK_MAX_BYTES, SchemaDescriptor};
@@ -11,6 +12,13 @@ use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, FlushOutcome, FlushWork, Table};
+
+thread_local! {
+    /// Reused per-partition scatter index buffers for `ingest_owned_batch`.
+    /// Clears (retaining capacity) rather than reallocating 256 vecs per
+    /// ingest — same hold-across-work, no-cap shape as exchange.rs's pools.
+    static PARTITION_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
+}
 
 // ---------------------------------------------------------------------------
 // PartitionedTable
@@ -85,41 +93,46 @@ impl PartitionedTable {
 
         let mb = batch.as_mem_batch();
         let np = self.num_partitions as usize;
-        let mut part_indices: Vec<Vec<u32>> = Vec::with_capacity(np);
-        for _ in 0..np {
-            part_indices.push(Vec::new());
-        }
-        if mb.pk_stride as usize > NARROW_PK_MAX_BYTES {
-            for i in 0..mb.count {
-                let p = partition_for_pk_bytes(mb.get_pk_bytes(i));
-                part_indices[p].push(i as u32);
-            }
-        } else {
-            for i in 0..mb.count {
-                let p = partition_for_key(mb.get_pk(i));
-                part_indices[p].push(i as u32);
-            }
-        }
 
-        let offset = self.part_offset as usize;
-        let num_live = self.tables.len();
+        // Thread-local per-partition index pool, mirroring exchange.rs's
+        // SCATTER_INDICES / WORKER_ROWS: clears (retaining capacity) per call
+        // rather than allocating 256 vecs every ingest. The borrow is held
+        // across the inner single-`Table` ingests, which never re-enter this
+        // function (no nested PARTITION_INDICES borrow).
+        PARTITION_INDICES.with(|pool| {
+            let mut part_indices = pool.borrow_mut();
+            if part_indices.len() < np {
+                part_indices.resize_with(np, Vec::new);
+            }
+            part_indices[..np].iter_mut().for_each(Vec::clear);
 
-        for p in 0..np {
-            if part_indices[p].is_empty() {
-                continue;
+            if mb.pk_stride as usize > NARROW_PK_MAX_BYTES {
+                for i in 0..mb.count {
+                    part_indices[partition_for_pk_bytes(mb.get_pk_bytes(i))].push(i as u32);
+                }
+            } else {
+                for i in 0..mb.count {
+                    part_indices[partition_for_key(mb.get_pk(i))].push(i as u32);
+                }
             }
-            let local = p.wrapping_sub(offset);
-            if local >= num_live {
-                continue;
+
+            let offset = self.part_offset as usize;
+            let num_live = self.tables.len();
+            for p in 0..np {
+                if part_indices[p].is_empty() {
+                    continue;
+                }
+                let local = p.wrapping_sub(offset);
+                if local >= num_live {
+                    continue;
+                }
+                let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &self.schema);
+                self.tables[local].ingest_owned_batch(sub_batch)?;
             }
-            let sub_batch = Batch::from_indexed_rows(
-                &mb, &part_indices[p], &self.schema,
-            );
-            self.tables[local].ingest_owned_batch(sub_batch)?;
-        }
+            Ok(())
+        })
 
         // `batch` drops here; its buffers return to batch_pool.
-        Ok(())
     }
 
     // ------------------------------------------------------------------

@@ -98,6 +98,16 @@ fn fill_payload_strides(
 ) -> usize {
     let mut idx = start;
     for (_, _, col) in schema.payload_columns() {
+        // A join carries both sides' payload columns through the intermediate
+        // batch, so two wide tables can drive `idx` past the region limit. Turn
+        // the would-be bare index-OOB into a named diagnostic (the correct
+        // long-term fix is a plan-time query error, tracked separately).
+        assert!(
+            idx < MAX_BATCH_REGIONS,
+            "fill_payload_strides: combined payload column count exceeds the batch \
+             region limit ({MAX_BATCH_REGIONS} = {REG_PAYLOAD_START} + {} payload cols)",
+            MAX_BATCH_REGIONS - REG_PAYLOAD_START,
+        );
         strides[idx] = col.size();
         idx += 1;
     }
@@ -1262,7 +1272,12 @@ impl Batch {
     /// Copy blob content from `src` and record that this batch shares `src`'s
     /// blob identity.  Must be called before `append_batch_no_blob_reloc`.
     pub fn share_blob_from(&mut self, src: &Batch) {
-        self.blob = src.blob.clone();
+        // Reuse the pooled destination buffer rather than dropping it for a
+        // fresh exact-sized clone (an allocation per call). The blob bytes are
+        // identical, so the shared blob_id and every German-string offset stay
+        // valid — a behavioral no-op apart from the saved allocation.
+        self.blob.clear();
+        self.blob.extend_from_slice(&src.blob);
         self.blob_id = src.blob_id;
     }
 
@@ -2366,5 +2381,19 @@ mod tests {
         let out_len = u32::from_le_bytes(out[0..4].try_into().unwrap());
         assert_eq!(out_len, 0, "OOB long string must relocate to empty");
         assert!(dst_blob.is_empty(), "no bytes should be copied on overrun");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the batch region limit")]
+    fn empty_joined_wide_combined_payload_panics() {
+        // Each side: 1 U64 PK + 64 U64 payload columns (MAX_COLUMNS = 65). A join
+        // carries both sides' payloads (128) through the intermediate batch,
+        // overflowing the 65 payload-region slots — a named assert, not a bare OOB.
+        let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..64 {
+            cols.push(SchemaColumn::new(type_code::U64, 0));
+        }
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        let _ = Batch::empty_joined(&schema, &schema);
     }
 }

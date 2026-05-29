@@ -290,7 +290,6 @@ impl CatalogEngine {
             // column — payload_idx/col_data would panic, and a compound PK must
             // be sliced to the indexed column.
             let is_pk_col = schema.is_pk_col(source_col_idx);
-            let pk_is_compound = schema.pk_indices().len() > 1;
             let pk_field_off = if is_pk_col {
                 schema.pk_byte_offset(source_col_idx) as usize
             } else { 0 };
@@ -332,13 +331,14 @@ impl CatalogEngine {
                     entry.handle.has_pk(batch.get_pk(row))
                 };
 
+                // Decode the indexed PK column OPK→native. `get_pk` is the
+                // OPK-widened value, which `index_opk_prefix` below would
+                // re-OPK-encode — wrong for a signed single PK (double sign flip).
+                // `pk_native_key` is correct for all widths and equals `get_pk`
+                // for unsigned single PKs.
                 let key_u128 = if is_pk_col {
-                    if pk_is_compound {
-                        pk_native_key(
-                            batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
-                    } else {
-                        batch.get_pk(row)
-                    }
+                    pk_native_key(
+                        batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
                 } else {
                     let col_data = batch.col_data(payload_col);
                     payload_native_key(col_data, row * col_size, col_size, col_type)

@@ -817,26 +817,18 @@ impl WorkerProcess {
                 // (scatter preserves per-worker order), aiding the cursor.
                 let project: Vec<u8> =
                     crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
-                // Wide (`pk_stride > 16`) PK batches can't be projected to a
-                // `u128` key list — `get_pk` panics — so route them through the
-                // byte sibling `gather_family_bytes` with a `&[PkBuf]` key list.
-                let wide = batch.as_ref()
-                    .and_then(|b| b.schema)
-                    .map(|s| s.pk_is_wide())
-                    .unwrap_or(false);
-                let gathered = if wide {
-                    let pks: Vec<PkBuf> = match &batch {
-                        Some(b) => (0..b.count).map(|i| PkBuf::from_bytes(b.get_pk_bytes(i))).collect(),
-                        None => Vec::new(),
-                    };
-                    self.cat().gather_family_bytes(target_id, &pks, &project)
-                } else {
-                    let pks: Vec<u128> = match &batch {
-                        Some(b) => (0..b.count).map(|i| b.get_pk(i)).collect(),
-                        None => Vec::new(),
-                    };
-                    self.cat().gather_family(target_id, &pks, &project)
+                // The batch PK region holds verbatim OPK bytes (the master packs
+                // them via `extend_pk_bytes`), so seek them directly with
+                // `gather_family_bytes` for every PK width. Round-tripping a
+                // narrow key back through `get_pk` → `opk_key` would re-OPK-encode
+                // it (double sign-flip for signed; scrambled compound bytes),
+                // probing a key that matches no stored row. `get_pk_bytes` works
+                // for both narrow and wide PKs.
+                let pks: Vec<PkBuf> = match &batch {
+                    Some(b) => (0..b.count).map(|i| PkBuf::from_bytes(b.get_pk_bytes(i))).collect(),
+                    None => Vec::new(),
                 };
+                let gathered = self.cat().gather_family_bytes(target_id, &pks, &project);
                 match gathered {
                     Ok(result) => {
                         let schema = result.schema;
