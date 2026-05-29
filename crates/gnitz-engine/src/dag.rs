@@ -86,11 +86,27 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched `has_pk` that works for every variant.
+    /// Dispatched `has_pk` that works for every variant. Takes a **native**
+    /// `u128`; routes via `opk_key` internally. Never feed it `get_pk`
+    /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.
     pub fn has_pk(&self, key: u128) -> bool {
         let tptr = self.table_ptr();
         unsafe {
             if !tptr.is_null() { (*tptr).has_pk(key) } else { (*self.ptable_ptr()).has_pk(key) }
+        }
+    }
+
+    /// Dispatched verbatim-OPK-bytes `has_pk` across all variants. Correct for
+    /// every PK width; takes the bytes `Batch::get_pk_bytes` produces, with no
+    /// native round-trip (and thus no double-encode for signed/compound PKs).
+    pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
+        let tptr = self.table_ptr();
+        unsafe {
+            if !tptr.is_null() {
+                (*tptr).has_pk_bytes(key)
+            } else {
+                (*self.ptable_ptr()).has_pk_bytes(key)
+            }
         }
     }
 
@@ -410,6 +426,13 @@ impl DagEngine {
             plan.pre_vm.regfile.clear_delta_batches();
             if let Some(post) = plan.post_vm.as_mut() {
                 post.regfile.clear_delta_batches();
+            }
+            // Binary set-op views (UNION ALL / EXCEPT / INTERSECT) compile the
+            // right-hand side into `side_b`, which owns its own VM regfile; its
+            // delta batches stay pinned (pooled batches leaked) until the view is
+            // invalidated unless cleared here too.
+            if let Some(sb) = plan.side_b.as_mut() {
+                sb.vm.regfile.clear_delta_batches();
             }
         }
     }
@@ -1543,7 +1566,13 @@ impl DagEngine {
 
     /// Enforce unique PK semantics: retract existing rows before inserting.
     /// Port of `registry._enforce_unique_pk()`.
-    /// Used for Single (view) stores where retractions don't need to propagate.
+    /// Used for Single (view) stores where retractions don't need to propagate
+    /// (a view store has no INSERT-over-existing semantics to retract, so `w<0`
+    /// passes through).
+    ///
+    /// Keys on `get_pk_bytes` (verbatim OPK) and dedups via `PkBuf` — correct
+    /// for every PK width. Never round-trips through a native `u128` (which
+    /// `opk_key` would re-encode, double-flipping the sign bit for signed PKs).
     fn enforce_unique_pk(
         &self,
         table: &mut Table,
@@ -1553,54 +1582,11 @@ impl DagEngine {
         if batch.count == 0 {
             return batch;
         }
-        if schema.pk_is_wide() {
-            return self.enforce_unique_pk_wide(table, schema, batch);
-        }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
         // pk → batch row index of the last +1 insertion in this batch.
         // Must be a batch index (not effective index) because
         // `append_batch_negated` below indexes into `batch`.
-        let mut seen: HashMap<u128, usize> = HashMap::with_capacity(batch.count);
-
-        for row in 0..batch.count {
-            let w = batch.get_weight(row);
-            let pk = batch.get_pk(row);
-
-            if w > 0 {
-                // Positive weight = insertion → retract existing if any
-                let (_existing_w, _found) = table.retract_pk(pk);
-
-                // Intra-batch dedup: if we've already seen this PK in this batch,
-                // retract the previous insertion.
-                if let Some(&prev_pos) = seen.get(&pk) {
-                    // The previous row at prev_pos was a +1 insertion.
-                    // We need to retract it by adding a -1 with the same payload.
-                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                }
-
-                // Add the new insertion
-                effective.append_batch(&batch, row, row + 1);
-                seen.insert(pk, row);
-            } else if w < 0 {
-                // Negative weight = deletion
-                effective.append_batch(&batch, row, row + 1);
-            }
-        }
-
-        effective
-    }
-
-    /// Wide-PK (`pk_stride > 16`) variant of [`enforce_unique_pk`]. Keys the
-    /// dedup map on `PkBuf` (probed zero-copy via `Borrow<[u8]>`) and retracts
-    /// via `retract_pk_bytes`, since a wide PK cannot be packed into a `u128`.
-    fn enforce_unique_pk_wide(
-        &self,
-        table: &mut Table,
-        schema: &SchemaDescriptor,
-        batch: Batch,
-    ) -> Batch {
-        let mut effective = Batch::with_schema(*schema, batch.count * 2);
         let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
 
         for row in 0..batch.count {
@@ -1608,13 +1594,20 @@ impl DagEngine {
             let pkb = batch.get_pk_bytes(row);
 
             if w > 0 {
+                // Positive weight = insertion → retract existing if any
                 let (_existing_w, _found) = table.retract_pk_bytes(pkb);
+
+                // Intra-batch dedup: if we've already seen this PK in this batch,
+                // retract the previous insertion.
                 if let Some(&prev_pos) = seen.get(pkb) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
                 }
+
+                // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
                 seen.insert(PkBuf::from_bytes(pkb), row);
             } else if w < 0 {
+                // Negative weight = deletion
                 effective.append_batch(&batch, row, row + 1);
             }
         }
@@ -1627,17 +1620,25 @@ impl DagEngine {
     /// Unlike `enforce_unique_pk` for Single stores, this version propagates
     /// retraction rows into the effective batch.  Downstream views need to see
     /// `(-1, old_row)` + `(+1, new_row)` to incrementally update.
+    ///
+    /// Keys on `get_pk_bytes` (verbatim OPK) and dedups via `PkBuf` — correct
+    /// for every PK width. Never round-trips through a native `u128` (which
+    /// `opk_key` would re-encode, double-flipping the sign bit for signed PKs,
+    /// so the probe would match no stored row and the retraction would be
+    /// silently dropped).
     fn enforce_unique_pk_partitioned(
         &self,
         ptable: &mut PartitionedTable,
         schema: &SchemaDescriptor,
         batch: Batch,
     ) -> Batch {
+        // Retain the empty-batch guard: this is the sole path now, and
+        // `Batch::with_schema(_, 0)` still allocates (capacity is forced to ≥1,
+        // plus a pooled data buffer and a blob Vec). Empty batches reach the
+        // engine via the `CatalogStore` ingest wrappers, which — unlike the
+        // worker loop — do not pre-filter `count == 0`.
         if batch.count == 0 {
             return batch;
-        }
-        if schema.pk_is_wide() {
-            return self.enforce_unique_pk_partitioned_wide(ptable, schema, batch);
         }
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
@@ -1646,71 +1647,11 @@ impl DagEngine {
         // `append_batch_negated` below indexes into `batch`, and the
         // effective batch may contain extra store-retraction rows that
         // break any 1:1 correspondence with `row`.
-        let mut seen: HashMap<u128, usize> = HashMap::with_capacity(batch.count);
+        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
         // pk set of store rows already retracted in this batch.
-        // `retract_pk` is read-only (sets `found_source` only), so calling
+        // `retract_pk_bytes` is read-only (sets `found_source` only), so calling
         // it twice for the same PK would emit the stored-row retraction
         // twice and drive downstream weights negative.
-        let mut store_retracted: HashSet<u128> = HashSet::with_capacity(batch.count);
-
-        for row in 0..batch.count {
-            let w = batch.get_weight(row);
-            let pk = batch.get_pk(row);
-
-            if w > 0 {
-                // Check store for existing row with this PK
-                let (_existing_w, found) = ptable.retract_pk(pk);
-                if found && !store_retracted.contains(&pk) {
-                    // Emit retraction of existing stored row so downstream views
-                    // see the removal of the old payload — exactly once per PK.
-                    effective.append_row_from_ptable_found(ptable, batch.get_pk_bytes(row), -1);
-                    store_retracted.insert(pk);
-                }
-
-                // Intra-batch dedup: retract previous insertion of same PK
-                if let Some(&prev_pos) = seen.get(&pk) {
-                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                }
-
-                // Add the new insertion
-                effective.append_batch(&batch, row, row + 1);
-                seen.insert(pk, row);
-            } else if w < 0 {
-                // Negative weight = explicit retraction
-                let (_existing_w, found) = ptable.retract_pk(pk);
-                let store_hit = found && !store_retracted.contains(&pk);
-                if store_hit {
-                    // Emit retraction using stored payload (the actual column data)
-                    effective.append_row_from_ptable_found(ptable, batch.get_pk_bytes(row), -1);
-                    store_retracted.insert(pk);
-                }
-
-                // Intra-batch dedup: if this PK was inserted earlier in this batch,
-                // negate that insertion to cancel it out.
-                if let Some(&prev_pos) = seen.get(&pk) {
-                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                    seen.remove(&pk);
-                } else if !found {
-                    // Not in store and not in batch — pass through as-is
-                    effective.append_batch(&batch, row, row + 1);
-                }
-            }
-        }
-
-        effective
-    }
-
-    /// Wide-PK (`pk_stride > 16`) variant of [`enforce_unique_pk_partitioned`].
-    /// Keys the dedup map and store-retracted set on `PkBuf` (probed zero-copy
-    /// via `Borrow<[u8]>`) and retracts via `retract_pk_bytes`.
-    fn enforce_unique_pk_partitioned_wide(
-        &self,
-        ptable: &mut PartitionedTable,
-        schema: &SchemaDescriptor,
-        batch: Batch,
-    ) -> Batch {
-        let mut effective = Batch::with_schema(*schema, batch.count * 2);
-        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
         let mut store_retracted: HashSet<PkBuf> = HashSet::with_capacity(batch.count);
 
         for row in 0..batch.count {
@@ -1718,30 +1659,40 @@ impl DagEngine {
             let pkb = batch.get_pk_bytes(row);
 
             if w > 0 {
+                // Check store for existing row with this PK
                 let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
                 if found && !store_retracted.contains(pkb) {
+                    // Emit retraction of existing stored row so downstream views
+                    // see the removal of the old payload — exactly once per PK.
                     effective.append_row_from_ptable_found(ptable, pkb, -1);
                     store_retracted.insert(PkBuf::from_bytes(pkb));
                 }
 
+                // Intra-batch dedup: retract previous insertion of same PK
                 if let Some(&prev_pos) = seen.get(pkb) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
                 }
 
+                // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
                 seen.insert(PkBuf::from_bytes(pkb), row);
             } else if w < 0 {
+                // Negative weight = explicit retraction
                 let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
                 let store_hit = found && !store_retracted.contains(pkb);
                 if store_hit {
+                    // Emit retraction using stored payload (the actual column data)
                     effective.append_row_from_ptable_found(ptable, pkb, -1);
                     store_retracted.insert(PkBuf::from_bytes(pkb));
                 }
 
+                // Intra-batch dedup: if this PK was inserted earlier in this batch,
+                // negate that insertion to cancel it out.
                 if let Some(&prev_pos) = seen.get(pkb) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
                     seen.remove(pkb);
                 } else if !found {
+                    // Not in store and not in batch — pass through as-is
                     effective.append_batch(&batch, row, row + 1);
                 }
             }
@@ -1995,5 +1946,66 @@ mod tests {
         dag.close();
         let _ = std::fs::remove_dir_all(dag_test_dir("flush_ic_parent"));
         let _ = std::fs::remove_dir_all(idx_dir);
+    }
+
+    // R2 regression: a DELETE/UPDATE retraction on a *signed* (I64) PK must
+    // actually retract the stored row. The pre-fix narrow arm fed `get_pk`
+    // (OPK-widened, sign-flipped) to `retract_pk(u128)`, which re-OPK-encoded it
+    // (a second sign flip) so the probe matched no stored row and the retraction
+    // was silently dropped. The byte path keys on verbatim OPK and is correct.
+    #[test]
+    fn test_enforce_unique_pk_partitioned_signed_negative_retraction() {
+        use crate::schema::{SchemaColumn, type_code};
+        crate::util::raise_fd_limit_for_tests();
+
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0), // signed PK
+                SchemaColumn::new(type_code::I64, 0), // payload
+            ],
+            &[0],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("enforce_signed");
+        let mut pt = crate::storage::PartitionedTable::new(
+            tdir.to_str().unwrap(), "enforce_signed", schema, 1234, 256, false, 0, 256,
+            crate::storage::partition_arena_size(256),
+        ).unwrap();
+
+        // Seed the store with a negative-PK row (PK=-5, payload=100).
+        let mut seed = Batch::with_schema(schema, 1);
+        seed.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
+        seed.extend_weight(&1i64.to_le_bytes());
+        seed.extend_null_bmp(&0u64.to_le_bytes());
+        seed.extend_col(0, &100i64.to_le_bytes());
+        seed.count += 1;
+        pt.ingest_owned_batch(seed).unwrap();
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&(-5i64).to_le_bytes(), type_code::I64, &mut opk);
+        assert!(pt.has_pk_bytes(&opk), "seed row must be present");
+
+        // DELETE PK=-5: a -1 retraction batch.
+        let mut del = Batch::with_schema(schema, 1);
+        del.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
+        del.extend_weight(&(-1i64).to_le_bytes());
+        del.extend_null_bmp(&0u64.to_le_bytes());
+        del.extend_col(0, &100i64.to_le_bytes());
+        del.count += 1;
+
+        let dag = DagEngine::new();
+        let effective = dag.enforce_unique_pk_partitioned(&mut pt, &schema, del);
+
+        // The store row must have been *found*: the effective batch carries a
+        // single net -1 for PK=-5 with the stored payload. (`retract_pk_bytes` is
+        // read-only — the store row is removed when the effective batch is
+        // re-ingested, mirroring the real DML pipeline below.)
+        assert_eq!(effective.count, 1, "one net retraction row expected");
+        assert_eq!(effective.get_weight(0), -1, "effective weight must be -1");
+        assert_eq!(effective.get_pk_bytes(0), &opk[..], "retraction PK must be OPK(-5)");
+
+        // Re-ingest the effective batch as the DML pipeline does; the stored
+        // negative-PK row then nets to zero and is gone.
+        pt.ingest_owned_batch(effective).unwrap();
+        assert!(!pt.has_pk_bytes(&opk), "stored negative-PK row must be gone after retraction");
     }
 }

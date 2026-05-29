@@ -369,9 +369,10 @@ impl ReadCursor {
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
     ) -> LoserTree {
-        // The heap key is the order-preserving `pk_sort_key` (= whole PK for
-        // narrow strides, OPK 16-byte prefix for wide). `get_pk_prefix` never
-        // panics on wide.
+        // Heap key is the order-preserving `pk_sort_key` (whole PK for narrow,
+        // OPK 16-byte prefix for wide). A differing key settles the order; a key
+        // tie falls to a raw OPK-byte compare (implied-equal for narrow,
+        // separating wide low-16 collisions) then the payload tiebreak.
         let init = |i: usize| {
             if states[i].is_valid() {
                 Some((sources[i].get_pk_prefix(states[i].position), states[i].position))
@@ -379,38 +380,14 @@ impl ReadCursor {
                 None
             }
         };
-        // Mirror the storage sort order (merge.rs): PK-primary, then payload
-        // tie-break. Dispatch the wide vs narrow `less` once here (as
-        // `merge_batches` splits merge_run_wide/narrow) so the reachable narrow
-        // path stays branch-free.
-        if schema.pk_is_wide() {
-            // Wide: prefix-first. `node.key` is the order-preserving OPK 16-byte
-            // prefix, so a differing prefix settles the order; only a prefix
-            // collision pays the `compare_pk_bytes` walk.
-            let less = move |a: &HeapNode, b: &HeapNode| {
-                match a.key.cmp(&b.key) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => match columnar::compare_pk_bytes(
-                        sources[a.source_idx].get_pk_bytes(a.row),
-                        sources[b.source_idx].get_pk_bytes(b.row),
-                    ) {
-                        Ordering::Less => true,
-                        Ordering::Greater => false,
-                        Ordering::Equal => row_cmp(
-                            schema,
-                            &sources[a.source_idx], a.row,
-                            &sources[b.source_idx], b.row,
-                        ) == Ordering::Less,
-                    },
-                }
-            };
-            LoserTree::build(sources.len(), init, less)
-        } else {
-            // Narrow: the order-preserving key is the whole PK, so the PK axis
-            // is a raw `a.key.cmp(&b.key)`.
-            let less = move |a: &HeapNode, b: &HeapNode| {
-                match a.key.cmp(&b.key) {
+        let less = move |a: &HeapNode, b: &HeapNode| {
+            match a.key.cmp(&b.key) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => match columnar::compare_pk_bytes(
+                    sources[a.source_idx].get_pk_bytes(a.row),
+                    sources[b.source_idx].get_pk_bytes(b.row),
+                ) {
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => row_cmp(
@@ -418,10 +395,10 @@ impl ReadCursor {
                         &sources[a.source_idx], a.row,
                         &sources[b.source_idx], b.row,
                     ) == Ordering::Less,
-                }
-            };
-            LoserTree::build(sources.len(), init, less)
-        }
+                },
+            }
+        };
+        LoserTree::build(sources.len(), init, less)
     }
 
     fn build_tree(
@@ -715,52 +692,31 @@ impl ReadCursor {
         // whole-`self` borrow. We commit the tuple (and fetch `get_null_word`)
         // after it returns.
         //
-        // Dispatch the wide vs narrow closure set once (mirroring storage's
-        // merge_run_wide/narrow split) so the reachable narrow hot loop has no
-        // width term. Only `less`/`eq_payload` differ.
-        let emitted = if schema.pk_is_wide() {
-            // Wide: prefix-first. `node.key` is the order-preserving OPK 16-byte
-            // prefix, so a differing prefix settles the order; only a prefix
-            // collision pays `compare_pk_bytes`. `eq_payload` keeps the full
-            // column-aware PK equality term so two distinct wide PKs sharing a
-            // prefix AND a payload are not folded into one summed group.
-            let less = |a: &HeapNode, b: &HeapNode| -> bool {
-                match a.key.cmp(&b.key) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => match columnar::compare_pk_bytes(
-                        sources[a.source_idx].get_pk_bytes(a.row),
-                        sources[b.source_idx].get_pk_bytes(b.row)) {
-                        Ordering::Less => true,
-                        Ordering::Greater => false,
-                        Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
-                                                           &sources[b.source_idx], b.row) == Ordering::Less,
-                    },
-                }
-            };
-            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-                sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
-                && row_cmp(schema, &sources[a_src], a_row,
-                                   &sources[b_src], b_row) == Ordering::Equal
-            };
-            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
-        } else {
-            // Narrow: the heap key is the whole order-preserving PK, so the PK
-            // axis is a raw `a.key.cmp(&b.key)` (no per-comparison column walk).
-            let less = |a: &HeapNode, b: &HeapNode| -> bool {
-                match a.key.cmp(&b.key) {
+        // `node.key` (the order-preserving `pk_sort_key`) settles distinct keys
+        // with no column work; a key tie falls to a raw OPK-byte compare
+        // (implied-equal for narrow, separating wide low-16 collisions) then the
+        // payload tiebreak. `eq_payload` keeps the byte term so two distinct wide
+        // PKs sharing a prefix AND a payload are not folded into one group.
+        let less = |a: &HeapNode, b: &HeapNode| -> bool {
+            match a.key.cmp(&b.key) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => match columnar::compare_pk_bytes(
+                    sources[a.source_idx].get_pk_bytes(a.row),
+                    sources[b.source_idx].get_pk_bytes(b.row)) {
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
                                                        &sources[b.source_idx], b.row) == Ordering::Less,
-                }
-            };
-            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-                row_cmp(schema, &sources[a_src], a_row,
-                                &sources[b_src], b_row) == Ordering::Equal
-            };
-            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
+                },
+            }
         };
+        let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+            sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
+            && row_cmp(schema, &sources[a_src], a_row,
+                               &sources[b_src], b_row) == Ordering::Equal
+        };
+        let emitted = Self::drive_inner(heap, sources, states, schema, less, eq_payload);
         // Heap key is the OPK; recompute current_key (narrow native value /
         // wide prefix) here, off the comparator. One pack per emitted group.
         if let Some((weight, idx, row)) = emitted {

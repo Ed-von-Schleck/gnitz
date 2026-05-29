@@ -28,14 +28,18 @@ pub fn op_filter(
     let mb = batch.as_mem_batch();
     let mut output = Batch::with_schema(*schema, n);
 
-    // If the batch has out-of-line string data, pre-clone the blob so that
-    // 16-byte string structs can be copied verbatim (no per-row relocation).
-    // Offsets inside the structs remain valid because both blobs are identical.
-    let blob_passthrough = !batch.blob.is_empty()
-        && (0..schema.num_columns()).any(|ci| {
-            let tc = schema.columns[ci].type_code;
-            tc == type_code::STRING || tc == type_code::BLOB
-        });
+    // When the schema has a STRING/BLOB column, copy 16-byte string structs
+    // verbatim (no per-row relocation); offsets inside the structs stay valid
+    // because both blobs are identical. No `!batch.blob.is_empty()` guard: a
+    // batch whose strings are all short (≤12 bytes, stored inline) has an empty
+    // blob, but the bulk copy is still correct — short strings are self-contained
+    // in their struct and an empty shared blob is a no-op for the absent long
+    // strings. Gating on a non-empty blob needlessly dropped all-short-string
+    // batches to the slow `relocate_string_cell` path.
+    let blob_passthrough = (0..schema.num_columns()).any(|ci| {
+        let tc = schema.columns[ci].type_code;
+        tc == type_code::STRING || tc == type_code::BLOB
+    });
     if blob_passthrough {
         output.share_blob_from(batch);
     }
@@ -523,16 +527,21 @@ pub(super) struct PkPromoter {
 }
 
 enum PromoteKind {
-    /// Reindex on a PK column. `off`/`cs`/`tc` locate and type the column
-    /// within the OPK PK region so it can be decoded to its native value —
-    /// matching the Narrow/Wide arms, which build the synthetic key from the
-    /// native value. (A verbatim OPK byte copy would mis-encode signed columns
-    /// and panic when the reindex output stride differs from the source PK
-    /// stride, e.g. an 8-byte PK reindexed into a 16-byte join key.)
-    Pk { off: usize, cs: usize, tc: u8 },
+    /// Reindex on a PK column: copy that column's OPK bytes verbatim. The PK
+    /// region is already OPK at rest (sign bit flipped for signed), so a verbatim
+    /// byte copy — right-aligned into the output stride — is the sign-aware
+    /// synthetic key. `widen_pk_be` of the result equals `extract_col_key`'s
+    /// `widen_pk_be(get_pk_bytes[col])`, so the reindexed (delta) side and the
+    /// OPK-routed (trace) side land on the same worker.
+    Pk { off: usize, cs: usize },
+    /// U128/UUID payload (unsigned): OPK == big-endian.
     Wide { pi: usize },
+    /// STRING/BLOB payload: sign-agnostic XXH3 hash key.
     String { pi: usize },
-    Narrow { pi: usize, cs: usize },
+    /// Reindex on an integer payload column: OPK-encode the native value
+    /// (sign-flipped for signed), matching `extract_col_key`'s payload arm so
+    /// equal logical values from the Pk and Narrow arms produce identical bytes.
+    Narrow { pi: usize, cs: usize, tc: u8 },
 }
 
 impl PkPromoter {
@@ -540,8 +549,7 @@ impl PkPromoter {
         if schema.is_pk_col(col_idx) {
             let off = schema.pk_byte_offset(col_idx) as usize;
             let cs = schema.columns[col_idx].size() as usize;
-            let tc = schema.columns[col_idx].type_code;
-            return PkPromoter { kind: PromoteKind::Pk { off, cs, tc } };
+            return PkPromoter { kind: PromoteKind::Pk { off, cs } };
         }
         let tc = schema.columns[col_idx].type_code;
         let pi = schema.payload_idx(col_idx);
@@ -550,10 +558,10 @@ impl PkPromoter {
             // BLOB shares the 16-byte German-string struct layout with STRING,
             // so it must take the same hash path (not the narrow ≤8-byte copy).
             type_code::STRING | type_code::BLOB => PromoteKind::String { pi },
-            // All ≤8-byte integer and float types: zero-extend the little-
-            // endian bytes to u128. Float bit patterns are intentionally
-            // re-used as-is — identical floats map to identical group keys.
-            _ => PromoteKind::Narrow { pi, cs: crate::schema::type_size(tc) as usize },
+            // All ≤8-byte integer and float types: OPK-encode the native value
+            // (sign-flip for signed integers), matching extract_col_key's
+            // payload arm. Float bit patterns OPK-encode as their unsigned image.
+            _ => PromoteKind::Narrow { pi, cs: crate::schema::type_size(tc) as usize, tc },
         };
         PkPromoter { kind }
     }
@@ -576,75 +584,72 @@ impl PkPromoter {
         ((h_hi as u128) << 64) | (h as u128)
     }
 
-    // Only the test-only `promote` oracle reads a narrow column's native value;
-    // production `promote_into` OPK-encodes the column bytes via `encode_pk_column`.
-    #[cfg(test)]
-    #[inline]
-    fn read_narrow(batch: &MemBatch, pi: usize, cs: usize, row: usize) -> u128 {
-        let ptr = batch.get_col_ptr(row, pi, cs);
-        let mut buf = [0u8; 8];
-        buf[..cs].copy_from_slice(ptr);
-        u64::from_le_bytes(buf) as u128
-    }
-
+    /// Test-only oracle: the **OPK-widened** value (what `get_pk` returns after
+    /// `promote_into`), via the same `pk_route_key`/`payload_route_key` helpers
+    /// the routing surfaces use — sign-aware for signed columns, so it discriminates
+    /// the OPK encoding (an unsigned-native oracle would pass on the broken code).
     #[cfg(test)]
     #[inline]
     pub(super) fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
         match self.kind {
-            PromoteKind::Pk { off, cs, tc } => {
-                crate::schema::pk_native_key(batch.get_pk_bytes(row), off, cs, tc)
-            }
+            PromoteKind::Pk { off, cs } =>
+                crate::schema::pk_route_key(batch.get_pk_bytes(row), off, cs),
+            PromoteKind::Narrow { pi, cs, tc } =>
+                crate::schema::payload_route_key(batch.get_col_ptr(row, pi, cs), 0, cs, tc),
             PromoteKind::Wide { pi } => Self::read_wide(batch, pi, row),
             PromoteKind::String { pi } => Self::read_string(batch, pi, row),
-            PromoteKind::Narrow { pi, cs, .. } => Self::read_narrow(batch, pi, cs, row),
         }
     }
 
     /// Promote every row of `output` from `batch`, hoisting the per-batch
-    /// kind dispatch out of the row loop (the kind is a batch-invariant).
+    /// kind dispatch out of the row loop (the kind is a batch-invariant). Every
+    /// arm emits sign-aware OPK bytes right-aligned into `output.pk_stride()`, so
+    /// the synthetic reindex key is byte-identical to how `extract_col_key`,
+    /// `partition_for_pk_bytes`, and storage encode the same value — the
+    /// co-partition contract — and equal logical values from the `Pk` and
+    /// `Narrow` arms produce identical bytes.
     pub(super) fn promote_into(&self, batch: &MemBatch, output: &mut Batch) {
+        let stride = output.pk_stride() as usize;
+        // The fixed `[0u8; 16]` scratch buffers below right-align into this
+        // stride; a stride > 16 would underflow `16 - stride`. The compiler types
+        // every current synthetic reindex key as U128 (stride 16). When compound
+        // reindex output (stride > 16) lands, the buffers must grow to
+        // `MAX_PK_BYTES` — this assert is the tripwire for that work.
+        debug_assert!(stride <= 16, "promote_into: synthetic key stride {stride} > 16");
         match self.kind {
-            PromoteKind::Pk { off, cs, tc } => {
-                // Decode the source PK column (OPK at rest) to its native value,
-                // then write the synthetic reindex key big-endian at the output
-                // stride — exactly as the Narrow/Wide arms do. A verbatim OPK
-                // byte copy panics when the output stride differs from the source
-                // PK stride and would mis-encode signed columns relative to the
-                // other (Narrow) join side.
-                let stride = output.pk_stride() as usize;
+            // Source PK column is already OPK at rest — copy it verbatim, right-
+            // aligned with left zero-pad. widen_pk_be of the result equals
+            // extract_col_key's `widen_pk_be(get_pk_bytes[col])`, so routing agrees.
+            PromoteKind::Pk { off, cs } => {
                 for row in 0..output.count {
-                    let v = crate::schema::pk_native_key(batch.get_pk_bytes(row), off, cs, tc);
-                    output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
+                    let src = &batch.get_pk_bytes(row)[off..off + cs];
+                    let mut buf = [0u8; 16];
+                    buf[16 - cs..].copy_from_slice(src);
+                    output.set_pk_at_bytes(row, &buf[16 - stride..]);
                 }
             }
+            // Payload integer: OPK-encode the native value (sign-flipped for
+            // signed), matching extract_col_key's payload arm.
+            PromoteKind::Narrow { pi, cs, tc } => {
+                for row in 0..output.count {
+                    let native = batch.get_col_ptr(row, pi, cs);
+                    let mut opk = [0u8; 16];
+                    gnitz_wire::encode_pk_column(native, tc, &mut opk[16 - cs..]);
+                    output.set_pk_at_bytes(row, &opk[16 - stride..]);
+                }
+            }
+            // U128/UUID are unsigned: OPK == big-endian.
             PromoteKind::Wide { pi } => {
-                // Output PK is U128/UUID (unsigned); OPK == BE of the value.
                 for row in 0..output.count {
                     let v = Self::read_wide(batch, pi, row);
-                    output.set_pk_at_bytes(row, &v.to_be_bytes());
+                    output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
                 }
             }
+            // Synthetic XXH3 hash key (unsigned U128): OPK == big-endian.
             PromoteKind::String { pi } => {
-                // Output PK is a synthetic U128 hash (unsigned); OPK == BE.
                 for row in 0..output.count {
                     let h = Self::read_string(batch, pi, row);
-                    output.set_pk_at_bytes(row, &h.to_be_bytes());
-                }
-            }
-            PromoteKind::Narrow { pi, cs } => {
-                // The reindex output PK is a synthetic unsigned (U128, or a
-                // narrower unsigned in unit schemas), so its OPK is the BE of
-                // the value. Zero-extend the column's native LE bytes to the
-                // output PK width and write right-aligned BE — matching the
-                // Wide/String arms (native value, no signed sign-flip) and the
-                // `promote` oracle's `read_narrow`.
-                let stride = output.pk_stride() as usize;
-                for row in 0..output.count {
-                    let ptr = batch.get_col_ptr(row, pi, cs);
-                    let mut buf = [0u8; 8];
-                    buf[..cs].copy_from_slice(ptr);
-                    let v = u64::from_le_bytes(buf) as u128;
-                    output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
+                    output.set_pk_at_bytes(row, &h.to_be_bytes()[16 - stride..]);
                 }
             }
         }
@@ -1186,6 +1191,90 @@ mod tests {
         for row in 0..batch.count {
             assert_eq!(out_pk.get_pk(row), promoter_pk.promote(&mb, row), "row {} pk", row);
         }
+
+        // Signed (I64) schema — the discriminating case. The oracle is sign-aware
+        // (route_key helpers), so promote_into must produce OPK-encoded bytes for
+        // both the PK-column (Pk) and payload-column (Narrow) arms.
+        let s_schema = make_schema_i64pk_i64();
+        let s_rows: Vec<(i64, i64, i64)> =
+            (-500..500).map(|i| (i, 1, (i * 3 - 7))).collect();
+        let s_batch = make_batch_i64pk(&s_schema, &s_rows);
+        let s_mb = s_batch.as_mem_batch();
+
+        let s_narrow = PkPromoter::new(&s_schema, 1);
+        let mut s_out = s_batch.clone_batch();
+        s_narrow.promote_into(&s_mb, &mut s_out);
+        for row in 0..s_batch.count {
+            assert_eq!(s_out.get_pk(row), s_narrow.promote(&s_mb, row), "row {} signed narrow", row);
+        }
+
+        let s_pk = PkPromoter::new(&s_schema, 0);
+        let mut s_out_pk = s_batch.clone_batch();
+        s_pk.promote_into(&s_mb, &mut s_out_pk);
+        for row in 0..s_batch.count {
+            assert_eq!(s_out_pk.get_pk(row), s_pk.promote(&s_mb, row), "row {} signed pk", row);
+        }
+    }
+
+    #[test]
+    fn test_pk_promoter_signed_opk_encoding() {
+        // Reindex on a signed I64 PAYLOAD column (Narrow arm). The synthetic key
+        // must be the sign-aware OPK image (matching extract_col_key's payload
+        // encoding), NOT the raw unsigned value — for -3 the OPK leading byte is
+        // 0x7F, not 0xFF. This is the assertion the old unsigned-only test could
+        // not make.
+        let schema = make_schema_i64pk_i64();
+        let batch = make_batch_i64pk(&schema, &[(1, 1, -3), (2, 1, 5), (3, 1, -1)]);
+        let mb = batch.as_mem_batch();
+        let promoter = PkPromoter::new(&schema, 1); // payload col → Narrow arm
+        // Output PK stride is 8 here (single I64 PK), so the synthetic key is the
+        // 8-byte OPK image directly (right-aligned into stride 8 == verbatim).
+        let mut out = batch.clone_batch();
+        promoter.promote_into(&mb, &mut out);
+
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&(-3i64).to_le_bytes(), type_code::I64, &mut opk);
+        assert_eq!(out.get_pk_bytes(0), &opk[..], "synthetic key must be sign-aware OPK");
+        assert_eq!(opk[0], 0x7F, "OPK leading byte of -3:I64 is 0x7F (sign-flipped), not 0xFF");
+
+        for row in 0..batch.count {
+            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {} narrow signed", row);
+        }
+    }
+
+    #[test]
+    fn test_pk_promoter_signed_copartition_pk_vs_narrow() {
+        // Co-partition contract: a value reindexed via the Pk arm (as a PK column)
+        // and via the Narrow arm (as a payload column) must produce byte-identical
+        // synthetic PK bytes, and widen_pk_be of those bytes must equal the routing
+        // key for that value — including negatives. This is what makes the
+        // reindexed (delta) side and the OPK-routed (trace) side co-partition.
+        let schema = make_schema_i64pk_i64();
+        // Each row carries the same logical value V in both the PK and the payload.
+        let vals = [-7i64, -1, 0, 3, i64::MIN, i64::MAX];
+        let rows: Vec<(i64, i64, i64)> = vals.iter().map(|&v| (v, 1, v)).collect();
+        let batch = make_batch_i64pk(&schema, &rows);
+        let mb = batch.as_mem_batch();
+
+        let promoter_pk = PkPromoter::new(&schema, 0);     // PK column → Pk arm
+        let promoter_narrow = PkPromoter::new(&schema, 1);  // payload column → Narrow arm
+        let mut out_pk = batch.clone_batch();
+        let mut out_narrow = batch.clone_batch();
+        promoter_pk.promote_into(&mb, &mut out_pk);
+        promoter_narrow.promote_into(&mb, &mut out_narrow);
+
+        for row in 0..batch.count {
+            assert_eq!(
+                out_pk.get_pk_bytes(row), out_narrow.get_pk_bytes(row),
+                "row {}: Pk-arm and Narrow-arm synthetic bytes must match for V={}",
+                row, vals[row],
+            );
+            // widen_pk_be of the synthetic bytes equals the sign-aware routing key
+            // (what extract_col_key returns for this value).
+            let expect =
+                crate::schema::payload_route_key(&vals[row].to_le_bytes(), 0, 8, type_code::I64);
+            assert_eq!(out_pk.get_pk(row), expect, "row {}: routing key mismatch", row);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1448,10 +1537,14 @@ mod tests {
 
         let out = op_map(&batch, &func, &schema, &schema, /* reindex_col = */ 1, 0);
         assert_eq!(out.count, 3);
-        // Each output row's PK equals its source payload value.
-        assert_eq!(out.get_pk(0) as u64, 200);
-        assert_eq!(out.get_pk(1) as u64, 100);
-        assert_eq!(out.get_pk(2) as u64, 300);
+        // Each output row's PK is the sign-aware OPK image of its source payload
+        // value (col 1 is I64): `widen_pk_be(encode_pk_column(v))`, i.e. the value
+        // with its sign bit flipped, matching how extract_col_key routes the same
+        // value. A raw-native `== 200` assertion would falsely fail signed reindex.
+        let opk_i64 = |v: i64| ((v as u64) ^ 0x8000_0000_0000_0000) as u128;
+        assert_eq!(out.get_pk(0), opk_i64(200));
+        assert_eq!(out.get_pk(1), opk_i64(100));
+        assert_eq!(out.get_pk(2), opk_i64(300));
         // Payload itself is unchanged by the projection.
         assert_eq!(get_payload_i64(&out, 0), 200);
         assert_eq!(get_payload_i64(&out, 1), 100);

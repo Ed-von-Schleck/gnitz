@@ -66,12 +66,19 @@ fn alloc_large_zeroed(size: usize) -> Vec<u8> {
 /// otherwise misalign the following region. MORSEL=256 batches are already
 /// aligned, but smaller batches are not. Total allocation grows by at most 7
 /// bytes per region boundary.
-pub(super) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([u32; MAX_BATCH_REGIONS], usize) {
-    let mut offsets = [0u32; MAX_BATCH_REGIONS];
+pub(super) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([usize; MAX_BATCH_REGIONS], usize) {
+    // Offsets are `usize`, not `u32`: a single large batch (a wide multi-column
+    // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
+    // though each individual region is still capped at 4 GB by the u32 wire
+    // region sizes. A `u32` store silently truncated the per-region offset, so
+    // `region_ptr` aliased an earlier region — silent corruption. Not a wire
+    // change: the WAL/exchange encoding serializes region *sizes* and recomputes
+    // offsets via this fn on receive, so offsets never cross a process boundary.
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
     let mut off = 0usize;
     for i in 0..num_regions {
         off = (off + 7) & !7;
-        offsets[i] = off as u32;
+        offsets[i] = off;
         off += capacity * strides[i] as usize;
     }
     (offsets, off)
@@ -130,29 +137,41 @@ pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_
 }
 
 /// Carve a contiguous arena into the four `DirectWriter` regions: PK, weight,
-/// null bitmap, then one slice per payload column. Each region is sized for
-/// `rows * stride`. The caller is responsible for ensuring `data` has at least
-/// that many bytes; any tail is left untouched and discarded.
+/// null bitmap, then one slice per payload column. Region starts honour the
+/// exact same 8-byte-aligned offsets `compute_offsets` produces (and the
+/// resulting `Batch` reads back through), so writer and reader never disagree
+/// when `rows * pk_stride` is not 8-aligned.
 #[allow(clippy::type_complexity)]
 pub(crate) fn carve_writer_slices<'a>(
     data: &'a mut [u8],
     schema: &SchemaDescriptor,
     rows: usize,
 ) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
-    let pk_sz = rows * pk_stride(schema) as usize;
-    let fixed = rows * 8;
-    let (pk, rest) = data.split_at_mut(pk_sz);
-    let (weight, rest) = rest.split_at_mut(fixed);
-    let (null_bmp, mut rest) = rest.split_at_mut(fixed);
+    let (strides, nr) = strides_from_schema(schema);
+    let nr = nr as usize;
+    let (offsets, _total) = compute_offsets(&strides, nr, rows);
 
-    let npc = schema.num_payload_cols();
-    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(npc);
-    for (_pi, _ci, col) in schema.payload_columns() {
-        let col_sz = rows * col.size() as usize;
-        let (c, new_rest) = rest.split_at_mut(col_sz);
-        col_slices.push(c);
-        rest = new_rest;
+    // Walk regions in order, splitting off [alignment pad | region] for each.
+    // `base` tracks the absolute offset of `rest[0]` within `data`, so
+    // `offsets[r] - base` is the padding to discard before region `r`.
+    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(nr);
+    let mut rest: &mut [u8] = data;
+    let mut base = 0usize;
+    for r in 0..nr {
+        let pad = offsets[r] - base;
+        let after_pad = std::mem::take(&mut rest).split_at_mut(pad).1;
+        let sz = rows * strides[r] as usize;
+        let (region, remainder) = after_pad.split_at_mut(sz);
+        slices.push(region);
+        base = offsets[r] + sz;
+        rest = remainder;
     }
+
+    let mut it = slices.into_iter();
+    let pk = it.next().expect("REG_PK");
+    let weight = it.next().expect("REG_WEIGHT");
+    let null_bmp = it.next().expect("REG_NULL_BMP");
+    let col_slices: Vec<&mut [u8]> = it.collect();
     (pk, weight, null_bmp, col_slices)
 }
 
@@ -168,7 +187,9 @@ pub(crate) fn carve_writer_slices<'a>(
 pub struct Batch {
     data: Vec<u8>,
     pub blob: Vec<u8>,
-    offsets: [u32; MAX_BATCH_REGIONS],
+    // `usize`, not `u32`: a single large batch's cumulative region offset can
+    // exceed 4 GB (see `compute_offsets`). In-memory only — never serialized.
+    offsets: [usize; MAX_BATCH_REGIONS],
     strides: [u8; MAX_BATCH_REGIONS],
     num_regions: u8,
     capacity: u32,
@@ -207,7 +228,7 @@ impl Batch {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
-            offsets: [0u32; MAX_BATCH_REGIONS],
+            offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
             num_regions: nr as u8,
             capacity: 0,
@@ -230,7 +251,7 @@ impl Batch {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
-            offsets: [0u32; MAX_BATCH_REGIONS],
+            offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
             num_regions: nr,
             capacity: 0,
@@ -259,7 +280,7 @@ impl Batch {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
-            offsets: [0u32; MAX_BATCH_REGIONS],
+            offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
             num_regions: out_idx as u8,
             capacity: 0,
@@ -406,7 +427,7 @@ impl Batch {
         data: Vec<u8>,
         blob: Vec<u8>,
         strides: [u8; MAX_BATCH_REGIONS],
-        offsets: [u32; MAX_BATCH_REGIONS],
+        offsets: [usize; MAX_BATCH_REGIONS],
         num_regions: u8,
         count: usize,
     ) -> Self {
@@ -1325,6 +1346,11 @@ impl Batch {
     /// Pass `None` for `blob_cache` when the schema has no STRING columns or
     /// when cross-row dedup isn't worth the bookkeeping. Pass `Some(...)` to
     /// dedup repeated source long-string spans into a single destination copy.
+    ///
+    /// Takes a **native** `u128` PK. The FK check-batch filter now keys on
+    /// verbatim OPK bytes (`append_row_from_source_bytes`), so this native entry
+    /// point has no production caller and is retained only for unit tests.
+    #[cfg(test)]
     pub fn append_row_from_source<S: ColumnarSource>(
         &mut self,
         key: u128,
@@ -1712,18 +1738,18 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     let n = count as usize;
     let pk_stride_val = pk_stride(schema);
 
-    let mut offsets = [0u32; MAX_BATCH_REGIONS];
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
     // Validate every fixed region: data covers [off, off + n*stride).
-    let validate = |r: usize, row_stride: usize| -> Result<u32, &'static str> {
+    let validate = |r: usize, row_stride: usize| -> Result<usize, &'static str> {
         if n == 0 { return Ok(0); }
         let off = wal_offsets[r] as usize;
         let sz  = sizes[r]  as usize;
         let needed = n * row_stride;
-        if sz < needed || off + sz > data.len() || off > u32::MAX as usize {
+        if sz < needed || off + sz > data.len() {
             return Err("data WAL region OOB");
         }
-        Ok(off as u32)
+        Ok(off)
     };
 
     offsets[REG_PK]       = validate(REG_PK,       pk_stride_val as usize)?;
@@ -1899,6 +1925,53 @@ mod tests {
             b.count += 1;
             assert_eq!(b.get_pk(0), pk,
                 "type_code {} narrow-stride round-trip", tc);
+        }
+    }
+
+    #[test]
+    fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
+        // Regression: `carve_writer_slices` (the writer) must carve at the same
+        // 8-byte-aligned region offsets `compute_offsets` (the reader) produces.
+        // At an odd row count a narrow `pk_stride` makes `rows * pk_stride`
+        // non-8-aligned, so a back-to-back writer carve placed every post-PK
+        // region a few bytes earlier than the reader expected — corrupting
+        // weight/payload and dropping rows on a plain INSERT + scan. Build a
+        // correct source via the extend path (the reader-offset oracle), rebuild
+        // it through `write_to_batch` → `carve_writer_slices`, and assert the
+        // read-back is byte-exact for every narrow stride at 3 rows.
+        let rows: [(u128, i64, i64); 3] = [(1, 1, 30), (2, 1, 10), (3, 1, 20)];
+        // U8/U16/U32 = strides 1/2/4 (the buggy non-8-aligned cases at 3 rows);
+        // U64 = stride 8 (always aligned) as a control.
+        for tc in [type_code::U8, type_code::U16, type_code::U32, type_code::U64] {
+            let schema = single_col_pk_schema(tc);
+            let stride = schema.pk_stride() as usize;
+
+            let mut src = Batch::empty_with_schema(&schema);
+            src.reserve_rows(rows.len());
+            for &(pk, w, v) in &rows {
+                src.extend_pk(pk);
+                src.extend_weight(&w.to_le_bytes());
+                src.extend_null_bmp(&0u64.to_le_bytes());
+                src.extend_col(0, &v.to_le_bytes());
+                src.count += 1;
+            }
+            let src_mb = src.as_mem_batch();
+
+            let out = write_to_batch(&schema, rows.len(), 0, |w| {
+                for i in 0..rows.len() {
+                    w.write_row(&src_mb, i, src_mb.get_weight(i));
+                }
+            });
+
+            assert_eq!(out.count, rows.len(), "tc={tc} stride={stride}: row count");
+            for (i, &(pk, w, v)) in rows.iter().enumerate() {
+                assert_eq!(out.get_pk_bytes(i), &pk.to_be_bytes()[16 - stride..],
+                    "tc={tc} stride={stride}: pk row {i}");
+                assert_eq!(out.get_weight(i), w, "tc={tc} stride={stride}: weight row {i}");
+                let col = out.get_col_ptr(i, 0, 8);
+                assert_eq!(i64::from_le_bytes(col.try_into().unwrap()), v,
+                    "tc={tc} stride={stride}: payload row {i}");
+            }
         }
     }
 

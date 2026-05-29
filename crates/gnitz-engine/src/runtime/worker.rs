@@ -194,10 +194,10 @@ pub struct WorkerProcess {
 /// Deduplicate a list of (dev, ino, fd) triples by (dev, ino), returning one fd per
 /// unique directory inode. Both fields are u64 to handle varying ino_t/dev_t widths.
 pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc::c_int> {
-    // The fds are the long-lived `Table::dirfd` borrowed for fsync, NOT owned by
-    // the flush — they must NOT be closed here (doing so breaks the next flush's
-    // openat/renameat). Just deduplicate by (dev, ino) so a shared directory is
-    // fsynced once.
+    // Returns one fd per unique (dev, ino) so a shared directory is fsynced
+    // once. The fds are per-flush and owned by the caller, which closes EVERY
+    // collected fd (not just this deduped subset) after the fsync — so this
+    // helper must NOT close the duplicates it drops.
     inodes.sort_unstable_by_key(|&(dev, ino, _)| (dev, ino));
     inodes.dedup_by_key(|&mut (dev, ino, _)| (dev, ino));
     inodes.into_iter().map(|(_, _, fd)| fd).collect()
@@ -258,28 +258,9 @@ fn uring_batch_fdatasync_with(
     Ok(())
 }
 
-fn filter_by_pk(
-    batch: &Option<Batch>,
-    schema: SchemaDescriptor,
-    n: usize,
-    mut has_pk: impl FnMut(u128) -> bool,
-) -> Batch {
-    let mut result = Batch::with_schema(schema, n);
-    if let Some(ref b) = batch {
-        let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
-        for i in 0..n {
-            let pk = b.get_pk(i);
-            if has_pk(pk) {
-                result.append_row_from_source(pk, 1, b, i, blob_cache.get_mut());
-            }
-        }
-    }
-    result
-}
-
-/// Byte-keyed sibling of [`filter_by_pk`] for wide (`pk_stride > 16`) PKs.
-/// The narrow version panics in both `get_pk` and `append_row_from_source`,
-/// so wide check-batches route here. `exists` receives the row's raw PK bytes.
+/// Filter a check-batch to the rows whose PK `exists` accepts, copying each
+/// matched row into the result. Keys on verbatim OPK bytes, correct for every
+/// PK width. `exists` receives the row's raw OPK PK bytes.
 fn filter_by_pk_bytes(
     batch: &Option<Batch>,
     schema: SchemaDescriptor,
@@ -1224,15 +1205,12 @@ impl WorkerProcess {
                 let schema = self.cat().get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={}", target_id))?;
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
-                let result = if schema.pk_is_wide() {
-                    filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                        ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
-                    })
-                } else {
-                    filter_by_pk(&batch, schema, n, |pk| {
-                        ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk(pk))
-                    })
-                };
+                // Route on verbatim OPK bytes for every PK width. The old narrow
+                // arm fed `get_pk` (OPK-widened) to `has_pk(u128)`, which
+                // re-OPK-encodes it — a double sign-flip that misses signed PKs.
+                let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
+                    ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
+                });
                 (schema, result)
             }
         };
@@ -1269,12 +1247,23 @@ impl WorkerProcess {
         }
         self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
 
+        // The fds are per-flush dir fds, owned by this batch (opened in
+        // `flush_prepare`, returned by `flush_commit`). Fsync one fd per unique
+        // directory inode, then close every fd so the flush leaks none.
+        let all_fds: Vec<libc::c_int> =
+            dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
+        let mut fsync_err = None;
         for fd in dedup_dirfds(dir_inodes) {
-            // `fd` is the Table's persistent dirfd; fsync but do NOT close it.
             if unsafe { libc::fsync(fd) } < 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("dir fsync failed: {}", err));
+                fsync_err = Some(std::io::Error::last_os_error());
+                break;
             }
+        }
+        for fd in all_fds {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(err) = fsync_err {
+            return Err(format!("dir fsync failed: {}", err));
         }
         Ok(())
     }
@@ -1446,8 +1435,8 @@ mod tests {
 
     #[test]
     fn test_dedup_dirfds_removes_duplicates() {
-        // The fds are borrowed Table dirfds, NOT owned by the flush, so
-        // dedup_dirfds must NOT close them — it only deduplicates by (dev, ino).
+        // dedup_dirfds only deduplicates by (dev, ino) — it does not close the
+        // duplicates it drops (the caller closes every collected fd).
         let inodes = vec![
             (1u64, 10u64, 3i32),
             (1u64, 10u64, 7i32),  // duplicate of (1,10)

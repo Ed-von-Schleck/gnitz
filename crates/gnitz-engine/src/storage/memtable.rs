@@ -94,14 +94,14 @@ impl MemTable {
         }
         self.check_capacity()?;
         // The bloom is keyed by the OPK bytes (via `pack_pk_be`), the same
-        // derivation `may_contain_pk` uses — consistent for signed PKs too,
-        // where `get_pk`'s sign-flipped value would not be. Wide-PK
-        // (`pk_stride > 16`) batches can't pack into a u128, so skip them; a
-        // missing bloom just falls through to the sorted-run search.
-        if !self.schema.pk_is_wide() {
-            for i in 0..batch.count {
-                self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
-            }
+        // derivation `may_contain_pk` uses — consistent for signed PKs, whose
+        // sign-flipped `get_pk` value would not be. `pack_pk_be` truncates to
+        // the leading 16 OPK bytes, so wide PKs (`pk_stride > 16`) hash their
+        // prefix: add and probe pack identically, so there is no false
+        // negative; two wide PKs sharing a 16-byte prefix collide to one slot,
+        // a tolerated false positive resolved by the run scan.
+        for i in 0..batch.count {
+            self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
         }
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();

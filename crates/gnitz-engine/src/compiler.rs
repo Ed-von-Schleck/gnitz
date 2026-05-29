@@ -943,8 +943,14 @@ fn create_child_table(
 // ---------------------------------------------------------------------------
 
 fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
+    // `.all()` (not `.any()`): a ScanTrace node feeding a join on PORT_TRACE
+    // skips its delta-register allocation, leaving no `out_reg_of` entry. If the
+    // SAME node also feeds a normal-port consumer (Filter/Map/Union on PORT_IN),
+    // an `.any()` test would still skip, and the normal consumer's `in_regs`
+    // lookup would miss and fall back to register 0 — reading unrelated payload.
+    // The skip is only safe when EVERY outgoing edge is a join trace side.
     loaded.outgoing.get(&nid).map(|outs| {
-        outs.iter().any(|&(dst, port)| {
+        !outs.is_empty() && outs.iter().all(|&(dst, port)| {
             port == PORT_TRACE
                 && matches!(
                     loaded.nodes.get(&dst),

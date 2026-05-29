@@ -6,12 +6,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::schema::{NARROW_PK_MAX_BYTES, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use super::batch::Batch;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, FlushOutcome, FlushWork, Table};
+use super::columnar;
 
 thread_local! {
     /// Reused per-partition scatter index buffers for `ingest_owned_batch`.
@@ -106,14 +107,13 @@ impl PartitionedTable {
             }
             part_indices[..np].iter_mut().for_each(Vec::clear);
 
-            if mb.pk_stride as usize > NARROW_PK_MAX_BYTES {
-                for i in 0..mb.count {
-                    part_indices[partition_for_pk_bytes(mb.get_pk_bytes(i))].push(i as u32);
-                }
-            } else {
-                for i in 0..mb.count {
-                    part_indices[partition_for_key(mb.get_pk(i))].push(i as u32);
-                }
+            // Route every row on its verbatim OPK bytes. For `stride <= 16`,
+            // `partition_for_pk_bytes(bytes)` == `partition_for_key(get_pk(i))`
+            // (since `get_pk = widen_pk_be ∘ get_pk_bytes`), so a single
+            // stride-agnostic loop subsumes the old narrow/wide split — and routes
+            // signed/compound PKs to the same partition every other surface uses.
+            for i in 0..mb.count {
+                part_indices[partition_for_pk_bytes(mb.get_pk_bytes(i))].push(i as u32);
             }
 
             let offset = self.part_offset as usize;
@@ -193,37 +193,21 @@ impl PartitionedTable {
     // PK lookups
     // ------------------------------------------------------------------
 
+    /// Native `u128` PK existence check. Routes via the OPK bytes — exactly as
+    /// ingestion does (`partition_for_pk_bytes(get_pk_bytes)`) — so a signed or
+    /// compound key reaches the same partition it was ingested into. Routing on
+    /// the raw native value would `mix(native) != mix(widen_pk_be(opk))` and probe
+    /// the wrong partition. The sole production caller is the lone-PK FK existence
+    /// check (passes a native value); all DML retraction routes through `_bytes`.
     pub fn has_pk(&mut self, key: u128) -> bool {
-        if self.tables.is_empty() {
-            return false;
-        }
-        if self.num_partitions == 1 {
-            return self.tables[0].has_pk(key);
-        }
-        match self.local_index(key) {
-            Some(local) => self.tables[local].has_pk(key),
-            None => false,
-        }
+        let (opk, n) = columnar::opk_key(&self.schema, key);
+        self.has_pk_bytes(&opk[..n])
     }
 
+    #[cfg(test)] // no production caller after the §4 DML/UPSERT byte-path fixes
     pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
-        self.last_found_partition = None;
-        if self.tables.is_empty() {
-            return (0, false);
-        }
-        let local = if self.num_partitions == 1 {
-            0
-        } else {
-            match self.local_index(key) {
-                Some(l) => l,
-                None => return (0, false),
-            }
-        };
-        let (w, found) = self.tables[local].retract_pk(key);
-        if found {
-            self.last_found_partition = Some(local);
-        }
-        (w, found)
+        let (opk, n) = columnar::opk_key(&self.schema, key);
+        self.retract_pk_bytes(&opk[..n])
     }
 
     /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
@@ -378,18 +362,10 @@ impl PartitionedTable {
     // Internal
     // ------------------------------------------------------------------
 
-    fn local_index(&self, key: u128) -> Option<usize> {
-        let p = partition_for_key(key) as u32;
-        let local = p.wrapping_sub(self.part_offset) as usize;
-        if local < self.tables.len() {
-            Some(local)
-        } else {
-            None
-        }
-    }
-
-    /// Byte-keyed sibling of [`local_index`] for wide PKs. `partition_for_pk_bytes`
-    /// is bit-identical to `partition_for_key` for `len <= 16`.
+    /// Maps an OPK PK key to this worker's local partition slot. The sole router
+    /// now that the native `u128` path routes through `opk_key` → these bytes;
+    /// `partition_for_pk_bytes` is bit-identical to `partition_for_key` for
+    /// `len <= 16`.
     fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
         let p = partition_for_pk_bytes(key) as u32;
         let local = p.wrapping_sub(self.part_offset) as usize;

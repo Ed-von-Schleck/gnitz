@@ -74,7 +74,14 @@ impl Drop for FlushWork {
     fn drop(&mut self) {
         self.close_fds();
         if let Some(r) = self.shard_rename.take() {
-            unsafe { libc::unlinkat(r.dirfd, r.tmp_name.as_ptr(), 0); }
+            // `dirfd` is owned by this in-flight flush (opened in
+            // `flush_prepare`); unlink the orphaned .tmp through it, then close
+            // it. `flush_commit` `take()`s `shard_rename` on success, so the
+            // committed fd is returned to the caller, never reaching here.
+            unsafe {
+                libc::unlinkat(r.dirfd, r.tmp_name.as_ptr(), 0);
+                libc::close(r.dirfd);
+            }
         }
         if let Some(m) = self.manifest.take() {
             unsafe { libc::unlink(m.tmp_path.as_ptr()); }
@@ -103,7 +110,6 @@ pub struct Table {
     schema: SchemaDescriptor,
     table_id: u32,
     directory: String,
-    dirfd: libc::c_int,
 
     durable: bool,
     manifest_path: Option<String>,
@@ -131,14 +137,6 @@ impl Table {
         // Try to set NOCOW (btrfs; silently ignored on other fs)
         set_nocow_dir(&dir_c);
 
-        // Open dirfd
-        let dirfd = unsafe {
-            libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
-        if dirfd < 0 {
-            return Err(StorageError::Io);
-        }
-
         // Erase stale ephemeral shards (prefix-matched)
         if !durable {
             erase_stale_shards(dir, table_id);
@@ -153,7 +151,6 @@ impl Table {
             schema,
             table_id,
             directory: dir.to_string(),
-            dirfd,
             durable,
             manifest_path: None,
             flush_seq: 0,
@@ -239,6 +236,23 @@ impl Table {
         self.flush_inner(true, true)
     }
 
+    /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
+    /// Opened per flush/compaction rather than held for the table's lifetime,
+    /// so a 256-partition table pins 0 directory fds at rest instead of 256
+    /// (which exhausted the default `ulimit -n` after a handful of tables).
+    /// The caller owns the returned fd and must close it.
+    fn open_dirfd(&self) -> Result<libc::c_int, StorageError> {
+        let dir_c = CString::new(self.directory.as_str())
+            .map_err(|_| StorageError::InvalidPath)?;
+        let fd = unsafe {
+            libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+        };
+        if fd < 0 {
+            return Err(StorageError::Io);
+        }
+        Ok(fd)
+    }
+
     /// Phase 1 of two-phase flush.
     ///
     /// `durable=true` and a non-empty consolidated snapshot:
@@ -287,27 +301,40 @@ impl Table {
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let regions = snapshot.regions();
 
+        // Owned for this flush only. The non-durable branch closes it before
+        // returning; the durable branch moves ownership into `ShardRename`
+        // (whose Drop closes it on a rollback) and hands it to the committer.
+        let dirfd = self.open_dirfd()?;
+
         if !durable {
-            shard_file::write_shard_streaming(
-                self.dirfd, &name_c, self.table_id, snapshot.count as u32,
+            let res = shard_file::write_shard_streaming(
+                dirfd, &name_c, self.table_id, snapshot.count as u32,
                 &regions, false,
-            )?;
+            );
+            unsafe { libc::close(dirfd); }
+            res?;
             let final_full = format!("{}/{}", self.directory, shard_name);
             self.shard_index.add_shard(&final_full, 0, 0)?;
             self.memtable.reset();
             return Ok(FlushOutcome::DoneInline);
         }
 
-        let prepared = shard_file::write_shard_streaming_prepare(
-            self.dirfd, &name_c, self.table_id, snapshot.count as u32, &regions,
-        )?;
+        let prepared = match shard_file::write_shard_streaming_prepare(
+            dirfd, &name_c, self.table_id, snapshot.count as u32, &regions,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe { libc::close(dirfd); }
+                return Err(e);
+            }
+        };
         let shard_fd = prepared.fd;
         let tmp_name = prepared.tmp_name;
 
         let mut work = FlushWork {
             shard_fd: Some(shard_fd),
             shard_rename: Some(ShardRename {
-                dirfd: self.dirfd,
+                dirfd,
                 tmp_name: tmp_name.clone(),
                 final_name: name_c.clone(),
             }),
@@ -337,11 +364,15 @@ impl Table {
     }
 
     /// Phase 3: rename shard then manifest into final names; insert
-    /// pending_shard into shard_index; reset the memtable. Returns
-    /// `Some(dirfd)` to fsync after all renames in the worker batch.
+    /// pending_shard into shard_index; reset the memtable. Returns the
+    /// per-flush directory fd (opened in `flush_prepare`, owned by the
+    /// returned `Some`) for the caller to `fsync` after all renames in the
+    /// worker batch and then **close**. On any error path the fd is closed
+    /// here (or by `FlushWork`'s Drop, when `shard_rename` is restored) so a
+    /// failed commit does not leak it.
     pub fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<libc::c_int>, StorageError> {
         // Rename shard .tmp → final.
-        if let Some(rename) = work.shard_rename.take() {
+        let dirfd = if let Some(rename) = work.shard_rename.take() {
             let rc = unsafe {
                 libc::renameat(
                     rename.dirfd, rename.tmp_name.as_ptr(),
@@ -349,11 +380,16 @@ impl Table {
                 )
             };
             if rc < 0 {
-                // Restore so Drop unlinks the shard .tmp.
+                // Restore so Drop unlinks the shard .tmp and closes the fd.
                 work.shard_rename = Some(rename);
                 return Err(StorageError::Io);
             }
-        }
+            // Rename succeeded: the fd is no longer owned by `ShardRename`
+            // (consumed by `take()`), so ownership moves to the returned value.
+            Some(rename.dirfd)
+        } else {
+            None
+        };
 
         // Rename manifest .tmp → final. fd already closed by close_fds.
         if let Some(m) = work.manifest.take() {
@@ -362,17 +398,21 @@ impl Table {
                 // Restore so Drop unlinks the manifest .tmp. The shard is
                 // already at its final path and will be collected by orphan GC.
                 work.manifest = Some(m);
+                if let Some(fd) = dirfd { unsafe { libc::close(fd); } }
                 return Err(StorageError::Io);
             }
         }
 
         // Publish the pending shard into the index.
         if let Some(pending) = work.pending_shard.take() {
-            self.shard_index.add_opened_shard(pending)?;
+            if let Err(e) = self.shard_index.add_opened_shard(pending) {
+                if let Some(fd) = dirfd { unsafe { libc::close(fd); } }
+                return Err(e);
+            }
         }
 
         self.memtable.reset();
-        Ok(Some(self.dirfd))
+        Ok(dirfd)
     }
 
     fn flush_inner(&mut self, durable: bool, sync_dir: bool) -> Result<bool, StorageError> {
@@ -391,12 +431,15 @@ impl Table {
                     }
                 }
                 work.close_fds();
+                // `flush_commit` returns the owned per-flush dir fd; fsync it
+                // (when durability is requested) then close it — it is not held
+                // for the table's lifetime.
                 let dirfd = self.flush_commit(*work)?;
-                if sync_dir {
-                    if let Some(fd) = dirfd {
-                        if unsafe { libc::fsync(fd) } < 0 {
-                            return Err(StorageError::Io);
-                        }
+                if let Some(fd) = dirfd {
+                    let rc = if sync_dir { unsafe { libc::fsync(fd) } } else { 0 };
+                    unsafe { libc::close(fd); }
+                    if rc < 0 {
+                        return Err(StorageError::Io);
                     }
                 }
                 Ok(true)
@@ -481,12 +524,12 @@ impl Table {
         self.has_pk_bytes(&opk[..n])
     }
 
-    /// Byte-keyed PK existence check. The memtable bloom (keyed by the OPK
-    /// bytes) gates the sorted-run lookup for narrow PKs; wide PKs are never
-    /// bloom-populated, so they go straight to the runs and shard index.
+    /// Byte-keyed PK existence check. The OPK-keyed memtable bloom gates the
+    /// sorted-run lookup at every PK width (a wide-PK probe matches the 16-byte
+    /// prefix the insert side hashed, so there are no false negatives).
     pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
         let mut mt_w: i64 = 0;
-        if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+        if self.memtable.may_contain_pk(key) {
             let (w, _, _) = self.memtable.lookup_pk_bytes(key);
             mt_w = w;
         }
@@ -497,9 +540,10 @@ impl Table {
     /// Look up a PK for retraction.  Returns (net_weight, found).
     /// If found, sets `found_source` so `found_*` accessors can read the row.
     ///
-    /// Uses `find_positive_payload_row` so that after an UPDATE (which leaves
-    /// old-payload rows with net weight 0 in the memtable), the found row is
-    /// the live (PK, new_payload) entry, not the cancelled old one.
+    /// Takes a **native** `u128` and `opk_key`s it; the DML retraction path now
+    /// keys on verbatim OPK bytes via `retract_pk_bytes`, so this native entry
+    /// point has no production caller and is retained only for unit tests.
+    #[cfg(test)]
     pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
         let (opk, n) = columnar::opk_key(&self.schema, key);
         self.retract_pk_bytes(&opk[..n])
@@ -507,13 +551,13 @@ impl Table {
 
     /// Look up a PK for retraction by its OPK `key` bytes. Returns
     /// `(net_weight, found)`; on a hit sets `found_source` so the `found_*`
-    /// accessors expose the live (PK, payload) row. The memtable bloom (keyed
-    /// by OPK bytes) gates the run lookup for narrow PKs.
+    /// accessors expose the live (PK, payload) row. The OPK-keyed memtable
+    /// bloom gates the run lookup at every PK width.
     pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
         self.found_source = FoundSource::None;
 
         let (mt_w, _, mt_row_count) =
-            if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+            if self.memtable.may_contain_pk(key) {
                 self.memtable.lookup_pk_bytes(key)
             } else {
                 (0, false, 0)
@@ -555,7 +599,7 @@ impl Table {
     }
 
     /// Net weight for a specific (PK, payload) row, keyed by OPK `key` bytes.
-    /// The memtable bloom (keyed by OPK bytes) gates the run scan for narrow PKs.
+    /// The OPK-keyed memtable bloom gates the run scan at every PK width.
     pub fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
         &mut self,
         key: &[u8],
@@ -564,7 +608,7 @@ impl Table {
     ) -> i64 {
         let mut total_w: i64 = 0;
 
-        if self.schema.pk_is_wide() || self.memtable.may_contain_pk(key) {
+        if self.memtable.may_contain_pk(key) {
             total_w += self.memtable.find_weight_for_row_bytes(key, ref_source, ref_row);
         }
 
@@ -624,7 +668,12 @@ impl Table {
         self.shard_index.run_compact()?;
         if let Some(ref path) = self.manifest_path {
             self.shard_index.publish_manifest(path)?;
-            if unsafe { libc::fsync(self.dirfd) } < 0 {
+            // Open the dir fd just for this fsync, then close it — not held
+            // for the table's lifetime.
+            let dirfd = self.open_dirfd()?;
+            let rc = unsafe { libc::fsync(dirfd) };
+            unsafe { libc::close(dirfd); }
+            if rc < 0 {
                 return Err(StorageError::Io);
             }
         }
@@ -637,11 +686,8 @@ impl Table {
     // ------------------------------------------------------------------
 
     pub fn close(&mut self) {
-        // ShardIndex + MemTable dropped when Table is dropped
-        if self.dirfd >= 0 {
-            unsafe { libc::close(self.dirfd); }
-            self.dirfd = -1;
-        }
+        // ShardIndex + MemTable drop with the Table. Directory fds are opened
+        // per flush/compaction and closed there, so nothing is held to close.
     }
 
     // ------------------------------------------------------------------

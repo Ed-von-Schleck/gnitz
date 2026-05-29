@@ -328,7 +328,11 @@ impl CatalogEngine {
                         && cur.cursor.current_weight > 0
                         && cur.cursor.current_pk_bytes() == row_pk_bytes
                 } else {
-                    entry.handle.has_pk(batch.get_pk(row))
+                    // Verbatim OPK bytes — never `get_pk` (OPK-widened), which
+                    // `has_pk(u128)` re-OPK-encodes (double sign-flip for signed),
+                    // so an existing signed PK would be missed and the UPSERT
+                    // misclassified as a fresh insert.
+                    entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
                 };
 
                 // Decode the indexed PK column OPK→native. `get_pk` is the

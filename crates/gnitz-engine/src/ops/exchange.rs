@@ -186,24 +186,17 @@ impl PartitionRouter {
     }
 }
 
-/// True when the routing columns are exactly the single PK column, so
-/// routing can read the PK directly instead of extracting a group key.
-#[inline]
-fn is_single_pk_col(schema: &SchemaDescriptor, col_indices: &[u32]) -> bool {
-    col_indices.len() == 1 && schema.pk_indices() == col_indices
-}
-
 fn hash_row_for_partition(
     mb: &MemBatch,
     row: usize,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
 ) -> usize {
-    if is_single_pk_col(schema, col_indices) {
-        return partition_for_key(mb.get_pk(row));
-    }
-    let pk = extract_group_key(mb, row, schema, col_indices);
-    partition_for_key(pk)
+    // Reached only on the non-PK-routing path (every caller guards with
+    // `is_pk_routing = col_indices == pk_indices` and routes PK-keyed rows via
+    // `partition_for_pk_bytes`), so `col_indices != pk_indices` here.
+    // `extract_group_key` already handles a single PK column internally.
+    partition_for_key(extract_group_key(mb, row, schema, col_indices))
 }
 
 fn fill_worker_indices(
