@@ -9,7 +9,7 @@ use crate::types::{
     CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
     OWNER_KIND_TABLE, OWNER_KIND_VIEW,
     schema_tab_schema, table_tab_schema, col_tab_schema, view_tab_schema,
-    dep_tab_schema, circuit_nodes_schema, circuit_edges_schema,
+    dep_tab_schema, idx_tab_schema, circuit_nodes_schema, circuit_edges_schema,
     circuit_node_columns_schema,
 };
 use crate::circuit::Circuit;
@@ -43,31 +43,18 @@ fn col_str(col: &ColData, i: usize) -> Result<Option<&str>, ClientError> {
     }
 }
 
+/// A secondary index maps the indexed column to the PK of the index table, so
+/// the indexed column must be PK-eligible. Defer to the canonical
+/// `is_pk_eligible` allow-list (the exact set the server's `get_index_key_type`
+/// accepts) rather than a deny-list: any future `TypeCode` is index-ineligible
+/// until explicitly vetted, instead of silently slipping through.
 fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
-    match tc {
-        TypeCode::F32 | TypeCode::F64 | TypeCode::String => Err(ClientError::ServerError(
-            "index on float/string column not supported".to_string()
-        )),
-        _ => Ok(()),
+    if !tc.is_pk_eligible() {
+        return Err(ClientError::ServerError(
+            "index on this column type is not supported (must be an integer scalar)".to_string(),
+        ));
     }
-}
-
-fn idx_tab_schema() -> &'static Schema {
-    use std::sync::OnceLock;
-    use crate::protocol::ColumnDef;
-    static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef { name: "index_id".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "owner_id".into(),        type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "owner_kind".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "source_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "name".into(),            type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "is_unique".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-        ],
-        pk_cols: vec![0],
-    })
+    Ok(())
 }
 
 /// Decode the persisted PK-list `u64` (from `TABLE_TAB.pk_col_idx`) into a
@@ -492,6 +479,21 @@ impl GnitzClient {
                 for &dep_tid in &deps {
                     // Compound PK (view_id, dep_table_id): low 8 bytes = view_id,
                     // high 8 bytes = dep_table_id. dep_view_id is the only payload.
+                    //
+                    // CONVERGENCE INVARIANT (all circuit-PK packings below too):
+                    // the client packs view_id in the LOW u128 half while the
+                    // engine's `pack_view_pk` packs it in the HIGH half. These
+                    // produce the IDENTICAL view_id-major big-endian at-rest OPK
+                    // image only because the client's multi-column `PkColumn::Bytes`
+                    // arm OPK-encodes each 8-byte PK column independently (low u128
+                    // bytes → first column) while the engine writes the whole u128
+                    // big-endian — byte-order duals that agree only because every
+                    // circuit-PK column is exactly 8 bytes and unsigned.
+                    // `load_circuit` / `retract_rows_by_view` prefix-seek on
+                    // `view_id.to_be_bytes()` and depend on this. Do NOT "align"
+                    // the two packings: flipping the client to `(vid << 64) | sub`
+                    // moves `sub` into the leading at-rest bytes and breaks every
+                    // view-load prefix seek.
                     let pk = (vid as u128) | ((dep_tid as u128) << 64);
                     a.add_row(pk, 1)
                         .u64_val(0); // dep_view_id
@@ -826,6 +828,20 @@ mod tests {
         let id = pack_col_id(12345, 7).unwrap();
         assert_eq!(id >> 9, 12345);
         assert_eq!(id & 0x1FF, 7);
+    }
+
+    #[test]
+    fn validate_index_col_type_rejects_non_pk_eligible() {
+        // Deny-list misses these no longer: float/string/blob are all rejected
+        // client-side, matching the server's get_index_key_type allow-list.
+        for tc in [TypeCode::F32, TypeCode::F64, TypeCode::String, TypeCode::Blob] {
+            assert!(validate_index_col_type(tc).is_err(), "{tc:?} must be rejected");
+        }
+        // Integer scalars (+ U128/UUID) remain index-eligible.
+        for tc in [TypeCode::U64, TypeCode::I64, TypeCode::U32, TypeCode::I8,
+                   TypeCode::U128, TypeCode::UUID] {
+            assert!(validate_index_col_type(tc).is_ok(), "{tc:?} must be accepted");
+        }
     }
 
     #[test]

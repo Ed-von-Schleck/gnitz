@@ -402,7 +402,12 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
                 "HELLO ACK reported status={}", ack.status,
             )));
         }
-        return Ok(ack.limit_bytes);
+        // Clamp the server-supplied limit to the client's hard ceiling. The
+        // negotiated bound is `min(server_limit, MAX_FRAME_PAYLOAD_CLIENT)`,
+        // so a compromised or buggy server cannot raise the client's own
+        // allocation bound above its hard maximum (honoring the doc-comment
+        // on `Connection::max_payload_len`).
+        return Ok(ack.limit_bytes.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT as u32));
     }
 
     // Not an ACK — the server is sending a STATUS_ERROR control block.
@@ -647,6 +652,36 @@ mod tests {
         unsafe { libc::close(a); }
         let got = reader.join().unwrap();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_hello_handshake_clamps_server_limit() {
+        // A server advertising an oversized limit (u32::MAX) must not raise the
+        // client's negotiated ceiling above MAX_FRAME_PAYLOAD_CLIENT.
+        let (a, b) = make_socketpair();
+        // Pre-stage the ACK frame on `b` so the handshake on `a` can read it
+        // after sending its HELLO (which lands harmlessly in `a`'s recv buffer).
+        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, u32::MAX);
+        unsafe {
+            libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
+        }
+        let limit = hello_handshake(a).unwrap();
+        assert_eq!(limit as usize, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn test_hello_handshake_preserves_smaller_limit() {
+        // A server limit below the client ceiling passes through unchanged.
+        let (a, b) = make_socketpair();
+        let small: u32 = 16 * 1024 * 1024;
+        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, small);
+        unsafe {
+            libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
+        }
+        let limit = hello_handshake(a).unwrap();
+        assert_eq!(limit, small);
+        unsafe { libc::close(a); libc::close(b); }
     }
 
     #[test]

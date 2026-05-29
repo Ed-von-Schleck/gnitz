@@ -119,6 +119,30 @@ class TestSchemaMismatch:
         finally:
             _cleanup(client, sn, tables=["t"])
 
+    def test_wrong_pk_type_rejected_when_cache_warm(self, client):
+        """A PK-type mismatch must be rejected whether or not the table schema
+        is cached. Warming the cache (via a scan of the table) used to route
+        the push through the schema-less warm path, where the server skipped
+        validate_schema_match and silently reinterpreted the U64-encoded PK as
+        I64 — corrupting at rest. The push must fail identically to the cold
+        path (cf. test_wrong_column_type)."""
+        sn = "err" + _uid()
+        try:
+            tid = self._make_table(client, sn)  # pk BIGINT (stored I64)
+            # Warm the client's schema cache for this table.
+            client.scan(tid)
+            wrong_cols = [
+                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),  # wrong: table is I64
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+            ]
+            wrong_schema = gnitz.Schema(wrong_cols)
+            batch = gnitz.ZSetBatch(wrong_schema)
+            batch.append(pk=1, val=42)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, batch)
+        finally:
+            _cleanup(client, sn, tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # Schema construction limits

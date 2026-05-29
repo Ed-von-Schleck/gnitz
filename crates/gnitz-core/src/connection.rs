@@ -35,9 +35,14 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
         return Err(ClientError::SchemaMismatch);
     }
     if msg.status == STATUS_ERROR {
-        return Err(ClientError::ServerError(
-            msg.error_text.unwrap_or_else(|| "unknown server error".into())
-        ));
+        // Fall back to the default text on an empty string, not only on None:
+        // a STATUS_ERROR with Some("") would otherwise surface as a blank
+        // ServerError. This matters because the warm-push guard converts
+        // silent corruption into a surfaced error, which must be legible.
+        let text = msg.error_text
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown server error".into());
+        return Err(ClientError::ServerError(text));
     }
     Ok(msg)
 }
@@ -199,9 +204,20 @@ impl Connection {
     }
 
     /// Push path: packs `WireConflictMode` into bits 16-23 of `wire_flags`.
-    /// When the schema cache holds a valid version for `target_id`, omits the
-    /// schema block from the wire frame (warm path). On STATUS_SCHEMA_MISMATCH
-    /// the cache entry is evicted and the push is retried with the full schema.
+    /// When the schema cache holds a valid version for `target_id` *and* the
+    /// caller's `schema` type-matches the cached one, omits the schema block
+    /// from the wire frame (warm path). On STATUS_SCHEMA_MISMATCH the cache
+    /// entry is evicted and the push is retried with the full schema.
+    ///
+    /// The schema *version* alone is not a sufficient identity check for the
+    /// data encoding: it proves the catalog has not changed, not that the
+    /// caller encoded under the same column types. A version match with a
+    /// type mismatch on the warm (schema-less) path ships bytes the server
+    /// silently reinterprets under the catalog schema (e.g. a U64-encoded PK
+    /// decoded as I64), corrupting at rest. So the warm path is gated on
+    /// `types_match`; on a mismatch we fall through to the cold path so the
+    /// full schema block is sent and the server's `validate_schema_match`
+    /// returns the same deterministic error the cold path already gives.
     fn roundtrip_push(
         &mut self,
         target_id: u64,
@@ -210,9 +226,12 @@ impl Connection {
         mode:      WireConflictMode,
         cache:     &mut LruCache<u64, (Schema, u16)>,
     ) -> Result<Message, ClientError> {
-        let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let base_flags = wire_flags_set_conflict_mode(0, mode);
-        if cached_version != 0 {
+        let (cached_version, warm_ok) = match cache.peek(&target_id) {
+            Some((cached_schema, v)) if *v != 0 => (*v, schema.types_match(cached_schema)),
+            _ => (0, false),
+        };
+        if warm_ok {
             // Warm path: omit schema block, embed cached version.
             let flags = wire_flags_set_schema_version(base_flags, cached_version);
             send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
@@ -230,11 +249,14 @@ impl Connection {
             Ok(msg) => msg,
             Err(e)  => return Err(e),
         };
-        // Warm the cache from the ACK's schema version (no schema block in ACK).
-        let ack_version = wire_flags_get_schema_version(ack.flags);
-        if ack_version != 0 && ack_version != cached_version {
-            cache.put(target_id, (schema.clone(), ack_version));
-        }
+        // No manual cache write here. Whenever the server changed the schema
+        // version it also included the schema block in the ACK
+        // (wire_should_include_schema), and recv_message_cached_inner already
+        // cached that authoritative schema (with the server's real column
+        // names). A schema.clone() here would clobber it with the caller's
+        // copy — dropping the server's column names, and on schema evolution
+        // pairing the OLD schema with the NEW version. On the pure warm path
+        // the version is unchanged: nothing to do.
         Ok(ack)
     }
 
@@ -266,5 +288,47 @@ impl Connection {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, low_16, extra, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error_msg(error_text: Option<String>) -> Message {
+        Message {
+            status: STATUS_ERROR,
+            target_id: 0, client_id: 0, flags: 0, seek_pk: 0,
+            seek_col_idx: 0, request_id: 0,
+            schema: None, schema_batch: None, data_batch: None,
+            error_text,
+        }
+    }
+
+    // `Message` does not implement Debug, so match the Result rather than
+    // calling unwrap_err (which would require the Ok variant to be Debug).
+    fn server_error_text(msg: Message) -> String {
+        match check_response(msg) {
+            Err(ClientError::ServerError(s)) => s,
+            Err(other) => panic!("expected ServerError, got {other:?}"),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    #[test]
+    fn check_response_empty_error_text_falls_back_to_default() {
+        // A STATUS_ERROR with Some("") must surface the default text, not a
+        // blank ServerError — the warm-push guard's rejection must be legible.
+        assert_eq!(server_error_text(error_msg(Some(String::new()))), "unknown server error");
+    }
+
+    #[test]
+    fn check_response_none_error_text_falls_back_to_default() {
+        assert_eq!(server_error_text(error_msg(None)), "unknown server error");
+    }
+
+    #[test]
+    fn check_response_nonempty_error_text_preserved() {
+        assert_eq!(server_error_text(error_msg(Some("real error".into()))), "real error");
     }
 }

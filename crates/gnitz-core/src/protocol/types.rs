@@ -170,6 +170,19 @@ impl Schema {
             )
             && !self.columns[cols[0]].is_nullable
     }
+
+    /// Structural type-equality used by the warm-push guard. Mirrors the
+    /// server's `validate_schema_match` field set: column count, per-column
+    /// `type_code`, `pk_cols`, and per-column nullability. Deliberately does
+    /// NOT compare column *names* (the server validator does not), so a
+    /// name-only difference still takes the warm fast path.
+    pub fn types_match(&self, other: &Schema) -> bool {
+        self.columns.len() == other.columns.len()
+            && self.pk_cols == other.pk_cols
+            && self.columns.iter().zip(&other.columns).all(|(a, b)| {
+                a.type_code == b.type_code && a.is_nullable == b.is_nullable
+            })
+    }
 }
 
 /// Returns the META_SCHEMA singleton (4 columns: col_idx/U64 pk=0, type_code/U64, flags/U64, name/String).
@@ -981,6 +994,69 @@ mod tests {
             pk_cols: vec![0],
         };
         assert_ne!(a, b);
+    }
+
+    // --- types_match (warm-push guard) tests ---
+
+    fn one_col(name: &str, tc: TypeCode, nullable: bool) -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: name.into(), type_code: tc, is_nullable: nullable, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    #[test]
+    fn types_match_false_on_pk_type_u64_vs_i64() {
+        // The core bug: a U64-pk batch against an I64 table must NOT take the
+        // warm path (different OPK image for the same logical value).
+        let u = one_col("pk", TypeCode::U64, false);
+        let i = one_col("pk", TypeCode::I64, false);
+        assert!(!u.types_match(&i));
+    }
+
+    #[test]
+    fn types_match_ignores_column_names() {
+        // A name-only difference must still take the warm fast path: the
+        // server validator ignores names.
+        let a = one_col("pk", TypeCode::U64, false);
+        let b = one_col("id", TypeCode::U64, false);
+        assert!(a.types_match(&b));
+    }
+
+    #[test]
+    fn types_match_false_on_nullability() {
+        let a = one_col("x", TypeCode::U64, false);
+        let b = one_col("x", TypeCode::U64, true);
+        assert!(!a.types_match(&b));
+    }
+
+    #[test]
+    fn types_match_false_on_pk_cols() {
+        let a = Schema {
+            columns: vec![
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut b = a.clone();
+        b.pk_cols = vec![1];
+        assert!(!a.types_match(&b));
+    }
+
+    #[test]
+    fn types_match_false_on_column_count() {
+        let a = one_col("pk", TypeCode::U64, false);
+        let b = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        assert!(!a.types_match(&b));
     }
 
     // --- Step 2: validate() tests ---

@@ -58,17 +58,16 @@ class TestFilterRetraction:
                 "CREATE VIEW v AS SELECT * FROM t WHERE val > 50",
                 schema_name=sn,
             )
-            tid, _ = client.resolve_table(sn, "t")
+            tid, t_schema = client.resolve_table(sn, "t")
             vid, _ = client.resolve_table(sn, "v")
 
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
 
-            # Retract the row
-            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-            schema = gnitz.Schema(cols)
-            batch = gnitz.ZSetBatch(schema)
+            # Retract using the table's actual schema, not a hand-built U64 one.
+            # BIGINT PKs are stored as signed I64; a U64-typed batch would encode
+            # a different order-preserving PK image and never consolidate.
+            batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=1, val=100, weight=-1)
             client.push(tid, batch)
 
@@ -93,16 +92,13 @@ class TestFilterRetraction:
                 "CREATE VIEW v AS SELECT * FROM t WHERE val > 50",
                 schema_name=sn,
             )
-            tid, _ = client.resolve_table(sn, "t")
+            tid, t_schema = client.resolve_table(sn, "t")
             vid, _ = client.resolve_table(sn, "v")
 
             client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
 
-            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-            schema = gnitz.Schema(cols)
-            batch = gnitz.ZSetBatch(schema)
+            batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=1, val=10, weight=-1)
             client.push(tid, batch)
 
@@ -135,24 +131,21 @@ class TestJoinRetraction:
             "CREATE VIEW v AS SELECT a.pk, a.val, b.label FROM a JOIN b ON a.pk = b.pk",
             schema_name=sn,
         )
-        a_tid, _ = client.resolve_table(sn, "a")
-        b_tid, _ = client.resolve_table(sn, "b")
+        a_tid, a_schema = client.resolve_table(sn, "a")
+        b_tid, b_schema = client.resolve_table(sn, "b")
         vid, _ = client.resolve_table(sn, "v")
-        return a_tid, b_tid, vid
+        return a_tid, a_schema, b_tid, b_schema, vid
 
     def test_delete_propagates_through_join(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            a_tid, b_tid, vid = self._setup(client, sn)
+            a_tid, a_schema, b_tid, b_schema, vid = self._setup(client, sn)
 
             client.execute_sql("INSERT INTO a VALUES (1, 100)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
 
-            a_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                      gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-            a_schema = gnitz.Schema(a_cols)
             batch = gnitz.ZSetBatch(a_schema)
             batch.append(pk=1, val=100, weight=-1)
             client.push(a_tid, batch)
@@ -170,15 +163,12 @@ class TestJoinRetraction:
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            a_tid, b_tid, vid = self._setup(client, sn)
+            a_tid, a_schema, b_tid, b_schema, vid = self._setup(client, sn)
 
             client.execute_sql("INSERT INTO a VALUES (1, 100)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
 
-            b_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                      gnitz.ColumnDef("label", gnitz.TypeCode.I64)]
-            b_schema = gnitz.Schema(b_cols)
             batch = gnitz.ZSetBatch(b_schema)
             batch.append(pk=1, label=999, weight=-1)
             client.push(b_tid, batch)
@@ -660,14 +650,11 @@ class TestViewCascade:
             v1_id, v1_schema = client.resolve_table(sn, "v1")
             v2_id = client.create_view(sn, "v2", v1_id, v1_schema)
 
-            tid, _ = client.resolve_table(sn, "t")
+            tid, t_schema = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
             assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 1
 
-            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-            schema = gnitz.Schema(cols)
-            batch = gnitz.ZSetBatch(schema)
+            batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=1, val=100, weight=-1)
             client.push(tid, batch)
 

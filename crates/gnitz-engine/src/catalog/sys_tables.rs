@@ -255,6 +255,16 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
 /// prefix that `retract_rows_by_view` / `load_circuit` / `get_dep_map` seek and
 /// decode. `sub` is the per-view secondary (node_id, dep_table_id, or an
 /// edge/node-column field pack).
+///
+/// CONVERGENCE INVARIANT: the client (`write_circuit_rows`) packs the same
+/// compound PK with `view_id` in the LOW u128 half (`vid | (sub << 64)`),
+/// the byte-order dual of this `(vid << 64) | sub`. The two reach storage
+/// through different encoders — the client OPK-encodes each 8-byte PK column
+/// independently (low u128 bytes → first column), the engine writes the whole
+/// u128 big-endian — and produce the IDENTICAL view_id-major at-rest image
+/// only because every circuit-PK column is exactly 8 bytes and unsigned.
+/// Changing either encoder, the column widths, or the signedness breaks view
+/// loading (prefix seeks on `view_id.to_be_bytes()`).
 pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
     ((view_id as u64 as u128) << 64) | (sub as u128)
 }
