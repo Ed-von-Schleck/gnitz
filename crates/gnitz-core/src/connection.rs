@@ -1,5 +1,6 @@
 use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use lru::LruCache;
 use crate::protocol::{
@@ -99,7 +100,7 @@ impl Connection {
         target_id: u64,
         schema:    &Schema,
         batch:     &ZSetBatch,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<u64, ClientError> {
         self.push_with_mode(target_id, schema, batch, WireConflictMode::Update, cache)
     }
@@ -110,7 +111,7 @@ impl Connection {
         schema:    &Schema,
         batch:     &ZSetBatch,
         mode:      WireConflictMode,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<u64, ClientError> {
         batch.validate(schema).map_err(ClientError::ServerError)?;
         let msg = self.roundtrip_push(target_id, schema, batch, mode, cache)?;
@@ -120,19 +121,19 @@ impl Connection {
     pub fn scan(
         &mut self,
         target_id: u64,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
-    ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, &[], 0, None, None)?;
-        let mut schema: Option<Schema> = None;
+        let mut schema: Option<Arc<Schema>> = None;
         let mut data:   Option<ZSetBatch> = None;
         let lsn: u64 = loop {
             let msg = check_response(self.recv_message_cached_inner(target_id, cache)?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
-            schema = schema.or(msg.schema);
+            schema = schema.or(msg.schema.map(Arc::new));
             if let Some(batch) = msg.data_batch {
                 match data.as_mut() {
                     Some(acc) => acc.extend_from_owned(batch),
@@ -143,6 +144,10 @@ impl Connection {
                 break msg.seek_pk as u64;
             }
         };
+        // Warm-cache responses omit the schema block. Recover once from the LRU cache.
+        if schema.is_none() {
+            schema = cache.get(&target_id).map(|(s, _)| Arc::clone(s));
+        }
         Ok((schema, data, lsn))
     }
 
@@ -150,10 +155,11 @@ impl Connection {
         &mut self,
         target_id: u64,
         pk:        &PkTuple,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
-    ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         let msg = self.roundtrip_seek(target_id, pk, cache)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
+        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
+        Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     pub fn seek_by_index(
@@ -161,10 +167,11 @@ impl Connection {
         table_id: u64,
         col_idx:  u64,
         key:      u128,
-        cache:    &mut LruCache<u64, (Schema, u16)>,
-    ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+        cache:    &mut LruCache<u64, (Arc<Schema>, u16)>,
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         let msg = self.roundtrip_seek_by_index(table_id, col_idx, key, cache)?;
-        Ok((msg.schema, msg.data_batch, msg.seek_pk as u64))
+        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
+        Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     /// Receive one framed message, using the LRU cache to decode continuation
@@ -172,12 +179,12 @@ impl Connection {
     fn recv_message_cached_inner(
         &mut self,
         target_id: u64,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let msg = {
             // `get` (not `peek`) so a frequently-accessed schema refreshes its
             // LRU recency and isn't evicted under memory pressure.
-            let hint = cache.get(&target_id).map(|(s, v)| (s as &_, *v));
+            let hint = cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
             recv_message(self.sock.as_raw_fd(), hint, self.max_payload_len)?
         };
         // schema_batch is Some only when the schema block was physically in the frame;
@@ -185,7 +192,7 @@ impl Connection {
         if msg.schema_batch.is_some() {
             let version = wire_flags_get_schema_version(msg.flags);
             let s = msg.schema.as_ref().unwrap();
-            cache.put(target_id, (s.clone(), version));
+            cache.put(target_id, (Arc::new(s.clone()), version));
         }
         Ok(msg)
     }
@@ -224,14 +231,14 @@ impl Connection {
         schema:    &Schema,
         batch:     &ZSetBatch,
         mode:      WireConflictMode,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let base_flags = wire_flags_set_conflict_mode(0, mode);
-        let (cached_version, warm_ok) = match cache.peek(&target_id) {
-            Some((cached_schema, v)) if *v != 0 => (*v, schema.types_match(cached_schema)),
-            _ => (0, false),
+        let warm_version: Option<u16> = match cache.peek(&target_id) {
+            Some((cached_schema, v)) if *v != 0 && schema.types_match(cached_schema.as_ref()) => Some(*v),
+            _ => None,
         };
-        if warm_ok {
+        if let Some(cached_version) = warm_version {
             // Warm path: omit schema block, embed cached version.
             let flags = wire_flags_set_schema_version(base_flags, cached_version);
             send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
@@ -265,7 +272,7 @@ impl Connection {
         table_id: u64,
         col_idx:  u64,
         key:      u128,
-        cache:    &mut LruCache<u64, (Schema, u16)>,
+        cache:    &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         // Embed the cached schema version so the server can omit the schema
         // block on a warm-cache hit (matching roundtrip_push/scan).
@@ -280,7 +287,7 @@ impl Connection {
         &mut self,
         target_id: u64,
         pk:        &PkTuple,
-        cache:     &mut LruCache<u64, (Schema, u16)>,
+        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let (low_16, extra) = pk.split_wire();
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
@@ -288,6 +295,33 @@ impl Connection {
         send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, low_16, extra, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::sync::Arc;
+    use lru::LruCache;
+    use crate::protocol::{Schema, ColumnDef, TypeCode};
+
+    #[test]
+    fn schema_cache_arc_not_clone() {
+        let mut cache: LruCache<u64, (Arc<Schema>, u16)> =
+            LruCache::new(std::num::NonZeroUsize::new(4).unwrap());
+        let schema = Arc::new(Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), type_code: TypeCode::I64,
+                             is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        });
+        cache.put(42, (Arc::clone(&schema), 1));
+
+        // Warm hit must bump the refcount, not deep-copy.
+        let warm = cache.get(&42).map(|(s, _)| Arc::clone(s)).unwrap();
+        assert_eq!(Arc::strong_count(&schema), 3); // original + cache + warm
+        drop(warm);
+        assert_eq!(Arc::strong_count(&schema), 2); // original + cache
     }
 }
 

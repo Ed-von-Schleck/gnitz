@@ -233,6 +233,12 @@ int gnitz_seek_by_index(GnitzConn *conn,
 
 int gnitz_execute_sql(GnitzConn *conn, const char *sql, const char *schema, uint64_t *out_id);
 
+int gnitz_batch_is_null(const GnitzBatch *batch, size_t col_idx, size_t row);
+
+double gnitz_batch_get_f64(const GnitzBatch *batch, size_t col_idx, size_t row);
+
+GnitzBatch *gnitz_execute_sql_query(GnitzConn *conn, const char *sql, const char *schema);
+
 void gnitz_free_string(char *s);
 
 #endif  /* GNITZ_H */

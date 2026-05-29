@@ -46,8 +46,11 @@ class TestTypeCode:
     def test_all_values_present(self):
         assert {tc.name for tc in TypeCode} == {
             "U8", "I8", "U16", "I16", "U32", "I32", "F32",
-            "U64", "I64", "F64", "STRING", "U128", "UUID",
+            "U64", "I64", "F64", "STRING", "U128", "UUID", "BLOB",
         }
+
+    def test_blob_constant(self):
+        assert TypeCode.BLOB == 14
 
 
 class TestColumnDef:
@@ -246,6 +249,20 @@ class TestRow:
     def test_missing_key_raises(self):
         with pytest.raises(KeyError):
             _ = self._row()["nonexistent"]
+
+    def test_hashable_hash_equals_tuple_hash(self):
+        row = self._row()
+        assert hash(row) == hash(self._VALUES)
+
+    def test_hashable_usable_in_set(self):
+        row = self._row()
+        s = {row}
+        assert row in s
+
+    def test_hashable_usable_as_dict_key(self):
+        row = self._row()
+        d = {row: "value"}
+        assert d[row] == "value"
 
 
 class TestZSetBatchErrors:
@@ -902,5 +919,81 @@ class TestStructOnline:
         rows = {r.pk: r.label for r in client.scan(tid)}
         assert rows[1] == "hello"
         assert rows[2] is None
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+
+class TestEmptyTableLazySchema:
+    """Fix 3: scan on an empty table must return a ScanResult with a
+    non-None schema."""
+
+    def test_scan_empty_table_has_schema(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
+                ColumnDef("val", TypeCode.I64)]
+        tid = client.create_table(sn, "t", cols)
+        result = client.scan(tid)
+        assert result.schema is not None, "scan on empty table must return non-None schema"
+        assert len(result) == 0
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+
+class TestUuidScalars:
+    """Fix 8: ScanResult.scalars() on a UUID payload column must return
+    hyphenated strings, matching the output of iteration and mappings()."""
+
+    def test_scalars_uuid_col_returns_hyphenated_strings(self, client):
+        import uuid as _uuid
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        uid_val = _uuid.uuid4()
+        uid_str = str(uid_val)
+        cols = [
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("id", TypeCode.UUID),
+        ]
+        schema = Schema(cols)
+        tid = client.create_table(sn, "t", cols)
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, id=uid_val)
+        client.push(tid, batch)
+        result = client.scan(tid)
+        scalars = result.scalars("id")
+        assert len(scalars) == 1
+        assert scalars[0] == uid_str, f"expected {uid_str!r}, got {scalars[0]!r}"
+        # Verify it matches the iteration path too.
+        row = result.first()
+        assert row.id == uid_str
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+
+class TestUuidSeekDelete:
+    """Fix 11: seek() must accept uuid.UUID objects as PK."""
+
+    def test_seek_with_uuid_object(self, client):
+        import uuid as _uuid
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        uid_val = _uuid.uuid4()
+        uid_str = str(uid_val)
+        cols = [
+            ColumnDef("pk", TypeCode.UUID, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        schema = Schema(cols)
+        tid = client.create_table(sn, "t", cols)
+        batch = ZSetBatch(schema)
+        batch.append(pk=uid_val, val=42)
+        client.push(tid, batch)
+        # seek() with a uuid.UUID object must not raise TypeError.
+        result = client.seek(tid, uid_val)
+        assert result is not None
+        assert len(result) == 1
+        row = result.first()
+        assert row is not None
+        assert row.pk == uid_str
         client.drop_table(sn, "t")
         client.drop_schema(sn)

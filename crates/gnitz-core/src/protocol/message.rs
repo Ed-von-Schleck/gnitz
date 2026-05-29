@@ -319,21 +319,25 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
             None => return Err(ProtocolError::DecodeError(
                 "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into()
             )),
-            Some((hint_schema, cached_version)) => {
+            Some((_hint_schema, cached_version)) => {
                 let server_version = wire_flags_get_schema_version(flags);
                 if server_version != cached_version {
                     return Err(ProtocolError::DecodeError(format!(
                         "schema version mismatch: cached={cached_version} server={server_version}"
                     )));
                 }
-                wire_schema = Some(hint_schema.clone());
+                // hint-only frame: decode against borrowed hint below; no schema carried in Message
             }
         }
     }
 
     let data_batch = if has_data {
-        let eff = wire_schema.as_ref()
-            .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?;
+        let eff: &Schema = match wire_schema.as_ref() {
+            Some(s) => s,
+            None => schema_hint.map(|(s, _)| s).ok_or_else(|| {
+                ProtocolError::DecodeError("no schema for data block".into())
+            })?,
+        };
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
             return Err(ProtocolError::DecodeError("data block header truncated".into()));
         }
@@ -386,6 +390,7 @@ mod tests {
     use std::os::unix::io::RawFd;
     use crate::protocol::types::{ColData, PkColumn, ColumnDef, Schema, TypeCode, ZSetBatch};
     use crate::protocol::header::{Header, FLAG_PUSH, STATUS_ERROR};
+    use crate::protocol::header::wire_flags_set_schema_version;
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
@@ -714,5 +719,45 @@ mod tests {
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
         assert!(msg.data_batch.is_none());
+    }
+
+    /// A hint-only frame (FLAG_HAS_DATA set, FLAG_HAS_SCHEMA clear, matching schema
+    /// version) must decode data_batch correctly but leave schema == None.
+    /// Before Fix 1, parse_response cloned the hint into wire_schema, so msg.schema
+    /// would be Some — this test catches that regression.
+    #[test]
+    fn hint_only_frame_returns_data_schema_none() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut val_bytes = Vec::new();
+        val_bytes.extend_from_slice(&42i64.to_le_bytes());
+        let batch = ZSetBatch {
+            pks:     PkColumn::U64s(vec![1u64]),
+            weights: vec![1],
+            nulls:   vec![0],
+            columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
+        };
+
+        let (a, b) = make_socketpair();
+        // Embed version=1 in flags; no schema block in the frame.
+        let flags = wire_flags_set_schema_version(0, 1);
+        send_message_noschema(a, 42, 0, flags, &schema, &batch).unwrap();
+
+        // Parse with a matching hint (same schema, version 1).
+        let msg = recv_message(b, Some((&schema, 1)), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+
+        // Fix 1: schema must be None — the hint was not physically in the frame.
+        assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
+        // Data must still decode correctly.
+        let data = msg.data_batch.expect("data_batch must be Some");
+        assert_eq!(data.pks, vec![1u128]);
+        assert_eq!(data.weights, vec![1i64]);
+
+        unsafe { libc::close(a); libc::close(b); }
     }
 }

@@ -15,3 +15,4 @@ class TypeCode(IntEnum):
     STRING = 11
     U128   = 12
     UUID   = 13
+    BLOB   = 14

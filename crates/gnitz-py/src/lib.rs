@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use lru::LruCache;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyString, PyTuple};
@@ -37,6 +38,7 @@ impl PyTypeCode {
     #[classattr] pub const STRING: u32 = 11;
     #[classattr] pub const U128:   u32 = 12;
     #[classattr] pub const UUID:   u32 = 13;
+    #[classattr] pub const BLOB:   u32 = 14;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +298,10 @@ impl PyRow {
         }
     }
 
+    pub fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        self.values.bind(py).hash()
+    }
+
     pub fn _asdict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let fields = self.fields.bind(py);
         let values = self.values.bind(py);
@@ -321,7 +327,7 @@ impl PyRow {
 /// and batch without any Python→Rust re-extraction.
 #[pyclass(name = "ZSetBatch")]
 pub struct PyZSetBatch {
-    pub(crate) schema:   Schema,
+    pub(crate) schema:   Arc<Schema>,
     pub(crate) batch:    ZSetBatch,
     /// Interned PyString for each column name — built once, reused across all appends.
     col_keys:     Vec<Py<PyString>>,
@@ -386,7 +392,7 @@ impl PyZSetBatch {
     /// row (e.g. type error on the third payload column) does not leave the
     /// batch with mismatched column lengths.
     fn rollback_to(&mut self, n: usize) {
-        self.batch.truncate(n, &self.schema);
+        self.batch.truncate(n, self.schema.as_ref());
     }
 
     fn append_column_value(
@@ -509,7 +515,7 @@ impl PyZSetBatch {
             .map(|(pi, ci, _)| (pi, ci))
             .collect();
         let batch = ZSetBatch::new(&rust_schema);
-        Ok(PyZSetBatch { schema: rust_schema, batch, col_keys, payload_cols })
+        Ok(PyZSetBatch { schema: Arc::new(rust_schema), batch, col_keys, payload_cols })
     }
 
     /// Append a row given column-ordered values and a weight (backward compat).
@@ -573,7 +579,7 @@ impl PyZSetBatch {
     }
     #[getter]
     pub fn columns(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        rust_batch_columns_to_py(py, &self.schema, &self.batch, self.batch.len())
+        rust_batch_columns_to_py(py, self.schema.as_ref(), &self.batch, self.batch.len())
     }
 
     pub fn __len__(&self) -> usize { self.batch.len() }
@@ -716,9 +722,9 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
 
 /// Convert a Rust ZSetBatch + Schema into a Python ZSetBatch (used by non-lazy scan/seek).
 fn rust_batch_to_py(
-    py: Python<'_>,
-    schema: &Schema,
-    batch:  &ZSetBatch,
+    py:     Python<'_>,
+    schema: Arc<Schema>,
+    batch:  ZSetBatch,
 ) -> PyResult<Py<PyZSetBatch>> {
     let col_keys = schema.columns.iter()
         .map(|c| PyString::new(py, &c.name).unbind())
@@ -726,12 +732,7 @@ fn rust_batch_to_py(
     let payload_cols = schema.payload_columns()
         .map(|(pi, ci, _)| (pi, ci))
         .collect();
-    Py::new(py, PyZSetBatch {
-        schema: schema.clone(),
-        batch:  batch.clone(),
-        col_keys,
-        payload_cols,
-    })
+    Py::new(py, PyZSetBatch { schema, batch, col_keys, payload_cols })
 }
 
 // ---------------------------------------------------------------------------
@@ -739,38 +740,84 @@ fn rust_batch_to_py(
 // ---------------------------------------------------------------------------
 
 struct SharedBatchData {
-    schema: Schema,
-    batch:  ZSetBatch,
+    schema:      Arc<Schema>,
+    batch:       ZSetBatch,
     /// Pre-computed field-name tuple, created once and shared across all iterators.
-    fields: Py<PyTuple>,
+    fields:      Py<PyTuple>,
     /// field name → column index, built once and shared via Arc for O(1) row attr lookup.
     field_index: Arc<HashMap<String, usize>>,
+    /// Per-column UUID flag, hoisted out of the per-row loop.
+    is_uuid:     Vec<bool>,
+    /// Per-column PK flag, hoisted out of the per-row loop.
+    is_pk:       Vec<bool>,
+    /// schema.payload_idx(ci) for non-PK cols; 0 for PK cols (unused).
+    payload_idx: Vec<usize>,
+    /// type_code.wire_stride() per column.
+    wire_stride: Vec<usize>,
 }
 
 fn build_field_index(schema: &Schema) -> Arc<HashMap<String, usize>> {
     Arc::new(schema.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect())
 }
 
+fn make_shared_batch_data(
+    py: Python<'_>,
+    s: Arc<Schema>,
+    b: ZSetBatch,
+) -> PyResult<Arc<SharedBatchData>> {
+    if b.len() == 0 {
+        return Ok(Arc::new(SharedBatchData {
+            schema:      s,
+            batch:       b,
+            fields:      PyTuple::empty(py).unbind(),
+            field_index: Arc::new(HashMap::new()),
+            is_uuid:     Vec::new(),
+            is_pk:       Vec::new(),
+            payload_idx: Vec::new(),
+            wire_stride: Vec::new(),
+        }));
+    }
+    let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+    let fields = PyTuple::new(py, names)?.unbind();
+    let field_index = build_field_index(s.as_ref());
+    let is_uuid: Vec<bool> = s.columns.iter().map(|c| c.type_code == TypeCode::UUID).collect();
+    let is_pk: Vec<bool> = (0..s.columns.len()).map(|ci| s.is_pk_col(ci)).collect();
+    let payload_idx: Vec<usize> = (0..s.columns.len())
+        .map(|ci| if s.is_pk_col(ci) { 0 } else { s.payload_idx(ci) }).collect();
+    let wire_stride: Vec<usize> = s.columns.iter().map(|c| c.type_code.wire_stride()).collect();
+    Ok(Arc::new(SharedBatchData {
+        schema: s, batch: b, fields, field_index,
+        is_uuid, is_pk, payload_idx, wire_stride,
+    }))
+}
+
 /// Build Python values for a single row from Rust data, appending to `out`.
 fn build_row_values_into(
-    py: Python<'_>, schema: &Schema, batch: &ZSetBatch, row: usize,
-    out: &mut Vec<PyObject>,
+    py:          Python<'_>,
+    schema:      &Schema,
+    batch:       &ZSetBatch,
+    row:         usize,
+    is_uuid:     &[bool],
+    is_pk:       &[bool],
+    payload_idx: &[usize],
+    wire_stride: &[usize],
+    out:         &mut Vec<PyObject>,
 ) -> PyResult<()> {
     let null_word = batch.nulls[row];
     let pk_stride = schema.pk_stride() as u8;
     let pk_tuple  = batch.pks.get_tuple(row, pk_stride);
 
     for ci in 0..schema.columns.len() {
-        if schema.is_pk_col(ci) {
+        if is_pk[ci] {
             out.push(pk_value_from_tuple(py, schema, ci, &pk_tuple));
         } else {
-            let payload_idx = schema.payload_idx(ci);
-            if null_word & (1u64 << payload_idx) != 0 {
+            let p_idx = payload_idx[ci];
+            if null_word & (1u64 << p_idx) != 0 {
                 out.push(py.None());
             } else {
                 match &batch.columns[ci] {
                     ColData::Fixed(buf) => {
-                        let stride = schema.columns[ci].type_code.wire_stride();
+                        let stride = wire_stride[ci];
                         out.push(read_fixed_le(
                             py, schema.columns[ci].type_code,
                             &buf[row * stride..(row + 1) * stride],
@@ -785,7 +832,7 @@ fn build_row_values_into(
                         None    => out.push(py.None()),
                     },
                     ColData::U128s(v) => {
-                        if schema.columns[ci].type_code == TypeCode::UUID {
+                        if is_uuid[ci] {
                             out.push(format_uuid(v[row]).into_pyobject(py)?.into_any().unbind());
                         } else {
                             out.push(v[row].into_pyobject(py)?.into_any().unbind());
@@ -850,7 +897,7 @@ impl PyRustBatch {
         if let Some(ref cached) = self.cached_columns {
             return Ok(cached.clone_ref(py));
         }
-        let schema = &self.data.schema;
+        let schema = self.data.schema.as_ref();
         let batch = &self.data.batch;
         let n = batch.len();
         let list = rust_batch_columns_to_py(py, schema, batch, n)?;
@@ -941,7 +988,7 @@ impl PyScanResult {
         }
         let obj = match &self.data {
             None => py.None(),
-            Some(d) => rust_schema_to_py(py, &d.schema)?.into_any(),
+            Some(d) => rust_schema_to_py(py, d.schema.as_ref())?.into_any(),
         };
         self.cached_schema = Some(obj.clone_ref(py));
         Ok(obj)
@@ -1037,7 +1084,10 @@ impl PyScanResult {
         let mut row_buf = Vec::new();
         for i in 0..data.batch.len() {
             row_buf.clear();
-            build_row_values_into(py, &data.schema, &data.batch, i, &mut row_buf)?;
+            build_row_values_into(py, &data.schema, &data.batch, i,
+                                  &data.is_uuid, &data.is_pk,
+                                  &data.payload_idx, &data.wire_stride,
+                                  &mut row_buf)?;
             let dict = PyDict::new(py);
             for (fi, val) in row_buf.iter().enumerate() {
                 dict.set_item(fields.get_item(fi)?, val)?;
@@ -1135,12 +1185,17 @@ impl PyScanResult {
                 Ok(PyList::new(py, items)?.unbind())
             }
             ColData::U128s(v) => {
+                let is_uuid = data.schema.columns[col_idx].type_code == TypeCode::UUID;
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, &x)| {
                         if nulls[i] & null_bit != 0 {
                             return Ok(py.None());
                         }
-                        Ok(x.into_pyobject(py)?.into_any().unbind())
+                        if is_uuid {
+                            Ok(format_uuid(x).into_pyobject(py)?.into_any().unbind())
+                        } else {
+                            Ok(x.into_pyobject(py)?.into_any().unbind())
+                        }
                     })
                     .collect::<PyResult<_>>()?;
                 Ok(PyList::new(py, items)?.unbind())
@@ -1173,7 +1228,10 @@ impl PyRowIterator {
         }
         let data = self.data.as_ref().unwrap();
         self.row_buf.clear();
-        build_row_values_into(py, &data.schema, &data.batch, self.pos, &mut self.row_buf)?;
+        build_row_values_into(py, &data.schema, &data.batch, self.pos,
+                              &data.is_uuid, &data.is_pk,
+                              &data.payload_idx, &data.wire_stride,
+                              &mut self.row_buf)?;
         let weight = data.batch.weights[self.pos];
         self.pos += 1;
 
@@ -1192,21 +1250,21 @@ impl PyRowIterator {
 // GnitzClient
 // ---------------------------------------------------------------------------
 
-/// Shared helper: convert a (Option<Schema>, Option<ZSetBatch>, u64) response into a Python tuple.
+/// Shared helper: convert a (Option<Arc<Schema>>, Option<ZSetBatch>, u64) response into a Python tuple.
 fn response_to_py_tuple(
     py: Python<'_>,
-    result: Result<(Option<Schema>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
+    result: Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
 ) -> PyResult<PyObject> {
     let (opt_schema, opt_batch, view_lsn) = result
         .map_err(|e| GnitzError::new_err(e.to_string()))?;
     let (py_schema, py_batch) = match (opt_schema, opt_batch) {
         (Some(s), Some(b)) => {
-            let ps = rust_schema_to_py(py, &s)?.into_any();
-            let pb = rust_batch_to_py(py, &s, &b)?.into_any();
+            let ps = rust_schema_to_py(py, s.as_ref())?.into_any();
+            let pb = rust_batch_to_py(py, Arc::clone(&s), b)?.into_any();
             (ps, pb)
         }
         (Some(s), None) => {
-            let ps = rust_schema_to_py(py, &s)?.into_any();
+            let ps = rust_schema_to_py(py, s.as_ref())?.into_any();
             (ps, py.None())
         }
         _ => (py.None(), py.None()),
@@ -1215,19 +1273,27 @@ fn response_to_py_tuple(
     Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
 }
 
-/// Shared helper: wrap a (Option<Schema>, Option<ZSetBatch>, u64) into a lazy PyScanResult.
+/// Shared helper: wrap a (Option<Arc<Schema>>, Option<ZSetBatch>, u64) into a lazy PyScanResult.
 fn response_to_lazy(
     py: Python<'_>,
-    result: Result<(Option<Schema>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
+    result: Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
 ) -> PyResult<Py<PyScanResult>> {
     let (opt_schema, opt_batch, view_lsn) = result
         .map_err(|e| GnitzError::new_err(e.to_string()))?;
     let data = match (opt_schema, opt_batch) {
-        (Some(s), Some(b)) => {
-            let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
-            let fields = PyTuple::new(py, names)?.unbind();
-            let field_index = build_field_index(&s);
-            Some(Arc::new(SharedBatchData { schema: s, batch: b, fields, field_index }))
+        (Some(s), Some(b)) if b.len() > 0 => Some(make_shared_batch_data(py, s, b)?),
+        (Some(s), opt_b) => {
+            let b = opt_b.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
+            Some(Arc::new(SharedBatchData {
+                schema:      s,
+                batch:       b,
+                fields:      PyTuple::empty(py).unbind(),
+                field_index: Arc::new(HashMap::new()),
+                is_uuid:     Vec::new(),
+                is_pk:       Vec::new(),
+                payload_idx: Vec::new(),
+                wire_stride: Vec::new(),
+            }))
         }
         _ => None,
     };
@@ -1325,7 +1391,7 @@ impl PyGnitzClient {
                 "invalid conflict_mode '{}': expected 'update' or 'error'", other
             ))),
         };
-        client!(self).push_with_mode(target_id, &batch.schema, &batch.batch, mode)
+        client!(self).push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, mode)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -1479,10 +1545,7 @@ impl PyGnitzClient {
                 }
                 SqlResult::Rows { schema, batch } => {
                     d.set_item("type", "Rows")?;
-                    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-                    let fields = PyTuple::new(py, names)?.unbind();
-                    let field_index = build_field_index(&schema);
-                    let data = Arc::new(SharedBatchData { schema, batch, fields, field_index });
+                    let data = make_shared_batch_data(py, Arc::new(schema), batch)?;
                     let scan_result = Py::new(py, PyScanResult {
                         data: Some(data), lsn: 0,
                         cached_schema: None, cached_batch: None,
@@ -1680,29 +1743,13 @@ fn encode_push_payload(
     gnitz_core::encode_message(target_id, client_id, 0, 0u128, &[], 0, Some(schema), Some(batch))
 }
 
-fn encode_scan_payload(
-    client_id: u64, target_id: u64,
-) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0u128, &[], 0, None, None)
-}
-
-fn encode_seek_payload(
-    client_id: u64, target_id: u64, pk: &gnitz_core::PkTuple,
-) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    let (pk_lo, pk_extra) = pk.split_wire();
-    gnitz_core::encode_message(
-        target_id, client_id, gnitz_core::FLAG_SEEK, pk_lo, pk_extra, 0, None, None,
-    )
-}
-
 /// Build a `PkTuple` from a Python value for the wire-only `seek` paths,
 /// where no schema is available at the FFI boundary. An int extracts as a
 /// narrow 16-byte tuple — the high padding is inert because the server
 /// reads only the column's actual stride. Bytes are forwarded verbatim.
 fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
-    if let Ok(val) = pk.extract::<u128>() {
-        return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
-    }
+    // bytes first: extract::<&[u8]>() rejects non-bytes in O(1), whereas
+    // extract_uuid_or_u128 invokes getattr("int") on failure (~100 ns).
     if let Ok(bytes) = pk.extract::<&[u8]>() {
         if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1710,7 +1757,10 @@ fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
         }
         return Ok(gnitz_core::PkTuple::from_bytes(bytes));
     }
-    Err(pyo3::exceptions::PyTypeError::new_err("pk must be int or bytes"))
+    if let Ok(val) = extract_uuid_or_u128(pk) {
+        return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err("pk must be int, uuid.UUID, UUID string, or bytes"))
 }
 
 /// Build a `PkTuple` from a Python value when the schema's PK stride is
@@ -1720,9 +1770,8 @@ fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
 fn pk_tuple_from_py_with_stride(
     pk: &Bound<'_, PyAny>, stride: usize,
 ) -> PyResult<gnitz_core::PkTuple> {
-    if let Ok(val) = pk.extract::<u128>() {
-        return Ok(gnitz_core::PkTuple::from_u128(stride as u8, val));
-    }
+    // bytes first: extract::<&[u8]>() rejects non-bytes in O(1), whereas
+    // extract_uuid_or_u128 invokes getattr("int") on failure (~100 ns).
     if let Ok(bytes) = pk.extract::<&[u8]>() {
         if bytes.len() != stride {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1731,7 +1780,10 @@ fn pk_tuple_from_py_with_stride(
         }
         return Ok(gnitz_core::PkTuple::from_bytes(bytes));
     }
-    Err(pyo3::exceptions::PyTypeError::new_err("pk must be int or bytes"))
+    if let Ok(val) = extract_uuid_or_u128(pk) {
+        return Ok(gnitz_core::PkTuple::from_u128(stride as u8, val));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err("pk must be int, uuid.UUID, UUID string, or bytes"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,20 +1797,25 @@ enum ResponseKind {
 }
 
 struct IoRequest {
-    payload: Vec<u8>,
-    future:  Py<PyAny>,
-    kind:    ResponseKind,
+    payload:   Vec<u8>,
+    hint:      Option<(Arc<Schema>, u16)>,
+    target_id: u64,
+    future:    Py<PyAny>,
+    kind:      ResponseKind,
 }
 
 /// Bound on the I/O request channel. Limits RAM when Python sends faster than
 /// the network flushes. `enqueue` returns GnitzError if the channel is full.
 const IO_CHANNEL_DEPTH: usize = 4096;
 
+const ASYNC_SCHEMA_CACHE_CAP: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(64).unwrap();
+
 /// Cap on requests merged into one natural-batching cycle.
 const IO_BATCH_MAX: usize = 1024;
 
-static TRANSPORT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static TRANSPORT_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
 
 /// dup() of the connection's socket fd. The I/O thread owns the original
 /// sock_fd; `DupFd` is an independent reference whose `shutdown` wakes any
@@ -1775,16 +1832,19 @@ impl Drop for DupFd {
 
 #[pyclass(name = "AsyncTransport")]
 struct PyAsyncTransport {
-    tx:         Option<std::sync::mpsc::SyncSender<IoRequest>>,
-    dup_fd:     Option<DupFd>,
-    event_loop: Py<PyAny>,
-    client_id:  u64,
-    thread:     Option<std::thread::JoinHandle<()>>,
+    tx:           Option<std::sync::mpsc::SyncSender<IoRequest>>,
+    dup_fd:       Option<DupFd>,
+    event_loop:   Py<PyAny>,
+    client_id:    u64,
+    thread:       Option<std::thread::JoinHandle<()>>,
+    schema_cache: Arc<Mutex<LruCache<u64, (Arc<Schema>, u16)>>>,
 }
 
 impl PyAsyncTransport {
     fn enqueue(
-        &self, py: Python<'_>, payload: Vec<u8>, kind: ResponseKind,
+        &self, py: Python<'_>,
+        payload: Vec<u8>, hint: Option<(Arc<Schema>, u16)>, target_id: u64,
+        kind: ResponseKind,
     ) -> PyResult<PyObject> {
         let tx = self.tx.as_ref().ok_or_else(|| {
             GnitzError::new_err("connection closed")
@@ -1792,6 +1852,8 @@ impl PyAsyncTransport {
         let fut = self.event_loop.call_method0(py, "create_future")?;
         tx.try_send(IoRequest {
             payload,
+            hint,
+            target_id,
             future: fut.clone_ref(py),
             kind,
         }).map_err(|e| match e {
@@ -1837,46 +1899,74 @@ impl PyAsyncTransport {
         }
         let dup_fd = DupFd(raw_dup);
 
-        let client_id = TRANSPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = TRANSPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+        let client_id = (std::process::id() as u64) << 32 | seq;
         let (tx, rx) = std::sync::mpsc::sync_channel(IO_CHANNEL_DEPTH);
         let loop_ref: Py<PyAny> = event_loop.clone_ref(py);
         let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py);
         let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py);
 
+        let schema_cache: Arc<Mutex<LruCache<u64, (Arc<Schema>, u16)>>> =
+            Arc::new(Mutex::new(LruCache::new(ASYNC_SCHEMA_CACHE_CAP)));
+        let cache_ref = Arc::clone(&schema_cache);
         let handle = std::thread::spawn(move || {
-            async_io_loop(sock_fd, max_payload_len, rx, loop_ref, sr_fn, se_fn);
+            async_io_loop(sock_fd, max_payload_len, rx, loop_ref, sr_fn, se_fn, cache_ref);
         });
 
         Ok(PyAsyncTransport {
-            tx:         Some(tx),
-            dup_fd:     Some(dup_fd),
+            tx:           Some(tx),
+            dup_fd:       Some(dup_fd),
             event_loop,
             client_id,
-            thread:     Some(handle),
+            thread:       Some(handle),
+            schema_cache,
         })
     }
 
     fn push(
         &self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>,
     ) -> PyResult<PyObject> {
-        let payload = encode_push_payload(self.client_id, target_id, &batch.schema, &batch.batch)
+        let payload = encode_push_payload(self.client_id, target_id, batch.schema.as_ref(), &batch.batch)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        self.enqueue(py, payload, ResponseKind::Push)
+        self.enqueue(py, payload, None, target_id, ResponseKind::Push)
     }
 
     fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
-        let payload = encode_scan_payload(self.client_id, target_id)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        self.enqueue(py, payload, ResponseKind::Scan)
+        let (flags, hint) = {
+            let cache = self.schema_cache.lock().unwrap();
+            match cache.peek(&target_id) {
+                Some((s, v)) => (
+                    gnitz_core::wire_flags_set_schema_version(0u64, *v),
+                    Some((Arc::clone(s), *v)),
+                ),
+                None => (0u64, None),
+            }
+        };
+        let payload = gnitz_core::encode_message(
+            target_id, self.client_id, flags, 0u128, &[], 0, None, None,
+        ).map_err(|e| GnitzError::new_err(e.to_string()))?;
+        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
 
     fn seek(
         &self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>,
     ) -> PyResult<PyObject> {
         let t = pk_tuple_from_py(&pk)?;
-        let payload = encode_seek_payload(self.client_id, target_id, &t)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        self.enqueue(py, payload, ResponseKind::Scan)
+        let (flags, hint) = {
+            let cache = self.schema_cache.lock().unwrap();
+            match cache.peek(&target_id) {
+                Some((s, v)) => (
+                    gnitz_core::wire_flags_set_schema_version(gnitz_core::FLAG_SEEK, *v),
+                    Some((Arc::clone(s), *v)),
+                ),
+                None => (gnitz_core::FLAG_SEEK, None),
+            }
+        };
+        let (pk_lo, pk_extra) = t.split_wire();
+        let payload = gnitz_core::encode_message(
+            target_id, self.client_id, flags, pk_lo, pk_extra, 0, None, None,
+        ).map_err(|e| GnitzError::new_err(e.to_string()))?;
+        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
 
     #[getter]
@@ -1906,43 +1996,55 @@ impl Drop for PyAsyncTransport {
     }
 }
 
-/// Receive a streaming scan response: loop on `recv_framed` + `parse_response`
-/// until a frame without `FLAG_CONTINUATION` arrives, accumulating schema and
-/// data from each worker frame.  The terminal frame carries the LSN in seek_pk.
+/// Receive a streaming scan response, using `hint` for warm-cache decoding.
+///
+/// Returns `Ok(Ok(...))` on success, `Ok(Err(text))` for application-level
+/// server errors (transport stays up), and `Err(...)` for transport/protocol
+/// failures (caller should tear down the connection).
 fn recv_scan_response(
-    sock_fd: std::os::unix::io::RawFd, max_payload_len: usize,
-) -> Result<gnitz_core::Message, String> {
-    let mut schema: Option<Schema> = None;
-    let mut schema_version: u16 = 0;
-    let mut data:   Option<ZSetBatch> = None;
-    let lsn: u128 = loop {
+    sock_fd:         std::os::unix::io::RawFd,
+    max_payload_len: usize,
+    hint:            Option<(Arc<Schema>, u16)>,
+) -> Result<Result<(Option<Arc<Schema>>, u16, Option<ZSetBatch>, u64), String>, String> {
+    let mut schema: Option<Arc<Schema>> = hint.as_ref().map(|(s, _)| Arc::clone(s));
+    let mut schema_version: u16 = hint.map_or(0, |(_, v)| v);
+    let mut data: Option<ZSetBatch> = None;
+    let lsn: u64 = loop {
         let buf = gnitz_core::recv_framed(sock_fd, max_payload_len).map_err(|e| e.to_string())?;
-        let hint = schema.as_ref().map(|s| (s, schema_version));
-        let msg = gnitz_core::parse_response(&buf, hint).map_err(|e| e.to_string())?;
+        let hint_ref = schema.as_ref().map(|s| (s.as_ref(), schema_version));
+        let msg = gnitz_core::parse_response(&buf, hint_ref).map_err(|e| e.to_string())?;
         if msg.status != 0 {
-            return Err(msg.error_text.unwrap_or_default());
+            let text = msg.error_text
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "server error".into());
+            return Ok(Err(text));
         }
         let is_continuation = (msg.flags & gnitz_core::FLAG_CONTINUATION) != 0;
-        if msg.schema.is_some() {
+        if let Some(s) = msg.schema {
             schema_version = gnitz_core::wire_flags_get_schema_version(msg.flags);
-            schema = msg.schema;
+            schema = Some(Arc::new(s));
         }
         if let Some(batch) = msg.data_batch {
             match data.as_mut() {
                 Some(acc) => acc.extend_from_owned(batch),
-                None => data = Some(batch),
+                None      => data = Some(batch),
             }
         }
-        if !is_continuation {
-            break msg.seek_pk;
-        }
+        if !is_continuation { break msg.seek_pk as u64; }
     };
-    Ok(gnitz_core::Message {
-        status: 0,
-        target_id: 0, client_id: 0, flags: 0,
-        seek_pk: lsn, seek_col_idx: 0, request_id: 0,
-        schema, schema_batch: None, data_batch: data, error_text: None,
-    })
+    Ok(Ok((schema, schema_version, data, lsn)))
+}
+
+enum LoopResult {
+    Push(gnitz_core::Message),
+    Scan {
+        schema:         Option<Arc<Schema>>,
+        schema_version: u16,
+        batch:          Option<ZSetBatch>,
+        lsn:            u64,
+        target_id:      u64,
+    },
+    ScanError(String),
 }
 
 fn async_io_loop(
@@ -1952,6 +2054,7 @@ fn async_io_loop(
     loop_ref:        Py<PyAny>,
     sr_fn:           Py<PyAny>,
     se_fn:           Py<PyAny>,
+    schema_cache:    Arc<Mutex<LruCache<u64, (Arc<Schema>, u16)>>>,
 ) {
     use std::collections::VecDeque;
 
@@ -1961,9 +2064,11 @@ fn async_io_loop(
     // Hoisted scratch — .clear()ed each iteration so the outer slot
     // arrays are reused. (Inner `Vec<u8>` payloads are still produced
     // and dropped per batch by `encode_push_payload`.)
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(IO_BATCH_MAX);
-    let mut kinds:    Vec<ResponseKind> = Vec::with_capacity(IO_BATCH_MAX);
-    let mut results:  Vec<gnitz_core::Message> = Vec::with_capacity(IO_BATCH_MAX);
+    let mut payloads:    Vec<Vec<u8>>                     = Vec::with_capacity(IO_BATCH_MAX);
+    let mut kinds:       Vec<ResponseKind>                = Vec::with_capacity(IO_BATCH_MAX);
+    let mut hints:       Vec<Option<(Arc<Schema>, u16)>>  = Vec::with_capacity(IO_BATCH_MAX);
+    let mut target_ids:  Vec<u64>                         = Vec::with_capacity(IO_BATCH_MAX);
+    let mut results:     Vec<LoopResult>                  = Vec::with_capacity(IO_BATCH_MAX);
 
     loop {
         // Block until at least one request
@@ -1977,14 +2082,20 @@ fn async_io_loop(
         // Py<PyAny>: Send, so moving futures into pending_futures needs no GIL.
         payloads.clear();
         kinds.clear();
+        hints.clear();
+        target_ids.clear();
         payloads.push(first.payload);
         kinds.push(first.kind);
+        hints.push(first.hint);
+        target_ids.push(first.target_id);
         pending_futures.push_back((first.future, first.kind));
         while payloads.len() < IO_BATCH_MAX {
             match rx.try_recv() {
                 Ok(req) => {
                     payloads.push(req.payload);
                     kinds.push(req.kind);
+                    hints.push(req.hint);
+                    target_ids.push(req.target_id);
                     pending_futures.push_back((req.future, req.kind));
                 }
                 Err(_) => break,
@@ -2011,57 +2122,77 @@ fn async_io_loop(
         // remaining futures are failed with the same exception below.
         results.clear();
         let mut recv_err: Option<String> = None;
-        for &kind in &kinds {
-            let r = match kind {
-                ResponseKind::Scan => recv_scan_response(sock_fd, max_payload_len),
+        for (i, &kind) in kinds.iter().enumerate() {
+            let r: Result<LoopResult, String> = match kind {
+                ResponseKind::Scan => {
+                    let hint = hints[i].take();
+                    match recv_scan_response(sock_fd, max_payload_len, hint) {
+                        Ok(Ok((schema, schema_version, batch, lsn))) => Ok(LoopResult::Scan {
+                            schema, schema_version, batch, lsn, target_id: target_ids[i],
+                        }),
+                        Ok(Err(err_text)) => Ok(LoopResult::ScanError(err_text)),
+                        Err(e) => Err(e),
+                    }
+                }
                 ResponseKind::Push => {
                     gnitz_core::recv_framed(sock_fd, max_payload_len)
                         .map_err(|e| e.to_string())
-                        .and_then(|buf| gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string()))
+                        .and_then(|buf| gnitz_core::parse_response(&buf, None)
+                            .map_err(|e| e.to_string()))
+                        .map(LoopResult::Push)
                 }
             };
             match r {
-                Ok(msg) => results.push(msg),
+                Ok(res) => results.push(res),
                 Err(e)  => { recv_err = Some(e); break; }
             }
         }
 
         // Single GIL acquisition to resolve all futures.
         let conn_lost = recv_err.is_some();
+        let cache_ref = Arc::clone(&schema_cache);
         Python::with_gil(|py| {
-            for msg in results.drain(..) {
-                let (fut, kind) = pending_futures.pop_front().unwrap();
-                if msg.status == gnitz_core::STATUS_ERROR {
-                    let err_text = msg.error_text.unwrap_or_default();
-                    let exc = GnitzError::new_err(err_text);
-                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                        (&se_fn, &fut, exc));
-                } else {
-                    let py_val = match kind {
-                        ResponseKind::Push => {
-                            (msg.seek_pk as u64).into_pyobject(py).unwrap().into_any().unbind()
+            for result in results.drain(..) {
+                let (fut, _kind) = pending_futures.pop_front().unwrap();
+                match result {
+                    LoopResult::Push(msg) => {
+                        if msg.status != 0 {
+                            let err_text = msg.error_text
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "server error".into());
+                            let exc = GnitzError::new_err(err_text);
+                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                                (&se_fn, &fut, exc));
+                        } else {
+                            let lsn = (msg.seek_pk as u64)
+                                .into_pyobject(py).unwrap().into_any().unbind();
+                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                                (&sr_fn, &fut, lsn));
                         }
-                        ResponseKind::Scan => {
-                            let lsn = msg.seek_pk as u64;
-                            let data = match (msg.schema, msg.data_batch) {
-                                (Some(s), Some(b)) => {
-                                    let names: Vec<&str> = s.columns.iter()
-                                        .map(|c| c.name.as_str()).collect();
-                                    let fields = PyTuple::new(py, names).unwrap().unbind();
-                                    let field_index = build_field_index(&s);
-                                    Some(Arc::new(SharedBatchData {
-                                        schema: s, batch: b, fields, field_index
-                                    }))
-                                }
-                                _ => None,
-                            };
-                            Py::new(py, PyScanResult {
-                                data, lsn, cached_schema: None, cached_batch: None,
-                            }).unwrap().into_any()
+                    }
+                    LoopResult::ScanError(err_text) => {
+                        let exc = GnitzError::new_err(err_text);
+                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                            (&se_fn, &fut, exc));
+                    }
+                    LoopResult::Scan { schema, schema_version, batch, lsn, target_id } => {
+                        // Update cache so the next scan on this table is warm.
+                        if let Some(ref s) = schema {
+                            cache_ref.lock().unwrap().put(target_id, (Arc::clone(s), schema_version));
                         }
-                    };
-                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
-                        (&sr_fn, &fut, py_val));
+                        let data = match schema {
+                            Some(s) => {
+                                let b = batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
+                                Some(make_shared_batch_data(py, s, b).unwrap())
+                            }
+                            None => None,
+                        };
+                        let py_val = Py::new(py, PyScanResult {
+                            data, lsn, cached_schema: None, cached_batch: None,
+                        }).unwrap().into_any();
+                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                            (&sr_fn, &fut, py_val));
+                    }
                 }
             }
             if let Some(e) = recv_err {

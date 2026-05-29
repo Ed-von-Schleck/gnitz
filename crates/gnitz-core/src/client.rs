@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use lru::LruCache;
 use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, PkColumn, PkTuple, WireConflictMode};
 use crate::protocol::types::type_code_from_u64;
@@ -118,7 +119,7 @@ struct ViewRecord {
 
 pub struct GnitzClient {
     conn:         Connection,
-    schema_cache: LruCache<u64, (Schema, u16)>,
+    schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
 }
 
 impl GnitzClient {
@@ -162,7 +163,7 @@ impl GnitzClient {
         self.conn.push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
     }
 
-    pub fn scan(&mut self, table_id: u64) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+    pub fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         self.conn.scan(table_id, &mut self.schema_cache)
     }
 
@@ -170,13 +171,13 @@ impl GnitzClient {
         &mut self,
         table_id: u64,
         pk:       &PkTuple,
-    ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
 
     pub fn seek_by_index(
         &mut self, table_id: u64, col_idx: u64, key: u128,
-    ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         self.conn.seek_by_index(table_id, col_idx, key, &mut self.schema_cache)
     }
 
@@ -281,9 +282,21 @@ impl GnitzClient {
                 ColData::Fixed(vec![])
             } else {
                 match col.type_code {
-                    TypeCode::String                => ColData::Strings(vec![Some(String::new()); count]),
-                    TypeCode::Blob                  => ColData::Bytes  (vec![Some(Vec::new());     count]),
-                    TypeCode::U128 | TypeCode::UUID => ColData::U128s  (vec![0u128;                count]),
+                    TypeCode::String => {
+                        if col.is_nullable {
+                            ColData::Strings(vec![None; count])
+                        } else {
+                            ColData::Strings(vec![Some(String::new()); count])
+                        }
+                    }
+                    TypeCode::Blob => {
+                        if col.is_nullable {
+                            ColData::Bytes(vec![None; count])
+                        } else {
+                            ColData::Bytes(vec![Some(Vec::new()); count])
+                        }
+                    }
+                    TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![0u128; count]),
                     _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
                 }
             }

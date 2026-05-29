@@ -235,8 +235,9 @@ impl Accumulator {
                     if first || replaces { self.acc = v; }
                 }
             }
-            // Count / CountNonNull / Null handled above.
-            AggOp::Count | AggOp::CountNonNull | AggOp::Null => {}
+            // Count and CountNonNull return early above; Null is a no-op sentinel.
+            AggOp::Null => {}
+            AggOp::Count | AggOp::CountNonNull => unreachable!("handled by early return above"),
         }
     }
 

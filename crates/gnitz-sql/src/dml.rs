@@ -4,6 +4,7 @@ use sqlparser::ast::{
     FromTable, Assignment, AssignmentTarget,
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
+use std::sync::Arc;
 use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
@@ -697,11 +698,11 @@ pub fn execute_select(
     };
 
     // Use the resolved schema for column metadata
-    let actual_schema = schema_out.unwrap_or_else(|| (*schema).clone());
+    let actual_schema = schema_out.as_deref().unwrap_or(&*schema);
 
     // Apply projection
     let (proj_schema, proj_batch) = apply_projection(
-        &select.projection, &actual_schema, batch_opt, binder
+        &select.projection, actual_schema, batch_opt, binder
     )?;
 
     // Apply LIMIT
@@ -875,10 +876,10 @@ fn try_extract_index_seek(
 }
 
 fn apply_residual_filter(
-    result:  (Option<Schema>, Option<ZSetBatch>),
+    result:  (Option<Arc<Schema>>, Option<ZSetBatch>),
     pred:    Option<&BoundExpr>,
     schema:  &Schema,
-) -> Result<(Option<Schema>, Option<ZSetBatch>), GnitzSqlError> {
+) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
     let pred = match pred {
         None => return Ok(result),
         Some(p) => p,
@@ -888,7 +889,7 @@ fn apply_residual_filter(
         None => return Ok((schema_opt, None)),
         Some(b) => b,
     };
-    let actual_schema = schema_opt.as_ref().unwrap_or(schema);
+    let actual_schema = schema_opt.as_deref().unwrap_or(schema);
     let mut new_batch = ZSetBatch::new(actual_schema);
 
     for i in 0..batch.pks.len() {
@@ -1490,7 +1491,7 @@ pub fn execute_update(
                 Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
-            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
             let mut new_batch = ZSetBatch::new(actual_schema);
             write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
             client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
@@ -1508,7 +1509,7 @@ pub fn execute_update(
                 Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
-            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
             if let Some(pred) = residual {
                 if !eval_pred_row(&pred, &current, 0, actual_schema)? {
                     return Ok(SqlResult::RowsAffected { count: 0 });
@@ -1523,7 +1524,7 @@ pub fn execute_update(
         // Path 3: Full scan with predicate
         let pred = binder.bind_expr(where_expr, &schema)?;
         let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-        let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+        let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
         let mut updates = ZSetBatch::new(actual_schema);
         let mut count = 0usize;
         if let Some(ref scan_batch) = batch_opt {
@@ -1541,7 +1542,7 @@ pub fn execute_update(
 
     // Path 4: No WHERE — update all rows
     let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-    let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+    let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
     let mut updates = ZSetBatch::new(actual_schema);
     match batch_opt {
         None => Ok(SqlResult::RowsAffected { count: 0 }),
@@ -1589,7 +1590,7 @@ pub fn execute_delete(
         None => {
             // DELETE all rows
             let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
             let batch = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
@@ -1603,7 +1604,7 @@ pub fn execute_delete(
             // Path 1: PK equality — seek first for accurate count
             if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
                 let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
-                let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+                let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
                 let exists = batch_opt.is_some_and(|b| !b.pks.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
                 let pks = PkColumn::one_row(actual_schema, &pk);
@@ -1629,7 +1630,7 @@ pub fn execute_delete(
             {
                 let (schema_opt, batch_opt, _) =
                     client.seek_by_index(table_id, col_idx as u64, key)?;
-                let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+                let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
                 let batch = match batch_opt {
                     None => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -1649,7 +1650,7 @@ pub fn execute_delete(
             // Path 4: Full scan with predicate
             let pred = binder.bind_expr(where_expr, &schema)?;
             let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
             let mut out_pks = PkColumn::empty_for_schema(actual_schema);
             let mut n = 0usize;
             if let Some(ref scan_batch) = batch_opt {
