@@ -168,9 +168,10 @@ pub fn op_reduce(
     }
 
     // group_set_eq_pk: GROUP BY is a permutation of the source PK columns.
-    // group_by_pk additionally requires stride ∈ {8, 16} because the fast
-    // path widens PK regions via widen_pk_le on each row; wider compound
-    // PKs cannot use the u128 comparator and must take the slow path.
+    // Group membership is tested on the full PK byte window (get_pk_bytes),
+    // exact at every width, and argsort_pk_canonical orders wide PKs via the
+    // authoritative compare_pk_bytes walk — so no narrow-stride restriction is
+    // needed.
     // The fast path's group-detection loop walks rows in iteration order
     // and breaks on PK mismatch — sound iff iteration order is canonical
     // PK order. When `working.sorted` is set the input is already in that
@@ -179,8 +180,7 @@ pub fn op_reduce(
     // multiple groups. Output's pk_indices is in source pk-list order
     // regardless of group_by_cols permutation.
     let group_set_eq_pk = input_schema.group_cols_eq_pk(group_by_cols);
-    let group_by_pk = group_set_eq_pk
-        && matches!(input_schema.pk_stride(), 8 | 16);
+    let group_by_pk = group_set_eq_pk;
 
     // Pre-compute sort descriptors for group comparisons (non-pk path).
     let (sort_descs, sort_descs_len) = if group_by_pk {
@@ -253,7 +253,14 @@ pub fn op_reduce(
         let group_start_idx = sorted_indices[group_start_pos] as usize;
 
         let group_key: u128 = if group_by_pk {
-            mb.get_pk(group_start_idx)
+            // Only a single-column output PK consumes group_key (extend_pk); a
+            // compound PK emits the verbatim source bytes, so a meaningless
+            // wide-PK u128 is unused.
+            if output_schema.pk_indices().len() == 1 {
+                mb.get_pk(group_start_idx)
+            } else {
+                0
+            }
         } else {
             extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
         };
@@ -268,16 +275,15 @@ pub fn op_reduce(
         while idx < n {
             let curr_idx = sorted_indices[idx] as usize;
             if group_by_pk {
-                let curr_pk = mb.get_pk(curr_idx);
-                if curr_pk != group_key {
+                // Full PK byte-window compare: exact at every width, unlike the
+                // lossy u128 get_pk for pk_stride > 16.
+                if mb.get_pk_bytes(curr_idx) != group_pk_bytes {
                     break;
                 }
-            } else {
-                if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs)
-                    != std::cmp::Ordering::Equal
-                {
-                    break;
-                }
+            } else if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs)
+                != std::cmp::Ordering::Equal
+            {
+                break;
             }
 
             let w = mb.get_weight(curr_idx);

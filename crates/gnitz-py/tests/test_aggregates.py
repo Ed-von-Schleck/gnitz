@@ -793,3 +793,224 @@ class TestGroupByPkAndNullable:
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+
+class TestReducePathRegressions:
+    """Reduce-path defects: U128 numeric-agg reject, signed-PK projection,
+    F32 MIN/MAX, nullable-group MIN/MAX, and HAVING over the grouped relation."""
+
+    def test_sum_avg_over_u128_rejected(self, client):
+        """SUM/AVG accumulate into a 64-bit slot; a U128 source overflows it and
+        the engine marks the decode unreachable, so the planner must reject it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  category BIGINT NOT NULL,"
+                "  big DECIMAL(38,0) NOT NULL"  # U128
+                ")",
+                schema_name=sn,
+            )
+            for fn in ("SUM", "AVG"):
+                with pytest.raises(gnitz.GnitzError):
+                    client.execute_sql(
+                        f"CREATE VIEW v AS SELECT category, {fn}(big) AS x "
+                        "FROM t GROUP BY category",
+                        schema_name=sn,
+                    )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    @pytest.mark.parametrize("col_type", [
+        "TINYINT", "SMALLINT", "INT", "BIGINT",
+    ])
+    def test_group_by_signed_pk_projection_roundtrips(self, client, col_type):
+        """Projecting a signed PK group column must emit the native value, not
+        the order-preserving (sign-flipped) OPK image. Includes negatives."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                f"CREATE TABLE t (pk {col_type} NOT NULL PRIMARY KEY, category BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT pk, category, COUNT(*) AS cnt "
+                "FROM t GROUP BY pk, category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (-5, 10), (-1, 20), (0, 30), (7, 40)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_pk = {r["pk"]: r for r in rows}
+            assert set(by_pk) == {-5, -1, 0, 7}, f"signed PKs must round-trip: {sorted(by_pk)}"
+            assert by_pk[-5]["category"] == 10
+            assert by_pk[-1]["category"] == 20
+            assert by_pk[0]["category"] == 30
+            assert by_pk[7]["category"] == 40
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_f32_not_corrupted(self, client):
+        """MIN/MAX over an F32 column (AVI-eligible with an int group key) must
+        emit the true extremal, not an F32 bit pattern read as an F64 denormal."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  grp BIGINT NOT NULL,"
+                "  v REAL NOT NULL"  # F32
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT grp, MIN(v) AS lo, MAX(v) AS hi "
+                "FROM t GROUP BY grp",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 9, 1.5), (2, 9, -2.25), (3, 9, 4.0)",
+                schema_name=sn,
+            )
+            row = next(r for r in client.scan(vid) if r.weight > 0)
+            assert abs(row["lo"] - (-2.25)) < 1e-6, f"MIN f32 corrupted: {row['lo']}"
+            assert abs(row["hi"] - 4.0) < 1e-6, f"MAX f32 corrupted: {row['hi']}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_group_by_nullable_int_null_vs_zero(self, client):
+        """MIN/MAX GROUP BY a nullable int takes the GI path; the GI must be
+        disabled for a nullable group column so the NULL group does not collide
+        with group 0 (which would fetch 0's history or drop NULL's state)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  grp BIGINT NULL,"
+                "  v BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT grp, MIN(v) AS lo, MAX(v) AS hi "
+                "FROM t GROUP BY grp",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # NULL group: {100, 50}; group 0: {7, 9}; distinct.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9)",
+                schema_name=sn,
+            )
+            by_grp = {r["grp"]: r for r in client.scan(vid) if r.weight > 0}
+            assert set(by_grp) == {None, 0}, f"NULL and 0 groups must stay distinct: {by_grp}"
+            assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (50, 100)
+            assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 9)
+
+            # Incremental update: lower the NULL group's min, raise 0's max.
+            client.execute_sql("INSERT INTO t VALUES (5, NULL, 10), (6, 0, 999)", schema_name=sn)
+            by_grp = {r["grp"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (10, 100)
+            assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 999)
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_unprojected_group_col(self, client):
+        """HAVING on a GROUP BY column omitted from SELECT (valid standard SQL):
+        binds against the grouped relation, before projection."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, COUNT(*) AS cnt FROM t GROUP BY a, b HAVING b > 5",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # (a,b) groups: (1,3) excluded, (1,9) kept, (2,7) kept.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 3), (2, 1, 9), (3, 2, 7)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            groups = sorted(r["a"] for r in rows)
+            assert groups == [1, 2], f"only groups with b>5 survive: {groups}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_aliased_group_col_by_original_name(self, client):
+        """HAVING references a group column by its source name even when SELECT
+        aliases it: HAVING binds against the grouped relation (source names)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a AS x, COUNT(*) AS cnt FROM t GROUP BY a HAVING a > 5",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 3), (2, 9), (3, 7)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            xs = sorted(r["x"] for r in rows)
+            assert xs == [7, 9], f"only a>5 survive (aliased to x): {xs}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_aggregate_not_projected(self, client):
+        """HAVING on an aggregate absent from SELECT: it must still be
+        materialised in the reduce and resolvable in HAVING."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # a=10 appears twice (kept), a=20 once (excluded).
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            groups = sorted(r["a"] for r in rows)
+            assert groups == [10], f"only groups with COUNT(*)>1 survive: {groups}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

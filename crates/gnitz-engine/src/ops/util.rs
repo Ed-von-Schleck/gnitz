@@ -322,7 +322,13 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
             (e as i64).wrapping_sub(1i64 << 63) as u64
         }
         TypeCode::F64 => ieee_order_bits_reverse(e),
-        TypeCode::F32 => ieee_order_bits_f32_reverse(e) as u64,
+        TypeCode::F32 => {
+            // The accumulator and the reduce output column are F64; promote the
+            // recovered F32 to F64 bits so the AVI seed matches the
+            // step_from_batch path.
+            let f32_bits = ieee_order_bits_f32_reverse(e);
+            f64::to_bits(f32::from_bits(f32_bits) as f64)
+        }
         TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
         | TypeCode::U128 | TypeCode::UUID | TypeCode::String => e,
         TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),

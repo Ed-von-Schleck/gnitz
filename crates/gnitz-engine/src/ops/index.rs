@@ -204,7 +204,10 @@ pub fn op_integrate_with_indexes(
             let av_u64 = super::util::encode_ordered(
                 av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max,
             );
-            key[n..n + super::util::AVI_AV_BYTES].copy_from_slice(&av_u64.to_le_bytes());
+            // Serialise the order-encoded value big-endian: the index orders
+            // entries by raw lexicographic byte comparison, so big-endian bytes
+            // make lexicographic order match the encoded value's numeric order.
+            key[n..n + super::util::AVI_AV_BYTES].copy_from_slice(&av_u64.to_be_bytes());
 
             avi_batch.extend_pk_bytes(&key[..n + super::util::AVI_AV_BYTES]);
             avi_batch.extend_weight(&mb.get_weight(row).to_le_bytes());

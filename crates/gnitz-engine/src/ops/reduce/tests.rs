@@ -10,7 +10,7 @@ use crate::storage::{Batch, ConsolidatedBatch};
 use super::super::util::{
     extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse,
 };
-use super::agg::{Accumulator, AggDescriptor, AggOp};
+use super::agg::{Accumulator, AggDescriptor, AggOp, apply_agg_from_value_index};
 use super::emit::{emit_finalized_row, emit_reduce_row};
 use super::op_gather::op_gather_reduce;
 use super::op_reduce::{cursor_matches_group, op_reduce};
@@ -3328,7 +3328,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
             key[0..4].copy_from_slice(&a.to_le_bytes());
             key[4..8].copy_from_slice(&bb.to_le_bytes());
             let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
-            key[8..16].copy_from_slice(&av.to_le_bytes());
+            key[8..16].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3425,7 +3425,7 @@ fn avi_retraction_returns_next_extremum() {
             let mut key = [0u8; 12];
             key[0..4].copy_from_slice(&1u32.to_le_bytes());
             let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
-            key[4..12].copy_from_slice(&av.to_le_bytes());
+            key[4..12].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3529,7 +3529,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             let mut key = vec![0u8; stride];
             key[..gsize].copy_from_slice(&gval.to_le_bytes()[..gsize]);
             let av = encode_ordered(&42i64.to_le_bytes(), type_code::I64, false);
-            key[gsize..gsize + 8].copy_from_slice(&av.to_le_bytes());
+            key[gsize..gsize + 8].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3877,7 +3877,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
             key[0..4].copy_from_slice(&a.to_le_bytes());
             key[4..8].copy_from_slice(&bb.to_le_bytes());
             let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
-            key[8..16].copy_from_slice(&av.to_le_bytes());
+            key[8..16].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -4008,7 +4008,7 @@ fn avi_wide_two_u64_groups_match_reference() {
                 key[0..8].copy_from_slice(&a.to_le_bytes());
                 key[8..16].copy_from_slice(&b.to_le_bytes());
                 let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-                key[16..24].copy_from_slice(&av.to_le_bytes());
+                key[16..24].copy_from_slice(&av.to_be_bytes());
                 key
             })
             .collect();
@@ -4127,7 +4127,7 @@ fn avi_wide_single_u128_group_distinct() {
             let mut key = [0u8; 24];
             key[0..16].copy_from_slice(&g.to_le_bytes());
             let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-            key[16..24].copy_from_slice(&av.to_le_bytes());
+            key[16..24].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -4223,7 +4223,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
                 key[0..8].copy_from_slice(&a.to_le_bytes());
                 key[8..16].copy_from_slice(&bb.to_le_bytes());
                 let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-                key[16..24].copy_from_slice(&av.to_le_bytes());
+                key[16..24].copy_from_slice(&av.to_be_bytes());
                 key
             })
             .collect();
@@ -4330,7 +4330,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
             key[8..16].copy_from_slice(&bb.to_le_bytes());
             key[16..24].copy_from_slice(&c.to_le_bytes());
             let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-            key[24..32].copy_from_slice(&av.to_le_bytes());
+            key[24..32].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -4422,7 +4422,7 @@ fn avi_wide_retraction_returns_next_extremum() {
             key[0..8].copy_from_slice(&a.to_le_bytes());
             key[8..16].copy_from_slice(&bb.to_le_bytes());
             let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
-            key[16..24].copy_from_slice(&av.to_le_bytes());
+            key[16..24].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -4474,4 +4474,198 @@ fn avi_wide_retraction_returns_next_extremum() {
     assert_eq!(retracted, Some(5), "must retract the stale wide-key MIN");
     assert_eq!(inserted, Some(9),
         "wide AVI must return group (ga,gb)'s next MIN (9), not the decoy's 1");
+}
+
+// =======================================================================
+// Reduce-path correctness regressions: a value-independent aggregate (COUNT)
+// must not read a wide PK source column; the AVI order-encoded value must be
+// byte-ordered so incremental MIN/MAX reads the true extremal; an F32 AVI seed
+// must promote to F64 bits; and the group-by-PK path must handle a compound PK
+// of any width.
+// =======================================================================
+
+// Bug 1: COUNT(*) is compiled with a placeholder arg column index 0. When
+// column 0 is a 16-byte UUID PK, the old step_from_batch decoded the PK column
+// into an 8-byte scratch buffer before the per-op match — `pk_le_buf[..16]` was
+// out of range and the worker crashed. COUNT is value-independent and must
+// return before touching the column.
+#[test]
+fn count_accumulator_over_uuid_pk_does_not_panic() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::UUID, 0), // 16-byte PK
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let mut b = Batch::with_schema(schema, 2);
+    for pk in [1u128, 2] {
+        b.extend_pk(pk);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(schema.payload_idx(1), &0i64.to_le_bytes());
+        b.count += 1;
+    }
+    let desc = AggDescriptor {
+        col_idx: 0, agg_op: AggOp::Count, col_type_code: TypeCode::UUID, _pad: [0; 2],
+    };
+    let mut acc = Accumulator::new(&desc, &schema);
+    let mb = b.as_mem_batch();
+    acc.step_from_batch(&mb, 0, 1);
+    acc.step_from_batch(&mb, 1, 1);
+    assert_eq!(acc.get_value_bits() as i64, 2, "COUNT over a UUID PK column must count rows");
+}
+
+// Bug 3: the order-encoded aggregate value must be serialized big-endian so the
+// index's lexicographic byte ordering matches numeric order. With three values
+// in one group whose extremes differ above the low byte ({101, 111, -5}), a
+// little-endian serialization sorts 101 first and reports it as the MIN; -5 is
+// never seen. Drives the full production path: op_integrate_with_indexes
+// populates the AVI, then apply_agg_from_value_index reads it back.
+#[test]
+fn avi_full_path_min_max_across_high_byte() {
+    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+    use crate::storage::Table;
+    use super::super::util::GroupKeyExtractor;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // pk
+            SchemaColumn::new(type_code::U64, 0), // g (group)
+            SchemaColumn::new(type_code::I64, 0), // val (agg)
+        ],
+        &[0],
+    );
+    // One group g=5 with values {101, 111, -5}.
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 3);
+        for (pk, v) in [(1u128, 101i64), (2, 111), (3, -5)] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(1), &5u64.to_le_bytes());
+            b.extend_col(in_schema.payload_idx(2), &v.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let group_by = vec![1u32];
+
+    let seed = |for_max: bool, table_id: u32| -> i64 {
+        let avi_schema = make_avi_schema(&in_schema, &group_by);
+        let mut avi_t = Table::new(
+            tmp.path().to_str().unwrap(), "avi", avi_schema, table_id, 1 << 20, false,
+        ).unwrap();
+        let avi = AviDesc {
+            table: &mut avi_t as *mut Table,
+            for_max,
+            agg_col_type_code: type_code::I64,
+            group_by_cols: group_by.clone(),
+            agg_col_idx: 2,
+        };
+        op_integrate_with_indexes(&delta, None, &in_schema, None, Some(&avi)).unwrap();
+
+        let mut ch = avi_t.open_cursor();
+        let extractor = GroupKeyExtractor::new(&in_schema, &group_by);
+        let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
+        extractor.gather(&delta.as_mem_batch(), 0, &mut gk);
+        let agg_desc = AggDescriptor {
+            col_idx: 2,
+            agg_op: if for_max { AggOp::Max } else { AggOp::Min },
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        };
+        let mut acc = Accumulator::new(&agg_desc, &in_schema);
+        let ok = apply_agg_from_value_index(
+            ch.cursor_mut(), &gk[..extractor.stride], for_max, TypeCode::I64, &mut acc,
+        );
+        assert!(ok, "AVI seek must find group g=5");
+        acc.get_value_bits() as i64
+    };
+
+    assert_eq!(seed(false, 90), -5, "MIN across the high-byte boundary must be -5, not 101");
+    assert_eq!(seed(true, 91), 111, "MAX must be 111");
+}
+
+// Bug 4: a float aggregate's accumulator and output column are F64, so the AVI
+// seed for an F32 source must promote to F64 bits — not zero-extend the raw
+// 32-bit IEEE bits, which an F64 reader interprets as a tiny denormal.
+#[test]
+fn avi_f32_seed_promotes_to_f64_bits() {
+    use super::super::util::{decode_ordered, encode_ordered};
+    for v in [1.5f32, -2.25, 0.0, 1.0e30] {
+        let enc = encode_ordered(&v.to_le_bytes(), type_code::F32, false);
+        let bits = decode_ordered(enc, TypeCode::F32, false);
+        assert_eq!(
+            bits, f64::to_bits(v as f64),
+            "F32 AVI seed must be the F64 bits of (f32 as f64) for v={v}",
+        );
+        assert_eq!(f64::from_bits(bits), v as f64);
+    }
+}
+
+// Bug 5: a compound PK with pk_stride > 16 (two U128 columns = stride 32) whose
+// GROUP BY is exactly the PK must take the unified group-by-PK path — group
+// membership tested on the full PK byte window, argsorted by canonical PK
+// order, emitting one weight-folded row per distinct PK. Before the
+// unification the {8,16}-stride gate forced this onto the slow per-column path.
+#[test]
+fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0), // pk col 0
+            SchemaColumn::new(type_code::U128, 0), // pk col 1
+        ],
+        &[0, 1],
+    );
+    assert!(in_schema.pk_stride() > 16, "compound U128+U128 PK must exceed 16 bytes");
+
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1), // COUNT
+        ],
+        &[0, 1],
+    );
+
+    // Distinct PKs: (1,1) twice → cnt 2, (1,2) once → cnt 1. Unsorted input so
+    // the argsort_pk_canonical branch runs.
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 3);
+        for (a, c) in [(1u128, 2u128), (1, 1), (1, 1)] {
+            b.extend_pk_opk(&in_schema, &[a, c]);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+
+    let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[to_batch], out_schema);
+
+    let agg = AggDescriptor {
+        col_idx: 0, agg_op: AggOp::Count, col_type_code: TypeCode::U128, _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[0u32, 1u32], &[agg],
+        None, false, TypeCode::U128, None, 0, None, None,
+    );
+
+    // One row per distinct PK; output is sorted + consolidated.
+    assert!(out.sorted && out.consolidated, "group-by-PK output must be sorted+consolidated");
+    let mut counts: Vec<i64> = (0..out.count)
+        .filter(|&i| out.get_weight(i) > 0)
+        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![1, 2], "two distinct compound PKs with counts 1 and 2");
 }

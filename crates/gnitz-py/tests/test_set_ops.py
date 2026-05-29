@@ -345,3 +345,45 @@ class TestSetOps:
                 except Exception:
                     pass
             client.drop_schema(sn)
+
+
+class TestSetOpNullability:
+    """Set-op output column nullability is the union of both inputs. A NOT NULL
+    left paired with a nullable right that emits NULL must produce a nullable
+    output column, so the reader checks the null bitmap instead of reading 0."""
+
+    def test_union_all_right_null_reads_back_null(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # Left val NOT NULL; right val nullable.
+            client.execute_sql(
+                "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (2, NULL)", schema_name=sn)
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            vals = sorted((r["val"] is None, r["val"]) for r in rows)
+            # One concrete 10 from the left, one NULL (not 0) from the right.
+            assert (False, 10) in vals, f"left value missing: {vals}"
+            assert any(r["val"] is None for r in rows), \
+                f"right NULL must read back as NULL, not 0: {[r['val'] for r in rows]}"
+            assert 0 not in [r["val"] for r in rows], "NULL must not be read as 0"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE a", schema_name=sn)
+            client.execute_sql("DROP TABLE b", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

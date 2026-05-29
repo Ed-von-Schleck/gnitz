@@ -143,31 +143,55 @@ impl Accumulator {
         row: usize,
         weight: i64,
     ) {
+        // COUNT is value-independent: count the row and return before any column
+        // read, so a wide PK column (cs = 16) never reaches the ≤8-byte value path.
+        if self.agg_op == AggOp::Count {
+            self.acc = self.acc.wrapping_add(weight);
+            self.has_value = true;
+            return;
+        }
+
+        let slot = self.pi_or_pk_off as usize;
+
+        // Null gate for nullable payload columns. PK columns are never null
+        // (catalog rule), so the probe is skipped for is_pk_col.
+        if !self.is_pk_col {
+            let null_word = mb.get_null_word(row);
+            if (null_word >> slot) & 1 != 0 {
+                return;
+            }
+        }
+
+        // COUNT_NON_NULL: presence established (PK, or non-null payload above).
+        // Count the row without reading its value.
+        if self.agg_op == AggOp::CountNonNull {
+            self.acc = self.acc.wrapping_add(weight);
+            self.has_value = true;
+            return;
+        }
+
         let tc = self.col_type_code;
         let cs = self.col_size as usize;
+        // SUM/MIN/MAX accumulate into an i64/u64 slot; the planner rejects
+        // U128/UUID/BLOB sources for these (decode_signed/decode_float mark them
+        // unreachable). STRING is also rejected by the planner, but decode_signed
+        // does handle it via an 8-byte prefix compare, so engine-level callers may
+        // still reach here with a 16-byte STRING slot — exempt it. Every other
+        // column addressed here is ≤ 8 bytes.
+        debug_assert!(
+            cs <= 8 || tc == TypeCode::String,
+            "SUM/MIN/MAX over a >8-byte non-STRING column must be rejected by the planner",
+        );
 
-        // PK columns are never null, so the null check is gated on
-        // !is_pk_col. COUNT skips the null check entirely because it
-        // counts rows regardless of value-column nullness.
-        let slot = self.pi_or_pk_off as usize;
-        // PK regions hold OPK (order-preserving big-endian) bytes; the
-        // decoders below read native little-endian, so decode the addressed
-        // PK column back to native before aggregating.
-        let mut pk_le_buf = [0u8; 8];
+        // PK regions hold OPK (order-preserving big-endian) bytes; decode the
+        // addressed PK column back to native little-endian before aggregating.
+        let mut pk_le_buf = [0u8; 16];
         let bytes: &[u8] = if self.is_pk_col {
             gnitz_wire::decode_pk_column(
-                &mb.get_pk_bytes(row)[slot..slot + cs],
-                tc as u8,
-                &mut pk_le_buf[..cs],
+                &mb.get_pk_bytes(row)[slot..slot + cs], tc as u8, &mut pk_le_buf[..cs],
             );
             &pk_le_buf[..cs]
         } else {
-            if self.agg_op != AggOp::Count {
-                let null_word = mb.get_null_word(row);
-                if (null_word >> slot) & 1 != 0 {
-                    return;
-                }
-            }
             mb.get_col_ptr(row, slot, cs)
         };
 
@@ -176,18 +200,11 @@ impl Accumulator {
         let is_f = self.is_float();
 
         match self.agg_op {
-            AggOp::Count => {
-                self.acc = self.acc.wrapping_add(weight);
-            }
-            AggOp::CountNonNull => {
-                self.acc = self.acc.wrapping_add(weight);
-            }
             AggOp::Sum => {
                 if is_f {
                     let val_f = decode_float(bytes, tc);
                     let cur_f = f64::from_bits(self.acc as u64);
-                    let w_f = weight as f64;
-                    self.acc = f64::to_bits(cur_f + val_f * w_f) as i64;
+                    self.acc = f64::to_bits(cur_f + val_f * weight as f64) as i64;
                 } else {
                     let val = decode_signed(bytes, tc);
                     self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
@@ -196,49 +213,32 @@ impl Accumulator {
             AggOp::Min => {
                 if is_f {
                     let v = decode_float(bytes, tc);
-                    if first
-                        || v.total_cmp(&f64::from_bits(self.acc as u64))
-                            == std::cmp::Ordering::Less
-                    {
+                    if first || v.total_cmp(&f64::from_bits(self.acc as u64)) == std::cmp::Ordering::Less {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
                     let v = decode_signed(bytes, tc);
-                    // U64 comparison must be unsigned: `decode_signed`
-                    // returns the bit pattern verbatim, so high-bit-set
-                    // values look negative under signed `<`.
-                    let replaces = if tc == TypeCode::U64 {
-                        (v as u64) < (self.acc as u64)
-                    } else {
-                        v < self.acc
-                    };
-                    if first || replaces {
-                        self.acc = v;
-                    }
+                    // U64 comparison must be unsigned: `decode_signed` returns the
+                    // bit pattern verbatim, so high-bit-set values look negative
+                    // under signed `<`.
+                    let replaces = if tc == TypeCode::U64 { (v as u64) < (self.acc as u64) } else { v < self.acc };
+                    if first || replaces { self.acc = v; }
                 }
             }
             AggOp::Max => {
                 if is_f {
                     let v = decode_float(bytes, tc);
-                    if first
-                        || v.total_cmp(&f64::from_bits(self.acc as u64))
-                            == std::cmp::Ordering::Greater
-                    {
+                    if first || v.total_cmp(&f64::from_bits(self.acc as u64)) == std::cmp::Ordering::Greater {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
                     let v = decode_signed(bytes, tc);
-                    let replaces = if tc == TypeCode::U64 {
-                        (v as u64) > (self.acc as u64)
-                    } else {
-                        v > self.acc
-                    };
-                    if first || replaces {
-                        self.acc = v;
-                    }
+                    let replaces = if tc == TypeCode::U64 { (v as u64) > (self.acc as u64) } else { v > self.acc };
+                    if first || replaces { self.acc = v; }
                 }
             }
-            AggOp::Null => {}
+            // Count / CountNonNull / Null handled above.
+            AggOp::Count | AggOp::CountNonNull | AggOp::Null => {}
         }
     }
 
@@ -436,7 +436,7 @@ pub(super) fn apply_agg_from_value_index(
             "AVI key = group_stride + AVI_AV_BYTES",
         );
         let av_start = group_key.len();
-        let av = u64::from_le_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
+        let av = u64::from_be_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
         acc.seed_from_raw_bits(super::super::util::decode_ordered(av, agg_col_type_code, for_max));
         return true;
     }

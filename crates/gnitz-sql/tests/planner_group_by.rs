@@ -112,6 +112,24 @@ fn test_sum_string_rejected() {
 }
 
 #[test]
+fn test_sum_avg_u128_rejected() {
+    // SUM/AVG accumulate into a 64-bit slot; a U128 (DECIMAL(38,0)) source
+    // overflows it and the engine's decode marks it unreachable, so the planner
+    // must reject SUM/AVG over U128 at bind time (mirroring the MIN/MAX reject).
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, big DECIMAL(38,0) NOT NULL)").unwrap();
+    for func in ["SUM", "AVG"] {
+        let err = must_err(p.execute(&format!(
+            "CREATE VIEW v AS SELECT g, {func}(big) AS x FROM t GROUP BY g"
+        )));
+        assert!(matches!(err, GnitzSqlError::Bind(_)),
+            "expected Bind for {func}(u128), got {:?}", err);
+    }
+}
+
+#[test]
 fn test_min_uuid_rejected() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);

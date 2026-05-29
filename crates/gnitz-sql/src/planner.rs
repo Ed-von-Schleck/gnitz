@@ -1221,10 +1221,15 @@ fn execute_create_group_by_view(
                     let is_numeric = is_integer_type(tc) || tc.is_float();
                     match func {
                         AggFunc::Sum | AggFunc::Avg | AggFunc::CountNonNull => {
-                            // CountNonNull only counts presence, but SUM/AVG need numbers.
-                            if matches!(func, AggFunc::Sum | AggFunc::Avg) && !is_numeric {
+                            // SUM/AVG accumulate into a 64-bit slot; U128/UUID
+                            // overflow it and the engine's decode_signed marks
+                            // them unreachable. CountNonNull only counts
+                            // presence, so it accepts any type.
+                            if matches!(func, AggFunc::Sum | AggFunc::Avg)
+                                && (!is_numeric || matches!(tc, TypeCode::U128 | TypeCode::UUID))
+                            {
                                 return Err(GnitzSqlError::Bind(format!(
-                                    "{:?} requires a numeric column, got {:?} ('{}')",
+                                    "{:?} is not supported on column type {:?} ('{}')",
                                     func, tc, source_schema.columns[c].name,
                                 )));
                             }
@@ -1284,6 +1289,16 @@ fn execute_create_group_by_view(
                 "GROUP BY SELECT: only column refs and aggregates supported".to_string()
             )),
         }
+    }
+
+    // 3b. Materialise aggregates referenced only by HAVING. HAVING is evaluated
+    //     over the grouped relation, so every aggregate it references needs an
+    //     agg_spec and a reduce-output column even when the SELECT list omits
+    //     it. Done before reduce_schema is built so the new columns are included.
+    if let Some(having_expr) = &select.having {
+        collect_having_aggs(
+            having_expr, &source_schema, &mut agg_specs, &mut agg_mappings,
+        )?;
     }
 
     // 4. Determine reduce output schema layout.
@@ -1445,26 +1460,30 @@ fn execute_create_group_by_view(
 
     // The result_reg for a MAP program is typically 0 (true = pass through)
     let post_map_prog = post_map_eb.build(0);
-    let mapped = cb.map_expr(reduced, post_map_prog);
 
-    let post_map_schema = Schema { columns: out_cols.clone(), pk_cols: vec![0] };
-
-    // 7. Optional HAVING filter (applied after MAP so column indices match output)
-    let having_input = if let Some(having_expr) = &select.having {
+    // 7. Optional HAVING filter, applied to the grouped relation *before* the
+    //    SELECT projection — the relational order standard SQL specifies. Filter
+    //    and map are both row-wise linear operators and commute, so this is
+    //    semantically and incrementally sound. Binding against reduce_schema lets
+    //    HAVING reference group columns by their source name (unaffected by
+    //    SELECT aliases or omission) and aggregates that are not projected.
+    let filtered_reduced = if let Some(having_expr) = &select.having {
         let bound = bind_having_expr(
-            having_expr, &post_map_schema, &source_schema,
-            &agg_mappings, &select_items,
+            having_expr, &reduce_schema, &source_schema,
+            &group_col_indices, use_natural_pk, &agg_mappings, agg_col_offset,
         )?;
         let mut heb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &post_map_schema, &mut heb)?;
+        let (result_reg, _) = compile_bound_expr(&bound, &reduce_schema, &mut heb)?;
         let prog = heb.build(result_reg);
-        cb.filter(mapped, Some(prog))
+        cb.filter(reduced, Some(prog))
     } else {
-        mapped
+        reduced
     };
 
+    let mapped = cb.map_expr(filtered_reduced, post_map_prog);
+
     // 8. Sink
-    cb.sink(having_input);
+    cb.sink(mapped);
     let circuit = cb.build();
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols)
@@ -1473,79 +1492,167 @@ fn execute_create_group_by_view(
     Ok(SqlResult::ViewCreated { view_id })
 }
 
-/// Bind a HAVING expression against the post-reduce schema.
-/// Aggregate function calls are resolved to their output column indices.
+/// Resolve a HAVING function call to its aggregate function selector + argument
+/// column, shared by collection and binding so both agree on what an aggregate
+/// reference means.
+fn having_agg_func(
+    func: &sqlparser::ast::Function,
+    source_schema: &Schema,
+) -> Result<(AggFunc, Option<usize>), GnitzSqlError> {
+    let name = func.name.to_string().to_lowercase();
+    let arg_col = extract_func_arg_col(func, source_schema)?;
+    let agg_func = match name.as_str() {
+        "count" => if arg_col.is_none() { AggFunc::Count } else { AggFunc::CountNonNull },
+        "sum" => AggFunc::Sum,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "avg" => AggFunc::Avg,
+        _ => return Err(GnitzSqlError::Unsupported(
+            format!("HAVING: function '{}' not supported", name)
+        )),
+    };
+    Ok((agg_func, arg_col))
+}
+
+/// True iff `m` is the reduce mapping for the aggregate `(agg_func, arg_col)`.
+/// COUNT(*) ignores arg_col (it has none); every other form matches the source
+/// column too, so `MAX(c2)` never binds to `SUM(c1)`.
+fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
+    match agg_func {
+        AggFunc::Avg => m.is_avg && m.arg_col == arg_col,
+        AggFunc::Count => m.agg_func == AggFunc::Count,
+        AggFunc::CountNonNull => m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
+        AggFunc::Sum => m.agg_func == AggFunc::Sum && m.arg_col == arg_col,
+        AggFunc::Min => m.agg_func == AggFunc::Min && m.arg_col == arg_col,
+        AggFunc::Max => m.agg_func == AggFunc::Max && m.arg_col == arg_col,
+    }
+}
+
+/// Push the agg_specs + AggMapping for one HAVING-only aggregate (one absent
+/// from the SELECT list). Mirrors the spec layout of the SELECT projection so
+/// the reduce-output column positions line up. Returns nothing — the mapping is
+/// found later by `agg_mapping_matches`.
+fn append_having_agg(
+    agg_func: AggFunc,
+    arg_col: Option<usize>,
+    source_schema: &Schema,
+    agg_specs: &mut Vec<(u64, usize)>,
+    agg_mappings: &mut Vec<AggMapping>,
+) {
+    let out_type = agg_result_type(agg_func, arg_col, source_schema);
+    let agg_idx = agg_mappings.len();
+    let start = agg_specs.len();
+    let is_avg = match agg_func {
+        AggFunc::Count => { agg_specs.push((AGG_COUNT, 0)); false }
+        AggFunc::CountNonNull => { agg_specs.push((AGG_COUNT_NON_NULL, arg_col.unwrap())); false }
+        AggFunc::Sum => { agg_specs.push((AGG_SUM, arg_col.unwrap())); false }
+        AggFunc::Min => { agg_specs.push((AGG_MIN, arg_col.unwrap())); false }
+        AggFunc::Max => { agg_specs.push((AGG_MAX, arg_col.unwrap())); false }
+        AggFunc::Avg => {
+            let c = arg_col.unwrap();
+            agg_specs.push((AGG_SUM, c));
+            agg_specs.push((AGG_COUNT_NON_NULL, c));
+            true
+        }
+    };
+    agg_mappings.push(AggMapping {
+        specs_start: start, is_avg,
+        output_name: format!("_having_agg{}", agg_idx),
+        output_type: out_type, agg_func, arg_col,
+    });
+}
+
+/// Recursively collect aggregate calls referenced in a HAVING expression,
+/// appending any not already present in `agg_mappings`.
+fn collect_having_aggs(
+    expr: &Expr,
+    source_schema: &Schema,
+    agg_specs: &mut Vec<(u64, usize)>,
+    agg_mappings: &mut Vec<AggMapping>,
+) -> Result<(), GnitzSqlError> {
+    match expr {
+        Expr::Function(func) => {
+            let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
+            if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
+                append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings);
+            }
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_aggs(left, source_schema, agg_specs, agg_mappings)?;
+            collect_having_aggs(right, source_schema, agg_specs, agg_mappings)
+        }
+        Expr::UnaryOp { expr, .. } => collect_having_aggs(expr, source_schema, agg_specs, agg_mappings),
+        Expr::Nested(inner) => collect_having_aggs(inner, source_schema, agg_specs, agg_mappings),
+        _ => Ok(()),
+    }
+}
+
+/// Bind a HAVING expression against the reduce-output (grouped) relation —
+/// before the SELECT projection, as standard SQL specifies. Group-column
+/// identifiers resolve by their source name (unaffected by SELECT aliases or
+/// omission); aggregate calls resolve to their reduce-output column.
+#[allow(clippy::too_many_arguments)]
 fn bind_having_expr(
-    expr:             &Expr,
-    post_map_schema:  &Schema,
-    source_schema:    &Schema,
-    agg_mappings:     &[AggMapping],
-    select_items:     &[GroupBySelectItem],
+    expr:              &Expr,
+    reduce_schema:     &Schema,
+    source_schema:     &Schema,
+    group_col_indices: &[usize],
+    use_natural_pk:    bool,
+    agg_mappings:      &[AggMapping],
+    agg_col_offset:    usize,
 ) -> Result<BoundExpr, GnitzSqlError> {
     match expr {
         Expr::Identifier(ident) => {
-            // Column name → must be a group column
+            // HAVING references the grouped relation by source column name. Map
+            // the name to a GROUP BY column, then to its reduce-output position
+            // (natural-PK grouping puts the lone group col at the PK index 0; the
+            // synthetic path lays group cols out after the U128 _group_pk).
             let col_name = &ident.value;
-            let idx = post_map_schema.columns.iter()
+            let src = source_schema.columns.iter()
                 .position(|c| c.name.eq_ignore_ascii_case(col_name))
                 .ok_or_else(|| GnitzSqlError::Bind(
-                    format!("HAVING: column '{}' not found in output", col_name)
+                    format!("HAVING: column '{}' not found", col_name)
                 ))?;
-            Ok(BoundExpr::ColRef(idx))
+            let gpos = group_col_indices.iter().position(|&gi| gi == src)
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "HAVING: column '{}' must appear in GROUP BY or an aggregate function",
+                    col_name,
+                )))?;
+            let reduce_col = if use_natural_pk { 0 } else { 1 + gpos };
+            Ok(BoundExpr::ColRef(reduce_col))
         }
         Expr::Function(func) => {
-            // Aggregate function → find matching agg_mapping by function name + arg
-            let name = func.name.to_string().to_lowercase();
-            let arg_col = extract_func_arg_col(func, source_schema)?;
-            let agg_func = match name.as_str() {
-                "count" => if arg_col.is_none() { AggFunc::Count } else { AggFunc::CountNonNull },
-                "sum" => AggFunc::Sum,
-                "min" => AggFunc::Min,
-                "max" => AggFunc::Max,
-                "avg" => AggFunc::Avg,
-                _ => return Err(GnitzSqlError::Unsupported(
-                    format!("HAVING: function '{}' not supported", name)
-                )),
-            };
-            // Find the matching aggregate in select_items
-            for si in select_items {
-                if let GroupBySelectItem::Aggregate { agg_idx } = si {
-                    let m = &agg_mappings[*agg_idx];
-                    // Match the function type AND the argument column; the prior
-                    // `_ => !m.is_avg` fallthrough bound any non-AVG aggregate to
-                    // the first non-AVG mapping regardless of which column it
-                    // aggregated, so HAVING MAX(c2) could silently read SUM(c1).
-                    let matches = match agg_func {
-                        AggFunc::Avg => m.is_avg,
-                        AggFunc::Count => m.agg_func == AggFunc::Count,
-                        AggFunc::CountNonNull =>
-                            m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
-                        AggFunc::Sum =>
-                            m.agg_func == AggFunc::Sum && m.arg_col == arg_col,
-                        AggFunc::Min =>
-                            m.agg_func == AggFunc::Min && m.arg_col == arg_col,
-                        AggFunc::Max =>
-                            m.agg_func == AggFunc::Max && m.arg_col == arg_col,
-                    };
-                    if matches {
-                        // Find this agg's position in the output schema
-                        let out_idx = post_map_schema.columns.iter()
-                            .position(|c| c.name == m.output_name)
-                            .unwrap();
-                        return Ok(BoundExpr::ColRef(out_idx));
-                    }
-                }
+            let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
+            let m = agg_mappings.iter()
+                .find(|m| agg_mapping_matches(m, agg_func, arg_col))
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "HAVING: aggregate {:?}({}) could not be resolved", agg_func,
+                    arg_col.map_or("*".to_string(), |c| source_schema.columns[c].name.clone()),
+                )))?;
+            if m.is_avg {
+                // AVG = SUM / COUNT, both materialised as reduce columns. Force
+                // float division (an int-source SUM/COUNT would otherwise
+                // truncate) by lifting SUM to float via `* 1.0`.
+                let sum_col = agg_col_offset + m.specs_start;
+                let cnt_col = agg_col_offset + m.specs_start + 1;
+                let sum_f = BoundExpr::BinOp(
+                    Box::new(BoundExpr::ColRef(sum_col)),
+                    BinOp::Mul,
+                    Box::new(BoundExpr::LitFloat(1.0)),
+                );
+                Ok(BoundExpr::BinOp(
+                    Box::new(sum_f), BinOp::Div, Box::new(BoundExpr::ColRef(cnt_col)),
+                ))
+            } else {
+                Ok(BoundExpr::ColRef(agg_col_offset + m.specs_start))
             }
-            Err(GnitzSqlError::Bind(
-                format!("HAVING: aggregate {}({}) not found in SELECT", name,
-                    arg_col.map_or("*".to_string(), |c| source_schema.columns[c].name.clone()))
-            ))
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = bind_having_expr(left, post_map_schema, source_schema,
-                agg_mappings, select_items)?;
-            let r = bind_having_expr(right, post_map_schema, source_schema,
-                agg_mappings, select_items)?;
+            let l = bind_having_expr(left, reduce_schema, source_schema,
+                group_col_indices, use_natural_pk, agg_mappings, agg_col_offset)?;
+            let r = bind_having_expr(right, reduce_schema, source_schema,
+                group_col_indices, use_natural_pk, agg_mappings, agg_col_offset)?;
             let bop = match op {
                 sqlparser::ast::BinaryOperator::Plus  => BinOp::Add,
                 sqlparser::ast::BinaryOperator::Minus => BinOp::Sub,
@@ -1578,8 +1685,8 @@ fn bind_having_expr(
             }
         }
         Expr::Nested(inner) => bind_having_expr(
-            inner, post_map_schema, source_schema,
-            agg_mappings, select_items,
+            inner, reduce_schema, source_schema,
+            group_col_indices, use_natural_pk, agg_mappings, agg_col_offset,
         ),
         _ => Err(GnitzSqlError::Unsupported(
             format!("HAVING: unsupported expression {:?}", expr)
@@ -1823,8 +1930,12 @@ fn execute_create_set_op_view(
     out_cols_final.push(ColumnDef {
         name: "_set_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
-    for col in &left_cols {
-        out_cols_final.push(col.clone());
+    for (l, r) in left_cols.iter().zip(&right_cols) {
+        let mut col = l.clone();
+        // A set-op row may originate from either side; the column is nullable if
+        // either input column is. Type equality is already checked above.
+        col.is_nullable = l.is_nullable || r.is_nullable;
+        out_cols_final.push(col);
     }
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final)

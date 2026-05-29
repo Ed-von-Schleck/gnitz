@@ -79,9 +79,15 @@ pub(super) fn emit_reduce_row(
             if grp_idx < group_by_cols.len() {
                 let src_ci = group_by_cols[grp_idx] as usize;
                 if input_schema.is_pk_col(src_ci) {
-                    // PK is never null and lives outside the payload region.
-                    let pk = input_mb.get_pk(exemplar_row);
-                    output.extend_col(out_pi, &pk.to_le_bytes()[..cs]);
+                    // PK lives in the OPK region; decode the addressed column back
+                    // to native LE before copying into the payload region (raw
+                    // copy keeps the flipped sign bit / big-endian order for
+                    // signed and wide columns).
+                    let opk = input_mb.get_pk_bytes(exemplar_row);
+                    let off = input_schema.pk_byte_offset(src_ci) as usize;
+                    let mut le = [0u8; 16];
+                    gnitz_wire::decode_pk_column(&opk[off..off + cs], col.type_code, &mut le[..cs]);
+                    output.extend_col(out_pi, &le[..cs]);
                 } else {
                     let src_pi = input_schema.payload_idx(src_ci);
                     // Check null from input
@@ -156,7 +162,9 @@ pub(super) fn emit_finalized_row(
                         // column type for a verbatim copy.
                         let opk = raw_mb.get_pk_bytes(raw_row);
                         let off = pk_off as usize;
-                        let mut le = [0u8; crate::schema::MAX_PK_BYTES];
+                        // A single PK column is decoded here, never the whole
+                        // compound region; 16 bytes (widest scalar PK) suffices.
+                        let mut le = [0u8; 16];
                         gnitz_wire::decode_pk_column(
                             &opk[off..off + cs],
                             col.type_code,

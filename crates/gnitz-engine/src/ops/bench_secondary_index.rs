@@ -291,7 +291,8 @@ fn secondary_index_bench_avi_decomposition() {
         extractor.gather(&mb, row, key);
         let av_bytes = mb.get_col_ptr(row, avi_pi, 8);
         let av = encode_ordered(av_bytes, tc, false);
-        key[n..n + AVI_AV_BYTES].copy_from_slice(&av.to_le_bytes());
+        // Big-endian, mirroring the production key layout in op_integrate_with_indexes.
+        key[n..n + AVI_AV_BYTES].copy_from_slice(&av.to_be_bytes());
         n + AVI_AV_BYTES
     };
     let build_batch = || {

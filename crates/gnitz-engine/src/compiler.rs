@@ -1527,7 +1527,12 @@ fn emit_reduce(
         let gc_col_idx = gcols[0] as usize;
         let gc_raw = in_reg_schema.columns[gc_col_idx].type_code;
         let gc_tc = TypeCode::from_validated_u8(gc_raw);
-        if matches!(gc_tc,
+        // A nullable group column makes the GI unsound: NULL rows are skipped at
+        // population, but the reduce GI path extracts gc=0 from a NULL group's
+        // zero-filled slot and would collide it with a real group 0. Fall back to
+        // the predicate-filtered full trace scan, which distinguishes NULL from 0.
+        let gc_nullable = in_reg_schema.columns[gc_col_idx].nullable != 0;
+        if !gc_nullable && matches!(gc_tc,
             TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
             TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
         ) {
