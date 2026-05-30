@@ -168,6 +168,34 @@ impl UniqueFilter {
     }
 }
 
+/// RAII guard that removes cold UniqueFilter entries if the warmup future is
+/// dropped before it completes. Uses a raw pointer rather than `&mut Map` to
+/// avoid holding a mutable reference across `.await` suspension points, which
+/// would violate noalias assumptions if the committer task touches the map
+/// while the master future is parked.
+struct WarmupGuard {
+    disp_ptr: *mut MasterDispatcher,
+    table_id: i64,
+    cols: Vec<u32>,
+    disarmed: bool,
+}
+
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            unsafe {
+                let disp = &mut *self.disp_ptr;
+                for &col in &self.cols {
+                    disp.unique_filter_remove_col(self.table_id, col);
+                }
+            }
+        }
+    }
+}
+
+// Safety: WarmupGuard is only used inside the single-threaded master event loop.
+unsafe impl Send for WarmupGuard {}
+
 /// Column-extraction descriptor for one unique index on a table.
 /// Precomputed so the hot update path avoids catalog reborrows per row.
 #[derive(Clone, Copy)]
@@ -617,6 +645,14 @@ impl MasterDispatcher {
 
     /// CPU-only first half of exchange relay: looks up shard columns via
     /// the catalog DAG, scatters the payloads into per-worker batches,
+    /// True when enough SAL space remains for a relay write.  The threshold
+    /// mirrors the one in `prepare_relay` but is checked *before* consuming
+    /// the relay so a low-space condition can be resolved (checkpoint) rather
+    /// than silently discarding the relay and deadlocking blocked workers.
+    pub(crate) fn sal_has_relay_space(&self) -> bool {
+        self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
+    }
+
     /// and collects column names. No SAL write yet — `relay_loop` runs
     /// this without `sal_writer_excl` so the lock covers only the
     /// synchronous SAL write in `emit_relay`.
@@ -1259,6 +1295,13 @@ impl MasterDispatcher {
         self.check_batch_pool.remove(&table_id);
     }
 
+    /// Remove the unique-filter entry for a single (owner_table_id, col_idx)
+    /// pair. Called on DROP INDEX so subsequent INSERTs re-trigger warmup for
+    /// the now-absent index while leaving unrelated filters on the same table.
+    pub(crate) fn unique_filter_remove_col(&mut self, owner_id: i64, col_idx: u32) {
+        self.unique_filters.remove(&(owner_id, col_idx));
+    }
+
     // -----------------------------------------------------------------------
     // Pipelined distributed validation
     // -----------------------------------------------------------------------
@@ -1320,7 +1363,13 @@ impl MasterDispatcher {
             if !wide {
                 pk_lo_hi = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
                     let mut m = cell.borrow_mut();
-                    m.clear();
+                    // Reclaim capacity after an unusually large batch to prevent
+                    // the thread-local from growing without bound.
+                    if m.capacity() > 65_536 {
+                        *m = FxHashMap::default();
+                    } else {
+                        m.clear();
+                    }
                     m.reserve(batch.count);
                     for i in 0..batch.count {
                         let w = batch.get_weight(i);
@@ -1982,7 +2031,7 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         table_id: i64,
     ) -> Result<(), String> {
-        let missing: Vec<UniqueIndexDesc> = unsafe {
+        let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = unsafe {
             let disp = &mut *disp_ptr;
             let (_schema, descs) = match disp.unique_index_descriptors(table_id) {
                 Some(x) => x,
@@ -1995,7 +2044,14 @@ impl MasterDispatcher {
             for d in &missing {
                 disp.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
             }
-            missing
+            let missing_cols: Vec<u32> = missing.iter().map(|d| d.col_idx).collect();
+            let guard = WarmupGuard {
+                disp_ptr,
+                table_id,
+                cols: missing_cols,
+                disarmed: false,
+            };
+            (missing, guard)
         };
 
         let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
@@ -2064,24 +2120,23 @@ impl MasterDispatcher {
         }.await;
 
         // On success the filters are fully populated → mark warm so the
-        // broadcast-skip shortcut may trust them. On failure (worker crash
-        // mid-scan) remove the unwarmed entries so the next validation
-        // retries warmup instead of seeing them present and skipping it
-        // forever (the "already warming" guard filters on key presence).
-        let disp = unsafe { &mut *disp_ptr };
+        // broadcast-skip shortcut may trust them. Disarm the guard so the
+        // drop handler does not remove the now-warm entries. On failure (worker
+        // crash mid-scan or cancellation) let the guard's Drop handler remove
+        // the cold entries so the next validation retries warmup from scratch.
         match scan_result {
             Ok(()) => {
+                let disp = unsafe { &mut *disp_ptr };
                 for d in &missing {
                     if let Some(f) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
                         f.warm = true;
                     }
                 }
+                guard.disarmed = true;
                 Ok(())
             }
             Err(e) => {
-                for d in &missing {
-                    disp.unique_filters.remove(&(table_id, d.col_idx));
-                }
+                // Guard is not disarmed → Drop removes the cold entries.
                 Err(e)
             }
         }

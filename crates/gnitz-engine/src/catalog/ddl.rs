@@ -223,10 +223,11 @@ impl CatalogEngine {
         // Remove the view's dependency rows from sys_view_deps first. dag.dep_map
         // is rebuilt by scanning sys_view_deps; ghost entries for a dropped view
         // would accumulate and force re-evaluation of dead dependencies on every
-        // upstream change.
+        // upstream change. Route through ingest_to_family so dep retractions
+        // enter pending_broadcasts and are visible to compensate_stage_a rollback.
         let dep_batch = retract_rows_by_view(&self.sys_view_deps, &dep_tab_schema(), vid as u64);
         if dep_batch.count > 0 {
-            ingest_batch_into(&mut self.sys_view_deps, &dep_batch);
+            self.ingest_to_family(DEP_TAB_ID, &dep_batch)?;
         }
 
         let schema = view_tab_schema();
@@ -430,6 +431,8 @@ impl CatalogEngine {
             // always promotes the leading key to ≤16 bytes, so a u128 dedup
             // token suffices (zero-padded LE for narrower types).
             let key_size = idx_schema.columns[0].size() as usize;
+            debug_assert!(key_size <= 16,
+                "unique index key size {} exceeds 16-byte dedup buffer", key_size);
             let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
             for row in 0..projected.count {
                 if projected.get_weight(row) <= 0 { continue; }
@@ -538,7 +541,7 @@ impl CatalogEngine {
         self.ingest_to_family(COL_TAB_ID, &batch)
     }
 
-    pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) {
+    pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) -> Result<(), String> {
         let schema = dep_tab_schema();
         let mut bb = BatchBuilder::new(schema);
         for &dep_tid in dep_ids {
@@ -548,7 +551,10 @@ impl CatalogEngine {
             bb.end_row();
         }
         let batch = bb.finish();
-        ingest_batch_into(&mut self.sys_view_deps, &batch);
+        if batch.count > 0 {
+            self.ingest_to_family(DEP_TAB_ID, &batch)?;
+        }
+        Ok(())
     }
 
 }

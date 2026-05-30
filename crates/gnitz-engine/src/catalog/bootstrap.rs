@@ -59,6 +59,7 @@ impl CatalogEngine {
             pending_dir_deletions: Vec::new(),
             ddl_zone_lsn: 0,
             cascading_drop: false,
+            in_rollback: false,
         };
 
         if is_new {

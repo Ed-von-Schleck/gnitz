@@ -41,11 +41,18 @@ impl CatalogEngine {
             entry.schema.columns[col.fk_col_idx as usize].type_code
         };
 
+        // Promote BOTH sides before comparing. `get_index_key_type` maps signed
+        // ints to their unsigned index-key code (I64→U64) and is idempotent on
+        // already-unsigned codes, so an I64 child column referencing an I64
+        // parent column compares equal — as does the legacy U64-vs-U64 case.
+        // Comparing the promoted child against the parent's raw type_code would
+        // wrongly reject identical-type FKs once PKs are stored as signed I64.
         let promoted = get_index_key_type(col.type_code)?;
-        if promoted != target_type {
+        let target_promoted = get_index_key_type(target_type)?;
+        if promoted != target_promoted {
             return Err(format!(
                 "FK type mismatch: promoted code {} vs target {}",
-                promoted, target_type
+                promoted, target_promoted
             ));
         }
         Ok(())

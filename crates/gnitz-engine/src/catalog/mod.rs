@@ -51,6 +51,7 @@ use crate::storage::{Batch, PartitionedTable, partition_arena_size, CursorHandle
 // Re-export items used by other crate modules.
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
+pub(crate) use sys_tables::{TABLE_TAB_ID, IDX_TAB_ID};
 
 // Import everything from sys_tables for internal use.
 use sys_tables::*;
@@ -134,5 +135,11 @@ pub struct CatalogEngine {
     // FK/view-dep precheck), so the IDX_TAB integrity guard is suppressed for
     // them — it only protects against standalone user DROP INDEX.
     cascading_drop: bool,
+
+    // Set only by compensate_stage_a for the duration of a rollback. Guards
+    // cascade hooks that must not re-issue broadcasts or re-run side effects
+    // (backfill_index, backfill_view, cascade_retract_columns, hook_cascade_fk)
+    // during compensation. Never nested; always cleared before returning.
+    pub(crate) in_rollback: bool,
 }
 

@@ -441,7 +441,7 @@ fn test_view_deps_compound_pk_round_trip() {
     let dir = temp_dir("view_deps_compound");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    engine.write_view_deps(7, &[100, 200]);
+    engine.write_view_deps(7, &[100, 200]).unwrap();
     engine.dag.invalidate_dep_map();
 
     let dep_map = engine.dag.get_dep_map().clone();

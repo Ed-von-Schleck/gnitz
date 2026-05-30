@@ -64,6 +64,11 @@ impl CatalogEngine {
     /// User tables delegate to `DagEngine::ingest_to_family`.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
+            if self.in_rollback {
+                // During rollback all cascade writes must bypass pending_broadcasts
+                // so no compensating row is re-broadcast to workers.
+                return self.ingest_to_family_no_broadcast(table_id, batch);
+            }
             // Reject BEFORE any WAL write; avoids dangling retractions that
             // would later trip replay_catalog.
             self.precheck_sys_ingest(table_id, batch)?;
@@ -125,14 +130,130 @@ impl CatalogEngine {
         // Deliberately no push to pending_broadcasts.
     }
 
-    /// Reject FK-blocked or view-dep-blocked drops before they hit the WAL.
-    /// Only TABLE_TAB and VIEW_TAB retractions have pre-conditions; other
-    /// system tables (including cascade targets) are no-ops.
+    /// Reject a CREATE whose qualified `schema.name` collides with an existing
+    /// entity. Re-ingesting the same row (e.g. a pk-col update of `self_id`) is
+    /// allowed; only a genuinely different entity under that name is rejected.
+    /// Also resolves `sid`, erroring if the schema does not exist.
+    fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64) -> Result<(), String> {
+        let schema_name = self.caches.schema_by_id.get(&sid)
+            .ok_or_else(|| format!("Schema with ID {} does not exist", sid))?;
+        let qualified = format!("{}.{}", schema_name, name);
+        if let Some(&existing) = self.caches.entity_by_qname.get(&qualified) {
+            if existing != self_id {
+                return Err(format!("Table or view already exists: {}", qualified));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a system-table write before any mutation (memtable or hooks).
+    /// Covers both positive-weight (CREATE) invariants and negative-weight (DROP)
+    /// integrity guards so that no invalid state is ever written.
     fn precheck_sys_ingest(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID && table_id != IDX_TAB_ID {
+        if table_id != SCHEMA_TAB_ID
+            && table_id != TABLE_TAB_ID
+            && table_id != VIEW_TAB_ID
+            && table_id != IDX_TAB_ID
+        {
             return Ok(());
         }
 
+        // -- Positive-weight (CREATE) checks ----------------------------------
+        for i in 0..batch.count {
+            if batch.get_weight(i) <= 0 { continue; }
+
+            match table_id {
+                SCHEMA_TAB_ID => {
+                    let name = self.read_batch_string(batch, i, 0);
+                    if self.caches.schema_by_name.contains_key(&name) {
+                        return Err(format!("Schema already exists: {}", name));
+                    }
+                }
+                TABLE_TAB_ID => {
+                    let tid = batch.get_pk(i) as i64;
+                    let sid = self.read_batch_u64(batch, i, 0) as i64;
+                    let name = self.read_batch_string(batch, i, 1);
+                    let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
+
+                    // Collect ColumnDefs, rejecting any gap/duplicate in the
+                    // column-index sequence (would mismap columns downstream).
+                    let col_defs = self.scan_column_defs(tid, true)?;
+
+                    if col_defs.is_empty() {
+                        return Err(format!(
+                            "catalog invariant violated: table '{}' (tid={}) registered \
+                             before its column records. COL_TAB writes must precede \
+                             TABLE_TAB writes (see hooks.rs dispatch doc).",
+                            name, tid));
+                    }
+                    validate_pk_cols(&col_defs, &pk)?;
+                    if col_defs.len() > crate::schema::MAX_COLUMNS {
+                        return Err(format!(
+                            "table '{}' (tid={}) has {} columns (max {})",
+                            name, tid, col_defs.len(), crate::schema::MAX_COLUMNS));
+                    }
+
+                    let first_pk = pk.as_slice()[0];
+                    let self_pk_type = col_defs[first_pk as usize].type_code;
+                    for (col_idx, cd) in col_defs.iter().enumerate() {
+                        if cd.fk_table_id != 0 {
+                            self.validate_fk_column(cd, col_idx, tid, first_pk, self_pk_type)?;
+                        }
+                    }
+
+                    self.precheck_qname_unique(sid, &name, tid)?;
+                }
+                VIEW_TAB_ID => {
+                    let vid = batch.get_pk(i) as i64;
+                    let sid = self.read_batch_u64(batch, i, 0) as i64;
+                    let name = self.read_batch_string(batch, i, 1);
+
+                    // Reject any gap/duplicate in the column-index sequence;
+                    // only the count is needed here.
+                    let col_count = self.scan_column_defs(vid, true)?.len();
+                    if col_count == 0 {
+                        return Err(format!(
+                            "catalog invariant violated: view '{}' (vid={}) registered \
+                             before its column records. COL_TAB writes must precede \
+                             VIEW_TAB writes (see hooks.rs dispatch doc).",
+                            name, vid));
+                    }
+                    self.precheck_qname_unique(sid, &name, vid)?;
+                }
+                IDX_TAB_ID => {
+                    let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+                    let source_col_idx = self.read_batch_u64(batch, i, 2) as usize;
+                    let index_name = self.read_batch_string(batch, i, 3);
+
+                    let entry = self.dag.tables.get(&owner_id)
+                        .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
+
+                    if source_col_idx >= entry.schema.num_columns() {
+                        return Err(format!(
+                            "Index: column index {} out of bounds for table '{}' \
+                             (tid={}, columns={})",
+                            source_col_idx,
+                            self.caches.entity_by_id.get(&owner_id)
+                                .map(|(_, n)| n.as_str()).unwrap_or("?"),
+                            owner_id,
+                            entry.schema.num_columns()));
+                    }
+
+                    let col_type = entry.schema.columns[source_col_idx].type_code;
+                    get_index_key_type(col_type)?;
+
+                    let idx_id = batch.get_pk(i) as i64;
+                    if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
+                        if existing != idx_id {
+                            return Err(format!("Index already exists: {}", index_name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // -- Negative-weight (DROP) checks ------------------------------------
         let mut drop_ids: Vec<i64> = Vec::new();
         for i in 0..batch.count {
             if batch.get_weight(i) < 0 {
@@ -196,19 +317,30 @@ impl CatalogEngine {
             }
         }
 
-        let dep_map = self.dag.get_dep_map();
-        for &id in &drop_ids {
-            if let Some(dependents) = dep_map.get(&id) {
-                // A dependent that is itself being dropped in this same batch
-                // is self-resolving — only an *outside* dependent blocks the
-                // drop. drop_ids is sorted+deduped above, so binary_search is
-                // O(N log M) vs the O(N·M) of `contains`.
-                let still_active = dependents.iter()
-                    .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
-                if still_active {
-                    let (sn, tn) = self.caches.entity_by_id.get(&id)
-                        .cloned().unwrap_or_default();
-                    return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+        // The view-dependency guard applies only to TABLE/VIEW drops. A
+        // SCHEMA_TAB drop carries the schema id, and schema ids (allocated from
+        // FIRST_USER_SCHEMA_ID = 3) share an i64 space with table ids (from
+        // FIRST_USER_TABLE_ID = 16): as both counters climb, a schema id
+        // eventually equals an earlier table id. dep_map is keyed by *table*
+        // id, so probing it with a schema id would spuriously match an
+        // unrelated table's dependents. A schema's own members were already
+        // dropped (and individually dep-checked) by the drop_schema cascade
+        // before this row is emitted, so the schema row itself needs no guard.
+        if table_id == TABLE_TAB_ID || table_id == VIEW_TAB_ID {
+            let dep_map = self.dag.get_dep_map();
+            for &id in &drop_ids {
+                if let Some(dependents) = dep_map.get(&id) {
+                    // A dependent that is itself being dropped in this same
+                    // batch is self-resolving — only an *outside* dependent
+                    // blocks the drop. drop_ids is sorted+deduped above, so
+                    // binary_search is O(N log M) vs the O(N·M) of `contains`.
+                    let still_active = dependents.iter()
+                        .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
+                    if still_active {
+                        let (sn, tn) = self.caches.entity_by_id.get(&id)
+                            .cloned().unwrap_or_default();
+                        return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+                    }
                 }
             }
         }
@@ -240,6 +372,102 @@ impl CatalogEngine {
     /// did not durably drop, so its files must survive.
     pub fn discard_pending_dir_deletions(&mut self) {
         self.pending_dir_deletions.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage-A compensation (DDL rollback)
+    // -----------------------------------------------------------------------
+
+    /// Topological creation priority for rollback sort. Lower = earlier in the
+    /// dependency chain (created first, destroyed last). Priorities must be
+    /// distinct for TABLE_TAB and VIEW_TAB so the relative order is stable.
+    fn rollback_topo_priority(tid: i64) -> u8 {
+        match tid {
+            SCHEMA_TAB_ID                => 0,
+            COL_TAB_ID                   => 1,
+            DEP_TAB_ID                   => 2,
+            CIRCUIT_NODES_TAB_ID         => 3,
+            CIRCUIT_EDGES_TAB_ID         => 4,
+            CIRCUIT_NODE_COLUMNS_TAB_ID  => 5,
+            TABLE_TAB_ID                 => 6,
+            VIEW_TAB_ID                  => 7,
+            IDX_TAB_ID                   => 8,
+            _                            => 99,
+        }
+    }
+
+    /// Negate every row's weight in-place.
+    pub(crate) fn negate_batch_in_place(batch: &mut Batch) {
+        for i in 0..batch.count {
+            let w = batch.get_weight(i);
+            let negated = (-w).to_le_bytes();
+            let off = i * 8;
+            batch.weight_data_mut()[off..off + 8].copy_from_slice(&negated);
+        }
+    }
+
+    /// Compensate a failed Stage-A DDL: undo every in-memory mutation that
+    /// was applied before the failure so the catalog is exactly as it was.
+    ///
+    /// Called from the executor's Stage-A error arm. `original_batch` is the
+    /// batch that was passed to `ingest_to_family` before the failure.
+    pub(crate) fn compensate_stage_a(
+        &mut self,
+        target_id: i64,
+        original_batch: &Batch,
+    ) {
+        let mut rollback_list = self.drain_pending_broadcasts();
+
+        // pending_broadcasts is children-before-parents: the top-level batch is
+        // pushed last (after fire_hooks returns Ok). It is present iff fire_hooks
+        // succeeded (evaluate_dag then panicked); absent iff fire_hooks itself
+        // failed. Use iter().any() for robustness over .last().
+        let top_level_present = rollback_list.iter().any(|(tid, _)| *tid == target_id);
+        if !top_level_present {
+            let mut b = original_batch.clone();
+            b.set_schema(sys_tab_schema(target_id));
+            rollback_list.push((target_id, b));
+        }
+
+        let is_create = (0..original_batch.count)
+            .any(|i| original_batch.get_weight(i) > 0);
+
+        // For CREATE rollback: dependents unregistered before dependencies — DESCENDING.
+        // For DROP rollback: dependencies restored before dependents — ASCENDING.
+        if is_create {
+            rollback_list.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::rollback_topo_priority(*tid)));
+        } else {
+            rollback_list.sort_by_key(|(tid, _)| Self::rollback_topo_priority(*tid));
+        }
+
+        // Replay each with negated weight through the no-broadcast path.
+        // fire_hooks still fires so caches, dag.tables, and pending_dir_deletions
+        // are updated. The in_rollback gate in ingest_to_family ensures any
+        // cascade that calls back into ingest_to_family also bypasses broadcasts.
+        self.in_rollback = true;
+        let result = (|| -> Result<(), String> {
+            for (tid, mut batch) in rollback_list {
+                Self::negate_batch_in_place(&mut batch);
+                self.ingest_to_family_no_broadcast(tid, &batch)?;
+            }
+            Ok(())
+        })();
+        self.in_rollback = false;
+
+        // For CREATE: drain cleans up any pre-staged directories from hooks.
+        // For DROP: discard keeps the entity files on disk (drop was not durable).
+        if is_create {
+            self.drain_pending_dir_deletions();
+        } else {
+            self.discard_pending_dir_deletions();
+        }
+
+        result.unwrap_or_else(|e| {
+            gnitz_fatal_abort!(
+                "Stage-A DDL compensation failed — catalog cannot be restored; \
+                 aborting to prevent serving a diverged catalog. Cause: {}", e
+            );
+        });
     }
 
     /// Pin all system-table writes in the current DDL to `lsn`. Must be
@@ -918,7 +1146,17 @@ impl CatalogEngine {
 
     // -- Read column definitions from sys_columns --------------------------
 
-    pub(crate) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
+    /// Scan sys_columns for every positive-weight column record owned by
+    /// `owner_id`, in column-index order. When `check_contiguity` is set the
+    /// column indices (lower 9 bits of the packed PK) must run 0,1,2,… with no
+    /// gap or duplicate — a gap would silently mismap columns in
+    /// `build_schema_from_col_defs`, so the create-precheck path rejects it.
+    /// The non-checking form is infallible by construction.
+    pub(crate) fn scan_column_defs(
+        &self,
+        owner_id: i64,
+        check_contiguity: bool,
+    ) -> Result<Vec<ColumnDef>, String> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_columns.open_cursor();
@@ -926,26 +1164,37 @@ impl CatalogEngine {
         cursor.cursor.seek_bytes(&start_pk.to_be_bytes());
 
         let mut defs = Vec::new();
+        let mut expected: i64 = 0;
         while cursor.cursor.valid {
             let pk = cursor.cursor.current_key as u64;
             if pk >= end_pk { break; }
             if cursor.cursor.current_weight > 0 {
-                let type_code = cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8;
-                let is_nullable = cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0;
-                let name = cursor_read_string(&cursor, COLTAB_COL_NAME);
-                let fk_table_id = cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64;
-                let fk_col_idx = cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32;
+                if check_contiguity {
+                    // pack_column_id layout: owner_id << 9 | col_idx (lower 9 bits).
+                    let actual = (pk & 0x1FF) as i64;
+                    if actual != expected {
+                        return Err(format!(
+                            "entity (owner_id={}): column records are non-contiguous; \
+                             expected index {}, got {}",
+                            owner_id, expected, actual));
+                    }
+                    expected += 1;
+                }
                 defs.push(ColumnDef {
-                    name,
-                    type_code,
-                    is_nullable,
-                    fk_table_id,
-                    fk_col_idx,
+                    name:        cursor_read_string(&cursor, COLTAB_COL_NAME),
+                    type_code:   cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8,
+                    is_nullable: cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0,
+                    fk_table_id: cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64,
+                    fk_col_idx:  cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
                 });
             }
             cursor.cursor.advance();
         }
-        defs
+        Ok(defs)
+    }
+
+    pub(crate) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
+        self.scan_column_defs(owner_id, false).unwrap()
     }
 
     pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_cols: &[u32]) -> SchemaDescriptor {

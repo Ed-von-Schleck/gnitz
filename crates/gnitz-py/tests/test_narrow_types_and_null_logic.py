@@ -178,7 +178,8 @@ class TestSqlThreeValuedLogic:
     """
 
     def _make_or_view(self, client, sn):
-        client.create_schema(sn)
+        # Caller owns schema creation + cleanup; creating it here too would
+        # trip the CREATE SCHEMA duplicate precheck.
         client.execute_sql(
             "CREATE TABLE t "
             "(pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, a BIGINT NULL, b BIGINT NULL)",

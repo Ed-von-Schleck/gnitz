@@ -91,13 +91,23 @@ impl CatalogEngine {
     fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
+            let name = self.read_batch_string(batch, i, 0);
+            let path = format!("{}/{}", self.base_dir, name);
             if weight > 0 {
-                let name = self.read_batch_string(batch, i, 0);
-                let path = format!("{}/{}", self.base_dir, name);
+                // Pre-stage for cleanup before ensure_dir so that if Stage-A
+                // fails after the directory is created, compensate_stage_a's
+                // drain_pending_dir_deletions removes it.
+                let cleanup_idx = self.pending_dir_deletions.len();
+                self.pending_dir_deletions.push(path.clone());
                 ensure_dir(&path)?;
-                // Flush the child inode itself, then the parent's dirent.
+                // Success: remove the pre-staged entry.
+                self.pending_dir_deletions.truncate(cleanup_idx);
                 fsync_dir(&path);
                 fsync_dir(&self.base_dir);
+            } else {
+                // Queue for deletion on successful DROP SCHEMA and on CREATE SCHEMA
+                // rollback when compensate_stage_a re-fires this hook with -1.
+                self.pending_dir_deletions.push(path);
             }
         }
         Ok(())
@@ -147,10 +157,16 @@ impl CatalogEngine {
                 let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);
                 gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, num_parts);
+                // Pre-stage for cleanup so that if Stage-A fails after the table
+                // directory is created, compensate_stage_a's drain removes it.
+                let cleanup_idx = self.pending_dir_deletions.len();
+                self.pending_dir_deletions.push(directory.clone());
                 let pt = PartitionedTable::new(
                     &directory, &name, tbl_schema, tid as u32, num_parts,
                     true, self.active_part_start, self.active_part_end, arena,
                 ).map_err(|e| format!("Failed to create table '{}': error {} (dir={})", name, e, directory))?;
+                // Success: remove the pre-staged entry.
+                self.pending_dir_deletions.truncate(cleanup_idx);
 
                 fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
                 self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, 0, is_unique, directory);
@@ -159,8 +175,16 @@ impl CatalogEngine {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
                 let directory = self.dag.tables.get(&tid).map(|e| e.directory.clone());
+                // cascade_retract_indices cleans up any in-transaction FK indices
+                // (those were never broadcast and must be physically removed).
+                // During rollback the in_rollback gate in ingest_to_family ensures
+                // these writes bypass pending_broadcasts.
                 self.cascade_retract_indices(tid)?;
-                self.cascade_retract_columns(tid)?;
+                // During CREATE TABLE rollback the column records were committed by
+                // prior RPCs; retracting them here would diverge master from workers.
+                if !self.in_rollback {
+                    self.cascade_retract_columns(tid)?;
+                }
                 self.dag.unregister_table(tid);
                 if let Some(dir) = directory {
                     self.pending_dir_deletions.push(dir);
@@ -238,10 +262,13 @@ impl CatalogEngine {
 
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);
+                let cleanup_idx = self.pending_dir_deletions.len();
+                self.pending_dir_deletions.push(directory.clone());
                 let et = PartitionedTable::new(
                     &directory, &name, view_schema, vid as u32, num_parts,
                     false, self.active_part_start, self.active_part_end, arena,
                 ).map_err(|e| format!("Failed to create view '{}': error {}", name, e))?;
+                self.pending_dir_deletions.truncate(cleanup_idx);
 
                 let source_ids = self.dag.get_source_ids(vid);
                 let max_depth = source_ids.iter()
@@ -253,7 +280,10 @@ impl CatalogEngine {
                 self.dag.register_table(vid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))), view_schema, max_depth, false, directory);
                 if vid + 1 > self.next_table_id { self.next_table_id = vid + 1; }
 
-                if self.active_part_start != self.active_part_end
+                // During DROP VIEW rollback the partition files are intact; re-pushing
+                // source rows through the circuit would double every aggregation.
+                if !self.in_rollback
+                    && self.active_part_start != self.active_part_end
                     && self.dag.ensure_compiled(vid)
                     && !self.dag.view_needs_exchange(vid)
                 {
@@ -261,8 +291,13 @@ impl CatalogEngine {
                 }
             } else if self.dag.tables.contains_key(&vid) {
                 let directory = self.dag.tables.get(&vid).map(|e| e.directory.clone());
-                self.cascade_retract_circuit_and_deps(vid)?;
-                self.cascade_retract_columns(vid)?;
+                // During CREATE VIEW rollback the circuit/dep and column records
+                // were committed by prior RPCs; retracting them here would diverge
+                // master from workers.
+                if !self.in_rollback {
+                    self.cascade_retract_circuit_and_deps(vid)?;
+                    self.cascade_retract_columns(vid)?;
+                }
                 self.dag.unregister_table(vid);
                 if let Some(dir) = directory {
                     self.pending_dir_deletions.push(dir);
@@ -304,6 +339,13 @@ impl CatalogEngine {
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
 
             if weight > 0 {
+                // Keep worker next_index_id in sync with master-assigned IDs so that
+                // create_fk_indices → allocate_index_id never collides with an explicit
+                // user index that was broadcast via IDX_TAB +1.
+                if idx_id + 1 > self.next_index_id {
+                    self.next_index_id = idx_id + 1;
+                }
+
                 // Use dag presence check since apply_index_by_name may have already fired
                 let already_registered = self.dag.tables.get(&owner_id)
                     .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
@@ -322,6 +364,12 @@ impl CatalogEngine {
                     .map(|e| e.directory.clone()).unwrap_or_default();
                 let idx_dir = format!("{}/idx_{}", owner_dir, idx_id);
 
+                // Pre-stage before Table::new so that if backfill_index fails the
+                // directory is in pending_dir_deletions for cleanup. Truncate only
+                // after ALL fallible operations succeed.
+                let cleanup_idx = self.pending_dir_deletions.len();
+                self.pending_dir_deletions.push(idx_dir.clone());
+
                 let idx_table = Table::new(
                     &idx_dir, &format!("_idx_{}", idx_id), idx_schema, idx_id as u32,
                     SYS_TABLE_ARENA, false,
@@ -329,8 +377,13 @@ impl CatalogEngine {
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
-                self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
+                if !self.in_rollback {
+                    self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
+                }
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
+
+                // Only truncate after all fallible steps succeed.
+                self.pending_dir_deletions.truncate(cleanup_idx);
             } else {
                 let is_registered = self.dag.tables.get(&owner_id)
                     .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
@@ -347,6 +400,11 @@ impl CatalogEngine {
     }
 
     fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {
+        // During CREATE TABLE rollback the TABLE +1 compensation re-registers the
+        // table; running hook_cascade_fk here would allocate new index IDs for FK
+        // indices that conflict with the IDX +1 rows the topological replay
+        // restores a moment later.
+        if self.in_rollback { return Ok(()); }
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             if weight <= 0 { continue; }

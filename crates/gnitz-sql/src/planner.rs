@@ -1505,7 +1505,7 @@ fn having_agg_func(
 /// column too, so `MAX(c2)` never binds to `SUM(c1)`.
 fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
     match agg_func {
-        AggFunc::Avg => m.is_avg && m.arg_col == arg_col,
+        AggFunc::Avg => m.agg_func == AggFunc::Avg && m.is_avg && m.arg_col == arg_col,
         AggFunc::Count => m.agg_func == AggFunc::Count,
         AggFunc::CountNonNull => m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
         AggFunc::Sum => m.agg_func == AggFunc::Sum && m.arg_col == arg_col,

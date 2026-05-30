@@ -783,7 +783,7 @@ fn make_shared_batch_data(
     let is_uuid: Vec<bool> = s.columns.iter().map(|c| c.type_code == TypeCode::UUID).collect();
     let is_pk: Vec<bool> = (0..s.columns.len()).map(|ci| s.is_pk_col(ci)).collect();
     let payload_idx: Vec<usize> = (0..s.columns.len())
-        .map(|ci| if s.is_pk_col(ci) { 0 } else { s.payload_idx(ci) }).collect();
+        .map(|ci| if is_pk[ci] { 0 } else { s.payload_idx(ci) }).collect();
     let wire_stride: Vec<usize> = s.columns.iter().map(|c| c.type_code.wire_stride()).collect();
     Ok(Arc::new(SharedBatchData {
         schema: s, batch: b, fields, field_index,
@@ -1280,22 +1280,12 @@ fn response_to_lazy(
 ) -> PyResult<Py<PyScanResult>> {
     let (opt_schema, opt_batch, view_lsn) = result
         .map_err(|e| GnitzError::new_err(e.to_string()))?;
-    let data = match (opt_schema, opt_batch) {
-        (Some(s), Some(b)) if b.len() > 0 => Some(make_shared_batch_data(py, s, b)?),
-        (Some(s), opt_b) => {
-            let b = opt_b.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
-            Some(Arc::new(SharedBatchData {
-                schema:      s,
-                batch:       b,
-                fields:      PyTuple::empty(py).unbind(),
-                field_index: Arc::new(HashMap::new()),
-                is_uuid:     Vec::new(),
-                is_pk:       Vec::new(),
-                payload_idx: Vec::new(),
-                wire_stride: Vec::new(),
-            }))
+    let data = match opt_schema {
+        Some(s) => {
+            let b = opt_batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
+            Some(make_shared_batch_data(py, s, b)?)
         }
-        _ => None,
+        None => None,
     };
     Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
 }
@@ -2148,9 +2138,21 @@ fn async_io_loop(
             }
         }
 
+        // Update the schema cache before acquiring the GIL: the Mutex has no
+        // GIL dependency, and holding it inside with_gil would reverse the
+        // lock order relative to scan()/seek(), which lock the Mutex then
+        // drop it before any GIL-gated code.
+        {
+            let mut cache = schema_cache.lock().unwrap();
+            for result in &results {
+                if let LoopResult::Scan { schema: Some(s), schema_version, target_id, .. } = result {
+                    cache.put(*target_id, (Arc::clone(s), *schema_version));
+                }
+            }
+        }
+
         // Single GIL acquisition to resolve all futures.
         let conn_lost = recv_err.is_some();
-        let cache_ref = Arc::clone(&schema_cache);
         Python::with_gil(|py| {
             for result in results.drain(..) {
                 let (fut, _kind) = pending_futures.pop_front().unwrap();
@@ -2175,11 +2177,7 @@ fn async_io_loop(
                         let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
                             (&se_fn, &fut, exc));
                     }
-                    LoopResult::Scan { schema, schema_version, batch, lsn, target_id } => {
-                        // Update cache so the next scan on this table is warm.
-                        if let Some(ref s) = schema {
-                            cache_ref.lock().unwrap().put(target_id, (Arc::clone(s), schema_version));
-                        }
+                    LoopResult::Scan { schema, batch, lsn, .. } => {
                         let data = match schema {
                             Some(s) => {
                                 let b = batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));

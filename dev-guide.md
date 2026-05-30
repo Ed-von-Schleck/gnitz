@@ -289,3 +289,7 @@ Never save code-specific details (function names, file paths, invariants,
 fix recipes) to Claude Code memory. Code changes; memories become stale
 and cause more problems than they solve. If something matters, put it in
 the code (comments, doc strings, assertions) or in this guide.
+
+## GIT Branches
+
+All development happens on main for now; never branch off.

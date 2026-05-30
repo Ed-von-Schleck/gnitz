@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use rustc_hash::{FxHashMap, FxHashSet};
 use crate::storage::batch_pool::PooledSendBuf;
 
-use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
+use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
+                     TABLE_TAB_ID, IDX_TAB_ID};
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
@@ -527,6 +528,26 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             Some(r) => r,
             None => return,
         };
+
+        // Check space BEFORE consuming the relay. If SAL capacity is low,
+        // force a checkpoint to reclaim space. A lost relay causes an
+        // unrecoverable cluster deadlock (workers in do_exchange_wait block
+        // indefinitely), so gnitz_fatal_abort! is correct if space remains
+        // exhausted after the checkpoint.
+        let space_ok = unsafe { (*shared.dispatcher).sal_has_relay_space() };
+        if !space_ok {
+            gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
+            let (tx, rx_done) = oneshot::channel();
+            shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+            let _ = rx_done.await;
+            if !unsafe { (*shared.dispatcher).sal_has_relay_space() } {
+                gnitz_fatal_abort!(
+                    "SAL space exhausted even after forced checkpoint; \
+                     cannot deliver exchange relay — aborting to prevent cluster deadlock"
+                );
+            }
+        }
+
         // Phase 1: CPU work + catalog read only — no SAL mutex.
         let prep = {
             let _cat = shared.catalog_rwlock.read().await;
@@ -534,7 +555,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 (*shared.dispatcher).prepare_relay(relay)
             }) {
                 Ok(p) => p,
-                Err(e) => { gnitz_warn!("prepare_relay: {}", e); continue; }
+                Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
             }
         };
         // Phase 2: SAL write only — grab the mutex, no awaits inside.
@@ -991,6 +1012,11 @@ async fn handle_system_dml(
     let zone_lsn = shared.ingest_lsn.get() + 1;
     unsafe { (*cat_ptr_raw).set_ddl_zone_lsn(zone_lsn); }
 
+    // Clone before evaluate_dag consumes the batch; used by compensate_stage_a
+    // to reconstruct the rollback list when fire_hooks succeeded but evaluate_dag
+    // panicked (the top-level batch was never pushed to pending_broadcasts).
+    let batch_for_undo = batch.clone();
+
     if let Err(e) = guard_panic("DDL", || {
         let cat = unsafe { &mut *cat_ptr_raw };
         cat.ingest_to_family(target_id, &batch)?;
@@ -998,11 +1024,14 @@ async fn handle_system_dml(
         unsafe { (*dag).evaluate_dag(target_id, batch); }
         Ok(())
     }) {
-        // A partial cascade may have pushed entries before the failing hook;
-        // clear them so the next DDL doesn't inherit half-applied broadcasts.
-        let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
-        // The drop did not durably commit; keep the entities' files on disk.
-        unsafe { (*cat_ptr_raw).discard_pending_dir_deletions(); }
+        guard_panic("DDL-compensate", || {
+            unsafe { (*cat_ptr_raw).compensate_stage_a(target_id, &batch_for_undo); }
+            Ok::<(), String>(())
+        }).unwrap_or_else(|ce| {
+            gnitz_fatal_abort!(
+                "Stage-A DDL compensation panicked after DDL error '{}': {}", e, ce
+            );
+        });
         unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
@@ -1059,6 +1088,31 @@ async fn handle_system_dml(
     // Drop is now durable — physically remove the directories the drop hooks
     // queued (the catalog analog of ShardIndex::pending_deletions cleanup).
     unsafe { (*cat_ptr_raw).drain_pending_dir_deletions(); }
+
+    // Invalidate unique-filter state for durably-dropped tables/indices so a
+    // recreated table with the same ID does not inherit stale filter entries.
+    let disp_ptr_raw = shared.dispatcher;
+    if target_id == TABLE_TAB_ID {
+        for i in 0..batch_for_undo.count {
+            if batch_for_undo.get_weight(i) < 0 {
+                let tid = batch_for_undo.get_pk(i) as i64;
+                unsafe { (*disp_ptr_raw).unique_filter_invalidate_table(tid); }
+            }
+        }
+    } else if target_id == IDX_TAB_ID {
+        for i in 0..batch_for_undo.count {
+            if batch_for_undo.get_weight(i) < 0 {
+                let owner_id = unsafe {
+                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, 0)
+                } as i64;
+                let col_idx = unsafe {
+                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, 2)
+                } as u32;
+                unsafe { (*disp_ptr_raw).unique_filter_remove_col(owner_id, col_idx); }
+            }
+        }
+    }
+
     send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);

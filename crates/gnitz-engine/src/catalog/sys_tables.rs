@@ -27,10 +27,10 @@ pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 pub(super) const NUM_PARTITIONS: u32 = 256;
 
 pub(super) const SCHEMA_TAB_ID: i64             = gnitz_wire::SCHEMA_TAB as i64;
-pub(super) const TABLE_TAB_ID: i64              = gnitz_wire::TABLE_TAB as i64;
+pub(crate) const TABLE_TAB_ID: i64              = gnitz_wire::TABLE_TAB as i64;
 pub(super) const VIEW_TAB_ID: i64               = gnitz_wire::VIEW_TAB as i64;
 pub(super) const COL_TAB_ID: i64                = gnitz_wire::COL_TAB as i64;
-pub(super) const IDX_TAB_ID: i64                = gnitz_wire::IDX_TAB as i64;
+pub(crate) const IDX_TAB_ID: i64                = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64                = gnitz_wire::DEP_TAB as i64;
 pub(super) const SEQ_TAB_ID: i64                = gnitz_wire::SEQ_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64        = gnitz_wire::CIRCUIT_NODES_TAB as i64;

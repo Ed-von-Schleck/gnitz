@@ -958,6 +958,13 @@ pub unsafe extern "C" fn gnitz_circuit_filter(
     cb_ref.0.filter(input, expr_opt)
 }
 
+/// Build a slice from a C `ptr`+`len`, treating a NULL pointer or zero length
+/// as empty. Caller guarantees a non-null `ptr` addresses `len` valid `T`s.
+unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+    if ptr.is_null() || len == 0 { &[] }
+    else { unsafe { std::slice::from_raw_parts(ptr, len) } }
+}
+
 /// Add a map/projection node.
 /// projection: array of output column indices (0-based), n_cols entries; may be NULL.
 #[no_mangle]
@@ -968,8 +975,7 @@ pub unsafe extern "C" fn gnitz_circuit_map(
     n_cols:     usize,
 ) -> u64 {
     let cb_ref = check_ptr_mut!(cb, 0);
-    let cols = if projection.is_null() || n_cols == 0 { &[][..] }
-               else { unsafe { std::slice::from_raw_parts(projection, n_cols) } };
+    let cols = unsafe { slice_or_empty(projection, n_cols) };
     cb_ref.0.map(input, cols)
 }
 
@@ -1035,8 +1041,7 @@ pub unsafe extern "C" fn gnitz_circuit_reduce(
     agg_col_idx:  usize,
 ) -> u64 {
     let cb_ref = check_ptr_mut!(cb, 0);
-    let gcols = if group_cols.is_null() || n_group_cols == 0 { &[][..] }
-                else { unsafe { std::slice::from_raw_parts(group_cols, n_group_cols) } };
+    let gcols = unsafe { slice_or_empty(group_cols, n_group_cols) };
     cb_ref.0.reduce(input, gcols, agg_func_id, agg_col_idx)
 }
 
@@ -1049,8 +1054,7 @@ pub unsafe extern "C" fn gnitz_circuit_shard(
     n_shard_cols: usize,
 ) -> u64 {
     let cb_ref = check_ptr_mut!(cb, 0);
-    let cols = if shard_cols.is_null() || n_shard_cols == 0 { &[][..] }
-               else { unsafe { std::slice::from_raw_parts(shard_cols, n_shard_cols) } };
+    let cols = unsafe { slice_or_empty(shard_cols, n_shard_cols) };
     cb_ref.0.shard(input, cols)
 }
 
