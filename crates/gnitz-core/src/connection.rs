@@ -127,7 +127,7 @@ impl Connection {
         let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, &[], 0, None, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None, None)?;
         let mut schema: Option<Arc<Schema>> = None;
         let mut data:   Option<ZSetBatch> = None;
         let lsn: u64 = loop {
@@ -204,7 +204,7 @@ impl Connection {
         schema:    Option<&Schema>,
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, 0u128, &[], 0, schema, data)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, &PkTuple::EMPTY, 0, schema, data)?;
         // Alloc roundtrips carry no schema blocks; recv_message without a hint is sufficient.
         let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
@@ -244,13 +244,13 @@ impl Connection {
             send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
         } else {
             // Cold path: include schema block, version = 0.
-            send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, &[], 0, Some(schema), Some(batch))?;
+            send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, &PkTuple::EMPTY, 0, Some(schema), Some(batch))?;
         }
         let ack = match check_response(self.recv_message_cached_inner(target_id, cache)?) {
             Err(ClientError::SchemaMismatch) => {
                 // Stale cache: evict and retry with full schema.
                 cache.pop(&target_id);
-                send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, 0u128, &[], 0, Some(schema), Some(batch))?;
+                send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, &PkTuple::EMPTY, 0, Some(schema), Some(batch))?;
                 check_response(self.recv_message_cached_inner(target_id, cache)?)?
             }
             Ok(msg) => msg,
@@ -278,7 +278,7 @@ impl Connection {
         // block on a warm-cache hit (matching roundtrip_push/scan).
         let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, cached_version);
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, key, &[], col_idx, None, None)?;
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, &PkTuple::from_u128_narrow(key), col_idx, None, None)?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }
@@ -289,10 +289,9 @@ impl Connection {
         pk:        &PkTuple,
         cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
-        let (low_16, extra) = pk.split_wire();
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK, cached_version);
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, low_16, extra, 0, None, None)?;
+        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, pk, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
     }

@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use super::error::ProtocolError;
 use super::header::{Header, STATUS_ERROR, STATUS_OK, STATUS_SCHEMA_MISMATCH, FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     wire_flags_get_schema_version};
-use super::types::{ColData, PkColumn, Schema, ZSetBatch, meta_schema};
+use super::types::{ColData, PkColumn, PkTuple, Schema, ZSetBatch, meta_schema};
 use crate::types::schema_from_wire_cols;
 use super::codec::{schema_to_batch, batch_to_schema};
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
@@ -175,18 +175,19 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
 /// The returned `Vec<u8>` contains concatenated WAL blocks: control + optional
 /// schema + optional data.  Pass to `send_framed()` to add framing and send.
 ///
-/// `seek_pk_extra` carries PK bytes 16..stride for a wide compound-PK seek;
-/// for narrow PKs and non-seek frames, pass `&[]`.
+/// `seek_pk` carries the seek key for `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` frames;
+/// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
+/// `(seek_pk: u128, seek_pk_extra: BLOB)` split is performed here via
+/// `PkTuple::split_wire`, so callers never handle it.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_message(
-    target_id:     u64,
-    client_id:     u64,
-    flags:         u64,
-    seek_pk:       u128,
-    seek_pk_extra: &[u8],
-    seek_col_idx:  u64,
-    schema:        Option<&Schema>,
-    data_batch:    Option<&ZSetBatch>,
+    target_id:    u64,
+    client_id:    u64,
+    flags:        u64,
+    seek_pk:      &PkTuple,
+    seek_col_idx: u64,
+    schema:       Option<&Schema>,
+    data_batch:   Option<&ZSetBatch>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let has_data   = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
     let has_schema = schema.is_some();
@@ -195,9 +196,10 @@ pub fn encode_message(
     if has_schema { flags_out |= FLAG_HAS_SCHEMA; }
     if has_data   { flags_out |= FLAG_HAS_DATA;   }
 
+    let (seek_pk_lo, seek_pk_extra) = seek_pk.split_wire();
     let ctrl_hdr = Header {
         status: STATUS_OK, target_id, client_id, flags: flags_out,
-        seek_pk, seek_col_idx,
+        seek_pk: seek_pk_lo, seek_col_idx,
         request_id: 0,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
@@ -224,20 +226,17 @@ pub fn encode_message(
 
 #[allow(clippy::too_many_arguments)]
 pub fn send_message(
-    sock_fd:       RawFd,
-    target_id:     u64,
-    client_id:     u64,
-    flags:         u64,
-    seek_pk:       u128,
-    seek_pk_extra: &[u8],
-    seek_col_idx:  u64,
-    schema:        Option<&Schema>,
-    data_batch:    Option<&ZSetBatch>,
+    sock_fd:      RawFd,
+    target_id:    u64,
+    client_id:    u64,
+    flags:        u64,
+    seek_pk:      &PkTuple,
+    seek_col_idx: u64,
+    schema:       Option<&Schema>,
+    data_batch:   Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
     let payload = encode_message(
-        target_id, client_id, flags,
-        seek_pk, seek_pk_extra, seek_col_idx,
-        schema, data_batch,
+        target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch,
     )?;
     send_framed(sock_fd, &payload)
 }
@@ -388,8 +387,8 @@ pub fn recv_message(
 mod tests {
     use super::*;
     use std::os::unix::io::RawFd;
-    use crate::protocol::types::{ColData, PkColumn, ColumnDef, Schema, TypeCode, ZSetBatch};
-    use crate::protocol::header::{Header, FLAG_PUSH, STATUS_ERROR};
+    use crate::protocol::types::{ColData, PkColumn, ColumnDef, PkTuple, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
     use crate::protocol::header::wire_flags_set_schema_version;
 
     fn make_socketpair() -> (RawFd, RawFd) {
@@ -480,7 +479,7 @@ mod tests {
 
         let empty_batch = ZSetBatch::new(&schema);
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0u128, &[], 0, Some(&schema), Some(&empty_batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty_batch)).unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
@@ -525,7 +524,7 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0u128, &[], 0, Some(&schema), Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -578,7 +577,7 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0u128, &[], 0, Some(&schema), Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -600,7 +599,7 @@ mod tests {
     fn test_message_no_schema_no_data() {
         // Control-only message (scan/alloc style)
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, 0u128, &[], 0, None, None).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, None, None).unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
@@ -619,8 +618,7 @@ mod tests {
             0xDEAD_BEEF_1234_5678,  // target_id
             0xCAFE_BABE_0000_0001,  // client_id
             FLAG_PUSH,              // flags
-            seek_pk,
-            &[],                    // seek_pk_extra
+            &PkTuple::from_u128_narrow(seek_pk),
             7,                      // seek_col_idx
             None,
             None,
@@ -653,7 +651,7 @@ mod tests {
         let seek_pk = 42u128 | (99u128 << 64);
         let payload = encode_message(
             0xDEAD, 0xBEEF, FLAG_PUSH,
-            seek_pk, &[], 7,
+            &PkTuple::from_u128_narrow(seek_pk), 7,
             None, None,
         ).unwrap();
         let msg = parse_response(&payload, None).unwrap();
@@ -690,7 +688,7 @@ mod tests {
         };
 
         let payload = encode_message(
-            42, 1, 0, 0u128, &[], 0,
+            42, 1, 0, &PkTuple::EMPTY, 0,
             Some(&schema), Some(&batch),
         ).unwrap();
         let msg = parse_response(&payload, None).unwrap();
@@ -712,13 +710,31 @@ mod tests {
         let empty = ZSetBatch::new(&schema);
 
         let payload = encode_message(
-            10, 1, 0, 0u128, &[], 0,
+            10, 1, 0, &PkTuple::EMPTY, 0,
             Some(&schema), Some(&empty),
         ).unwrap();
         let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
         assert!(msg.data_batch.is_none());
+    }
+
+    /// A wide (stride 24) PK seek must split inside `encode_message`: low 16
+    /// bytes land in `seek_pk`, bytes 16..24 in `seek_pk_extra`. `parse_response`
+    /// only surfaces the low-16 `seek_pk`, so decode the control block directly
+    /// to inspect the extra region.
+    #[test]
+    fn encode_message_wide_pk_seek_emits_extra() {
+        let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
+        let payload = encode_message(7, 1, FLAG_SEEK, &pk, 0, None, None).unwrap();
+
+        let ctrl_size = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+        let (hdr, _err, extra) = decode_control_block(&payload[..ctrl_size]).unwrap();
+
+        let (want_lo, want_extra) = pk.split_wire();
+        assert_eq!(hdr.seek_pk, want_lo);
+        assert_eq!(extra, want_extra);          // bytes 16..24
+        assert_eq!(hdr.flags & FLAG_SEEK, FLAG_SEEK);
     }
 
     /// A hint-only frame (FLAG_HAS_DATA set, FLAG_HAS_SCHEMA clear, matching schema

@@ -1730,7 +1730,7 @@ impl PyCircuit {
 fn encode_push_payload(
     client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
-    gnitz_core::encode_message(target_id, client_id, 0, 0u128, &[], 0, Some(schema), Some(batch))
+    gnitz_core::encode_message(target_id, client_id, 0, &gnitz_core::PkTuple::EMPTY, 0, Some(schema), Some(batch))
 }
 
 /// Build a `PkTuple` from a Python value for the wire-only `seek` paths,
@@ -1933,7 +1933,7 @@ impl PyAsyncTransport {
             }
         };
         let payload = gnitz_core::encode_message(
-            target_id, self.client_id, flags, 0u128, &[], 0, None, None,
+            target_id, self.client_id, flags, &gnitz_core::PkTuple::EMPTY, 0, None, None,
         ).map_err(|e| GnitzError::new_err(e.to_string()))?;
         self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
@@ -1952,9 +1952,8 @@ impl PyAsyncTransport {
                 None => (gnitz_core::FLAG_SEEK, None),
             }
         };
-        let (pk_lo, pk_extra) = t.split_wire();
         let payload = gnitz_core::encode_message(
-            target_id, self.client_id, flags, pk_lo, pk_extra, 0, None, None,
+            target_id, self.client_id, flags, &t, 0, None, None,
         ).map_err(|e| GnitzError::new_err(e.to_string()))?;
         self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
