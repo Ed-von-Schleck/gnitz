@@ -13,6 +13,7 @@ mod bench_secondary_index;
 pub use distinct::op_distinct;
 pub use exchange::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
+    op_relay_scatter_join, op_relay_scatter_consolidated_join,
     with_worker_indices,
     worker_for_partition,
 };

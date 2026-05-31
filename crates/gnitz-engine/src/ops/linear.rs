@@ -505,6 +505,24 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
     }
 }
 
+/// Synthetic-PK / routing key for a German-string column's content, used by
+/// both `PkPromoter::read_string` (which sets a reindexed row's `_join_pk`) and
+/// the exchange scatter's `route_partition_key`. Both MUST agree so a string
+/// join key scatters to the worker that owns its reindexed `_join_pk` partition;
+/// otherwise the row is stored on the wrong worker and the view scan misses it.
+/// Empty content (including a NULL string, stored as a zeroed German-string
+/// struct) hashes to 0.
+#[inline]
+pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u128 {
+    let content = crate::schema::german_string_content(struct_bytes, blob);
+    if content.is_empty() {
+        return 0;
+    }
+    let h = xxh::checksum(content);
+    let h_hi = mix64(h);
+    ((h_hi as u128) << 64) | (h as u128)
+}
+
 /// Murmur3 64-bit finalizer.
 #[inline]
 fn mix64(mut v: u64) -> u64 {
@@ -572,13 +590,7 @@ impl PkPromoter {
     #[inline]
     fn read_string(batch: &MemBatch, pi: usize, row: usize) -> u128 {
         let struct_bytes = batch.get_col_ptr(row, pi, 16);
-        let content = crate::schema::german_string_content(struct_bytes, batch.blob);
-        if content.is_empty() {
-            return 0;
-        }
-        let h = xxh::checksum(content);
-        let h_hi = mix64(h);
-        ((h_hi as u128) << 64) | (h as u128)
+        german_string_promote_key(struct_bytes, batch.blob)
     }
 
     /// Test-only oracle: the **OPK-widened** value (what `get_pk` returns after

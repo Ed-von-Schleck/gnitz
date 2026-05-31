@@ -31,6 +31,7 @@ use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
     PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
+    op_relay_scatter_join, op_relay_scatter_consolidated_join,
     worker_for_partition, with_worker_indices,
 };
 
@@ -666,11 +667,15 @@ impl MasterDispatcher {
         let PendingRelay { view_id, payloads, schema, source_id } = relay;
 
         let cat = unsafe { &mut *self.catalog };
-        let shard_cols = if source_id > 0 {
+        // A join-shard scatter (cols from a reindex chain) must route by the
+        // reindex key so a row lands on the worker that owns its `_join_pk`
+        // partition; a GROUP BY / set-op exchange scatter routes by the group
+        // key (consistent with op_reduce's output PK). See `RouteMode`.
+        let (shard_cols, is_join) = if source_id > 0 {
             let cols = cat.dag.get_join_shard_cols(view_id, source_id);
-            if cols.is_empty() { cat.dag.get_shard_cols(view_id) } else { cols }
+            if cols.is_empty() { (cat.dag.get_shard_cols(view_id), false) } else { (cols, true) }
         } else {
-            cat.dag.get_shard_cols(view_id)
+            (cat.dag.get_shard_cols(view_id), false)
         };
 
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
@@ -683,10 +688,14 @@ impl MasterDispatcher {
             .collect();
 
         let dest_batches = match consolidated_sources {
-            Some(sources) => op_relay_scatter_consolidated(&sources, &col_indices, &schema, self.num_workers),
+            Some(sources) => {
+                let scatter = if is_join { op_relay_scatter_consolidated_join } else { op_relay_scatter_consolidated };
+                scatter(&sources, &col_indices, &schema, self.num_workers)
+            }
             None => {
                 let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
-                op_relay_scatter(&sources, &col_indices, &schema, self.num_workers)
+                let scatter = if is_join { op_relay_scatter_join } else { op_relay_scatter };
+                scatter(&sources, &col_indices, &schema, self.num_workers)
             }
         };
 

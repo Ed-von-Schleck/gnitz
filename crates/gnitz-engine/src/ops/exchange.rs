@@ -184,17 +184,84 @@ impl PartitionRouter {
     }
 }
 
+/// Scatter routing key for `cols` at `row`. Equal to `extract_group_key` for
+/// co-locating equal keys, EXCEPT a NULL in a single non-PK integer column
+/// routes by its raw (zero) bytes via `payload_route_key` rather than the
+/// null-distinct hash `extract_group_key` uses.
+///
+/// This must match `PkPromoter::promote_into`, which ignores the null bitmap and
+/// OPK-encodes the column bytes into the synthetic `_join_pk`. A LEFT-join
+/// NULL-key bypass row reindexes to that same `_join_pk`; routing it by the
+/// null-distinct hash would scatter it to a worker that does NOT own its
+/// `_join_pk` partition, so the view scan (which reads each `_join_pk` from its
+/// partition owner) would never see it. `extract_group_key` itself must keep
+/// NULL distinct because it also generates GROUP BY output PKs (op_reduce),
+/// where a NULL group and a 0 group must not collide on one PK; scatter routing
+/// has no such requirement — local grouping (`compare_by_group_cols`) still
+/// separates co-located groups.
+fn route_partition_key(
+    mb: &MemBatch,
+    row: usize,
+    cols: &[u32],
+    schema: &SchemaDescriptor,
+) -> u128 {
+    use crate::schema::type_code;
+    if cols.len() == 1 {
+        let c_idx = cols[0] as usize;
+        let col = &schema.columns[c_idx];
+        let tc = col.type_code;
+        if !schema.is_pk_col(c_idx) {
+            if matches!(tc,
+                type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
+                    | type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64
+                    | type_code::U128 | type_code::UUID)
+            {
+                let cs = col.size() as usize;
+                let pi = schema.payload_idx(c_idx);
+                let ptr = mb.get_col_ptr(row, pi, cs);
+                return crate::schema::payload_route_key(ptr, 0, cs, tc);
+            }
+            // A string join key reindexes to the same content hash; route by it
+            // so the row co-locates with its `_join_pk` partition. A NULL string
+            // is a zeroed struct → empty content → 0, matching promote_into.
+            if gnitz_wire::is_german_string(tc) {
+                let pi = schema.payload_idx(c_idx);
+                let struct_bytes = mb.get_col_ptr(row, pi, 16);
+                return crate::ops::linear::german_string_promote_key(struct_bytes, mb.blob);
+            }
+        }
+    }
+    extract_group_key(mb, row, schema, cols)
+}
+
+/// Which routing key a non-PK scatter uses. A JOIN scatter must route by the
+/// key the downstream reindex (`promote_into`) writes as `_join_pk`, so a row
+/// lands on the worker that owns its `_join_pk` partition. A GROUP BY / set-op
+/// scatter must route by `extract_group_key`, which op_reduce also uses for the
+/// group's output PK — the two must agree or the result is mis-gathered. The two
+/// keys diverge for nullable and string columns, so the scatter caller picks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteMode {
+    GroupKey,
+    JoinPromote,
+}
+
 fn hash_row_for_partition(
     mb: &MemBatch,
     row: usize,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
+    mode: RouteMode,
 ) -> usize {
     // Reached only on the non-PK-routing path (every caller guards with
     // `is_pk_routing = col_indices == pk_indices` and routes PK-keyed rows via
     // `partition_for_pk_bytes`), so `col_indices != pk_indices` here.
-    // `extract_group_key` already handles a single PK column internally.
-    partition_for_key(extract_group_key(mb, row, schema, col_indices))
+    // Both key functions handle a single PK column internally.
+    let key = match mode {
+        RouteMode::JoinPromote => route_partition_key(mb, row, col_indices, schema),
+        RouteMode::GroupKey => extract_group_key(mb, row, schema, col_indices),
+    };
+    partition_for_key(key)
 }
 
 fn fill_worker_indices(
@@ -224,7 +291,8 @@ fn fill_worker_indices(
         }
     } else {
         for i in 0..batch.count {
-            let partition = hash_row_for_partition(&mb, i, col_indices, schema);
+            // PK-routing for index seeks; the non-PK fallback uses the group key.
+            let partition = hash_row_for_partition(&mb, i, col_indices, schema, RouteMode::GroupKey);
             out[w_map[partition]].push(i as u32);
         }
     }
@@ -310,6 +378,16 @@ pub fn op_repartition_batches(
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
+    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
+}
+
+fn op_repartition_batches_mode(
+    sources: &[Option<&Batch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+    mode: RouteMode,
+) -> Vec<Batch> {
     gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
     assert!(sources.len() <= 256, "source index must fit in u8 (got {})", sources.len());
     let w_map = build_w_map(num_workers);
@@ -346,7 +424,7 @@ pub fn op_repartition_batches(
                 }
             } else {
                 for i in 0..mb.count {
-                    let partition = hash_row_for_partition(mb, i, col_indices, schema);
+                    let partition = hash_row_for_partition(mb, i, col_indices, schema, mode);
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
                 }
             }
@@ -460,6 +538,7 @@ fn relay_scatter_merge_walk(
     schema: &SchemaDescriptor,
     num_workers: usize,
     worker_rows: &mut Vec<Vec<(u8, u32)>>,
+    mode: RouteMode,
 ) {
     assert!(mem_batches.len() <= 256, "source index must fit in u8 (got {})", mem_batches.len());
     let w_map = build_w_map(num_workers);
@@ -508,7 +587,7 @@ fn relay_scatter_merge_walk(
         partition_for_pk_bytes(mb.get_pk_bytes(row))
     };
     let route_group = |mb: &MemBatch, row: usize, _pk_val: u128| {
-        hash_row_for_partition(mb, row, col_indices, schema)
+        hash_row_for_partition(mb, row, col_indices, schema, mode)
     };
 
     if !is_wide {
@@ -606,6 +685,27 @@ pub fn op_relay_scatter_consolidated(
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
+    op_relay_scatter_consolidated_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
+}
+
+/// Join-shard variant: routes by the reindex (`promote_into`) key so a row
+/// co-locates with the worker that owns its `_join_pk` partition.
+pub fn op_relay_scatter_consolidated_join(
+    sources: &[Option<&ConsolidatedBatch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Batch> {
+    op_relay_scatter_consolidated_mode(sources, col_indices, schema, num_workers, RouteMode::JoinPromote)
+}
+
+fn op_relay_scatter_consolidated_mode(
+    sources: &[Option<&ConsolidatedBatch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+    mode: RouteMode,
+) -> Vec<Batch> {
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
         .map(|opt| match opt {
@@ -631,7 +731,7 @@ pub fn op_relay_scatter_consolidated(
 
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        relay_scatter_merge_walk(&mem_batches, col_indices, schema, num_workers, &mut worker_rows);
+        relay_scatter_merge_walk(&mem_batches, col_indices, schema, num_workers, &mut worker_rows, mode);
 
         let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
         (0..num_workers)
@@ -665,6 +765,17 @@ pub fn op_relay_scatter(
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
     );
     op_repartition_batches(sources, col_indices, schema, num_workers)
+}
+
+/// Join-shard variant of [`op_relay_scatter`]: routes by the reindex
+/// (`promote_into`) key so a row co-locates with its `_join_pk` partition owner.
+pub fn op_relay_scatter_join(
+    sources: &[Option<&Batch>],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Batch> {
+    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::JoinPromote)
 }
 
 /// Scatter a single batch across workers using multiple independent column
@@ -702,7 +813,7 @@ pub fn op_multi_scatter(
                 }
             } else {
                 for i in 0..n {
-                    let partition = hash_row_for_partition(&mb, i, spec, schema);
+                    let partition = hash_row_for_partition(&mb, i, spec, schema, RouteMode::GroupKey);
                     flat_indices[si * num_workers + w_map[partition]].push(i as u32);
                 }
             }

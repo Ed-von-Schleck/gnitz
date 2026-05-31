@@ -882,18 +882,68 @@ fn execute_create_join_view(
     let right_reindex_prog = build_reindex_program(&right_schema);
 
     // Build circuit
+    let left_n = left_schema.columns.len();
+    let right_n = right_schema.columns.len();
+
+    // Right-side type codes for null-extend (used by LEFT-join null fills).
+    let right_col_tcs: Vec<u64> =
+        right_schema.columns.iter().map(|c| c.type_code as u64).collect();
+
+    // A NULL equi-join key must match nothing (SQL 3VL: NULL = anything, including
+    // NULL = NULL, is unknown). map_reindex would promote a NULL integer key to
+    // synthetic PK 0 and a NULL string to the empty-content hash 0, colliding with
+    // a real 0/"" key and with every other NULL. Gate NULL keys out of the match.
+    // A NOT NULL key leaves its side untouched (no filter node) — byte-identical to
+    // the original plan, so the common case has zero overhead.
+    let left_key_nullable  = left_schema.columns[left_join_col].is_nullable;
+    let right_key_nullable = right_schema.columns[right_join_col].is_nullable;
+
     let mut cb = CircuitBuilder::new(view_id, 0); // no single primary source
     let input_a = cb.input_delta_tagged(left_tid);
     let input_b = cb.input_delta_tagged(right_tid);
-    let reindex_a = cb.map_reindex(input_a, left_join_col, left_reindex_prog);
+
+    // Inner (right) side: NULL keys can never match — drop them before reindex.
+    let input_b = if right_key_nullable {
+        cb.filter(input_b, Some(null_filter_prog(right_join_col, &right_schema, false)?))
+    } else {
+        input_b
+    };
     let reindex_b = cb.map_reindex(input_b, right_join_col, right_reindex_prog);
+
+    // Preserved (left) side.
+    //   INNER join: a NULL left key matches nothing — drop it.
+    //   LEFT  join: a NULL left key must still be emitted with NULL right columns
+    //               but must bypass the match (else it collides with a right 0/""
+    //               key and pollutes trace_a, corrupting join_ba and the ΔB
+    //               null-fill correction). Split it out, reindex it to a U128 PK
+    //               (so it is layout-compatible with the join output — a bare Filter
+    //               would keep the left table's native PK stride and corrupt the
+    //               downstream Union, which merges by raw PK bytes into one stride),
+    //               null-extend it, and union it into the unmatched-left stream.
+    //               Its synthetic PK is 0, which is harmless: the left PK is among
+    //               the copied payload columns and compare_rows treats NULL ≠ 0, so
+    //               it never merges with a real-0-key row.
+    let (input_a_match, left_null_filled) = if !left_key_nullable {
+        (input_a, None)
+    } else {
+        let left_not_null = cb.filter(
+            input_a, Some(null_filter_prog(left_join_col, &left_schema, false)?));
+        if !is_left_join {
+            (left_not_null, None)
+        } else {
+            let left_null = cb.filter(
+                input_a, Some(null_filter_prog(left_join_col, &left_schema, true)?));
+            let left_null_ri = cb.map_reindex(
+                left_null, left_join_col, build_reindex_program(&left_schema));
+            (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
+        }
+    };
+    let reindex_a = cb.map_reindex(input_a_match, left_join_col, left_reindex_prog);
+
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
     let join_ab = cb.join_with_trace_node(reindex_a, trace_b); // ΔA ⋈ z^{-1}(I(B))
     let join_ba = cb.join_with_trace_node(reindex_b, trace_a); // ΔB ⋈ z^{-1}(I(A))
-
-    let left_n = left_schema.columns.len();
-    let right_n = right_schema.columns.len();
 
     // Path AB projection: identity (already canonical: [PK, A_cols, B_cols])
     let proj_ab: Vec<usize> = (1..1 + left_n + right_n).collect();
@@ -912,13 +962,8 @@ fn execute_create_join_view(
     let inner_merged = cb.union(proj_ab_node, proj_ba_node);
 
     let merged = if is_left_join {
-        // Decomposed LEFT OUTER JOIN: inner ∪ (anti_join × null_right)
+        // Decomposed LEFT OUTER JOIN: inner ∪ (anti_join × null_right) ∪ null-key bypass.
         // This handles both ΔA and ΔB correctly.
-
-        // Collect right-side type codes for null-extend (original right table columns)
-        let right_col_tcs: Vec<u64> = right_schema.columns.iter()
-            .map(|c| c.type_code as u64)
-            .collect();
 
         // Key-only B: strip payload, keep only join key PK for distinct tracking
         let key_only_b = cb.map_key_only(reindex_b);
@@ -937,7 +982,12 @@ fn execute_create_join_view(
         let correction = cb.negate(correction_raw);
         let null_filled_correction = cb.null_extend(correction, &right_col_tcs);
 
-        let all_null_fills = cb.union(null_filled_a, null_filled_correction);
+        let mut all_null_fills = cb.union(null_filled_a, null_filled_correction);
+        // NULL-key left rows bypass the match entirely (SQL 3VL) but are still
+        // emitted once as (left payload, NULL right) via this reindexed branch.
+        if let Some(f) = left_null_filled {
+            all_null_fills = cb.union(all_null_fills, f);
+        }
         cb.union(inner_merged, all_null_fills)
     } else {
         inner_merged
@@ -1033,6 +1083,25 @@ fn execute_create_join_view(
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
+}
+
+/// Single-column null predicate for a Filter, reusing the same
+/// bound-expr → ExprProgram path the planner uses for WHERE clauses (so the
+/// column index is correctly mapped to its payload byte). `want_null` selects
+/// IS NULL vs IS NOT NULL. Used to gate NULL equi-join keys out of the match.
+fn null_filter_prog(
+    col_idx:   usize,
+    schema:    &Schema,
+    want_null: bool,
+) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
+    let bound = if want_null {
+        BoundExpr::IsNull(col_idx)
+    } else {
+        BoundExpr::IsNotNull(col_idx)
+    };
+    let mut eb = ExprBuilder::new();
+    let (r, _) = compile_bound_expr(&bound, schema, &mut eb)?;
+    Ok(eb.build(r))
 }
 
 /// Build a reindex ExprProgram that copies all columns as payload.
