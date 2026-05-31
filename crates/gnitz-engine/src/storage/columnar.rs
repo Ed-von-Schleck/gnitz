@@ -223,6 +223,43 @@ pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
 }
 
 // ---------------------------------------------------------------------------
+// Fast path: unsigned-integer, non-nullable schemas
+// ---------------------------------------------------------------------------
+
+/// Returns true iff every payload column is non-nullable and an unsigned
+/// fixed-width integer (U8/U16/U32/U64). Restricted to ≤ 8 bytes because
+/// `read_unsigned` returns a `u64` and cannot handle U128/UUID without truncation.
+#[inline]
+pub(crate) fn schema_is_uint_nonnull(schema: &SchemaDescriptor) -> bool {
+    use crate::schema::type_code::{U8, U16, U32, U64};
+    schema.payload_columns().all(|(_, _, col)| {
+        col.nullable == 0 && matches!(col.type_code, U8 | U16 | U32 | U64)
+    })
+}
+
+/// Fast path for unsigned integer payloads: zero-extends each column to u64
+/// and compares as unsigned. Caller MUST guarantee `schema_is_uint_nonnull`.
+#[inline]
+pub(crate) fn compare_rows_uint_nonnull<A: ColumnarSource, B: ColumnarSource>(
+    schema: &SchemaDescriptor,
+    src_a: &A, row_a: usize,
+    src_b: &B, row_b: usize,
+) -> Ordering {
+    debug_assert!(
+        schema_is_uint_nonnull(schema),
+        "compare_rows_uint_nonnull called on schema without non-nullable unsigned int payload",
+    );
+    for (payload_col, _ci, col) in schema.payload_columns() {
+        let cs = col.size() as usize;
+        let av = crate::schema::read_unsigned(src_a.get_col_ptr(row_a, payload_col, cs), cs);
+        let bv = crate::schema::read_unsigned(src_b.get_col_ptr(row_b, payload_col, cs), cs);
+        let ord = av.cmp(&bv);
+        if ord != Ordering::Equal { return ord; }
+    }
+    Ordering::Equal
+}
+
+// ---------------------------------------------------------------------------
 // Sort helpers
 // ---------------------------------------------------------------------------
 

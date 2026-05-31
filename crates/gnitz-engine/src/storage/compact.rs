@@ -7,7 +7,8 @@ use super::error::StorageError;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::batch::Batch;
 use super::merge::BlobCacheGuard;
-use crate::schema::SchemaDescriptor;
+use super::shard_file::PkUniqueChecker;
+use crate::schema::{PayloadCmpKind, SchemaDescriptor};
 use super::shard_reader::MappedShard;
 #[cfg(test)]
 use crate::util::{read_i64_le, read_u32_le};
@@ -132,26 +133,32 @@ fn open_and_merge(
 
     // Select the comparator closure set once — never a per-comparison branch
     // (mirrors `merge.rs`). Wide (`pk_stride > 16`) adds a `compare_pk_bytes`
-    // tiebreak on an OPK-prefix collision; the `schema_is_int_nonnull` split
-    // is the orthogonal payload-comparator fast path.
+    // tiebreak on an OPK-prefix collision; `schema.payload_cmp` selects the
+    // payload-comparator fast path (pre-computed in SchemaDescriptor::new).
     //
     // Wrap as a non-capturing closure: a direct fn-item reference would fix
     // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
+    // Select the wide vs narrow merge path once, then dispatch the payload
+    // comparator from the pre-computed schema field.
     #[allow(clippy::redundant_closure)]
     if schema.pk_is_wide() {
-        if columnar::schema_is_int_nonnull(schema) {
-            open_and_merge_wide_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-        } else {
-            open_and_merge_wide_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        match schema.payload_cmp {
+            PayloadCmpKind::IntNonnull  => open_and_merge_wide_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            PayloadCmpKind::UintNonnull => open_and_merge_wide_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            PayloadCmpKind::Generic     => open_and_merge_wide_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
         }
-    } else if columnar::schema_is_int_nonnull(schema) {
-        open_and_merge_narrow_with(&shards, cursors, schema, emit,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
     } else {
-        open_and_merge_narrow_with(&shards, cursors, schema, emit,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        match schema.payload_cmp {
+            PayloadCmpKind::IntNonnull  => open_and_merge_narrow_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            PayloadCmpKind::UintNonnull => open_and_merge_narrow_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            PayloadCmpKind::Generic     => open_and_merge_narrow_with(&shards, cursors, schema, emit,
+                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        }
     }
     Ok(())
 }
@@ -281,18 +288,24 @@ pub fn compact_shards(
     output_file: &CStr,
     schema: &SchemaDescriptor,
     table_id: u32,
+    can_tag_pk_unique: bool,
 ) -> Result<(), StorageError> {
     let mut batch = Batch::with_schema(*schema, 1024);
     let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
+    let mut checker = PkUniqueChecker::new();
     // `_key` is the order-preserving sort key (no longer the raw PK); copy the
     // PK from the source bytes so wide PKs are not truncated and narrow PKs are
     // not written as their OPK encoding.
     open_and_merge(input_files, schema, |_key, weight, shard, row| {
+        let pk_bytes = shard.get_pk_bytes(row);
+        if can_tag_pk_unique {
+            checker.observe(pk_bytes, weight);
+        }
         batch.append_row_from_source_bytes(
-            shard.get_pk_bytes(row), weight, shard, row, blob_cache.get_mut(),
+            pk_bytes, weight, shard, row, blob_cache.get_mut(),
         );
     })?;
-    batch.write_as_shard(output_file, table_id)
+    batch.write_as_shard_with_flags(output_file, table_id, checker.flags_if(can_tag_pk_unique))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -305,6 +318,7 @@ pub fn merge_and_route(
     level_num: u32,
     lsn_tag: u64,
     out_results: &mut [GuardResult],
+    can_tag_pk_unique: bool,
 ) -> Result<usize, StorageError> {
     // Empty guard_keys would make find_guard_for_key return 0 (via
     // saturating_sub(1)) and then index batches[0] out of bounds. Callers
@@ -321,6 +335,9 @@ pub fn merge_and_route(
     let mut blob_caches: Vec<BlobCacheGuard> = (0..num_guards)
         .map(|_| BlobCacheGuard::acquire(schema, 256))
         .collect();
+    let mut checkers: Vec<PkUniqueChecker> = (0..num_guards)
+        .map(|_| PkUniqueChecker::new())
+        .collect();
     let out_filenames: Vec<String> = (0..num_guards)
         .map(|i| format!(
             "{}/shard_{}_{}_L{}_G{}.db",
@@ -333,8 +350,12 @@ pub fn merge_and_route(
     // bytes so wide PKs are not truncated.
     open_and_merge(input_files, schema, |key, weight, shard, row| {
         let gi = find_guard_for_key(guard_keys, key);
+        let pk_bytes = shard.get_pk_bytes(row);
+        if can_tag_pk_unique {
+            checkers[gi].observe(pk_bytes, weight);
+        }
         batches[gi].append_row_from_source_bytes(
-            shard.get_pk_bytes(row), weight, shard, row, blob_caches[gi].get_mut(),
+            pk_bytes, weight, shard, row, blob_caches[gi].get_mut(),
         );
     })?;
 
@@ -351,7 +372,8 @@ pub fn merge_and_route(
             continue;
         }
         let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
-        if let Err(e) = batches[i].write_as_shard(&cpath, table_id) {
+        let flags = checkers[i].flags_if(can_tag_pk_unique);
+        if let Err(e) = batches[i].write_as_shard_with_flags(&cpath, table_id, flags) {
             for fname in out_filenames.iter().take(i) {
                 let _ = std::fs::remove_file(fname);
             }
@@ -439,7 +461,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         // Read back merged shard
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -478,7 +500,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         // Key 2 should be eliminated (net weight = 0)
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -504,7 +526,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
@@ -528,7 +550,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3); // only keys 1, 3, 5
@@ -568,7 +590,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs: [&CStr; 0] = [];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         // Output shard should exist with 0 rows
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -600,7 +622,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 0);
@@ -616,7 +638,7 @@ mod tests {
         let cdir = std::ffi::CString::new("/tmp").unwrap();
         let guards: [u128; 0] = [];
         let mut results: [GuardResult; 0] = [];
-        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, &mut results);
+        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, &mut results, false);
         assert!(r.is_err(), "empty guard_keys must return Err, not panic");
     }
 
@@ -651,7 +673,7 @@ mod tests {
 
         let n = merge_and_route(
             &inputs, &cdir, &guards, &schema,
-            0, 1, 99, &mut results,
+            0, 1, 99, &mut results, false,
         ).unwrap();
         assert_eq!(n, 2); // both guards should have rows
 
@@ -702,7 +724,7 @@ mod tests {
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
         let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
-        let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results);
+        let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results, false);
 
         assert!(rc.is_err(), "expected failure, got {:?}", rc);
         let guard0_file = dir.join("shard_0_99_L1_G0.db");
@@ -749,7 +771,7 @@ mod tests {
         let output = dir.join("merged.db");
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
         let inputs = [cpath.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
@@ -807,7 +829,7 @@ mod tests {
         let output = dir.join("merged.db");
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
         let inputs = [cpath.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2);
@@ -907,7 +929,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(rows.len(), 1, "expected 1 surviving row, got {:?}", rows);
@@ -953,7 +975,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {:?}", rows);
@@ -999,7 +1021,7 @@ mod tests {
         let inputs: Vec<_> = cstrs.iter().map(|c| c.as_c_str()).collect();
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(rows.len(), 1, "expected 1 row after 10-tick consolidation, got {}", rows.len());
@@ -1039,7 +1061,7 @@ mod tests {
         let guard_keys: Vec<u128> = vec![0]; // single guard
         let mut results = vec![GuardResult::zeroed()];
 
-        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results).unwrap();
+        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results, false).unwrap();
         assert!(n > 0, "merge_and_route should produce output");
 
         let fn0 = crate::util::cstr_from_buf(&results[0].filename);
@@ -1073,7 +1095,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).expect("compact with checksums enabled must succeed for valid data");
+        compact_shards(&inputs, &cout, &schema, 0, false).expect("compact with checksums enabled must succeed for valid data");
 
         let merged = MappedShard::open(&cout, &schema, true).unwrap();
         assert_eq!(merged.count, 6);
@@ -1110,7 +1132,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0).unwrap();
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, true).unwrap();
         assert_eq!(merged.count, 10000);
@@ -1149,7 +1171,7 @@ mod tests {
         let guard_keys: Vec<u128> = vec![200]; // single guard at key 200
         let mut results = vec![GuardResult::zeroed()];
 
-        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results).unwrap();
+        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results, false).unwrap();
         assert!(n > 0, "merge_and_route should produce output");
 
         let fn0 = crate::util::cstr_from_buf(&results[0].filename);
@@ -1249,7 +1271,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         // (2,3) cancels (+1 -1 = 0). The cross-shard duplicate must fold, which
@@ -1303,7 +1325,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 4);
@@ -1361,7 +1383,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2, "prefix-colliding distinct wide PKs must not fold");

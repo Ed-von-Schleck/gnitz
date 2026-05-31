@@ -2,10 +2,10 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{PayloadCmpKind, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{
     Batch, MemBatch,
-    compare_pk_bytes, compare_rows, compare_rows_int_nonnull, pk_sort_key, schema_is_int_nonnull,
+    compare_pk_bytes, compare_rows, compare_rows_int_nonnull, compare_rows_uint_nonnull, pk_sort_key,
     scatter_copy, write_to_batch,
 };
 
@@ -222,33 +222,40 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
 
     let mut indices: Vec<u32> = (0..n as u32).collect();
 
-    let row_int = |a: usize, b: usize| compare_rows_int_nonnull(schema, &mb, a, &mb, b);
+    let row_int  = |a: usize, b: usize| compare_rows_int_nonnull(schema, &mb, a, &mb, b);
+    let row_uint = |a: usize, b: usize| compare_rows_uint_nonnull(schema, &mb, a, &mb, b);
     let row_full = |a: usize, b: usize| compare_rows(schema, &mb, a, &mb, b);
 
     if schema.pk_is_wide() {
-        // Wide: authoritative column walk primary, payload tiebreak. Dispatch
-        // the row comparator once, outside the sort, exactly as the narrow arm.
-        if schema_is_int_nonnull(schema) {
-            indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
+        // Wide: authoritative column walk primary, payload tiebreak.
+        match schema.payload_cmp {
+            PayloadCmpKind::IntNonnull  => indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
                 mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
                 Ordering::Equal => row_int(a as usize, b as usize),
                 ord => ord,
-            });
-        } else {
-            indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
+            }),
+            PayloadCmpKind::UintNonnull => indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
+                mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                Ordering::Equal => row_uint(a as usize, b as usize),
+                ord => ord,
+            }),
+            PayloadCmpKind::Generic     => indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
                 mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
                 Ordering::Equal => row_full(a as usize, b as usize),
                 ord => ord,
-            });
+            }),
         }
     } else {
         // Narrow: order-preserving raw-`u128` key (unsigned/signed/compound),
         // payload tiebreak. The PK axis is a single primitive compare.
         let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(mb.get_pk_bytes(i))).collect();
-        if schema_is_int_nonnull(schema) {
-            sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_int);
-        } else {
-            sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_full);
+        match schema.payload_cmp {
+            PayloadCmpKind::IntNonnull  =>
+                sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_int),
+            PayloadCmpKind::UintNonnull =>
+                sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_uint),
+            PayloadCmpKind::Generic     =>
+                sort_indices_by_pk_then_row(&mut indices, &pks, |a, b| a.cmp(&b), row_full),
         }
     }
 

@@ -56,6 +56,26 @@ pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
     offset as i64
 }
 
+/// `fdatasync` with EINTR retry. Returns the OS error on any other failure.
+pub(crate) fn fdatasync_eintr(fd: c_int) -> std::io::Result<()> {
+    loop {
+        let rc = unsafe { libc::fdatasync(fd) };
+        if rc >= 0 { return Ok(()); }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+    }
+}
+
+/// `fsync` with EINTR retry. Returns the OS error on any other failure.
+pub(crate) fn fsync_eintr(fd: c_int) -> std::io::Result<()> {
+    loop {
+        let rc = unsafe { libc::fsync(fd) };
+        if rc >= 0 { return Ok(()); }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+    }
+}
+
 #[inline]
 pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())

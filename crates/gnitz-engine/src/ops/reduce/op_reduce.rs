@@ -251,7 +251,8 @@ pub fn op_reduce(
     // pass (O(trace + delta)). `fallback_state` is `(matched_rows, offsets)`:
     // matched_rows is sorted by group so `offsets[g] = (start, len)` slices the
     // rows belonging to group g.
-    let fallback_state: Option<(Vec<(u32, u32, i64)>, Vec<(u32, u32)>)> =
+    type FallbackScan = (Vec<(u32, u32, i64)>, Vec<(u32, u32)>);
+    let fallback_state: Option<FallbackScan> =
         if !all_linear && avi.is_none() && !group_by_pk && gi.is_none() {
             trace_in.as_deref_mut().map(|ti_cursor| {
                 // Pass 1: one exemplar row per distinct delta group, in group order.

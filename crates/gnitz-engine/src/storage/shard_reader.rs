@@ -115,6 +115,10 @@ pub struct MappedShard {
     pub(crate) has_ghosts: bool,
     /// Physical byte width of each PK value on disk (8 for U64, 16 for U128/String).
     pub(crate) pk_stride: u8,
+    /// True when `SHARD_FLAG_PK_UNIQUE` is set: this shard contains at most one
+    /// positive-weight row per PK. When all cursor sources carry this flag, the
+    /// payload comparator can be skipped on a cross-source PK tie.
+    pub(crate) is_pk_unique: bool,
 }
 
 impl MappedShard {
@@ -304,6 +308,12 @@ impl MappedShard {
             None
         };
 
+        // Read the flags byte written at OFF_FLAGS (byte 56). Old v7 shards that
+        // predate this field have 0 there (written by vec![0u8; total_size]), so
+        // they are conservatively treated as ZSet (not PkUnique).
+        let is_pk_unique = file_size > OFF_FLAGS
+            && (data[OFF_FLAGS] & SHARD_FLAG_PK_UNIQUE != 0);
+
         Ok(MappedShard {
             mmap,
             count,
@@ -317,6 +327,7 @@ impl MappedShard {
             xor8_filter,
             has_ghosts,
             pk_stride,
+            is_pk_unique,
         })
     }
 

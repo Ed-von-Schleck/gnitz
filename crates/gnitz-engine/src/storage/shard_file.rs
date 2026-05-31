@@ -15,9 +15,82 @@ use super::error::StorageError;
 use super::xor8;
 use xorf::Xor8;
 use crate::xxh;
+use super::merge::pack_pk_be;
+use crate::schema::MAX_PK_BYTES;
+use crate::util::{fdatasync_eintr, fsync_eintr};
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+}
+
+// ---------------------------------------------------------------------------
+// PkUniqueChecker — shared detection primitive (used by flush and compaction)
+// ---------------------------------------------------------------------------
+
+/// Determines at write time whether an output shard qualifies as PkUnique.
+///
+/// Call `observe` once per output row in write order. A shard qualifies if it
+/// contains no negative-weight rows and no duplicate adjacent PKs. The u128
+/// prefix fast-path avoids the full byte compare for the overwhelmingly common
+/// case of distinct adjacent PKs.
+///
+/// Placed in `shard_file.rs` so both the flush path (table.rs) and the
+/// compaction path (compact.rs) can use it without a separate module.
+pub struct PkUniqueChecker {
+    last_prefix: u128,
+    last_pk: [u8; MAX_PK_BYTES],
+    has_last: bool,
+    qualifies: bool,
+}
+
+impl PkUniqueChecker {
+    pub fn new() -> Self {
+        Self {
+            last_prefix: 0,
+            last_pk: [0; MAX_PK_BYTES],
+            has_last: false,
+            qualifies: true,
+        }
+    }
+
+    /// Observe one output row. `pk_bytes` is the OPK-encoded key slice (sorted).
+    /// `weight` is the net row weight after consolidation.
+    pub fn observe(&mut self, pk_bytes: &[u8], weight: i64) {
+        if !self.qualifies { return; }
+        if weight < 0 {
+            self.qualifies = false;
+            return;
+        }
+        let prefix = pack_pk_be(pk_bytes);
+        let n = pk_bytes.len().min(MAX_PK_BYTES);
+        if prefix != self.last_prefix {
+            // Distinct prefix ⇒ distinct PK. Wide PKs need last_pk for the
+            // collision path; narrow PKs (n ≤ 16) can't collide since pack_pk_be
+            // is injective for ≤16 bytes, so skip the copy for them.
+            self.last_prefix = prefix;
+            if n > 16 {
+                self.last_pk[..n].copy_from_slice(&pk_bytes[..n]);
+            }
+            self.has_last = true;
+            return;
+        }
+        // Prefix collision — full byte compare (wide PKs only in practice).
+        if self.has_last && self.last_pk[..n] == pk_bytes[..n] {
+            // Identical adjacent OPK bytes ⇒ duplicate PK ⇒ not unique.
+            self.qualifies = false;
+        } else {
+            // Same prefix, different PK (or first row with prefix=0). Update last.
+            self.last_pk[..n].copy_from_slice(&pk_bytes[..n]);
+            self.has_last = true;
+        }
+    }
+
+    /// Returns `SHARD_FLAG_PK_UNIQUE` when `enabled` and the observed stream
+    /// was unique, otherwise 0. Convenience for flush and compaction callers.
+    pub fn flags_if(&self, enabled: bool) -> u8 {
+        use crate::layout::SHARD_FLAG_PK_UNIQUE;
+        if enabled && self.qualifies { SHARD_FLAG_PK_UNIQUE } else { 0 }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,8 +398,9 @@ pub fn write_shard_streaming_prepare(
     table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
+    flags: u8,
 ) -> Result<PreparedShard, StorageError> {
-    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions)?;
+    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, flags)?;
     Ok(PreparedShard { fd, tmp_name })
 }
 
@@ -340,15 +414,18 @@ pub fn write_shard_streaming(
     row_count: u32,
     regions: &[(*const u8, usize)],
     durable: bool,
+    flags: u8,
 ) -> Result<(), StorageError> {
-    let prepared = write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions)?;
-    unsafe {
-        if durable && libc::fdatasync(prepared.fd) < 0 {
+    let prepared = write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions, flags)?;
+    if durable && fdatasync_eintr(prepared.fd).is_err() {
+        unsafe {
             libc::close(prepared.fd);
             libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
-            return Err(StorageError::Io);
         }
-        libc::close(prepared.fd);
+        return Err(StorageError::Io);
+    }
+    unsafe { libc::close(prepared.fd); }
+    unsafe {
         if libc::renameat(dirfd, prepared.tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
             libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
             return Err(StorageError::Io);
@@ -356,7 +433,8 @@ pub fn write_shard_streaming(
         // Flush the directory inode so the renamed entry survives a power loss
         // (fdatasync on the file alone does not flush the parent directory).
         if durable {
-            libc::fsync(dirfd);
+            // Ignore EINTR-retried fsync errors on directory fds (best-effort).
+            let _ = fsync_eintr(dirfd);
         }
     }
     Ok(())
@@ -364,7 +442,8 @@ pub fn write_shard_streaming(
 
 /// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
 /// Caller is responsible for fdatasync, close, and rename. On error the fd
-/// is closed and the .tmp is unlinked.
+/// is closed and the .tmp is unlinked. `flags` is written to the `OFF_FLAGS`
+/// byte in the header (use `SHARD_FLAG_PK_UNIQUE` as appropriate).
 #[allow(clippy::needless_range_loop)]
 fn write_shard_streaming_inner(
     dirfd: c_int,
@@ -372,6 +451,7 @@ fn write_shard_streaming_inner(
     table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
+    flags: u8,
 ) -> Result<(c_int, std::ffi::CString), StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
@@ -489,6 +569,7 @@ fn write_shard_streaming_inner(
     write_u64_le(&mut hdr_buf, OFF_TABLE_ID, table_id as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
+    hdr_buf[OFF_FLAGS] = flags;
 
     let tmp_name = super::cstr_with_tmp_suffix(basename)?;
 
@@ -576,7 +657,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             return Err(abort(fd, tmp_name.as_ptr()));
         }
 
-        if durable && libc::fdatasync(fd) < 0 {
+        if durable && fdatasync_eintr(fd).is_err() {
             return Err(abort(fd, tmp_name.as_ptr()));
         }
 
@@ -732,7 +813,7 @@ mod tests {
         ];
 
         write_shard_streaming(
-            libc::AT_FDCWD, &cpath, 42, row_count, &regions, true,
+            libc::AT_FDCWD, &cpath, 42, row_count, &regions, true, 0,
         ).unwrap();
 
         let schema = make_schema_desc(2, 0);
@@ -852,7 +933,7 @@ mod tests {
         ];
 
         write_shard_streaming(
-            libc::AT_FDCWD, &cpath, 7, row_count, &regions, true,
+            libc::AT_FDCWD, &cpath, 7, row_count, &regions, true, 0,
         ).unwrap();
 
         let schema = make_schema_desc(2, 0);

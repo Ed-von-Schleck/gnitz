@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
-use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{PayloadCmpKind, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{pack_pk_be, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
@@ -340,6 +340,20 @@ enum SourceMode {
     Multi(LoserTree),
 }
 
+/// Selects the row-comparator strategy for a cursor. Computed once at
+/// construction; governs `drive`, `advance`, and `drain_sorted_into`.
+#[derive(Copy, Clone, PartialEq)]
+enum CursorComparator {
+    /// Every source is a PkUnique shard: payload comparison skipped on PK ties.
+    PkUnique,
+    /// All payload columns are non-nullable signed integers.
+    IntNonnull,
+    /// All payload columns are non-nullable unsigned integers ≤ 8 bytes.
+    UintNonnull,
+    /// General case.
+    Generic,
+}
+
 pub struct ReadCursor {
     sources: Vec<CursorSource>,
     states: Vec<CursorState>,
@@ -348,7 +362,7 @@ pub struct ReadCursor {
     unified_sources: OnceCell<Vec<UnifiedSource>>,
     mode: SourceMode,
     schema: SchemaDescriptor,
-    is_fast: bool,
+    cmp_kind: CursorComparator,
     // Current row state
     pub valid: bool,
     /// The current row's PK as a u128: the full PK for `pk_stride ≤ 16`, the
@@ -427,29 +441,46 @@ impl ReadCursor {
         sources: &[CursorSource],
         states: &[CursorState],
         schema: &SchemaDescriptor,
-        is_fast: bool,
+        cmp_kind: CursorComparator,
     ) -> LoserTree {
-        // Wrap as a non-capturing closure: a direct fn-item reference would
-        // fix the source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
+        // Wrap as non-capturing closures: direct fn-item references fix the
+        // source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
         #[allow(clippy::redundant_closure)]
-        if is_fast {
-            Self::build_tree_with(sources, states, schema,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi))
-        } else {
-            Self::build_tree_with(sources, states, schema,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi))
+        match cmp_kind {
+            CursorComparator::PkUnique =>
+                Self::build_tree_with(sources, states, schema,
+                    |_, _, _, _, _| Ordering::Equal),
+            CursorComparator::IntNonnull =>
+                Self::build_tree_with(sources, states, schema,
+                    |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            CursorComparator::UintNonnull =>
+                Self::build_tree_with(sources, states, schema,
+                    |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            CursorComparator::Generic =>
+                Self::build_tree_with(sources, states, schema,
+                    |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
         }
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let is_fast = columnar::schema_is_int_nonnull(&schema);
+        let all_pk_unique = !sources.is_empty() && sources.iter().all(|s| match s {
+            CursorSource::Shard(shard) => shard.is_pk_unique,
+            CursorSource::Batch(_)     => false,
+        });
+        let cmp_kind = if all_pk_unique {
+            CursorComparator::PkUnique
+        } else {
+            match schema.payload_cmp {
+                PayloadCmpKind::IntNonnull  => CursorComparator::IntNonnull,
+                PayloadCmpKind::UintNonnull => CursorComparator::UintNonnull,
+                PayloadCmpKind::Generic     => CursorComparator::Generic,
+            }
+        };
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
-            _ => SourceMode::Multi(
-                Self::build_tree(&sources, &states, &schema, is_fast),
-            ),
+            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, cmp_kind)),
         };
         let mut cursor = ReadCursor {
             sources,
@@ -457,7 +488,7 @@ impl ReadCursor {
             unified_sources: OnceCell::new(),
             mode,
             schema,
-            is_fast,
+            cmp_kind,
             valid: false,
             current_key: 0,
             current_weight: 0,
@@ -477,7 +508,7 @@ impl ReadCursor {
     fn rebuild_and_drive(&mut self) {
         if let SourceMode::Multi(_) = &self.mode {
             self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_fast),
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.cmp_kind),
             );
         }
         self.drive();
@@ -594,15 +625,26 @@ impl ReadCursor {
     }
 
     pub fn advance(&mut self) {
-        if !self.valid {
-            return;
-        }
+        if !self.valid { return; }
         #[allow(clippy::redundant_closure)]
-        if self.is_fast {
-            self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-        } else {
-            self.advance_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        match self.cmp_kind {
+            CursorComparator::PkUnique =>
+                self.advance_pk_unique(),
+            CursorComparator::IntNonnull =>
+                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            CursorComparator::UintNonnull =>
+                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            CursorComparator::Generic =>
+                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
         }
+    }
+
+    #[inline]
+    fn advance_pk_unique(&mut self) {
+        if matches!(self.mode, SourceMode::Single) {
+            self.states[0].advance(&self.sources[0]);
+        }
+        self.drive_pk_unique();
     }
 
     /// Step past the previously-emitted row, then drive to the next group.
@@ -622,10 +664,73 @@ impl ReadCursor {
     #[inline]
     fn drive(&mut self) {
         #[allow(clippy::redundant_closure)]
-        if self.is_fast {
-            self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
+        match self.cmp_kind {
+            CursorComparator::PkUnique =>
+                self.drive_pk_unique(),
+            CursorComparator::IntNonnull =>
+                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            CursorComparator::UintNonnull =>
+                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            CursorComparator::Generic =>
+                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        }
+    }
+
+    /// N-way merge driver for all-PkUnique cursors. Skips payload comparison:
+    /// a cross-source PK tie implies the same Z-set element (no retractions
+    /// exist in any source). For narrow PKs the comparator is a single u128
+    /// compare; for wide PKs it falls back to `compare_pk_bytes` on a prefix
+    /// collision.
+    #[inline]
+    fn drive_pk_unique(&mut self) {
+        let heap = match &mut self.mode {
+            SourceMode::Empty  => { self.valid = false; return; }
+            SourceMode::Single => { self.drive_single(); return; }
+            SourceMode::Multi(h) => h,
+        };
+        let schema  = &self.schema;
+        let sources = &self.sources;
+        let states  = &mut self.states;
+
+        let emitted = if schema.pk_is_wide() {
+            // Wide PkUnique: prefix tie-break via compare_pk_bytes; no row_cmp.
+            let less = |a: &HeapNode, b: &HeapNode| -> bool {
+                match a.key.cmp(&b.key) {
+                    Ordering::Less    => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal   => columnar::compare_pk_bytes(
+                        sources[a.source_idx].get_pk_bytes(a.row),
+                        sources[b.source_idx].get_pk_bytes(b.row),
+                    ) == Ordering::Less,
+                }
+            };
+            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+                // No row_cmp: matching PK bytes ⇒ same element under PkUnique.
+                debug_assert_eq!(
+                    columnar::compare_rows(schema, &sources[a_src], a_row, &sources[b_src], b_row),
+                    Ordering::Equal,
+                    "PkUnique shard has a PK tie with different payloads — corrupted data or wrong flag",
+                );
+                sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
+            };
+            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
         } else {
-            self.drive_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+            // Narrow PkUnique: the u128 heap key IS the whole PK; a tie means
+            // same PK → same element. eq_payload is trivially true.
+            let less = |a: &HeapNode, b: &HeapNode| -> bool { a.key < b.key };
+            let eq_payload = |_, _, _, _| true;
+            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
+        };
+
+        if let Some((weight, idx, row)) = emitted {
+            self.valid = true;
+            self.current_key = Self::current_key_from_bytes(sources[idx].get_pk_bytes(row));
+            self.current_weight = weight;
+            self.current_entry_idx = idx;
+            self.current_row = row;
+            self.current_null_word = sources[idx].get_null_word(row);
+        } else {
+            self.valid = false;
         }
     }
 
@@ -991,12 +1096,41 @@ impl ReadCursor {
         out: &mut Vec<(u32, u32, i64)>,
     ) {
         #[allow(clippy::redundant_closure)]
-        if self.is_fast {
-            self.drain_sorted_into_with(limit, out,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-        } else {
-            self.drain_sorted_into_with(limit, out,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+        match self.cmp_kind {
+            CursorComparator::PkUnique =>
+                self.drain_sorted_into_pk_unique(limit, out),
+            CursorComparator::IntNonnull =>
+                self.drain_sorted_into_with(limit, out,
+                    |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+            CursorComparator::UintNonnull =>
+                self.drain_sorted_into_with(limit, out,
+                    |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+            CursorComparator::Generic =>
+                self.drain_sorted_into_with(limit, out,
+                    |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        }
+    }
+
+    /// Drain for all-PkUnique cursors: advances using `drive_pk_unique`.
+    fn drain_sorted_into_pk_unique(
+        &mut self,
+        limit: usize,
+        out: &mut Vec<(u32, u32, i64)>,
+    ) {
+        out.clear();
+        let mut count = 0usize;
+        while self.valid {
+            if limit > 0 && count >= limit { break; }
+            let w = self.current_weight;
+            if w != 0 {
+                out.push((
+                    self.current_entry_idx as u32,
+                    self.current_row as u32,
+                    w,
+                ));
+                count += 1;
+            }
+            self.advance_pk_unique();
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::schema::MAX_PK_BYTES;
-use crate::util::{read_u64_le, write_u64_le};
+use crate::util::{read_u64_le, write_u64_le, fdatasync_eintr, fsync_eintr};
 use super::error::StorageError;
 
 // ---------------------------------------------------------------------------
@@ -371,7 +371,7 @@ unsafe fn fsync_parent_dir(path: &std::ffi::CStr) {
     };
     let fd = libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
     if fd >= 0 {
-        libc::fsync(fd);
+        let _ = fsync_eintr(fd); // best-effort; ignore error on directory fd
         libc::close(fd);
     }
 }
@@ -421,7 +421,7 @@ pub fn write_file(
     let mut prepared = prepare_file(path, entries, global_max_lsn)?;
     let fd = prepared.fd.take().expect("prepare_file always returns fd");
     unsafe {
-        if libc::fdatasync(fd) < 0 {
+        if fdatasync_eintr(fd).is_err() {
             libc::close(fd);
             return Err(StorageError::Io);
         }

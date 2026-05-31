@@ -1254,8 +1254,8 @@ impl WorkerProcess {
             dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
         let mut fsync_err = None;
         for fd in dedup_dirfds(dir_inodes) {
-            if unsafe { libc::fsync(fd) } < 0 {
-                fsync_err = Some(std::io::Error::last_os_error());
+            if let Err(e) = crate::util::fsync_eintr(fd) {
+                fsync_err = Some(e);
                 break;
             }
         }

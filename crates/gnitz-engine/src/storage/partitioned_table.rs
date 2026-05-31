@@ -89,6 +89,14 @@ impl PartitionedTable {
         })
     }
 
+    /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for all partitions.
+    /// Only call this for base tables with a user-defined PK constraint.
+    pub fn enable_pk_unique_tagging(&mut self) {
+        for t in &mut self.tables {
+            t.enable_pk_unique_tagging();
+        }
+    }
+
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------

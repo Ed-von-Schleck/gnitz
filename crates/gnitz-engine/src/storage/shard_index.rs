@@ -206,6 +206,10 @@ pub struct ShardIndex {
     needs_compaction: bool,
     compact_seq: u64,
     pending_deletions: Vec<String>,
+    /// Propagated from `Table::can_tag_pk_unique`; passed through to
+    /// `compact_shards` / `merge_and_route` so compacted output shards
+    /// are tagged correctly. Defaults to `false` (conservative).
+    can_tag_pk_unique: bool,
 }
 
 impl ShardIndex {
@@ -219,7 +223,14 @@ impl ShardIndex {
             needs_compaction: false,
             compact_seq: 0,
             pending_deletions: Vec::new(),
+            can_tag_pk_unique: false,
         }
+    }
+
+    /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for compacted shards.
+    /// Only call this for base tables with a user-defined PK constraint.
+    pub fn enable_pk_unique_tagging(&mut self) {
+        self.can_tag_pk_unique = true;
     }
 
     fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
@@ -546,6 +557,7 @@ impl ShardIndex {
             1,
             lsn_tag,
             &mut results,
+            self.can_tag_pk_unique,
         )?;
 
         let guard_outputs: Vec<(u128, String)> = results[..num_results]
@@ -681,7 +693,7 @@ impl ShardIndex {
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
         let out_cstr = CString::new(out_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
 
-        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id) {
+        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id, self.can_tag_pk_unique) {
             let _ = fs::remove_file(&out_path);
             return Err(e);
         }
@@ -792,6 +804,7 @@ impl ShardIndex {
             src_level_num as u32 + 1,
             lsn_tag,
             &mut results,
+            self.can_tag_pk_unique,
         )?;
 
         let guard_outputs: Vec<(u128, String)> = results[..num_results]

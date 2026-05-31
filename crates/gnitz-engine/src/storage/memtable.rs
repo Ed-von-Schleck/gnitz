@@ -17,12 +17,17 @@ use super::batch::relocate_string_cell;
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
 
-/// Lower-bound index of OPK `key` in `run`, or `run.count` when `key` lies
-/// outside the run's `[min, max]` range (so the caller's
-/// `get_pk_bytes(lo) == key` loop runs zero times). After the OPK-at-rest flip
-/// this is a raw `memcmp` binary search at every PK width — no schema, no
-/// pk_is_fast dispatch. `key` is exactly `pk_stride` OPK bytes.
-fn run_lower_bound_bytes(run: &Batch, key: &[u8]) -> usize {
+/// Start index of the first exact-match candidate for OPK `key` in `run`.
+/// Returns `run.count` when `key` falls outside the run's `[min, max]` range
+/// (so the caller's `get_pk_bytes(lo) == key` loop runs zero times). After the
+/// OPK-at-rest flip this is a raw `memcmp` binary search at every PK width —
+/// no schema, no pk_is_fast dispatch. `key` is exactly `pk_stride` OPK bytes.
+///
+/// Named `exact_match_start` rather than `lower_bound` because it returns
+/// `run.count` (past-the-end) for out-of-range keys, which is not standard
+/// lower-bound behaviour; callers always use it as the start of an exact-match
+/// scan, never for range queries.
+fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
     if run.count == 0 {
         return 0;
     }
@@ -156,7 +161,15 @@ impl MemTable {
         self.runs.clear();
         self.runs_bytes = merged.total_bytes();
         self.total_row_count = merged.count;
+        // Rebuild bloom from surviving rows only: stale hashes from
+        // weight-cancelled rows are cleared here, reducing false-positive rate.
+        self.bloom.reset();
         if merged.count > 0 {
+            // pack_pk_be takes the leading min(len,16) OPK bytes, which is exactly
+            // what the probe side hashes for both narrow and wide PKs.
+            for i in 0..merged.count {
+                self.bloom.add(pack_pk_be(merged.get_pk_bytes(i)));
+            }
             self.runs.push(Rc::new(merged));
         }
         self.has_found = false;
@@ -188,7 +201,7 @@ impl MemTable {
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound_bytes(run, key);
+            let mut lo = run_exact_match_start_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 total_w += run.get_weight(lo);
                 if !self.has_found {
@@ -244,7 +257,7 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            let mut lo = run_lower_bound_bytes(run, key);
+            let mut lo = run_exact_match_start_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, run.as_ref(), lo, ref_source, ref_row,
@@ -271,7 +284,7 @@ impl MemTable {
     /// `found_run`/`found_row`/`has_found` on success.
     pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_lower_bound_bytes(run, key);
+            let mut lo = run_exact_match_start_bytes(run, key);
             while lo < run.count && run.get_pk_bytes(lo) == key {
                 let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
                 if net_w > 0 {

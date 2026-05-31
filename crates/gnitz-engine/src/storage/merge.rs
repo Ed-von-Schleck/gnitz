@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 
 use super::columnar::{self, ColumnarSource, SortEntry};
 use super::batch::FIXED_REGION_BYTES;
-use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{BlobCache, PayloadCmpKind, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::util::read_u64_le;
 use gnitz_wire::is_german_string;
@@ -432,12 +432,14 @@ pub fn merge_batches(
     // The heap key (`peek_key` → `pk_sort_key` → `pack_pk_be`) is
     // order-preserving for both widths, so a single closure set serves both —
     // the only remaining split is the fast/generic payload comparator.
-    if columnar::schema_is_int_nonnull(schema) {
-        merge_run(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-    } else {
-        merge_run(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    #[allow(clippy::redundant_closure)]
+    match schema.payload_cmp {
+        PayloadCmpKind::IntNonnull  => merge_run(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::UintNonnull => merge_run(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::Generic     => merge_run(&mut cursors, batches, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
     }
 }
 
@@ -549,12 +551,14 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    if columnar::schema_is_int_nonnull(schema) {
-        sort_consolidate_inner(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-    } else {
-        sort_consolidate_inner(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    #[allow(clippy::redundant_closure)]
+    match schema.payload_cmp {
+        PayloadCmpKind::IntNonnull  => sort_consolidate_inner(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::UintNonnull => sort_consolidate_inner(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::Generic     => sort_consolidate_inner(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
     }
 }
 
@@ -603,12 +607,14 @@ pub fn fold_sorted(
     // detection in `drain_groups_into` is the `cur_pk == pending_pk` packed
     // prefix reject plus the exact OPK-byte `pk_eq` (redundant-but-correct for
     // narrow, the real separator for wide low-16 collisions).
-    if columnar::schema_is_int_nonnull(schema) {
-        fold_with(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi));
-    } else {
-        fold_with(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi));
+    #[allow(clippy::redundant_closure)]
+    match schema.payload_cmp {
+        PayloadCmpKind::IntNonnull  => fold_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::UintNonnull => fold_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
+        PayloadCmpKind::Generic     => fold_with(n, batch, schema, writer,
+            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
     }
 }
 
@@ -878,8 +884,11 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
                     let idx = *indices.get_unchecked(out) as usize;
                     let pi = *indices.get_unchecked(out + AHEAD) as usize;
                     debug_assert!((idx + 1) * N <= src.len());
+                    // Use wrapping_add: `pi * N` may exceed the allocation
+                    // boundary on speculative indices; wrapping_add imposes no
+                    // provenance constraint so this is well-defined UB-free.
                     std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                        src.as_ptr().add(pi * N) as *const i8,
+                        src.as_ptr().wrapping_add(pi * N) as *const i8,
                     );
                     copy_row::<N>(src, dst, idx, out);
                 }
@@ -1098,7 +1107,13 @@ pub(crate) fn scatter_unified_sources_with_weights(
                 let cp = src.cols[pi];
                 let p = unsafe { cp.base.add(ri as usize * cp.stride) };
                 let src_struct = unsafe { std::slice::from_raw_parts(p, 16) };
-                let src_blob = unsafe { std::slice::from_raw_parts(src.blob_ptr, src.blob_len) };
+                // Guard against null blob_ptr (source with no string data):
+                // from_raw_parts on a null pointer is UB even when len==0.
+                let src_blob: &[u8] = if src.blob_ptr.is_null() {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(src.blob_ptr, src.blob_len) }
+                };
                 writer.write_string_cell(pi, src_struct, src_blob, base + out);
             }
         } else {
@@ -1113,6 +1128,8 @@ pub(crate) fn scatter_unified_sources_with_weights(
 // PK stride is `PKS` (literal 8 or 16) for the destination; source reads use
 // `src.pk.stride` so Constant PK regions (stride=0) read the same bytes for
 // every output row — identical to the existing null_bmp Constant behaviour.
+// Raw pointer writes eliminate the redundant bounds checks that slice indexing
+// emits — `DirectWriter` pre-allocates exactly `count` rows per buffer.
 #[inline(always)]
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     sources: &[UnifiedSource],
@@ -1121,16 +1138,20 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
+    let pk_dst  = writer.pk.as_mut_ptr();
+    let wt_dst  = writer.weight.as_mut_ptr();
+    let nbm_dst = writer.null_bmp.as_mut_ptr();
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize) };
+        let src     = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
+        let pk_ptr  = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
         let nbm_ptr = unsafe { src.null_bmp.base.add(ri as usize * src.null_bmp.stride) };
-        writer.pk[dst_row * PKS..][..PKS]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(pk_ptr, PKS) });
-        writer.weight[dst_row * FB..][..FB].copy_from_slice(&w.to_le_bytes());
-        writer.null_bmp[dst_row * FB..][..FB]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(nbm_ptr, FB) });
+        let wb = w.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(pk_ptr,       pk_dst.add(dst_row * PKS),  PKS);
+            std::ptr::copy_nonoverlapping(wb.as_ptr(),  wt_dst.add(dst_row * FB),   FB);
+            std::ptr::copy_nonoverlapping(nbm_ptr,      nbm_dst.add(dst_row * FB),  FB);
+        }
     }
 }
 
@@ -1139,6 +1160,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 // (per-source — handles the `stride==0` Constant region case); only the
 // destination copy width uses `writer.pk_stride`. No source/dest stride
 // conflation. Fused PK + weight + null_bmp loop preserved.
+// Raw pointer writes eliminate redundant bounds checks.
 #[inline(always)]
 fn scatter_unified_pk_dynamic(
     sources: &[UnifiedSource],
@@ -1147,17 +1169,21 @@ fn scatter_unified_pk_dynamic(
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    let pks = writer.pk_stride as usize;
+    let pks     = writer.pk_stride as usize;
+    let pk_dst  = writer.pk.as_mut_ptr();
+    let wt_dst  = writer.weight.as_mut_ptr();
+    let nbm_dst = writer.null_bmp.as_mut_ptr();
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize) };
+        let src     = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
+        let pk_ptr  = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
         let nbm_ptr = unsafe { src.null_bmp.base.add(ri as usize * src.null_bmp.stride) };
-        writer.pk[dst_row * pks..][..pks]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(pk_ptr, pks) });
-        writer.weight[dst_row * FB..][..FB].copy_from_slice(&w.to_le_bytes());
-        writer.null_bmp[dst_row * FB..][..FB]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(nbm_ptr, FB) });
+        let wb = w.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(pk_ptr,       pk_dst.add(dst_row * pks),  pks);
+            std::ptr::copy_nonoverlapping(wb.as_ptr(),  wt_dst.add(dst_row * FB),   FB);
+            std::ptr::copy_nonoverlapping(nbm_ptr,      nbm_dst.add(dst_row * FB),  FB);
+        }
     }
 }
 

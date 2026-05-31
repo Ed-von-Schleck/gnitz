@@ -1471,9 +1471,17 @@ impl Batch {
     pub(crate) fn data_capacity(&self) -> usize { self.data.capacity() }
 
     /// Write this batch as a shard file directly to disk.
+    #[cfg(test)]
     pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> Result<(), super::error::StorageError> {
         let regions = self.regions();
-        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true)
+        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, 0)
+    }
+
+    /// Write this batch as a shard file with an explicit flags byte.
+    /// Use `SHARD_FLAG_PK_UNIQUE` when the output was verified by `PkUniqueChecker`.
+    pub fn write_as_shard_with_flags(&self, path: &CStr, table_id: u32, flags: u8) -> Result<(), super::error::StorageError> {
+        let regions = self.regions();
+        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, flags)
     }
 
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────

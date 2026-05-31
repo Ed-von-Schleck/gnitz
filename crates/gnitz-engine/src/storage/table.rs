@@ -9,13 +9,14 @@ use std::rc::Rc;
 use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
+use crate::util::{fdatasync_eintr, fsync_eintr};
 use super::memtable::MemTable;
 use super::batch::Batch;
 #[cfg(test)]
 use super::batch::ConsolidatedBatch;
 use super::manifest::PreparedManifest;
 use super::read_cursor::{self, CursorHandle};
-use super::shard_file;
+use super::shard_file::{self, PkUniqueChecker};
 use super::shard_index::{PendingShard, ShardIndex};
 use super::shard_reader::MappedShard;
 
@@ -120,6 +121,10 @@ pub struct Table {
     found_source: FoundSource,
 
     cached_full_scan: Option<Rc<Batch>>,
+    /// When true, flushed and compacted shards may be tagged `SHARD_FLAG_PK_UNIQUE`
+    /// if `PkUniqueChecker` confirms the invariant. Must only be set for base tables
+    /// with a user-defined PK constraint enforced by the DML layer.
+    can_tag_pk_unique: bool,
 }
 
 impl Table {
@@ -157,6 +162,7 @@ impl Table {
             current_lsn: 1,
             found_source: FoundSource::None,
             cached_full_scan: None,
+            can_tag_pk_unique: false,
         };
 
         if durable {
@@ -171,6 +177,14 @@ impl Table {
         }
 
         Ok(table)
+    }
+
+    /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for flushed and compacted shards.
+    /// Only call this for base tables with a user-defined PK constraint enforced
+    /// by the DML layer. Idempotent.
+    pub fn enable_pk_unique_tagging(&mut self) {
+        self.can_tag_pk_unique = true;
+        self.shard_index.enable_pk_unique_tagging();
     }
 
     // ------------------------------------------------------------------
@@ -301,6 +315,18 @@ impl Table {
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let regions = snapshot.regions();
 
+        // Compute PkUnique flag by observing all rows in sorted order.
+        // Only run the checker for base tables; memtable runs are always ZSet.
+        let flush_flags = if self.can_tag_pk_unique {
+            let mut checker = PkUniqueChecker::new();
+            for i in 0..snapshot.count {
+                checker.observe(snapshot.get_pk_bytes(i), snapshot.get_weight(i));
+            }
+            checker.flags_if(true)
+        } else {
+            0
+        };
+
         // Owned for this flush only. The non-durable branch closes it before
         // returning; the durable branch moves ownership into `ShardRename`
         // (whose Drop closes it on a rollback) and hands it to the committer.
@@ -309,7 +335,7 @@ impl Table {
         if !durable {
             let res = shard_file::write_shard_streaming(
                 dirfd, &name_c, self.table_id, snapshot.count as u32,
-                &regions, false,
+                &regions, false, flush_flags,
             );
             unsafe { libc::close(dirfd); }
             res?;
@@ -320,7 +346,7 @@ impl Table {
         }
 
         let prepared = match shard_file::write_shard_streaming_prepare(
-            dirfd, &name_c, self.table_id, snapshot.count as u32, &regions,
+            dirfd, &name_c, self.table_id, snapshot.count as u32, &regions, flush_flags,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -421,12 +447,12 @@ impl Table {
             FlushOutcome::DoneInline => Ok(true),
             FlushOutcome::Pending(mut work) => {
                 if let Some(fd) = work.shard_fd() {
-                    if unsafe { libc::fdatasync(fd) } < 0 {
+                    if fdatasync_eintr(fd).is_err() {
                         return Err(StorageError::Io);
                     }
                 }
                 if let Some(fd) = work.manifest_fd() {
-                    if unsafe { libc::fdatasync(fd) } < 0 {
+                    if fdatasync_eintr(fd).is_err() {
                         return Err(StorageError::Io);
                     }
                 }
@@ -436,9 +462,13 @@ impl Table {
                 // for the table's lifetime.
                 let dirfd = self.flush_commit(*work)?;
                 if let Some(fd) = dirfd {
-                    let rc = if sync_dir { unsafe { libc::fsync(fd) } } else { 0 };
+                    let ok = if sync_dir {
+                        fsync_eintr(fd).is_ok()
+                    } else {
+                        true
+                    };
                     unsafe { libc::close(fd); }
-                    if rc < 0 {
+                    if !ok {
                         return Err(StorageError::Io);
                     }
                 }
@@ -671,9 +701,9 @@ impl Table {
             // Open the dir fd just for this fsync, then close it — not held
             // for the table's lifetime.
             let dirfd = self.open_dirfd()?;
-            let rc = unsafe { libc::fsync(dirfd) };
+            let ok = fsync_eintr(dirfd).is_ok();
             unsafe { libc::close(dirfd); }
-            if rc < 0 {
+            if !ok {
                 return Err(StorageError::Io);
             }
         }

@@ -166,10 +166,14 @@ impl CatalogEngine {
                 // directory is created, compensate_stage_a's drain removes it.
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let pt = PartitionedTable::new(
+                let mut pt = PartitionedTable::new(
                     &directory, &name, tbl_schema, tid as u32, num_parts,
                     true, self.active_part_start, self.active_part_end, arena,
                 ).map_err(|e| format!("Failed to create table '{}': error {} (dir={})", name, e, directory))?;
+                // User base tables have a user-defined PK enforced by the DML
+                // layer; tag their flushed/compacted shards as PkUnique so the
+                // read cursor can skip payload comparison on a cross-source PK tie.
+                pt.enable_pk_unique_tagging();
                 // Success: remove the pre-staged entry.
                 self.pending_dir_deletions.truncate(cleanup_idx);
 

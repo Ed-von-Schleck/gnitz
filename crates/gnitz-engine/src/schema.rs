@@ -69,6 +69,11 @@ pub fn assemble_wide_pk(
             "assemble_wide_pk: narrow stride {stride} (expected > {NARROW_PK_MAX_BYTES})"
         ));
     }
+    if stride > MAX_PK_BYTES {
+        return Err(format!(
+            "wide PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"
+        ));
+    }
     let needed = stride - NARROW_PK_MAX_BYTES;
     if extra.len() < needed {
         return Err(format!(
@@ -90,6 +95,52 @@ pub fn assemble_wide_pk(
 /// `u8::MAX` (not 0) keeps the sentinel unambiguous against a real
 /// payload index of 0.
 pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
+
+/// Pre-computed payload row-comparator strategy for a schema. Stored on
+/// `SchemaDescriptor` and computed once in `new()` so every merge/sort/join
+/// dispatch reads a single field instead of iterating over columns.
+///
+/// - `IntNonnull`  — all payload columns are non-nullable signed ints (I8/I16/I32/I64).
+/// - `UintNonnull` — all payload columns are non-nullable unsigned ints (U8/U16/U32/U64).
+/// - `Generic`     — anything else (nullables, floats, strings, mixed types, etc.).
+///
+/// Vacuously true for zero-payload schemas (all-PK tables): `IntNonnull` is returned,
+/// matching the empty-iterator result of `schema_is_int_nonnull`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PayloadCmpKind {
+    IntNonnull,
+    UintNonnull,
+    Generic,
+}
+
+const fn compute_payload_cmp(cols: &[SchemaColumn], payload_mapping: &[u8; MAX_COLUMNS]) -> PayloadCmpKind {
+    let mut all_int  = true;
+    let mut all_uint = true;
+    let mut ci = 0;
+    while ci < cols.len() {
+        if payload_mapping[ci] == PAYLOAD_MAPPING_PK_SENTINEL {
+            ci += 1;
+            continue;
+        }
+        let tc       = cols[ci].type_code;
+        let nullable = cols[ci].nullable;
+        if nullable != 0 {
+            all_int  = false;
+            all_uint = false;
+        } else {
+            if !matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64) {
+                all_int = false;
+            }
+            if !matches!(tc, type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64) {
+                all_uint = false;
+            }
+        }
+        ci += 1;
+    }
+    if all_int       { PayloadCmpKind::IntNonnull  }
+    else if all_uint { PayloadCmpKind::UintNonnull }
+    else             { PayloadCmpKind::Generic     }
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -117,6 +168,10 @@ pub struct SchemaDescriptor {
     /// Lets `payload_columns()` walk a contiguous `0..num_payload` range
     /// with one byte load per element, no per-row predicate.
     payload_to_ci: [u8; MAX_COLUMNS],
+    /// Pre-computed payload comparator strategy. Derived from column types in
+    /// `new()`; read by every merge/sort/join dispatch in place of calling
+    /// `schema_is_int_nonnull` / `schema_is_uint_nonnull` at each site.
+    pub payload_cmp: PayloadCmpKind,
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
@@ -229,6 +284,7 @@ impl SchemaDescriptor {
         let pk_stride = stride_acc as u8;
         let (payload_mapping, payload_to_ci) =
             compute_mappings(cols.len(), pk_indices);
+        let payload_cmp = compute_payload_cmp(cols, &payload_mapping);
         SchemaDescriptor {
             num_columns: cols.len() as u32,
             pk_count: pk_indices.len() as u32,
@@ -236,6 +292,7 @@ impl SchemaDescriptor {
             pk_stride,
             payload_mapping,
             payload_to_ci,
+            payload_cmp,
             columns,
         }
     }
