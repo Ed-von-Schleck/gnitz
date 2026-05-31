@@ -12,11 +12,9 @@ mod bench_secondary_index;
 
 pub use distinct::op_distinct;
 pub use exchange::{
-    PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    op_relay_scatter_join, op_relay_scatter_consolidated_join,
-    with_worker_indices,
-    worker_for_partition,
+    PartitionRouter, with_worker_indices, worker_for_partition,
 };
+pub(crate) use exchange::{RouteMode, op_repartition_batches_mode, op_relay_scatter_consolidated_mode};
 // Only the test harness routes via the eager (cloning) variant now; the
 // production scatter paths all borrow via `with_worker_indices`.
 #[cfg(test)]

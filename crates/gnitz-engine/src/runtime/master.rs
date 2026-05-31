@@ -30,8 +30,7 @@ use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
-    PartitionRouter, op_relay_scatter, op_relay_scatter_consolidated,
-    op_relay_scatter_join, op_relay_scatter_consolidated_join,
+    PartitionRouter, RouteMode, op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
     worker_for_partition, with_worker_indices,
 };
 
@@ -687,15 +686,14 @@ impl MasterDispatcher {
             })
             .collect();
 
+        let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
         let dest_batches = match consolidated_sources {
             Some(sources) => {
-                let scatter = if is_join { op_relay_scatter_consolidated_join } else { op_relay_scatter_consolidated };
-                scatter(&sources, &col_indices, &schema, self.num_workers)
+                op_relay_scatter_consolidated_mode(&sources, &col_indices, &schema, self.num_workers, mode)
             }
             None => {
                 let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
-                let scatter = if is_join { op_relay_scatter_join } else { op_relay_scatter };
-                scatter(&sources, &col_indices, &schema, self.num_workers)
+                op_repartition_batches_mode(&sources, &col_indices, &schema, self.num_workers, mode)
             }
         };
 

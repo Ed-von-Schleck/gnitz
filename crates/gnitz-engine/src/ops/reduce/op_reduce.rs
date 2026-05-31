@@ -276,16 +276,22 @@ pub fn op_reduce(
                 // Hash index only pays off past a handful of groups; below the
                 // threshold a direct linear probe per trace row is cheaper than
                 // hashing every trace row. Either way the trace is scanned once.
+                //
+                // Sorted Vec<(hash, group_idx)> rather than HashMap<u128, Vec<usize>>:
+                // binary search is O(log num_g) per trace row but avoids per-bucket
+                // heap allocations (one malloc per group in the HashMap). For groups
+                // that share a hash key (u128 collision, astronomically rare),
+                // `cursor_matches_group` still picks the right one via byte compare.
                 const HASH_THRESHOLD: usize = 16;
                 let use_hash = num_g >= HASH_THRESHOLD;
-                let mut hash_to_groups =
-                    rustc_hash::FxHashMap::<u128, Vec<usize>>::default();
+                let mut hash_groups: Vec<(u128, usize)> = Vec::new(); // (group_key, group_idx)
                 if use_hash {
-                    hash_to_groups.reserve(num_g);
-                    for (g, &exemplar) in group_exemplars.iter().enumerate() {
-                        let hash = extract_group_key(&mb, exemplar, input_schema, group_by_cols);
-                        hash_to_groups.entry(hash).or_default().push(g);
-                    }
+                    hash_groups = group_exemplars.iter().enumerate()
+                        .map(|(g, &exemplar)| {
+                            (extract_group_key(&mb, exemplar, input_schema, group_by_cols), g)
+                        })
+                        .collect();
+                    hash_groups.sort_unstable_by_key(|&(h, _)| h);
                 }
 
                 // Pass 2: one full trace scan, route each row to its group.
@@ -302,15 +308,17 @@ pub fn op_reduce(
                             let hash = extract_group_key_cursor(
                                 ti_cursor, input_schema, group_by_cols,
                             );
-                            if let Some(cands) = hash_to_groups.get(&hash) {
-                                for &g in cands {
-                                    if cursor_matches_group(
-                                        ti_cursor, &mb, group_exemplars[g], group_descs,
-                                    ) {
-                                        matched = Some(g);
-                                        break;
-                                    }
+                            let pos = hash_groups.partition_point(|&(h, _)| h < hash);
+                            let mut p = pos;
+                            while p < hash_groups.len() && hash_groups[p].0 == hash {
+                                let g = hash_groups[p].1;
+                                if cursor_matches_group(
+                                    ti_cursor, &mb, group_exemplars[g], group_descs,
+                                ) {
+                                    matched = Some(g);
+                                    break;
                                 }
+                                p += 1;
                             }
                         } else {
                             for (g, &exemplar) in group_exemplars.iter().enumerate() {
@@ -512,10 +520,17 @@ pub fn op_reduce(
                             gi_c.advance();
                             hit = gi_c.walk_to_positive_with_prefix(&prefix);
                         }
-                    } else if let Some((ref matched_rows, ref offsets)) = fallback_state {
+                    } else {
                         // Precomputed by the single-scan pre-pass; `num_groups`
                         // is this group's index (the pre-pass walks identical
                         // group boundaries) and has not yet been incremented.
+                        // fallback_state is Some whenever trace_in is Some (the
+                        // pre-pass is gated by the same condition as this branch).
+                        debug_assert!(
+                            fallback_state.is_some(),
+                            "fallback_state is None despite trace_in being Some",
+                        );
+                        let (matched_rows, offsets) = fallback_state.as_ref().unwrap();
                         let (start, len) = offsets[num_groups];
                         for &(entry, row, w) in
                             &matched_rows[start as usize..(start + len) as usize]

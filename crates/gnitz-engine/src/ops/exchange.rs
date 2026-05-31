@@ -240,7 +240,7 @@ fn route_partition_key(
 /// scatter must route by `extract_group_key`, which op_reduce also uses for the
 /// group's output PK — the two must agree or the result is mis-gathered. The two
 /// keys diverge for nullable and string columns, so the scatter caller picks.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RouteMode {
     GroupKey,
     JoinPromote,
@@ -372,23 +372,18 @@ pub fn op_repartition_batch(
     out
 }
 
-pub fn op_repartition_batches(
-    sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
-    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
-}
-
-fn op_repartition_batches_mode(
+pub(crate) fn op_repartition_batches_mode(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
     mode: RouteMode,
 ) -> Vec<Batch> {
-    gnitz_debug!("op_repartition_batches: sources={} num_workers={}", sources.len(), num_workers);
+    gnitz_debug!(
+        "op_repartition_batches_mode: sources={} mode={:?}",
+        sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
+        mode,
+    );
     assert!(sources.len() <= 256, "source index must fit in u8 (got {})", sources.len());
     let w_map = build_w_map(num_workers);
 
@@ -679,6 +674,7 @@ fn relay_scatter_merge_walk(
 /// Scatter pre-consolidated batches across workers using a merge-walk.
 /// All sources must satisfy the consolidated invariant (sorted, no duplicate PKs).
 /// Output batches are sorted but not consolidated (duplicate PKs can appear across sources).
+#[cfg(test)]
 pub fn op_relay_scatter_consolidated(
     sources: &[Option<&ConsolidatedBatch>],
     col_indices: &[u32],
@@ -688,18 +684,7 @@ pub fn op_relay_scatter_consolidated(
     op_relay_scatter_consolidated_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
 }
 
-/// Join-shard variant: routes by the reindex (`promote_into`) key so a row
-/// co-locates with the worker that owns its `_join_pk` partition.
-pub fn op_relay_scatter_consolidated_join(
-    sources: &[Option<&ConsolidatedBatch>],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
-    op_relay_scatter_consolidated_mode(sources, col_indices, schema, num_workers, RouteMode::JoinPromote)
-}
-
-fn op_relay_scatter_consolidated_mode(
+pub(crate) fn op_relay_scatter_consolidated_mode(
     sources: &[Option<&ConsolidatedBatch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
@@ -754,28 +739,14 @@ fn op_relay_scatter_consolidated_mode(
 }
 
 /// Scatter non-consolidated batches across workers by hashing each row.
+#[cfg(test)]
 pub fn op_relay_scatter(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
-    gnitz_debug!(
-        "op_relay_scatter: sources={}",
-        sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
-    );
-    op_repartition_batches(sources, col_indices, schema, num_workers)
-}
-
-/// Join-shard variant of [`op_relay_scatter`]: routes by the reindex
-/// (`promote_into`) key so a row co-locates with its `_join_pk` partition owner.
-pub fn op_relay_scatter_join(
-    sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
-    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::JoinPromote)
+    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
 }
 
 /// Scatter a single batch across workers using multiple independent column
@@ -873,7 +844,7 @@ mod tests {
         // silently in release builds. The guard must be a hard assert.
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         let sources: Vec<Option<&Batch>> = vec![None; 257];
-        let _ = op_repartition_batches(&sources, &[0], &schema, 4);
+        let _ = op_repartition_batches_mode(&sources, &[0], &schema, 4, RouteMode::GroupKey);
     }
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -1410,7 +1381,7 @@ mod tests {
         // Single contributing source, PK routing: propagate both flags.
         let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let single: Vec<Option<&Batch>> = vec![Some(&b0)];
-        let out = op_repartition_batches(&single, &[0u32], &schema, 4);
+        let out = op_repartition_batches_mode(&single, &[0u32], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
             assert!(sb.sorted, "single-source PK-routed must inherit sorted");
             assert!(sb.consolidated, "single-source PK-routed must inherit consolidated");
@@ -1420,7 +1391,7 @@ mod tests {
         // not globally sorted, so nothing propagates.
         let b1 = make_batch(&schema, &[(4, 1, 40), (5, 1, 50), (6, 1, 60)]);
         let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-        let out = op_repartition_batches(&multi, &[0u32], &schema, 4);
+        let out = op_repartition_batches_mode(&multi, &[0u32], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
             assert!(!sb.sorted, "multi-source scatter must not claim sorted");
             assert!(!sb.consolidated, "multi-source scatter must not claim consolidated");
@@ -1723,7 +1694,7 @@ mod tests {
 
     #[test]
     fn test_op_repartition_batches_compound_pk_routes_by_bytes() {
-        // op_repartition_batches must route compound-PK rows by raw PK
+        // op_repartition_batches_mode must route compound-PK rows by raw PK
         // bytes (partition_for_pk_bytes), matching PartitionedTable::
         // local_index. The pre-fix code only branched on (single_pk &&
         // wide), falling through to hash_row_for_partition for narrow
@@ -1743,7 +1714,7 @@ mod tests {
         ]);
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         // col_indices = [0, 1] = the full PK set → compound-PK routing.
-        let sub_batches = op_repartition_batches(&sources, &[0u32, 1u32], &schema, num_workers);
+        let sub_batches = op_repartition_batches_mode(&sources, &[0u32, 1u32], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 6);
         for (w, sb) in sub_batches.iter().enumerate() {
             for r in 0..sb.count {
