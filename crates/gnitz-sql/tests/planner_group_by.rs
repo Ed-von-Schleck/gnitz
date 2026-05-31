@@ -99,6 +99,52 @@ fn test_avg_ignores_nulls_no_nan() {
     assert_eq!(batch.len(), 2, "exactly groups g=6 and g=7 are emitted");
 }
 
+// A group that *transitions* to all-NULL via DELETE is NOT suppressed (unlike
+// a from-inception all-NULL group): the SUM/COUNT accumulators keep has_value
+// after the retract+merge, so the group is re-emitted with COUNT_NON_NULL=0 →
+// AVG = float_div(_, 0) → NULL. The AVG output column must therefore be nullable
+// to represent the emitted NULL; declaring it NOT NULL mislabels that value.
+
+#[test]
+fn test_avg_emits_null_on_delete_to_all_null() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // signed g → synthetic-PK path so g is a readable payload column.
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, x DOUBLE)").unwrap();
+        p.execute("CREATE VIEW v AS SELECT g, AVG(x) AS ax FROM t GROUP BY g").unwrap();
+        // g=8 has one non-NULL contributor (5.0) and one NULL row.
+        p.execute("INSERT INTO t (id, g, x) VALUES (10, 8, 5.0), (11, 8, NULL)").unwrap();
+    }
+
+    // The AVG column must be declared nullable.
+    {
+        let (schema, batch) = read_view(&mut client, &sn, "v");
+        assert!(schema.columns[col_idx(&schema, "ax")].is_nullable,
+            "AVG output column must be nullable");
+        assert_eq!(batch.len(), 1, "one group before delete");
+        let ax_payload = col_idx(&schema, "ax") - 1;
+        assert!(!is_null_at(&batch, ax_payload, 0), "AVG=5.0 is not NULL before delete");
+        assert!((f64_at(&batch, col_idx(&schema, "ax"), 0) - 5.0).abs() < 1e-9);
+    }
+
+    // Delete the only non-NULL contributor; the group still has the NULL row.
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("DELETE FROM t WHERE id = 10").unwrap();
+    }
+
+    // The group persists (it still has rows) and its AVG reads as NULL —
+    // not absent, not 0.0, not NaN.
+    let (schema, batch) = read_view(&mut client, &sn, "v");
+    assert_eq!(batch.len(), 1, "the group must persist — it still has the NULL row");
+    assert_eq!(i64_at(&batch, col_idx(&schema, "g"), 0), 8);
+    let ax_payload = col_idx(&schema, "ax") - 1;
+    assert!(is_null_at(&batch, ax_payload, 0),
+        "AVG of a group that lost all non-NULL values must read as NULL");
+}
+
 // ── item 13: numeric aggregate type rejection ────────────────────────
 
 #[test]

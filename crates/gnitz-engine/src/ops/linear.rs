@@ -36,10 +36,8 @@ pub fn op_filter(
     // in their struct and an empty shared blob is a no-op for the absent long
     // strings. Gating on a non-empty blob needlessly dropped all-short-string
     // batches to the slow `relocate_string_cell` path.
-    let blob_passthrough = (0..schema.num_columns()).any(|ci| {
-        let tc = schema.columns[ci].type_code;
-        tc == type_code::STRING || tc == type_code::BLOB
-    });
+    let blob_passthrough = (0..schema.num_columns())
+        .any(|ci| gnitz_wire::is_german_string(schema.columns[ci].type_code));
     if blob_passthrough {
         output.share_blob_from(batch);
     }
@@ -409,9 +407,9 @@ pub fn op_null_extend(
     // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
     // 16-byte structs are copied verbatim below still resolve against the
     // shared heap. Without this they would point into an empty blob.
-    let needs_blob = in_schema.payload_columns().any(|(_, _, col)| {
-        col.type_code == type_code::STRING || col.type_code == type_code::BLOB
-    });
+    let needs_blob = in_schema
+        .payload_columns()
+        .any(|(_, _, col)| gnitz_wire::is_german_string(col.type_code));
     if needs_blob && !batch.blob.is_empty() {
         output.share_blob_from(batch);
     }
@@ -487,8 +485,7 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
                 let is_null = (null_word >> pi) & 1 != 0;
                 hasher.update(&[is_null as u8]);
                 if is_null { continue; }
-                let tc = col.type_code;
-                if tc == type_code::STRING || tc == type_code::BLOB {
+                if gnitz_wire::is_german_string(col.type_code) {
                     let sb = mb.get_col_ptr(row, pi, 16);
                     let content = crate::schema::german_string_content(sb, mb.blob);
                     // Length-prefix the content so "ab"+"c" can't alias "a"+"bc".

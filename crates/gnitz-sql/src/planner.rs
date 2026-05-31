@@ -1422,8 +1422,11 @@ fn execute_create_group_by_view(
                     let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
                     post_map_eb.emit_col(avg_reg, payload_idx);
                     out_cols.push(ColumnDef {
+                        // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
+                        // → float_div by zero marks the result NULL), so the column
+                        // must be nullable to match what the circuit can emit.
                         name: m.output_name.clone(), type_code: TypeCode::F64,
-                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+                        is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
                     });
                     payload_idx += 1;
                 } else {

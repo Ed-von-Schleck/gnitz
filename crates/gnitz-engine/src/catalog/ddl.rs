@@ -264,13 +264,10 @@ impl CatalogEngine {
         // without collision; the distributed uniqueness-check pipeline would
         // silently bypass or falsely reject rows. (Non-unique FK indices use the
         // xxhash-based extract_col_key path and are unaffected.)
-        if is_unique {
-            let tc = col_defs[col_idx].type_code;
-            if tc == crate::schema::type_code::STRING || tc == crate::schema::type_code::BLOB {
-                return Err(
-                    "UNIQUE index on STRING or BLOB columns is not supported".into()
-                );
-            }
+        if is_unique && gnitz_wire::is_german_string(col_defs[col_idx].type_code) {
+            return Err(
+                "UNIQUE index on STRING or BLOB columns is not supported".into()
+            );
         }
 
         let index_name = make_secondary_index_name(schema_name, table_name, col_name);

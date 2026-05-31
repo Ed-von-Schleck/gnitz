@@ -49,6 +49,20 @@ fn parse_level(s: &str) -> u32 {
     }
 }
 
+/// Parse and validate `--workers=N` against the hard `MAX_WORKERS` limit.
+/// Values above it cannot work — `worker_for_partition` divides by
+/// `256 / num_workers` (zero when `num_workers > 256`, panicking) and the SAL
+/// write path rejects groups wider than `MAX_WORKERS` — so reject them at the
+/// boundary with a clear message instead of crashing later.
+fn parse_workers(val: &str) -> Result<u32, String> {
+    const MAX: u32 = runtime::sal::MAX_WORKERS as u32;
+    match val.parse::<u32>() {
+        Ok(n) if (1..=MAX).contains(&n) => Ok(n),
+        Ok(n) => Err(format!("--workers must be between 1 and {MAX} (got {n})")),
+        Err(_) => Err("invalid --workers value".to_string()),
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -71,10 +85,10 @@ fn main() {
         } else if let Some(val) = arg.strip_prefix("--log-level=") {
             level = parse_level(val);
         } else if let Some(val) = arg.strip_prefix("--workers=") {
-            match val.parse::<u32>() {
-                Ok(n) if n >= 1 => num_workers = n,
-                _ => {
-                    eprintln!("Error: invalid --workers value");
+            match parse_workers(val) {
+                Ok(n) => num_workers = n,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     process::exit(1);
                 }
             }
@@ -97,4 +111,35 @@ fn main() {
     log::init(level, b"M");
     let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level);
     process::exit(rc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_workers;
+    use super::runtime::sal::MAX_WORKERS;
+
+    #[test]
+    fn parse_workers_accepts_valid_range() {
+        assert_eq!(parse_workers("1"), Ok(1));
+        assert_eq!(parse_workers(&MAX_WORKERS.to_string()), Ok(MAX_WORKERS as u32));
+    }
+
+    #[test]
+    fn parse_workers_rejects_zero() {
+        assert!(parse_workers("0").is_err());
+    }
+
+    #[test]
+    fn parse_workers_rejects_above_max() {
+        // Regression: values > MAX_WORKERS reached worker_for_partition and
+        // divided by `256 / num_workers == 0` (panic for num_workers > 256).
+        assert!(parse_workers(&(MAX_WORKERS + 1).to_string()).is_err());
+        assert!(parse_workers("100000").is_err());
+    }
+
+    #[test]
+    fn parse_workers_rejects_nonnumeric() {
+        assert!(parse_workers("abc").is_err());
+        assert!(parse_workers("").is_err());
+    }
 }

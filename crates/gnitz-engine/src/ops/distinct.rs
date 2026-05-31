@@ -262,6 +262,61 @@ mod tests {
         assert_eq!(out.count, 0, "I8: matching (PK,payload) should produce no output");
     }
 
+    fn make_schema_u64_blob() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::BLOB, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// Build a batch with one short (inline, ≤12-byte) BLOB payload value per row.
+    fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            assert!(val.len() <= 12, "test helper only supports inline (short) blobs");
+            let mut cell = [0u8; 16];
+            cell[0..4].copy_from_slice(&(val.len() as u32).to_le_bytes());
+            cell[4..4 + val.len()].copy_from_slice(val);
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &cell);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// Regression: a non-null BLOB payload column previously panicked. The
+    /// (non-null, non-null) payload-compare arm routed BLOB to `cmp_typed_le`,
+    /// whose Blob arm is `unreachable!`. BLOB shares the German-string layout
+    /// and must dispatch through `compare_german_strings` like STRING.
+    #[test]
+    fn test_distinct_blob_payload_no_panic() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_blob();
+
+        // Equal (PK=1, "hi") on both sides → compare returns Equal → no output.
+        let trace = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        let delta = make_batch_blob(&schema, &[(1, 1, b"hi")]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "BLOB: matching (PK,payload) should produce no output");
+
+        // A different blob at the same PK is a distinct element → +1.
+        let trace2 = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
+        let mut ch2 = CursorHandle::from_owned(&[trace2], schema);
+        let delta2 = make_batch_blob(&schema, &[(1, 1, b"bye")]);
+        let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
+        assert_eq!(out2.count, 1, "BLOB: a new payload at an existing PK emits +1");
+    }
+
     fn make_schema_compound() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[

@@ -11,12 +11,10 @@ use std::cmp::Ordering;
 
 use super::columnar::{self, ColumnarSource, SortEntry};
 use super::batch::FIXED_REGION_BYTES;
-use crate::schema::{BlobCache, SchemaDescriptor, type_code, MAX_COLUMNS};
+use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::util::read_u64_le;
-
-use type_code::STRING as TYPE_STRING;
-use type_code::BLOB   as TYPE_BLOB;
+use gnitz_wire::is_german_string;
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
@@ -85,7 +83,7 @@ pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 impl BlobCacheGuard {
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
         let has_strings = schema.payload_columns()
-            .any(|(_, _, col)| col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB);
+            .any(|(_, _, col)| is_german_string(col.type_code));
         if has_strings {
             let mut cache = acquire_blob_cache();
             cache.reserve(max_rows);
@@ -339,7 +337,7 @@ impl<'a> DirectWriter<'a> {
             if is_null {
                 let off = out_row * col_size;
                 self.col_bufs[payload_idx][off..off + col_size].fill(0);
-            } else if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
+            } else if is_german_string(col.type_code) {
                 let src_struct = batch.get_col_ptr(row, payload_idx, 16);
                 self.write_string_cell(payload_idx, src_struct, batch.blob, out_row);
             } else {
@@ -735,7 +733,7 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
+        if is_german_string(col.type_code) {
             // Blob relocation is sequential per-row; no way to batch.
             for (out, &idx) in indices.iter().enumerate() {
                 let row = idx as usize;
@@ -938,7 +936,7 @@ pub fn scatter_multi_source(
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
+        if is_german_string(col.type_code) {
             for (out, &(si, ri)) in rows.iter().enumerate() {
                 let src = sources[si as usize].as_ref().unwrap();
                 let row = ri as usize;
@@ -1093,7 +1091,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
     let schema = writer.schema;
     for (pi, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        if col.type_code == TYPE_STRING || col.type_code == TYPE_BLOB {
+        if is_german_string(col.type_code) {
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
@@ -1215,7 +1213,7 @@ fn gather_unified_col<const N: usize>(
 mod tests {
     use super::*;
     use super::super::batch::Batch;
-    use crate::schema::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_schema_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(

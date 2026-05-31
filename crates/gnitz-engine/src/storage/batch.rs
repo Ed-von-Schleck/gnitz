@@ -847,8 +847,7 @@ impl Batch {
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
                 if pi >= npc { break; }
-                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING
-                    || col.type_code == crate::schema::type_code::BLOB;
+                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
             }
         }
         for (pi, &is_str) in is_string_at[..npc].iter().enumerate() {
@@ -1079,8 +1078,7 @@ impl Batch {
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
                 if pi >= npc { break; }
-                is_string_at[pi] = col.type_code == crate::schema::type_code::STRING
-                    || col.type_code == crate::schema::type_code::BLOB;
+                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
             }
         }
 
@@ -1129,9 +1127,7 @@ impl Batch {
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
                 self.fill_col_zero(pi, cs);
-            } else if col_desc.type_code == crate::schema::type_code::STRING
-                || col_desc.type_code == crate::schema::type_code::BLOB
-            {
+            } else if gnitz_wire::is_german_string(col_desc.type_code) {
                 let src = ptable.found_col_ptr(pi, cs);
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
@@ -1190,8 +1186,7 @@ impl Batch {
 
             let is_string = schema.is_some_and(|s| {
                 ci < s.num_columns()
-                    && (s.columns[ci].type_code == crate::schema::type_code::STRING
-                        || s.columns[ci].type_code == crate::schema::type_code::BLOB)
+                    && gnitz_wire::is_german_string(s.columns[ci].type_code)
             });
             let is_null = (null_word >> pi) & 1 != 0;
             let col_size = sz as usize;
@@ -1409,9 +1404,7 @@ impl Batch {
 
             if is_null {
                 self.fill_col_zero(pi, cs);
-            } else if col.type_code == crate::schema::type_code::STRING
-                || col.type_code == crate::schema::type_code::BLOB
-            {
+            } else if gnitz_wire::is_german_string(col.type_code) {
                 let src_struct = source.get_col_ptr(row, pi, cs);
                 let dest = crate::schema::relocate_german_string_vec(
                     src_struct, src_blob, &mut self.blob, blob_cache.as_deref_mut(),

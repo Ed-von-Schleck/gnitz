@@ -481,6 +481,51 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_avg_delete_to_all_null_emits_null(self, client):
+        """A group that loses its only non-NULL value (via DELETE) is re-emitted
+        with AVG = NULL (COUNT_NON_NULL drops to 0), and the group stays present
+        because it still has the NULL row. The AVG column must therefore be
+        nullable and expose the value as Python None."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  category BIGINT NOT NULL,"
+                "  amount BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, AVG(amount) AS avg_amt "
+                "FROM t GROUP BY category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # category 10: one non-NULL (5) and one NULL → AVG ignores NULL → 5.0
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1
+            assert abs(rows[0]["avg_amt"] - 5.0) < 0.001
+
+            # Delete the only non-NULL contributor; the NULL row keeps the group.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1, f"group must persist, got {rows}"
+            assert rows[0]["category"] == 10
+            assert rows[0]["avg_amt"] is None, (
+                f"AVG of an all-NULL group must be NULL, got {rows[0]['avg_amt']}")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_group_by_with_where(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

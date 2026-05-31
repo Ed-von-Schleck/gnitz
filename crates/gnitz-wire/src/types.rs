@@ -88,6 +88,16 @@ impl TypeCode {
         matches!(self, TypeCode::F32 | TypeCode::F64)
     }
 
+    /// Whether this type uses the 16-byte "German string" layout (a 4-byte
+    /// length, a 4-byte inline prefix, and an inline-or-out-of-line tail).
+    /// STRING and BLOB share this representation; both must compare, relocate,
+    /// and copy via the german-string paths (`compare_german_strings`, the blob
+    /// heap), never via fixed-width byte ops. Allow-list so new variants are
+    /// excluded until explicitly vetted.
+    pub const fn is_german_string(&self) -> bool {
+        matches!(self, TypeCode::String | TypeCode::Blob)
+    }
+
     /// Whether this type may be a PRIMARY KEY column. PK regions are compared
     /// as raw bytes, which is correct only for integer scalars: String/Blob
     /// carry out-of-line blob heaps that cannot be bulk-copied in the PK
@@ -117,6 +127,15 @@ impl TypeCode {
 #[inline]
 pub fn is_pk_eligible(tc: u8) -> bool {
     TypeCode::try_from_u8(tc).is_some_and(|t| t.is_pk_eligible())
+}
+
+/// Whether a raw wire type code uses the 16-byte German-string layout. u8-based
+/// counterpart to [`TypeCode::is_german_string`] for callers holding a raw
+/// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes
+/// are not german strings.
+#[inline]
+pub fn is_german_string(tc: u8) -> bool {
+    tc == type_code::STRING || tc == type_code::BLOB
 }
 
 /// Wire stride (byte width) for a column type code.

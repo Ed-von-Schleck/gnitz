@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
-use crate::schema::{SchemaDescriptor, type_code, MAX_COLUMNS};
+use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{pack_pk_be, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
@@ -811,7 +811,7 @@ impl ReadCursor {
             let ptr = self.col_ptr(ci, col_size);
             if !ptr.is_null() {
                 let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
-                if (col.type_code == type_code::STRING || col.type_code == type_code::BLOB) && col_size == 16 {
+                if gnitz_wire::is_german_string(col.type_code) && col_size == 16 {
                     let cell = crate::schema::relocate_german_string_vec(data, src_blob, &mut batch.blob, None);
                     batch.extend_col(payload_idx, &cell);
                 } else {

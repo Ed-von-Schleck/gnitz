@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::schema::type_code::STRING as TYPE_STRING;
+use gnitz_wire::is_german_string;
 use crate::storage::{
     write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
     compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull,
@@ -449,7 +449,7 @@ fn write_left_payload(
         let is_null = (left_null >> pi) & 1 != 0;
         if is_null {
             output.fill_col_zero(pi, cs);
-        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
+        } else if is_german_string(col.type_code) {
             write_string_from_batch(output, pi, left_batch, left_row, pi);
         } else {
             output.extend_col(pi, left_batch.get_col_ptr(left_row, pi, cs));
@@ -490,7 +490,7 @@ fn write_join_row(
         let out_pi = left_npc + rpi;
         if is_null {
             output.fill_col_zero(out_pi, cs);
-        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
+        } else if is_german_string(col.type_code) {
             let ptr = right_cursor.col_ptr(ci, 16);
             if ptr.is_null() {
                 output.fill_col_zero(out_pi, 16);
@@ -881,7 +881,7 @@ fn write_join_row_from_batches(
         let out_pi = left_npc + rpi;
         if is_null {
             output.fill_col_zero(out_pi, cs);
-        } else if col.type_code == TYPE_STRING || col.type_code == crate::schema::type_code::BLOB {
+        } else if is_german_string(col.type_code) {
             write_string_from_batch(output, out_pi, right_batch, right_row, rpi);
         } else {
             output.extend_col(out_pi, right_batch.get_col_ptr(right_row, rpi, cs));

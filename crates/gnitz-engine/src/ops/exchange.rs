@@ -55,11 +55,9 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
     }
     let col = &schema.columns[col_idx];
     let col_size = col.size() as usize;
-    if col.type_code == crate::schema::type_code::STRING
-        || col.type_code == crate::schema::type_code::BLOB
-    {
-        // BLOB shares STRING's 16-byte German-string header layout
-        // (col_size = 16); the generic else-branch's 8-byte buffer would panic.
+    if gnitz_wire::is_german_string(col.type_code) {
+        // German strings have the 16-byte header layout (col_size = 16); the
+        // generic else-branch's 8-byte buffer would panic.
         let struct_bytes = mb.get_col_ptr(row, pi, 16);
         let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
         if length == 0 {

@@ -594,6 +594,47 @@ class TestDistinctOperator:
         client.drop_table(sn, tname)
         client.drop_schema(sn)
 
+    def test_distinct_blob_payload(self, client):
+        """DISTINCT over a table with a BLOB payload column drives the full-row
+        comparator across BLOB columns. BLOB shares the German-string layout but
+        is a distinct type code from STRING; a regression once routed it to a
+        path that panicked (`unreachable!`). BLOB is only reachable via the
+        binding layer (SQL DDL rejects BLOB), so build the table/circuit here."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("payload", gnitz.TypeCode.BLOB)]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        cb = client.circuit_builder(source_table_id=tid)
+        out = cb.distinct(cb.input_delta())
+        cb.sink(out)
+        vid = client.create_view_with_circuit(sn, "vd", cb.build(), cols)
+
+        # Push the same (pk, blob) twice → distinct keeps weight 1 (the second
+        # push compares its payload row against the first via the BLOB arm).
+        for _ in range(2):
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, payload=b"hello\x00world", weight=1)
+            client.push(tid, b)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 1
+        assert rows[0]["payload"] == b"hello\x00world"
+
+        # A different blob at the same PK is a distinct element → two rows.
+        b = gnitz.ZSetBatch(schema)
+        b.append(pk=1, payload=b"goodbye", weight=1)
+        client.push(tid, b)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 2
+        assert {bytes(r["payload"]) for r in rows} == {b"hello\x00world", b"goodbye"}
+
+        client.drop_view(sn, "vd")
+        client.drop_table(sn, tname)
+        client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # TestUnionOperator

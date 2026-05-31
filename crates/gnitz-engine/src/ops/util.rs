@@ -110,7 +110,10 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                 let c_bytes = unsafe { std::slice::from_raw_parts(c_ptr, cs) };
                 let b_bytes = batch.get_col_ptr(row, pi, cs);
 
-                if col.type_code == TYPE_STRING {
+                // German strings (STRING/BLOB) compare via compare_german_strings;
+                // cmp_typed_le's String/Blob arm is `unreachable!`, so they must
+                // be dispatched here or a BLOB payload column panics the engine.
+                if gnitz_wire::is_german_string(col.type_code) {
                     crate::schema::compare_german_strings(
                         c_bytes,
                         cursor_blob_slice,
