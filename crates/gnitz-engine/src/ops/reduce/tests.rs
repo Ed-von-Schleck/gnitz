@@ -4669,3 +4669,588 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     counts.sort_unstable();
     assert_eq!(counts, vec![1, 2], "two distinct compound PKs with counts 1 and 2");
 }
+
+// -----------------------------------------------------------------------
+// Non-linear REDUCE fallback: single trace scan (O(trace + delta)).
+//
+// The fallback path is reached when all hold: non-linear aggregate,
+// no AVI, no GroupIndex, group_by is not the PK. The tests here pin
+// three properties: (1) hash correctness (extract_group_key_cursor must
+// produce byte-identical results to extract_group_key for the same row),
+// (2) aggregate correctness across INSERT/DELETE ticks, and (3) the
+// trace is scanned at most once per tick (REWIND_CALLS ≤ 1).
+// -----------------------------------------------------------------------
+
+/// Verifies that `extract_group_key_cursor` and `extract_group_key` return
+/// identical 128-bit keys for every row in a sorted batch, for the given
+/// group columns. A divergence would silently merge or split groups (wrong
+/// MIN/MAX results).
+fn assert_group_key_cursor_matches_batch(
+    b: &Batch,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use super::super::util::{extract_group_key, extract_group_key_cursor};
+
+    let rc = Rc::new(unsafe {
+        // Batch has no Clone; transmute a duplicate via raw read for test use only.
+        // Safety: we only read the batch through the Rc reference; the original `b`
+        // is not mutated or freed while the Rc lives (both are on the stack here).
+        //
+        // The proper way is to build the batch into an Rc from the start, but the
+        // helper receives a `&Batch` from the caller. We use ptr::read to produce an
+        // owned value without running a destructor on the source.
+        std::ptr::read(b as *const Batch)
+    });
+    let mb = rc.as_mem_batch();
+    let mut ch = CursorHandle::from_owned(&[Rc::clone(&rc)], *schema);
+    let cursor = ch.cursor_mut();
+
+    for row in 0..b.count {
+        assert!(cursor.valid, "cursor must be valid at row {row}");
+        let batch_key = extract_group_key(&mb, row, schema, group_by_cols);
+        let cursor_key = extract_group_key_cursor(cursor, schema, group_by_cols);
+        assert_eq!(
+            batch_key, cursor_key,
+            "group key mismatch at row {row}: batch={batch_key:#034x} cursor={cursor_key:#034x}",
+        );
+        cursor.advance();
+    }
+    // Prevent rc from being dropped before mb (the MemBatch holds a raw pointer into it).
+    std::mem::forget(rc);
+}
+
+#[test]
+fn extract_group_key_cursor_matches_batch() {
+    // Single U64 PK, group by PK column (single-PK fast path).
+    {
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0)],
+            &[0],
+        );
+        let mut b = Batch::with_schema(schema, 3);
+        for pk in [1u64, 5, 100] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[0u32]);
+    }
+
+    // Single non-nullable I64 payload, group by payload col (single-col fast path).
+    {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        let mut b = Batch::with_schema(schema, 4);
+        for (pk, grp) in [(1u64, -100i64), (2, 0), (3, 42), (4, i64::MAX)] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi, &grp.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
+    }
+
+    // Single nullable I64, group by nullable col — covers NULL in the hash loop.
+    {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1), // nullable
+            ],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        let mut b = Batch::with_schema(schema, 4);
+        // non-null rows
+        for (pk, grp, null_bit) in [(1u64, 10i64, 0u64), (2, 20, 0), (3, 30, 0)] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&(null_bit << pi as u64).to_le_bytes());
+            b.extend_col(pi, &grp.to_le_bytes());
+            b.count += 1;
+        }
+        // NULL row: null bit set; payload bytes irrelevant
+        b.extend_pk(4u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(1u64 << pi).to_le_bytes()); // pi-th bit = null
+        b.extend_col(pi, &0i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
+    }
+
+    // Single STRING payload, group by STRING col — covers string hash path and empty string.
+    {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0), // non-nullable STRING
+            ],
+            &[0],
+        );
+        let pi = schema.payload_idx(1);
+        let make_gs = |s: &str| -> [u8; 16] {
+            let bytes = s.as_bytes();
+            assert!(bytes.len() <= crate::schema::SHORT_STRING_THRESHOLD);
+            let mut gs = [0u8; 16];
+            gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            gs[4..4 + bytes.len()].copy_from_slice(bytes);
+            gs
+        };
+        let mut b = Batch::with_schema(schema, 3);
+        for (pk, s) in [(1u64, ""), (2, "hello"), (3, "zebra")] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi, &make_gs(s));
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
+    }
+
+    // U128 PK, group by PK column.
+    {
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U128, 0)],
+            &[0],
+        );
+        let mut b = Batch::with_schema(schema, 2);
+        for pk in [0u128, u128::MAX] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[0u32]);
+    }
+
+    // Multi-column key: (I64, I64), group by [col1, col2].
+    {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 1), // nullable second column
+            ],
+            &[0],
+        );
+        let pi0 = schema.payload_idx(1);
+        let pi1 = schema.payload_idx(2);
+        let mut b = Batch::with_schema(schema, 4);
+        // (non-null, non-null), (non-null, NULL), (non-null, non-null), (non-null, non-null)
+        let rows: &[(u64, i64, Option<i64>)] = &[
+            (1, 10, Some(100)),
+            (2, 10, None),
+            (3, 20, Some(100)),
+            (4, 20, Some(200)),
+        ];
+        for &(pk, c1, c2) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            let null_bit = if c2.is_none() { 1u64 << pi1 } else { 0 };
+            b.extend_null_bmp(&null_bit.to_le_bytes());
+            b.extend_col(pi0, &c1.to_le_bytes());
+            b.extend_col(pi1, &c2.unwrap_or(0).to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        assert_group_key_cursor_matches_batch(&b, &schema, &[1u32, 2u32]);
+    }
+}
+
+// Helper: build a sorted+consolidated Batch for the 3-col fallback correctness schemas.
+// Schema: U64 pk | group_col (type/nullable per schema) | I64 val.
+// Rows: (pk, weight, group_bytes [16 if string else 8], null_bit for group_col, val).
+fn make_fallback_batch_i64_grp(
+    schema: &SchemaDescriptor,
+    rows: &[(u64, i64, i64, bool, i64)], // (pk, w, grp, grp_is_null, val)
+) -> Batch {
+    let pi_grp = schema.payload_idx(1);
+    let pi_val = schema.payload_idx(2);
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, w, grp, grp_null, val) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        let null_word = if grp_null { 1u64 << pi_grp } else { 0u64 };
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(pi_grp, &grp.to_le_bytes());
+        b.extend_col(pi_val, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.sorted = true;
+    b.consolidated = true;
+    b
+}
+
+/// Read (grp_i64, min_i64) pairs from a fallback-style output (U128 pk | I64 grp | I64 min).
+fn read_grp_min_pairs(out: &Batch) -> Vec<(i64, i64)> {
+    let grp_data = out.col_data(0);
+    let min_data = out.col_data(1);
+    let mut pairs: Vec<(i64, i64)> = (0..out.count)
+        .filter(|&i| out.get_weight(i) > 0)
+        .map(|i| {
+            let g = crate::util::read_i64_le(grp_data, i * 8);
+            let m = crate::util::read_i64_le(min_data, i * 8);
+            (g, m)
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+/// Run the non-linear REDUCE fallback correctness test.
+///
+/// Schema: U64 pk | I64 grp (nullable) | I64 val. MIN on val, grouped by grp.
+/// No GI, no AVI → triggers the single-scan fallback path.
+///
+/// Two ticks:
+///   Tick 1: insert `tick1_rows` → verify MIN per group.
+///   Tick 2: apply `delta_rows` with trace_in from tick 1 → verify updated MIN.
+fn run_fallback_min_i64_grp(
+    tick1_rows: &[(u64, i64, i64, bool, i64)], // (pk, w, grp, grp_null, val)
+    delta_rows: &[(u64, i64, i64, bool, i64)],
+    expected_tick1: &mut Vec<(i64, i64)>, // sorted (grp, min) pairs after tick 1
+    expected_tick2: &mut Vec<(i64, i64)>, // sorted (grp, min) pairs after tick 2
+) {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1), // nullable grp
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1), // nullable grp (carried through)
+            SchemaColumn::new(type_code::I64, 1), // nullable min
+        ],
+        &[0],
+    );
+
+    let agg = AggDescriptor {
+        col_idx: 2,
+        agg_op: AggOp::Min,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+
+    // --- Tick 1: empty trace_in, empty trace_out ---
+    let delta1 = make_fallback_batch_i64_grp(&in_schema, tick1_rows);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch1 = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch1.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+
+    let got1 = read_grp_min_pairs(&out1);
+    expected_tick1.sort_unstable();
+    assert_eq!(got1, *expected_tick1, "tick 1 MIN mismatch");
+
+    // --- Tick 2: trace_in = tick1 input, trace_out = tick1 output ---
+    let ti_batch = Rc::new(make_fallback_batch_i64_grp(&in_schema, tick1_rows));
+    let to_batch = Rc::new(out1);
+    let delta2 = make_fallback_batch_i64_grp(&in_schema, delta_rows);
+
+    let mut ti_ch2 = CursorHandle::from_owned(&[ti_batch], in_schema);
+    let mut to_ch2 = CursorHandle::from_owned(&[to_batch], out_schema);
+
+    let (out2, _) = op_reduce(
+        &delta2,
+        Some(ti_ch2.cursor_mut()),
+        to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+
+    let grp_data = out2.col_data(0);
+    let min_data = out2.col_data(1);
+
+    // After tick 2, accumulate tick1 + delta. The net MIN per group is what
+    // tick1 produced (already verified) plus the new delta's contribution.
+    // We build expected from tick1 final values + delta applied.
+    let mut final_rows: std::collections::BTreeMap<i64, Vec<i64>> =
+        std::collections::BTreeMap::new();
+    for &(_, w, grp, grp_null, val) in tick1_rows.iter().chain(delta_rows.iter()) {
+        if grp_null { continue; } // NULL group: skip for simplicity (tested separately)
+        if w > 0 {
+            final_rows.entry(grp).or_default().push(val);
+        } else {
+            let v = final_rows.entry(grp).or_default();
+            v.retain(|&x| x != val); // remove one occurrence
+        }
+    }
+    let mut expected2: Vec<(i64, i64)> = final_rows.iter()
+        .filter(|(_, vals)| !vals.is_empty())
+        .map(|(&g, vals)| (g, *vals.iter().min().unwrap()))
+        .collect();
+    expected2.sort_unstable();
+    expected_tick2.sort_unstable();
+    assert_eq!(expected2, *expected_tick2, "tick 2 expected mismatch in test setup");
+
+    // The live MIN values in out2: start from tick1 result and apply net changes.
+    let mut live: std::collections::BTreeMap<i64, i64> = got1.iter().cloned().collect();
+    for i in 0..out2.count {
+        let w = out2.get_weight(i);
+        let g = crate::util::read_i64_le(grp_data, i * 8);
+        let m = crate::util::read_i64_le(min_data, i * 8);
+        if w < 0 {
+            live.remove(&g);
+        } else if w > 0 {
+            live.insert(g, m);
+        }
+    }
+    let mut live_pairs: Vec<(i64, i64)> = live.into_iter().collect();
+    live_pairs.sort_unstable();
+    assert_eq!(live_pairs, *expected_tick2, "tick 2 MIN mismatch (fallback path)");
+}
+
+/// MIN grouped by nullable I64 — linear probe branch (< HASH_THRESHOLD groups).
+#[test]
+fn fallback_min_nullable_i64_group_linear_probe() {
+    // 3 distinct non-null groups.
+    let tick1 = vec![
+        (1u64, 1i64, 10i64, false, 100i64),
+        (2, 1, 10, false, 50),
+        (3, 1, 20, false, 30),
+        (4, 1, 30, false, 200),
+    ];
+    // Delete the row with val=100 from group 10 → new MIN(10) = 50.
+    let delta2 = vec![(1u64, -1i64, 10i64, false, 100i64)];
+    let mut exp1 = vec![(10i64, 50i64), (20, 30), (30, 200)];
+    let mut exp2 = vec![(10i64, 50i64), (20, 30), (30, 200)];
+    run_fallback_min_i64_grp(&tick1, &delta2, &mut exp1, &mut exp2);
+}
+
+/// MIN grouped by nullable I64 — hash branch (>= HASH_THRESHOLD groups).
+#[test]
+fn fallback_min_nullable_i64_group_hash_path() {
+    // 20 distinct groups (exceeds HASH_THRESHOLD=16).
+    let tick1: Vec<(u64, i64, i64, bool, i64)> = (0..20)
+        .flat_map(|g| {
+            vec![
+                ((g * 2) as u64, 1, g as i64, false, (g * 10 + 5) as i64),
+                ((g * 2 + 1) as u64, 1, g as i64, false, (g * 10 + 1) as i64),
+            ]
+        })
+        .collect();
+    // MIN per group g = g*10+1. Delete the row with val=51 from group 5 → MIN(5) becomes 55.
+    // pk=11 = g*2+1 for g=5 carries val=g*10+1=51.
+    let delta2 = vec![(11u64, -1i64, 5i64, false, 51i64)]; // remove pk=11 (val=51)
+    let mut exp1: Vec<(i64, i64)> = (0..20).map(|g| (g as i64, (g * 10 + 1) as i64)).collect();
+    let mut exp2: Vec<(i64, i64)> = (0..20)
+        .map(|g| (g as i64, if g == 5 { 55 } else { (g * 10 + 1) as i64 }))
+        .collect();
+    run_fallback_min_i64_grp(&tick1, &delta2, &mut exp1, &mut exp2);
+}
+
+/// MIN grouped by multi-column key (I64, I64) — no GI → fallback path.
+#[test]
+fn fallback_min_multi_col_group() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // Schema: U64 pk | I64 c1 | I64 c2 | I64 val. Group by [c1, c2].
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    // Output: U128 pk | I64 c1 | I64 c2 | I64 min (nullable).
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+
+    let agg = AggDescriptor {
+        col_idx: 3,
+        agg_op: AggOp::Min,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+
+    let pi_c1 = in_schema.payload_idx(1);
+    let pi_c2 = in_schema.payload_idx(2);
+    let pi_val = in_schema.payload_idx(3);
+
+    let make_batch = |rows: &[(u64, i64, i64, i64, i64)]| -> Batch {
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, w, c1, c2, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi_c1, &c1.to_le_bytes());
+            b.extend_col(pi_c2, &c2.to_le_bytes());
+            b.extend_col(pi_val, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    };
+
+    // Tick 1: groups (1,1)→min=10, (1,2)→min=30, (2,1)→min=50.
+    let tick1_rows = [(1u64,1,1i64,1i64,10i64),(2,1,1,1,20),(3,1,1,2,30),(4,1,2,1,50)];
+    let delta1 = make_batch(&tick1_rows);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    // Verify 3 distinct groups came out.
+    assert_eq!(out1.count, 3, "tick 1 must emit 3 groups");
+
+    // Tick 2: add val=5 to group (1,1). trace_out is empty (no prior output to
+    // retract); the fallback must still pull trace rows for group (1,1) from
+    // trace_in so the replay is {10, 20, 5} and MIN = 5.
+    let delta2_rows = [(5u64,1,1i64,1i64,5i64)];
+    let ti_batch = Rc::new(make_batch(&tick1_rows));
+    let empty_out2 = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let delta2 = make_batch(&delta2_rows);
+
+    let mut ti_ch = CursorHandle::from_owned(&[ti_batch], in_schema);
+    let mut to_ch2 = CursorHandle::from_owned(&[empty_out2], out_schema);
+
+    let (out2, _) = op_reduce(
+        &delta2,
+        Some(ti_ch.cursor_mut()),
+        to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32, 2u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+
+    // No retraction (trace_out was empty), just one insert for group (1,1).
+    assert_eq!(out2.count, 1, "tick 2 must emit one row for group (1,1)");
+    let out2_min = out2.col_data(2);
+    let new_min = crate::util::read_i64_le(out2_min, 0);
+    assert_eq!(new_min, 5,
+        "MIN for group (1,1) must be 5 — trace rows (10,20) + delta (5) → min=5");
+}
+
+/// Performance guard: the single-scan pre-pass must rewind the trace cursor at
+/// most once per op_reduce call, regardless of how many delta groups there are.
+/// Uses a `#[cfg(test)]` thread-local counter in `ReadCursor::rewind`.
+#[test]
+fn fallback_trace_rewind_at_most_once() {
+    use std::rc::Rc;
+    use crate::storage::{CursorHandle, REWIND_CALLS};
+
+    // Schema: U64 pk | I64 grp | I64 val. 32 distinct groups (> HASH_THRESHOLD=16).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let agg = AggDescriptor {
+        col_idx: 2,
+        agg_op: AggOp::Min,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+
+    let pi_grp = in_schema.payload_idx(1);
+    let pi_val = in_schema.payload_idx(2);
+    let num_groups = 32usize;
+
+    // Trace: one history row per group.
+    let mut ti_b = Batch::with_schema(in_schema, num_groups);
+    for g in 0..num_groups {
+        ti_b.extend_pk((g as u128) * 2); // even PKs for trace
+        ti_b.extend_weight(&1i64.to_le_bytes());
+        ti_b.extend_null_bmp(&0u64.to_le_bytes());
+        ti_b.extend_col(pi_grp, &(g as i64).to_le_bytes());
+        ti_b.extend_col(pi_val, &(g as i64 * 10).to_le_bytes());
+        ti_b.count += 1;
+    }
+    ti_b.sorted = true;
+    ti_b.consolidated = true;
+
+    // Delta: one new row per group (odd PKs).
+    let mut delta_b = Batch::with_schema(in_schema, num_groups);
+    for g in 0..num_groups {
+        delta_b.extend_pk((g as u128) * 2 + 1);
+        delta_b.extend_weight(&1i64.to_le_bytes());
+        delta_b.extend_null_bmp(&0u64.to_le_bytes());
+        delta_b.extend_col(pi_grp, &(g as i64).to_le_bytes());
+        delta_b.extend_col(pi_val, &(g as i64 * 10 + 5).to_le_bytes());
+        delta_b.count += 1;
+    }
+    delta_b.sorted = true;
+    delta_b.consolidated = true;
+
+    let ti_rc = Rc::new(ti_b);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut ti_ch = CursorHandle::from_owned(&[ti_rc], in_schema);
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    // Reset the per-thread rewind counter before the call.
+    REWIND_CALLS.with(|c| c.set(0));
+
+    let (out, _) = op_reduce(
+        &delta_b,
+        Some(ti_ch.cursor_mut()),
+        to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+
+    let rewinds = REWIND_CALLS.with(|c| c.get());
+    assert!(
+        rewinds <= 1,
+        "trace cursor was rewound {rewinds} times; the single-scan pre-pass must rewind ≤ 1 time",
+    );
+
+    // Correctness: MIN per group = min(g*10, g*10+5) = g*10 (trace value).
+    assert_eq!(out.count, num_groups, "must emit one row per group");
+}

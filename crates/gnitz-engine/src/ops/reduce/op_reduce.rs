@@ -6,7 +6,7 @@ use crate::storage::{
     scatter_copy,
 };
 
-use super::super::util::{GroupKeyExtractor, extract_group_key};
+use super::super::util::{GroupKeyExtractor, extract_group_key, extract_group_key_cursor};
 use super::agg::{
     Accumulator, AggDescriptor, apply_agg_from_value_index, is_single_col_natural_pk,
 };
@@ -246,6 +246,124 @@ pub fn op_reduce(
     let mut replay = (!all_linear && avi.is_none())
         .then(|| Batch::with_schema(*input_schema, 32));
 
+    // Single-scan trace gather for the non-linear, non-PK, no-index fallback.
+    // Replaces the per-group full-trace rescan (O(groups × trace)) with one
+    // pass (O(trace + delta)). `fallback_state` is `(matched_rows, offsets)`:
+    // matched_rows is sorted by group so `offsets[g] = (start, len)` slices the
+    // rows belonging to group g.
+    let fallback_state: Option<(Vec<(u32, u32, i64)>, Vec<(u32, u32)>)> =
+        if !all_linear && avi.is_none() && !group_by_pk && gi.is_none() {
+            trace_in.as_deref_mut().map(|ti_cursor| {
+                // Pass 1: one exemplar row per distinct delta group, in group order.
+                let mut group_exemplars = Vec::with_capacity(n);
+                let mut tmp_idx = 0usize;
+                while tmp_idx < n {
+                    let exemplar = sorted_indices[tmp_idx] as usize;
+                    group_exemplars.push(exemplar);
+                    tmp_idx += 1;
+                    while tmp_idx < n {
+                        let curr = sorted_indices[tmp_idx] as usize;
+                        if compare_by_group_cols(&mb, curr, exemplar, group_descs)
+                            != std::cmp::Ordering::Equal
+                        {
+                            break;
+                        }
+                        tmp_idx += 1;
+                    }
+                }
+                let num_g = group_exemplars.len();
+
+                // Hash index only pays off past a handful of groups; below the
+                // threshold a direct linear probe per trace row is cheaper than
+                // hashing every trace row. Either way the trace is scanned once.
+                const HASH_THRESHOLD: usize = 16;
+                let use_hash = num_g >= HASH_THRESHOLD;
+                let mut hash_to_groups =
+                    rustc_hash::FxHashMap::<u128, Vec<usize>>::default();
+                if use_hash {
+                    hash_to_groups.reserve(num_g);
+                    for (g, &exemplar) in group_exemplars.iter().enumerate() {
+                        let hash = extract_group_key(&mb, exemplar, input_schema, group_by_cols);
+                        hash_to_groups.entry(hash).or_default().push(g);
+                    }
+                }
+
+                // Pass 2: one full trace scan, route each row to its group.
+                let mut tagged: Vec<(u32, u32, u32, i64)> = Vec::new(); // (g, entry, row, w)
+                ti_cursor.rewind();
+                let mut scanned = 0usize;
+                while ti_cursor.valid {
+                    scanned += 1;
+                    if ti_cursor.current_weight != 0 {
+                        // Disjoint groups: a trace row belongs to at most one, so
+                        // `matched` stops at the first exact match.
+                        let mut matched = None;
+                        if use_hash {
+                            let hash = extract_group_key_cursor(
+                                ti_cursor, input_schema, group_by_cols,
+                            );
+                            if let Some(cands) = hash_to_groups.get(&hash) {
+                                for &g in cands {
+                                    if cursor_matches_group(
+                                        ti_cursor, &mb, group_exemplars[g], group_descs,
+                                    ) {
+                                        matched = Some(g);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (g, &exemplar) in group_exemplars.iter().enumerate() {
+                                if cursor_matches_group(ti_cursor, &mb, exemplar, group_descs) {
+                                    matched = Some(g);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(g) = matched {
+                            let (entry, row, w) = ti_cursor.current_row_loc();
+                            tagged.push((g as u32, entry, row, w));
+                        }
+                    }
+                    ti_cursor.advance();
+                }
+
+                gnitz_debug!(
+                    "op_reduce fallback: 1 trace scan, {} rows, {} groups, {} matched",
+                    scanned, num_g, tagged.len()
+                );
+
+                // Cluster matches by group in O(matched + groups) via counting
+                // sort — group ids are dense `0..num_g`, so a comparison sort is
+                // unnecessary. `offsets[g] = (start, len)` slices group g's rows
+                // in `matched_rows`; empty groups get `(start, 0)`.
+                let mut offsets = vec![(0u32, 0u32); num_g];
+                for &(g, _, _, _) in &tagged {
+                    offsets[g as usize].1 += 1; // pass 1: per-group counts
+                }
+                let mut acc = 0u32; // pass 2: prefix-sum counts into start offsets
+                for off in offsets.iter_mut() {
+                    off.0 = acc;
+                    acc += off.1; // off.1 keeps the count, now the slice len
+                }
+                // Pass 3: scatter each tagged row into its group's slice.
+                // Use offsets[g].0 as the advancing write cursor, then restore
+                // it to the original start (start = cursor - count = .0 - .1).
+                let mut matched_rows = vec![(0u32, 0u32, 0i64); tagged.len()];
+                for &(g, entry, row, w) in &tagged {
+                    let p = offsets[g as usize].0;
+                    matched_rows[p as usize] = (entry, row, w);
+                    offsets[g as usize].0 += 1;
+                }
+                for off in offsets.iter_mut() {
+                    off.0 -= off.1; // restore start from advanced cursor
+                }
+                (matched_rows, offsets)
+            })
+        } else {
+            None
+        };
+
     let mut idx = 0usize;
     let mut num_groups = 0usize;
     while idx < n {
@@ -394,18 +512,15 @@ pub fn op_reduce(
                             gi_c.advance();
                             hit = gi_c.walk_to_positive_with_prefix(&prefix);
                         }
-                    } else {
-                        // Fallback: full trace scan, predicate-filtered.
-                        ti_cursor.rewind();
-                        let ti_mb_exemplar_row = group_start_idx;
-                        while ti_cursor.valid {
-                            if cursor_matches_group(
-                                ti_cursor, &mb, ti_mb_exemplar_row,
-                                group_descs,
-                            ) {
-                                ti_cursor.push_current_row(&mut trace_rows);
-                            }
-                            ti_cursor.advance();
+                    } else if let Some((ref matched_rows, ref offsets)) = fallback_state {
+                        // Precomputed by the single-scan pre-pass; `num_groups`
+                        // is this group's index (the pre-pass walks identical
+                        // group boundaries) and has not yet been incremented.
+                        let (start, len) = offsets[num_groups];
+                        for &(entry, row, w) in
+                            &matched_rows[start as usize..(start + len) as usize]
+                        {
+                            trace_rows.push((entry, row, w));
                         }
                     }
                 }

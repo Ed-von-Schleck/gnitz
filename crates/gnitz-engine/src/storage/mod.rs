@@ -33,6 +33,8 @@ pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use read_cursor::{DrainGuard, ReadCursor};
+#[cfg(test)]
+pub(crate) use read_cursor::REWIND_CALLS;
 pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_int_nonnull, schema_is_int_nonnull, encode_order_preserving_pk, opk_key};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter, pk_sort_key};
 pub(crate) use batch::carve_writer_slices;

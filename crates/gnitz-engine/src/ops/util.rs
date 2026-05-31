@@ -353,10 +353,92 @@ fn mix64(mut v: u64) -> u64 {
     v
 }
 
+/// Minimal row accessor shared by `extract_group_key` over a `MemBatch` row and
+/// over a `ReadCursor`'s current row, so the group-key hash has ONE
+/// implementation. The two must hash byte-identically — a divergence would
+/// silently merge or split groups in the non-linear REDUCE fallback (wrong
+/// MIN/MAX). Pinned by `extract_group_key_cursor_matches_batch`.
+///
+/// `c_idx` is a LOGICAL column index. The `MemBatch` impl maps it to a payload
+/// slot via the passed schema; the `ReadCursor` impl maps it via the cursor's
+/// own (identical) schema — the trace-in cursor is built with the input schema,
+/// so both resolve the same physical layout.
+trait GroupKeyRow {
+    /// OPK (big-endian) PK byte window for the row.
+    fn pk_bytes(&self) -> &[u8];
+    /// Null bitmap word for the row.
+    fn null_word(&self) -> u64;
+    /// Raw little-endian bytes of non-PK logical column `c_idx` (`cs` wide), or
+    /// `None` if the backing pointer is null (treated as an absent value).
+    fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]>;
+    /// Blob arena backing this row's German strings.
+    fn blob(&self) -> &[u8];
+}
+
+struct BatchRow<'a, 'b> {
+    mb: &'b MemBatch<'a>,
+    row: usize,
+}
+
+impl GroupKeyRow for BatchRow<'_, '_> {
+    #[inline]
+    fn pk_bytes(&self) -> &[u8] { self.mb.get_pk_bytes(self.row) }
+    #[inline]
+    fn null_word(&self) -> u64 { self.mb.get_null_word(self.row) }
+    #[inline]
+    fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
+        // MemBatch get_col_ptr is infallible (panics OOB) — always Some, so the
+        // batch path keeps its original non-null assumption and behaviour.
+        Some(self.mb.get_col_ptr(self.row, schema.payload_idx(c_idx), cs))
+    }
+    #[inline]
+    fn blob(&self) -> &[u8] { self.mb.blob }
+}
+
+impl GroupKeyRow for ReadCursor {
+    #[inline]
+    fn pk_bytes(&self) -> &[u8] { self.current_pk_bytes() }
+    #[inline]
+    fn null_word(&self) -> u64 { self.current_null_word }
+    #[inline]
+    fn payload_bytes(&self, _schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
+        // col_ptr maps logical→payload internally and returns null for PK /
+        // unpositioned cursors. The caller has already excluded PK columns and
+        // scans only under `valid`, so null is an invariant violation — treat it
+        // as an absent value rather than dereferencing it (UB).
+        let p = self.col_ptr(c_idx, cs);
+        if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, cs) }) }
+    }
+    #[inline]
+    fn blob(&self) -> &[u8] { self.blob_slice() }
+}
+
 /// Extract 128-bit group key from a batch row.
+#[inline]
 pub(super) fn extract_group_key(
     mb: &MemBatch,
     row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> u128 {
+    extract_group_key_row(&BatchRow { mb, row }, schema, group_by_cols)
+}
+
+/// Extract 128-bit group key from a `ReadCursor`'s current row. Hashes
+/// byte-identically to [`extract_group_key`] for the same logical row, so a
+/// trace row routes to the delta group it belongs to.
+#[inline]
+pub(super) fn extract_group_key_cursor(
+    cursor: &ReadCursor,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> u128 {
+    extract_group_key_row(cursor, schema, group_by_cols)
+}
+
+#[inline]
+fn extract_group_key_row<R: GroupKeyRow>(
+    row: &R,
     schema: &SchemaDescriptor,
     group_by_cols: &[u32],
 ) -> u128 {
@@ -369,7 +451,7 @@ pub(super) fn extract_group_key(
         let c_idx = group_by_cols[0] as usize;
         let off = schema.pk_byte_offset(c_idx) as usize;
         let cs = schema.columns[c_idx].size() as usize;
-        return crate::schema::pk_route_key(mb.get_pk_bytes(row), off, cs);
+        return crate::schema::pk_route_key(row.pk_bytes(), off, cs);
     }
 
     if group_by_cols.len() == 1 {
@@ -390,13 +472,13 @@ pub(super) fn extract_group_key(
                     | type_code::U128 | type_code::UUID)
         {
             let cs = col.size() as usize;
-            let pi = schema.payload_idx(c_idx);
-            let ptr = mb.get_col_ptr(row, pi, cs);
-            return crate::schema::payload_route_key(ptr, 0, cs, tc);
+            if let Some(b) = row.payload_bytes(schema, c_idx, cs) {
+                return crate::schema::payload_route_key(b, 0, cs, tc);
+            }
         }
     }
 
-    let null_word = mb.get_null_word(row);
+    let null_word = row.null_word();
     let mut h: u64 = 0x9E3779B97F4A7C15; // golden ratio seed
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
         let c_idx = c_idx_u32 as usize;
@@ -408,7 +490,7 @@ pub(super) fn extract_group_key(
             // below applies the matching encode+widen).
             let off = schema.pk_byte_offset(c_idx) as usize;
             let cs = schema.columns[c_idx].size() as usize;
-            let key = crate::schema::pk_route_key(mb.get_pk_bytes(row), off, cs);
+            let key = crate::schema::pk_route_key(row.pk_bytes(), off, cs);
             if tc == type_code::U128 || tc == type_code::UUID {
                 let lo = key as u64;
                 let hi = (key >> 64) as u64;
@@ -423,22 +505,30 @@ pub(super) fn extract_group_key(
                 h = mix64(h ^ 0xDEAD_BEEF_DEAD_BEEF ^ (i as u64));
                 continue;
             }
+            let cs = if tc == TYPE_STRING || tc == type_code::U128 || tc == type_code::UUID {
+                16
+            } else {
+                schema.columns[c_idx].size() as usize
+            };
+            // A null ptr here means the non-null bit disagrees with the backing
+            // store (cursor invariant violation) — fold a position-dependent
+            // constant rather than dereference. Never taken on the batch path.
+            let Some(bytes) = row.payload_bytes(schema, c_idx, cs) else {
+                h = mix64(h ^ 0xDEAD_BEEF_DEAD_BEEF ^ (i as u64));
+                continue;
+            };
             if tc == TYPE_STRING {
-                let struct_bytes = mb.get_col_ptr(row, pi, 16);
-                let content = crate::schema::german_string_content(struct_bytes, mb.blob);
+                let content = crate::schema::german_string_content(bytes, row.blob());
                 if content.is_empty() { 0u64 } else { xxh::checksum(content) }
             } else if tc == type_code::U128 || tc == type_code::UUID {
-                let ptr = mb.get_col_ptr(row, pi, 16);
-                let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
-                let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
+                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
                 mix64(lo ^ mix64(hi))
             } else {
                 // Native-LE payload int: encode+widen (payload_route_key) so a
                 // payload FK column hashes like the same value stored as a PK
                 // column (sign-flipped for signed), matching the PK arm above.
-                let cs = schema.columns[c_idx].size() as usize;
-                let ptr = mb.get_col_ptr(row, pi, cs);
-                mix64(crate::schema::payload_route_key(ptr, 0, cs, tc) as u64)
+                mix64(crate::schema::payload_route_key(bytes, 0, cs, tc) as u64)
             }
         };
         h = mix64(h ^ col_hash ^ (i as u64));

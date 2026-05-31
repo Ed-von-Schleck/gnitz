@@ -28,6 +28,11 @@ thread_local! {
         const { Cell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REWIND_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// RAII handle wrapping the thread-local drain scratch buffer.  Behaves like
 /// `&mut Vec<_>` via `Deref`/`DerefMut`.  On unwind `Drop` swaps in an empty
 /// Vec via `mem::take`, costing a one-time capacity reset (not a poison).
@@ -361,6 +366,26 @@ pub struct ReadCursor {
 trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
 impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
 
+/// Resolve the PK ordering after a heap-key tie. Narrow PKs (key = whole PK)
+/// are byte-equal by definition; wide PKs (16-byte OPK prefix) may collide on
+/// the key yet differ in the full bytes, so the full compare is required.
+#[inline]
+fn pk_cmp_after_key_tie(
+    schema: &SchemaDescriptor,
+    sources: &[CursorSource],
+    a: &HeapNode,
+    b: &HeapNode,
+) -> Ordering {
+    if schema.pk_is_wide() {
+        columnar::compare_pk_bytes(
+            sources[a.source_idx].get_pk_bytes(a.row),
+            sources[b.source_idx].get_pk_bytes(b.row),
+        )
+    } else {
+        Ordering::Equal
+    }
+}
+
 impl ReadCursor {
     #[inline]
     fn build_tree_with<RowCmp: RowComparator>(
@@ -384,10 +409,7 @@ impl ReadCursor {
             match a.key.cmp(&b.key) {
                 Ordering::Less => true,
                 Ordering::Greater => false,
-                Ordering::Equal => match columnar::compare_pk_bytes(
-                    sources[a.source_idx].get_pk_bytes(a.row),
-                    sources[b.source_idx].get_pk_bytes(b.row),
-                ) {
+                Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => row_cmp(
@@ -468,6 +490,8 @@ impl ReadCursor {
     /// every negative-keyed row. Rewinding by row index is correct at every PK
     /// shape.
     pub fn rewind(&mut self) {
+        #[cfg(test)]
+        REWIND_CALLS.with(|c| c.set(c.get() + 1));
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.position = 0;
             state.skip_ghosts(src);
@@ -701,13 +725,11 @@ impl ReadCursor {
             match a.key.cmp(&b.key) {
                 Ordering::Less => true,
                 Ordering::Greater => false,
-                Ordering::Equal => match columnar::compare_pk_bytes(
-                    sources[a.source_idx].get_pk_bytes(a.row),
-                    sources[b.source_idx].get_pk_bytes(b.row)) {
+                Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
-                                                       &sources[b.source_idx], b.row) == Ordering::Less,
+                                               &sources[b.source_idx], b.row) == Ordering::Less,
                 },
             }
         };
@@ -925,6 +947,13 @@ impl ReadCursor {
     /// output blob arena.
     pub(crate) fn total_blob_len(&self) -> usize {
         self.sources.iter().map(|s| s.blob_slice().len()).sum()
+    }
+
+    /// Current row's `(entry_idx, row, weight)`. Unlike `push_current_row`, applies
+    /// no validity / zero-weight filter — a caller scanning under a `valid` guard
+    /// tags each row with an external group id and filters weight itself.
+    pub(crate) fn current_row_loc(&self) -> (u32, u32, i64) {
+        (self.current_entry_idx as u32, self.current_row as u32, self.current_weight)
     }
 
     /// Append the cursor's current `(entry_idx, row, weight)` to `buf` if the

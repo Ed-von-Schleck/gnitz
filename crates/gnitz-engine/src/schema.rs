@@ -61,7 +61,14 @@ pub fn assemble_wide_pk(
     extra: &[u8],
     stride: usize,
 ) -> Result<[u8; MAX_PK_BYTES], String> {
-    debug_assert!(stride > NARROW_PK_MAX_BYTES, "assemble_wide_pk: narrow stride {stride}");
+    // Public fn: enforce the wide-stride contract at runtime, not just via
+    // debug_assert. A narrow stride would underflow `stride - NARROW_PK_MAX_BYTES`
+    // and panic in release; return a clean error instead.
+    if stride <= NARROW_PK_MAX_BYTES {
+        return Err(format!(
+            "assemble_wide_pk: narrow stride {stride} (expected > {NARROW_PK_MAX_BYTES})"
+        ));
+    }
     let needed = stride - NARROW_PK_MAX_BYTES;
     if extra.len() < needed {
         return Err(format!(
