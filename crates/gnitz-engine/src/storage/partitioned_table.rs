@@ -55,6 +55,20 @@ impl PartitionedTable {
         );
         table::ensure_dir(dir)?;
 
+        // Test seam: widen the window where the table dir exists but its
+        // partition subdirs do not, so a concurrent master remove_dir_all
+        // (DROP) deterministically races this create. User tables only.
+        #[cfg(debug_assertions)]
+        if num_partitions == 256 {
+            if let Some(ms) = std::env::var("GNITZ_INJECT_TABLE_CREATE_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
             let part_dir = if num_partitions == 1 {

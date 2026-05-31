@@ -141,6 +141,42 @@ def client(_srv):
         yield conn
 
 
+@pytest.fixture
+def race_server(monkeypatch):
+    """
+    A dedicated server (separate from the session server) spawned with the
+    debug-only `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam enabled, for the
+    DROP-directory-removal race regression test.
+
+    The seam makes every worker sleep between creating a table directory and
+    its partition subdirectories, deterministically widening the window in
+    which a master DROP `remove_dir_all` can race a lagging worker's CREATE.
+    Needs >= 2 workers for the master-vs-worker race; forces 4 if fewer.
+
+    Yields a connected client.  No-op against a release server (the seam is
+    `#[cfg(debug_assertions)]`), so the test simply passes there.
+    """
+    binary = os.environ.get(
+        "GNITZ_SERVER_BIN",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
+    )
+    if not os.path.isfile(binary):
+        pytest.skip(f"Server binary not found: {binary}")
+
+    # monkeypatch reverts both vars at fixture teardown.
+    monkeypatch.setenv("GNITZ_INJECT_TABLE_CREATE_DELAY_MS", "50")
+    if int(os.environ.get("GNITZ_WORKERS", "1")) < 2:
+        monkeypatch.setenv("GNITZ_WORKERS", "4")
+
+    s = _Server(binary)
+    try:
+        s.start()
+        with gnitz.connect(s.sock_path) as conn:
+            yield conn
+    finally:
+        s.teardown()
+
+
 @pytest.fixture(autouse=True, scope="class")
 def _server_guard(_srv, request):
     """

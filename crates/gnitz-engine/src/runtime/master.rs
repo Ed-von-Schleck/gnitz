@@ -1205,6 +1205,9 @@ impl MasterDispatcher {
                 unsafe { libc::waitpid(pid, &mut status, 0); }
             }
         }
+        // All workers reaped: no process can race a removal. Reclaim any dirs
+        // still gated (dropped entities whose gating checkpoint never arrived).
+        unsafe { &mut *self.catalog }.drain_checkpoint_gated_deletions();
     }
 
     // -----------------------------------------------------------------------
@@ -2191,6 +2194,9 @@ impl MasterDispatcher {
     pub(crate) fn checkpoint_post_ack(&mut self) {
         let cat = unsafe { &mut *self.catalog };
         cat.flush_all_system_tables();
+        // Now safe: every worker ACKed the FLUSH, so all have consumed past any
+        // DROP that gated a directory — hence finished the matching CREATE.
+        cat.drain_checkpoint_gated_deletions();
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
     }

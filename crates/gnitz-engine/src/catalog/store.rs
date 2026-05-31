@@ -355,16 +355,21 @@ impl CatalogEngine {
         std::mem::take(&mut self.pending_broadcasts)
     }
 
-    /// Physically remove the directories queued by table/view/index drop
-    /// hooks. The executor calls this only after the DDL zone's fdatasync
-    /// confirms the drop is durable — see `pending_dir_deletions`. An existence
-    /// guard keeps a re-queued path (drop applied, dir already gone) quiet.
-    pub fn drain_pending_dir_deletions(&mut self) {
-        for dir in std::mem::take(&mut self.pending_dir_deletions) {
+    /// Physically remove a batch of queued directory paths. An existence guard
+    /// keeps a re-queued path (drop applied, dir already gone) quiet.
+    fn remove_queued_dirs(dirs: Vec<String>) {
+        for dir in dirs {
             if std::path::Path::new(&dir).exists() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
+    }
+
+    /// Physically remove the directories queued by table/view/index drop
+    /// hooks. The executor calls this only after the DDL zone's fdatasync
+    /// confirms the drop is durable — see `pending_dir_deletions`.
+    pub fn drain_pending_dir_deletions(&mut self) {
+        Self::remove_queued_dirs(std::mem::take(&mut self.pending_dir_deletions));
     }
 
     /// Drop the queued directory paths *without* deleting them. Used when a DDL
@@ -372,6 +377,35 @@ impl CatalogEngine {
     /// did not durably drop, so its files must survive.
     pub fn discard_pending_dir_deletions(&mut self) {
         self.pending_dir_deletions.clear();
+    }
+
+    /// Move durably-dropped directories from the in-flight DDL queue into the
+    /// checkpoint-gated queue instead of removing them now. See
+    /// `checkpoint_gated_deletions`. Used on the DROP-success path where worker
+    /// processes may still be applying the entity's CREATE.
+    pub fn defer_pending_dir_deletions(&mut self) {
+        self.checkpoint_gated_deletions
+            .append(&mut self.pending_dir_deletions);
+    }
+
+    /// Physically remove every checkpoint-gated directory. SAFE only at a
+    /// checkpoint boundary, after the per-worker FLAG_FLUSH ACKs prove all
+    /// workers consumed past the DROP that queued each entry.
+    pub fn drain_checkpoint_gated_deletions(&mut self) {
+        Self::remove_queued_dirs(std::mem::take(&mut self.checkpoint_gated_deletions));
+    }
+
+    /// Cancel a pending checkpoint-gated removal of `dir`. Required when an
+    /// entity whose on-disk path is *name-based* (not `<name>_<tid>`) is
+    /// recreated before the gating checkpoint drains the queue: only schemas
+    /// have name-based paths (`<base>/<schema>`), so a `DROP SCHEMA s` +
+    /// `CREATE SCHEMA s` would otherwise leave `<base>/s` queued, and the next
+    /// checkpoint's `remove_dir_all` would wipe the recreated schema and every
+    /// new table beneath it. Tables/indices encode a monotonic tid in their
+    /// path, so a recreate never collides with a gated entry and needs no
+    /// cancellation.
+    pub fn cancel_gated_deletion(&mut self, dir: &str) {
+        self.checkpoint_gated_deletions.retain(|d| d != dir);
     }
 
     // -----------------------------------------------------------------------
@@ -431,6 +465,15 @@ impl CatalogEngine {
 
         let is_create = (0..original_batch.count)
             .any(|i| original_batch.get_weight(i) > 0);
+
+        debug_assert!(
+            original_batch.count == 0
+                || (0..original_batch.count).all(|i| original_batch.get_weight(i) > 0)
+                || (0..original_batch.count).all(|i| original_batch.get_weight(i) < 0),
+            "compensate_stage_a assumes a weight-homogeneous top-level batch; a mixed \
+             CREATE/DROP batch would misclassify the rollback direction and mishandle \
+             pending_dir_deletions"
+        );
 
         // For CREATE rollback: dependents unregistered before dependencies — DESCENDING.
         // For DROP rollback: dependencies restored before dependents — ASCENDING.

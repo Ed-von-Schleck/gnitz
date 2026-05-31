@@ -1085,9 +1085,12 @@ async fn handle_system_dml(
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
     unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
-    // Drop is now durable — physically remove the directories the drop hooks
-    // queued (the catalog analog of ShardIndex::pending_deletions cleanup).
-    unsafe { (*cat_ptr_raw).drain_pending_dir_deletions(); }
+    // Drop is now durable, but worker processes share this tree and may still
+    // be applying the CREATE of an entity dropped in the same session. Defer
+    // physical removal to the next checkpoint, whose worker-ACK barrier proves
+    // every worker has consumed past this DROP. Removing here races a lagging
+    // worker's partition-dir create and aborts it with ENOENT.
+    unsafe { (*cat_ptr_raw).defer_pending_dir_deletions(); }
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.

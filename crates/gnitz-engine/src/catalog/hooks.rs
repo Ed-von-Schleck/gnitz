@@ -94,6 +94,11 @@ impl CatalogEngine {
             let name = self.read_batch_string(batch, i, 0);
             let path = format!("{}/{}", self.base_dir, name);
             if weight > 0 {
+                // A prior DROP SCHEMA may have queued this exact (name-based)
+                // path for checkpoint-gated removal; recreating it now must
+                // cancel that, or the gating checkpoint would wipe the new
+                // schema and its tables.
+                self.cancel_gated_deletion(&path);
                 // Pre-stage for cleanup before ensure_dir so that if Stage-A
                 // fails after the directory is created, compensate_stage_a's
                 // drain_pending_dir_deletions removes it.

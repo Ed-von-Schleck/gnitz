@@ -6,6 +6,7 @@ mod uuid_tests;
 mod index_tests;
 mod engine_tests;
 mod wide_pk_validation;
+mod dir_deletion_tests;
 
 use super::*;
 use super::sys_tables::*;

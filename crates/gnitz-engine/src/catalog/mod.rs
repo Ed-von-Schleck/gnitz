@@ -124,6 +124,14 @@ pub struct CatalogEngine {
     // catalog analog of `ShardIndex::pending_deletions`.
     pub(crate) pending_dir_deletions: Vec<String>,
 
+    /// Directories that are durably dropped but must NOT be physically removed
+    /// yet: worker processes share this on-disk tree and may still be applying
+    /// the CREATE of the same entity (FLAG_DDL_SYNC is fire-and-forget and
+    /// applied in-order, slower than the master's own removal). Removal is
+    /// deferred to the next checkpoint, whose per-worker ACK barrier proves
+    /// every worker has consumed past this DROP — hence finished the CREATE.
+    pub(crate) checkpoint_gated_deletions: Vec<String>,
+
     // 0 means "no zone active". The executor sets this before the DDL
     // mutate phase and clears it after fsync so every hook in the same
     // zone writes the same `current_lsn`. Recovery's dedup filter then
