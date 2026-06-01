@@ -138,6 +138,35 @@ pub fn is_german_string(tc: u8) -> bool {
     tc == type_code::STRING || tc == type_code::BLOB
 }
 
+/// Whether a raw wire type code is a *signed* fixed-width integer
+/// (I8/I16/I32/I64). The order-preserving encoders/comparators flip the sign
+/// bit for these so two's-complement negatives sort below non-negatives.
+/// Unsigned, float, string, and unknown codes are not signed.
+pub const fn is_signed_int(tc: u8) -> bool {
+    matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
+}
+
+/// Whether a raw wire type code is a fixed-width integer of ≤ 8 bytes
+/// (U8/I8/U16/I16/U32/I32/U64/I64, any sign). Excludes U128/UUID (16 bytes) and
+/// all float/string/blob types — these are exactly the payload columns the
+/// fixed-int fast-path row comparator can compare via a single `u64` load.
+pub const fn is_fixed_int(tc: u8) -> bool {
+    matches!(
+        tc,
+        type_code::U8 | type_code::I8 | type_code::U16 | type_code::I16
+            | type_code::U32 | type_code::I32 | type_code::U64 | type_code::I64
+    )
+}
+
+/// Whether a raw wire type code is any integer-valued fixed-width type that
+/// `payload_route_key` can encode as an order-preserving routing key:
+/// U8..U64, I8..I64, plus the 16-byte U128/UUID. The superset of `is_fixed_int`
+/// that also admits the wide integer types. Floats, strings, and blobs route via
+/// the content-hash path instead, so they are excluded.
+pub const fn is_routable_int(tc: u8) -> bool {
+    is_fixed_int(tc) || matches!(tc, type_code::U128 | type_code::UUID)
+}
+
 /// Wire stride (byte width) for a column type code.
 /// Returns 8 for unknown codes (engine compare_rows depends on this default).
 pub const fn wire_stride(tc: u8) -> usize {

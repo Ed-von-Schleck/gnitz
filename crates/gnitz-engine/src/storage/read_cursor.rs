@@ -10,7 +10,8 @@ use std::rc::Rc;
 
 use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::columnar::{self, ColumnarSource};
-use crate::schema::{PayloadCmpKind, SchemaDescriptor, MAX_COLUMNS};
+use super::with_payload_cmp;
+use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{pack_pk_be, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
@@ -340,20 +341,6 @@ enum SourceMode {
     Multi(LoserTree),
 }
 
-/// Selects the row-comparator strategy for a cursor. Computed once at
-/// construction; governs `drive`, `advance`, and `drain_sorted_into`.
-#[derive(Copy, Clone, PartialEq)]
-enum CursorComparator {
-    /// Every source is a PkUnique shard: payload comparison skipped on PK ties.
-    PkUnique,
-    /// All payload columns are non-nullable signed integers.
-    IntNonnull,
-    /// All payload columns are non-nullable unsigned integers ≤ 8 bytes.
-    UintNonnull,
-    /// General case.
-    Generic,
-}
-
 pub struct ReadCursor {
     sources: Vec<CursorSource>,
     states: Vec<CursorState>,
@@ -362,7 +349,10 @@ pub struct ReadCursor {
     unified_sources: OnceCell<Vec<UnifiedSource>>,
     mode: SourceMode,
     schema: SchemaDescriptor,
-    cmp_kind: CursorComparator,
+    /// Every source is a PkUnique shard ⇒ payload comparison is skipped on PK
+    /// ties (a cross-source PK match is the same Z-set element). The non-PkUnique
+    /// comparator is read live from `schema.payload_cmp` via `with_payload_cmp!`.
+    is_pk_unique: bool,
     // Current row state
     pub valid: bool,
     /// The current row's PK as a u128: the full PK for `pk_stride ≤ 16`, the
@@ -441,46 +431,31 @@ impl ReadCursor {
         sources: &[CursorSource],
         states: &[CursorState],
         schema: &SchemaDescriptor,
-        cmp_kind: CursorComparator,
+        is_pk_unique: bool,
     ) -> LoserTree {
-        // Wrap as non-capturing closures: direct fn-item references fix the
-        // source-ref lifetime, conflicting with `_with`'s HRTB Fn bound.
-        #[allow(clippy::redundant_closure)]
-        match cmp_kind {
-            CursorComparator::PkUnique =>
-                Self::build_tree_with(sources, states, schema,
-                    |_, _, _, _, _| Ordering::Equal),
-            CursorComparator::IntNonnull =>
-                Self::build_tree_with(sources, states, schema,
-                    |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            CursorComparator::UintNonnull =>
-                Self::build_tree_with(sources, states, schema,
-                    |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            CursorComparator::Generic =>
-                Self::build_tree_with(sources, states, schema,
-                    |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        // PkUnique skips the payload tiebreak (a PK tie ⇒ same element); the
+        // non-PkUnique comparator is the live `with_payload_cmp!` selection.
+        // Each arm passes a non-capturing closure so `build_tree_with` inlines
+        // it — a direct fn-item reference would fix the source-ref lifetime and
+        // conflict with the `_with` HRTB Fn bound.
+        if is_pk_unique {
+            #[allow(clippy::redundant_closure)]
+            Self::build_tree_with(sources, states, schema, |_, _, _, _, _| Ordering::Equal)
+        } else {
+            with_payload_cmp!(schema, Self::build_tree_with, sources, states, schema)
         }
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let all_pk_unique = !sources.is_empty() && sources.iter().all(|s| match s {
+        let is_pk_unique = !sources.is_empty() && sources.iter().all(|s| match s {
             CursorSource::Shard(shard) => shard.is_pk_unique,
             CursorSource::Batch(_)     => false,
         });
-        let cmp_kind = if all_pk_unique {
-            CursorComparator::PkUnique
-        } else {
-            match schema.payload_cmp {
-                PayloadCmpKind::IntNonnull  => CursorComparator::IntNonnull,
-                PayloadCmpKind::UintNonnull => CursorComparator::UintNonnull,
-                PayloadCmpKind::Generic     => CursorComparator::Generic,
-            }
-        };
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
-            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, cmp_kind)),
+            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, is_pk_unique)),
         };
         let mut cursor = ReadCursor {
             sources,
@@ -488,7 +463,7 @@ impl ReadCursor {
             unified_sources: OnceCell::new(),
             mode,
             schema,
-            cmp_kind,
+            is_pk_unique,
             valid: false,
             current_key: 0,
             current_weight: 0,
@@ -508,7 +483,7 @@ impl ReadCursor {
     fn rebuild_and_drive(&mut self) {
         if let SourceMode::Multi(_) = &self.mode {
             self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.cmp_kind),
+                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_pk_unique),
             );
         }
         self.drive();
@@ -626,16 +601,10 @@ impl ReadCursor {
 
     pub fn advance(&mut self) {
         if !self.valid { return; }
-        #[allow(clippy::redundant_closure)]
-        match self.cmp_kind {
-            CursorComparator::PkUnique =>
-                self.advance_pk_unique(),
-            CursorComparator::IntNonnull =>
-                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            CursorComparator::UintNonnull =>
-                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            CursorComparator::Generic =>
-                self.advance_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        if self.is_pk_unique {
+            self.advance_pk_unique();
+        } else {
+            with_payload_cmp!(self.schema, Self::advance_with, self);
         }
     }
 
@@ -663,16 +632,10 @@ impl ReadCursor {
 
     #[inline]
     fn drive(&mut self) {
-        #[allow(clippy::redundant_closure)]
-        match self.cmp_kind {
-            CursorComparator::PkUnique =>
-                self.drive_pk_unique(),
-            CursorComparator::IntNonnull =>
-                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            CursorComparator::UintNonnull =>
-                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            CursorComparator::Generic =>
-                self.drive_with(|s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        if self.is_pk_unique {
+            self.drive_pk_unique();
+        } else {
+            with_payload_cmp!(self.schema, Self::drive_with, self);
         }
     }
 
@@ -1095,19 +1058,10 @@ impl ReadCursor {
         limit: usize,
         out: &mut Vec<(u32, u32, i64)>,
     ) {
-        #[allow(clippy::redundant_closure)]
-        match self.cmp_kind {
-            CursorComparator::PkUnique =>
-                self.drain_sorted_into_pk_unique(limit, out),
-            CursorComparator::IntNonnull =>
-                self.drain_sorted_into_with(limit, out,
-                    |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            CursorComparator::UintNonnull =>
-                self.drain_sorted_into_with(limit, out,
-                    |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            CursorComparator::Generic =>
-                self.drain_sorted_into_with(limit, out,
-                    |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
+        if self.is_pk_unique {
+            self.drain_sorted_into_pk_unique(limit, out);
+        } else {
+            with_payload_cmp!(self.schema, Self::drain_sorted_into_with, self, limit, out);
         }
     }
 

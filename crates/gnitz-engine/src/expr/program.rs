@@ -291,8 +291,7 @@ impl ExprProgram {
                     let logical_idx = instr[2] as usize;
                     let tc = schema.columns[logical_idx].type_code;
                     if schema.is_pk_col(logical_idx) {
-                        let signed = matches!(tc,
-                            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64);
+                        let signed = crate::schema::is_signed_int(tc);
                         instr[0] = if signed { EXPR_LOAD_PK_SIGNED_INT } else { EXPR_LOAD_PK_UNSIGNED_INT };
                         let offset = schema.pk_byte_offset(logical_idx) as u64;
                         let size = schema.columns[logical_idx].size() as u64;

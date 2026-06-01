@@ -183,81 +183,83 @@ pub(crate) fn opk_key(
 }
 
 // ---------------------------------------------------------------------------
-// Fast path: signed-integer, non-nullable schemas
+// Fast path: fixed-width integer, non-nullable schemas (any signedness)
 // ---------------------------------------------------------------------------
 
-/// Returns true iff every payload column is non-nullable and a signed
-/// fixed-width integer (I8/I16/I32/I64). Unsigned types are excluded:
-/// `compare_rows_int_nonnull` reads via `read_signed` and would misorder
-/// values ≥ the sign bit.
+/// True iff every payload column is non-nullable and a fixed-width integer of
+/// ≤ 8 bytes (I8..I64 or U8..U64, any signedness). U128/UUID excluded. This is
+/// the exact predicate `SchemaDescriptor::new` evaluates once into
+/// `payload_cmp`, so we read that cached field rather than re-walk the columns.
 #[inline]
-pub(crate) fn schema_is_int_nonnull(schema: &SchemaDescriptor) -> bool {
-    use crate::schema::type_code::{I8, I16, I32, I64};
-    schema.payload_columns().all(|(_, _, col)| {
-        col.nullable == 0 && matches!(col.type_code, I8 | I16 | I32 | I64)
-    })
+pub(crate) fn schema_is_fixedint_nonnull(schema: &SchemaDescriptor) -> bool {
+    schema.payload_cmp == crate::schema::PayloadCmpKind::FixedIntNonnull
 }
 
-/// Fast path for `compare_rows`: skips null-bitmap reads and the per-column
-/// type-code dispatch. Caller MUST guarantee `schema_is_int_nonnull(schema)`
-/// — otherwise the lack of null/float/string/U128 arms produces silent
-/// miscompares.
+/// Fast path for non-nullable fixed-width integer payloads of any signedness.
+/// Maps each column to an order-preserving u64: zero-extend, then flip the sign
+/// bit for signed columns. Produces the same order as `compare_rows` while
+/// skipping null-bitmap reads and the per-column type-code dispatch. Caller MUST
+/// guarantee `schema_is_fixedint_nonnull(schema)`.
 #[inline]
-pub(crate) fn compare_rows_int_nonnull<A: ColumnarSource, B: ColumnarSource>(
+pub(crate) fn compare_rows_fixedint_nonnull<A: ColumnarSource, B: ColumnarSource>(
     schema: &SchemaDescriptor,
     src_a: &A, row_a: usize,
     src_b: &B, row_b: usize,
 ) -> Ordering {
+    use crate::schema::read_unsigned;
     debug_assert!(
-        schema_is_int_nonnull(schema),
-        "compare_rows_int_nonnull called on schema with non-signed-integer or nullable columns",
-    );
-    for (payload_col, _ci, col) in schema.payload_columns() {
-        let col_size = col.size() as usize;
-        let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
-        let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
-        let ord = read_signed(raw_a, col_size).cmp(&read_signed(raw_b, col_size));
-        if ord != Ordering::Equal { return ord; }
-    }
-    Ordering::Equal
-}
-
-// ---------------------------------------------------------------------------
-// Fast path: unsigned-integer, non-nullable schemas
-// ---------------------------------------------------------------------------
-
-/// Returns true iff every payload column is non-nullable and an unsigned
-/// fixed-width integer (U8/U16/U32/U64). Restricted to ≤ 8 bytes because
-/// `read_unsigned` returns a `u64` and cannot handle U128/UUID without truncation.
-#[inline]
-pub(crate) fn schema_is_uint_nonnull(schema: &SchemaDescriptor) -> bool {
-    use crate::schema::type_code::{U8, U16, U32, U64};
-    schema.payload_columns().all(|(_, _, col)| {
-        col.nullable == 0 && matches!(col.type_code, U8 | U16 | U32 | U64)
-    })
-}
-
-/// Fast path for unsigned integer payloads: zero-extends each column to u64
-/// and compares as unsigned. Caller MUST guarantee `schema_is_uint_nonnull`.
-#[inline]
-pub(crate) fn compare_rows_uint_nonnull<A: ColumnarSource, B: ColumnarSource>(
-    schema: &SchemaDescriptor,
-    src_a: &A, row_a: usize,
-    src_b: &B, row_b: usize,
-) -> Ordering {
-    debug_assert!(
-        schema_is_uint_nonnull(schema),
-        "compare_rows_uint_nonnull called on schema without non-nullable unsigned int payload",
+        schema_is_fixedint_nonnull(schema),
+        "compare_rows_fixedint_nonnull on a non-fixedint or nullable schema",
     );
     for (payload_col, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        let av = crate::schema::read_unsigned(src_a.get_col_ptr(row_a, payload_col, cs), cs);
-        let bv = crate::schema::read_unsigned(src_b.get_col_ptr(row_b, payload_col, cs), cs);
+        // `schema_is_fixedint_nonnull` already bounds cs to {1,2,4,8}; this
+        // guards a future maintainer who widens the predicate (e.g. U128) without
+        // revisiting the shift, which would otherwise be `1 << 127`.
+        debug_assert!(cs <= 8, "compare_rows_fixedint_nonnull: column wider than 8 bytes");
+        // Branchless sign-flip: signed columns flip their MSB so two's-complement
+        // negatives sort below non-negatives; `is_signed` is 0 for unsigned
+        // columns, so the XOR is a no-op there. `cs*8-1 ∈ {7,15,31,63}` is always
+        // a valid u64 shift. Reads `size`/`is_signed` only — never `type_code`.
+        let sign_flip = (col.is_signed() as u64) << (cs * 8 - 1);
+        let av = read_unsigned(src_a.get_col_ptr(row_a, payload_col, cs), cs) ^ sign_flip;
+        let bv = read_unsigned(src_b.get_col_ptr(row_b, payload_col, cs), cs) ^ sign_flip;
         let ord = av.cmp(&bv);
         if ord != Ordering::Equal { return ord; }
     }
     Ordering::Equal
 }
+
+/// Select the payload row comparator from `$schema.payload_cmp` and hand it to
+/// a generic helper. `with_payload_cmp!(schema, func, args...)` expands to
+/// `func(args..., cmp)`, appending the selected comparator as the trailing
+/// argument. The comparator stays an inlined closure — a stored `fn` pointer
+/// would turn each comparison into an indirect call — so codegen matches an
+/// open-coded match.
+///
+/// The closure is passed *directly* into the call, so closure signature
+/// deduction makes it higher-ranked over each source's borrow
+/// (`for<'a> Fn(&'a Src, ..)`) — what every `_with`/`_inner` helper's `Fn` bound
+/// requires. `func` is any path: a free fn, `Self::assoc`, or (via UFCS)
+/// `Self::method` with the receiver passed as the first argument. Helpers that
+/// need to *adapt* the comparator (e.g. wrap it over fixed operands) must do so
+/// inside the called helper, where the comparator is a concrete generic
+/// parameter rather than a lifetime-pinned `let` binding.
+macro_rules! with_payload_cmp {
+    ($schema:expr, $f:path $(, $arg:expr)* $(,)?) => {
+        match $schema.payload_cmp {
+            $crate::schema::PayloadCmpKind::FixedIntNonnull => $f(
+                $($arg,)*
+                |s, a, ai, b, bi| $crate::storage::compare_rows_fixedint_nonnull(s, a, ai, b, bi),
+            ),
+            $crate::schema::PayloadCmpKind::Generic => $f(
+                $($arg,)*
+                |s, a, ai, b, bi| $crate::storage::compare_rows(s, a, ai, b, bi),
+            ),
+        }
+    };
+}
+pub(crate) use with_payload_cmp;
 
 // ---------------------------------------------------------------------------
 // Sort helpers
@@ -614,7 +616,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fast path: schema_is_int_nonnull / compare_rows_int_nonnull
+    // Fast path: schema_is_fixedint_nonnull / compare_rows_fixedint_nonnull
     // -----------------------------------------------------------------------
 
     fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
@@ -628,131 +630,182 @@ mod tests {
         SchemaDescriptor::new(&columns[..n], &[0])
     }
 
-    /// Verify the fast path agrees with the generic `compare_rows` for I8/I16/I32/I64.
+    /// Encode `vals` (each value's low `cs` bytes, two's-complement for signed,
+    /// zero-extended for unsigned) into a single-payload-column batch and assert
+    /// the fast path matches the generic comparator for every ordered pair.
+    fn check_single_col_fixedint(tc: u8, vals: &[i128]) {
+        let schema = make_schema(&[(tc, 0)]);
+        let cs = SchemaColumn::new(tc, 0).size() as usize;
+        let mut col = Vec::new();
+        for &v in vals {
+            col.extend_from_slice(&v.to_le_bytes()[..cs]);
+        }
+        let batch = single_col_batch(&vec![0u64; vals.len()], col);
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                assert_eq!(
+                    compare_rows_fixedint_nonnull(&schema, &batch, i, &batch, j),
+                    compare_rows(&schema, &batch, i, &batch, j),
+                    "tc={tc} mismatch at ({i}, {j})",
+                );
+            }
+        }
+    }
+
+    /// Verify the fast path agrees with the generic `compare_rows` for signed,
+    /// unsigned, and mixed-sign non-nullable fixed-int schemas across widths.
     #[test]
-    fn test_compare_rows_int_nonnull_matches_generic() {
-        // I64
-        {
-            let schema = make_schema(&[(type_code::I64, 0)]);
-            let mut col = Vec::new();
-            col.extend_from_slice(&(-42i64).to_le_bytes());
-            col.extend_from_slice(&0i64.to_le_bytes());
-            col.extend_from_slice(&42i64.to_le_bytes());
-            let batch = single_col_batch(&[0, 0, 0], col);
-            for i in 0..3 {
-                for j in 0..3 {
-                    assert_eq!(
-                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
-                        compare_rows(&schema, &batch, i, &batch, j),
-                        "I64 mismatch at ({i}, {j})",
-                    );
-                }
-            }
-        }
-        // I32
-        {
-            let schema = make_schema(&[(type_code::I32, 0)]);
-            let vals: [i32; 4] = [i32::MIN, -1, 0, i32::MAX];
-            let mut col = Vec::new();
-            for v in vals { col.extend_from_slice(&v.to_le_bytes()); }
-            let batch = single_col_batch(&[0; 4], col);
-            for i in 0..4 {
-                for j in 0..4 {
-                    assert_eq!(
-                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
-                        compare_rows(&schema, &batch, i, &batch, j),
-                    );
-                }
-            }
-        }
-        // I16
-        {
-            let schema = make_schema(&[(type_code::I16, 0)]);
-            let vals: [i16; 4] = [i16::MIN, -1, 0, i16::MAX];
-            let mut col = Vec::new();
-            for v in vals { col.extend_from_slice(&v.to_le_bytes()); }
-            let batch = single_col_batch(&[0; 4], col);
-            for i in 0..4 {
-                for j in 0..4 {
-                    assert_eq!(
-                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
-                        compare_rows(&schema, &batch, i, &batch, j),
-                    );
-                }
-            }
-        }
-        // I8
-        {
-            let schema = make_schema(&[(type_code::I8, 0)]);
-            let vals: [i8; 4] = [i8::MIN, -1, 0, i8::MAX];
-            let mut col = Vec::new();
-            for v in vals { col.push(v as u8); }
-            let batch = single_col_batch(&[0; 4], col);
-            for i in 0..4 {
-                for j in 0..4 {
-                    assert_eq!(
-                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
-                        compare_rows(&schema, &batch, i, &batch, j),
-                    );
-                }
-            }
-        }
-        // Multi-column (I32, I64): primary diff in col 0, tie-break in col 1.
-        {
-            let schema = make_schema(&[(type_code::I32, 0), (type_code::I64, 0)]);
-            // Two payload cols means `single_col_batch` is wrong shape.
-            // Build inline: 3 rows × (i32, i64).
-            let rows: &[(i32, i64)] = &[(1, 100), (1, 200), (2, 50)];
-            let mut col0 = Vec::new();
-            let mut col1 = Vec::new();
-            for &(a, b) in rows {
-                col0.extend_from_slice(&a.to_le_bytes());
-                col1.extend_from_slice(&b.to_le_bytes());
-            }
+    fn test_compare_rows_fixedint_nonnull_matches_generic() {
+        // Signed: MIN / -1 / 0 / 1 / MAX exercise the sign-flip across the MSB.
+        check_single_col_fixedint(type_code::I8,  &[i8::MIN as i128, -1, 0, 1, i8::MAX as i128]);
+        check_single_col_fixedint(type_code::I16, &[i16::MIN as i128, -1, 0, 1, i16::MAX as i128]);
+        check_single_col_fixedint(type_code::I32, &[i32::MIN as i128, -1, 0, 1, i32::MAX as i128]);
+        check_single_col_fixedint(type_code::I64, &[i64::MIN as i128, -1, 0, 1, i64::MAX as i128]);
+        // Unsigned: include high-bit-set values that signed reads would invert.
+        check_single_col_fixedint(type_code::U8,  &[0, 1, 0x7F, 0x80, 0xFF]);
+        check_single_col_fixedint(type_code::U16, &[0, 1, 0x7FFF, 0x8000, 0xFFFF]);
+        check_single_col_fixedint(type_code::U32, &[0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF]);
+        check_single_col_fixedint(type_code::U64, &[0, 1, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, u64::MAX as i128]);
+
+        // Multi-column schemas. (I32, I64) is all-signed (primary diff col 0,
+        // tie-break col 1); (I32, U32) and (U64, I64) mix signedness — the case
+        // the old whole-schema split missed (it fell back to the generic path).
+        for (c0, c1) in [
+            (type_code::I32, type_code::I64),
+            (type_code::I32, type_code::U32),
+            (type_code::U64, type_code::I64),
+        ] {
+            let schema = make_schema(&[(c0, 0), (c1, 0)]);
+            let (col0, col1) = mixed_rows(c0, c1);
+            let n = col0.len() / SchemaColumn::new(c0, 0).size() as usize;
             let mut null_bmp = Vec::new();
-            for _ in rows { null_bmp.extend_from_slice(&0u64.to_le_bytes()); }
+            for _ in 0..n { null_bmp.extend_from_slice(&0u64.to_le_bytes()); }
             let batch = TestBatch { null_bmp, col_data: vec![col0, col1], blob: vec![] };
-            for i in 0..rows.len() {
-                for j in 0..rows.len() {
+            for i in 0..n {
+                for j in 0..n {
                     assert_eq!(
-                        compare_rows_int_nonnull(&schema, &batch, i, &batch, j),
+                        compare_rows_fixedint_nonnull(&schema, &batch, i, &batch, j),
                         compare_rows(&schema, &batch, i, &batch, j),
-                        "multi-col mismatch at ({i}, {j})",
+                        "mixed ({c0},{c1}) mismatch at ({i}, {j})",
                     );
                 }
             }
         }
     }
 
-    /// Verify `schema_is_int_nonnull` rejects unsigned ints, U128, floats,
-    /// strings, blobs, and any nullable column.
+    /// Build two payload columns of types `(a, b)` with rows spanning negative,
+    /// zero, small-positive, and high-bit-set values so signedness matters.
+    fn mixed_rows(a: u8, b: u8) -> (Vec<u8>, Vec<u8>) {
+        let cs_a = SchemaColumn::new(a, 0).size() as usize;
+        let cs_b = SchemaColumn::new(b, 0).size() as usize;
+        // (col0, col1) value pairs as i128 images; -1 stresses signed ordering,
+        // the large positive stresses unsigned high-bit ordering.
+        let pairs: &[(i128, i128)] = &[(-1, 5), (-1, 7), (0, 0), (1, -1), (1, 9)];
+        let mut col0 = Vec::new();
+        let mut col1 = Vec::new();
+        for &(v0, v1) in pairs {
+            col0.extend_from_slice(&v0.to_le_bytes()[..cs_a]);
+            col1.extend_from_slice(&v1.to_le_bytes()[..cs_b]);
+        }
+        (col0, col1)
+    }
+
+    /// `schema_is_fixedint_nonnull`: all-signed, all-unsigned, and mixed-sign
+    /// non-null schemas all pass; nullable and U128/UUID/F32/F64/STRING/BLOB fail.
     #[test]
-    fn test_schema_is_int_nonnull_excludes_unsigned() {
-        // All-signed-int, non-nullable → true
-        assert!(schema_is_int_nonnull(&make_schema(&[
+    fn test_schema_is_fixedint_nonnull_bounds() {
+        // All-signed, non-nullable → true
+        assert!(schema_is_fixedint_nonnull(&make_schema(&[
             (type_code::I8, 0), (type_code::I16, 0),
             (type_code::I32, 0), (type_code::I64, 0),
         ])));
+        // All-unsigned, non-nullable → true
+        assert!(schema_is_fixedint_nonnull(&make_schema(&[
+            (type_code::U8, 0), (type_code::U16, 0),
+            (type_code::U32, 0), (type_code::U64, 0),
+        ])));
+        // Mixed signed/unsigned, non-nullable → true (the old split missed this)
+        assert!(schema_is_fixedint_nonnull(&make_schema(&[
+            (type_code::I64, 0), (type_code::U32, 0),
+        ])));
+        // Empty payload (all-PK) → vacuously true
+        assert!(schema_is_fixedint_nonnull(&pk_only_schema(&[type_code::U64])));
 
-        // Nullable signed int → false
-        assert!(!schema_is_int_nonnull(&make_schema(&[(type_code::I32, 1)])));
+        // Nullable fixed int → false
+        assert!(!schema_is_fixedint_nonnull(&make_schema(&[(type_code::I32, 1)])));
+        assert!(!schema_is_fixedint_nonnull(&make_schema(&[(type_code::U32, 1)])));
 
-        // Each disqualifying type → false
+        // Each non-fixed-int type → false (U128/UUID exceed 8 bytes; floats/strings/blobs)
         for tc in [
-            type_code::U8, type_code::U16, type_code::U32, type_code::U64,
-            type_code::U128, type_code::F32, type_code::F64,
+            type_code::U128, type_code::UUID, type_code::F32, type_code::F64,
             type_code::STRING, type_code::BLOB,
         ] {
             assert!(
-                !schema_is_int_nonnull(&make_schema(&[(tc, 0)])),
+                !schema_is_fixedint_nonnull(&make_schema(&[(tc, 0)])),
                 "expected schema with type_code={tc} to be rejected",
             );
         }
 
-        // Mixed: signed int + unsigned → false (any disqualifier kills it)
-        assert!(!schema_is_int_nonnull(&make_schema(&[
-            (type_code::I64, 0), (type_code::U32, 0),
+        // A single disqualifier among valid columns kills it.
+        assert!(!schema_is_fixedint_nonnull(&make_schema(&[
+            (type_code::I64, 0), (type_code::U128, 0),
         ])));
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_rows_fixedint_nonnull ≡ compare_rows property test
+    // -----------------------------------------------------------------------
+
+    mod fixedint_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_fixedint_type() -> impl Strategy<Value = u8> {
+            prop_oneof![
+                Just(type_code::I8),  Just(type_code::U8),
+                Just(type_code::I16), Just(type_code::U16),
+                Just(type_code::I32), Just(type_code::U32),
+                Just(type_code::I64), Just(type_code::U64),
+            ]
+        }
+
+        /// `(payload type codes, n rows, per-column row-major bytes)`. 1..=4
+        /// columns over all eight fixed-int types spans every sign combination
+        /// including mixed; random bytes frequently set the high bit, so a
+        /// signedness bug surfaces as a fast-vs-generic disagreement.
+        fn arb_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<Vec<u8>>)> {
+            (prop::collection::vec(arb_fixedint_type(), 1..=4), 2usize..=6usize)
+                .prop_flat_map(|(types, n)| {
+                    let cols: Vec<_> = types.iter().map(|&t| {
+                        let cs = SchemaColumn::new(t, 0).size() as usize;
+                        prop::collection::vec(any::<u8>(), n * cs)
+                    }).collect();
+                    (Just(types), Just(n), cols)
+                })
+        }
+
+        proptest! {
+            /// The load-bearing guarantee: the fixed-int fast path produces the
+            /// same order as the generic comparator for every random row pair,
+            /// across all widths {1,2,4,8} and every signed/unsigned mix.
+            #[test]
+            fn fixedint_matches_generic((types, n, col_data) in arb_case()) {
+                let payload: Vec<(u8, u8)> = types.iter().map(|&t| (t, 0)).collect();
+                let schema = make_schema(&payload);
+                prop_assert!(schema_is_fixedint_nonnull(&schema));
+
+                let batch = TestBatch { null_bmp: vec![0u8; n * 8], col_data, blob: vec![] };
+                for i in 0..n {
+                    for j in 0..n {
+                        prop_assert_eq!(
+                            compare_rows_fixedint_nonnull(&schema, &batch, i, &batch, j),
+                            compare_rows(&schema, &batch, i, &batch, j),
+                            "mismatch at ({}, {})", i, j,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

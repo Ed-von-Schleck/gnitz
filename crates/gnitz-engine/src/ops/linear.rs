@@ -4,8 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-use crate::schema::PayloadCmpKind;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_rows, compare_rows_int_nonnull, compare_rows_uint_nonnull};
+use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
 
@@ -196,15 +195,7 @@ fn op_union_merge(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> Batch {
-    #[allow(clippy::redundant_closure)]
-    match schema.payload_cmp {
-        PayloadCmpKind::IntNonnull  => op_union_merge_inner(batch_a, batch_b, schema,
-            |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::UintNonnull => op_union_merge_inner(batch_a, batch_b, schema,
-            |s, a, ai, b, bi| compare_rows_uint_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::Generic     => op_union_merge_inner(batch_a, batch_b, schema,
-            |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi)),
-    }
+    with_payload_cmp!(schema, op_union_merge_inner, batch_a, batch_b, schema)
 }
 
 #[inline]

@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::util::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
+pub(crate) use gnitz_wire::{is_fixed_int, is_routable_int, is_signed_int};
 pub(crate) use gnitz_wire::TypeCode;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub use gnitz_wire::MAX_COLUMNS;
@@ -22,12 +23,13 @@ pub struct SchemaColumn {
     pub type_code: u8,
     size: u8,
     pub nullable: u8,
-    _pad: u8,
+    is_signed: u8,
 }
 
 impl SchemaColumn {
     pub const fn new(type_code: u8, nullable: u8) -> Self {
-        SchemaColumn { type_code, size: type_size(type_code), nullable, _pad: 0 }
+        let is_signed = is_signed_int(type_code) as u8;
+        SchemaColumn { type_code, size: type_size(type_code), nullable, is_signed }
     }
 
     /// On-disk byte width of one cell of this column. Derived from `type_code`
@@ -35,6 +37,15 @@ impl SchemaColumn {
     #[inline]
     pub const fn size(&self) -> u8 {
         self.size
+    }
+
+    /// True iff this column is a signed integer (I8/I16/I32/I64). Derived from
+    /// `type_code` in `new()` (like `size`); read by the fixed-int fast-path
+    /// comparator to pick the order-preserving sign-flip mask without a
+    /// per-column type-code branch.
+    #[inline]
+    pub(crate) const fn is_signed(&self) -> bool {
+        self.is_signed != 0
     }
 }
 
@@ -99,47 +110,29 @@ pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 /// Pre-computed payload row-comparator strategy for a schema. Stored on
 /// `SchemaDescriptor` and computed once in `new()` so every merge/sort/join
 /// dispatch reads a single field instead of iterating over columns.
-///
-/// - `IntNonnull`  — all payload columns are non-nullable signed ints (I8/I16/I32/I64).
-/// - `UintNonnull` — all payload columns are non-nullable unsigned ints (U8/U16/U32/U64).
-/// - `Generic`     — anything else (nullables, floats, strings, mixed types, etc.).
-///
-/// Vacuously true for zero-payload schemas (all-PK tables): `IntNonnull` is returned,
-/// matching the empty-iterator result of `schema_is_int_nonnull`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PayloadCmpKind {
-    IntNonnull,
-    UintNonnull,
+    /// All payload columns are non-nullable fixed-width ints ≤ 8 bytes (any sign).
+    /// Vacuously true for zero-payload (all-PK) schemas.
+    FixedIntNonnull,
+    /// Any schema with a disqualifying payload column: nullable, float, string,
+    /// blob, or U128/UUID. (Mixed signed/unsigned fixed ints stay in the fast
+    /// path — only a non-fixed-int column falls back here.)
     Generic,
 }
 
 const fn compute_payload_cmp(cols: &[SchemaColumn], payload_mapping: &[u8; MAX_COLUMNS]) -> PayloadCmpKind {
-    let mut all_int  = true;
-    let mut all_uint = true;
     let mut ci = 0;
     while ci < cols.len() {
-        if payload_mapping[ci] == PAYLOAD_MAPPING_PK_SENTINEL {
-            ci += 1;
-            continue;
-        }
-        let tc       = cols[ci].type_code;
-        let nullable = cols[ci].nullable;
-        if nullable != 0 {
-            all_int  = false;
-            all_uint = false;
-        } else {
-            if !matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64) {
-                all_int = false;
-            }
-            if !matches!(tc, type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64) {
-                all_uint = false;
+        if payload_mapping[ci] != PAYLOAD_MAPPING_PK_SENTINEL {
+            let col = cols[ci];
+            if !(col.nullable == 0 && is_fixed_int(col.type_code)) {
+                return PayloadCmpKind::Generic;
             }
         }
         ci += 1;
     }
-    if all_int       { PayloadCmpKind::IntNonnull  }
-    else if all_uint { PayloadCmpKind::UintNonnull }
-    else             { PayloadCmpKind::Generic     }
+    PayloadCmpKind::FixedIntNonnull
 }
 
 #[derive(Clone, Copy)]
@@ -169,8 +162,8 @@ pub struct SchemaDescriptor {
     /// with one byte load per element, no per-row predicate.
     payload_to_ci: [u8; MAX_COLUMNS],
     /// Pre-computed payload comparator strategy. Derived from column types in
-    /// `new()`; read by every merge/sort/join dispatch in place of calling
-    /// `schema_is_int_nonnull` / `schema_is_uint_nonnull` at each site.
+    /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`)
+    /// in place of calling `schema_is_fixedint_nonnull` at each site.
     pub payload_cmp: PayloadCmpKind,
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
@@ -356,7 +349,7 @@ impl SchemaDescriptor {
             return false;
         }
         let tc = self.columns[self.pk_indices[0] as usize].type_code;
-        matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
+        is_signed_int(tc)
     }
 
     /// The single PK column index. Use only at boundaries that have not yet
@@ -460,7 +453,8 @@ impl PartialEq for SchemaDescriptor {
         if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
             return false;
         }
-        // Compare only the active columns; _pad is always 0 (SchemaColumn::new enforces it).
+        // Compare all four bytes of each active column; `size` and `is_signed` are
+        // derived from `type_code` in `new()`, so they never disagree when type_code matches.
         self.columns[..self.num_columns()] == other.columns[..other.num_columns()]
     }
 }
@@ -912,6 +906,28 @@ mod tests {
         let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
         assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
         assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
+    }
+
+    #[test]
+    fn test_schema_column_layout_and_is_signed() {
+        // Repurposing the old `_pad` byte as `is_signed` must not grow the struct:
+        // SchemaDescriptor is Copy and embedded by value in 20+ structs.
+        assert_eq!(std::mem::size_of::<SchemaColumn>(), 4);
+
+        // `is_signed` is derived from `type_code` in `new()`: true for I8..I64,
+        // false for every unsigned / float / string / blob type.
+        for tc in [type_code::I8, type_code::I16, type_code::I32, type_code::I64] {
+            assert!(SchemaColumn::new(tc, 0).is_signed(), "type_code {tc} must be signed");
+            // Nullability does not change signedness.
+            assert!(SchemaColumn::new(tc, 1).is_signed(), "nullable type_code {tc} must be signed");
+        }
+        for tc in [
+            type_code::U8, type_code::U16, type_code::U32, type_code::U64,
+            type_code::U128, type_code::UUID, type_code::F32, type_code::F64,
+            type_code::STRING, type_code::BLOB,
+        ] {
+            assert!(!SchemaColumn::new(tc, 0).is_signed(), "type_code {tc} must not be signed");
+        }
     }
 
     #[test]

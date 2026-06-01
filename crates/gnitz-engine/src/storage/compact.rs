@@ -2,13 +2,18 @@
 
 use std::ffi::CStr;
 
+// `columnar` is reached only by the module-path comparators in the test module
+// now that dispatch goes through `with_payload_cmp!` (which spells the absolute
+// `$crate::storage::*` paths).
+#[cfg(test)]
 use super::columnar;
+use super::with_payload_cmp;
 use super::error::StorageError;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::batch::Batch;
 use super::merge::BlobCacheGuard;
 use super::shard_file::PkUniqueChecker;
-use crate::schema::{PayloadCmpKind, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use super::shard_reader::MappedShard;
 #[cfg(test)]
 use crate::util::{read_i64_le, read_u32_le};
@@ -136,29 +141,12 @@ fn open_and_merge(
     // tiebreak on an OPK-prefix collision; `schema.payload_cmp` selects the
     // payload-comparator fast path (pre-computed in SchemaDescriptor::new).
     //
-    // Wrap as a non-capturing closure: a direct fn-item reference would fix
-    // the source-ref lifetime, conflicting with `_inner`'s HRTB Fn bound.
     // Select the wide vs narrow merge path once, then dispatch the payload
-    // comparator from the pre-computed schema field.
-    #[allow(clippy::redundant_closure)]
+    // comparator from the pre-computed schema field via `with_payload_cmp!`.
     if schema.pk_is_wide() {
-        match schema.payload_cmp {
-            PayloadCmpKind::IntNonnull  => open_and_merge_wide_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            PayloadCmpKind::UintNonnull => open_and_merge_wide_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            PayloadCmpKind::Generic     => open_and_merge_wide_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
-        }
+        with_payload_cmp!(schema, open_and_merge_wide_with, &shards, cursors, schema, emit)
     } else {
-        match schema.payload_cmp {
-            PayloadCmpKind::IntNonnull  => open_and_merge_narrow_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-            PayloadCmpKind::UintNonnull => open_and_merge_narrow_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-            PayloadCmpKind::Generic     => open_and_merge_narrow_with(&shards, cursors, schema, emit,
-                |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
-        }
+        with_payload_cmp!(schema, open_and_merge_narrow_with, &shards, cursors, schema, emit)
     }
     Ok(())
 }

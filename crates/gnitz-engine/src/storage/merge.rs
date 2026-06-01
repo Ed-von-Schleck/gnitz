@@ -9,9 +9,14 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{self, ColumnarSource, SortEntry};
+use super::columnar::{ColumnarSource, SortEntry};
+// `columnar` as a module path is needed only by the test module's
+// `compare_pk_bytes`/`compare_rows` calls; dispatch uses `with_payload_cmp!`.
+#[cfg(test)]
+use super::columnar;
+use super::with_payload_cmp;
 use super::batch::FIXED_REGION_BYTES;
-use crate::schema::{BlobCache, PayloadCmpKind, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::util::read_u64_le;
 use gnitz_wire::is_german_string;
@@ -432,15 +437,7 @@ pub fn merge_batches(
     // The heap key (`peek_key` → `pk_sort_key` → `pack_pk_be`) is
     // order-preserving for both widths, so a single closure set serves both —
     // the only remaining split is the fast/generic payload comparator.
-    #[allow(clippy::redundant_closure)]
-    match schema.payload_cmp {
-        PayloadCmpKind::IntNonnull  => merge_run(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::UintNonnull => merge_run(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::Generic     => merge_run(&mut cursors, batches, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
-    }
+    with_payload_cmp!(schema, merge_run, &mut cursors, batches, schema, writer)
 }
 
 /// N-way merge closure builder for all PK widths. `node.key` (the
@@ -551,15 +548,7 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    #[allow(clippy::redundant_closure)]
-    match schema.payload_cmp {
-        PayloadCmpKind::IntNonnull  => sort_consolidate_inner(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::UintNonnull => sort_consolidate_inner(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::Generic     => sort_consolidate_inner(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
-    }
+    with_payload_cmp!(schema, sort_consolidate_inner, n, batch, schema, writer)
 }
 
 /// Sort-plus-consolidate for all PK widths. Primary key is the order-preserving
@@ -607,15 +596,7 @@ pub fn fold_sorted(
     // detection in `drain_groups_into` is the `cur_pk == pending_pk` packed
     // prefix reject plus the exact OPK-byte `pk_eq` (redundant-but-correct for
     // narrow, the real separator for wide low-16 collisions).
-    #[allow(clippy::redundant_closure)]
-    match schema.payload_cmp {
-        PayloadCmpKind::IntNonnull  => fold_with(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_int_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::UintNonnull => fold_with(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows_uint_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::Generic     => fold_with(n, batch, schema, writer,
-            |s, a, ai, b, bi| columnar::compare_rows(s, a, ai, b, bi)),
-    }
+    with_payload_cmp!(schema, fold_with, n, batch, schema, writer)
 }
 
 /// `fold_sorted` closure dispatcher: forwards to the single generic drain with

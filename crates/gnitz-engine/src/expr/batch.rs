@@ -519,11 +519,7 @@ pub(in crate::expr) fn eval_batch(
                 let pi = a1 as usize;
                 let (size_u8, col_tc) = prog.payload_col_info[pi];
                 let col_size = size_u8 as usize;
-                let is_signed = matches!(col_tc,
-                    crate::schema::type_code::I8 |
-                    crate::schema::type_code::I16 |
-                    crate::schema::type_code::I32 |
-                    crate::schema::type_code::I64);
+                let is_signed = crate::schema::is_signed_int(col_tc);
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 match col_size {

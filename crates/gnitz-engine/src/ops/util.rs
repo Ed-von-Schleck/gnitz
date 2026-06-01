@@ -465,12 +465,7 @@ fn extract_group_key_row<R: GroupKeyRow>(
         // (sign-flipped for signed), matching the PK side. STRING/BLOB/F32/F64
         // fall through to the hash loop — a zero-extended content prefix is not
         // a valid routing key for them.
-        if col.nullable == 0
-            && matches!(tc,
-                type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
-                    | type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64
-                    | type_code::U128 | type_code::UUID)
-        {
+        if col.nullable == 0 && crate::schema::is_routable_int(tc) {
             let cs = col.size() as usize;
             if let Some(b) = row.payload_bytes(schema, c_idx, cs) {
                 return crate::schema::payload_route_key(b, 0, cs, tc);

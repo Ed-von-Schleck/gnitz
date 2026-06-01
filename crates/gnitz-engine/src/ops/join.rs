@@ -2,11 +2,11 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{PayloadCmpKind, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::is_german_string;
 use crate::storage::{
     write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
-    compare_rows, compare_rows_int_nonnull, compare_rows_uint_nonnull,
+    with_payload_cmp,
 };
 
 use super::util::{merge_null_words, write_string_from_batch};
@@ -587,15 +587,7 @@ fn filter_join_dd_with_payload(
     let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
     let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
 
-    #[allow(clippy::redundant_closure)]
-    match schema.payload_cmp {
-        PayloadCmpKind::IntNonnull  => filter_join_dd_with_payload_inner(ca, cb, schema,
-            |s, a, ai, b, bi| compare_rows_int_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::UintNonnull => filter_join_dd_with_payload_inner(ca, cb, schema,
-            |s, a, ai, b, bi| compare_rows_uint_nonnull(s, a, ai, b, bi)),
-        PayloadCmpKind::Generic     => filter_join_dd_with_payload_inner(ca, cb, schema,
-            |s, a, ai, b, bi| compare_rows(s, a, ai, b, bi)),
-    }
+    with_payload_cmp!(schema, filter_join_dd_with_payload_inner, ca, cb, schema)
 }
 
 #[inline]

@@ -10,6 +10,7 @@
 //! rejected at DDL), so the transform is a fixed-width bijection: unsigned types
 //! map to big-endian, signed types map to big-endian with the sign bit flipped.
 
+#[cfg(test)]
 use crate::type_code;
 
 /// Order-preserving big-endian encoding of one PK column.
@@ -22,7 +23,7 @@ use crate::type_code;
 #[inline]
 pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let signed = matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64);
+    let signed = crate::is_signed_int(tc);
     match dst.len() {
         16 => dst.copy_from_slice(&u128::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
         8 => dst.copy_from_slice(&u64::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
@@ -43,7 +44,7 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 #[inline]
 pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let signed = matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64);
+    let signed = crate::is_signed_int(tc);
     dst.copy_from_slice(src);
     if signed {
         dst[0] ^= 0x80;

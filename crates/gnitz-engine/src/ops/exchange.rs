@@ -205,17 +205,12 @@ fn route_partition_key(
     cols: &[u32],
     schema: &SchemaDescriptor,
 ) -> u128 {
-    use crate::schema::type_code;
     if cols.len() == 1 {
         let c_idx = cols[0] as usize;
         let col = &schema.columns[c_idx];
         let tc = col.type_code;
         if !schema.is_pk_col(c_idx) {
-            if matches!(tc,
-                type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64
-                    | type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64
-                    | type_code::U128 | type_code::UUID)
-            {
+            if crate::schema::is_routable_int(tc) {
                 let cs = col.size() as usize;
                 let pi = schema.payload_idx(c_idx);
                 let ptr = mb.get_col_ptr(row, pi, cs);
