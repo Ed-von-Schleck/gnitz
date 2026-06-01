@@ -13,7 +13,6 @@ Run (both worker counts matter — the bug was deterministic at each):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_shared_source_incremental.py -v --tb=short
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest -m slow tests/test_shared_source_incremental.py -v
 """
-import os
 import random
 
 import pytest
@@ -21,28 +20,13 @@ import pytest
 import gnitz
 import _oracle as oracle
 
-_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-
 # A JOIN whose two operands both trace to the same base relation (transitive
-# self-join `t JOIN vt`, or `vt1 JOIN vt2` over one base) crashes a worker under
-# GNITZ_WORKERS>1: the multiworker two-sided dispatch seeds an operand-shaped
-# delta into the join's wider output register, tripping the VM column-count guard
-# (`assertion left == right failed: VM register N schema/batch column-count
-# mismatch` at gnitz-engine/src/vm.rs:743). The crash is correct at WORKERS=1.
-# It is a pre-existing engine bug in the multiworker JOIN register routing —
-# unrelated to the set-op fix in this change, and out of its scope. `run=False`
-# marks the case xfail WITHOUT executing it, so the worker crash cannot cascade
-# into unrelated tests. Two-sided same-source *set-ops* route correctly at
-# WORKERS>1 and are NOT gated. See
-# plans/transitive-self-join-multiworker-crash.md.
-_MULTIWORKER_JOIN_XFAIL = pytest.mark.xfail(
-    _NUM_WORKERS > 1,
-    reason="two-sided same-source JOIN crashes a worker at GNITZ_WORKERS>1 "
-           "(vm.rs:743 register column-count mismatch); pre-existing engine bug, "
-           "see plans/transitive-self-join-multiworker-crash.md",
-    run=False,
-    strict=False,
-)
+# self-join `t JOIN vt`, or `vt1 JOIN vt2` over one base) must settle correctly
+# at every worker count. The DAG drivers carry each edge batch under the
+# PRODUCER's output schema, so an operand-shaped delta is no longer mislabelled
+# with the join's wider final schema (which previously crashed a worker at
+# GNITZ_WORKERS>1 via the vm.rs seed guard). These classes run and pass at both
+# WORKERS=1 and WORKERS>1.
 
 
 def _uid():
@@ -107,7 +91,6 @@ def _self_join_expected(t_state):
     )
 
 
-@_MULTIWORKER_JOIN_XFAIL
 class TestTransitiveSelfJoin:
     def test_simultaneous_both_side_matches_single_epoch(self, client):
         """The decisive settle-it-immediately check: one multi-row INSERT that
@@ -177,7 +160,7 @@ class TestTransitiveSelfJoin:
 
 
 # Direct self-join rejection is a planner check (no runtime join), so it is
-# correct at every worker count and lives outside the xfailed join classes.
+# correct at every worker count.
 class TestDirectSelfJoinRejected:
     def test_direct_self_join_rejected(self, client):
         """Direct self-join t JOIN t (single dependency edge) is rejected."""
@@ -199,7 +182,6 @@ class TestDirectSelfJoinRejected:
 
 # ── two different views over the same base, joined: vt1 JOIN vt2 ───────────
 
-@_MULTIWORKER_JOIN_XFAIL
 class TestTwoViewsJoin:
     def test_two_views_over_same_base_joined(self, client):
         """vt1 (v>0) JOIN vt2 (v>50) on k, both views over t. Distinct source
@@ -483,7 +465,6 @@ class TestSameSourceUnion:
 
 # ── property test: random ops over the transitive-self-join config ─────────
 
-@_MULTIWORKER_JOIN_XFAIL
 class TestSelfJoinProperty:
     @pytest.mark.slow
     @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])

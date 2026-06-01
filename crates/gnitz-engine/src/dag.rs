@@ -1,7 +1,6 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 
 use std::cell::UnsafeCell;
-use std::collections::{HashMap, HashSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
@@ -1059,45 +1058,19 @@ impl DagEngine {
                 // Terminal view: move batch directly — no clone for unique_pk.
                 self.ingest_to_family(view_id, out_delta);
             } else {
+                // This driver returns early on count == 0, so the producer
+                // always has output here — pass Some.
+                let src_schema = self.tables[&view_id].schema;
                 self.ingest_by_ref(view_id, &out_delta);
-                for dep_id in dep_view_ids {
-                    let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {
-                        Some(e) => (e.depth, e.schema),
-                        None => continue,
-                    };
-
-                    if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
-                        if existing_idx < pending.len() {
-                            let existing = std::mem::replace(
-                                &mut pending[existing_idx].batch,
-                                Batch::empty_with_schema(&dep_schema),
-                            );
-                            let schema = existing.schema.unwrap_or(dep_schema);
-                            let merged = ops::op_union(
-                                existing,
-                                Some(&out_delta),
-                                &schema,
-                            );
-                            pending[existing_idx].batch = merged;
-                        }
-                    } else {
-                        let new_idx = pending.len();
-                        pending.push(PendingEntry {
-                            depth: dep_depth,
-                            view_id: dep_id,
-                            source_id: view_id,
-                            batch: out_delta.clone_batch(),
-                        });
-                        pending_pos.insert((dep_id, view_id), new_idx);
-                        // Re-sort to maintain descending depth order
-                        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
-                        // Rebuild pending_pos
-                        pending_pos.clear();
-                        for (i, pe) in pending.iter().enumerate() {
-                            pending_pos.insert((pe.view_id, pe.source_id), i);
-                        }
-                    }
-                }
+                Self::queue_dependents(
+                    &mut pending,
+                    &mut pending_pos,
+                    &self.tables,
+                    &dep_view_ids,
+                    view_id,
+                    src_schema,
+                    Some(&out_delta),
+                );
                 crate::storage::batch_pool::recycle(out_delta);
             }
             dirty_views.insert(view_id);
@@ -1237,51 +1210,20 @@ impl DagEngine {
                 dirty_views.insert(view_id);
             }
 
-            for dep_id in dep_view_ids {
-                let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {
-                    Some(e) => (e.depth, e.schema),
-                    None => continue,
-                };
-
-                if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
-                    if existing_idx < pending.len() && has_output {
-                        let existing = std::mem::replace(
-                            &mut pending[existing_idx].batch,
-                            Batch::empty_with_schema(&dep_schema),
-                        );
-                        let schema = existing.schema.unwrap_or(dep_schema);
-                        let merged = ops::op_union(
-                            existing,
-                            out_delta.as_ref(),
-                            &schema,
-                        );
-                        pending[existing_idx].batch = merged;
-                    }
-                } else {
-                    let new_idx = pending.len();
-                    if has_output {
-                        pending.push(PendingEntry {
-                            depth: dep_depth,
-                            view_id: dep_id,
-                            source_id: view_id,
-                            batch: out_delta.as_ref().unwrap().clone_batch(),
-                        });
-                    } else {
-                        pending.push(PendingEntry {
-                            depth: dep_depth,
-                            view_id: dep_id,
-                            source_id: view_id,
-                            batch: Batch::with_schema(dep_schema, 0),
-                        });
-                    }
-                    pending_pos.insert((dep_id, view_id), new_idx);
-                    pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
-                    pending_pos.clear();
-                    for (i, pe) in pending.iter().enumerate() {
-                        pending_pos.insert((pe.view_id, pe.source_id), i);
-                    }
-                }
-            }
+            // Multi-worker queues empty placeholders so exchange-dependent
+            // views still fire, so pass the producer's delta only when it has
+            // output (an empty `out_delta` Some(count==0) must NOT be merged).
+            let src_schema = self.tables[&view_id].schema;
+            let delta = if has_output { out_delta.as_ref() } else { None };
+            Self::queue_dependents(
+                &mut pending,
+                &mut pending_pos,
+                &self.tables,
+                &dep_view_ids,
+                view_id,
+                src_schema,
+                delta,
+            );
             if let Some(batch) = out_delta {
                 crate::storage::batch_pool::recycle(batch);
             }
@@ -1296,6 +1238,78 @@ impl DagEngine {
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
+
+    /// Restore the pending queue's descending-depth order and rebuild the
+    /// `(view_id, source_id) → index` lookup. Both DAG drivers call this after
+    /// pushing a new entry.
+    fn resort_pending(
+        pending: &mut [PendingEntry],
+        pending_pos: &mut FxHashMap<(i64, i64), usize>,
+    ) {
+        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
+        pending_pos.clear();
+        for (i, pe) in pending.iter().enumerate() {
+            pending_pos.insert((pe.view_id, pe.source_id), i);
+        }
+    }
+
+    /// Queue `view_id`'s output onto each dependent's pending edge.
+    ///
+    /// `delta` is the producer's output, or `None` when the producer fired with
+    /// no output (multi-worker queues empty placeholders so exchange-dependent
+    /// views still run; the single-source driver returns early on empty and
+    /// always passes `Some`). When present it is merged into an existing pending
+    /// entry, or cloned into a new one; when absent a new entry gets an empty
+    /// placeholder batch and existing entries are left untouched.
+    ///
+    /// Every queued batch is labelled with `src_schema` — the PRODUCER's output
+    /// schema, never the consumer's. A JOIN consumer's combine-widened final
+    /// schema is a different width than the operand batch on this edge; tagging
+    /// the operand with it would trip the vm seed guard. `src_schema` must be
+    /// `self.tables[&view_id].schema`; `tables` is read only for dependents'
+    /// depth, so the immutable borrow does not conflict with the snapshot.
+    fn queue_dependents(
+        pending: &mut Vec<PendingEntry>,
+        pending_pos: &mut FxHashMap<(i64, i64), usize>,
+        tables: &FxHashMap<i64, TableEntry>,
+        dep_view_ids: &[i64],
+        view_id: i64,
+        src_schema: SchemaDescriptor,
+        delta: Option<&Batch>,
+    ) {
+        for &dep_id in dep_view_ids {
+            let dep_depth = match tables.get(&dep_id) {
+                Some(e) => e.depth,
+                None => continue,
+            };
+
+            if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
+                if let (true, Some(d)) = (existing_idx < pending.len(), delta) {
+                    let existing = std::mem::replace(
+                        &mut pending[existing_idx].batch,
+                        Batch::empty_with_schema(&src_schema),
+                    );
+                    let schema = existing.schema.unwrap_or(src_schema);
+                    let merged = ops::op_union(existing, Some(d), &schema);
+                    pending[existing_idx].batch = merged;
+                }
+            } else {
+                let new_idx = pending.len();
+                let batch = match delta {
+                    Some(d) => d.clone_batch(),
+                    None => Batch::with_schema(src_schema, 0),
+                };
+                pending.push(PendingEntry {
+                    depth: dep_depth,
+                    view_id: dep_id,
+                    source_id: view_id,
+                    batch,
+                });
+                pending_pos.insert((dep_id, view_id), new_idx);
+                Self::resort_pending(pending, pending_pos);
+            }
+        }
+    }
 
     /// Build ext cursor handles indexed by register ID.
     /// Returns (cursor_ptrs, storage_owner). Storage must outlive cursor_ptrs.
@@ -1316,11 +1330,17 @@ impl DagEngine {
                 #[allow(clippy::disallowed_methods)] // explicit maintenance: operator-state trace read
                 let cursor_opt = entry.handle.create_cursor_compacting().ok();
                 if let Some(ch) = cursor_opt {
-                    let mut boxed = Box::new(ch);
+                    storage.push(Box::new(ch));
                     if (reg_id as usize) < num_regs {
-                        ptrs[reg_id as usize] = &mut *boxed as *mut CursorHandle as *mut libc::c_void;
+                        // Derive the raw pointer AFTER the move, from the box's
+                        // stable heap address inside `storage`. Deriving it from
+                        // a local Box and then moving the box would invalidate it
+                        // under Stacked/Tree Borrows. The CursorHandle heap
+                        // allocation is stable across later Vec growth, so the
+                        // pointer remains valid.
+                        let p = storage.last_mut().unwrap().as_mut() as *mut CursorHandle;
+                        ptrs[reg_id as usize] = p as *mut libc::c_void;
                     }
-                    storage.push(boxed);
                 }
             }
         }
@@ -1520,7 +1540,19 @@ impl DagEngine {
     {
         let p = self.cache.get(&view_id)?;
         let sb = p.side_b.as_ref()?;
-        let a_schema = p.exchange_in_schema.unwrap_or_else(|| self.tables[&view_id].schema);
+        // A two-sided plan always records side A's pre-exchange output schema;
+        // the view's final (combine-widened) schema is a different width for a
+        // JOIN and would mislabel side A's operand batch.
+        let a_schema = p.exchange_in_schema
+            .expect("two-sided plan must carry side A's exchange_in_schema");
+        // Each set-op side scans exactly one relation (the planner rejects a
+        // JOIN on either side), so both ids are real tables — never
+        // single_source's ambiguous sentinel 0. run_two_sided routes by
+        // `src_id == source_id`; a 0 would silently drop a real-table delta.
+        debug_assert!(
+            p.side_a_source_id != 0 && sb.source_id != 0,
+            "two-sided set-op side resolved to ambiguous source 0"
+        );
         Some((
             (a_schema, p.side_a_source_id, p.post_in_reg),
             (sb.exchange_schema, sb.source_id, sb.post_seed_reg),
@@ -1594,7 +1626,8 @@ impl DagEngine {
         // pk → batch row index of the last +1 insertion in this batch.
         // Must be a batch index (not effective index) because
         // `append_batch_negated` below indexes into `batch`.
-        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
+        let mut seen: FxHashMap<PkBuf, usize> =
+            FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
@@ -1654,12 +1687,14 @@ impl DagEngine {
         // `append_batch_negated` below indexes into `batch`, and the
         // effective batch may contain extra store-retraction rows that
         // break any 1:1 correspondence with `row`.
-        let mut seen: HashMap<PkBuf, usize> = HashMap::with_capacity(batch.count);
+        let mut seen: FxHashMap<PkBuf, usize> =
+            FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
         // pk set of store rows already retracted in this batch.
         // `retract_pk_bytes` is read-only (sets `found_source` only), so calling
         // it twice for the same PK would emit the stored-row retraction
         // twice and drive downstream weights negative.
-        let mut store_retracted: HashSet<PkBuf> = HashSet::with_capacity(batch.count);
+        let mut store_retracted: FxHashSet<PkBuf> =
+            FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
@@ -1741,11 +1776,13 @@ impl DagEngine {
         } else { 0 };
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
-        // `vec![0u8; idx_stride]` zero-fills once. The leading `[..idx_key_size]`
-        // (the OPK-encoded indexed value) and trailing `[idx_key_size..]` (the
-        // source PK suffix) slots are both fully overwritten per row, so no
-        // per-row re-zero is needed.
-        let mut idx_pk_buf = vec![0u8; idx_stride];
+        // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
+        // SchemaDescriptor::new), so the scratch PK buffer lives on the stack
+        // with no per-batch heap allocation. The used [..idx_stride] prefix is
+        // fully overwritten each row (the leading [..idx_key_size] OPK-encoded
+        // indexed value and trailing source PK suffix); the single zero-init
+        // covers the (currently empty) tail.
+        let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
 
         for row in 0..src.count {
             let weight = src.get_weight(row);
@@ -1781,7 +1818,7 @@ impl DagEngine {
             idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride]
                 .copy_from_slice(src_pk_bytes);
 
-            out.extend_pk_bytes(&idx_pk_buf);
+            out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
             out.extend_weight(&weight.to_le_bytes());
             // Index schema has zero payload columns, but the null_bmp region
             // is still part of the batch layout. Keep the per-row null-bmp

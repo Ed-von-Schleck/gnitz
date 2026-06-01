@@ -1036,6 +1036,32 @@ fn emit_node(
                 ext_trace_regs.push((reg_id as u16, *tid as i64));
 
                 if !is_join_trace_side(loaded, nid) {
+                    // Overwriting out_reg_of below points this node at the
+                    // cursorless delta register. out_reg_of holds one register
+                    // per node, so a consumer reading this node's PORT_TRACE
+                    // would resolve to that single delta register and read an
+                    // empty trace — silently emitting empty output. Routing both
+                    // would require emitting two output registers for the node.
+                    // The graph builder emits trace and delta scans as separate
+                    // nodes, so a ScanTrace never has both a PORT_TRACE join
+                    // consumer and a non-join consumer; assert it rather than
+                    // corrupt results if that ever changes.
+                    assert!(
+                        loaded.outgoing.get(&nid).is_none_or(|outs| {
+                            !outs.iter().any(|&(dst, port)| {
+                                port == PORT_TRACE
+                                    && matches!(
+                                        loaded.nodes.get(&dst),
+                                        Some(gnitz_wire::OpNode::Join(_))
+                                            | Some(gnitz_wire::OpNode::AntiJoin(_))
+                                            | Some(gnitz_wire::OpNode::SemiJoin(_))
+                                            | Some(gnitz_wire::OpNode::SeekTrace)
+                                    )
+                            })
+                        }),
+                        "ScanTrace node {nid} has mixed consumers: a PORT_TRACE join consumer would \
+                         misroute to the cursorless delta register"
+                    );
                     let out_delta_id = state.next_extra_reg;
                     state.next_extra_reg += 1;
                     reg_schemas[out_delta_id as usize] = ext.schema;
@@ -1488,6 +1514,12 @@ fn emit_reduce(
     }
 
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
+    // No nullable check on agg_col_idx: NULL aggregate values never reach the
+    // AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs) and AVI
+    // integration skips NULL aggregate values before encoding the index key
+    // (ops/index.rs), whose value column is a non-nullable PK. Moving either
+    // filter without revisiting this would write a zeroed key and corrupt
+    // MIN/MAX.
     let will_use_avi = agg_descs.len() == 1
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
         && agg_value_idx_eligible(

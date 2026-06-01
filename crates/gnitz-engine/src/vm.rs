@@ -783,9 +783,14 @@ pub fn execute_epoch_multi(
             }
 
             Instr::Delay { src, state_reg, dst } => {
-                debug_assert_ne!(*src, *state_reg, "Delay: src and state_reg must be distinct");
-                debug_assert_ne!(*src, *dst, "Delay: src and dst must be distinct");
-                debug_assert_ne!(*state_reg, *dst, "Delay: state_reg and dst must be distinct");
+                // reg_mut! hands out aliasing &mut via a raw pointer, so
+                // coincident indices would make the swaps below form two &mut to
+                // one register — UB. The compiler always assigns distinct
+                // registers; assert it in every profile (free, once per epoch)
+                // rather than only in debug.
+                assert_ne!(*src, *state_reg, "Delay: src and state_reg must be distinct");
+                assert_ne!(*src, *dst, "Delay: src and dst must be distinct");
+                assert_ne!(*state_reg, *dst, "Delay: state_reg and dst must be distinct");
                 // Rotate the three registers in place with zero allocation:
                 // dst ← old state_reg, state_reg ← old src, src ← old dst.
                 // Correctness of the two-swap rotation relies on `dst` being
