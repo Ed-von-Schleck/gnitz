@@ -211,12 +211,18 @@ pub(crate) fn compare_rows_fixedint_nonnull<A: ColumnarSource, B: ColumnarSource
         schema_is_fixedint_nonnull(schema),
         "compare_rows_fixedint_nonnull on a non-fixedint or nullable schema",
     );
+    // Shift-safety tripwire, hoisted out of the per-column loop below since the
+    // bound is schema-level (constant across every comparison). `cs*8-1` must
+    // stay a valid u64 shift, so every payload column must be ≤ 8 bytes.
+    // `schema_is_fixedint_nonnull` already implies this (FixedIntNonnull excludes
+    // U128/UUID); this guards a future maintainer who widens the predicate without
+    // revisiting the shift, which would otherwise become `1 << 127`.
+    debug_assert!(
+        schema.payload_columns().all(|(_, _, col)| col.size() <= 8),
+        "compare_rows_fixedint_nonnull: payload column wider than 8 bytes",
+    );
     for (payload_col, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        // `schema_is_fixedint_nonnull` already bounds cs to {1,2,4,8}; this
-        // guards a future maintainer who widens the predicate (e.g. U128) without
-        // revisiting the shift, which would otherwise be `1 << 127`.
-        debug_assert!(cs <= 8, "compare_rows_fixedint_nonnull: column wider than 8 bytes");
         // Branchless sign-flip: signed columns flip their MSB so two's-complement
         // negatives sort below non-negatives; `is_signed` is 0 for unsigned
         // columns, so the XOR is a no-op there. `cs*8-1 ∈ {7,15,31,63}` is always
