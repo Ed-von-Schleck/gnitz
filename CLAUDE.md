@@ -1,5 +1,6 @@
-Never check if failures are pre-existing; as a rule, all tests are green
-at the start of a session.
+Never check if failures are pre-existing; as a rule, all tests are green at the start of a session.
+
+Never check or confirm that compilation warnings or Clippy errors/warnings are caused by the current session, always directly fix them.
 
 Use `semble search` (the semble MCP server is installed) to find code by describing what it does or naming a symbol/identifier instead of grep. There are other useful semble commands as well. Prefer it over grep + read every time.
 
