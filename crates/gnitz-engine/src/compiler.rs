@@ -91,17 +91,29 @@ pub struct ExternalTable {
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
-/// A second exchange side, present only for binary set-op views (UNION /
-/// EXCEPT / INTERSECT) which repartition **two** `HashRow`-reindexed inputs.
-/// Side A reuses the `pre_*` fields of [`CompileOutput`]; this struct carries
-/// the parallel right-hand sub-pipeline.
-pub struct SideBPlan {
+/// A compiled sub-pipeline: the VM program, its register layout, its
+/// source-to-input-register map, and any external trace registers it reads.
+/// Used for: (a) the pre-exchange phase of every view, (b) each side of a
+/// binary set-op, and (c) the post-combine phase (single- and two-exchange
+/// views). All three are structurally identical; the difference is only which
+/// part of the plan graph they cover.
+pub struct SubPlan {
     pub vm: Box<VmHandle>,
     pub num_regs: u32,
     pub in_reg: u16,
     pub out_reg: u16,
+    /// Maps a source table id to the input register that receives its delta.
+    /// Empty for the post-combine phase (which has no source-level routing).
     pub source_reg_map: HashMap<i64, u16>,
     pub ext_trace_regs: Vec<(u16, i64)>,
+}
+
+/// A second exchange side, present only for binary set-op views (UNION /
+/// EXCEPT / INTERSECT) which repartition **two** `HashRow`-reindexed inputs.
+/// Side A reuses [`CompileOutput::pre`]; this struct carries the parallel
+/// right-hand sub-pipeline.
+pub struct SideBPlan {
+    pub plan: SubPlan,
     pub exchange_schema: SchemaDescriptor,
     /// Register in the post VM seeded with this side's relayed/exchanged batch.
     pub post_seed_reg: u16,
@@ -113,29 +125,22 @@ pub struct SideBPlan {
 /// Output from `compile_view`, consumed directly by DagEngine to build `CachedPlan`.
 ///
 /// Phase model:
-/// * **No exchange** (`post_vm == None`): `pre_vm` is the whole plan.
-/// * **One exchange** (GROUP BY, SELECT DISTINCT): `pre_vm` computes up to the
-///   shard, `post_vm` consumes the relayed batch.
-/// * **Two exchanges** (binary set-ops, `side_b.is_some()`): `pre_vm` is side A,
-///   `side_b` is side B; each is exchanged independently, then `post_vm` runs
+/// * **No exchange** (`post == None`): `pre` is the whole plan.
+/// * **One exchange** (GROUP BY, SELECT DISTINCT): `pre` computes up to the
+///   shard, `post` consumes the relayed batch.
+/// * **Two exchanges** (binary set-ops, `side_b.is_some()`): `pre` is side A,
+///   `side_b` is side B; each is exchanged independently, then `post` runs
 ///   the combine over both relayed inputs.
 pub struct CompileOutput {
-    pub pre_vm: Box<VmHandle>,
-    pub post_vm: Option<Box<VmHandle>>,
+    pub pre: SubPlan,
+    /// Post-combine phase; `None` for views with no exchange.
+    /// `SubPlan::in_reg` is the seed register for the relayed batch.
+    /// For two-sided set-ops it is side A's seed; side B's lives in
+    /// [`SideBPlan::post_seed_reg`].
+    pub post: Option<SubPlan>,
     pub exchange_in_schema: Option<SchemaDescriptor>,
-    pub pre_num_regs: u32,
-    pub pre_in_reg: u16,
-    pub pre_out_reg: u16,
-    pub post_num_regs: u32,
-    /// Post-phase seed register for the relayed batch. For two-sided set-ops
-    /// this is side A's seed; side B's lives in [`SideBPlan::post_seed_reg`].
-    pub post_in_reg: u16,
-    pub post_out_reg: u16,
-    pub source_reg_map: HashMap<i64, u16>,
     pub co_partitioned: HashSet<i64>,
-    pub pre_ext_trace_regs: Vec<(u16, i64)>,
-    pub post_ext_trace_regs: Vec<(u16, i64)>,
-    /// Source table side A (`pre_*`) scans, for exchange keying. 0 when unknown
+    /// Source table side A (`pre`) scans, for exchange keying. 0 when unknown
     /// (single-exchange views keep passing source_id=0 to the exchange).
     pub side_a_source_id: i64,
     /// Right-hand exchange side for binary set-ops; `None` otherwise.
@@ -2100,19 +2105,17 @@ pub unsafe fn compile_view(
             let source_reg_map = source_reg_map_u16(&plan.source_reg_map);
 
             Ok(CompileOutput {
-                pre_vm: plan.vm,
-                post_vm: None,
+                pre: SubPlan {
+                    vm: plan.vm,
+                    num_regs: plan.num_regs,
+                    in_reg: plan.in_reg as u16,
+                    out_reg: plan.out_reg as u16,
+                    source_reg_map,
+                    ext_trace_regs: plan.ext_trace_regs,
+                },
+                post: None,
                 exchange_in_schema: None,
-                pre_num_regs: plan.num_regs,
-                pre_in_reg: plan.in_reg as u16,
-                pre_out_reg: plan.out_reg as u16,
-                post_num_regs: 0,
-                post_in_reg: 0,
-                post_out_reg: 0,
-                source_reg_map,
                 co_partitioned: ann.co_partitioned,
-                pre_ext_trace_regs: plan.ext_trace_regs,
-                post_ext_trace_regs: Vec::new(),
                 side_a_source_id: 0,
                 side_b: None,
             })
@@ -2165,19 +2168,24 @@ pub unsafe fn compile_view(
             let source_reg_map = source_reg_map_u16(&pre.source_reg_map);
 
             Ok(CompileOutput {
-                pre_vm: pre.vm,
-                post_vm: Some(post.vm),
+                pre: SubPlan {
+                    vm: pre.vm,
+                    num_regs: pre.num_regs,
+                    in_reg: pre.in_reg as u16,
+                    out_reg: pre.out_reg as u16,
+                    source_reg_map,
+                    ext_trace_regs: pre.ext_trace_regs,
+                },
+                post: Some(SubPlan {
+                    vm: post.vm,
+                    num_regs: post.num_regs,
+                    in_reg: post.in_reg as u16,
+                    out_reg: post.out_reg as u16,
+                    source_reg_map: HashMap::new(),
+                    ext_trace_regs: post.ext_trace_regs,
+                }),
                 exchange_in_schema: Some(exchange_schema),
-                pre_num_regs: pre.num_regs,
-                pre_in_reg: pre.in_reg as u16,
-                pre_out_reg: pre.out_reg as u16,
-                post_num_regs: post.num_regs,
-                post_in_reg: post.in_reg as u16,
-                post_out_reg: post.out_reg as u16,
-                source_reg_map,
                 co_partitioned: ann.co_partitioned,
-                pre_ext_trace_regs: pre.ext_trace_regs,
-                post_ext_trace_regs: post.ext_trace_regs,
                 side_a_source_id,
                 side_b: None,
             })
@@ -2274,27 +2282,34 @@ pub unsafe fn compile_view(
             let source_reg_map_b = source_reg_map_u16(&side_b.source_reg_map);
 
             Ok(CompileOutput {
-                pre_vm: side_a.vm,
-                post_vm: Some(post.vm),
+                pre: SubPlan {
+                    vm: side_a.vm,
+                    num_regs: side_a.num_regs,
+                    in_reg: side_a.in_reg as u16,
+                    out_reg: side_a.out_reg as u16,
+                    source_reg_map: source_reg_map_a,
+                    ext_trace_regs: side_a.ext_trace_regs,
+                },
+                post: Some(SubPlan {
+                    vm: post.vm,
+                    num_regs: post.num_regs,
+                    in_reg: post_seed_a,
+                    out_reg: post.out_reg as u16,
+                    source_reg_map: HashMap::new(),
+                    ext_trace_regs: post.ext_trace_regs,
+                }),
                 exchange_in_schema: Some(schema_a),
-                pre_num_regs: side_a.num_regs,
-                pre_in_reg: side_a.in_reg as u16,
-                pre_out_reg: side_a.out_reg as u16,
-                post_num_regs: post.num_regs,
-                post_in_reg: post_seed_a,
-                post_out_reg: post.out_reg as u16,
-                source_reg_map: source_reg_map_a,
                 co_partitioned: ann.co_partitioned,
-                pre_ext_trace_regs: side_a.ext_trace_regs,
-                post_ext_trace_regs: post.ext_trace_regs,
                 side_a_source_id,
                 side_b: Some(SideBPlan {
-                    vm: side_b.vm,
-                    num_regs: side_b.num_regs,
-                    in_reg: side_b.in_reg as u16,
-                    out_reg: side_b.out_reg as u16,
-                    source_reg_map: source_reg_map_b,
-                    ext_trace_regs: side_b.ext_trace_regs,
+                    plan: SubPlan {
+                        vm: side_b.vm,
+                        num_regs: side_b.num_regs,
+                        in_reg: side_b.in_reg as u16,
+                        out_reg: side_b.out_reg as u16,
+                        source_reg_map: source_reg_map_b,
+                        ext_trace_regs: side_b.ext_trace_regs,
+                    },
                     exchange_schema: schema_b,
                     post_seed_reg: post_seed_b,
                     source_id: side_b_source_id,

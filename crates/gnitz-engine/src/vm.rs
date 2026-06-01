@@ -2245,6 +2245,52 @@ mod tests {
         );
     }
 
+    // Item 41 (companion): trace_out_reg always checked; if its cursor is null
+    // the VM must return Err(-10). Disable trace_in (pass -1) so Err(-11) is
+    // not reached first.
+    #[test]
+    fn test_reduce_trace_out_null_cursor_aborts() {
+        let in_schema = make_schema(&[type_code::I64, type_code::I64]);
+        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
+        let agg_descs = [AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Sum,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        }];
+        let group_cols = [1u32];
+
+        let mut builder = ProgramBuilder::new(3);
+        builder.add_reduce(
+            0,            // in_reg
+            -1,           // trace_in_reg disabled — avoids Err(-11) check
+            1,            // trace_out_reg (cursor will be null → Err(-10))
+            2,            // out_reg
+            -1,           // fin_out_reg
+            &agg_descs,
+            &group_cols,
+            out_schema,
+            std::ptr::null_mut(), false, 0, 0,
+            std::ptr::null_mut(), 0,
+            std::ptr::null(), std::ptr::null(),
+        );
+        builder.add_halt();
+
+        let reg_schemas = [in_schema, out_schema, out_schema];
+        let reg_kinds = [0u8, 1, 0];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        let input = make_batch_2col(in_schema, &[(1u128, 1, 1, 10)]);
+        let cursors = vec![std::ptr::null_mut(); 3];
+        let result = execute_epoch(
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
+        );
+        assert!(
+            matches!(result, Err(-10)),
+            "null trace_out cursor must abort Reduce with Err(-10)",
+        );
+    }
+
     #[test]
     fn test_seek_trace_point_lookup() {
         // SeekTrace positions a cursor at a given key, then ScanTrace reads from it.

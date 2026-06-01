@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
-use crate::compiler::{self, CompileOutput, ExternalTable};
+use crate::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PkBuf, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
@@ -429,16 +429,16 @@ impl DagEngine {
     /// a post-VM that also accumulates delta registers during backfill).
     pub fn clear_view_regfile_deltas(&mut self, view_id: i64) {
         if let Some(plan) = self.cache.get_mut(&view_id) {
-            plan.pre_vm.regfile.clear_delta_batches();
-            if let Some(post) = plan.post_vm.as_mut() {
-                post.regfile.clear_delta_batches();
+            plan.pre.vm.regfile.clear_delta_batches();
+            if let Some(post) = plan.post.as_mut() {
+                post.vm.regfile.clear_delta_batches();
             }
             // Binary set-op views (UNION ALL / EXCEPT / INTERSECT) compile the
             // right-hand side into `side_b`, which owns its own VM regfile; its
             // delta batches stay pinned (pooled batches leaked) until the view is
             // invalidated unless cleared here too.
             if let Some(sb) = plan.side_b.as_mut() {
-                sb.vm.regfile.clear_delta_batches();
+                sb.plan.vm.regfile.clear_delta_batches();
             }
         }
     }
@@ -705,7 +705,7 @@ impl DagEngine {
 
         match result {
             Ok(output) => {
-                gnitz_debug!("dag: compiled view_id={}, pre_regs={}", view_id, output.pre_num_regs);
+                gnitz_debug!("dag: compiled view_id={}, pre_regs={}", view_id, output.pre.num_regs);
                 Some(output)
             }
             Err(code) => {
@@ -742,44 +742,12 @@ impl DagEngine {
         // Exchange views (GROUP BY / SELECT DISTINCT / set-ops) need their full
         // multi-phase pipeline; backfill runs single-worker, so route through the
         // local path which handles pre→post and two-sided combines.
-        if self.cache.get(&view_id).map(|p| p.post_vm.is_some()).unwrap_or(false) {
+        if self.cache.get(&view_id).map(|p| p.post.is_some()).unwrap_or(false) {
             return self.execute_epoch_for_dag(view_id, input, source_id);
         }
 
-        let plan = self.cache.get(&view_id).unwrap();
-        let num_regs = plan.pre_num_regs as usize;
-        let etr = plan.pre_ext_trace_regs.clone(); // TODO: avoid clone once borrow split is refactored
-        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
-
         let plan = self.cache.get_mut(&view_id).unwrap();
-
-        // Determine input register based on source_id
-        let in_reg = if source_id > 0 {
-            plan.source_reg_map.get(&source_id).copied().unwrap_or(plan.pre_in_reg)
-        } else {
-            plan.pre_in_reg
-        };
-
-        // Refresh owned cursors
-        plan.pre_vm.refresh_owned_cursors();
-
-        // Execute
-        match vm::execute_epoch(
-            &plan.pre_vm.program,
-            &mut plan.pre_vm.regfile,
-            input,
-            in_reg,
-            plan.pre_out_reg,
-            &cursor_ptrs,
-            &plan.pre_vm.owned_trace_regs,
-        ) {
-            Ok(Some(batch)) if batch.count > 0 => Some(batch),
-            Ok(_) => None,
-            Err(code) => {
-                gnitz_warn!("dag: execute_epoch error {} for view_id={}", code, view_id);
-                None
-            }
-        }
+        Self::execute_sub_plan(view_id, &mut plan.pre, &self.tables, input, source_id)
     }
 
     /// Check if a source_id is co-partitioned for a view (from cached plan).
@@ -1151,7 +1119,7 @@ impl DagEngine {
                 let exchange_schema = self.get_exchange_schema(view_id)
                     .unwrap_or_else(|| self.tables[&view_id].schema);
 
-                let pre_result = match self.execute_plan_phase(view_id, true, input, src_id) {
+                let pre_result = match self.execute_pre_phase(view_id, input, src_id) {
                     Some(mut batch) => {
                         batch.set_schema(exchange_schema);
                         batch
@@ -1169,12 +1137,12 @@ impl DagEngine {
                     exchange.do_exchange(view_id, &pre_result, 0)
                 };
                 let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
-                self.execute_plan_phase(view_id, false, post_in, 0)
+                self.execute_post_phase(view_id, post_in)
             } else if has_join_shard {
                 // Join shard exchange
                 let copart_join = self.plan_source_co_partitioned(view_id, src_id);
                 if copart_join {
-                    self.execute_plan_phase(view_id, true, input, src_id)
+                    self.execute_pre_phase(view_id, input, src_id)
                 } else {
                     // Set batch schema for the exchange wire encoding.
                     let mut input_with_schema = input;
@@ -1184,11 +1152,11 @@ impl DagEngine {
                         }
                     }
                     let exchanged = exchange.do_exchange(view_id, &input_with_schema, src_id);
-                    self.execute_plan_phase(view_id, true, exchanged, src_id)
+                    self.execute_pre_phase(view_id, exchanged, src_id)
                 }
             } else {
                 // No exchange: simple single-phase execution
-                self.execute_plan_phase(view_id, true, input, src_id)
+                self.execute_pre_phase(view_id, input, src_id)
             };
 
             let has_output = out_delta.as_ref().map(|b| b.count > 0).unwrap_or(false);
@@ -1315,14 +1283,14 @@ impl DagEngine {
     /// Returns (cursor_ptrs, storage_owner). Storage must outlive cursor_ptrs.
     #[allow(clippy::vec_box)]
     fn build_ext_cursors(
-        &self,
+        tables: &FxHashMap<i64, TableEntry>,
         ext_trace_regs: &[(u16, i64)],
         num_regs: usize,
     ) -> (Vec<*mut libc::c_void>, Vec<Box<CursorHandle>>) {
         let mut ptrs: Vec<*mut libc::c_void> = vec![std::ptr::null_mut(); num_regs];
         let mut storage: Vec<Box<CursorHandle>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
-            if let Some(entry) = self.tables.get(&table_id) {
+            if let Some(entry) = tables.get(&table_id) {
                 // External-trace reads are the operator-state read path: keep
                 // them compacting so L0 on intermediate/trace tables stays
                 // bounded (no background compactor yet). These are not
@@ -1366,7 +1334,7 @@ impl DagEngine {
         }
 
         let plan = self.cache.get(&view_id).unwrap();
-        let has_post = plan.post_vm.is_some();
+        let has_post = plan.post.is_some();
 
         if self.view_has_side_b(view_id) {
             // Two-sided set-op: single worker owns every shard, so run both
@@ -1381,114 +1349,72 @@ impl DagEngine {
             // assume sorted, weight-merged input.
             let exchange_schema = self.get_exchange_schema(view_id)
                 .unwrap_or_else(|| self.tables[&view_id].schema);
-            let pre_result = self.execute_plan_phase(view_id, true, input, source_id)
+            let pre_result = self.execute_pre_phase(view_id, input, source_id)
                 .unwrap_or_else(|| Batch::with_schema(exchange_schema, 0));
             let consolidated = Self::consolidate_exchanged(pre_result, &exchange_schema);
-            self.execute_plan_phase(view_id, false, consolidated, 0)
+            self.execute_post_phase(view_id, consolidated)
         } else {
-            self.execute_plan_phase(view_id, true, input, source_id)
+            self.execute_pre_phase(view_id, input, source_id)
         }
     }
 
-    /// Execute either the pre or post phase of a plan.
-    fn execute_plan_phase(
+    /// Execute one sub-pipeline epoch. Takes the sub-plan by mutable reference
+    /// (to reach the VM's regfile and owned-cursor state) and the engine's table
+    /// map by shared reference (for external-trace cursor construction). Both
+    /// come from different fields of `DagEngine`, so the caller can hold them as
+    /// independent borrows.
+    ///
+    /// `source_id > 0` selects the sub-plan's input register from its
+    /// `source_reg_map`; pass `0` when the sub-plan has a single unambiguous input.
+    fn execute_sub_plan(
+        view_id: i64,
+        sub: &mut SubPlan,
+        tables: &FxHashMap<i64, TableEntry>,
+        input: Batch,
+        source_id: i64,
+    ) -> Option<Batch> {
+        let (cursor_ptrs, _cursor_storage) =
+            Self::build_ext_cursors(tables, &sub.ext_trace_regs, sub.num_regs as usize);
+        let actual_in_reg = if source_id > 0 {
+            sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg)
+        } else {
+            sub.in_reg
+        };
+        sub.vm.refresh_owned_cursors();
+        Self::vm_epoch_result(view_id, vm::execute_epoch(
+            &sub.vm.program,
+            &mut sub.vm.regfile,
+            input,
+            actual_in_reg,
+            sub.out_reg,
+            &cursor_ptrs,
+            &sub.vm.owned_trace_regs,
+        ))
+    }
+
+    fn execute_pre_phase(
         &mut self,
         view_id: i64,
-        is_pre: bool,
         input: Batch,
         source_id: i64,
     ) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
+        Self::execute_sub_plan(view_id, &mut plan.pre, &self.tables, input, source_id)
+    }
 
-        let (in_reg, out_reg, num_regs) = if is_pre {
-            (plan.pre_in_reg, plan.pre_out_reg, plan.pre_num_regs as usize)
-        } else {
-            (plan.post_in_reg, plan.post_out_reg, plan.post_num_regs as usize)
-        };
-        let etr = if is_pre {
-            plan.pre_ext_trace_regs.clone()
-        } else {
-            plan.post_ext_trace_regs.clone()
-        };
-
-        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
-
-        let actual_in_reg = if source_id > 0 && is_pre {
-            self.cache.get(&view_id).unwrap()
-                .source_reg_map.get(&source_id).copied().unwrap_or(in_reg)
-        } else {
-            in_reg
-        };
-
-        let plan = self.cache.get_mut(&view_id).unwrap();
-        let vm = if is_pre {
-            &mut plan.pre_vm
-        } else {
-            plan.post_vm.as_mut().unwrap()
-        };
-
-        vm.refresh_owned_cursors();
-
-        match vm::execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            input,
-            actual_in_reg,
-            out_reg,
-            &cursor_ptrs,
-            &vm.owned_trace_regs,
-        ) {
-            Ok(Some(batch)) if batch.count > 0 => Some(batch),
-            Ok(_) => None,
-            Err(code) => {
-                gnitz_warn!("dag: execute error {} for view_id={}", code, view_id);
-                None
-            }
-        }
+    fn execute_post_phase(
+        &mut self,
+        view_id: i64,
+        input: Batch,
+    ) -> Option<Batch> {
+        let plan = self.cache.get_mut(&view_id)?;
+        Self::execute_sub_plan(view_id, plan.post.as_mut().unwrap(), &self.tables, input, 0)
     }
 
     /// Whether a view's compiled plan carries a second exchange side (binary
     /// set-op). The plan must already be in the cache.
     fn view_has_side_b(&self, view_id: i64) -> bool {
         self.cache.get(&view_id).map(|p| p.side_b.is_some()).unwrap_or(false)
-    }
-
-    /// Run side B's pre-exchange sub-pipeline (the right-hand set-op input).
-    fn execute_side_b_phase(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-        source_id: i64,
-    ) -> Option<Batch> {
-        let plan = self.cache.get_mut(&view_id)?;
-        let sb = plan.side_b.as_ref()?;
-        let (in_reg, out_reg, num_regs) = (sb.in_reg, sb.out_reg, sb.num_regs as usize);
-        let etr = sb.ext_trace_regs.clone();
-
-        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
-
-        let actual_in_reg = if source_id > 0 {
-            self.cache.get(&view_id).unwrap().side_b.as_ref().unwrap()
-                .source_reg_map.get(&source_id).copied().unwrap_or(in_reg)
-        } else {
-            in_reg
-        };
-
-        let plan = self.cache.get_mut(&view_id).unwrap();
-        let vm = &mut plan.side_b.as_mut().unwrap().vm;
-        vm.refresh_owned_cursors();
-
-        match vm::execute_epoch(
-            &vm.program, &mut vm.regfile, input, actual_in_reg, out_reg,
-            &cursor_ptrs, &vm.owned_trace_regs,
-        ) {
-            Ok(Some(batch)) if batch.count > 0 => Some(batch),
-            Ok(_) => None,
-            Err(code) => {
-                gnitz_warn!("dag: side-B execute error {} for view_id={}", code, view_id);
-                None
-            }
-        }
     }
 
     /// Run the post phase seeding several exchange-input registers (one per
@@ -1499,27 +1425,14 @@ impl DagEngine {
         inputs: Vec<(u16, Batch)>,
     ) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
-        let out_reg = plan.post_out_reg;
-        let num_regs = plan.post_num_regs as usize;
-        let etr = plan.post_ext_trace_regs.clone();
-
-        let (cursor_ptrs, _cursor_storage) = self.build_ext_cursors(&etr, num_regs);
-
-        let plan = self.cache.get_mut(&view_id).unwrap();
-        let vm = plan.post_vm.as_mut()?;
-        vm.refresh_owned_cursors();
-
-        match vm::execute_epoch_multi(
-            &vm.program, &mut vm.regfile, inputs, out_reg,
-            &cursor_ptrs, &vm.owned_trace_regs,
-        ) {
-            Ok(Some(batch)) if batch.count > 0 => Some(batch),
-            Ok(_) => None,
-            Err(code) => {
-                gnitz_warn!("dag: post-multi execute error {} for view_id={}", code, view_id);
-                None
-            }
-        }
+        let post = plan.post.as_mut()?;
+        let (cursor_ptrs, _cursor_storage) =
+            Self::build_ext_cursors(&self.tables, &post.ext_trace_regs, post.num_regs as usize);
+        post.vm.refresh_owned_cursors();
+        Self::vm_epoch_result(view_id, vm::execute_epoch_multi(
+            &post.vm.program, &mut post.vm.regfile, inputs, post.out_reg,
+            &cursor_ptrs, &post.vm.owned_trace_regs,
+        ))
     }
 
     /// Force a real sort+weight-merge of a post-exchange batch. The exchange
@@ -1532,6 +1445,32 @@ impl DagEngine {
         batch.sorted = false;
         batch.consolidated = false;
         batch.into_consolidated(schema).into_inner()
+    }
+
+    /// Normalize a VM epoch result into the DAG's `Option<Batch>` convention:
+    /// a positive-count batch, or `None` for an empty epoch.
+    ///
+    /// A VM `Err` is an unrecoverable internal-invariant violation — the only
+    /// codes (`-10`/`-11`, vm.rs) mean a Reduce trace cursor the compiler
+    /// promised is unbound, i.e. the compiled circuit is malformed. Every VM
+    /// operator is otherwise infallible, so there is no data- or query-level
+    /// fault to surface. Continuing would drop the delta and permanently desync
+    /// the view's integral (and in multi-worker, a skipped exchange round
+    /// deadlocks the cluster), so we fail stop. In multi-worker the master's
+    /// `worker_watcher` reaps the exited worker and tears the tick down;
+    /// single-worker exits the process. If a recoverable (data/query-level) VM
+    /// error is ever introduced, it must be a distinct code routed to
+    /// transaction-level failure — never funneled here.
+    fn vm_epoch_result(view_id: i64, r: Result<Option<Batch>, i32>) -> Option<Batch> {
+        match r {
+            Ok(Some(batch)) if batch.count > 0 => Some(batch),
+            Ok(_) => None,
+            Err(code) => gnitz_fatal_abort!(
+                "dag: VM execution error {} for view_id={} — malformed circuit, \
+                 cannot continue without producing inconsistent view state",
+                code, view_id,
+            ),
+        }
     }
 
     /// Per-side exchange metadata snapshot for both sides of a two-sided join.
@@ -1554,9 +1493,34 @@ impl DagEngine {
             "two-sided set-op side resolved to ambiguous source 0"
         );
         Some((
-            (a_schema, p.side_a_source_id, p.post_in_reg),
+            (a_schema, p.side_a_source_id, p.post.as_ref().unwrap().in_reg),
             (sb.exchange_schema, sb.source_id, sb.post_seed_reg),
         ))
+    }
+
+    /// Execute one side of a two-sided set-op: run the sub-pipeline on `input`
+    /// (skipped entirely when `None`), relay the result, and consolidate.
+    /// Takes the sub-plan and table map as independent borrows.
+    #[allow(clippy::too_many_arguments)]
+    fn run_one_side(
+        view_id: i64,
+        sub: &mut SubPlan,
+        tables: &FxHashMap<i64, TableEntry>,
+        input: Option<Batch>,
+        src_id: i64,
+        schema: SchemaDescriptor,
+        source: i64,
+        relay: &mut impl FnMut(Batch, i64) -> Batch,
+    ) -> Batch {
+        match input {
+            Some(delta) => {
+                let mut pre = Self::execute_sub_plan(view_id, sub, tables, delta, src_id)
+                    .unwrap_or_else(|| Batch::with_schema(schema, 0));
+                pre.set_schema(schema);
+                Self::consolidate_exchanged(relay(pre, source), &schema)
+            }
+            None => Batch::empty_with_schema(&schema),
+        }
     }
 
     /// Execute a two-sided set-op view: run each side's sub-pipeline, hand its
@@ -1577,28 +1541,42 @@ impl DagEngine {
         let ((a_schema, a_source, a_seed), (b_schema, b_source, b_seed)) =
             self.two_sided_meta(view_id)?;
 
-        // Route the incoming delta to whichever side(s) scan its source, moving
-        // it rather than cloning unless both sides need it (e.g. `a UNION a`).
-        let empty = || Batch::with_schema(SchemaDescriptor::default(), 0);
+        // The delta belongs to whichever side(s) scan its source. An inactive
+        // side has no delta this epoch, so its pre-phase (a linear
+        // single-relation reshuffle) would emit nothing and the combine
+        // integrates an empty seed as a no-op — skip its VM pass, its exchange
+        // round, and its consolidate, and seed the combine directly.
+        //
+        // `a_needs`/`b_needs` derive only from the plan sources and `src_id`,
+        // both identical on every worker, so all workers skip the same side's
+        // `do_exchange`; the per-(view_id, source_id) barrier stays balanced.
+        // Both true only when both sides scan one relation (e.g. `a UNION a`):
+        // clone so each side gets the delta, otherwise move to the active side.
         let (a_needs, b_needs) = (src_id == a_source, src_id == b_source);
+        debug_assert!(
+            a_needs || b_needs,
+            "run_two_sided view {view_id}: delta source {src_id} matches neither \
+             side ({a_source}, {b_source})",
+        );
         let (a_in, b_in) = match (a_needs, b_needs) {
-            (true, true)   => (input.clone_batch(), input),
-            (true, false)  => (input, empty()),
-            (false, true)  => (empty(), input),
-            (false, false) => (empty(), empty()),
+            (true, true)  => (Some(input.clone_batch()), Some(input)),
+            (true, false) => (Some(input), None),
+            (false, true)  => (None, Some(input)),
+            (false, false) => unreachable!("run_two_sided view {view_id}: source {src_id} matches neither side"),
         };
 
-        let mut pre_a = self.execute_plan_phase(
-            view_id, true, a_in, if a_needs { src_id } else { 0 },
-        ).unwrap_or_else(|| Batch::with_schema(a_schema, 0));
-        pre_a.set_schema(a_schema);
-        let cons_a = Self::consolidate_exchanged(relay(pre_a, a_source), &a_schema);
-
-        let mut pre_b = self.execute_side_b_phase(
-            view_id, b_in, if b_needs { src_id } else { 0 },
-        ).unwrap_or_else(|| Batch::with_schema(b_schema, 0));
-        pre_b.set_schema(b_schema);
-        let cons_b = Self::consolidate_exchanged(relay(pre_b, b_source), &b_schema);
+        // Each scope ends before the next so the mutable cache borrow does not
+        // overlap with execute_post_multi's borrow via self.
+        let cons_a = {
+            let plan = self.cache.get_mut(&view_id).unwrap();
+            Self::run_one_side(view_id, &mut plan.pre, &self.tables,
+                               a_in, src_id, a_schema, a_source, &mut relay)
+        };
+        let cons_b = {
+            let plan = self.cache.get_mut(&view_id).unwrap();
+            Self::run_one_side(view_id, &mut plan.side_b.as_mut().unwrap().plan,
+                               &self.tables, b_in, src_id, b_schema, b_source, &mut relay)
+        };
 
         self.execute_post_multi(view_id, vec![(a_seed, cons_a), (b_seed, cons_b)])
     }
@@ -2051,5 +2029,35 @@ mod tests {
         // negative-PK row then nets to zero and is gone.
         pt.ingest_owned_batch(effective).unwrap();
         assert!(!pt.has_pk_bytes(&opk), "stored negative-PK row must be gone after retraction");
+    }
+
+    // Spawn a clean subprocess to verify that vm_epoch_result calls
+    // gnitz_fatal_abort! (→ _exit(134)) on Err. A direct in-process call would
+    // terminate the test runner; std::process::Command gives us a clean process
+    // with no multi-threaded fork hazard.
+    #[test]
+    fn test_vm_epoch_result_abort_exit_status() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_vm_epoch_result_abort_internal")
+            .env("GNITZ_RUN_ABORT_TEST", "1")
+            .status()
+            .unwrap();
+        // _exit(134) is a normal (non-signal) exit on Linux, so code() == Some(134).
+        assert_eq!(
+            status.code(),
+            Some(134),
+            "vm_epoch_result must call gnitz_fatal_abort! (exit 134) on Err",
+        );
+    }
+
+    // Guard: runs only when GNITZ_RUN_ABORT_TEST=1 (set by the parent test above).
+    // Constructs an Err(-10) result and passes it to vm_epoch_result, which must
+    // call gnitz_fatal_abort!. The parent asserts exit code 134.
+    #[test]
+    fn test_vm_epoch_result_abort_internal() {
+        if std::env::var("GNITZ_RUN_ABORT_TEST").is_err() { return; }
+        let r: Result<Option<Batch>, i32> = Err(-10);
+        DagEngine::vm_epoch_result(42, r);
+        unreachable!("vm_epoch_result must not return on Err");
     }
 }
