@@ -338,6 +338,115 @@ fn test_transitive_self_join_accepted_and_correct() {
     assert_eq!(batch.len(), 4, "transitive self-join must recover the full 2x2 product");
 }
 
+// ── §4: EXCEPT lifts its LEFT branch through distinct (weight-1) ─────────────
+//
+// Two left rows with distinct PKs projecting to the same value must contribute
+// weight 1 to EXCEPT, not weight 2. `map_hash_row` consolidates them into one
+// synthetic-PK tuple of weight 2; anti-joining the RAW left_node would pass that
+// weight 2 through, and a later right-side cover (which retracts only weight 1)
+// would leave the value surviving at weight 1. Over two distinct tables so the
+// same-source guard does not reject.
+
+#[test]
+fn test_except_left_duplicate_projected_weight_one() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM a EXCEPT SELECT c FROM b").unwrap();
+        // Two left rows projecting to c=5; right side still empty.
+        p.execute("INSERT INTO a (id, c) VALUES (1, 5), (2, 5)").unwrap();
+    }
+    let weight_of_5 = |client: &mut GnitzClient| -> i64 {
+        let (schema, batch) = read_view(client, &sn, "v");
+        let ci = col_idx(&schema, "c");
+        (0..batch.len())
+            .filter(|&r| i64_at(&batch, ci, r) == 5)
+            .map(|r| batch.weights[r])
+            .sum()
+    };
+    assert_eq!(weight_of_5(&mut client), 1,
+        "EXCEPT must lift the left branch through distinct: c=5 carried by two source rows → weight 1, not 2");
+
+    // Right side now covers c=5 → the difference nets to 0 (a raw weight-2 left
+    // would leave it surviving at weight 1).
+    insert(&mut client, &sn, "b", 1, 5);
+    assert_eq!(weight_of_5(&mut client), 0,
+        "once the right side covers c=5 the EXCEPT must net to 0");
+}
+
+// ── §7: per-operator output nullability ─────────────────────────────────────
+//
+// `||` over both sides is sound but imprecise for INTERSECT (a tuple must be in
+// BOTH sides → AND) and EXCEPT (every output is a left-side tuple → exactly the
+// left's). Tightening only removes the flag when the operator's tuple algebra
+// forbids NULL, so it is a strict precision gain.
+
+/// Nullability of column `col` in the `SELECT *` schema of view `view`.
+fn view_col_nullable(client: &mut GnitzClient, sn: &str, view: &str, col: &str) -> bool {
+    let (schema, _batch) = read_view(client, sn, view);
+    schema.columns[col_idx(&schema, col)].is_nullable
+}
+
+/// Tables `nn(id PK, v BIGINT NOT NULL)` and `nl(id PK, v BIGINT)` — same type,
+/// one NOT NULL, one nullable — so each operator's bound can be observed.
+fn setup_nullability_tables(client: &mut GnitzClient, sn: &str) {
+    let mut p = SqlPlanner::new(client, sn);
+    p.execute("CREATE TABLE nn (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE nl (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
+}
+
+#[test]
+fn test_intersect_nullability_is_and() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    setup_nullability_tables(&mut client, &sn);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // NOT NULL ∩ nullable → AND → NOT NULL.
+        p.execute("CREATE VIEW v AS SELECT v FROM nn INTERSECT SELECT v FROM nl").unwrap();
+    }
+    assert!(!view_col_nullable(&mut client, &sn, "v", "v"),
+        "INTERSECT column is nullable only if BOTH sides are; here the left is NOT NULL");
+}
+
+#[test]
+fn test_except_nullability_equals_left() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    setup_nullability_tables(&mut client, &sn);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // left NOT NULL, right nullable → output NOT NULL (the right is ignored).
+        p.execute("CREATE VIEW v_nn AS SELECT v FROM nn EXCEPT SELECT v FROM nl").unwrap();
+        // left nullable, right NOT NULL → output nullable (equals the left).
+        p.execute("CREATE VIEW v_nl AS SELECT v FROM nl EXCEPT SELECT v FROM nn").unwrap();
+    }
+    assert!(!view_col_nullable(&mut client, &sn, "v_nn", "v"),
+        "EXCEPT nullability equals the LEFT input's; NOT NULL left → NOT NULL output");
+    assert!(view_col_nullable(&mut client, &sn, "v_nl", "v"),
+        "EXCEPT nullability equals the LEFT input's, independent of the right; nullable left → nullable output");
+}
+
+#[test]
+fn test_union_nullability_is_or() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    setup_nullability_tables(&mut client, &sn);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // A union tuple may originate from either side → OR retained → nullable.
+        p.execute("CREATE VIEW v_u AS SELECT v FROM nn UNION SELECT v FROM nl").unwrap();
+        p.execute("CREATE VIEW v_ua AS SELECT v FROM nn UNION ALL SELECT v FROM nl").unwrap();
+    }
+    assert!(view_col_nullable(&mut client, &sn, "v_u", "v"),
+        "UNION keeps the OR: a nullable side makes the output nullable");
+    assert!(view_col_nullable(&mut client, &sn, "v_ua", "v"),
+        "UNION ALL keeps the OR: a nullable side makes the output nullable");
+}
+
 #[test]
 fn test_direct_self_join_still_rejected() {
     // Mirror of planner_view_validation.rs:81; kept here so the set-op scope

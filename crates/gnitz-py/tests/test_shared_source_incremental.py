@@ -463,6 +463,94 @@ class TestSameSourceUnion:
             _cleanup(client, sn, tables=["t"], views=["v"])
 
 
+# ── duplicate projected values on a side: the left branch must be distinct ──
+#
+# Two source rows with distinct PKs projecting to the same value consolidate to
+# one synthetic-PK tuple of weight 2 (map_hash_row sums weights). EXCEPT must
+# lift its LEFT branch through distinct so that value contributes weight 1, not
+# 2 — otherwise a later right-side cover (which retracts only weight 1) leaves it
+# surviving at weight 1. Over two DISTINCT tables so the same-source guard does
+# not reject. The oracle (set membership → weight 1) is the ground truth.
+
+class TestDuplicateProjectedValues:
+    def _setup(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+
+    def test_except_left_duplicate_nets_to_one_then_zero(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM a EXCEPT SELECT c FROM b", schema_name=sn)
+            vid = _vid(client, sn, "v")
+            a_state, b_state = {}, {}
+
+            def check(ctx):
+                left = oracle.oracle_filter_project(a_state, None, ["c"])
+                right = oracle.oracle_filter_project(b_state, None, ["c"])
+                exp = oracle.oracle_setop("EXCEPT", left, right)
+                oracle.assert_view_matches(client, vid, ["c"], exp, ctx=ctx)
+
+            # Two left rows projecting to c=5; right empty → c=5 survives weight 1.
+            client.execute_sql("INSERT INTO a VALUES (1, 5), (2, 5)", schema_name=sn)
+            oracle.apply_insert(a_state, "id", [{"id": 1, "c": 5}, {"id": 2, "c": 5}])
+            check("left-duplicate-right-empty")
+
+            # Right covers c=5 → the difference nets to 0 (raw weight-2 left would
+            # leave it surviving at weight 1).
+            client.execute_sql("INSERT INTO b VALUES (1, 5)", schema_name=sn)
+            oracle.apply_insert(b_state, "id", [{"id": 1, "c": 5}])
+            check("right-covers")
+
+            # Remove one of the two left rows: c=5 is still in a → still excluded.
+            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+            oracle.apply_delete(a_state, "id", [1])
+            check("one-left-removed")
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    def test_intersect_duplicate_each_side_weight_one(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM a INTERSECT SELECT c FROM b", schema_name=sn)
+            vid = _vid(client, sn, "v")
+            a_state, b_state = {}, {}
+
+            def check(ctx):
+                left = oracle.oracle_filter_project(a_state, None, ["c"])
+                right = oracle.oracle_filter_project(b_state, None, ["c"])
+                exp = oracle.oracle_setop("INTERSECT", left, right)
+                oracle.assert_view_matches(client, vid, ["c"], exp, ctx=ctx)
+
+            # c=5 carried by two rows on each side → in both → weight 1.
+            client.execute_sql("INSERT INTO a VALUES (1, 5), (2, 5)", schema_name=sn)
+            oracle.apply_insert(a_state, "id", [{"id": 1, "c": 5}, {"id": 2, "c": 5}])
+            client.execute_sql("INSERT INTO b VALUES (10, 5), (11, 5)", schema_name=sn)
+            oracle.apply_insert(b_state, "id", [{"id": 10, "c": 5}, {"id": 11, "c": 5}])
+            check("both-sides-duplicate")
+
+            # Drop both right rows for c=5 → no longer in B → intersect empty.
+            client.execute_sql("DELETE FROM b WHERE id = 10", schema_name=sn)
+            oracle.apply_delete(b_state, "id", [10])
+            check("one-right-removed-still-present")
+            client.execute_sql("DELETE FROM b WHERE id = 11", schema_name=sn)
+            oracle.apply_delete(b_state, "id", [11])
+            check("right-empty")
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+
 # ── property test: random ops over the transitive-self-join config ─────────
 
 class TestSelfJoinProperty:

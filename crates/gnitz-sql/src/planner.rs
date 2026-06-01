@@ -1975,30 +1975,42 @@ fn execute_create_set_op_view(
             cb.distinct(merged)
         }
         (SetOperator::Intersect, _) => {
-            // INTERSECT: integrate both sides, bidirectional semi-join. The semi
-            // inputs are lifted through `distinct` so a key that is inserted
-            // multiple times (same projected content, different source PKs)
-            // changes set membership exactly once — otherwise duplicate inserts
-            // would emit the intersect row more than once.
-            let trace_l = cb.integrate_trace(left_node);
-            let trace_r = cb.integrate_trace(right_node);
+            // Lift both sides through `distinct`: set membership flips once per
+            // projected row regardless of how many source rows carry it, and the
+            // integrated traces then hold only weight-1 entries (semi-join tests
+            // existence, not weight, so storing raw multiplicities only bloats
+            // the trace tables for no effect). Build each `integrate_trace`
+            // before its `distinct`'s other consumer so the Kahn schedule
+            // (ascending node-id tie-break) keeps the non-destructive reader
+            // ahead of any destructive co-consumer; here both readers of each
+            // `distinct` are semi-joins (no trace-absent destructive branch).
             let distinct_l = cb.distinct(left_node);
             let distinct_r = cb.distinct(right_node);
+            let trace_l = cb.integrate_trace(distinct_l);
+            let trace_r = cb.integrate_trace(distinct_r);
             let semi_lr = cb.semi_join_with_trace_node(distinct_l, trace_r);
             let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
             cb.union(semi_lr, semi_rl)
         }
         (SetOperator::Except, _) => {
-            // EXCEPT: bidirectional anti-join.
-            let trace_l = cb.integrate_trace(left_node);
-            let trace_r = cb.integrate_trace(right_node);
-            // ΔA path: left rows not in I(B)
-            let except_lr = cb.anti_join_with_trace_node(left_node, trace_r);
-            // ΔB path: when B's *set membership* changes, retract/emit matching
-            // left rows. Feeding ΔD(B) (the distinct delta) — not the raw ΔB —
-            // ensures a second insert of an already-present projected B row is a
-            // no-op, instead of driving the EXCEPT weight below zero.
+            // EXCEPT DISTINCT: difference of the two projected sets. Lifting the
+            // left through `distinct` before the anti-join caps a value carried
+            // by multiple source rows at weight 1 (the raw `left_node` would emit
+            // weight n, surviving the difference once the right side covers it);
+            // the integrated traces then hold only weight-1 entries.
+            let distinct_l = cb.distinct(left_node);
             let distinct_r = cb.distinct(right_node);
+            // `trace_l` is created before `except_lr`: whenever `trace_r` is still
+            // empty the anti-join takes its trace-absent branch and drains
+            // `distinct_l`'s register, so the non-destructive `integrate_trace`
+            // (lower node id) must — and does — schedule first.
+            let trace_l = cb.integrate_trace(distinct_l);
+            let trace_r = cb.integrate_trace(distinct_r);
+            // ΔA path: left set-members not in I(B).
+            let except_lr = cb.anti_join_with_trace_node(distinct_l, trace_r);
+            // ΔB path: when B's set membership flips, retract/emit the matching
+            // left row. Reading `distinct_r` makes a second insert of an
+            // already-present projected B row a no-op.
             let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
             let correction = cb.negate(semi_rl);
             cb.union(except_lr, correction)
@@ -2018,9 +2030,20 @@ fn execute_create_set_op_view(
     });
     for (l, r) in left_cols.iter().zip(&right_cols) {
         let mut col = l.clone();
-        // A set-op row may originate from either side; the column is nullable if
-        // either input column is. Type equality is already checked above.
-        col.is_nullable = l.is_nullable || r.is_nullable;
+        // Output nullability is operator-specific. EXCEPT emits only left-side
+        // values (right-side corrections must match a left set-pk to fire, and a
+        // NULL-in-c right tuple has a set-pk a NOT NULL left column never
+        // produces), so it is nullable iff the left input is. INTERSECT emits a
+        // tuple only when it is in both sides (set membership matches NULLs as
+        // equal), so a column is nullable iff BOTH inputs admit NULL there.
+        // UNION{,ALL} may emit from either side. Tightening only ever removes the
+        // flag, and only when the operator's tuple algebra forbids NULL, so it
+        // cannot mislabel a nullable column. Type equality is checked above.
+        col.is_nullable = match op {
+            SetOperator::Intersect => l.is_nullable && r.is_nullable,
+            SetOperator::Except    => l.is_nullable,
+            _                      => l.is_nullable || r.is_nullable,
+        };
         out_cols_final.push(col);
     }
 
