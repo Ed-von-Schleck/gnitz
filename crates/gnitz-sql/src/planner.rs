@@ -1797,7 +1797,7 @@ fn compile_set_op_side(
     binder:      &mut Binder<'_>,
     cb:          &mut CircuitBuilder,
     branch_id:   u8,
-) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>), GnitzSqlError> {
+) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(GnitzSqlError::Unsupported(
             "set operation: each side must be a simple SELECT from one table".to_string()
@@ -1837,7 +1837,7 @@ fn compile_set_op_side(
     // is computed in-circuit, so the master cannot pre-shard the source by it;
     // this in-circuit exchange is mandatory. Single-worker mode elides the IPC.
     let sharded = cb.shard(reindexed, &[0]);
-    Ok((sharded, out_cols))
+    Ok((sharded, out_cols, source_tid))
 }
 
 /// Resolve a set-operation side's projection to source column indices plus
@@ -1930,8 +1930,22 @@ fn execute_create_set_op_view(
         (SetOperator::Union, SetQuantifier::All)
     ) as u8;
 
-    let (left_node, left_cols) = compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
-    let (right_node, right_cols) = compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id)?;
+    let (left_node, left_cols, left_tid) = compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
+    let (right_node, right_cols, right_tid) = compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id)?;
+
+    // INTERSECT/EXCEPT inline both branches and semi/anti-join each against the
+    // other's delayed trace with no same-epoch cross-correction. When both
+    // branches are the same relation, one delta drives both sides in a single
+    // pass and the correction term is dropped — silently wrong results. Mirror
+    // of the self-join guard. UNION / UNION ALL are linear merges with no
+    // correction term, exempt. Two *different* views over the same base table
+    // produce two distinct dependency edges (two passes), so the discriminator
+    // is source-id equality, not base-table overlap.
+    if matches!(op, SetOperator::Intersect | SetOperator::Except) && left_tid == right_tid {
+        return Err(GnitzSqlError::Unsupported(
+            "INTERSECT/EXCEPT whose two inputs are the same relation is not supported".into()
+        ));
+    }
 
     // Schema compatibility check
     if left_cols.len() != right_cols.len() {

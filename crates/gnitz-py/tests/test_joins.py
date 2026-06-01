@@ -7,6 +7,7 @@ import os
 import random
 import pytest
 import gnitz
+import _oracle as oracle
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 _NEEDS_MULTI = pytest.mark.skipif(
@@ -311,6 +312,60 @@ class TestJoins:
             assert len(rows) == 6, f"expected 6 cross-product rows, got {len(rows)}"
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
+
+    def test_inner_join_differential_oracle(self, client):
+        """Lock-in: the canonical two-distinct-table inner join, checked against
+        the from-scratch oracle after each epoch (validates the oracle against a
+        known-good path)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amount BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, cname BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS "
+                "SELECT orders.id AS oid, orders.amount AS amt, "
+                "customers.id AS cid, customers.cname AS cname "
+                "FROM orders JOIN customers ON orders.cid = customers.id",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["oid", "amt", "cid", "cname"]
+            orders, customers = {}, {}
+
+            def expected():
+                return oracle.oracle_equijoin(
+                    left=orders, lwhere=None, lkey="cid", lproj=["id", "amount"],
+                    right=customers, rwhere=None, rkey="id", rproj=["id", "cname"],
+                    out_cols=project,
+                )
+
+            def check(ctx):
+                oracle.assert_view_matches(client, vid, project, expected(), ctx=ctx)
+
+            client.execute_sql("INSERT INTO customers VALUES (10, 111), (20, 222)", schema_name=sn)
+            oracle.apply_insert(customers, "id", [{"id": 10, "cname": 111}, {"id": 20, "cname": 222}])
+            check("after-customers")
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300)", schema_name=sn)
+            oracle.apply_insert(orders, "id", [
+                {"id": 1, "cid": 10, "amount": 100},
+                {"id": 2, "cid": 20, "amount": 200},
+                {"id": 3, "cid": 10, "amount": 300}])
+            check("after-orders")
+
+            client.execute_sql("DELETE FROM customers WHERE id = 10", schema_name=sn)
+            oracle.apply_delete(customers, "id", [10])
+            check("after-delete-customer")
+        finally:
+            _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
 
     @_NEEDS_MULTI
     def test_inner_join_wide_u64_pks_multiworker(self, client):

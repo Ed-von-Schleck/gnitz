@@ -1765,6 +1765,56 @@ fn build_plan(
         next_reg += 1;
     }
 
+    // Destructive-register ordering invariant. `Union`, `Distinct`, and `Delay`
+    // destructively empty their PORT_IN register (std::mem::replace/swap with an
+    // empty batch) to avoid allocation; the trace-absent `AntiJoin(DeltaTrace)`
+    // branch does the same to its PORT_IN_A delta input. Every node has one
+    // output register shared by all consumers, so a register that fans into both
+    // a non-destructive reader (e.g. integrate_trace) and a destructive consumer
+    // is only correct if the destructive op runs *last* among that register's
+    // consumers. The Kahn scheduler happens to order them that way today; nothing
+    // enforces it. Pin the invariant so a future planner shape (or a hand-built
+    // circuit) that schedules the destructive consumer first fails loudly in
+    // debug/test instead of silently dropping the other reader's batch.
+    #[cfg(debug_assertions)]
+    {
+        // Schedule position within THIS compiled slice (exchange views compile
+        // sub-slices, so index `ordered`, not loaded.ordered).
+        let pos: HashMap<i32, usize> =
+            ordered.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
+
+        for &nid in ordered {
+            // Ops that destructively empty an input register, and the port they
+            // empty. (Union's in_a and AntiJoinDT's delta side are both
+            // PORT_IN_A == PORT_IN.)
+            let dtor_port = match loaded.nodes.get(&nid) {
+                Some(gnitz_wire::OpNode::Distinct)
+                | Some(gnitz_wire::OpNode::Union)
+                | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
+                Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::JoinKind::DeltaTrace)) => Some(PORT_IN_A),
+                _ => None,
+            };
+            let Some(port) = dtor_port else { continue };
+
+            let Some(in_edges) = loaded.incoming.get(&nid) else { continue };
+            let Some(&(pred, _)) = in_edges.iter().find(|&&(_, p)| p == port) else { continue };
+            let Some(co_readers) = loaded.consumers.get(&pred) else { continue };
+            let Some(&dtor_pos) = pos.get(&nid) else { continue };
+
+            for &other in co_readers {
+                if other == nid { continue; }
+                if let Some(&other_pos) = pos.get(&other) {
+                    debug_assert!(
+                        other_pos < dtor_pos,
+                        "destructive op {nid} empties node {pred}'s register, but co-consumer \
+                         {other} is scheduled after it ({other_pos} >= {dtor_pos}); \
+                         non-destructive readers must precede the destructive consumer",
+                    );
+                }
+            }
+        }
+    }
+
     let mut extra_regs = 0;
     for &nid in ordered {
         let op = loaded.nodes.get(&nid);
@@ -3030,6 +3080,73 @@ mod tests {
             fold_finalize: HashMap::new(),
             folded_maps:   HashMap::new(),
         }
+    }
+
+    // ── §5: destructive-register ordering invariant ─────────────────────────
+    //
+    // Union/Distinct/Delay (and the trace-absent AntiJoin(DeltaTrace)) empty
+    // their input register in place. When that register fans out to other
+    // consumers, the destructive op must be scheduled LAST among them, or the
+    // co-readers see an emptied batch. build_plan pins this with a debug assert.
+
+    /// Build the INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans
+    /// into both a destructive `Distinct` and a non-destructive `Filter`
+    /// co-reader (standing in for integrate_trace); the Distinct feeds the
+    /// IntegrateSink at node 3. Caller picks `distinct_id`/`filter_id` — Kahn's
+    /// ascending tie-break schedules the lower id first, so the ids decide which
+    /// consumer the scheduler runs first.
+    fn make_dtor_fanout(distinct_id: i32, filter_id: i32) -> LoadedCircuit {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(distinct_id, gnitz_wire::OpNode::Distinct);
+        nodes.insert(filter_id, gnitz_wire::OpNode::Filter(None));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, distinct_id, PORT_IN),
+            (0, filter_id, PORT_IN),
+            (distinct_id, 3, PORT_IN),
+        ];
+        make_loaded(nodes, edges)
+    }
+
+    #[test]
+    fn test_destructive_fanout_legit_ordering_compiles() {
+        // Distinct id 2 > Filter id 1, so the destructive op is scheduled LAST:
+        // the assert must NOT fire and the circuit compiles end to end.
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{}/dtor_legit_{}", base, std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+
+        let loaded = make_dtor_fanout(2, 1);
+        // Precondition: the destructive Distinct really is scheduled after its co-reader.
+        let pos = |n: i32| loaded.ordered.iter().position(|&x| x == n).unwrap();
+        assert!(pos(1) < pos(2), "test precondition: co-reader must precede Distinct");
+
+        let ext = [ExternalTable { table_id: 10, schema: two_col_schema() }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, &view_dir, 0, 1, Some(3), &[], vec![],
+        );
+        let _ = std::fs::remove_dir_all(&view_dir);
+        assert!(result.is_some(),
+            "legitimate destructive fan-out must compile without tripping the ordering assert");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-destructive readers must precede the destructive consumer")]
+    fn test_destructive_fanout_bad_ordering_panics() {
+        // Distinct id 1 < Filter id 2, so the ascending tie-break schedules the
+        // destructive op FIRST — it would empty ScanDelta's register before the
+        // Filter reads it. The §5 debug invariant must catch this before emission.
+        let loaded = make_dtor_fanout(1, 2);
+        let ext = [ExternalTable { table_id: 10, schema: two_col_schema() }];
+        let ordered = loaded.ordered.clone();
+        let _ = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 1, Some(3), &[], vec![],
+        );
     }
 
     // ── ScanTrace join-trace-side: no add_scan_trace when feeding port=1 ──

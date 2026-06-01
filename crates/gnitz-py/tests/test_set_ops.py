@@ -5,6 +5,7 @@ Run:
 """
 import random
 import gnitz
+import _oracle as oracle
 
 def _uid():
     return str(random.randint(100000, 999999))
@@ -345,6 +346,72 @@ class TestSetOps:
                 except Exception:
                     pass
             client.drop_schema(sn)
+
+
+class TestSetOpsDifferential:
+    """Lock-in: the two-distinct-table set-ops, projected on `val` so dedup and
+    weight actually matter, checked against the from-scratch oracle after each
+    epoch (validates the oracle against the known-good two-table path)."""
+
+    def _setup(self, client, sn, op):
+        client.execute_sql(
+            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+        client.execute_sql(
+            f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name=sn)
+        return client.resolve_table(sn, "v")[0]
+
+    def _run(self, client, op):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            vid = self._setup(client, sn, op)
+            a_state, b_state = {}, {}
+
+            def check(ctx):
+                left = oracle.oracle_filter_project(a_state, None, ["val"])
+                right = oracle.oracle_filter_project(b_state, None, ["val"])
+                exp = oracle.oracle_setop(op, left, right)
+                oracle.assert_view_matches(client, vid, ["val"], exp, ctx=ctx)
+
+            # Overlapping values across the two tables so dedup/weight matters.
+            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
+            oracle.apply_insert(a_state, "pk", [
+                {"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}])
+            check(f"{op} after-a")
+
+            client.execute_sql("INSERT INTO b VALUES (4, 20), (5, 30), (6, 40)", schema_name=sn)
+            oracle.apply_insert(b_state, "pk", [
+                {"pk": 4, "val": 20}, {"pk": 5, "val": 30}, {"pk": 6, "val": 40}])
+            check(f"{op} after-b")
+
+            client.execute_sql("DELETE FROM b WHERE pk = 4", schema_name=sn)
+            oracle.apply_delete(b_state, "pk", [4])
+            check(f"{op} after-delete-b")
+
+            client.execute_sql("UPDATE a SET val = 99 WHERE pk = 1", schema_name=sn)
+            oracle.apply_update(a_state, "pk", 1, {"val": 99})
+            check(f"{op} after-update-a")
+        finally:
+            for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
+                try:
+                    client.execute_sql(sql, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
+    def test_except_differential(self, client):
+        self._run(client, "EXCEPT")
+
+    def test_intersect_differential(self, client):
+        self._run(client, "INTERSECT")
+
+    def test_union_differential(self, client):
+        self._run(client, "UNION")
+
+    def test_union_all_differential(self, client):
+        self._run(client, "UNION ALL")
 
 
 class TestSetOpNullability:
