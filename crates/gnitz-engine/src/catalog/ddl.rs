@@ -167,7 +167,7 @@ impl CatalogEngine {
             }
         }
 
-        let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, table_name, tid);
+        let directory = table_dir(&self.base_dir, schema_name, table_name, tid);
         let flags = if unique_pk { TABLETAB_FLAG_UNIQUE_PK } else { 0 };
 
         // Write columns first (table hook reads them via sys_columns)

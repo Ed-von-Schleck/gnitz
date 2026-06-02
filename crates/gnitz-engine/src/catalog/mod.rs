@@ -60,6 +60,8 @@ use sys_tables::*;
 pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
 pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_name,
                        make_fk_index_name, FK_INDEX_INFIX, make_secondary_index_name, ingest_batch_into,
+                       schema_dir, table_dir, view_dir, index_dir,
+                       is_index_dir_name, is_table_dir_name, subdir_names,
                        ensure_dir, fsync_dir,
                        get_index_key_type, make_index_schema,
                        cursor_read_u64, cursor_read_string,

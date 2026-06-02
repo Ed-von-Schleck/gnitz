@@ -395,8 +395,8 @@ impl CatalogEngine {
         Self::remove_queued_dirs(std::mem::take(&mut self.checkpoint_gated_deletions));
     }
 
-    /// Cancel a pending checkpoint-gated removal of `dir`. Required when an
-    /// entity whose on-disk path is *name-based* (not `<name>_<tid>`) is
+    /// Cancel a pending removal of `dir` from *both* deletion queues. Required
+    /// when an entity whose on-disk path is *name-based* (not `<name>_<tid>`) is
     /// recreated before the gating checkpoint drains the queue: only schemas
     /// have name-based paths (`<base>/<schema>`), so a `DROP SCHEMA s` +
     /// `CREATE SCHEMA s` would otherwise leave `<base>/s` queued, and the next
@@ -404,8 +404,119 @@ impl CatalogEngine {
     /// new table beneath it. Tables/indices encode a monotonic tid in their
     /// path, so a recreate never collides with a gated entry and needs no
     /// cancellation.
+    ///
+    /// Both queues are filtered: in normal operation the DROP and CREATE are
+    /// separate DDL RPCs, so the DROP's entry was already moved to the gated
+    /// queue by its own `defer` and clearing `pending_dir_deletions` is a no-op.
+    /// During SAL recovery, however, a replayed `DROP s` and a replayed
+    /// `CREATE s` land in the *same* `pending_dir_deletions` with no intervening
+    /// `defer`; the CREATE's own pre-stage `truncate` removes only its push and
+    /// leaves the DROP's `<base>/s` — the live, recreated path — in the queue.
+    /// Clearing it here lets the recreating hook reclaim that residue before the
+    /// boot-time `gc_orphan_directories` drain (or any later checkpoint) can
+    /// `remove_dir_all` the live schema and the tables beneath it.
     pub fn cancel_gated_deletion(&mut self, dir: &str) {
         self.checkpoint_gated_deletions.retain(|d| d != dir);
+        self.pending_dir_deletions.retain(|d| d != dir);
+    }
+
+    /// Remove table, view, and index directories on disk that belong to no live
+    /// entity — the residue of a DROP whose checkpoint-gated deletion was lost to
+    /// a crash before the next checkpoint drained it. Best-effort: a failure to
+    /// remove one orphan is logged and never aborts recovery.
+    ///
+    /// Two reclamation mechanisms run here:
+    /// - A schema-scoped path scan removes orphan table/view/index dirs under
+    ///   every live schema (the drop-flushed-but-gating-checkpoint-missed window,
+    ///   where the entity is absent from both the shard scan and the SAL, so
+    ///   nothing re-queues its dir).
+    /// - A `drain_pending_dir_deletions` removes every dir that SAL replay
+    ///   re-queued (the drop-committed-to-SAL-but-unflushed window), including a
+    ///   dropped schema subtree the path scan cannot reach because the schema is
+    ///   gone from `schema_by_id`.
+    ///
+    /// Must run only after BOTH shard replay (`replay_catalog`) and SAL replay
+    /// (`recover_system_tables_from_sal`) have populated `dag.tables`; otherwise a
+    /// table whose CREATE committed to the SAL but was not yet flushed would be
+    /// absent from `dag.tables` and its live directory wrongly deleted.
+    ///
+    /// Requires the `cancel_gated_deletion` fix that also clears
+    /// `pending_dir_deletions`; without it the drain could remove a recreated
+    /// same-name schema whose live path SAL replay left in the queue.
+    pub(crate) fn gc_orphan_directories(&mut self) {
+        // Full on-disk path of every live table/view (user + system).
+        let live_tables: rustc_hash::FxHashSet<&str> =
+            self.dag.tables.values().map(|e| e.directory.as_str()).collect();
+
+        // Full on-disk path of every live index: `<owner_dir>/idx_<idx_id>`.
+        let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        for (owner_id, idx_ids) in &self.caches.indices_by_owner {
+            if let Some(owner) = self.dag.tables.get(owner_id) {
+                for idx_id in idx_ids {
+                    live_indices.insert(index_dir(&owner.directory, *idx_id));
+                }
+            }
+        }
+
+        // Scan only schemas the catalog knows about. We never enumerate
+        // `base_dir` for unknown directories: a schema path is an arbitrary user
+        // name with no structural marker (`<base>/<schema>`), so removing an
+        // unrecognized entry could wipe unrelated host data if base_dir is
+        // shared. The real system catalog (`<base>/_system_catalog`) is never a
+        // registered schema name, so it is never reached; the `_system`/`public`
+        // logical-schema dirs are scanned but the system tables live under
+        // `_system_catalog`, so nothing system-owned is ever a candidate.
+        for schema_name in self.caches.schema_by_id.values() {
+            let schema_dir = schema_dir(&self.base_dir, schema_name);
+            for name in subdir_names(&schema_dir) {
+                let full = format!("{}/{}", schema_dir, name);
+
+                if live_tables.contains(full.as_str()) {
+                    // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
+                    // a standalone DROP INDEX whose gated deletion was lost to a
+                    // crash.
+                    for idx_name in subdir_names(&full) {
+                        if !is_index_dir_name(&idx_name) {
+                            continue;
+                        }
+                        let idx_full = format!("{}/{}", full, idx_name);
+                        if live_indices.contains(&idx_full) {
+                            continue;
+                        }
+                        match std::fs::remove_dir_all(&idx_full) {
+                            Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
+                            Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
+                        }
+                    }
+                    continue;
+                }
+
+                // Defense in depth: only `<something>_<digits>` dirs — the shape
+                // of table (`<name>_<tid>`) and view (`view_<name>_<vid>`)
+                // creation — are eligible for removal. Never touch an unexpected
+                // entry. The only component that writes a directory directly
+                // under a schema dir is table/view creation, so a table-shaped
+                // name absent from `live_tables` is necessarily an orphaned drop.
+                if !is_table_dir_name(&name) {
+                    continue;
+                }
+                match std::fs::remove_dir_all(&full) {
+                    Ok(()) => gnitz_debug!("recovery: removed orphan table/view dir {}", full),
+                    Err(e) => gnitz_debug!("recovery: failed to remove orphan dir {}: {}", full, e),
+                }
+            }
+        }
+
+        // SAL replay of any DROP fired hooks that re-pushed the dropped directory
+        // onto `pending_dir_deletions` (the committed-but-unflushed crash window).
+        // The schema-scoped scan above already removed the orphans under live
+        // schemas, but a dropped *schema*'s subtree is unreachable by that scan
+        // (the schema is gone from `schema_by_id`). Physically remove everything
+        // the replay re-queued so those dirs are reclaimed and no recovery residue
+        // is carried into the first DDL/checkpoint. Safe because the
+        // `cancel_gated_deletion` fix guarantees no recreated same-name (live)
+        // schema path survives in the queue.
+        self.drain_pending_dir_deletions();
     }
 
     // -----------------------------------------------------------------------

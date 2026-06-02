@@ -92,7 +92,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let name = self.read_batch_string(batch, i, 0);
-            let path = format!("{}/{}", self.base_dir, name);
+            let path = schema_dir(&self.base_dir, &name);
             if weight > 0 {
                 // A prior DROP SCHEMA may have queued this exact (name-based)
                 // path for checkpoint-gated removal; recreating it now must
@@ -156,7 +156,7 @@ impl CatalogEngine {
                 }
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid);
+                let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
                 let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
 
                 let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
@@ -177,7 +177,7 @@ impl CatalogEngine {
                 // Success: remove the pre-staged entry.
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
-                fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
+                fsync_dir(&schema_dir(&self.base_dir, &schema_name));
                 self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, 0, is_unique, directory);
                 if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
             } else if self.dag.tables.contains_key(&tid) {
@@ -266,7 +266,7 @@ impl CatalogEngine {
                 }
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = format!("{}/{}/view_{}_{}", self.base_dir, schema_name, name, vid);
+                let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
                 let view_schema = self.build_schema_from_col_defs(&col_defs, &[0]);
 
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
@@ -371,7 +371,7 @@ impl CatalogEngine {
 
                 let owner_dir = self.dag.tables.get(&owner_id)
                     .map(|e| e.directory.clone()).unwrap_or_default();
-                let idx_dir = format!("{}/idx_{}", owner_dir, idx_id);
+                let idx_dir = index_dir(&owner_dir, idx_id);
 
                 // Pre-stage before Table::new so that if backfill_index fails the
                 // directory is in pending_dir_deletions for cleanup. Truncate only
@@ -401,7 +401,7 @@ impl CatalogEngine {
                     let owner_dir = self.dag.tables.get(&owner_id)
                         .map(|e| e.directory.clone()).unwrap_or_default();
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
-                    self.pending_dir_deletions.push(format!("{}/idx_{}", owner_dir, idx_id));
+                    self.pending_dir_deletions.push(index_dir(&owner_dir, idx_id));
                 }
             }
         }

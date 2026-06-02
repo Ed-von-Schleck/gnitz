@@ -324,6 +324,13 @@ pub fn server_main(
         let catalog = unsafe { &mut *catalog_ptr };
         recover_system_tables_from_sal(sal_ptr as *const u8, catalog);
         catalog.flush_all_system_tables();
+
+        // Reclaim table/view/index directories whose DROP committed but whose
+        // deferred deletion was lost to a crash before the next checkpoint.
+        // Runs only now that both shard replay and SAL replay have populated
+        // dag.tables, so a SAL-committed-but-unflushed CREATE is not mistaken
+        // for an orphan.
+        catalog.gc_orphan_directories();
     }
 
     // --- W2M regions (memfd-backed, one per worker→master) ---

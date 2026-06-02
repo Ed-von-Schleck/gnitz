@@ -184,6 +184,65 @@ pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 }
 
 // ---------------------------------------------------------------------------
+// On-disk directory naming conventions
+//
+// Every entity directory is *built* and *parsed back* here, so the creation
+// hooks and the boot-time orphan sweep (`gc_orphan_directories`) can never
+// disagree on the shape. Each `*_dir` builder has a matching `is_*_dir_name`
+// recognizer where the sweep needs to classify an on-disk name.
+// ---------------------------------------------------------------------------
+
+/// `<base_dir>/<schema_name>` — a schema's directory. Name-based (no id): a
+/// DROP+CREATE of the same schema name reuses the path, which is why recreation
+/// must cancel a pending deletion of it.
+pub(crate) fn schema_dir(base_dir: &str, schema_name: &str) -> String {
+    format!("{}/{}", base_dir, schema_name)
+}
+
+/// `<base_dir>/<schema_name>/<name>_<tid>` — a table's directory.
+pub(crate) fn table_dir(base_dir: &str, schema_name: &str, name: &str, tid: i64) -> String {
+    format!("{}/{}/{}_{}", base_dir, schema_name, name, tid)
+}
+
+/// `<base_dir>/<schema_name>/view_<name>_<vid>` — a view's directory.
+pub(crate) fn view_dir(base_dir: &str, schema_name: &str, name: &str, vid: i64) -> String {
+    format!("{}/{}/view_{}_{}", base_dir, schema_name, name, vid)
+}
+
+/// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.
+pub(crate) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
+    format!("{}/idx_{}", owner_dir, idx_id)
+}
+
+/// True if `name` is shaped like an index directory (`idx_<digits>`).
+pub(crate) fn is_index_dir_name(name: &str) -> bool {
+    name.strip_prefix("idx_").is_some_and(has_numeric_id)
+}
+
+/// True if `name` is shaped like a table or view directory — both end in
+/// `_<digits>` (`<name>_<tid>` and `view_<name>_<vid>` respectively).
+pub(crate) fn is_table_dir_name(name: &str) -> bool {
+    name.rsplit_once('_').is_some_and(|(_, id)| has_numeric_id(id))
+}
+
+/// A directory-name id component: non-empty and all ASCII digits.
+fn has_numeric_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Immediate sub-directory names of `path`. Empty if `path` is missing or
+/// unreadable — both mean "nothing to scan" for the orphan sweep. Non-directory
+/// entries are skipped.
+pub(crate) fn subdir_names(path: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Free function: ingest a batch into a table (avoids borrow conflicts)
 // ---------------------------------------------------------------------------
 
