@@ -38,6 +38,16 @@ fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
     run.find_lower_bound_bytes(key)
 }
 
+/// Iterator over the run-row indices whose PK equals `key`. Runs are PK-sorted,
+/// so exact matches form one contiguous range beginning at the lower bound;
+/// iteration is lazy and stops at the first non-matching row, visiting only the
+/// matching rows. Factors out the per-run exact-match scan shared by every PK
+/// lookup so callers never re-derive the bound check or the index step.
+fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    let start = run_exact_match_start_bytes(run, key);
+    (start..run.count).take_while(move |&lo| run.get_pk_bytes(lo) == key)
+}
+
 /// Merge N sorted MemBatch views into a single consolidated Batch.
 fn consolidate_batches(
     batches: &[SortedMemBatch],
@@ -73,6 +83,9 @@ pub struct MemTable {
     found_run: usize,
     found_row: usize,
     has_found: bool,
+    // Reused (run, row, weight) scratch for `find_positive_payload_row_bytes`;
+    // cleared per call and kept across calls so that path never allocates.
+    cand_scratch: Vec<(usize, usize, i64)>,
 }
 
 impl MemTable {
@@ -88,6 +101,7 @@ impl MemTable {
             found_run: 0,
             found_row: 0,
             has_found: false,
+            cand_scratch: Vec::new(),
         }
     }
 
@@ -201,8 +215,7 @@ impl MemTable {
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_exact_match_start_bytes(run, key);
-            while lo < run.count && run.get_pk_bytes(lo) == key {
+            for lo in run_pk_match_rows(run, key) {
                 total_w += run.get_weight(lo);
                 if !self.has_found {
                     self.found_run = ri;
@@ -210,7 +223,6 @@ impl MemTable {
                     self.has_found = true;
                 }
                 row_count += 1;
-                lo += 1;
             }
         }
 
@@ -257,15 +269,13 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            let mut lo = run_exact_match_start_bytes(run, key);
-            while lo < run.count && run.get_pk_bytes(lo) == key {
+            for lo in run_pk_match_rows(run, key) {
                 let ord = columnar::compare_rows(
                     &self.schema, run.as_ref(), lo, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
                     total_w += run.get_weight(lo);
                 }
-                lo += 1;
             }
         }
 
@@ -283,9 +293,77 @@ impl MemTable {
     /// across all runs, keyed by OPK `key` bytes. Sets
     /// `found_run`/`found_row`/`has_found` on success.
     pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
+        self.has_found = false;
+
+        // Pass 1 — one binary search per run; collect every (run, row, weight)
+        // whose PK matches into `cand_scratch`. This is the only scan of the
+        // runs. The buffer is reused across calls (cleared, capacity retained),
+        // so this path allocates only while warming up to its high-water mark.
+        //
+        // Candidate count C is structurally bounded: `retract_pk_bytes` reaches
+        // this only when a PK has multiple un-consolidated memtable rows, runs
+        // are capped at `INLINE_CONSOLIDATE_THRESHOLD - 1` before a merge, and
+        // each run is `(PK, payload)`-consolidated, so a PK adds at most a
+        // retract+insert pair per run — hence `C ≤ 2R < 2·INLINE_CONSOLIDATE_-
+        // THRESHOLD` (~30). C only approaches that bound for a key re-updated on
+        // nearly every un-consolidated run; absent that it stays small. A
+        // `ConsolidatedBatch` folds only by (PK, payload), so the synthetic
+        // multi-payload case exceeds even 2R — the growable buffer absorbs any C.
+        self.cand_scratch.clear();
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run_exact_match_start_bytes(run, key);
-            while lo < run.count && run.get_pk_bytes(lo) == key {
+            for lo in run_pk_match_rows(run, key) {
+                self.cand_scratch.push((ri, lo, run.get_weight(lo)));
+            }
+        }
+
+        // Pass 2 — group equal payloads via `== Equal` and return the first group
+        // (in run order) whose weights net strictly positive. Only equality is
+        // needed, matching the replaced code; the result never depends on
+        // `compare_rows` being a total order. Skipping an already-grouped payload
+        // (the `already_grouped` check) is load-bearing for correctness, not just
+        // speed: a later candidate whose own weight is positive but whose full
+        // group nets ≤ 0 must not be returned. Entries are `Copy`, so indexing
+        // copies each tuple out and never holds a borrow on `cand_scratch`.
+        for i in 0..self.cand_scratch.len() {
+            let (ri, row, w0) = self.cand_scratch[i];
+            // Skip a payload already evaluated by an earlier candidate.
+            let already_grouped = self.cand_scratch[..i].iter().any(|&(rj, rowj, _)| {
+                columnar::compare_rows(
+                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rj].as_ref(), rowj,
+                ) == Ordering::Equal
+            });
+            if already_grouped {
+                continue;
+            }
+            let mut net = w0;
+            for k in i + 1..self.cand_scratch.len() {
+                let (rk, rowk, wk) = self.cand_scratch[k];
+                if columnar::compare_rows(
+                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rk].as_ref(), rowk,
+                ) == Ordering::Equal
+                {
+                    net += wk;
+                }
+            }
+            if net > 0 {
+                self.found_run = ri;
+                self.found_row = row;
+                self.has_found = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Pre-rewrite per-candidate re-scan, retained only as the micro-benchmark
+    /// baseline (see `memtable_find_positive_payload_row_bench`). Each
+    /// PK-matching candidate re-scans every run via `find_weight_for_row_bytes`;
+    /// the production function above replaced this with a single grouping pass.
+    /// Selects the same row, so the bench can assert the two agree before timing.
+    #[cfg(test)]
+    fn find_positive_payload_row_rescan_baseline(&mut self, key: &[u8]) -> bool {
+        for (ri, run) in self.runs.iter().enumerate() {
+            for lo in run_pk_match_rows(run, key) {
                 let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
                 if net_w > 0 {
                     self.found_run = ri;
@@ -293,7 +371,6 @@ impl MemTable {
                     self.has_found = true;
                     return true;
                 }
-                lo += 1;
             }
         }
         self.has_found = false;
@@ -958,6 +1035,236 @@ mod tests {
 
         assert!(!mt.find_positive_payload_row_bytes(&42u64.to_be_bytes()));
         assert!(!mt.has_found);
+    }
+
+    /// One payload for a PK spread across three runs as (+1), (-1), (+1) —
+    /// net +1 — interleaved with filler PKs. Exercises the single-pass
+    /// cross-run grouping: the live group's members live in non-adjacent runs,
+    /// and the middle retraction must be summed into the group, not treated as
+    /// a separate cancelled payload. Cross-checks the per-group net against the
+    /// `lookup_pk_bytes` PK aggregate (equal here, since PK 10 has one payload).
+    #[test]
+    fn test_find_positive_payload_row_cross_run_grouping() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Run 0: filler PK 5, then PK 10 payload 100 (+1)
+        mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50), (10, 1, 100)])).unwrap();
+        // Run 1: PK 10 payload 100 (-1), filler PK 20
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, -1, 100), (20, 1, 200)])).unwrap();
+        // Run 2: PK 10 payload 100 (+1), filler PK 30
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 100), (30, 1, 300)])).unwrap();
+        assert_eq!(mt.runs.len(), 3, "three un-consolidated runs");
+
+        let pk10 = 10u64.to_be_bytes();
+        let found = mt.find_positive_payload_row_bytes(&pk10);
+        assert!(found, "payload 100 nets +1 across the three runs");
+        assert!(mt.has_found);
+
+        // Found row decodes the live payload (100).
+        let col_ptr = mt.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 100, "found row should decode the live payload");
+
+        // Cross-check: PK 10 has a single payload, so its PK aggregate equals
+        // the winning group's net weight (+1). (Call after the found-row reads,
+        // since lookup_pk_bytes also mutates found_run/found_row.)
+        let (w, agg_found, row_count) = mt.lookup_pk_bytes(&pk10);
+        assert_eq!(w, 1, "PK aggregate matches the winning group's net (+1)");
+        assert!(agg_found);
+        assert_eq!(row_count, 3, "three rows across runs match PK 10");
+    }
+
+    /// Found-index contract: after a hit, the `found_run`/`found_row` indices
+    /// must address the row of the winning group — even when an *earlier* run
+    /// holds a fully-cancelled payload, so the winning group's first member is
+    /// in a later run (found_run != 0). Guards that `found_col_ptr` /
+    /// `found_null_word` read the live row, not the cancelled one.
+    #[test]
+    fn test_find_positive_payload_row_found_index_validity() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Run 0: PK 10 payload 100 (+1)  ── cancelled by run 1
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 100)])).unwrap();
+        // Run 1: PK 10 payload 100 (-1)  ── group {100} nets 0
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, -1, 100)])).unwrap();
+        // Run 2: PK 10 payload 200 (+1)  ── the lone live group
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 200)])).unwrap();
+
+        let pk10 = 10u64.to_be_bytes();
+        assert!(mt.find_positive_payload_row_bytes(&pk10));
+        assert!(mt.has_found);
+        assert_eq!(mt.found_run, 2, "winning group's first member is in run 2");
+        assert_eq!(mt.found_row, 0);
+
+        // Payload column is non-null in the fixture, so the null word is 0 and
+        // the decoded value is the live payload (200), not the cancelled 100.
+        assert_eq!(mt.found_null_word(), 0);
+        let col_ptr = mt.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 200);
+    }
+
+    /// Defensive structural guard (synthetic): two *distinct* payloads for one
+    /// PK that both net positive, seeded directly via `upsert_sorted_batch`.
+    /// This state is unreachable through the unique-PK DML path (which keeps at
+    /// most one live payload per PK), so this is NOT a regression guard for a
+    /// real divergence — it only pins that the rewrite returns *a* positive
+    /// group's payload and is internally consistent (the returned payload's own
+    /// net weight is strictly positive).
+    #[test]
+    fn test_find_positive_payload_row_multi_positive_structural() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Two distinct payloads for PK 10, each net +1.
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 100)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 200)])).unwrap();
+
+        let pk10 = 10u64.to_be_bytes();
+        assert!(mt.find_positive_payload_row_bytes(&pk10));
+        assert!(mt.has_found);
+
+        // Returned row decodes one of the two positive payloads...
+        let col_ptr = mt.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert!(val == 100 || val == 200, "found a positive group's payload");
+
+        // ...and that payload's group genuinely nets strictly positive (internal
+        // consistency: the found row is not a cancelled or zero-net group).
+        let ref_batch = make_batch(&schema, &[(10, 1, val)]);
+        assert!(mt.find_weight_for_row_bytes(&pk10, &*ref_batch, 0) > 0);
+    }
+
+    /// Build a run from `(pk, weight, payload)` triples in any order, sorting by
+    /// PK first so the run's binary-search invariant holds.
+    fn make_run(schema: &SchemaDescriptor, mut rows: Vec<(u64, i64, i64)>) -> ConsolidatedBatch {
+        rows.sort_by_key(|&(pk, _, _)| pk);
+        make_batch(schema, &rows)
+    }
+
+    /// Construct a memtable with `r` runs in which one hot PK has `c` candidate
+    /// rows spread as `c/2` cancelling `(+1,-1)` pairs across the runs (so every
+    /// payload group nets 0 and a lookup scans all `c` candidates — the
+    /// full-scan worst case). Each run also carries `filler` distinct PKs below
+    /// the hot PK plus a sentinel above it, so the per-run binary search for the
+    /// hot PK runs fully even in runs holding no hot row (modelling the re-scan
+    /// visiting every run). `c` must be even and `c ≤ 2r`; `r` stays below the
+    /// inline-consolidate threshold so the runs are not merged.
+    fn build_bench_memtable(r: usize, c: usize, filler: usize) -> MemTable {
+        assert!(c.is_multiple_of(2), "bench uses cancelling pairs; C must be even");
+        assert!(c <= 2 * r, "each batch adds at most a +/- pair per PK");
+        assert!((2..INLINE_CONSOLIDATE_THRESHOLD).contains(&r), "R below merge threshold");
+        const HOT: u64 = 1_000_000;
+        const SENTINEL_HI: u64 = HOT + 1; // keeps HOT inside every run's [min,max]
+
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 16 << 20);
+
+        let mut run_rows: Vec<Vec<(u64, i64, i64)>> = (0..r)
+            .map(|ri| {
+                let mut v: Vec<(u64, i64, i64)> = (0..filler as u64)
+                    .map(|f| (f, 1i64, ri as i64 * 100 + f as i64))
+                    .collect();
+                v.push((SENTINEL_HI, 1, 7));
+                v
+            })
+            .collect();
+
+        // Distinct payload per pair → each pair is one zero-net group; the two
+        // halves land in different runs, so no run holds a duplicate (PK,payload).
+        for j in 0..c / 2 {
+            let payload = 5000 + j as i64;
+            run_rows[(2 * j) % r].push((HOT, 1, payload));
+            run_rows[(2 * j + 1) % r].push((HOT, -1, payload));
+        }
+
+        for rows in run_rows {
+            mt.upsert_sorted_batch(make_run(&schema, rows)).unwrap();
+        }
+        assert_eq!(mt.runs.len(), r, "runs must not inline-consolidate below threshold");
+        mt
+    }
+
+    /// Micro-benchmark: pre-rewrite per-candidate re-scan vs single-pass
+    /// grouping. Ignored by default; run with:
+    ///
+    /// ```text
+    /// cargo test -p gnitz-engine --release memtable_find_positive_payload_row_bench \
+    ///     -- --ignored --nocapture --test-threads=1
+    /// ```
+    ///
+    /// Sweeps `C` independently of `R`. The headline `C = 2` is one
+    /// un-consolidated UPDATE delta (a retract+insert pair) over
+    /// `R ∈ {2,4,8,15}` — the gap there tracks `(1+C)` in re-scan count. The
+    /// `C ≈ R` points stress a key re-updated on nearly every un-consolidated
+    /// run; `INLINE_CONSOLIDATE_THRESHOLD` caps `R` at 15, so `C` cannot exceed
+    /// `2R` (~30) before a merge folds the cancelling pairs.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn memtable_find_positive_payload_row_bench() {
+        use std::time::Instant;
+        const ITERS: usize = 1_000_000;
+        const FILLER: usize = 64;
+        let hot = 1_000_000u64.to_be_bytes();
+
+        let points: &[(usize, usize, &str)] = &[
+            (2, 2, "headline C=2"),
+            (4, 2, "headline C=2"),
+            (8, 2, "headline C=2"),
+            (15, 2, "headline C=2"),
+            (8, 8, "stress C≈R"),
+            (15, 14, "stress C≈R"),
+        ];
+
+        println!("\nfind_positive_payload_row_bytes — re-scan baseline vs single-pass");
+        println!("  (all-cancelled full-scan worst case; {FILLER} filler PKs/run, {ITERS} iters)");
+        println!(
+            "  {:>3} {:>3}  {:>13}  {:>13}  {:>8}  point",
+            "R", "C", "baseline ns", "single ns", "speedup"
+        );
+        for &(r, c, label) in points {
+            let mut mt = build_bench_memtable(r, c, FILLER);
+
+            // Both algorithms select the same result (false here); pin it once.
+            assert_eq!(
+                mt.find_positive_payload_row_rescan_baseline(&hot),
+                mt.find_positive_payload_row_bytes(&hot),
+                "baseline and single-pass must agree (R={r}, C={c})",
+            );
+
+            for _ in 0..2_000 {
+                std::hint::black_box(mt.find_positive_payload_row_rescan_baseline(&hot));
+                std::hint::black_box(mt.find_positive_payload_row_bytes(&hot));
+            }
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                std::hint::black_box(mt.find_positive_payload_row_rescan_baseline(&hot));
+            }
+            let base_ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            let t1 = Instant::now();
+            for _ in 0..ITERS {
+                std::hint::black_box(mt.find_positive_payload_row_bytes(&hot));
+            }
+            let single_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            println!(
+                "  {r:>3} {c:>3}  {base_ns:>13.2}  {single_ns:>13.2}  {:>7.2}x  {label}",
+                base_ns / single_ns,
+            );
+        }
     }
 
     #[test]
