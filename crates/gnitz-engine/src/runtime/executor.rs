@@ -21,7 +21,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
-                     TABLE_TAB_ID, IDX_TAB_ID};
+                     TABLE_TAB_ID, IDX_TAB_ID,
+                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE};
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
@@ -1005,6 +1006,44 @@ async fn handle_system_dml(
     // post-fsync drain.)
     let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
 
+    // Pre-flight global uniqueness for every CREATE of a unique secondary index
+    // BEFORE reserving the zone LSN or mutating the catalog, so a violation needs
+    // no rollback — it just surfaces to the client. Uniqueness is a global
+    // property, but the per-worker `backfill_index` scan only sees a single
+    // partition: a within-partition duplicate would fatally `_exit` every
+    // affected worker via the DdlSync path, and a cross-partition duplicate would
+    // be silently accepted. Validating across all workers on the master here
+    // catches both and never broadcasts on failure, so no worker reaches that
+    // fatal path. Routing every unique-index `+1` through this one branch makes
+    // it the single choke point (standalone CREATE UNIQUE INDEX or an inline
+    // unique constraint that lowers to an IDX_TAB row). The IDX_TAB row layout
+    // (and the IDXTAB_PAY_* payload indices read below) is fixed by
+    // `create_index` and read identically by `hook_index_register`.
+    let mut filter_seeds: Vec<(i64, u32, FxHashSet<u128>)> = Vec::new();
+    if target_id == IDX_TAB_ID {
+        for i in 0..batch.count {
+            if batch.get_weight(i) > 0
+                && unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_IS_UNIQUE) } != 0
+            {
+                let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_OWNER_ID) } as i64;
+                let col_idx  = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_SOURCE_COL_IDX) } as u32;
+                match MasterDispatcher::validate_unique_index_create_async(
+                    shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+                    owner_id, col_idx,
+                ).await {
+                    // No zone LSN reserved, no catalog mutation yet: just surface
+                    // the violation to the client. The write lock drops on return.
+                    Err(e) => {
+                        send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+                        return;
+                    }
+                    // Hold the distinct key set to seed the filter post-commit.
+                    Ok(seen) => filter_seeds.push((owner_id, col_idx, seen)),
+                }
+            }
+        }
+    }
+
     // Reserve the zone LSN but do NOT publish it yet. ingest_lsn becomes
     // visible to readers only after fsync confirms durability — Cleanup D
     // closes the pre-fsync window where clients could see an LSN whose
@@ -1114,6 +1153,18 @@ async fn handle_system_dml(
                 unsafe { (*disp_ptr_raw).unique_filter_remove_col(owner_id, col_idx); }
             }
         }
+    }
+
+    // Seed the unique filters from the CREATE-time pre-flight's distinct key
+    // sets so the first INSERT skips a redundant full-cluster warmup scan. The
+    // pre-flight scanned every worker under the same catalog write lock the
+    // warmup uses, so each set is complete and `warm = true` is sound. Done here
+    // (post-fsync), never in the validator: the validator runs before the
+    // IDX_TAB +1 commits, and a broadcast/fsync failure aborts the process
+    // before this point, so no filter is published for an index that never
+    // committed. Symmetric with the removal above and needs no rollback.
+    for (owner_id, col_idx, seen) in filter_seeds {
+        unsafe { (*disp_ptr_raw).unique_filter_seed(owner_id, col_idx, seen); }
     }
 
     send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;

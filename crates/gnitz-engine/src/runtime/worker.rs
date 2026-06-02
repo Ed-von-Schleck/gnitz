@@ -1178,10 +1178,17 @@ impl WorkerProcess {
                         "No unique index on column {} for table {}", col_idx, target_id
                     ));
                 }
+                // The check target is the unique INDEX table, whose schema is
+                // `(indexed_col, src_pk…)` — NOT the owner table's schema.
+                // `idx_key_size` and the PK-byte interpretation below are taken
+                // from this schema, so an owner-table fallback would compute the
+                // wrong prefix width. The broadcast always carries the index
+                // schema today, so the fallback is currently unreachable, but
+                // `get_index_schema_by_col` keeps it type-correct.
                 let schema = batch.as_ref()
                     .and_then(|b| b.schema)
-                    .or_else(|| self.cat().get_schema_desc(target_id))
-                    .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                    .or_else(|| self.cat().get_index_schema_by_col(target_id, col_idx))
+                    .ok_or_else(|| format!("no index schema for tid={} col={}", target_id, col_idx))?;
                 // Index layout: PK = (indexed-key field, src_pk_cols). The
                 // check-batch carries the promoted indexed value in the low
                 // bytes of its PK. Any positive-weight match means the value

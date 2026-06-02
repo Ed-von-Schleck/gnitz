@@ -138,6 +138,15 @@ pub(super) const IDXTAB_COL_NAME: usize = 4;
 pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
 pub(super) const IDXTAB_COL_CACHE_DIRECTORY: usize = 6;
 
+// Payload-column indices into an IDX_TAB *batch* — the layout seen by
+// `read_batch_u64`/`read_batch_string`, where the single-column PK `index_id`
+// (full-schema column 0) is excluded. Each is the matching IDXTAB_COL_*
+// full-schema index minus one.
+pub(crate) const IDXTAB_PAY_OWNER_ID: usize       = IDXTAB_COL_OWNER_ID - 1;
+pub(crate) const IDXTAB_PAY_SOURCE_COL_IDX: usize = IDXTAB_COL_SOURCE_COL_IDX - 1;
+pub(crate) const IDXTAB_PAY_NAME: usize           = IDXTAB_COL_NAME - 1;
+pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize      = IDXTAB_COL_IS_UNIQUE - 1;
+
 // Compound-PK layout: view_id (PK0) and dep_table_id (PK1) live in the PK
 // region; dep_view_id is the sole payload column.
 pub(super) const DEPTAB_COL_VIEW_ID: usize = 0;

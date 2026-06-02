@@ -224,8 +224,8 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let name = self.read_batch_string(batch, i, 3); // IDXTAB_COL_NAME
-            
+            let name = self.read_batch_string(batch, i, IDXTAB_PAY_NAME);
+
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);
             } else {
@@ -239,10 +239,10 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let owner_id = self.read_batch_u64(batch, i, 0) as i64; // IDXTAB_COL_OWNER_ID
-            
+            let owner_id = self.read_batch_u64(batch, i, IDXTAB_PAY_OWNER_ID) as i64;
+
             if weight > 0 {
-                let name = self.read_batch_string(batch, i, 3);
+                let name = self.read_batch_string(batch, i, IDXTAB_PAY_NAME);
                 self.caches.index_by_id.insert(idx_id, name);
                 self.caches.indices_by_owner.entry(owner_id).or_default().push(idx_id);
             } else {

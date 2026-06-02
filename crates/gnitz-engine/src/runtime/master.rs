@@ -212,39 +212,64 @@ struct UniqueIndexDesc {
     pk_field_off: usize,
 }
 
-/// Walk every positive-weight, non-null row of `batch` and insert the
-/// indexed-column value into `filter`. Respects the filter's capped state.
+/// Invoke `f` with the native `u128` index key of every positive-weight,
+/// non-null row of `batch` for the column described by `d`. Returning `false`
+/// from `f` stops *this batch's* walk early (callers use it to bail once a
+/// filter caps or a duplicate is found); it does NOT stop the surrounding
+/// frame drain — `drain_index_scan` keeps consuming every frame regardless.
+/// This is the single definition of "what key does this column's value map
+/// to" — shared by the steady-state unique-filter warmup, the INSERT-path
+/// extraction, and the CREATE-time pre-flight validator, so all three agree
+/// by construction.
 ///
-/// Accepts a `MemBatch` so callers can feed wire bytes without an
-/// intermediate owned `Batch` allocation (zero-copy warmup path); owned
-/// batches use `Batch::as_mem_batch()`.
-fn extract_into_filter(
-    filter: &mut UniqueFilter,
+/// The key is the column's value decoded OPK→native: from the packed PK region
+/// when the column is itself a PK column, else from its native-LE payload slot.
+/// `get_pk` is wrong for signed single-column PKs (it returns the sign-flipped
+/// OPK value, which `index_opk_prefix` then flips again, seeking the wrong index
+/// key); `pk_native_key` is correct for every width and signedness, and equals
+/// `get_pk` for unsigned single PKs.
+///
+/// Accepts a `MemBatch` so callers can feed wire bytes without an intermediate
+/// owned `Batch` allocation (zero-copy scan path); owned batches use
+/// `Batch::as_mem_batch()`.
+fn for_each_index_key(
     batch: &crate::storage::MemBatch<'_>,
     d: &UniqueIndexDesc,
+    mut f: impl FnMut(u128) -> bool,
 ) {
     for i in 0..batch.count {
-        if filter.capped { return; }
         if batch.get_weight(i) <= 0 { continue; }
         if !d.is_pk_col {
+            // `src_payload_idx` is a payload-column index; payload columns are
+            // capped at 64 by MAX_COLUMNS = 65 (one PK col min, one u64 null
+            // word per row), so `1u64 << idx` never overflows.
             let null_word = batch.get_null_word(i);
             if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
         }
         let key = if d.is_pk_col {
-            // Slice the single indexed column out of the packed PK and decode
-            // OPK→native. `get_pk` would return the OPK-widened value — correct
-            // only for an unsigned single-column PK; for a signed PK it is the
-            // sign-flipped OPK value, which `index_opk_prefix` then flips again,
-            // seeking the wrong index key. `pk_native_key` is correct for every
-            // width and signedness, and equals `get_pk` for unsigned single PKs.
             pk_native_key(
                 batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
         } else {
             let col_data = batch.col_data(d.src_payload_idx, d.col_size);
             payload_native_key(col_data, i * d.col_size, d.col_size, d.type_code)
         };
-        filter.insert(key);
+        if !f(key) { return; }
     }
+}
+
+/// Walk every positive-weight, non-null row of `batch` and insert the
+/// indexed-column value into `filter`. Respects the filter's capped state by
+/// stopping the walk once the filter caps. Thin caller of `for_each_index_key`
+/// so the key contract is shared with the CREATE-time validator.
+fn extract_into_filter(
+    filter: &mut UniqueFilter,
+    batch: &crate::storage::MemBatch<'_>,
+    d: &UniqueIndexDesc,
+) {
+    for_each_index_key(batch, d, |key| {
+        filter.insert(key);
+        !filter.capped // stop walking once the filter caps
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -919,19 +944,35 @@ impl MasterDispatcher {
             )
         }).await?;
 
+        // A worker fault or decode error must NOT short-circuit the loop: a
+        // later worker still streaming its scan train would wedge in
+        // `send_encoded` on a full W2M ring if we returned before draining it.
+        // Capture the first error and surface it only after every worker's
+        // train is fully drained (or dropped, if the client already left).
         let mut disconnected = false;
+        let mut deferred_err: Option<String> = None;
         for (w, mut slot) in slots.into_iter().enumerate() {
             loop {
-                let ctrl = peek_control_block(slot.bytes())
-                    .map_err(|e| scan_decode_err(w, e))?;
+                let ctrl = match peek_control_block(slot.bytes()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if deferred_err.is_none() { deferred_err = Some(scan_decode_err(w, e)); }
+                        drop(slot);
+                        break;
+                    }
+                };
+                // Status-gated for the same reason as `drain_index_scan`: an error
+                // frame carries flags `0`, so keying `has_more` off
+                // `FLAG_SCAN_LAST` alone would await a frame the faulted worker
+                // never sends. FLAG_CONTINUATION is always set on worker frames.
+                let has_more = ctrl.status == 0 && (ctrl.flags & FLAG_SCAN_LAST == 0);
                 if ctrl.status != 0 {
-                    let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
-                    return Err(format!("worker {}: scan: {}", w, msg));
-                }
-                // FLAG_SCAN_LAST marks the last (or only) chunk from this worker.
-                // FLAG_CONTINUATION is always set on worker frames (client compat).
-                let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
-                if !disconnected {
+                    if deferred_err.is_none() {
+                        let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
+                        deferred_err = Some(format!("worker {}: scan: {}", w, msg));
+                    }
+                    drop(slot); // terminal fault frame; free the ring slot
+                } else if !disconnected {
                     // Forward slot to client; send_slot drops it on return.
                     let rc = reactor.send_slot(fd, slot).await;
                     if rc < 0 { disconnected = true; }
@@ -944,6 +985,7 @@ impl MasterDispatcher {
                 slot = reactor.await_scan_slot(req_ids[w] as u32).await;
             }
         }
+        if let Some(err) = deferred_err { return Err(err); }
         Ok(!disconnected)
     }
 
@@ -1256,6 +1298,31 @@ impl MasterDispatcher {
             }
         }
         if out.is_empty() { None } else { Some((schema, out)) }
+    }
+
+    /// Column-extraction descriptor for `col_idx` of `owner_id`, built from the
+    /// owner schema — used at CREATE time, before the index circuit exists, so
+    /// it cannot read `index_circuits`. Matches `unique_index_descriptors`
+    /// field-for-field, so the pre-flight key equals the steady-state
+    /// enforcement key.
+    fn unique_index_desc_for_col(&mut self, owner_id: i64, col_idx: u32) -> Option<UniqueIndexDesc> {
+        let schema = unsafe { (*self.catalog).get_schema_desc(owner_id) }?;
+        let col = col_idx as usize;
+        // `schema.columns` is a fixed `[SchemaColumn; MAX_COLUMNS]` array, so its
+        // `.len()` is the capacity (MAX_COLUMNS = 65), not the table's active
+        // column count. Bounding on it instead of `num_columns()` would let an
+        // out-of-range `col_idx` index a zero-initialized slot and build a bogus
+        // descriptor (wrong size/offset/type) rather than return None.
+        if col >= schema.num_columns() { return None; }
+        let is_pk_col = schema.is_pk_col(col);
+        Some(UniqueIndexDesc {
+            col_idx,
+            type_code: schema.columns[col].type_code,
+            is_pk_col,
+            src_payload_idx: if is_pk_col { usize::MAX } else { schema.payload_idx(col) },
+            col_size: schema.columns[col].size() as usize,
+            pk_field_off: if is_pk_col { schema.pk_byte_offset(col) as usize } else { 0 },
+        })
     }
 
     /// True if every key in `keys` is definitely absent from the filter
@@ -2073,61 +2140,18 @@ impl MasterDispatcher {
             )
         }).await?;
 
-        // Drain all continuation frames per worker, decoding directly into filters.
-        // Each slot is dropped before the next is awaited to prevent ring deadlock,
-        // but only AFTER `extract_into_filter` finishes — the zero-copy `MemBatch`
-        // borrows from `slot.bytes()` and dropping the slot first would
-        // use-after-free. Continuation frames carry no schema; reuse the schema +
-        // version saved from the first frame as a hint.
-        use crate::schema::SchemaDescriptor;
-        let scan_result: Result<(), String> = async {
-            for (w, mut slot) in slots.into_iter().enumerate() {
-                let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
-                loop {
-                    let ctrl = peek_control_block(slot.bytes())
-                        .map_err(|e| scan_decode_err(w, e))?;
-                    if ctrl.status != 0 {
-                        let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
-                        return Err(format!("worker {}: scan: {}", w, msg));
-                    }
-                    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0;
-                    let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-                    let ctrl_size = ctrl.block_size;
-                    let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-                        descriptor: s, version: *v,
-                    });
-                    let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                        slot.bytes(), ctrl_size, ctrl, schema_hint,
-                    ).map_err(|e| scan_decode_err(w, e))?;
-                    if saved_schema.is_none() {
-                        if let Some(ref s) = zc.schema {
-                            saved_schema = Some((*s, server_version));
-                        }
-                    }
-
-                    if let Some(ref mb) = zc.data_batch {
-                        if mb.count > 0 {
-                            unsafe {
-                                let disp = &mut *disp_ptr;
-                                for d in &missing {
-                                    if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                                        if !filter.capped {
-                                            extract_into_filter(filter, mb, d);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    drop(zc);
-                    drop(slot);
-
-                    if !has_more { break; }
-                    slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+        // Drain every worker's continuation-frame train into the cold filters.
+        // `drain_index_scan` owns the wedge-safety invariant (every frame from
+        // every worker is consumed, even on a worker-side error), the zero-copy
+        // `MemBatch` lifetime, and the continuation-schema-hint handling.
+        let scan_result = drain_index_scan(slots, &req_ids, reactor, |mb| unsafe {
+            let disp = &mut *disp_ptr;
+            for d in &missing {
+                if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                    if !filter.capped { extract_into_filter(filter, mb, d); }
                 }
             }
-            Ok(())
-        }.await;
+        }).await;
 
         // On success the filters are fully populated → mark warm so the
         // broadcast-skip shortcut may trust them. Disarm the guard so the
@@ -2150,6 +2174,89 @@ impl MasterDispatcher {
                 Err(e)
             }
         }
+    }
+
+    /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX. Scans the
+    /// owner table across ALL workers, decodes the indexed column of every row
+    /// to its native key, and fails if any value repeats — catching both
+    /// within-partition and cross-partition duplicates that no per-worker
+    /// `backfill_index` can see. On success the index is safe to commit and
+    /// broadcast and the returned distinct key set seeds the master's unique
+    /// filter; on failure the caller returns a client error and never
+    /// broadcasts, so no worker reaches the fatal `DdlSync` backfill path.
+    ///
+    /// MUST run inside the DDL critical section (committer barrier drained,
+    /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended/broadcast,
+    /// so the scanned snapshot is exactly the data each worker will later
+    /// backfill and no concurrent INSERT can be ordered between the snapshot and
+    /// the backfill.
+    ///
+    /// An out-of-range `col_idx` yields an empty set (nothing to validate).
+    pub async fn validate_unique_index_create_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        owner_id: i64,
+        col_idx: u32,
+    ) -> Result<FxHashSet<u128>, String> {
+        let desc = match unsafe { (*disp_ptr).unique_index_desc_for_col(owner_id, col_idx) } {
+            Some(d) => d,
+            None => return Ok(FxHashSet::default()), // column out of range ⇒ nothing to validate
+        };
+
+        // Fan out a full-table Scan (sal_flags = 0 ⇒ SalMessageKind::Scan); each
+        // worker streams its local partition rows in continuation frames. Same
+        // primitive as the warmup.
+        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+            let (schema, col_names) = disp.get_schema_and_names(owner_id);
+            let lsn = disp.next_lsn();
+            disp.write_group_with_req_ids(
+                owner_id, lsn, 0, 0, &[], &schema, &col_names,
+                0, 0, req_ids, -1, 0, None, &[],
+            )
+        })
+        .await?;
+
+        // Exact, uncapped collision set: correctness requires catching ANY
+        // duplicate, so unlike `UniqueFilter` (capped at UNIQUE_FILTER_CAP) this
+        // never gives up. The index key is ≤16 bytes (unique STRING/BLOB rejected
+        // at create time; float/STRING rejected for any index by the index key
+        // type), so the u128 key is lossless.
+        let mut seen: FxHashSet<u128> = FxHashSet::default();
+        let mut duplicate = false;
+        drain_index_scan(slots, &req_ids, reactor, |mb| {
+            if duplicate { return; } // stop inserting; drain keeps consuming frames
+            for_each_index_key(mb, &desc, |key| {
+                if !seen.insert(key) { duplicate = true; }
+                !duplicate // stop walking this frame once a dup is found
+            });
+        })
+        .await?;
+
+        if duplicate {
+            return Err(format!(
+                "cannot create unique index: column contains duplicate values \
+                 (table_id={}, col_idx={})",
+                owner_id, col_idx,
+            ));
+        }
+        Ok(seen)
+    }
+
+    /// Seed the `(table_id, col_idx)` filter from a complete distinct key set
+    /// captured under the catalog write lock (the CREATE-time pre-flight). Marks
+    /// it warm so the first INSERT skips `ensure_unique_filters_warm_async`. Over
+    /// the cap ⇒ leave the filter absent so the lazy path caps it exactly as it
+    /// would. Symmetric counterpart of `unique_filter_remove_col`, keeping the
+    /// capping invariant in one place.
+    pub(crate) fn unique_filter_seed(
+        &mut self, table_id: i64, col_idx: u32, seen: FxHashSet<u128>,
+    ) {
+        if seen.len() > UNIQUE_FILTER_CAP { return; }
+        let mut filter = UniqueFilter::new();
+        filter.values = seen;   // exact distinct set; same type, move not re-hash
+        filter.warm = true;     // pre-flight scanned every worker under the write lock
+        self.unique_filters.insert((table_id, col_idx), filter);
     }
 
     /// Commit N push batches as a single SAL group write. Called from
@@ -2342,6 +2449,97 @@ where
         req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
     ).await;
     Ok((slots, req_ids))
+}
+
+/// Fan-out scan drain shared by the unique-filter warmup and the CREATE-time
+/// validator. Invokes `on_batch` with the zero-copy `MemBatch` of every
+/// non-empty continuation frame, in worker order.
+///
+/// Drains EVERY worker's frame train to its terminal frame before returning:
+/// `FLAG_SCAN_LAST` on a successful train, or a single `STATUS_ERROR` frame on
+/// a worker-side scan fault (a fault frame is terminal — the worker emits no
+/// further frames for that request, so the drain stops that worker and moves to
+/// the next). A worker whose scan train exceeds its W2M ring blocks in
+/// `send_encoded` until the master drains it (`w2m.rs`), so failing to drain a
+/// still-streaming worker would wedge it. The first worker / decode error is
+/// captured and surfaced only after every worker is drained. `on_batch` may
+/// stop doing useful work at any point (filter capped, duplicate found); the
+/// drain continues anyway.
+///
+/// Continuation frames carry no schema; the schema + version saved from the
+/// first frame is reused as a decode hint. The zero-copy `MemBatch` borrows
+/// from `slot.bytes()`, so the slot is dropped only after `on_batch` returns.
+async fn drain_index_scan(
+    slots: Vec<W2mSlot>,
+    req_ids: &[u64; crate::runtime::sal::MAX_WORKERS],
+    reactor: &crate::runtime::reactor::Reactor,
+    mut on_batch: impl FnMut(&crate::storage::MemBatch<'_>),
+) -> Result<(), String> {
+    let mut deferred: Option<String> = None;
+    for (w, mut slot) in slots.into_iter().enumerate() {
+        let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
+        loop {
+            // A corrupt header yields no frame structure: abandon THIS worker's
+            // drain (the outer loop still drains the rest) rather than wedge the
+            // whole fan-out. peek_control_block returns an owned ControlBlock.
+            let ctrl = match peek_control_block(slot.bytes()) {
+                Ok(c) => c,
+                Err(e) => {
+                    if deferred.is_none() { deferred = Some(scan_decode_err(w, e)); }
+                    drop(slot);
+                    break;
+                }
+            };
+            // A worker fault is reported by `send_error` as a single frame with
+            // `status = STATUS_ERROR` and flags `0` (no `FLAG_SCAN_LAST`), tagged
+            // with this scan's request_id, and is terminal — the worker emits
+            // nothing more for the request. `has_more` MUST gate on status:
+            // keying off `FLAG_SCAN_LAST` alone reads the `0` flags as "more
+            // coming" and blocks forever in `await_scan_slot` on a frame that
+            // never arrives.
+            let has_more = ctrl.status == 0 && (ctrl.flags & FLAG_SCAN_LAST == 0);
+            if ctrl.status != 0 {
+                if deferred.is_none() {
+                    deferred = Some(format!(
+                        "worker {}: scan: {}",
+                        w, String::from_utf8_lossy(&ctrl.error_msg)));
+                }
+                // terminal fault frame: `has_more` is false, so the loop breaks
+                // below and the outer `for` advances to the next worker.
+            } else if deferred.is_none() {
+                let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
+                let ctrl_size = ctrl.block_size;
+                let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
+                    descriptor: s, version: *v,
+                });
+                match wire::decode_wire_ipc_zero_copy_with_ctrl(
+                    slot.bytes(), ctrl_size, ctrl, schema_hint,
+                ) {
+                    Ok(zc) => {
+                        if saved_schema.is_none() {
+                            if let Some(ref s) = zc.schema {
+                                saved_schema = Some((*s, server_version));
+                            }
+                        }
+                        if let Some(ref mb) = zc.data_batch {
+                            if mb.count > 0 { on_batch(mb); }
+                        }
+                        // zc borrows `slot`; dropped here, before `drop(slot)`.
+                    }
+                    Err(e) => {
+                        if deferred.is_none() { deferred = Some(scan_decode_err(w, e)); }
+                    }
+                }
+            }
+            drop(slot);
+            if !has_more { break; }
+            slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+        }
+    }
+    match deferred {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Common body for every single-worker async fan-out. Submits the SAL
@@ -2786,6 +2984,128 @@ mod unique_filter_tests {
         filter.capped = true;
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.is_empty(), "no-op on capped filter");
+    }
+
+    /// `drain_index_scan` must surface a worker-side scan fault as a deferred
+    /// error returned only AFTER every other worker's frame train is fully
+    /// drained — and the faulted worker's drain must terminate on its single
+    /// error frame WITHOUT awaiting a continuation that will never arrive.
+    ///
+    /// Layout: worker 0 emits one `STATUS_ERROR` frame (flags 0, like
+    /// `send_error`); worker 1 is healthy with a two-frame train (a non-terminal
+    /// frame plus a preloaded `FLAG_SCAN_LAST` continuation). The drain is driven
+    /// by a single manual poll with a noop waker:
+    ///  - If `has_more` were keyed on `FLAG_SCAN_LAST` alone (not status-gated),
+    ///    worker 0's flags-0 error frame reads as "more coming", the drain awaits
+    ///    `w0_req` (never preloaded), and the first poll returns `Pending` —
+    ///    caught here as a failed assert instead of an infinite hang.
+    ///  - If the drain early-returned on the error (the old warmup bug), worker
+    ///    1's preloaded continuation would never be consumed; the post-drain
+    ///    `await_scan_slot(w1_req)` would then resolve immediately rather than
+    ///    park — also caught here.
+    #[test]
+    fn drain_index_scan_defers_error_and_drains_survivor_train() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use crate::runtime::reactor::Reactor;
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR};
+
+        const CAPACITY: usize = 64 * 1024;
+
+        // Two W2M rings (one per worker). Anonymous shared mappings — no fork.
+        let mk_ring = || unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(), CAPACITY,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+            ) as *mut u8;
+            assert!(!ptr.is_null(), "mmap failed");
+            std::ptr::write_bytes(ptr, 0, CAPACITY);
+            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+            ptr
+        };
+        let ptr0 = mk_ring();
+        let ptr1 = mk_ring();
+
+        let reactor = Reactor::new(16).expect("reactor");
+        let w0_req = reactor.alloc_scan_request_id() as u32;
+        let w1_req = reactor.alloc_scan_request_id() as u32;
+        let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+        req_ids[0] = w0_req as u64;
+        req_ids[1] = w1_req as u64;
+
+        // Worker 0: single STATUS_ERROR frame (flags 0), tagged with w0_req.
+        let writer0 = W2mWriter::new(ptr0, CAPACITY as u64);
+        let err = b"boom";
+        let esz = ipc::wire_size(STATUS_ERROR, err, None, None, None, None, &[]);
+        writer0.send_encoded(esz, w0_req, |buf| {
+            ipc::encode_wire_into_ipc(
+                buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_ERROR, err, None, None, None, None, &[],
+            );
+        });
+
+        // Worker 1: frame A (non-terminal, flags 0) then frame B (FLAG_SCAN_LAST),
+        // both STATUS_OK and tagged with w1_req.
+        let writer1 = W2mWriter::new(ptr1, CAPACITY as u64);
+        let osz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
+        writer1.send_encoded(osz, w1_req, |buf| {
+            ipc::encode_wire_into_ipc(
+                buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[],
+            );
+        });
+        writer1.send_encoded(osz, w1_req, |buf| {
+            ipc::encode_wire_into_ipc(
+                buf, 0, 0, 0, FLAG_SCAN_LAST, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[],
+            );
+        });
+
+        let receiver = W2mReceiver::new(vec![ptr0, ptr1]);
+        // Initial slots handed to the drain (what dispatch_scan_fanout returns).
+        let slot0 = receiver.try_read_slot(0).expect("worker 0 frame");
+        let slot1a = receiver.try_read_slot(1).expect("worker 1 frame A");
+        // Worker 1's continuation: park it so await_scan_slot(w1_req) resolves.
+        let slot1b = receiver.try_read_slot(1).expect("worker 1 frame B");
+        reactor.test_route_scan_slot(slot1b);
+
+        let slots = vec![slot0, slot1a];
+
+        let noop: &Waker = Waker::noop();
+        let mut cx = Context::from_waker(noop);
+
+        let mut drain_fut = Box::pin(drain_index_scan(slots, &req_ids, &reactor, |_| {}));
+        let result = match drain_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!(
+                "drain_index_scan did not complete in one poll: status-gating \
+                 regression would await a phantom continuation for the error frame"
+            ),
+        };
+        drop(drain_fut);
+
+        let err = result.expect_err("worker fault must surface as Err");
+        assert!(err.contains("worker 0"), "deferred error names the faulted worker: {err}");
+        assert!(err.contains("boom"), "deferred error carries the worker message: {err}");
+
+        // Worker 1's continuation was consumed by the drain, so nothing remains
+        // parked for w1_req: a fresh await must park (Pending), not resolve.
+        let mut after = Box::pin(reactor.await_scan_slot(w1_req));
+        match after.as_mut().poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(_) => panic!(
+                "worker 1's continuation frame was left parked — drain returned \
+                 before draining a survivor's train"
+            ),
+        }
+        drop(after);
+
+        drop(reactor);
+        drop(receiver);
+        unsafe {
+            libc::munmap(ptr0 as *mut libc::c_void, CAPACITY);
+            libc::munmap(ptr1 as *mut libc::c_void, CAPACITY);
+        }
     }
 
     #[test]

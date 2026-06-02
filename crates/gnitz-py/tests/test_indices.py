@@ -32,6 +32,21 @@ def _drop_all(client, sn, tables=(), views=(), indices=()):
     client.drop_schema(sn)
 
 
+def _table_has_index(client, sn, table):
+    """True if any live IdxTab row names `table` as its owner."""
+    from gnitz.core import IDX_TAB
+    _, batch_obj, _ = client._client.scan(IDX_TAB)
+    if batch_obj is None:
+        return False
+    tid, _ = client.resolve_table(sn, table)
+    for i in range(len(batch_obj.pks)):
+        if batch_obj.weights[i] <= 0:
+            continue
+        if batch_obj.columns[1][i] == tid:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # TestIndexDdl
 # ---------------------------------------------------------------------------
@@ -942,3 +957,283 @@ class TestIndexReadBarrier:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestCreateUniqueIndexValidation
+#
+# CREATE UNIQUE INDEX over a table that ALREADY holds rows must validate
+# uniqueness globally (across all workers) on the master BEFORE broadcasting
+# the index. Uniqueness is global, but the per-worker backfill only sees one
+# partition: without the master pre-flight a within-partition duplicate would
+# fatally _exit every affected worker, and a cross-partition duplicate would be
+# silently accepted. Distinct from TestIndexIntegrity, which creates the index
+# FIRST and exercises the INSERT-time enforcement path.
+# ---------------------------------------------------------------------------
+
+class TestCreateUniqueIndexValidation:
+    def test_within_partition_duplicate_rejected_cluster_survives(self, client):
+        """Many rows share one non-PK value across consecutive PKs, so several
+        land on the SAME worker (pigeonhole over the worker count). CREATE
+        UNIQUE INDEX must return a clean error — and crucially every worker must
+        stay alive and answer a follow-up scan. (Pre-fix: each worker holding a
+        within-partition duplicate _exits, wedging the cluster.)"""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            # 50 rows, all val=42, PKs 1..50. With >1 worker, pigeonhole forces
+            # at least two duplicates onto one worker; with 1 worker all are.
+            rows = ", ".join(f"({pk}, 42)" for pk in range(1, 51))
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+
+            # Cluster survived: a full-table scan fans out to every worker and
+            # must return all 50 rows.
+            tid, _ = client.resolve_table(sn, "t")
+            result = client.scan(tid)
+            assert result.batch is not None
+            assert len(result.batch.pks) == 50, "all workers must answer the scan"
+            # No phantom constraint: the index was never created.
+            assert not _table_has_index(client, sn, "t")
+            # And the write path is still healthy across workers.
+            client.execute_sql("INSERT INTO t VALUES (51, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_cross_partition_duplicate_rejected(self, client):
+        """Rows sharing one non-PK value spread across a wide PK range land on
+        different workers; the duplicate is invisible to any single worker's
+        backfill but must be caught by the master pre-flight. The index must NOT
+        exist afterward and a fresh duplicate INSERT must still be permitted (no
+        phantom constraint). (Pre-fix: silently succeeds.)"""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            spread = [1, 7, 13, 1000, 99999, 123456, 777777, 8888888, 73501234, 901234567]
+            rows = ", ".join(f"({pk}, 42)" for pk in spread)
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+
+            assert not _table_has_index(client, sn, "t"), \
+                "no index may exist after a rejected CREATE UNIQUE INDEX"
+            # No phantom constraint: another duplicate value is still accepted.
+            client.execute_sql("INSERT INTO t VALUES (2, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_column_succeeds_and_enforces(self, client):
+        """CREATE UNIQUE INDEX on an all-distinct column succeeds; a subsequent
+        duplicate INSERT is rejected by the steady-state path, and an indexed
+        lookup returns the right row."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            rows = ", ".join(f"({pk}, {pk * 10})" for pk in range(1, 31))
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+
+            # Steady-state enforcement: re-inserting an existing value fails.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (999, 100)", schema_name=sn)
+            # A distinct value still inserts.
+            client.execute_sql("INSERT INTO t VALUES (999, 99999)", schema_name=sn)
+
+            # Indexed lookup returns the correct row.
+            results = client.execute_sql(
+                "SELECT * FROM t WHERE val = 200", schema_name=sn)
+            assert results[0]["type"] == "Rows"
+            rows = results[0]["rows"]
+            assert len(rows.batch.pks) == 1
+            assert rows.batch.pks[0] == 20
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_multiple_nulls_allowed(self, client):
+        """A nullable non-PK column with several NULLs is valid under SQL UNIQUE;
+        CREATE UNIQUE INDEX must succeed, and a later duplicate non-NULL value is
+        still rejected."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
+                schema_name=sn,
+            )
+            # Several NULLs plus distinct non-NULL values, spread across workers.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, NULL), (5, NULL), (9, NULL), "
+                "(100000, 10), (200000, 20), (300000, 30)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+
+            # More NULLs are still fine after creation.
+            client.execute_sql("INSERT INTO t VALUES (13, NULL)", schema_name=sn)
+            # A duplicate non-NULL value is rejected.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (400000, 10)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_empty_table_succeeds_and_enforces(self, client):
+        """CREATE UNIQUE INDEX on an empty table succeeds and enforces
+        uniqueness on later inserts."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (1000000, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_non_unique_index_on_duplicate_column_succeeds(self, client):
+        """The pre-flight is gated on is_unique: a NON-unique index over a
+        column full of duplicates must still be created without error."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            rows = ", ".join(f"({pk}, 42)" for pk in range(1, 41))
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+            # Non-unique index over an all-duplicate column: no validation.
+            results = client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            assert results[0]["type"] == "IndexCreated"
+            assert _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_larger_table_passing_and_failing_keep_cluster_alive(self, client):
+        """A larger table (rows fanned across all workers) for both a passing
+        and a failing CREATE UNIQUE INDEX; the cluster must stay alive either
+        way. (The drain-all-frames-per-worker wedge safety on a multi-frame scan
+        train is exercised directly by the drain_index_scan Rust unit test; the
+        256 MiB W2M frame ceiling makes a true multi-frame scan impractical to
+        provoke from E2E, so this guards the realistic large-table path.)"""
+        sn = _sn()
+        client.create_schema(sn)
+        n = 3000
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            # Distinct values across a wide PK spread → all workers populated.
+            batch = ", ".join(f"({pk}, {pk})" for pk in range(1, n + 1))
+            client.execute_sql(f"INSERT INTO t VALUES {batch}", schema_name=sn)
+
+            # Passing: all-distinct → index created.
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+            client.execute_sql(f"DROP INDEX {sn}__t__idx_val", schema_name=sn)
+
+            # Failing: introduce one duplicate, then CREATE must reject and the
+            # cluster must remain alive.
+            client.execute_sql(f"INSERT INTO t VALUES ({n + 1}, 1)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+
+            tid, _ = client.resolve_table(sn, "t")
+            result = client.scan(tid)
+            assert result.batch is not None
+            assert len(result.batch.pks) == n + 1, "all workers must answer post-failure"
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_concurrent_inserts_during_create(self, server):
+        """A steady INSERT stream into the owner table concurrent with CREATE
+        UNIQUE INDEX. All streamed values are distinct, so — whatever the
+        interleaving — the catalog write lock orders every INSERT strictly
+        before or after the pre-flight+backfill snapshot, the index must be
+        created and enforce, no row may be lost from it, and no worker may
+        wedge. Guards the snapshot-vs-backfill ordering."""
+        import threading
+        sn = _sn()
+        with gnitz.connect(server) as c_writer, gnitz.connect(server) as c_ddl:
+            c_ddl.create_schema(sn)
+            try:
+                c_ddl.execute_sql(
+                    "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                    schema_name=sn,
+                )
+                # Seed so the pre-flight scan has data on every worker.
+                seed = ", ".join(f"({i}, {i})" for i in range(1, 201))
+                c_ddl.execute_sql(f"INSERT INTO t VALUES {seed}", schema_name=sn)
+
+                stop = threading.Event()
+                errors = []
+
+                def insert_stream():
+                    v = 1000
+                    try:
+                        while not stop.is_set() and v < 5000:
+                            c_writer.execute_sql(
+                                f"INSERT INTO t VALUES ({v}, {v})", schema_name=sn)
+                            v += 1
+                    except Exception as e:  # noqa: BLE001 — surfaced via `errors`
+                        errors.append(e)
+
+                th = threading.Thread(target=insert_stream)
+                th.start()
+                try:
+                    c_ddl.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+                finally:
+                    stop.set()
+                    th.join(timeout=60)
+                assert not th.is_alive(), "insert stream did not stop"
+                assert not errors, f"streaming inserts errored: {errors}"
+                assert _table_has_index(c_ddl, sn, "t")
+
+                # Index enforces a seeded value, and the cluster is alive.
+                with pytest.raises(gnitz.GnitzError):
+                    c_ddl.execute_sql("INSERT INTO t VALUES (888888, 1)", schema_name=sn)
+                # A brand-new distinct value still inserts (no spurious reject).
+                c_ddl.execute_sql("INSERT INTO t VALUES (888888, 888888)", schema_name=sn)
+            finally:
+                _drop_all(c_ddl, sn,
+                          indices=[f"{sn}__t__idx_val"],
+                          tables=["t"])
