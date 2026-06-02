@@ -18,8 +18,6 @@ pub fn op_distinct(
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
 ) -> (ConsolidatedBatch, ConsolidatedBatch) {
-    assert!(!schema.pk_is_wide(),
-        "op_distinct: wide PK trace is unsupported (narrow u128 seek API)");
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
@@ -32,19 +30,19 @@ pub fn op_distinct(
     let mut emit_weights: Vec<i64> = Vec::with_capacity(n);
 
     let consolidated_mb = consolidated.as_mem_batch();
-    let mut prev_key = u128::MAX;
+    let mut prev_key: Option<&[u8]> = None;
 
     for i in 0..n {
-        let key = consolidated.get_pk(i);
+        let key = consolidated.get_pk_bytes(i);
         let w_delta = consolidated.get_weight(i);
 
-        if key != prev_key {
-            cursor.seek_bytes(consolidated.get_pk_bytes(i));
+        if prev_key != Some(key) {
+            cursor.seek_bytes(key);
         }
-        prev_key = key;
+        prev_key = Some(key);
 
         let w_old: i64 = loop {
-            if !cursor.valid || cursor.current_key != key {
+            if !cursor.valid || cursor.current_pk_bytes() != key {
                 break 0;
             }
             match compare_cursor_payload_to_batch_row(cursor, &consolidated_mb, i, schema) {
@@ -450,5 +448,138 @@ mod tests {
         assert!(out.consolidated, "distinct output must be consolidated");
         assert!(out.sorted, "distinct output must be sorted");
         assert!(consolidated.consolidated, "consolidated output must be consolidated");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wide-PK distinct tests (§8)
+    // -----------------------------------------------------------------------
+
+    fn make_schema_wide_pk() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0u32, 1u32, 2u32],
+        )
+    }
+
+    fn make_wide_batch_for_distinct(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, u64, i64, i64)], // (c0, c1, c2, weight, payload)
+    ) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(c0, c1, c2, w, val) in rows {
+            b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_distinct_wide_pk_empty_trace_three_new_rows() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        // Trace empty; delta has three wide-PK rows with distinct PKs.
+        // All three must emit +1.
+        let schema = make_schema_wide_pk();
+        let empty = Rc::new(Batch::empty(1, schema.pk_stride()));
+        let mut ch = CursorHandle::from_owned(&[empty], schema);
+
+        let delta = make_wide_batch_for_distinct(&schema, &[
+            (1, 0, 0, 1, 10),
+            (2, 0, 0, 1, 20),
+            (3, 0, 0, 1, 30),
+        ]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 3, "three new wide-PK rows must each emit +1");
+        for i in 0..3 {
+            assert_eq!(out.get_weight(i), 1);
+        }
+    }
+
+    #[test]
+    fn test_distinct_wide_pk_already_in_trace() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        // Trace has (1,0,0, payload=99, w=1). Delta re-adds same (PK, payload).
+        // Already in set → output must be empty.
+        let schema = make_schema_wide_pk();
+        let trace = Rc::new(make_wide_batch_for_distinct(&schema, &[(1, 0, 0, 1, 99)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        let delta = make_wide_batch_for_distinct(&schema, &[(1, 0, 0, 1, 99)]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "re-adding an existing (PK,payload) must produce no output");
+    }
+
+    #[test]
+    fn test_distinct_wide_pk_prefix_collision() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        // Two wide-PK rows with the same 16-byte OPK prefix (c0=1,c1=1) but
+        // differing in c2. One row in trace (w=1), one new row in delta (w=+1).
+        // The row in the trace must not emit; the new row must emit +1.
+        // This tests the cursor.current_pk_bytes() != key break condition.
+        let schema = make_schema_wide_pk();
+        // (1,1,0) is already in the trace
+        let trace = Rc::new(make_wide_batch_for_distinct(&schema, &[(1, 1, 0, 1, 50)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Delta has the NEW key (1,1, 1<<56) which shares 16 OPK bytes with (1,1,0)
+        let c2_new = 1u64 << 56;
+        let delta = make_wide_batch_for_distinct(&schema, &[(1, 1, c2_new, 1, 60)]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        // The new row is not in the trace → emit +1. The old row is not in delta.
+        assert_eq!(out.count, 1, "prefix-collision new row must emit +1");
+        assert_eq!(out.get_weight(0), 1);
+    }
+
+    #[test]
+    fn test_distinct_u128_max_sentinel_bug() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+        // Single-column U128 PK schema. Trace has (u128::MAX, payload, w=1).
+        // Delta re-adds the same (u128::MAX, payload, w=+1). The old sentinel bug
+        // (prev_key = u128::MAX) would skip the seek and compute w_old = 0,
+        // spuriously emitting +1. The fixed path uses Option<&[u8]>.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0u32],
+        );
+        let max_pk = u128::MAX;
+        let mut trace_b = Batch::with_schema(schema, 1);
+        trace_b.extend_pk(max_pk);
+        trace_b.extend_weight(&1i64.to_le_bytes());
+        trace_b.extend_null_bmp(&0u64.to_le_bytes());
+        trace_b.extend_col(0, &42i64.to_le_bytes());
+        trace_b.count += 1;
+        trace_b.sorted = true;
+        trace_b.consolidated = true;
+
+        let trace = Rc::new(trace_b);
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        let mut delta = Batch::with_schema(schema, 1);
+        delta.extend_pk(max_pk);
+        delta.extend_weight(&1i64.to_le_bytes());
+        delta.extend_null_bmp(&0u64.to_le_bytes());
+        delta.extend_col(0, &42i64.to_le_bytes());
+        delta.count += 1;
+        delta.sorted = true;
+        delta.consolidated = true;
+
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+        assert_eq!(out.count, 0, "u128::MAX PK re-add must produce no output (sentinel bug regression)");
     }
 }

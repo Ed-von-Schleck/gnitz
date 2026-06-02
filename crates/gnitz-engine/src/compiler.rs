@@ -980,20 +980,6 @@ struct EmitState {
     scratch_dirs: Vec<String>,
 }
 
-/// Reject a wide-PK (`pk_stride > 16`) input at compile time, failing the
-/// enclosing `emit_node` early. The runtime delta-trace join / anti-join /
-/// semi-join / seek ops use the narrow u128 seek API and assert
-/// `!pk_is_wide()`; failing the compile turns that would-be worker crash into a
-/// clean `None` from `build_plan`.
-macro_rules! reject_wide_pk {
-    ($state:expr, $schema:expr) => {
-        if $schema.pk_is_wide() {
-            $state.emit_failed = true;
-            return;
-        }
-    };
-}
-
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
 fn emit_node(
     loaded: &LoadedCircuit,
@@ -1273,12 +1259,10 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
-                    reject_wide_pk!(state, a_schema);
                     reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reject_wide_pk!(state, a_schema);
                     reg_schemas[reg_id as usize] = merge_schemas_for_join_outer(&a_schema, &b_schema);
                     builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
@@ -1296,7 +1280,6 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reject_wide_pk!(state, reg_schemas[a_reg as usize]);
                     builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
@@ -1312,7 +1295,6 @@ fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reject_wide_pk!(state, reg_schemas[a_reg as usize]);
                     builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
@@ -1395,7 +1377,6 @@ fn emit_node(
         gnitz_wire::OpNode::SeekTrace => {
             let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             let key_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            reject_wide_pk!(state, reg_schemas[key_reg as usize]);
             builder.add_seek_trace(trace_reg as u16, key_reg as u16);
         }
 
@@ -2761,11 +2742,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_plan_wide_pk_join_rejected() {
+    fn test_build_plan_wide_pk_join_accepted() {
+        // After byte-API port: wide-PK Join(DeltaTrace) must compile successfully.
         // ScanDelta(wide) --port0--> Join(DT) <--port1-- ScanTrace(wide)
-        // Join(DT) --> IntegrateSink. The delta-side schema is wide; the
-        // runtime op_join_delta_trace would assert, so build_plan must
-        // reject at compile time (emit_failed → None).
+        // Join(DT) --> IntegrateSink.
         let schema = wide_pk_schema();
         let mut nodes = HashMap::new();
         nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
@@ -2787,7 +2767,7 @@ mod tests {
             &loaded, &empty_rw(), &ordered, &ext,
             "", 0, 1, Some(2), &[], vec![],
         );
-        assert!(result.is_none(), "wide-PK join must be rejected at compile time");
+        assert!(result.is_some(), "wide-PK Join(DeltaTrace) must compile after byte-API port");
     }
 
     #[test]
@@ -2908,38 +2888,41 @@ mod tests {
 
     #[test]
     fn test_build_plan_cleans_scratch_dirs_on_failure() {
-        // ScanDelta(wide) → Distinct → Join(DT, wide) → Sink. Distinct creates a
-        // scratch dir, then the wide-PK Join fails the compile. The scratch dir
-        // must be removed so probing unsupported queries can't leak inodes.
+        // ScanDelta → IntegrateTrace → IntegrateSink. IntegrateTrace creates a
+        // scratch dir. An invalid view_dir causes IntegrateTrace to fail the
+        // compile. Scratch dirs created before the failure must be removed so
+        // probing unsupported queries can't leak inodes.
+        //
+        // Failure is triggered via an invalid view_dir (nonexistent path), not
+        // via a wide-PK rejection (the compiler no longer rejects wide PKs after
+        // the byte-API port).
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
         let view_dir = format!("{}/scratch_cleanup_test_{}", base, std::process::id());
         let _ = std::fs::remove_dir_all(&view_dir);
         std::fs::create_dir_all(&view_dir).unwrap();
 
-        let schema = wide_pk_schema();
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        // ScanDelta → IntegrateTrace → IntegrateSink. Using an invalid sub-path
+        // for the trace table so create_child_table fails the compile.
         let mut nodes = HashMap::new();
         nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
-        nodes.insert(1, gnitz_wire::OpNode::Distinct);
-        nodes.insert(2, gnitz_wire::OpNode::ScanTrace(20));
-        nodes.insert(3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-        nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![
-            (0, 1, PORT_IN),
-            (1, 3, PORT_IN_A),
-            (2, 3, PORT_TRACE),
-            (3, 4, PORT_IN),
-        ];
+        nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
         let loaded = make_loaded(nodes, edges);
-        let ext = [
-            ExternalTable { table_id: 10, schema },
-            ExternalTable { table_id: 20, schema },
-        ];
+        let ext = [ExternalTable { table_id: 10, schema }];
         let ordered = loaded.ordered.clone();
+        // /nonexistent_path forces create_child_table to fail.
         let result = build_plan(
-            &loaded, &empty_rw(), &ordered, &ext, &view_dir, 0, 1, Some(4), &[], vec![],
+            &loaded, &empty_rw(), &ordered, &ext,
+            "/nonexistent_gnitz_scratch_cleanup_test_path",
+            0, 1, Some(2), &[], vec![],
         );
-        assert!(result.is_none(), "wide-PK join must fail the compile");
+        assert!(result.is_none(), "IntegrateTrace failure must fail the compile");
 
         let leftover: Vec<String> = std::fs::read_dir(&view_dir).unwrap()
             .filter_map(|e| e.ok())
