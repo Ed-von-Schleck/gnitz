@@ -16,7 +16,10 @@ pub struct Circuit {
 
 /// `(opcode, source_table, reindex_col, expr_program_blob)` — the fields of
 /// a `nodes` system-table row excluding the node id (which is added by the
-/// caller). Reused by both `CircuitRows::nodes` and `encode_op_node`.
+/// caller). Reused by both `CircuitRows::nodes` and `encode_op_node`. The
+/// physical `reindex_col` cell is now permanently `None` for `Map` nodes; the
+/// live reindex column list is stored in `CircuitNodeColumns` under
+/// `NODE_COL_KIND_REINDEX`.
 pub type NodeFields = (u64, Option<TableId>, Option<u16>, Option<Vec<u8>>);
 
 /// One full row of the `nodes` system table: node id + [`NodeFields`].
@@ -31,7 +34,8 @@ pub type NodeColumnPayload = (u64, u16, u64, u64);
 #[derive(Clone, Debug, Default)]
 pub struct CircuitRows {
     /// `source_table` is `None` for nodes that don't carry one;
-    /// `reindex_col` is `None` outside `MapKind::Expression { reindex_col: Some(_) }`;
+    /// `reindex_col` is now always `None` for `Map` nodes; the reindex column list
+    /// is stored in `node_columns` under `NODE_COL_KIND_REINDEX`;
     /// `expr_program` is `None` outside `Filter`/`MapKind::Expression`.
     pub nodes:        Vec<NodeRow>,
     /// `(dst_node, dst_port, src_node)`. View id is implicit at the call site.
@@ -82,7 +86,7 @@ impl Circuit {
         }
         // Sort each group by (kind, position) so the typed payloads come out
         // in the order callers wrote them — the load path relies on this for
-        // group_cols / shard_cols / proj_cols / agg_specs / null_extend.
+        // group_cols / shard_cols / proj_cols / agg_specs / null_extend / reindex_cols.
         for v in per_node.values_mut() {
             v.sort_by_key(|&(kind, pos, _, _)| (kind, pos));
         }
@@ -120,8 +124,12 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Map(MapKind::Projection(cols)) => {
             ((OPCODE_MAP_PROJ, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
         }
-        OpNode::Map(MapKind::Expression { program, reindex_col }) => {
-            ((OPCODE_MAP_EXPR, None, reindex_col, Some(program)), Vec::new())
+        OpNode::Map(MapKind::Expression { program, reindex_cols }) => {
+            // Reindex columns now live in CircuitNodeColumns; the legacy single-cell
+            // `reindex` slot stays None (the physical column persists for back-compat
+            // but is no longer written).
+            ((OPCODE_MAP_EXPR, None, None, Some(program)),
+             encode_col_list(NODE_COL_KIND_REINDEX, reindex_cols))
         }
         OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
         OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
@@ -234,18 +242,19 @@ impl CircuitBuilder {
 
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
         let blob = program.encode();
-        let nid = self.alloc_node(OpNode::Map(MapKind::Expression { program: blob, reindex_col: None }));
+        let nid = self.alloc_node(OpNode::Map(MapKind::Expression { program: blob, reindex_cols: Vec::new() }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
 
-    /// Map with PK reindexing (equijoin pre-indexing). The new PK column is
-    /// `reindex_col` from the input schema.
-    pub fn map_reindex(&mut self, input: NodeId, reindex_col: usize, program: ExprProgram) -> NodeId {
+    /// Map with PK reindexing (equijoin pre-indexing). The new synthetic PK is built
+    /// from `reindex_cols` of the input schema, in the given order. Pass a one-element
+    /// slice for a single-column join key.
+    pub fn map_reindex(&mut self, input: NodeId, reindex_cols: &[usize], program: ExprProgram) -> NodeId {
         let blob = program.encode();
         let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
             program: blob,
-            reindex_col: Some(reindex_col as u16),
+            reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
         }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
@@ -442,5 +451,68 @@ impl CircuitBuilder {
     /// Finalises the circuit.
     pub fn build(self) -> Circuit {
         Circuit { view_id: self.view_id, nodes: self.nodes, edges: self.edges }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnitz_wire::NODE_COL_KIND_REINDEX;
+
+    fn empty_prog() -> ExprProgram {
+        ExprProgram { num_regs: 0, result_reg: 0, code: Vec::new(), const_strings: Vec::new() }
+    }
+
+    /// A compound (2-column) reindex descriptor must survive into_rows → from_rows
+    /// with its column *order* preserved, stored under NODE_COL_KIND_REINDEX with
+    /// position = key order, and the legacy single-cell `reindex` slot left None.
+    #[test]
+    fn reindex_cols_roundtrip_ordered() {
+        let (c1, c2) = (2usize, 5usize);
+        let mut cb = CircuitBuilder::new(7, 100);
+        let input = cb.input_delta();
+        let map_nid = cb.map_reindex(input, &[c1, c2], empty_prog());
+        let circuit = cb.build();
+
+        let rows = circuit.into_rows();
+
+        // The legacy reindex cell is None for the Map node.
+        let node_row = rows.nodes.iter().find(|r| r.0 == map_nid).expect("map node row");
+        assert_eq!(node_row.3, None, "legacy reindex cell must be None for new circuits");
+
+        // Exactly two NODE_COL_KIND_REINDEX rows, position-ordered, value1 = column.
+        let mut reindex_rows: Vec<_> = rows.node_columns.iter()
+            .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
+            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
+            .collect();
+        reindex_rows.sort_by_key(|&(pos, _, _)| pos);
+        assert_eq!(reindex_rows, vec![(0, c1 as u64, 0), (1, c2 as u64, 0)]);
+
+        // Round-trip: decode preserves the ordered list.
+        let decoded = Circuit::from_rows(7, rows).expect("from_rows");
+        match decoded.nodes.get(&map_nid) {
+            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) => {
+                assert_eq!(*reindex_cols, vec![c1 as u16, c2 as u16], "order must be preserved");
+            }
+            other => panic!("expected Map(Expression), got {other:?}"),
+        }
+    }
+
+    /// A plain compute map (`map_expr`) carries no reindex columns: no kind rows
+    /// and an empty decoded list.
+    #[test]
+    fn map_expr_has_no_reindex_cols() {
+        let mut cb = CircuitBuilder::new(1, 100);
+        let input = cb.input_delta();
+        let map_nid = cb.map_expr(input, empty_prog());
+        let rows = cb.build().into_rows();
+        assert!(rows.node_columns.iter()
+            .all(|(nid, kind, ..)| !(*nid == map_nid && *kind == NODE_COL_KIND_REINDEX)));
+        let decoded = Circuit::from_rows(1, rows).expect("from_rows");
+        match decoded.nodes.get(&map_nid) {
+            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) =>
+                assert!(reindex_cols.is_empty()),
+            other => panic!("expected Map(Expression), got {other:?}"),
+        }
     }
 }

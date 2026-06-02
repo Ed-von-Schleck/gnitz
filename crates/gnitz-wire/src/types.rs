@@ -119,6 +119,20 @@ impl TypeCode {
     pub fn wire_stride(self) -> usize {
         self.stride() as usize
     }
+
+    /// Output PK type for an equijoin synthetic reindex key built from a key
+    /// column of this type: a ≤8-byte integer key keeps its native width (stride
+    /// 8 for U64); everything wider or non-integer — U128/UUID, the STRING/BLOB
+    /// 128-bit content hash, and PK-ineligible floats — collapses to the 16-byte
+    /// U128 key. Single source of truth for the reindex / `_join_pk` PK width:
+    /// the engine compiler (reindex Map output schema) and the SQL planner
+    /// (`_join_pk` stamp) both derive their col-0 stride from this, and they MUST
+    /// agree or every cross-process consumer re-derives a mismatched stride and
+    /// the exchange wire decode hard-rejects ("WAL block PK region size mismatch").
+    #[inline]
+    pub fn reindex_output_type(self) -> TypeCode {
+        TypeCode::from_validated_u8(reindex_output_type_code(self as u8))
+    }
 }
 
 /// Whether a raw wire type code may be a PRIMARY KEY column. u8-based
@@ -158,6 +172,13 @@ pub const fn is_fixed_int(tc: u8) -> bool {
     )
 }
 
+/// u8-based counterpart to [`TypeCode::reindex_output_type`] for callers holding
+/// a raw `type_code` (mirrors the free `is_fixed_int`/`wire_stride`). See that
+/// method for the width policy and the engine ↔ planner lockstep it anchors.
+pub const fn reindex_output_type_code(tc: u8) -> u8 {
+    if is_fixed_int(tc) { tc } else { type_code::U128 }
+}
+
 /// Whether a raw wire type code is any integer-valued fixed-width type that
 /// `payload_route_key` can encode as an order-preserving routing key:
 /// U8..U64, I8..I64, plus the 16-byte U128/UUID. The superset of `is_fixed_int`
@@ -177,5 +198,34 @@ pub const fn wire_stride(tc: u8) -> usize {
         8..=10          => 8,   // U64, I64, F64
         11..=14           => 16,  // STRING, U128, UUID, BLOB
         _                 => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reindex / `_join_pk` width policy (the single source of truth the
+    /// engine compiler and SQL planner both derive from): a ≤8-byte integer key
+    /// keeps its native width; STRING/BLOB, U128/UUID, and floats collapse to
+    /// U128. Verified through both the `u8` free fn and the `TypeCode` method.
+    #[test]
+    fn reindex_output_type_policy() {
+        let narrow = [
+            TypeCode::U8, TypeCode::I8, TypeCode::U16, TypeCode::I16,
+            TypeCode::U32, TypeCode::I32, TypeCode::U64, TypeCode::I64,
+        ];
+        for tc in narrow {
+            assert_eq!(tc.reindex_output_type(), tc, "{tc:?} keeps native width");
+            assert_eq!(reindex_output_type_code(tc as u8), tc as u8);
+        }
+        let wide = [
+            TypeCode::U128, TypeCode::UUID, TypeCode::String,
+            TypeCode::Blob, TypeCode::F32, TypeCode::F64,
+        ];
+        for tc in wide {
+            assert_eq!(tc.reindex_output_type(), TypeCode::U128, "{tc:?} collapses to U128");
+            assert_eq!(reindex_output_type_code(tc as u8), type_code::U128);
+        }
     }
 }

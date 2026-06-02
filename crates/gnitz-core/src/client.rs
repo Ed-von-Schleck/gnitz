@@ -2,7 +2,7 @@ use std::sync::Arc;
 use lru::LruCache;
 use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, PkColumn, PkTuple, WireConflictMode};
 use crate::protocol::types::type_code_from_u64;
-use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
+use crate::connection::{Connection, ScanResult, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
 
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
@@ -163,7 +163,7 @@ impl GnitzClient {
         self.conn.push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
     }
 
-    pub fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    pub fn scan(&mut self, table_id: u64) -> ScanResult {
         self.conn.scan(table_id, &mut self.schema_cache)
     }
 
@@ -171,13 +171,13 @@ impl GnitzClient {
         &mut self,
         table_id: u64,
         pk:       &PkTuple,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> ScanResult {
         self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
 
     pub fn seek_by_index(
         &mut self, table_id: u64, col_idx: u64, key: u128,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> ScanResult {
         self.conn.seek_by_index(table_id, col_idx, key, &mut self.schema_cache)
     }
 

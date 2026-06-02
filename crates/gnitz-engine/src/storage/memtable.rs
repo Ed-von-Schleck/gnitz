@@ -1092,7 +1092,7 @@ mod tests {
             mt.upsert_sorted_batch(b).unwrap();
         }
 
-        // 6 more insertions → 14 runs, runs_bytes ≈ 560 > 525
+        // 6 more insertions → 14 runs, runs_bytes = 448 > 420
         for i in 8..14u64 {
             let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
             mt.upsert_sorted_batch(b).unwrap();
@@ -1106,7 +1106,7 @@ mod tests {
         mt.upsert_sorted_batch(r1).unwrap();
         mt.upsert_sorted_batch(r2).unwrap();
 
-        // After consolidation: net 12 rows ≈ 480 < 525
+        // After consolidation: net 12 rows = 384 < 420
         assert!(!mt.should_flush(), "net state should be under threshold");
     }
 

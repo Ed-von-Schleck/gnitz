@@ -77,6 +77,7 @@ pub const NODE_COL_KIND_PROJ:     u64 = 2;  // MAP projection columns
 pub const NODE_COL_KIND_NULL_EXT: u64 = 3;  // NULL_EXTEND payload type codes
 pub const NODE_COL_KIND_AGG_SPEC: u64 = 4;  // REDUCE aggregate specs (value1=func_id, value2=col_idx)
 pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch discriminator (value1=branch_id)
+pub const NODE_COL_KIND_REINDEX:  u64 = 6;  // MAP_EXPR equijoin pre-index cols (value1=col_idx, position=key order)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -134,9 +135,10 @@ pub enum MapKind {
     /// Pure projection/column-reorder. Carries payload column indices to keep.
     Projection(Vec<u16>),
     /// Expression-based map. `program` is an opaque `ExprProgram` blob;
-    /// each crate decodes it with its own decoder. `reindex_col` flips the PK
-    /// column for equijoin pre-indexing.
-    Expression { program: Vec<u8>, reindex_col: Option<u16> },
+    /// each crate decodes it with its own decoder. `reindex_cols` lists the
+    /// source columns, in key order, that become the synthetic PK for equijoin
+    /// pre-indexing (empty for a plain compute map).
+    Expression { program: Vec<u8>, reindex_cols: Vec<u16> },
     /// Drop all payload columns, keep only PK and weight.
     KeyOnly,
     /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
@@ -231,7 +233,13 @@ pub fn decode_op_node(
         x if x == OPCODE_MAP_PROJ          => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
         x if x == OPCODE_MAP_EXPR          => {
             let program = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
-            OpNode::Map(MapKind::Expression { program, reindex_col: reindex })
+            // Reindex columns live in CircuitNodeColumns (NODE_COL_KIND_REINDEX),
+            // position-ordered so a compound key's column order is preserved. Fall
+            // back to the legacy single `reindex` cell for circuits persisted before
+            // the column-list migration (which wrote the cell and no kind rows).
+            let mut reindex_cols = collect_cols(NODE_COL_KIND_REINDEX);
+            if reindex_cols.is_empty() { reindex_cols.extend(reindex); }
+            OpNode::Map(MapKind::Expression { program, reindex_cols })
         }
         x if x == OPCODE_MAP_KEY_ONLY      => OpNode::Map(MapKind::KeyOnly),
         x if x == OPCODE_MAP_HASH_ROW      => {
@@ -268,4 +276,45 @@ pub fn decode_op_node(
         x if x == OPCODE_CLEAR_DELTAS            => OpNode::ClearDeltas,
         _ => return Err(format!("unknown opcode {}", opcode)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reindex_cols_of(node: OpNode) -> Vec<u16> {
+        match node {
+            OpNode::Map(MapKind::Expression { reindex_cols, .. }) => reindex_cols,
+            other => panic!("expected Map(Expression), got {other:?}"),
+        }
+    }
+
+    /// MAP_EXPR reindex columns decode from NODE_COL_KIND_REINDEX rows in
+    /// position order (value1 = source column).
+    #[test]
+    fn decode_reindex_cols_from_kind_rows() {
+        let cols = [
+            (NODE_COL_KIND_REINDEX, 0u16, 3u64, 0u64),
+            (NODE_COL_KIND_REINDEX, 1u16, 9u64, 0u64),
+        ];
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
+        assert_eq!(reindex_cols_of(node), vec![3, 9]);
+    }
+
+    /// Circuits persisted before the column-list migration carry the reindex in
+    /// the legacy single cell and no kind rows; that cell is the fallback.
+    #[test]
+    fn decode_reindex_cols_legacy_cell_fallback() {
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &[]).unwrap();
+        assert_eq!(reindex_cols_of(node), vec![7]);
+    }
+
+    /// When both the legacy cell and kind rows are present, the kind rows win
+    /// (the cell is only consulted when no kind rows exist).
+    #[test]
+    fn decode_reindex_cols_kind_rows_win_over_cell() {
+        let cols = [(NODE_COL_KIND_REINDEX, 0u16, 4u64, 0u64)];
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &cols).unwrap();
+        assert_eq!(reindex_cols_of(node), vec![4]);
+    }
 }

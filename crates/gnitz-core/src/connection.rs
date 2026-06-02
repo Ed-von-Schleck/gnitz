@@ -20,6 +20,11 @@ pub use gnitz_wire::{
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 
+/// `(schema, data_batch, lsn)` returned by a `scan`/`seek`/`seek_by_index`:
+/// the (cached) `Schema`, the materialised `ZSetBatch` if any rows came back,
+/// and the server LSN at which the read was served.
+pub type ScanResult = Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError>;
+
 /// Generate a session-unique client ID.
 ///
 /// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
@@ -122,7 +127,7 @@ impl Connection {
         &mut self,
         target_id: u64,
         cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> ScanResult {
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
@@ -156,7 +161,7 @@ impl Connection {
         target_id: u64,
         pk:        &PkTuple,
         cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> ScanResult {
         let msg = self.roundtrip_seek(target_id, pk, cache)?;
         let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
@@ -168,7 +173,7 @@ impl Connection {
         col_idx:  u64,
         key:      u128,
         cache:    &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> ScanResult {
         let msg = self.roundtrip_seek_by_index(table_id, col_idx, key, cache)?;
         let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))

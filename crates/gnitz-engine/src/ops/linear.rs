@@ -615,8 +615,9 @@ impl PkPromoter {
         let stride = output.pk_stride() as usize;
         // The fixed `[0u8; 16]` scratch buffers below right-align into this
         // stride; a stride > 16 would underflow `16 - stride`. The compiler types
-        // every current synthetic reindex key as U128 (stride 16). When compound
-        // reindex output (stride > 16) lands, the buffers must grow to
+        // a narrow (≤8-byte) integer reindex key at its native width and every
+        // other key as U128, so the synthetic key is always ≤ 16 bytes. When
+        // compound reindex output (stride > 16) lands, the buffers must grow to
         // `MAX_PK_BYTES` — this assert is the tripwire for that work.
         debug_assert!(stride <= 16, "promote_into: synthetic key stride {stride} > 16");
         match self.kind {

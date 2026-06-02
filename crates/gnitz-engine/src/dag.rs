@@ -581,7 +581,7 @@ impl DagEngine {
         });
         let scan_nid = match scan_nid { Some(n) => n, None => return Vec::new() };
 
-        // Find the downstream Map(Expression { reindex_col }) node, walking
+        // Find the downstream Map(Expression { reindex_cols }) node, walking
         // through any intervening Filter nodes (planner emits Filter → Map
         // reindex chains for PK-redistribution views).
         crate::compiler::reindex_cols_through_filters(&loaded, scan_nid)

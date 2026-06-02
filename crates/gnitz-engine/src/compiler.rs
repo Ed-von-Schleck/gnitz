@@ -463,10 +463,10 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
 // ---------------------------------------------------------------------------
 
 /// Build the join-shard map by inspecting OpNode variants directly.
-/// Maps source_tid → [reindex_col] for ScanDelta → Map(Expression{reindex_col})
+/// Maps source_tid → reindex_cols for ScanDelta → Map(Expression{reindex_cols})
 /// chains (equijoin pre-indexing).
 /// Walk forward from `scan_nid` through `Filter` nodes and collect the reindex
-/// column of every `Map(Expression { reindex_col })` reached. The SQL planner
+/// columns of every `Map(Expression { reindex_cols })` reached. The SQL planner
 /// emits `Filter → Map(reindex)` chains for PK-redistribution views, so a
 /// one-hop `scan → Map` lookup would miss the reindex behind a Filter and treat
 /// the join as local-only. A table that participates in multiple joins on
@@ -488,10 +488,12 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
             for &(dst, _port) in outs {
                 match loaded.nodes.get(&dst) {
                     Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-                        reindex_col: Some(rc), ..
+                        reindex_cols, ..
                     })) => {
-                        let v = *rc as i32;
-                        if !cols.contains(&v) { cols.push(v); }
+                        for &rc in reindex_cols {
+                            let v = rc as i32;
+                            if !cols.contains(&v) { cols.push(v); }
+                        }
                     }
                     Some(gnitz_wire::OpNode::Filter(_)) => queue.push_back(dst),
                     _ => {}
@@ -547,9 +549,11 @@ fn propagate_distinct(loaded: &LoadedCircuit, ann: &mut Annotation) {
             Some(gnitz_wire::OpNode::Map(mk)) => {
                 // A reindex (equijoin pre-index or full-row HashRow) rewrites the
                 // PK, so upstream distinctness no longer holds at this node.
-                let has_reindex = matches!(mk,
-                    gnitz_wire::MapKind::Expression { reindex_col: Some(_), .. }
-                        | gnitz_wire::MapKind::HashRow(..));
+                let has_reindex = match mk {
+                    gnitz_wire::MapKind::Expression { reindex_cols, .. } => !reindex_cols.is_empty(),
+                    gnitz_wire::MapKind::HashRow(..) => true,
+                    _ => false,
+                };
                 if !has_reindex {
                     let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
                     if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
@@ -657,7 +661,8 @@ fn opt_fold_reduce_map(
 ) {
     for (&nid, op) in &loaded.nodes {
         let blob = match op {
-            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression { program, reindex_col: None }) => program,
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression { program, reindex_cols })
+                if reindex_cols.is_empty() => program,
             _ => continue,
         };
         let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
@@ -759,6 +764,27 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
         }
     }
     SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
+}
+
+/// Build the full output schema of a reindex Map: the synthetic PK column(s)
+/// derived from `reindex_cols` (in key order), followed by every input column.
+/// The PK width follows `gnitz_wire::reindex_output_type_code` — a ≤8-byte
+/// integer key keeps its native width, everything else (U128/UUID, the
+/// STRING/BLOB content hash, PK-ineligible floats) becomes U128 — which is the
+/// single policy point the planner's `_join_pk` stamp also derives from, so the
+/// engine and catalog strides stay in lockstep. Narrowing is safe for every
+/// view: reindex traces are non-durable and re-derived from the source.
+fn reindex_output_schema(in_schema: &SchemaDescriptor, reindex_cols: &[u16]) -> SchemaDescriptor {
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let pk_n = reindex_cols.len();
+    for (i, &c) in reindex_cols.iter().enumerate() {
+        let out_tc = gnitz_wire::reindex_output_type_code(in_schema.columns[c as usize].type_code);
+        cols[i] = SchemaColumn::new(out_tc, 0); // PK region: nullable = 0
+    }
+    let n = in_schema.num_columns();
+    cols[pk_n..pk_n + n].copy_from_slice(&in_schema.columns[..n]);
+    let pk_idx: Vec<u32> = (0..pk_n as u32).collect();
+    SchemaDescriptor::new(&cols[..pk_n + n], &pk_idx)
 }
 
 /// Determine the output type for an aggregate function.
@@ -1091,7 +1117,7 @@ fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
             match mk {
-                gnitz_wire::MapKind::Expression { program, reindex_col } => {
+                gnitz_wire::MapKind::Expression { program, reindex_cols } => {
                     // A corrupt MAP blob would otherwise be skipped, leaving the
                     // output register at the default empty schema and silently
                     // producing wrong/empty downstream results. Abort the compile.
@@ -1100,7 +1126,7 @@ fn emit_node(
                         None => { state.emit_failed = true; return; }
                     };
                     // Identity MAP: if no reindex and schemas match, skip if sequential copy.
-                    if reindex_col.is_none()
+                    if reindex_cols.is_empty()
                         && schemas_physically_identical(&in_reg_schema, &loaded.out_schema)
                     {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
@@ -1115,13 +1141,20 @@ fn emit_node(
                         out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
                         return;
                     }
+                    // Compound (len > 1) reindex is representable and round-trips, but
+                    // cannot be *emitted* yet: the trace-side exchange router
+                    // (route_partition_key → extract_group_key for len > 1) does not
+                    // co-partition a packed compound key to the same worker as
+                    // partition_for_pk_bytes on the reindexed side, and the runtime
+                    // promoter / Instr::Map are still single-column. Fail the compile
+                    // cleanly rather than silently scatter join rows.
+                    if reindex_cols.len() > 1 {
+                        state.emit_failed = true;
+                        return;
+                    }
                     let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                    let node_schema = if reindex_col.is_some() {
-                        let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-                        cols[0] = SchemaColumn::new(type_code::U128, 0);
-                        let n = in_reg_schema.num_columns();
-                        cols[1..n + 1].copy_from_slice(&in_reg_schema.columns[..n]);
-                        SchemaDescriptor::new(&cols[..n + 1], &[0])
+                    let node_schema = if !reindex_cols.is_empty() {
+                        reindex_output_schema(&in_reg_schema, reindex_cols)
                     } else {
                         loaded.out_schema
                     };
@@ -1129,7 +1162,7 @@ fn emit_node(
                         &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
-                    let rc = reindex_col.map(|c| c as i32).unwrap_or(-1);
+                    let rc = reindex_cols.first().map(|&c| c as i32).unwrap_or(-1);
                     builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc, 0);
                 }
 
@@ -2870,7 +2903,7 @@ mod tests {
         let mut nodes = HashMap::new();
         nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
         nodes.insert(1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-            program: corrupt, reindex_col: None,
+            program: corrupt, reindex_cols: vec![],
         }));
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
@@ -2882,6 +2915,69 @@ mod tests {
             &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
         );
         assert!(result.is_none(), "corrupt Map blob must abort compilation");
+    }
+
+    /// `reindex_output_schema` carries the shared width policy through to the exact
+    /// schema `emit_node` builds: a ≤8-byte integer key narrows to its native width;
+    /// STRING/BLOB, U128/UUID, and floats (PK-ineligible) stay U128, so `pk_stride()`
+    /// reflects the reindex output stride.
+    #[test]
+    fn test_reindex_output_pk_width_policy() {
+        // (key column type, expected output PK type, expected pk_stride)
+        let cases = [
+            (type_code::U64,    type_code::U64,  8u8),
+            (type_code::I32,    type_code::I32,  4),
+            (type_code::U16,    type_code::U16,  2),
+            (type_code::STRING, type_code::U128, 16),
+            (type_code::BLOB,   type_code::U128, 16),
+            (type_code::U128,   type_code::U128, 16),
+            (type_code::UUID,   type_code::U128, 16),
+            (type_code::F64,    type_code::U128, 16),
+        ];
+        for (key_tc, want_tc, want_stride) in cases {
+            // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
+            // PK-ineligible key types (STRING/BLOB/float) are exercisable as keys.
+            let in_schema = SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
+                &[0],
+            );
+            let node_schema = reindex_output_schema(&in_schema, &[1u16]);
+            assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
+            assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
+        }
+    }
+
+    /// A compound (len > 1) reindex Map is representable and round-trips, but cannot
+    /// be *emitted* yet (the trace-side co-partition router and the runtime promoter
+    /// are still single-column). `build_plan` must fail the compile cleanly rather
+    /// than silently scatter join rows.
+    #[test]
+    fn test_build_plan_compound_reindex_gated() {
+        // Valid 2-col copy program so decode_expr_blob succeeds and we reach the
+        // len > 1 gate (not the corrupt-blob abort).
+        let mut eb = gnitz_core::ExprBuilder::new();
+        eb.copy_col(type_code::U64 as u32, 0, 0);
+        eb.copy_col(type_code::I64 as u32, 1, 1);
+        let blob = eb.build(0).encode();
+
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+            program: blob, reindex_cols: vec![0, 1],
+        }));
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
+        );
+        assert!(result.is_none(), "compound (len > 1) reindex must fail the compile");
     }
 
     // ── Item 29: scratch dir cleanup on compile failure ─────────────────────
@@ -3293,12 +3389,12 @@ mod tests {
         nodes.insert(0, OpNode::ScanDelta(10));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
             program: dummy_blob.clone(),
-            reindex_col: Some(1),
+            reindex_cols: vec![1],
         }));
         nodes.insert(2, OpNode::ScanDelta(20));
         nodes.insert(3, OpNode::Map(MapKind::Expression {
             program: dummy_blob,
-            reindex_col: Some(0),
+            reindex_cols: vec![0],
         }));
         nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(5, OpNode::IntegrateSink);
@@ -3339,7 +3435,7 @@ mod tests {
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(2, OpNode::Map(MapKind::Expression {
             program: dummy_blob,
-            reindex_col: Some(1),
+            reindex_cols: vec![1],
         }));
         nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(4, OpNode::IntegrateSink);
@@ -3374,17 +3470,17 @@ mod tests {
         nodes.insert(0, OpNode::ScanDelta(7));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
             program: dummy_blob.clone(),
-            reindex_col: Some(3),
+            reindex_cols: vec![3],
         }));
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN)]);
         assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![3]);
 
-        // Absent: ScanDelta → Map with no reindex_col.
+        // Absent: ScanDelta → Map with no reindex columns.
         let mut nodes2 = HashMap::new();
         nodes2.insert(0, OpNode::ScanDelta(7));
         nodes2.insert(1, OpNode::Map(MapKind::Expression {
             program: dummy_blob,
-            reindex_col: None,
+            reindex_cols: vec![],
         }));
         let loaded2 = make_loaded(nodes2, vec![(0, 1, PORT_IN)]);
         assert!(reindex_cols_through_filters(&loaded2, 0).is_empty());
@@ -3403,11 +3499,11 @@ mod tests {
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(42));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
-            program: dummy_blob.clone(), reindex_col: Some(2),
+            program: dummy_blob.clone(), reindex_cols: vec![2],
         }));
         nodes.insert(2, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(3, OpNode::Map(MapKind::Expression {
-            program: dummy_blob, reindex_col: Some(5),
+            program: dummy_blob, reindex_cols: vec![5],
         }));
         let edges = vec![
             (0, 1, PORT_IN),
@@ -3433,7 +3529,7 @@ mod tests {
         nodes.insert(1, OpNode::ScanTrace(20));
         nodes.insert(2, OpNode::Map(MapKind::Expression {
             program: dummy_blob,
-            reindex_col: Some(2),
+            reindex_cols: vec![2],
         }));
         nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(4, OpNode::IntegrateSink);

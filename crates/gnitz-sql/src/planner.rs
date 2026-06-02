@@ -60,6 +60,19 @@ fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
+/// Catalog `_join_pk` type for an equijoin on the given (left, right) key types.
+/// Both reindex sides build `_join_pk` independently from their own key column
+/// via `TypeCode::reindex_output_type` (the engine derives the same per-side
+/// width), so the single persisted stride must agree with BOTH: narrow only when
+/// the two key types map to the same output width; otherwise keep the wide U128
+/// key so a mixed-width join fails loudly on the stride mismatch instead of
+/// silently dropping join rows.
+fn join_pk_output_type(left_key: TypeCode, right_key: TypeCode) -> TypeCode {
+    let lo = left_key.reindex_output_type();
+    let ro = right_key.reindex_output_type();
+    if lo == ro { lo } else { TypeCode::U128 }
+}
+
 /// Reject any CREATE VIEW form that reads from a compound-PK source.
 /// Lifting this needs the view storage layer (which registers every view
 /// with a hardcoded `pk_cols = &[0]`) and every planner reindex site
@@ -908,16 +921,16 @@ fn execute_create_join_view(
     } else {
         input_b
     };
-    let reindex_b = cb.map_reindex(input_b, right_join_col, right_reindex_prog);
+    let reindex_b = cb.map_reindex(input_b, &[right_join_col], right_reindex_prog);
 
     // Preserved (left) side.
     //   INNER join: a NULL left key matches nothing — drop it.
     //   LEFT  join: a NULL left key must still be emitted with NULL right columns
     //               but must bypass the match (else it collides with a right 0/""
     //               key and pollutes trace_a, corrupting join_ba and the ΔB
-    //               null-fill correction). Split it out, reindex it to a U128 PK
-    //               (so it is layout-compatible with the join output — a bare Filter
-    //               would keep the left table's native PK stride and corrupt the
+    //               null-fill correction). Split it out, reindex it to the synthetic
+    //               join PK (so it is layout-compatible with the join output — a bare
+    //               Filter would keep the left table's native PK stride and corrupt the
     //               downstream Union, which merges by raw PK bytes into one stride),
     //               null-extend it, and union it into the unmatched-left stream.
     //               Its synthetic PK is 0, which is harmless: the left PK is among
@@ -934,11 +947,11 @@ fn execute_create_join_view(
             let left_null = cb.filter(
                 input_a, Some(null_filter_prog(left_join_col, &left_schema, true)?));
             let left_null_ri = cb.map_reindex(
-                left_null, left_join_col, build_reindex_program(&left_schema));
+                left_null, &[left_join_col], build_reindex_program(&left_schema));
             (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
         }
     };
-    let reindex_a = cb.map_reindex(input_a_match, left_join_col, left_reindex_prog);
+    let reindex_a = cb.map_reindex(input_a_match, &[left_join_col], left_reindex_prog);
 
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
@@ -993,15 +1006,25 @@ fn execute_create_join_view(
         inner_merged
     };
 
-    // Build virtual combined output schema: U128 PK + all left cols + all right cols.
-    // After proj_ab/proj_ba, the UNION output has this layout (union col indices):
-    //   col 0: U128_pk (PK)
+    // Build virtual combined output schema: synthetic join PK + all left cols + all
+    // right cols. After proj_ab/proj_ba, the UNION output has this layout (union col
+    // indices):
+    //   col 0: _join_pk (PK)
     //   col 1..left_n: all A columns (in A schema order)
     //   col left_n+1..left_n+right_n: all B columns (in B schema order)
+    //
+    // The synthetic PK width must match the engine's reindex output width: both
+    // sides derive col 0 from `TypeCode::reindex_output_type` (gnitz-wire), so
+    // every cross-process consumer re-derives the same col-0 stride from this
+    // single persisted catalog value.
+    let join_pk_type = join_pk_output_type(
+        left_schema.columns[left_join_col].type_code,
+        right_schema.columns[right_join_col].type_code,
+    );
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     out_cols.push(ColumnDef {
         name: "_join_pk".into(),
-        type_code: TypeCode::U128,
+        type_code: join_pk_type,
         is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
     for col in &left_schema.columns {
@@ -2114,4 +2137,29 @@ fn execute_create_distinct_view(
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `join_pk_output_type` reconciles the two join sides: same narrow type →
+    /// narrow `_join_pk`; wide/string/float keys stay U128; mixed-width keys fall
+    /// back to the wide U128 key (the fail-loud guard against silent dropped join
+    /// rows). The per-side narrow-vs-U128 policy itself lives in gnitz-wire
+    /// (`TypeCode::reindex_output_type`) and is covered by its own test there.
+    #[test]
+    fn join_pk_output_type_reconciles_both_sides() {
+        // Same narrow type both sides → narrow (the behavioral win).
+        assert_eq!(join_pk_output_type(TypeCode::U64, TypeCode::U64), TypeCode::U64);
+        assert_eq!(join_pk_output_type(TypeCode::I64, TypeCode::I64), TypeCode::I64);
+        assert_eq!(join_pk_output_type(TypeCode::U32, TypeCode::U32), TypeCode::U32);
+        // Wide / string / float keys → U128.
+        assert_eq!(join_pk_output_type(TypeCode::String, TypeCode::String), TypeCode::U128);
+        assert_eq!(join_pk_output_type(TypeCode::U128, TypeCode::UUID), TypeCode::U128);
+        // Mixed widths / mixed sign → keep wide so the engine fails loudly rather
+        // than silently dropping rows on a stride mismatch.
+        assert_eq!(join_pk_output_type(TypeCode::U32, TypeCode::U64), TypeCode::U128);
+        assert_eq!(join_pk_output_type(TypeCode::U64, TypeCode::I64), TypeCode::U128);
+    }
 }
