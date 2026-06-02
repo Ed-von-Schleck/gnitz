@@ -7,6 +7,7 @@ import warnings
 
 import pytest
 import gnitz
+from _serverproc import server_preexec
 
 _TMP_DIR = os.path.expanduser("~/git/gnitz/tmp")
 os.makedirs(_TMP_DIR, exist_ok=True)
@@ -95,7 +96,10 @@ class _Server:
             cmd += [f"--log-level={ll}"]
         # Append so a restart does not discard the log that contains the crash.
         self._stderr_f = open(_LOG_PATH, "a")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f)
+        # preexec_fn ties the master's life to pytest's (PR_SET_PDEATHSIG): an
+        # interrupted run (Ctrl-C / SIGKILL / crash) can't orphan the server.
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f,
+                                     preexec_fn=server_preexec)
         for _ in range(100):
             if os.path.exists(self.sock_path):
                 break

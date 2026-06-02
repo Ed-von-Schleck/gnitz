@@ -18,6 +18,7 @@ import time
 import shutil
 import pytest
 import gnitz
+from _serverproc import server_preexec
 
 
 BINARY = os.environ.get(
@@ -45,7 +46,8 @@ def checkpoint_server():
     env["GNITZ_CHECKPOINT_BYTES"] = str(CHECKPOINT_BYTES)
     cmd = [BINARY, data_dir, sock_path, f"--workers={WORKERS}"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env)
+                            stderr=subprocess.PIPE, env=env,
+                            preexec_fn=server_preexec)
     for _ in range(100):
         if os.path.exists(sock_path):
             break

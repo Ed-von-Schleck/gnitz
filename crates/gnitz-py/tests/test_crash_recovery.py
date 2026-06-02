@@ -20,6 +20,7 @@ import time
 
 import pytest
 import gnitz
+from _serverproc import server_preexec
 
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
@@ -43,7 +44,7 @@ def _start_server(data_dir, sock_path, workers=None, extra_env=None,
         env.update(extra_env)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True, env=env,
+        start_new_session=True, env=env, preexec_fn=server_preexec,
     )
     if expect_socket:
         deadline = time.time() + timeout_s
