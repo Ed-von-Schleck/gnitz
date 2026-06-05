@@ -46,5 +46,5 @@ fn test_projection_pk_alias_accepted() {
     let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
     assert!(s.columns[0].name.eq_ignore_ascii_case("employee_id"),
         "aliased PK must be the first output column, got {:?}", s.columns[0].name);
-    assert_eq!(s.columns[0].is_nullable, false, "PK column must stay non-nullable");
+    assert!(!s.columns[0].is_nullable, "PK column must stay non-nullable");
 }

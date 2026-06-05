@@ -58,6 +58,110 @@ fn insert(client: &mut GnitzClient, sn: &str, tbl: &str, id: i64, val: i64) {
     p.execute(&format!("INSERT INTO {} (id, val) VALUES ({}, {})", tbl, id, val)).unwrap();
 }
 
+// ── Set operations over compound-PK sources ──────────────────────────
+// The synthetic `_set_pk` content hash decides membership at every source
+// PK arity, so a compound-PK source needs no special handling.
+
+#[test]
+fn test_set_ops_compound_pk() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
+        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
+        p.execute("CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2").unwrap();
+        p.execute("CREATE VIEW v_union_all AS SELECT val FROM t1 UNION ALL SELECT val FROM t2").unwrap();
+        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2").unwrap();
+        p.execute("CREATE VIEW v_intersect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2").unwrap();
+
+        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)").unwrap();
+        p.execute("INSERT INTO t2 (a, b, val) VALUES (1, 1, 200), (2, 2, 400)").unwrap();
+    }
+
+    // UNION (distinct): 200 appears on both sides but collapses to one row.
+    let (schema, batch) = read_view(&mut client, &sn, "v_union");
+    let val_idx = col_idx(&schema, "val"); // [_set_pk, val]: val at 1 for every view here
+    let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 200, 300, 400]);
+
+    // UNION ALL: the branch_id discriminator keeps both copies of 200.
+    let (_, batch) = read_view(&mut client, &sn, "v_union_all");
+    let mut vals: Vec<i64> = (0..batch.len())
+        .flat_map(|r| vec![i64_at(&batch, val_idx, r); batch.weights[r] as usize])
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 200, 200, 300, 400]);
+
+    // EXCEPT: t1.val \ t2.val = {100, 300}.
+    let (_, batch) = read_view(&mut client, &sn, "v_except");
+    let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 300]);
+
+    // INTERSECT: t1.val ∩ t2.val = {200}.
+    let (_, batch) = read_view(&mut client, &sn, "v_intersect");
+    let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![200]);
+}
+
+#[test]
+fn test_set_ops_incrementality_compound_pk() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
+        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
+        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2").unwrap();
+
+        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200)").unwrap();
+    }
+    let (schema, batch) = read_view(&mut client, &sn, "v_except");
+    let val_idx = col_idx(&schema, "val");
+    let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 200]);
+
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("INSERT INTO t2 (a, b, val) VALUES (1, 1, 100)").unwrap();
+    }
+    let (_, batch2) = read_view(&mut client, &sn, "v_except");
+    let mut vals: Vec<i64> = (0..batch2.len()).map(|r| i64_at(&batch2, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![200]);
+
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("DELETE FROM t1 WHERE a=1 AND b=2").unwrap();
+    }
+    let (_, batch3) = read_view(&mut client, &sn, "v_except");
+    assert_eq!(batch3.len(), 0);
+}
+
+#[test]
+fn test_set_ops_wide_pk_regression() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t1 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE t2 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE VIEW v AS SELECT val FROM t1 UNION SELECT val FROM t2").unwrap();
+
+        p.execute("INSERT INTO t1 (id, val) VALUES (1, 100)").unwrap();
+        p.execute("INSERT INTO t2 (id, val) VALUES (1, 200)").unwrap();
+    }
+    let (schema, batch) = read_view(&mut client, &sn, "v");
+    let val_idx = col_idx(&schema, "val");
+    let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, val_idx, r)).collect();
+    vals.sort();
+    assert_eq!(vals, vec![100, 200]);
+}
+
 // ── item 36: EXCEPT/INTERSECT use full-row identity, not source PK ────
 
 #[test]

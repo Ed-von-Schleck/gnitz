@@ -45,7 +45,7 @@ fn test_pk_int_keeps_native_type_and_not_nullable() {
     let s = schema_after_create(&mut client, &sn, "t1");
     let pk = &s.columns[s.pk_index_single()];
     assert_eq!(pk.type_code, TypeCode::I32);
-    assert_eq!(pk.is_nullable, false);
+    assert!(!pk.is_nullable);
 }
 
 #[test]
@@ -375,10 +375,10 @@ fn test_group_by_nullable_u64_uses_synthetic_pk() {
     // Synthetic-PK path: first column is the U128 _group_pk hash, not the
     // nullable U64 source group column.
     assert_eq!(s.columns[0].type_code, TypeCode::U128);
-    assert_eq!(s.columns[0].is_nullable, false);
+    assert!(!s.columns[0].is_nullable);
     // The non-PK group column carries the source nullability through.
     let grp = s.columns.iter().find(|c| c.name.eq_ignore_ascii_case("grp")).unwrap();
-    assert_eq!(grp.is_nullable, true,
+    assert!(grp.is_nullable,
         "synthetic-PK group column must propagate source nullability");
 }
 
@@ -399,7 +399,7 @@ fn test_group_by_nonnullable_u64_uses_natural_pk() {
     let (_, s) = client.resolve_table_or_view_id(&sn, "v_nat_grp").unwrap();
     // Natural-PK path: first column is the (non-nullable) source group column.
     assert_eq!(s.columns[0].type_code, TypeCode::U64);
-    assert_eq!(s.columns[0].is_nullable, false);
+    assert!(!s.columns[0].is_nullable);
     assert!(s.columns[0].name.eq_ignore_ascii_case("grp"));
 }
 
@@ -479,19 +479,6 @@ fn test_view_over_compound_pk_simple_select_rejected() {
 }
 
 #[test]
-fn test_view_over_compound_pk_distinct_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (mut client, sn) = make_planner(&srv);
-    create_compound_pk_table(&mut client, &sn, "cv_src2");
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE VIEW cv_d AS SELECT DISTINCT a, b FROM cv_src2"));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
-}
-
-#[test]
 fn test_view_over_compound_pk_group_by_rejected() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
@@ -499,22 +486,6 @@ fn test_view_over_compound_pk_group_by_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     let err = must_err(p.execute(
         "CREATE VIEW cv_g AS SELECT a, COUNT(*) AS n FROM cv_src3 GROUP BY a"
-    ));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
-}
-
-#[test]
-fn test_view_over_compound_pk_union_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (mut client, sn) = make_planner(&srv);
-    create_compound_pk_table(&mut client, &sn, "cv_l");
-    create_compound_pk_table(&mut client, &sn, "cv_r");
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE VIEW cv_u AS SELECT * FROM cv_l UNION ALL SELECT * FROM cv_r"
     ));
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),

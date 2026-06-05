@@ -271,20 +271,6 @@ def test_view_over_compound_pk_rejected(client):
         _cleanup(client, sn, "src")
 
 
-def test_view_distinct_over_compound_pk_rejected(client):
-    sn = "cpk" + _uid()
-    client.create_schema(sn)
-    try:
-        _make_compound_table(client, sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT a, b FROM src", schema_name=sn,
-            )
-        assert "compound" in str(exc.value).lower()
-    finally:
-        _cleanup(client, sn, "src")
-
-
 def test_view_group_by_over_compound_pk_rejected(client):
     sn = "cpk" + _uid()
     client.create_schema(sn)
@@ -298,6 +284,106 @@ def test_view_group_by_over_compound_pk_rejected(client):
         assert "compound" in str(exc.value).lower()
     finally:
         _cleanup(client, sn, "src")
+
+
+# ---------------------------------------------------------------------------
+# Set-operation / DISTINCT views over a compound-PK source.
+# Membership is decided by the synthetic content hash (`_set_pk` /
+# `_distinct_pk`), independent of the source PK arity. Under multiple workers
+# the master scatters each source delta by its compound PK, then the in-circuit
+# `shard(&[0])` re-partitions by the hash — these exercise that routing e2e.
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_union_view_e2e(client):
+    """UNION view projecting a non-PK column from two compound-PK tables: equal
+    `val`s collapse regardless of which compound PK (or worker partition) carried
+    them, and a value survives until its last carrier across both sides is
+    retracted."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t1 (a BIGINT UNSIGNED, b BIGINT UNSIGNED, val BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE t2 (a BIGINT UNSIGNED, b BIGINT UNSIGNED, val BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT val FROM t1 UNION SELECT val FROM t2",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+
+        # val=200 appears on both sides under different compound PKs.
+        client.execute_sql(
+            "INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t2 (a, b, val) VALUES (5, 9, 200), (7, 3, 400)",
+            schema_name=sn,
+        )
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["val"] for r in rows) == [100, 200, 300, 400]
+
+        # Retract one carrier of 200 (from t1); 200 still carried by t2 → survives.
+        client.execute_sql("DELETE FROM t1 WHERE a = 1 AND b = 2", schema_name=sn)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["val"] for r in rows) == [100, 200, 300, 400]
+
+        # Retract the other carrier of 200 (from t2) → 200 is fully retracted.
+        client.execute_sql("DELETE FROM t2 WHERE a = 5 AND b = 9", schema_name=sn)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["val"] for r in rows) == [100, 300, 400]
+    finally:
+        try:
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+        except Exception:
+            pass
+        _cleanup(client, sn, "t1", "t2")
+
+
+def test_compound_pk_distinct_view_e2e(client):
+    """DISTINCT view projecting a non-PK column from a compound-PK table: dedup
+    ignores both PK columns, so equal `payload`s under distinct compound PKs
+    collapse, and a value survives until its last carrier is retracted."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT DISTINCT payload FROM t", schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+
+        # payload=7 carried by two distinct compound PKs; payload=9 by one.
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 10, 7), (1, 20, 7), (2, 10, 9)",
+            schema_name=sn,
+        )
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["payload"] for r in rows) == [7, 9]
+
+        # Drop one carrier of 7 → 7 still present via (1, 20).
+        client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 10", schema_name=sn)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["payload"] for r in rows) == [7, 9]
+
+        # Drop the last carrier of 7 → 7 retracted.
+        client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 20", schema_name=sn)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted(r["payload"] for r in rows) == [9]
+    finally:
+        try:
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+        except Exception:
+            pass
+        _cleanup(client, sn, "t")
 
 
 def test_index_on_compound_pk_narrow_source_via_sql(client):

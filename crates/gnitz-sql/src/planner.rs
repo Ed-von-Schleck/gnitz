@@ -73,10 +73,17 @@ fn join_pk_output_type(left_key: TypeCode, right_key: TypeCode) -> TypeCode {
     if lo == ro { lo } else { TypeCode::U128 }
 }
 
-/// Reject any CREATE VIEW form that reads from a compound-PK source.
-/// Lifting this needs the view storage layer (which registers every view
-/// with a hardcoded `pk_cols = &[0]`) and every planner reindex site
-/// (which calls `pk_index_single()`) to widen first — a separate plan.
+/// Reject the CREATE VIEW shapes that emit a *real* (source / natural / join)
+/// output PK from a compound-PK source: plain projection, equijoin, and
+/// GROUP BY. Lifting those needs the view storage layer — which registers
+/// every view with a hardcoded `pk_cols = &[0]` — and the planner reindex
+/// sites that call `pk_index_single()` to persist and honor a real per-view
+/// PK column list first.
+///
+/// Set-operation (`UNION`/`EXCEPT`/`INTERSECT`) and `SELECT DISTINCT` views
+/// are exempt: their output PK is a synthetic single-column `U128` content
+/// hash (`_set_pk` / `_distinct_pk`) whose width is independent of the source
+/// PK's arity, so they need no storage migration and never call this guard.
 fn reject_compound_pk_view_source(schema: &Schema) -> Result<(), GnitzSqlError> {
     if schema.pk_count() >= 2 {
         return Err(GnitzSqlError::Unsupported(
@@ -1828,7 +1835,6 @@ fn compile_set_op_side(
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "set operation")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-    reject_compound_pk_view_source(&source_schema)?;
 
     let inp = cb.input_delta_tagged(source_tid);
 
@@ -2095,7 +2101,6 @@ fn execute_create_distinct_view(
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, "SELECT DISTINCT")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-    reject_compound_pk_view_source(&source_schema)?;
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, source_tid);
