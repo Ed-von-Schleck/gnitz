@@ -27,7 +27,7 @@ use crate::runtime::sal::{
 use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::reactor::{AsyncMutex, PendingRelay};
+use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
     PartitionRouter, RouteMode, op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
@@ -845,7 +845,10 @@ impl MasterDispatcher {
 
         // Cache miss: broadcast to all workers with per-worker req_ids and
         // forward the slot whose worker found a row (or slot 0 if none).
-        let (mut slots, _req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // `_lease` keeps the scan active across the single-frame inspection
+        // below; its workers also stream, so dropping it early would let the
+        // gate discard a late frame.
+        let (mut slots, _req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -884,7 +887,10 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, col_idx: u32, key: u128,
     ) -> Result<Option<Batch>, String> {
-        let (slots, _req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // `_lease` held across the single-frame collect: its workers stream, so
+        // releasing the gate before the slots are inspected risks a discarded
+        // late frame.
+        let (slots, _req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -932,7 +938,11 @@ impl MasterDispatcher {
         fd: i32,
         client_version: u16,
     ) -> Result<bool, String> {
-        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // `_lease` held across the entire continuation drain: every worker
+        // streams a multi-frame train, and a cancelled drain (client
+        // disconnect) must keep the ids active until the lease drops so the
+        // gate discards — not parks — late frames.
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             // Embed client_version in wire_flags bits 24-39 so workers can
@@ -2131,7 +2141,10 @@ impl MasterDispatcher {
             (missing, guard)
         };
 
-        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // `_lease` held across the full continuation drain below; its workers
+        // stream multi-frame trains, so releasing the gate early (e.g. on a
+        // mid-scan cancellation) would let a still-streaming worker wedge.
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -2207,7 +2220,10 @@ impl MasterDispatcher {
         // Fan out a full-table Scan (sal_flags = 0 ⇒ SalMessageKind::Scan); each
         // worker streams its local partition rows in continuation frames. Same
         // primitive as the warmup.
-        let (slots, req_ids) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
+        // `_lease` held across the full continuation drain below; the CREATE
+        // UNIQUE INDEX validator scans every worker's whole partition train,
+        // so the gate must stay open until the drain (or a cancellation) ends.
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(owner_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
@@ -2428,7 +2444,7 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex<()>>,
     submit: F,
-) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS]), String>
+) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
 where
     F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
 {
@@ -2437,6 +2453,16 @@ where
     for id in req_ids[..nw].iter_mut() {
         *id = reactor.alloc_scan_request_id();
     }
+
+    // Register the ids active BEFORE any await so a cancelled first-frame await
+    // still deregisters them and route_scan_slot discards late frames. The
+    // returned lease MUST be bound to a named local held to end of the caller's
+    // drain scope (never a bare `_`, which would drop it immediately and
+    // re-open the wedge).
+    let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
+    for (d, &s) in scan_ids[..nw].iter_mut().zip(&req_ids[..nw]) { *d = s as u32; }
+    let lease = reactor.scan_lease(&scan_ids[..nw]);
+
     {
         let _guard = sal_excl.lock().await;
         unsafe {
@@ -2448,7 +2474,7 @@ where
     let slots = crate::runtime::reactor::join_all_unpin(
         req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
     ).await;
-    Ok((slots, req_ids))
+    Ok((slots, req_ids, lease))
 }
 
 /// Fan-out scan drain shared by the unique-filter warmup and the CREATE-time
@@ -2576,6 +2602,11 @@ async fn single_worker_async(
             req_id
         }
     };
+    // Hold the scan active across the await; without this the gate in
+    // route_scan_slot discards the reply and the await never resolves. Dropped
+    // on return (nothing to purge) or on cancellation (freeing any in-flight
+    // slot). One frame, no continuation train, so the lease lives in this body.
+    let _lease = reactor.scan_lease(&[req_id as u32]);
     let slot = reactor.await_scan_slot(req_id as u32).await;
     let ctrl = peek_control_block(slot.bytes())
         .expect("W2M ctrl corrupt in single_worker_async");
@@ -3062,6 +3093,10 @@ mod unique_filter_tests {
         });
 
         let receiver = W2mReceiver::new(vec![ptr0, ptr1]);
+        // Mark both scans active: route_scan_slot now gates on active_scans, so
+        // without a lease the parked continuation below would be discarded
+        // (dispatch_scan_fanout normally holds this lease across the drain).
+        let lease = reactor.scan_lease(&[w0_req, w1_req]);
         // Initial slots handed to the drain (what dispatch_scan_fanout returns).
         let slot0 = receiver.try_read_slot(0).expect("worker 0 frame");
         let slot1a = receiver.try_read_slot(1).expect("worker 1 frame A");
@@ -3100,6 +3135,11 @@ mod unique_filter_tests {
         }
         drop(after);
 
+        // Drop the lease before the rings: its Drop purges scan_parked, which
+        // would drop any still-queued W2mSlot borrowing the soon-to-be-unmapped
+        // region. (The queue is already drained here, but keep the ordering
+        // honest.)
+        drop(lease);
         drop(reactor);
         drop(receiver);
         unsafe {

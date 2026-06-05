@@ -145,7 +145,11 @@ impl InFlightState {
         let n = self.completed.trailing_ones() as u64;
         if n > 0 {
             let last_vrc = self.queue[((self.front_idx + n - 1) % 64) as usize];
-            self.completed >>= n;
+            // At full capacity (all 64 slots completed) n == 64, and
+            // `>>= 64` is a shift-by-width: a debug-build panic, and on
+            // release x86_64 a mask to `>> 0` that leaves `completed` full of
+            // stale ones, corrupting the next release. Zero it explicitly.
+            if n == 64 { self.completed = 0; } else { self.completed >>= n; }
             self.front_idx += n;
             self.len -= n as u8;
             self.hdr.advance_consume_cursor(last_vrc);
@@ -444,6 +448,47 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("writer thread did not complete within 5 seconds");
             handle.join().expect("writer thread panicked");
+
+            free_region(ptr, size);
+        }
+    }
+
+    /// Fix F: releasing a full 64-slot in-flight prefix in one go drives
+    /// `trailing_ones()` to 64, so the bare `self.completed >>= 64` would be a
+    /// shift-by-width (debug panic / release UB). Release every slot EXCEPT the
+    /// head first (nothing retires), then the head — completing all 64 bits at
+    /// once — and assert it advances cleanly to the last slot's new_vrc.
+    #[test]
+    fn release_retires_full_64_prefix_without_ub() {
+        unsafe {
+            let (ptr, size, capacity) = make_ring(8, 64);
+            let writer = W2mWriter::new(ptr, capacity);
+            let receiver = W2mReceiver::new(vec![ptr]);
+            let hdr = receiver.header(0);
+
+            for i in 0..64u8 { writer.send_encoded(8, 0, |s| { s[0] = i; }); }
+            let mut slots: Vec<_> =
+                (0..64).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
+            // new_vrc of the 64th slot — where consume_cursor must land once the
+            // whole prefix retires.
+            let last_vrc = hdr.read_cursor().load(Ordering::Acquire);
+
+            // Release every slot except the head: completed fills bits 1..63 but
+            // no prefix retires while the front (bit 0) stays unset.
+            let head = slots.remove(0);
+            slots.clear(); // drops push_idx 1..63
+            assert_eq!(
+                hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64,
+                "no prefix may retire until the head releases",
+            );
+
+            // Release the head: all 64 bits set ⇒ trailing_ones() == 64 ⇒
+            // `completed >>= 64` without the Fix F guard is UB.
+            drop(head);
+            assert_eq!(
+                hdr.consume_cursor().load(Ordering::Acquire), last_vrc,
+                "head release must retire the full 64-slot prefix to the last new_vrc",
+            );
 
             free_region(ptr, size);
         }

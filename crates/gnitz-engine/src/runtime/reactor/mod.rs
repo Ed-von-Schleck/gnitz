@@ -39,6 +39,7 @@ use self::uring::IoUringRing;
 
 use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
+use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::sys::FUTEX2_SIZE_U32;
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 
@@ -127,6 +128,13 @@ struct ReactorShared {
     /// fires.
     fsync_wakers: RefCell<FxHashMap<u64, Waker>>,
     parked_fsync_results: RefCell<FxHashMap<u64, i32>>,
+    /// Fsync ids whose `FsyncFuture` was dropped before the CQE arrived.
+    /// The `KIND_FSYNC` handler parks its result unconditionally, so the
+    /// post-drop CQE would otherwise re-park an `i32` no future collects.
+    /// `Drop` records the id here; the handler consults it and drops the
+    /// late result instead. Empty on the steady-state path (cancellation
+    /// is rare), so the handler's `is_empty()` check skips the hash.
+    cancelled_fsyncs: RefCell<FxHashSet<u64>>,
     w2m: OnceCell<W2mReceiver>,
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
@@ -192,6 +200,14 @@ struct ReactorShared {
     /// Send results parked before their waker was installed (same pattern
     /// as parked_replies / parked_fsync_results).
     parked_send_results: RefCell<FxHashMap<u64, i32>>,
+    /// Send ids whose `SendFuture` was dropped before the CQE arrived.
+    /// `KIND_SEND` parks its result unconditionally, so `Drop` tombstones
+    /// the id here (after handing off the buffer keep-alive) and the
+    /// handler drops the late result. Kept separate from `cancelled_fsyncs`
+    /// because send ids (`alloc_send_id`) and fsync ids (`alloc_request_id`)
+    /// come from different counters — a shared set would let a cancelled
+    /// send id wrongly tombstone a live fsync of the same numeric value.
+    cancelled_sends: RefCell<FxHashSet<u64>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -204,8 +220,18 @@ struct ReactorShared {
     /// `await_scan_slot` futures; drained by `route_scan_slot`.
     scan_wakers: RefCell<FxHashMap<u32, Waker>>,
     /// Scan slots parked between `route_scan_slot` and the awaiting
-    /// `ScanSlotFuture::poll`.
-    scan_parked: RefCell<FxHashMap<u32, W2mSlot>>,
+    /// `ScanSlotFuture::poll`. A *queue* per `req_id`: a worker streams
+    /// continuation frames ahead while the master drains a different
+    /// worker serially, so a single-value slot would drop (and lose) all
+    /// but the last frame. Each queued `W2mSlot` still holds its ring slot
+    /// until dropped, so the worker blocks in `send_encoded` once the ring
+    /// fills — queue depth is bounded by ring capacity.
+    scan_parked: RefCell<FxHashMap<u32, VecDeque<W2mSlot>>>,
+    /// Scan request_ids with a live consumer (a held `ScanLease`). A frame
+    /// whose req_id is absent belongs to an abandoned scan and is dropped
+    /// (freeing ring space) by `route_scan_slot` rather than parked — so a
+    /// cancelled scan's still-streaming worker never wedges on a full ring.
+    active_scans: RefCell<FxHashSet<u32>>,
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
@@ -297,6 +323,7 @@ impl Reactor {
             parked_replies: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
             fsync_wakers: RefCell::new(FxHashMap::default()),
             parked_fsync_results: RefCell::new(FxHashMap::default()),
+            cancelled_fsyncs: RefCell::new(FxHashSet::default()),
             w2m: OnceCell::new(),
             futex_waitv_storage: RefCell::new(None),
             futex_waitv_armed: Cell::new(false),
@@ -319,6 +346,7 @@ impl Reactor {
             send_fd_for_id: RefCell::new(FxHashMap::default()),
             send_buffers_in_flight: RefCell::new(FxHashMap::default()),
             parked_send_results: RefCell::new(FxHashMap::default()),
+            cancelled_sends: RefCell::new(FxHashSet::default()),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
@@ -326,6 +354,7 @@ impl Reactor {
             closing_scratch: RefCell::new(Vec::new()),
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
+            active_scans: RefCell::new(FxHashSet::default()),
             accept_backoff_armed: Cell::new(false),
         });
         // Publish the run-queue pointer for the waker vtable. ReactorShared
@@ -507,6 +536,16 @@ impl Reactor {
         }
     }
 
+    /// Create a `ScanLease` that registers `ids` as active scans for its
+    /// lifetime. Membership in `active_scans` must span the whole scan
+    /// operation regardless of which `.await` a cancellation lands on, so the
+    /// lease must be bound to a named local held to end of scope. On drop the
+    /// lease deregisters its ids and purges any waker / queued frames they
+    /// left, so `route_scan_slot` discards an abandoned scan's later frames.
+    pub(crate) fn scan_lease(&self, ids: &[u32]) -> ScanLease {
+        ScanLease::new(Rc::clone(&self.inner), ids)
+    }
+
     /// Attach the `W2mReceiver` and arm a persistent `FUTEX_WAITV` SQE
     /// that watches every worker's `reader_seq` word. On each CQE, the
     /// reactor drains all rings (the wake index is not authoritative
@@ -651,7 +690,7 @@ impl Reactor {
     /// (0 on success, negative errno on failure).
     pub fn fsync(&self, fd: i32) -> FsyncFuture {
         let id = self.submit_fsync(fd);
-        FsyncFuture { id, inner: Rc::clone(&self.inner) }
+        FsyncFuture { id, completed: false, inner: Rc::clone(&self.inner) }
     }
 
     #[cfg(test)]
@@ -1018,9 +1057,21 @@ impl Reactor {
                 self.inner.futex_waitv_cancelled.set(true);
             }
             KIND_FSYNC => {
-                self.inner.parked_fsync_results.borrow_mut().insert(id, cqe.res);
-                if let Some(w) = self.inner.fsync_wakers.borrow_mut().remove(&id) {
-                    w.wake();
+                // Gate only the result-park on the tombstone. The set is empty
+                // on the steady-state path (cancellation is rare), so the
+                // `is_empty` check short-circuits before `remove` (and its hash)
+                // on every normal completion.
+                let cancelled = {
+                    let mut c = self.inner.cancelled_fsyncs.borrow_mut();
+                    !c.is_empty() && c.remove(&id)
+                };
+                if cancelled {
+                    // Awaiter dropped before the CQE; nothing to deliver.
+                } else {
+                    self.inner.parked_fsync_results.borrow_mut().insert(id, cqe.res);
+                    if let Some(w) = self.inner.fsync_wakers.borrow_mut().remove(&id) {
+                        w.wake();
+                    }
                 }
             }
             KIND_ACCEPT => {
@@ -1060,7 +1111,9 @@ impl Reactor {
                 self.handle_recv_cqe(fd, cqe.res);
             }
             KIND_SEND => {
-                self.inner.parked_send_results.borrow_mut().insert(id, cqe.res);
+                // Buffer / inflight / fd cleanup is unconditional — the kernel
+                // is done with the pointer regardless of whether the awaiter is
+                // still alive.
                 let fd = self.inner.send_fd_for_id.borrow_mut().remove(&id);
                 if let Some(fd) = fd {
                     if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
@@ -1068,8 +1121,20 @@ impl Reactor {
                     }
                 }
                 self.inner.send_buffers_in_flight.borrow_mut().remove(&id);
-                if let Some(w) = self.inner.send_wakers.borrow_mut().remove(&id) {
-                    w.wake();
+                // Only the result-park is gated. KIND_SEND fires per client
+                // reply / push chunk — the hottest CQE path — so the `is_empty`
+                // check skips the hash on every uncancelled send.
+                let cancelled = {
+                    let mut c = self.inner.cancelled_sends.borrow_mut();
+                    !c.is_empty() && c.remove(&id)
+                };
+                if cancelled {
+                    // Awaiter dropped before the CQE; buffer freed above, drop the result.
+                } else {
+                    self.inner.parked_send_results.borrow_mut().insert(id, cqe.res);
+                    if let Some(w) = self.inner.send_wakers.borrow_mut().remove(&id) {
+                        w.wake();
+                    }
                 }
             }
             _ => {}
@@ -1229,7 +1294,31 @@ impl Reactor {
 
     fn route_scan_slot(&self, slot: W2mSlot) {
         let req_id = slot.internal_req_id;
-        self.inner.scan_parked.borrow_mut().insert(req_id, slot);
+        if !self.inner.active_scans.borrow().contains(&req_id) {
+            // Abandoned scan (no live ScanLease): dropping `slot` advances
+            // consume_cursor so the still-streaming worker never wedges on a
+            // full ring.
+            return; // slot dropped here
+        }
+        // Queue, never overwrite: a worker streams continuation frames ahead
+        // while the master drains a different worker serially; a single-value
+        // slot would drop (and lose) all but the last.
+        let mut parked = self.inner.scan_parked.borrow_mut();
+        let q = parked.entry(req_id).or_default();
+        // One req_id maps to exactly one worker (`dispatch_scan_fanout`
+        // allocates a distinct id per worker), so a queued frame is one of that
+        // worker's in-flight (parked, un-dropped) W2M slots. The continuation
+        // chunker fills every frame to MAX_W2M_MSG — there is no small-frame
+        // path — so depth is capped by W2M_REGION_SIZE / MAX_W2M_MSG ≈ 4, far
+        // below the 64-slot InFlightState limit. The debug_assert turns any
+        // future chunking change that breaks that bound into a test failure
+        // rather than a silent InFlightState overwrite.
+        debug_assert!(
+            q.len() < 64,
+            "scan queue depth {} for req_id {} — W2M in-flight would overflow",
+            q.len(), req_id,
+        );
+        q.push_back(slot);
         if let Some(waker) = self.inner.scan_wakers.borrow_mut().remove(&req_id) {
             waker.wake();
         }
@@ -1582,6 +1671,21 @@ impl Future for ReplyFuture {
     }
 }
 
+impl Drop for ReplyFuture {
+    fn drop(&mut self) {
+        // select2 contract: a dropped awaiter must leave no registered state.
+        // Without this, a reply arriving after the drop finds a stale waker and
+        // is parked forever in parked_replies. On normal completion route_reply
+        // has already removed the waker and poll removed the parked reply, so
+        // Drop finds nothing — two absent-key removes, a few ns on a map already
+        // cache-hot from the same poll. (route_reply parks a reply only when a
+        // waker is registered, so withdrawing the waker is sufficient here — no
+        // tombstone, unlike fsync/send.)
+        self.inner.reply_wakers.borrow_mut().remove(&self.req_id);
+        self.inner.parked_replies.borrow_mut().remove(&self.req_id);
+    }
+}
+
 struct ScanSlotFuture {
     req_id: u32,
     inner: Rc<ReactorShared>,
@@ -1590,12 +1694,67 @@ struct ScanSlotFuture {
 impl Future for ScanSlotFuture {
     type Output = W2mSlot;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<W2mSlot> {
-        if let Some(slot) = self.inner.scan_parked.borrow_mut().remove(&self.req_id) {
-            return Poll::Ready(slot);
+        {
+            let mut parked = self.inner.scan_parked.borrow_mut();
+            if let Some(q) = parked.get_mut(&self.req_id) {
+                if let Some(slot) = q.pop_front() {
+                    if q.is_empty() { parked.remove(&self.req_id); }
+                    return Poll::Ready(slot);
+                }
+            }
         }
         self.inner.scan_wakers.borrow_mut()
             .insert(self.req_id, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for ScanSlotFuture {
+    fn drop(&mut self) {
+        // Only the waker: the ScanLease owns scan_parked for this req_id.
+        // Removing the parked queue here would discard the still-queued
+        // continuation frames a *resolved* future legitimately leaves behind
+        // (between continuation frames there is no live ScanSlotFuture to run a
+        // Drop, so the lease is the only scope that reliably spans the whole
+        // operation).
+        self.inner.scan_wakers.borrow_mut().remove(&self.req_id);
+    }
+}
+
+/// RAII guard owning the active-scan + parked-queue lifecycle of a whole scan
+/// operation. Registers its req_ids in `active_scans` on construction; on drop
+/// deregisters them and purges any waker / queued frames they left (dropping a
+/// queued `W2mSlot` advances `consume_cursor`, freeing ring space). Ids are
+/// stored inline (at most `MAX_WORKERS` per fan-out), mirroring the
+/// `[u64; MAX_WORKERS]` `req_ids` arrays in `dispatch_scan_fanout` — no
+/// per-scan heap allocation.
+pub(crate) struct ScanLease {
+    inner: Rc<ReactorShared>,
+    ids: [u32; MAX_WORKERS],
+    len: u8, // MAX_WORKERS = 64 < 256
+}
+
+impl ScanLease {
+    fn new(inner: Rc<ReactorShared>, ids: &[u32]) -> Self {
+        debug_assert!(ids.len() <= MAX_WORKERS);
+        inner.active_scans.borrow_mut().extend(ids.iter().copied());
+        let mut buf = [0u32; MAX_WORKERS];
+        buf[..ids.len()].copy_from_slice(ids);
+        ScanLease { inner, ids: buf, len: ids.len() as u8 }
+    }
+}
+
+impl Drop for ScanLease {
+    fn drop(&mut self) {
+        let mut active = self.inner.active_scans.borrow_mut();
+        let mut wakers = self.inner.scan_wakers.borrow_mut();
+        let mut parked = self.inner.scan_parked.borrow_mut();
+        for &id in &self.ids[..self.len as usize] {
+            active.remove(&id);
+            wakers.remove(&id);
+            parked.remove(&id); // drops the whole VecDeque → every W2mSlot
+                                // drop advances consume_cursor
+        }
     }
 }
 
@@ -1605,18 +1764,49 @@ impl Future for ScanSlotFuture {
 
 pub struct FsyncFuture {
     id: u64,
+    /// Set once `poll` resolves `Ready`. Lets `Drop` skip the cancellation
+    /// tombstone on the success path: `poll` already removed the parked result,
+    /// so the absent-result check in `Drop` cannot distinguish "resolved" from
+    /// "CQE still pending". Without this flag every successful fsync would
+    /// tombstone an id whose CQE was already consumed — an unbounded
+    /// `cancelled_fsyncs` leak, one entry per commit. `SendFuture` reuses its
+    /// `_alive` keep-alive for the same purpose; `FsyncFuture` has no such field.
+    completed: bool,
     inner: Rc<ReactorShared>,
 }
 
 impl Future for FsyncFuture {
     type Output = i32;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        if let Some(rc) = self.inner.parked_fsync_results.borrow_mut().remove(&self.id) {
+    // `mut self` so the ready arm can set `completed`; FsyncFuture is Unpin
+    // (plain fields, no PhantomPinned/pin_project), so DerefMut through the Pin
+    // is sound — the same shape SendFuture::poll already uses.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        let parked = self.inner.parked_fsync_results.borrow_mut().remove(&self.id);
+        if let Some(rc) = parked {
+            self.completed = true;
             return Poll::Ready(rc);
         }
         self.inner.fsync_wakers.borrow_mut()
             .insert(self.id, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for FsyncFuture {
+    fn drop(&mut self) {
+        // Resolved: poll already delivered the result and the CQE was consumed —
+        // no waker left (the handler removed it when it woke), nothing to reclaim.
+        if self.completed {
+            return;
+        }
+        self.inner.fsync_wakers.borrow_mut().remove(&self.id);
+        // CQE arrived after the last poll but before this drop: reclaim it.
+        if self.inner.parked_fsync_results.borrow_mut().remove(&self.id).is_some() {
+            return;
+        }
+        // CQE still pending: tombstone so the late KIND_FSYNC handler drops its
+        // result instead of leaking it (the handler parks unconditionally).
+        self.inner.cancelled_fsyncs.borrow_mut().insert(self.id);
     }
 }
 
@@ -1632,6 +1822,17 @@ impl Future for AcceptFuture {
         }
         *self.inner.accept_waker.borrow_mut() = Some(cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for AcceptFuture {
+    fn drop(&mut self) {
+        // Waker hygiene only: accept_waker is a single Option<Waker> rewritten
+        // by the next poll and take()n by the KIND_ACCEPT handler, and there is
+        // at most one live AcceptFuture (the eternal accept_loop). Purely
+        // defensive today — the accept loop is never cancelled — but completes
+        // the park-state enumeration for a future timeout/select2 over accept().
+        self.inner.accept_waker.borrow_mut().take();
     }
 }
 
@@ -1655,6 +1856,16 @@ impl Future for RecvFuture {
         }
         self.inner.recv_waiters.borrow_mut().insert(self.fd, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for RecvFuture {
+    fn drop(&mut self) {
+        // Waker hygiene only: recv_waiters holds at most one waker per fd (the
+        // single read loop for this connection), and no per-awaiter result is
+        // parked behind its back. Runs in normal operation — a recv loop ends on
+        // every client disconnect — so withdrawing the waker closes the family.
+        self.inner.recv_waiters.borrow_mut().remove(&self.fd);
     }
 }
 
@@ -1700,11 +1911,21 @@ impl Future for SendFuture {
 
 impl Drop for SendFuture {
     fn drop(&mut self) {
-        // CQE hasn't arrived — park the keep-alive in the reactor so the
-        // kernel's pointer stays valid until KIND_SEND fires.
+        // CQE already parked a result (and the handler already freed the
+        // buffer): reclaim the orphaned result, nothing else to do.
+        if self.inner.parked_send_results.borrow_mut().remove(&self.send_id).is_some() {
+            self._alive.take();
+            return;
+        }
+        // CQE still pending: keep the buffer alive for the kernel, withdraw the
+        // waker, and tombstone so the late KIND_SEND handler drops its result.
+        // (`_alive` is None on the resolved path — poll take()s it — so this arm
+        // never fires after a successful send, keeping cancelled_sends bounded.)
         if let Some(alive) = self._alive.take() {
             self.inner.send_buffers_in_flight.borrow_mut()
                 .insert(self.send_id, alive);
+            self.inner.send_wakers.borrow_mut().remove(&self.send_id);
+            self.inner.cancelled_sends.borrow_mut().insert(self.send_id);
         }
     }
 }
@@ -3554,15 +3775,20 @@ mod tests {
 
     #[test]
     fn route_scan_slot_parks_when_no_waker_registered() {
-        // Slot arrives before any future is polled: must be parked, not dropped.
+        // Slot arrives before any future is polled, but the scan IS active (a
+        // ScanLease is held): the frame must be queued, not dropped or
+        // overwritten.
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
         let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
 
+        let _lease = r.scan_lease(&[req_id]);
         r.test_route_scan_slot(slot);
 
         assert!(r.inner.scan_parked.borrow().contains_key(&req_id),
-            "slot must be parked when no waker is registered");
+            "slot must be queued when no waker is registered for an active scan");
+        assert_eq!(r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()), Some(1),
+            "exactly one frame queued");
         assert!(r.inner.scan_wakers.borrow().is_empty(),
             "no waker should have been inserted");
 
@@ -3578,6 +3804,7 @@ mod tests {
         let req_id = r.alloc_scan_request_id() as u32;
         let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
 
+        let _lease = r.scan_lease(&[req_id]);
         r.test_route_scan_slot(slot); // park before any poll
 
         let fut = r.await_scan_slot(req_id);
@@ -3597,6 +3824,7 @@ mod tests {
         let req_id = r.alloc_scan_request_id() as u32;
         let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
 
+        let _lease = r.scan_lease(&[req_id]);
         let delivered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let delivered2 = Rc::clone(&delivered);
         let fut = r.await_scan_slot(req_id);
@@ -3616,5 +3844,378 @@ mod tests {
 
         assert!(delivered.get(), "slot must be delivered after route_scan_slot");
         unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Cancel-safe + lossless scan path (Fix B): per-req_id frame queue,
+    // active-scan gate, and ScanLease lifecycle.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a W2M ring carrying `n` scan frames, all tagged with
+    /// `internal_req_id` but with distinct wire request_ids (100, 101, …) so the
+    /// caller can verify arrival order. The returned `W2mReceiver` owns the
+    /// `InFlightState` the slots reference; caller reads frames via
+    /// `receiver.try_read_slot(0)` and munmaps the pointer after both receiver
+    /// and all slots drop.
+    unsafe fn make_scan_ring(internal_req_id: u32, n: usize)
+        -> (crate::runtime::w2m::W2mReceiver, *mut u8, usize)
+    {
+        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::wire::{self as ipc, STATUS_OK};
+
+        const CAPACITY: usize = 64 * 1024;
+        let ptr = libc::mmap(
+            std::ptr::null_mut(), CAPACITY,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+        ) as *mut u8;
+        assert!(!ptr.is_null());
+        std::ptr::write_bytes(ptr, 0, CAPACITY);
+        w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+
+        let writer   = W2mWriter::new(ptr, CAPACITY as u64);
+        let receiver = W2mReceiver::new(vec![ptr]);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
+        for i in 0..n {
+            let wire_req = 100u64 + i as u64;
+            writer.send_encoded(sz, internal_req_id, |buf| {
+                ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, wire_req, STATUS_OK, &[], None, None, None, None, &[]);
+            });
+        }
+        (receiver, ptr, CAPACITY)
+    }
+
+    /// Failure mode 4: concurrently-streamed continuation frames for one
+    /// req_id must be queued in arrival order, not overwritten (the old
+    /// single-value `scan_parked` dropped all but the last).
+    #[test]
+    fn scan_queue_retains_continuation_frames_in_order() {
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 2) };
+        let _lease = r.scan_lease(&[req_id]);
+
+        // Route two frames for the same req_id while no awaiter is registered.
+        let s0 = recv.try_read_slot(0).expect("frame 0");
+        let s1 = recv.try_read_slot(0).expect("frame 1");
+        r.test_route_scan_slot(s0);
+        r.test_route_scan_slot(s1);
+        assert_eq!(
+            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()), Some(2),
+            "both frames must be queued, not overwritten");
+
+        // await twice → frames returned in arrival order (100 then 101).
+        let f0 = r.block_on(r.await_scan_slot(req_id));
+        let rid0 = wire::peek_control_block(f0.bytes()).unwrap().request_id;
+        drop(f0);
+        let f1 = r.block_on(r.await_scan_slot(req_id));
+        let rid1 = wire::peek_control_block(f1.bytes()).unwrap().request_id;
+        drop(f1);
+        assert_eq!((rid0, rid1), (100, 101),
+            "queued continuation frames must be returned in arrival order");
+        assert!(r.inner.scan_parked.borrow().is_empty(),
+            "queue emptied after both frames consumed");
+
+        drop(_lease);
+        drop(recv);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    /// Dropping the `ScanLease` purges the parked queue (dropping each queued
+    /// `W2mSlot` advances `consume_cursor`) and deregisters the active scan.
+    #[test]
+    fn scan_lease_drop_frees_queued_slots() {
+        use std::sync::atomic::Ordering;
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 1) };
+        let lease = r.scan_lease(&[req_id]);
+
+        let s0 = recv.try_read_slot(0).expect("frame 0");
+        r.test_route_scan_slot(s0); // queued (active)
+        assert!(r.inner.scan_parked.borrow().contains_key(&req_id));
+
+        let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        drop(lease); // purge parked queue → drop queued slot → advance consume_cursor
+        assert!(r.inner.scan_parked.borrow().is_empty(), "lease drop purges parked queue");
+        assert!(r.inner.scan_wakers.borrow().is_empty(), "lease drop purges wakers");
+        assert!(r.inner.active_scans.borrow().is_empty(), "lease drop deregisters active scan");
+        let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        assert!(cc_after > cc_before, "dropped queued slot must advance consume_cursor");
+
+        drop(recv);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    /// Failure mode 1: a frame whose scan has no live lease is discarded
+    /// (freeing ring space), not parked — so the still-streaming worker never
+    /// wedges on a full ring.
+    #[test]
+    fn abandoned_scan_frame_is_discarded_not_parked() {
+        use std::sync::atomic::Ordering;
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 1) };
+
+        // No lease held: route_scan_slot must drop the slot, not park it.
+        let s0 = recv.try_read_slot(0).expect("frame 0");
+        let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        r.test_route_scan_slot(s0); // dropped here (inactive)
+        assert!(r.inner.scan_parked.borrow().is_empty(),
+            "abandoned-scan frame must be discarded, not parked");
+        let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        assert!(cc_after > cc_before, "discarded slot must advance consume_cursor (ring freed)");
+
+        drop(recv);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    /// End-to-end Failure mode 1 guard: a worker streams more frames than the
+    /// ring holds; the master takes a lease, queues 2 (filling the ring and
+    /// parking the writer), then drops the lease mid-train. The freed slots +
+    /// the gate discarding every later frame must let the writer finish all its
+    /// writes instead of wedging in `send_encoded`.
+    #[test]
+    fn dropped_scan_lease_unblocks_streaming_writer() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+        use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
+        use crate::runtime::wire::{self as ipc, STATUS_OK};
+        use gnitz_wire::align8;
+
+        const TOTAL: usize = 8;
+
+        // Ring sized for exactly 2 small frames.
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
+        let msg_total = 8 + align8(sz) as u64;
+        let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
+        let size = capacity as usize;
+        let ptr = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+            ) as *mut u8;
+            assert!(!p.is_null());
+            std::ptr::write_bytes(p, 0, size);
+            w2m_ring::init_region_for_tests(p, capacity);
+            p
+        };
+
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        let writer = W2mWriter::new(ptr, capacity);
+        let receiver = W2mReceiver::new(vec![ptr]);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..TOTAL {
+                writer.send_encoded(sz, req_id, |buf| {
+                    ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[]);
+                });
+            }
+            let _ = done_tx.send(());
+        });
+
+        let lease = r.scan_lease(&[req_id]);
+
+        // Read+queue 2 frames (active) — fills the ring, parking the writer.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut queued = 0;
+        while queued < 2 {
+            if let Some(slot) = receiver.try_read_slot(0) {
+                r.test_route_scan_slot(slot);
+                queued += 1;
+            } else if Instant::now() > deadline {
+                panic!("writer never produced the first 2 frames");
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        // Drop the lease mid-train: queued slots free, later frames are gated.
+        drop(lease);
+
+        let mut read = queued;
+        while read < TOTAL {
+            if let Some(slot) = receiver.try_read_slot(0) {
+                r.test_route_scan_slot(slot); // discarded (lease gone)
+                read += 1;
+            } else if Instant::now() > deadline {
+                panic!("scan lease drop failed to free the ring — writer wedged at {}/{}", read, TOTAL);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        done_rx.recv_timeout(Duration::from_secs(5))
+            .expect("writer thread must finish — never wedge on a full ring");
+        handle.join().expect("writer thread panicked");
+
+        let hdr = unsafe { receiver.header(0) };
+        assert_eq!(
+            hdr.consume_cursor().load(Ordering::Acquire),
+            hdr.write_cursor().load(Ordering::Acquire),
+            "every emitted slot must be freed (consume_cursor reaches write_cursor)",
+        );
+
+        drop(receiver);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Cancel-safe park-state futures (Fixes A, C, D, E).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Fix A: a dropped `ReplyFuture` must withdraw its waker so a late reply
+    /// hits route_reply's `None` arm (logged + dropped) instead of being parked
+    /// behind a dead waker forever.
+    #[test]
+    fn dropped_reply_future_leaves_no_stale_waker() {
+        let r = make_reactor();
+        let req_id = 4242u64;
+        {
+            let mut fut = Box::pin(r.await_reply(req_id));
+            let w = make_waker(1);
+            let mut cx = Context::from_waker(&w);
+            assert!(fut.as_mut().poll(&mut cx).is_pending(), "no reply parked yet");
+            assert!(r.inner.reply_wakers.borrow().contains_key(&req_id),
+                "poll must register the reply waker");
+        } // fut dropped → Drop withdraws the waker
+        assert!(!r.inner.reply_wakers.borrow().contains_key(&req_id),
+            "drop must withdraw the reply waker");
+
+        // A reply arriving after the drop hits the None arm and is dropped.
+        r.test_route_reply(0, synthetic_decoded_wire(req_id));
+        assert!(!r.inner.parked_replies.borrow().contains_key(&req_id),
+            "late reply for a dropped future must not be parked");
+        assert!(r.inner.reply_wakers.borrow().is_empty());
+    }
+
+    /// Fix E: a dropped `AcceptFuture` must clear `accept_waker`.
+    #[test]
+    fn dropped_accept_future_leaves_no_stale_waker() {
+        let r = make_reactor();
+        {
+            let mut fut = Box::pin(r.accept());
+            let w = make_waker(1);
+            let mut cx = Context::from_waker(&w);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert!(r.inner.accept_waker.borrow().is_some(), "poll registers accept_waker");
+        }
+        assert!(r.inner.accept_waker.borrow().is_none(), "drop must clear accept_waker");
+    }
+
+    /// Fix C: a `FsyncFuture` dropped while pending must tombstone its id so the
+    /// late KIND_FSYNC handler drops the result instead of leaking an i32.
+    #[test]
+    fn dropped_fsync_future_tombstones_late_cqe() {
+        let r = make_reactor();
+        let id = 7001u64;
+        {
+            let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+            let w = make_waker(1);
+            let mut cx = Context::from_waker(&w);
+            assert!(fut.as_mut().poll(&mut cx).is_pending(), "no result yet");
+            assert!(r.inner.fsync_wakers.borrow().contains_key(&id));
+        } // drop while pending → tombstone
+        assert!(r.inner.cancelled_fsyncs.borrow().contains(&id),
+            "drop while pending must tombstone the id");
+        assert!(!r.inner.fsync_wakers.borrow().contains_key(&id),
+            "drop must withdraw the waker");
+
+        // Late CQE: handler consumes the tombstone, parks nothing.
+        r.inject_cqe(KIND_FSYNC, id, 0);
+        r.drain_injected_cqes();
+        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
+            "cancelled fsync's late result must not be parked");
+        assert!(r.inner.fsync_wakers.borrow().is_empty());
+        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "the late CQE must consume the tombstone");
+    }
+
+    /// Fix C: a CQE arriving before the drop is reclaimed by `Drop`, with no
+    /// tombstone left behind.
+    #[test]
+    fn dropped_fsync_future_reclaims_parked_result() {
+        let r = make_reactor();
+        let id = 7002u64;
+        let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+        let w = make_waker(1);
+        let mut cx = Context::from_waker(&w);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        r.inject_cqe(KIND_FSYNC, id, 0); // result parked before the drop
+        r.drain_injected_cqes();
+        assert!(r.inner.parked_fsync_results.borrow().contains_key(&id));
+
+        drop(fut); // not resolved → Drop reclaims the orphaned parked result
+        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
+            "drop must reclaim the orphaned parked result");
+        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "no tombstone when the result was already parked");
+    }
+
+    /// Fix C regression guard: the success path must NOT tombstone — otherwise
+    /// `cancelled_fsyncs` would grow once per durable commit.
+    #[test]
+    fn resolved_fsync_future_adds_no_tombstone() {
+        let r = make_reactor();
+        let id = 7003u64;
+        let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+        let w = make_waker(1);
+        let mut cx = Context::from_waker(&w);
+
+        r.inject_cqe(KIND_FSYNC, id, 0); // park result, then resolve from it
+        r.drain_injected_cqes();
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(rc) => assert_eq!(rc, 0),
+            Poll::Pending => panic!("must resolve from the parked result"),
+        }
+        drop(fut); // completed=true → Drop is a no-op
+        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "success path must not tombstone — else cancelled_fsyncs leaks per commit");
+    }
+
+    /// Fix D: a `SendFuture` dropped while pending must park its buffer
+    /// keep-alive, withdraw its waker, and tombstone its id so the late
+    /// KIND_SEND handler frees the buffer and drops the result.
+    #[test]
+    fn dropped_send_future_tombstones_late_cqe() {
+        let r = make_reactor();
+        let send_id = 8001u64;
+        let fd = 42i32;
+        r.inner.conns.borrow_mut().insert(fd, Box::new(io::Conn::new()));
+        r.inner.conns.borrow_mut().get_mut(&fd).unwrap().send_inflight = 1;
+        r.inner.send_fd_for_id.borrow_mut().insert(send_id, fd);
+        r.inner.send_wakers.borrow_mut().insert(send_id, make_waker(1));
+        {
+            let _fut = SendFuture {
+                send_id,
+                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16])))),
+                inner: Rc::clone(&r.inner),
+            };
+        } // drop while pending → buffer parked, waker withdrawn, tombstone set
+        assert!(r.inner.send_buffers_in_flight.borrow().contains_key(&send_id),
+            "drop must park the buffer keep-alive");
+        assert!(r.inner.cancelled_sends.borrow().contains(&send_id),
+            "drop while pending must tombstone the send id");
+        assert!(!r.inner.send_wakers.borrow().contains_key(&send_id),
+            "drop must withdraw the send waker");
+
+        // Late CQE: buffer + inflight cleanup unconditional, result dropped.
+        r.inject_cqe(KIND_SEND, send_id, 16);
+        r.drain_injected_cqes();
+        assert!(r.inner.parked_send_results.borrow().is_empty(),
+            "cancelled send's late result must not be parked");
+        assert!(r.inner.send_buffers_in_flight.borrow().is_empty(),
+            "handler must free the parked buffer");
+        assert!(r.inner.send_wakers.borrow().is_empty());
+        assert!(r.inner.cancelled_sends.borrow().is_empty(),
+            "the late CQE must consume the tombstone");
+        assert_eq!(r.inner.conns.borrow().get(&fd).unwrap().send_inflight, 0,
+            "handler must decrement send_inflight");
     }
 }
