@@ -421,11 +421,7 @@ pub fn op_null_extend(
     // Right-side payload columns are already zero-filled by with_schema.
 
     // Set null bits for all appended right-side columns
-    let right_null_bits = if right_npc < 64 {
-        (1u64 << right_npc) - 1
-    } else {
-        u64::MAX
-    };
+    let right_null_bits = super::util::all_payload_null_mask(right_npc);
     for row in 0..n {
         let off = row * 8;
         let in_null = u64::from_le_bytes(batch.null_bmp_data()[off..off + 8].try_into().unwrap());
@@ -493,9 +489,12 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
             pks.push(hasher.digest128());
         }
     }
+    let stride = out_schema.pk_stride() as usize;
+    debug_assert!(stride <= 16, "reindex_hash_row: synthetic key stride {stride} > 16");
     for (row, pk) in pks.iter().enumerate() {
-        // The reindex output PK is a synthetic U128 (unsigned), so OPK == BE.
-        output.set_pk_at_bytes(row, &pk.to_be_bytes());
+        // Synthetic U128 (unsigned): OPK == big-endian. Right-aligned into stride
+        // to match PkPromoter::promote_into.
+        output.set_pk_at_bytes(row, &pk.to_be_bytes()[16 - stride..]);
     }
 }
 
@@ -625,9 +624,11 @@ impl PkPromoter {
             // aligned with left zero-pad. widen_pk_be of the result equals
             // extract_col_key's `widen_pk_be(get_pk_bytes[col])`, so routing agrees.
             PromoteKind::Pk { off, cs } => {
+                // Loop-invariant scratch: only `buf[16 - cs..]` is rewritten per
+                // row; the left zero-pad (read when stride > cs) is set once.
+                let mut buf = [0u8; 16];
                 for row in 0..output.count {
                     let src = &batch.get_pk_bytes(row)[off..off + cs];
-                    let mut buf = [0u8; 16];
                     buf[16 - cs..].copy_from_slice(src);
                     output.set_pk_at_bytes(row, &buf[16 - stride..]);
                 }
@@ -635,9 +636,11 @@ impl PkPromoter {
             // Payload integer: OPK-encode the native value (sign-flipped for
             // signed), matching extract_col_key's payload arm.
             PromoteKind::Narrow { pi, cs, tc } => {
+                // Loop-invariant scratch: `encode_pk_column` fully overwrites the
+                // `[16 - cs..]` slice each row; the zero prefix persists.
+                let mut opk = [0u8; 16];
                 for row in 0..output.count {
                     let native = batch.get_col_ptr(row, pi, cs);
-                    let mut opk = [0u8; 16];
                     gnitz_wire::encode_pk_column(native, tc, &mut opk[16 - cs..]);
                     output.set_pk_at_bytes(row, &opk[16 - stride..]);
                 }

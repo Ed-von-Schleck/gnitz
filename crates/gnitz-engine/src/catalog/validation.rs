@@ -356,11 +356,7 @@ impl CatalogEngine {
                 };
 
                 if !seen.insert(key_u128) {
-                    let col_names = self.get_column_names(table_id);
-                    let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
-                    return Err(format!(
-                        "Unique index violation on column '{}': duplicate in batch", cname
-                    ));
+                    return Err(self.unique_violation_err(table_id, source_col_idx, true));
                 }
 
                 // Index PK layout: leading indexed-key column (OPK-encoded,
@@ -384,11 +380,7 @@ impl CatalogEngine {
 
                 if is_upsert && matches_existing { continue; }
 
-                let col_names = self.get_column_names(table_id);
-                let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
-                return Err(format!(
-                    "Unique index violation on column '{}'", cname
-                ));
+                return Err(self.unique_violation_err(table_id, source_col_idx, false));
             }
         }
         Ok(())

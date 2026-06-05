@@ -437,10 +437,7 @@ impl CatalogEngine {
                 let mut buf = [0u8; 16];
                 buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);
                 if !seen.insert(u128::from_le_bytes(buf)) {
-                    return Err(format!(
-                        "cannot create unique index: column contains duplicate values (table_id={}, col_idx={})",
-                        owner_id, col_idx,
-                    ));
+                    return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
                 }
             }
         }

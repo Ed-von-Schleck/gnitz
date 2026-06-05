@@ -1448,6 +1448,45 @@ impl CatalogEngine {
         self.caches.entity_by_id.get(&table_id).map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
+    /// `(schema, table, column)` names for `(table_id, col_idx)`, each falling
+    /// back to `"?"` when the catalog has no entry. The fallback is defensive:
+    /// the entity always exists on the constraint-violation paths that format
+    /// these names.
+    fn qualified_col_names(&mut self, table_id: i64, col_idx: usize)
+        -> (String, String, String)
+    {
+        let col = self.get_column_names(table_id)
+            .get(col_idx).cloned().unwrap_or_else(|| "?".to_string());
+        let (sn, tn) = self.get_qualified_name(table_id).unwrap_or(("?", "?"));
+        (sn.to_string(), tn.to_string(), col)
+    }
+
+    /// Format a unique-index constraint violation naming the qualified table and
+    /// offending column. `in_batch` appends the "duplicate in batch" qualifier
+    /// used when two rows of one ingest batch collide, versus a collision with
+    /// already-committed data. Single source of truth for this message — the
+    /// distributed path (`MasterDispatcher`) delegates here.
+    pub(crate) fn unique_violation_err(
+        &mut self, table_id: i64, col_idx: usize, in_batch: bool,
+    ) -> String {
+        let (sn, tn, col) = self.qualified_col_names(table_id, col_idx);
+        if in_batch {
+            format!("Unique index violation on '{sn}.{tn}' column '{col}': duplicate in batch")
+        } else {
+            format!("Unique index violation on '{sn}.{tn}' column '{col}'")
+        }
+    }
+
+    /// Format the `CREATE UNIQUE INDEX` rejection raised when the target column
+    /// already holds duplicate values. Same single-source-of-truth contract as
+    /// [`Self::unique_violation_err`].
+    pub(crate) fn unique_create_dup_err(&mut self, table_id: i64, col_idx: usize) -> String {
+        let (sn, tn, col) = self.qualified_col_names(table_id, col_idx);
+        format!(
+            "cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values"
+        )
+    }
+
     pub fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
         let qualified = format!("{}.{}", schema_name, table_name);
         self.caches.entity_by_qname.get(&qualified).copied()

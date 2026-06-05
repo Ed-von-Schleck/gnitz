@@ -1953,9 +1953,9 @@ impl MasterDispatcher {
                 // value in one transaction is a violation regardless of whether
                 // their PKs already exist.
                 if !seen.insert(key) {
-                    let col_name = unsafe { (*disp_ptr).get_col_name(target_id, source_col) };
-                    return Err(format!(
-                        "Unique index violation on column '{}': duplicate in batch", col_name));
+                    return Err(unsafe {
+                        (*disp_ptr).unique_violation_err(target_id, source_col, true)
+                    });
                 }
 
                 // Zero-copy lookup via Borrow<[u8]>.
@@ -2030,9 +2030,9 @@ impl MasterDispatcher {
             match label {
                 P2Label::NonUpsert { source_col } => {
                     if !p2_results[idx].is_empty() {
-                        let col_name = unsafe { (*disp_ptr).get_col_name(target_id, *source_col) };
-                        return Err(format!(
-                            "Unique index violation on column '{}'", col_name));
+                        return Err(unsafe {
+                            (*disp_ptr).unique_violation_err(target_id, *source_col, false)
+                        });
                     }
                 }
                 P2Label::FkRestrict { child_tid } => {
@@ -2082,11 +2082,9 @@ impl MasterDispatcher {
                             ).map_err(|e| e.to_string())?;
                             if let Some(ref found) = zc.data_batch {
                                 if found.count > 0 && found.get_pk_bytes(0) != pk_i.pk_bytes() {
-                                    let col_name = unsafe {
-                                        (*disp_ptr).get_col_name(target_id, *source_col)
-                                    };
-                                    return Err(format!(
-                                        "Unique index violation on column '{}'", col_name));
+                                    return Err(unsafe {
+                                        (*disp_ptr).unique_violation_err(target_id, *source_col, false)
+                                    });
                                 }
                             }
                         }
@@ -2250,11 +2248,9 @@ impl MasterDispatcher {
         .await?;
 
         if duplicate {
-            return Err(format!(
-                "cannot create unique index: column contains duplicate values \
-                 (table_id={}, col_idx={})",
-                owner_id, col_idx,
-            ));
+            return Err(unsafe {
+                (*disp_ptr).unique_create_dup_err(owner_id, col_idx as usize)
+            });
         }
         Ok(seen)
     }
@@ -2356,6 +2352,17 @@ impl MasterDispatcher {
         cat.get_qualified_name(table_id)
             .map(|(s, t)| (s.to_string(), t.to_string()))
             .unwrap_or_default()
+    }
+
+    /// Delegate unique-index violation formatting to the catalog, the single
+    /// source of truth for the message text and the table/column name lookups.
+    fn unique_violation_err(&mut self, target_id: i64, col_idx: usize, in_batch: bool) -> String {
+        unsafe { (*self.catalog).unique_violation_err(target_id, col_idx, in_batch) }
+    }
+
+    /// Delegate `CREATE UNIQUE INDEX` duplicate-value rejection to the catalog.
+    fn unique_create_dup_err(&mut self, owner_id: i64, col_idx: usize) -> String {
+        unsafe { (*self.catalog).unique_create_dup_err(owner_id, col_idx) }
     }
 
     /// Build the `(pk_names_joined, schema_name, table_name)` triple used
@@ -2694,7 +2701,7 @@ fn build_check_batch_with<K>(
         }
         _ => Batch::with_schema(*schema, keys.len()),
     };
-    let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
+    let null_word: u64 = crate::ops::util::all_payload_null_mask(npc);
     for key in keys {
         batch.ensure_row_capacity();
         push_pk(&mut batch, key);
@@ -2863,6 +2870,26 @@ mod unique_filter_tests {
             }
         }
         batch
+    }
+
+    #[test]
+    fn check_batch_64_payload_cols_full_null_word() {
+        // 65 columns: 1 U64 PK + 64 nullable payload cols → npc == 64, the
+        // shift-by-width boundary. Must not panic (debug) and must mark every
+        // payload column null (release silent-miss guard).
+        let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..64 {
+            cols.push(SchemaColumn::new(type_code::I64, 1));
+        }
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        assert_eq!(schema.num_payload_cols(), 64);
+
+        let keys = vec![42u128];
+        let batch = build_check_batch(&schema, &keys, None);
+        assert_eq!(batch.count, 1);
+
+        let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
+        assert_eq!(null_word, u64::MAX, "all 64 payload columns must be marked null");
     }
 
     #[test]

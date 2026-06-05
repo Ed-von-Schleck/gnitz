@@ -157,6 +157,10 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     // UNIQUE index over duplicate values must fail.
     let res = engine.create_index("public.t", "val", true);
     assert!(res.is_err(), "unique index over duplicate values must fail");
+    // The rejection must carry the qualified table and column context.
+    let err = res.unwrap_err();
+    assert!(err.contains("public.t"), "create-index error should name the table: {err}");
+    assert!(err.contains("val"), "create-index error should name the column: {err}");
 
     // No IDX_TAB broadcast may carry a negative weight for the failed index.
     let broadcasts = engine.drain_pending_broadcasts();
@@ -197,7 +201,11 @@ fn test_validate_unique_indices_duplicate_value() {
     bb.begin_row(2u128, 1); bb.put_u64(42); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Unique index violation"));
+    let err = result.unwrap_err();
+    assert!(err.contains("Unique index violation"));
+    // The diagnostic must carry the qualified table and column, not a bare column.
+    assert!(err.contains("public.t"), "violation should name the table: {err}");
+    assert!(err.contains("val"), "violation should name the column: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

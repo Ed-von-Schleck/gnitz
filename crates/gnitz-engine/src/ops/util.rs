@@ -75,6 +75,15 @@ pub(super) fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
     }
 }
 
+/// Null-bitmap word with the low `npc` payload bits set — i.e. "all `npc`
+/// payload columns are null". `npc` reaches the row-major cap of 64 only when a
+/// schema has exactly 64 payload columns; `1u64 << 64` is UB / debug-panics, so
+/// that boundary returns all-ones directly.
+#[inline]
+pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
+    if npc < 64 { (1u64 << npc) - 1 } else { u64::MAX }
+}
+
 
 /// Compare a cursor's current payload to a batch row's payload, returning their ordering.
 ///

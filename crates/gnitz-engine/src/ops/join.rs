@@ -9,7 +9,7 @@ use crate::storage::{
     with_payload_cmp,
 };
 
-use super::util::{merge_null_words, write_string_from_batch};
+use super::util::{all_payload_null_mask, merge_null_words, write_string_from_batch};
 
 thread_local! {
     /// Reused emit-index scratch for the delta-trace anti/semi joins. Cleared
@@ -360,7 +360,11 @@ fn join_dt_swapped(
         cursor.advance();
     }
 
-    output.sorted = true;
+    // Trace-major cartesian emission is PK-sorted but NOT (PK, payload)-sorted
+    // (left payloads interleave across trace entries). Unlike semi_join_dt_swapped
+    // (delta-only rows, deduped trace PKs), this output is genuinely unsorted —
+    // do not let into_consolidated/fold_sorted or an N-way merge trust it.
+    output.sorted = false;
     output
 }
 
@@ -482,11 +486,7 @@ fn write_join_row_null_right(
 
     let left_npc = left_schema.num_payload_cols();
     let right_npc = right_schema.num_payload_cols();
-    let right_null_bits = if right_npc < 64 {
-        (1u64 << right_npc) - 1
-    } else {
-        u64::MAX
-    };
+    let right_null_bits = all_payload_null_mask(right_npc);
     let null_word = merge_null_words(left_null, right_null_bits, left_npc);
 
     output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
@@ -1449,6 +1449,38 @@ mod tests {
         assert_eq!(out.count, 2, "both I32 keys must join (smallest key not dropped)");
         assert_eq!(out.get_pk(0) as i32, 1);
         assert_eq!(out.get_pk(1) as i32, 2);
+    }
+
+    #[test]
+    fn test_join_dt_swapped_marks_output_unsorted() {
+        use crate::storage::CursorHandle;
+        use std::rc::Rc;
+        // Many-to-many join with delta larger than the trace forces join_dt_swapped
+        // (n=3 > trace_len=2). The swapped path emits the cartesian product in
+        // trace-major order, interleaving left payloads out of (PK, payload) order.
+        let schema = make_schema_u64_i64();
+        // Trace: PK=1 with two right payloads (100, 200).
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]).into_inner());
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        // Delta: PK=1 with three left payloads.
+        let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]).into_inner();
+
+        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
+        assert_eq!(out.count, 6, "3 left × 2 right = 6 join outputs");
+
+        // col 0 = left payload, col 1 = right payload (all PKs equal). The sorted
+        // flag may be true ONLY if the rows are actually in (left, right) order.
+        let pairs: Vec<(i64, i64)> = (0..out.count)
+            .map(|r| (
+                crate::util::read_i64_le(out.col_data(0), r * 8),
+                crate::util::read_i64_le(out.col_data(1), r * 8),
+            ))
+            .collect();
+        let actually_sorted = pairs.windows(2).all(|w| w[0] <= w[1]);
+        assert!(
+            !out.sorted || actually_sorted,
+            "join_dt_swapped marked output sorted but payload order is {pairs:?}",
+        );
     }
 
     // -----------------------------------------------------------------------
