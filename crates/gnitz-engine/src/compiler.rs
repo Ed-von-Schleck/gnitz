@@ -1832,50 +1832,58 @@ fn build_plan(
     }
 
     // Destructive-register ordering invariant. `Union`, `Distinct`, and `Delay`
-    // destructively empty their PORT_IN register (std::mem::replace/swap with an
-    // empty batch) to avoid allocation; the trace-absent `AntiJoin(DeltaTrace)`
-    // branch does the same to its PORT_IN_A delta input. Every node has one
-    // output register shared by all consumers, so a register that fans into both
-    // a non-destructive reader (e.g. integrate_trace) and a destructive consumer
-    // is only correct if the destructive op runs *last* among that register's
-    // consumers. The Kahn scheduler happens to order them that way today; nothing
-    // enforces it. Pin the invariant so a future planner shape (or a hand-built
-    // circuit) that schedules the destructive consumer first fails loudly in
-    // debug/test instead of silently dropping the other reader's batch.
-    #[cfg(debug_assertions)]
-    {
-        // Schedule position within THIS compiled slice (exchange views compile
-        // sub-slices, so index `ordered`, not loaded.ordered).
-        let pos: HashMap<i32, usize> =
-            ordered.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
+    // empty their PORT_IN register in place (std::mem::replace/swap with an empty
+    // batch, to avoid allocation); the trace-absent `AntiJoin(DeltaTrace)` branch
+    // does the same to its PORT_IN_A delta input. Every node has one output register
+    // shared by all its consumers, so a register that fans into both a
+    // non-destructive reader (e.g. integrate_trace) and a destructive consumer is
+    // correct only if the destructive op runs LAST among that register's consumers —
+    // otherwise an earlier-scheduled co-consumer reads an emptied batch. The Kahn
+    // scheduler orders them that way today; nothing else enforces it. Reject any
+    // graph that violates it, in release too, rather than silently dropping a
+    // reader's batch.
+    //
+    // skip_nodes holds Distincts elided by opt_distinct (input already distinct):
+    // such a node aliases its input register and emits no instruction, so it neither
+    // empties a register nor destructively reads one. Exclude it from both roles.
 
-        for &nid in ordered {
-            // Ops that destructively empty an input register, and the port they
-            // empty. (Union's in_a and AntiJoinDT's delta side are both
-            // PORT_IN_A == PORT_IN.)
-            let dtor_port = match loaded.nodes.get(&nid) {
-                Some(gnitz_wire::OpNode::Distinct)
-                | Some(gnitz_wire::OpNode::Union)
-                | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
-                Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::JoinKind::DeltaTrace)) => Some(PORT_IN_A),
-                _ => None,
-            };
-            let Some(port) = dtor_port else { continue };
+    // Schedule position within THIS compiled slice (exchange views compile
+    // sub-slices, so index `ordered`, not loaded.ordered).
+    let pos: HashMap<i32, usize> =
+        ordered.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
 
-            let Some(in_edges) = loaded.incoming.get(&nid) else { continue };
-            let Some(&(pred, _)) = in_edges.iter().find(|&&(_, p)| p == port) else { continue };
-            let Some(co_readers) = loaded.consumers.get(&pred) else { continue };
-            let Some(&dtor_pos) = pos.get(&nid) else { continue };
-
-            for &other in co_readers {
-                if other == nid { continue; }
-                if let Some(&other_pos) = pos.get(&other) {
-                    debug_assert!(
-                        other_pos < dtor_pos,
-                        "destructive op {nid} empties node {pred}'s register, but co-consumer \
-                         {other} is scheduled after it ({other_pos} >= {dtor_pos}); \
-                         non-destructive readers must precede the destructive consumer",
+    for &nid in ordered {
+        if rw.skip_nodes.contains(&nid) {
+            continue;
+        }
+        // Ops that destructively empty an input register, and the port they empty.
+        // (Union's in_a and AntiJoinDT's delta side are both PORT_IN_A == PORT_IN.)
+        let dtor_port = match loaded.nodes.get(&nid) {
+            Some(gnitz_wire::OpNode::Distinct)
+            | Some(gnitz_wire::OpNode::Union)
+            | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
+            Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::JoinKind::DeltaTrace)) => Some(PORT_IN_A),
+            _ => None,
+        };
+        let Some(port) = dtor_port else { continue };
+        let Some(in_edges) = loaded.incoming.get(&nid) else { continue };
+        let Some(&(pred, _)) = in_edges.iter().find(|&&(_, p)| p == port) else { continue };
+        let Some(co_readers) = loaded.consumers.get(&pred) else { continue };
+        let Some(&dtor_pos) = pos.get(&nid) else { continue };
+        for &other in co_readers {
+            if other == nid || rw.skip_nodes.contains(&other) {
+                continue;
+            }
+            if let Some(&other_pos) = pos.get(&other) {
+                if other_pos >= dtor_pos {
+                    gnitz_warn!(
+                        "build_plan: destructive op {nid} empties node {pred}'s register, but \
+                         co-consumer {other} is scheduled at or after it ({other_pos} >= {dtor_pos}); \
+                         every other consumer of a destructively-read register — a non-destructive \
+                         reader, or a second destructive consumer that would find it already empty — \
+                         must precede it",
                     );
+                    return None;
                 }
             }
         }
@@ -3287,7 +3295,8 @@ mod tests {
     // Union/Distinct/Delay (and the trace-absent AntiJoin(DeltaTrace)) empty
     // their input register in place. When that register fans out to other
     // consumers, the destructive op must be scheduled LAST among them, or the
-    // co-readers see an emptied batch. build_plan pins this with a debug assert.
+    // co-readers see an emptied batch. build_plan rejects violations (returns
+    // None) in every build profile, release included.
 
     /// Build the INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans
     /// into both a destructive `Distinct` and a non-destructive `Filter`
@@ -3334,19 +3343,46 @@ mod tests {
             "legitimate destructive fan-out must compile without tripping the ordering assert");
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "non-destructive readers must precede the destructive consumer")]
-    fn test_destructive_fanout_bad_ordering_panics() {
+    fn test_destructive_fanout_bad_ordering_rejected() {
         // Distinct id 1 < Filter id 2, so the ascending tie-break schedules the
         // destructive op FIRST — it would empty ScanDelta's register before the
-        // Filter reads it. The §5 debug invariant must catch this before emission.
+        // Filter reads it. build_plan must reject this rather than emit it.
         let loaded = make_dtor_fanout(1, 2);
         let ext = [ExternalTable { table_id: 10, schema: two_col_schema() }];
         let ordered = loaded.ordered.clone();
-        let _ = build_plan(
+        let result = build_plan(
             &loaded, &empty_rw(), &ordered, &ext, "", 0, 1, Some(3), &[], vec![],
         );
+        assert!(result.is_none(),
+            "destructive-first fan-out must be rejected (return None), not emitted");
+    }
+
+    #[test]
+    fn test_destructive_fanout_skipped_distinct_not_rejected() {
+        // Distinct id 1 schedules before Filter id 2 — the destructive-first shape
+        // the guard rejects. But opt_distinct has elided the Distinct (it is in
+        // skip_nodes): it aliases ScanDelta's register and emits no destructive op,
+        // so the guard must NOT reject it.
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{}/dtor_skip_{}", base, std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+
+        let loaded = make_dtor_fanout(1, 2);
+        let mut rw = empty_rw();
+        rw.skip_nodes.insert(1); // Distinct elided by opt_distinct
+
+        let ext = [ExternalTable { table_id: 10, schema: two_col_schema() }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &rw, &ordered, &ext, &view_dir, 0, 1, Some(3), &[], vec![],
+        );
+        let _ = std::fs::remove_dir_all(&view_dir);
+        assert!(result.is_some(),
+            "a skipped (optimized-out) Distinct does not run destructively; \
+             the guard must not reject it");
     }
 
     // ── ScanTrace join-trace-side: no add_scan_trace when feeding port=1 ──
