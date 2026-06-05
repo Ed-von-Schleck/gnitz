@@ -873,25 +873,41 @@ fn execute_create_join_view(
         ));
     }
 
-    // The merged join output is [_join_pk, left cols..., right cols...]. Reject
-    // before the server's schema build hits its hard column-count assertion.
-    let combined_cols = 1 + left_schema.columns.len() + right_schema.columns.len();
-    if combined_cols > gnitz_core::MAX_COLUMNS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "JOIN view output has {} columns, exceeding the {}-column limit",
-            combined_cols, gnitz_core::MAX_COLUMNS,
-        )));
-    }
-
     // Build alias map for qualified column resolution
     let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
     alias_map.insert(left_alias.to_lowercase(), (left_tid, (*left_schema).clone(), 0));
     alias_map.insert(right_alias.to_lowercase(), (right_tid, (*right_schema).clone(), left_schema.columns.len()));
 
     // Extract equijoin keys
-    let (left_join_col, right_join_col) = extract_equijoin_keys(
+    let (left_join_cols, right_join_cols) = extract_equijoin_keys(
         on_expr, &left_schema, &right_schema, &alias_map,
     )?;
+    let k = left_join_cols.len();   // == right_join_cols.len(), 1..=MAX_PK_COLUMNS
+
+    // Composite (k ≥ 2) keys build a k-wide synthetic PK region, but view storage
+    // registers every view with `pk_cols = [0]` (a single PK column), so a k ≥ 2 view
+    // cannot be described end-to-end yet. Reject here so the feature fails closed
+    // at the planner with a clean error — before `alloc_table_id` or any circuit
+    // build, so no table id is consumed and no broken view is committed. This single
+    // gate is what the view-storage successor removes; the k-generalized circuit below
+    // is already in place behind it and is exercised at the extraction level by the
+    // in-module unit tests.
+    if k > 1 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: composite ({k}-column) equijoin keys are not yet supported \
+             (view storage must persist a multi-column view PK first); \
+             use a single equijoin key column")));
+    }
+
+    // The merged join output is [k _join_pk cols, left cols..., right cols...].
+    // Reject before the server's schema build hits its hard column-count assertion.
+    let combined_cols = k + left_schema.columns.len() + right_schema.columns.len();
+    if combined_cols > gnitz_core::MAX_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN view output has {} columns, exceeding the {}-column limit",
+            combined_cols, gnitz_core::MAX_COLUMNS,
+        )));
+    }
 
     // Allocate view_id
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
@@ -915,67 +931,67 @@ fn execute_create_join_view(
     // a real 0/"" key and with every other NULL. Gate NULL keys out of the match.
     // A NOT NULL key leaves its side untouched (no filter node) — byte-identical to
     // the original plan, so the common case has zero overhead.
-    let left_key_nullable  = left_schema.columns[left_join_col].is_nullable;
-    let right_key_nullable = right_schema.columns[right_join_col].is_nullable;
+    let left_key_nullable  = left_join_cols.iter().any(|&c| left_schema.columns[c].is_nullable);
+    let right_key_nullable = right_join_cols.iter().any(|&c| right_schema.columns[c].is_nullable);
 
     let mut cb = CircuitBuilder::new(view_id, 0); // no single primary source
     let input_a = cb.input_delta_tagged(left_tid);
     let input_b = cb.input_delta_tagged(right_tid);
 
-    // Inner (right) side: NULL keys can never match — drop them before reindex.
+    // Inner (right) side: a key with any NULL component can never match — drop it.
     let input_b = if right_key_nullable {
-        cb.filter(input_b, Some(null_filter_prog(right_join_col, &right_schema, false)?))
+        cb.filter(input_b, Some(multi_null_filter_prog(&right_join_cols, &right_schema, false)?))
     } else {
         input_b
     };
-    let reindex_b = cb.map_reindex(input_b, &[right_join_col], right_reindex_prog);
+    let reindex_b = cb.map_reindex(input_b, &right_join_cols, right_reindex_prog);
 
     // Preserved (left) side.
-    //   INNER join: a NULL left key matches nothing — drop it.
-    //   LEFT  join: a NULL left key must still be emitted with NULL right columns
-    //               but must bypass the match (else it collides with a right 0/""
-    //               key and pollutes trace_a, corrupting join_ba and the ΔB
-    //               null-fill correction). Split it out, reindex it to the synthetic
-    //               join PK (so it is layout-compatible with the join output — a bare
-    //               Filter would keep the left table's native PK stride and corrupt the
+    //   INNER join: a left row with any NULL key component matches nothing — drop it.
+    //   LEFT  join: such a row must still be emitted with NULL right columns but must
+    //               bypass the match (else it collides with a right 0/"" key and
+    //               pollutes trace_a, corrupting join_ba and the ΔB null-fill
+    //               correction). Split it out, reindex it to the synthetic join PK
+    //               (so it is layout-compatible with the join output — a bare Filter
+    //               would keep the left table's native PK stride and corrupt the
     //               downstream Union, which merges by raw PK bytes into one stride),
     //               null-extend it, and union it into the unmatched-left stream.
-    //               Its synthetic PK is 0, which is harmless: the left PK is among
-    //               the copied payload columns and compare_rows treats NULL ≠ 0, so
-    //               it never merges with a real-0-key row.
+    //               Its NULL components pack to 0 bytes, which is harmless: the source
+    //               columns are among the copied payload and compare_rows treats
+    //               NULL ≠ 0, so it never merges with a real-0-key row.
     let (input_a_match, left_null_filled) = if !left_key_nullable {
         (input_a, None)
     } else {
         let left_not_null = cb.filter(
-            input_a, Some(null_filter_prog(left_join_col, &left_schema, false)?));
+            input_a, Some(multi_null_filter_prog(&left_join_cols, &left_schema, false)?));
         if !is_left_join {
             (left_not_null, None)
         } else {
             let left_null = cb.filter(
-                input_a, Some(null_filter_prog(left_join_col, &left_schema, true)?));
+                input_a, Some(multi_null_filter_prog(&left_join_cols, &left_schema, true)?));
             let left_null_ri = cb.map_reindex(
-                left_null, &[left_join_col], build_reindex_program(&left_schema));
+                left_null, &left_join_cols, build_reindex_program(&left_schema));
             (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
         }
     };
-    let reindex_a = cb.map_reindex(input_a_match, &[left_join_col], left_reindex_prog);
+    let reindex_a = cb.map_reindex(input_a_match, &left_join_cols, left_reindex_prog);
 
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
     let join_ab = cb.join_with_trace_node(reindex_a, trace_b); // ΔA ⋈ z^{-1}(I(B))
     let join_ba = cb.join_with_trace_node(reindex_b, trace_a); // ΔB ⋈ z^{-1}(I(A))
 
-    // Path AB projection: identity (already canonical: [PK, A_cols, B_cols])
-    let proj_ab: Vec<usize> = (1..1 + left_n + right_n).collect();
+    // Path AB projection: identity (already canonical: [PK cols, A_cols, B_cols])
+    let proj_ab: Vec<usize> = (k..k + left_n + right_n).collect();
     let proj_ab_node = cb.map(join_ab, &proj_ab);
 
     // Path BA projection: reorder [A_cols, B_cols]
     let mut proj_ba: Vec<usize> = Vec::new();
     for i in 0..left_n {
-        proj_ba.push(1 + right_n + i);
+        proj_ba.push(k + right_n + i);
     }
     for i in 0..right_n {
-        proj_ba.push(1 + i);
+        proj_ba.push(k + i);
     }
     let proj_ba_node = cb.map(join_ba, &proj_ba);
 
@@ -1013,27 +1029,34 @@ fn execute_create_join_view(
         inner_merged
     };
 
-    // Build virtual combined output schema: synthetic join PK + all left cols + all
-    // right cols. After proj_ab/proj_ba, the UNION output has this layout (union col
-    // indices):
-    //   col 0: _join_pk (PK)
-    //   col 1..left_n: all A columns (in A schema order)
-    //   col left_n+1..left_n+right_n: all B columns (in B schema order)
+    // Build virtual combined output schema: k synthetic join PK cols + all left cols
+    // + all right cols. After proj_ab/proj_ba, the UNION output has this layout (union
+    // col indices):
+    //   col 0..k: _join_pk[_i] (PK region, one slot per key pair)
+    //   col k..k+left_n: all A columns (in A schema order)
+    //   col k+left_n..k+left_n+right_n: all B columns (in B schema order)
     //
-    // The synthetic PK width must match the engine's reindex output width: both
-    // sides derive col 0 from `TypeCode::reindex_output_type` (gnitz-wire), so
-    // every cross-process consumer re-derives the same col-0 stride from this
-    // single persisted catalog value.
-    let join_pk_type = join_pk_output_type(
-        left_schema.columns[left_join_col].type_code,
-        right_schema.columns[right_join_col].type_code,
-    );
+    // Each synthetic PK column's width must match the engine's reindex output width:
+    // both sides derive it from `TypeCode::reindex_output_type` (gnitz-wire), so every
+    // cross-process consumer re-derives the same stride from this single persisted
+    // catalog value. validate_join_key_pair guarantees both sides of pair i reindex to
+    // the same output type, so join_pk_output_type always yields that common type.
+    //
+    // The first key column keeps the name `_join_pk` at k = 1 (the catalog name is not
+    // referenced by any code, but preserving it keeps the shippable single-key view
+    // byte-identical); composite keys use `_join_pk_{i}`.
     let mut out_cols: Vec<ColumnDef> = Vec::new();
-    out_cols.push(ColumnDef {
-        name: "_join_pk".into(),
-        type_code: join_pk_type,
-        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
-    });
+    for i in 0..k {
+        let name = if k == 1 { "_join_pk".to_string() } else { format!("_join_pk_{i}") };
+        out_cols.push(ColumnDef {
+            name,
+            type_code: join_pk_output_type(
+                left_schema.columns[left_join_cols[i]].type_code,
+                right_schema.columns[right_join_cols[i]].type_code,
+            ),
+            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+        });
+    }
     for col in &left_schema.columns {
         out_cols.push(col.clone());
     }
@@ -1044,29 +1067,31 @@ fn execute_create_join_view(
     }
 
     // Compute user-specified projection and view schema.
-    // `combined_idx` is the 0-based index in [A_cols..B_cols]; union output col = combined_idx+1.
+    // `combined_idx` is the 0-based index in [A_cols..B_cols]; union output col = combined_idx + k.
     let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
     let (final_cols, final_projection) = if is_wildcard {
-        let proj: Vec<usize> = (1..1 + left_n + right_n).collect();
+        let proj: Vec<usize> = (k..k + left_n + right_n).collect();
         (out_cols, proj)
     } else {
         let mut cols = Vec::new();
         let mut proj = Vec::new();
-        // Always include join PK as first column
-        cols.push(out_cols[0].clone());
+        // Always include all k join PK columns first.
+        for c in out_cols.iter().take(k) {
+            cols.push(c.clone());
+        }
         for item in &select.projection {
             match item {
                 SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                     let idx = resolve_unqualified_column(&ident.value, &alias_map)?;
-                    cols.push(out_cols[1 + idx].clone());
-                    proj.push(idx + 1); // union output col index = combined_idx + 1
+                    cols.push(out_cols[k + idx].clone());
+                    proj.push(idx + k); // union output col index = combined_idx + k
                 }
                 SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
                     let idx = resolve_qualified_column(
                         &parts[0].value, &parts[1].value, &alias_map,
                     )?;
-                    cols.push(out_cols[1 + idx].clone());
-                    proj.push(idx + 1);
+                    cols.push(out_cols[k + idx].clone());
+                    proj.push(idx + k);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let idx = match expr {
@@ -1078,13 +1103,13 @@ fn execute_create_join_view(
                             "JOIN view: only column references supported in AS clause".to_string()
                         )),
                     };
-                    let mut col = out_cols[1 + idx].clone();
+                    let mut col = out_cols[k + idx].clone();
                     col.name = alias.value.clone();
                     cols.push(col);
-                    proj.push(idx + 1);
+                    proj.push(idx + k);
                 }
                 SelectItem::Wildcard(_) => {
-                    for (i, col) in out_cols.iter().enumerate().skip(1) {
+                    for (i, col) in out_cols.iter().enumerate().skip(k) {
                         cols.push(col.clone());
                         proj.push(i);
                     }
@@ -1098,9 +1123,9 @@ fn execute_create_join_view(
     };
 
     // Apply final column projection before sink when not identity.
-    // Identity = selecting all left+right cols in canonical order [1..left_n+right_n].
+    // Identity = selecting all left+right cols in canonical order [k..k+left_n+right_n].
     let is_identity = final_projection.len() == left_n + right_n
-        && final_projection.iter().enumerate().all(|(i, &p)| p == i + 1);
+        && final_projection.iter().enumerate().all(|(i, &p)| p == i + k);
     let sink_input = if is_identity {
         merged
     } else {
@@ -1115,26 +1140,40 @@ fn execute_create_join_view(
     Ok(SqlResult::ViewCreated { view_id })
 }
 
-/// Single-column null predicate for a Filter, reusing the same
-/// bound-expr → ExprProgram path the planner uses for WHERE clauses (so the
-/// column index is correctly mapped to its payload byte). `want_null` selects
-/// IS NULL vs IS NOT NULL. Used to gate NULL equi-join keys out of the match.
-fn null_filter_prog(
-    col_idx:   usize,
+/// Multi-column NULL predicate for a Filter over a composite equijoin key,
+/// reusing the WHERE-clause bound-expr → ExprProgram path so each column index
+/// maps to its payload byte. A composite key is NULL — and matches nothing
+/// (SQL 3VL) — iff ANY component is NULL.
+///   want_null == false: keep rows whose key is fully defined →
+///                       `c0 IS NOT NULL AND … AND ck IS NOT NULL`.
+///   want_null == true : keep rows whose key is NULL (LEFT-join bypass) →
+///                       `c0 IS NULL OR … OR ck IS NULL`.
+/// The two are exact De Morgan complements, so the LEFT-join match/bypass split
+/// partitions the preserved side with no gap and no double-count. `cols` is
+/// non-empty (k ≥ 1 is guaranteed by extract_equijoin_keys). At k = 1 this emits
+/// exactly the single-column IsNotNull/IsNull program, so existing single-key
+/// plans are byte-identical.
+fn multi_null_filter_prog(
+    cols:      &[usize],
     schema:    &Schema,
     want_null: bool,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
-    let bound = if want_null {
-        BoundExpr::IsNull(col_idx)
-    } else {
-        BoundExpr::IsNotNull(col_idx)
-    };
+    let leaf = |c: usize| if want_null { BoundExpr::IsNull(c) } else { BoundExpr::IsNotNull(c) };
+    let op = if want_null { BinOp::Or } else { BinOp::And };
+    let mut expr = leaf(cols[0]);
+    for &c in &cols[1..] {
+        expr = BoundExpr::BinOp(Box::new(expr), op, Box::new(leaf(c)));
+    }
     let mut eb = ExprBuilder::new();
-    let (r, _) = compile_bound_expr(&bound, schema, &mut eb)?;
+    let (r, _) = compile_bound_expr(&expr, schema, &mut eb)?;
     Ok(eb.build(r))
 }
 
-/// Build a reindex ExprProgram that copies all columns as payload.
+/// Build a reindex ExprProgram that copies all columns as payload. Arity-
+/// independent: it copies every source column to payload offsets `0..n`, and
+/// `reindex_output_schema` places those payload columns at physical indices
+/// `k..k+n` regardless of the key arity `k` (the `k` PK slots precede them), so
+/// the payload offsets never shift with the number of key columns.
 fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
     let mut eb = ExprBuilder::new();
     for (ci, col) in schema.columns.iter().enumerate() {
@@ -1144,35 +1183,124 @@ fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
 
-/// Extract equijoin key columns from an ON expression.
-/// Returns (left_col_idx, right_col_idx) for a single-column equijoin.
+/// Validate one equijoin key pair. Float keys are rejected outright (IEEE-754
+/// -0.0/+0.0 compare byte-unequal and NaN has no canonical form). A German string
+/// (STRING/BLOB) may only join another German string: it reindexes to a 16-byte
+/// content hash, which is byte-incompatible with the native U128/UUID encoding
+/// even though both collapse to the U128 output type. The remaining pairs must
+/// reindex to the *same* output type: equal output type ⇒ identical OPK stride AND
+/// sign encoding, so the two reindex sides co-partition and merge byte-for-byte
+/// and the `_join_pk` catalog stride matches both.
+fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<(), GnitzSqlError> {
+    for col in [left, right] {
+        if col.type_code.is_float() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "JOIN ON: float column '{}' cannot be a join key \
+                 (IEEE-754 -0.0/+0.0 and NaN break byte-equal key matching)",
+                col.name)));
+        }
+    }
+    // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
+    // 16-byte native value. Both collapse to the U128 output type, so the stride
+    // check below cannot tell them apart — but a content hash never equals a native
+    // integer, so the join would silently match nothing.
+    if left.type_code.is_german_string() != right.type_code.is_german_string() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: cannot equijoin string/blob column '{}' ({:?}) with non-string \
+             column '{}' ({:?}); a string content hash never matches a native key",
+            left.name, left.type_code, right.name, right.type_code)));
+    }
+    let lo = left.type_code.reindex_output_type();
+    let ro = right.type_code.reindex_output_type();
+    if lo != ro {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) reindex to \
+             incompatible key encodings ({:?} vs {:?}); both sides of an equijoin \
+             key must share an identical width and sign encoding",
+            left.name, left.type_code, right.name, right.type_code, lo, ro)));
+    }
+    Ok(())
+}
+
+/// Extract the ordered list of equijoin key columns from an ON expression.
+/// Returns (left_cols, right_cols), per-table-relative, paired by position.
 fn extract_equijoin_keys(
     on_expr:      &Expr,
     left_schema:  &Schema,
-    _right_schema: &Schema,
+    right_schema: &Schema,
     alias_map:    &HashMap<String, (u64, Schema, usize)>,
-) -> Result<(usize, usize), GnitzSqlError> {
-    match on_expr {
+) -> Result<(Vec<usize>, Vec<usize>), GnitzSqlError> {
+    let mut left_cols  = Vec::new();
+    let mut right_cols = Vec::new();
+    collect_equijoin_keys(on_expr, left_schema, right_schema, alias_map,
+                          &mut left_cols, &mut right_cols)?;
+    if left_cols.is_empty() {
+        return Err(GnitzSqlError::Bind(
+            "JOIN ON must have at least one equijoin predicate".into()));
+    }
+    // Each reindex key column occupies one PK slot; the engine's ReindexPacker
+    // hard-asserts the slot count against MAX_PK_COLUMNS. Reject here so an
+    // over-wide ON conjunction fails as a clean planner error, not a worker panic.
+    if left_cols.len() > gnitz_core::MAX_PK_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: at most {} equijoin key columns are supported (got {})",
+            gnitz_core::MAX_PK_COLUMNS, left_cols.len())));
+    }
+    Ok((left_cols, right_cols))
+}
+
+fn collect_equijoin_keys(
+    expr:         &Expr,
+    left_schema:  &Schema,
+    right_schema: &Schema,
+    alias_map:    &HashMap<String, (u64, Schema, usize)>,
+    left_cols:    &mut Vec<usize>,
+    right_cols:   &mut Vec<usize>,
+) -> Result<(), GnitzSqlError> {
+    match expr {
+        // Parentheses: `ON (a.x = b.x) AND a.y = b.y`, `ON (a.x = b.x AND a.y = b.y)`.
+        // sqlparser wraps a parenthesized sub-expression in Expr::Nested; unwrap it
+        // so grouping never changes which equijoins are extracted. This mirrors the
+        // WHERE binder (`binder.rs` Expr::Nested arm) and the HAVING path
+        // (`bind_having_expr`), both of which already unwrap Nested — the JOIN ON
+        // predicate path was the lone gap among the predicate binders. (The view
+        // *output* projection is a separate path and is not covered here.)
+        Expr::Nested(inner) => {
+            collect_equijoin_keys(inner, left_schema, right_schema, alias_map, left_cols, right_cols)?;
+        }
+        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
+            collect_equijoin_keys(left,  left_schema, right_schema, alias_map, left_cols, right_cols)?;
+            collect_equijoin_keys(right, left_schema, right_schema, alias_map, left_cols, right_cols)?;
+        }
         Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
-            let l_col = resolve_join_col_ref(left, alias_map)?;
-            let r_col = resolve_join_col_ref(right, alias_map)?;
-            // l_col and r_col are global indices; convert to per-table indices
+            let l = resolve_join_col_ref(left,  alias_map)?;  // global index
+            let r = resolve_join_col_ref(right, alias_map)?;  // global index
             let left_n = left_schema.columns.len();
-            let (left_idx, right_idx) = if l_col < left_n && r_col >= left_n {
-                (l_col, r_col - left_n)
-            } else if r_col < left_n && l_col >= left_n {
-                (r_col, l_col - left_n)
+            let (li, ri) = if l < left_n && r >= left_n {
+                (l, r - left_n)
+            } else if r < left_n && l >= left_n {
+                (r, l - left_n)
             } else {
                 return Err(GnitzSqlError::Bind(
-                    "JOIN ON: each side of = must reference a different table".to_string()
-                ));
+                    "JOIN ON: each side of = must reference a different table".into()));
             };
-            Ok((left_idx, right_idx))
+            // Drop an exact-duplicate pair (`a.x = b.x AND a.x = b.x`, or the same
+            // pair written with the sides swapped, `a.x = b.x AND b.x = a.x`). Both
+            // produce byte-identical key slots; keeping them only widens the
+            // synthetic PK and can spuriously trip the arity cap. A pair that shares
+            // one column but not the other (`a.x = b.x AND a.x = b.y`) is a distinct
+            // constraint — different `ri` — and is kept.
+            if left_cols.iter().zip(right_cols.iter()).any(|(&pl, &pr)| pl == li && pr == ri) {
+                return Ok(());
+            }
+            validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
+            left_cols.push(li);
+            right_cols.push(ri);
         }
-        _ => Err(GnitzSqlError::Unsupported(
-            "JOIN ON: only simple equijoin (col = col) supported".to_string()
-        )),
+        _ => return Err(GnitzSqlError::Unsupported(
+            "JOIN ON: only an AND-conjunction of column equijoins is supported".into())),
     }
+    Ok(())
 }
 
 /// Resolve a column reference in a JOIN ON clause to a global column index.
@@ -1181,6 +1309,7 @@ fn resolve_join_col_ref(
     alias_map:    &HashMap<String, (u64, Schema, usize)>,
 ) -> Result<usize, GnitzSqlError> {
     match expr {
+        Expr::Nested(inner) => resolve_join_col_ref(inner, alias_map),
         Expr::Identifier(ident) => {
             resolve_unqualified_column(&ident.value, alias_map)
         }
@@ -2166,5 +2295,163 @@ mod tests {
         // than silently dropping rows on a stride mismatch.
         assert_eq!(join_pk_output_type(TypeCode::U32, TypeCode::U64), TypeCode::U128);
         assert_eq!(join_pk_output_type(TypeCode::U64, TypeCode::I64), TypeCode::U128);
+    }
+
+    // ── Multi-column equijoin key extraction / validation ────────────────────
+    //
+    // These exercise the k ≥ 2 logic directly: extract_equijoin_keys and
+    // validate_join_key_pair return their result *before* the `k > 1` planner
+    // gate in execute_create_join_view, so a composite key is fully testable
+    // here even though CREATE VIEW still rejects it end-to-end.
+
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn col(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
+        ColumnDef { name: name.into(), type_code: tc, is_nullable: nullable,
+                    fk_table_id: 0, fk_col_idx: 0 }
+    }
+
+    fn parse_on(src: &str) -> Expr {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(src).unwrap()
+            .parse_expr().unwrap()
+    }
+
+    /// Build the (left_schema, right_schema, alias_map) trio the way
+    /// `execute_create_join_view` does, for aliases `a` (left) / `b` (right).
+    fn join_ctx(
+        left:  Vec<ColumnDef>,
+        right: Vec<ColumnDef>,
+    ) -> (Schema, Schema, HashMap<String, (u64, Schema, usize)>) {
+        let left_n = left.len();
+        let left_schema  = Schema { columns: left,  pk_cols: vec![0] };
+        let right_schema = Schema { columns: right, pk_cols: vec![0] };
+        let mut am = HashMap::new();
+        am.insert("a".to_string(), (1u64, left_schema.clone(), 0usize));
+        am.insert("b".to_string(), (2u64, right_schema.clone(), left_n));
+        (left_schema, right_schema, am)
+    }
+
+    fn extract(
+        on: &str,
+        left:  Vec<ColumnDef>,
+        right: Vec<ColumnDef>,
+    ) -> Result<(Vec<usize>, Vec<usize>), GnitzSqlError> {
+        let (ls, rs, am) = join_ctx(left, right);
+        extract_equijoin_keys(&parse_on(on), &ls, &rs, &am)
+    }
+
+    fn two_u64() -> Vec<ColumnDef> {
+        vec![col("x", TypeCode::U64, false), col("y", TypeCode::U64, false)]
+    }
+
+    #[test]
+    fn extract_keys_per_table_order_side_independent() {
+        // Each `=` is resolved regardless of which side the left/right ref appears
+        // on: `b.y = a.y` keys the same as `a.y = b.y`.
+        let r = extract("a.x = b.x AND b.y = a.y", two_u64(), two_u64()).unwrap();
+        assert_eq!(r, (vec![0, 1], vec![0, 1]));
+    }
+
+    #[test]
+    fn extract_keys_parentheses_unwrap() {
+        // Expr::Nested grouping never changes which equijoins are extracted.
+        let base = extract("a.x = b.x AND a.y = b.y", two_u64(), two_u64()).unwrap();
+        assert_eq!(base, (vec![0, 1], vec![0, 1]));
+        assert_eq!(extract("(a.x = b.x) AND a.y = b.y", two_u64(), two_u64()).unwrap(), base);
+        assert_eq!(extract("(a.x = b.x AND a.y = b.y)", two_u64(), two_u64()).unwrap(), base);
+        // Parenthesized column ref on one side resolves too (single pair).
+        assert_eq!(extract("(a.x) = b.x", two_u64(), two_u64()).unwrap(), (vec![0], vec![0]));
+    }
+
+    #[test]
+    fn extract_keys_dedup_exact_duplicate() {
+        // Exact duplicate and sides-swapped duplicate both collapse to one column.
+        assert_eq!(extract("a.x = b.x AND a.x = b.x", two_u64(), two_u64()).unwrap(),
+                   (vec![0], vec![0]));
+        assert_eq!(extract("a.x = b.x AND b.x = a.x", two_u64(), two_u64()).unwrap(),
+                   (vec![0], vec![0]));
+        // Overlapping-but-distinct (shares left col, differs on right) keeps both.
+        assert_eq!(extract("a.x = b.x AND a.x = b.y", two_u64(), two_u64()).unwrap(),
+                   (vec![0, 0], vec![0, 1]));
+    }
+
+    #[test]
+    fn extract_keys_single_pair() {
+        assert_eq!(extract("a.x = b.y", two_u64(), two_u64()).unwrap(), (vec![0], vec![1]));
+    }
+
+    #[test]
+    fn extract_keys_rejections() {
+        // Float key → Unsupported (from validate_join_key_pair).
+        let fl = vec![col("x", TypeCode::F64, false), col("y", TypeCode::U64, false)];
+        assert!(matches!(extract("a.x = b.x", fl.clone(), fl).unwrap_err(),
+                         GnitzSqlError::Unsupported(_)));
+        // Encoding-mismatched pair U32 = U64 → Unsupported.
+        let l = vec![col("x", TypeCode::U32, false)];
+        let r = vec![col("x", TypeCode::U64, false)];
+        assert!(matches!(extract("a.x = b.x", l, r).unwrap_err(),
+                         GnitzSqlError::Unsupported(_)));
+        // Six distinct pairs > MAX_PK_COLUMNS (5) → Unsupported (arity cap).
+        let wide: Vec<ColumnDef> = (0..6)
+            .map(|i| col(&format!("c{i}"), TypeCode::U64, false)).collect();
+        let on6 = "a.c0=b.c0 AND a.c1=b.c1 AND a.c2=b.c2 AND a.c3=b.c3 AND a.c4=b.c4 AND a.c5=b.c5";
+        assert!(matches!(extract(on6, wide.clone(), wide).unwrap_err(),
+                         GnitzSqlError::Unsupported(_)));
+        // Both refs on the same table → Bind.
+        assert!(matches!(extract("a.x = a.y", two_u64(), two_u64()).unwrap_err(),
+                         GnitzSqlError::Bind(_)));
+        // Non-Eq / non-And operator → Unsupported.
+        assert!(matches!(extract("a.x < b.x", two_u64(), two_u64()).unwrap_err(),
+                         GnitzSqlError::Unsupported(_)));
+    }
+
+    #[test]
+    fn validate_pair_accepts_compatible() {
+        validate_join_key_pair(&col("a", TypeCode::U64, false),
+                               &col("b", TypeCode::U64, false)).unwrap();
+        validate_join_key_pair(&col("a", TypeCode::String, false),
+                               &col("b", TypeCode::String, false)).unwrap();
+        validate_join_key_pair(&col("a", TypeCode::String, false),
+                               &col("b", TypeCode::Blob, false)).unwrap();
+        validate_join_key_pair(&col("a", TypeCode::U128, false),
+                               &col("b", TypeCode::UUID, false)).unwrap();
+    }
+
+    #[test]
+    fn validate_pair_rejects_incompatible() {
+        // Float column.
+        assert!(validate_join_key_pair(&col("a", TypeCode::F64, false),
+                                       &col("b", TypeCode::U64, false)).is_err());
+        // Different reindex_output_type.
+        assert!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                                       &col("b", TypeCode::U64, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::U64, false),
+                                       &col("b", TypeCode::I64, false)).is_err());
+        // Mixed string/native — STRING = U128 both reindex to U128, so this is
+        // caught *only* by the german-string check, not the output-type check.
+        assert!(validate_join_key_pair(&col("a", TypeCode::String, false),
+                                       &col("b", TypeCode::U128, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::String, false),
+                                       &col("b", TypeCode::I64, false)).is_err());
+    }
+
+    #[test]
+    fn multi_null_filter_builds_at_every_arity() {
+        let schema = Schema {
+            columns: vec![
+                col("c0", TypeCode::U64, true),
+                col("c1", TypeCode::U64, true),
+                col("c2", TypeCode::U64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        // k = 1 (byte-identical to the old single-column null_filter_prog).
+        multi_null_filter_prog(&[0], &schema, false).unwrap();
+        multi_null_filter_prog(&[0], &schema, true).unwrap();
+        // k ≥ 2: a multi-leaf And for want_null=false, a multi-leaf Or for true.
+        multi_null_filter_prog(&[0, 1, 2], &schema, false).unwrap();
+        multi_null_filter_prog(&[0, 1, 2], &schema, true).unwrap();
     }
 }
