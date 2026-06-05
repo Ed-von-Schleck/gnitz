@@ -259,6 +259,23 @@ fn hash_row_for_partition(
     partition_for_key(key)
 }
 
+/// The packer that routes a compound (len > 1) `JoinPromote` scatter by the
+/// SAME packed OPK bytes the reindex Map writes as `_join_pk` — so the delta
+/// scatter and the reindexed trace co-partition byte-for-byte. Returns `None`
+/// for `len == 1` JoinPromote and every GroupKey scatter, which keep the
+/// `hash_row_for_partition` path (GROUP BY / set-op rows are never reindexed to
+/// a packed PK). Centralised so the two scatter implementations
+/// (`op_repartition_batches_mode` and `relay_scatter_merge_walk`) gate on the
+/// exact same predicate and cannot drift out of sync.
+fn compound_join_packer(
+    mode: RouteMode,
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+) -> Option<crate::ops::linear::ReindexPacker> {
+    (mode == RouteMode::JoinPromote && col_indices.len() > 1)
+        .then(|| crate::ops::linear::ReindexPacker::new(schema, col_indices))
+}
+
 fn fill_worker_indices(
     batch: &Batch,
     col_indices: &[u32],
@@ -405,11 +422,22 @@ pub(crate) fn op_repartition_batches_mode(
         // the hash-combine path with PK-existence checks would route rows
         // to the wrong worker.
         let is_pk_routing = col_indices == schema.pk_indices();
+        // Compound JoinPromote routes by the packed `_join_pk` (see
+        // `compound_join_packer`); the `pack_buf` is hoisted out of the row loop
+        // because `pack_into` fully overwrites `buf[..out_stride]` each row.
+        let join_packer = compound_join_packer(mode, col_indices, schema);
+        let mut pack_buf = [0u8; gnitz_wire::MAX_PK_BYTES];
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt { Some(m) => m, None => continue };
             if is_pk_routing {
                 for i in 0..mb.count {
                     let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+                    worker_rows[w_map[partition]].push((si as u8, i as u32));
+                }
+            } else if let Some(p) = &join_packer {
+                for i in 0..mb.count {
+                    p.pack_into(&mut pack_buf, mb, i);
+                    let partition = partition_for_pk_bytes(&pack_buf[..p.out_stride]);
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
                 }
             } else {
@@ -570,6 +598,15 @@ fn relay_scatter_merge_walk(
     // route path stays consistent.
     let is_pk_routing = col_indices == schema.pk_indices();
 
+    // Compound JoinPromote routes by the packed `_join_pk` (see
+    // `compound_join_packer`) — the consolidated join path, exactly where
+    // co-partition must hold. The packer is captured by shared ref so the
+    // `route_group` closure stays `Copy` (`&T` is `Copy`), satisfying the
+    // `Route: Fn + Copy` bound on `relay_walk_inner`; the per-row scratch buffer
+    // therefore lives INSIDE the closure (a captured `&mut buf` would make it
+    // non-`Copy`).
+    let join_packer = compound_join_packer(mode, col_indices, schema);
+
     // Route closures — 3-arg form. pk_val is the cached PK in the K-way
     // path and `get_pk(row)` in the bulk-drain (both narrow only).
     let route_pk_narrow = |_mb: &MemBatch, _row: usize, pk_val: u128| partition_for_key(pk_val);
@@ -577,7 +614,13 @@ fn relay_scatter_merge_walk(
         partition_for_pk_bytes(mb.get_pk_bytes(row))
     };
     let route_group = |mb: &MemBatch, row: usize, _pk_val: u128| {
-        hash_row_for_partition(mb, row, col_indices, schema, mode)
+        if let Some(p) = &join_packer {
+            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            p.pack_into(&mut buf, mb, row);
+            partition_for_pk_bytes(&buf[..p.out_stride])
+        } else {
+            hash_row_for_partition(mb, row, col_indices, schema, mode)
+        }
     };
 
     if !is_wide {
@@ -748,7 +791,11 @@ pub fn op_relay_scatter(
 /// specifications in one pass.  Returns one `Vec<Batch>` per spec.
 ///
 /// Only used in tests; retained as `#[cfg(test)]` so the helper doesn't
-/// bloat the production binary.
+/// bloat the production binary. Routes non-PK specs by `RouteMode::GroupKey`
+/// only — it does NOT build a `ReindexPacker`, so it does not co-partition a
+/// join-promoted compound key. A hand-assembled compound-join co-partition test
+/// must drive `op_repartition_batches_mode` / `op_relay_scatter_consolidated_mode`
+/// with `RouteMode::JoinPromote`, not this helper.
 #[cfg(test)]
 pub fn op_multi_scatter(
     batch: &Batch,
@@ -1718,5 +1765,100 @@ mod tests {
                 assert_eq!(expected, w, "compound-PK row routed to wrong worker");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Compound JoinPromote scatter co-partition (both production functions)
+    // -----------------------------------------------------------------------
+
+    /// Schema with a compound, non-PK join key spanning a signed I64 and a U128
+    /// column (packed stride 24 > 16). The PK is a separate U64 so the join key
+    /// is NOT the PK and routing goes through the `route_group` / packer arm.
+    fn make_join_key_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),  // col0: PK
+                SchemaColumn::new(type_code::I64, 0),  // col1: signed join key part
+                SchemaColumn::new(type_code::U128, 0), // col2: wide join key part
+            ],
+            &[0],
+        )
+    }
+
+    fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, c1, c2) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &c1.to_le_bytes()); // I64 payload (pi 0)
+            b.extend_col(1, &c2.to_le_bytes()); // U128 payload (pi 1)
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    #[test]
+    fn test_compound_join_promote_scatter_copartitions_both_functions() {
+        // A compound JoinPromote scatter must route every row by the SAME packed
+        // OPK bytes the reindex Map writes as `_join_pk` — i.e. by
+        // `partition_for_pk_bytes(ReindexPacker::pack(cols, row))`, NOT by
+        // `extract_group_key`. Exercised through BOTH production scatter
+        // functions: the non-consolidated row loop in `op_repartition_batches_mode`
+        // and the consolidated merge-walk's `route_group` in
+        // `op_relay_scatter_consolidated_mode`. Covers signed-negative and
+        // >16-byte composite keys, including a duplicate join key that must
+        // co-locate (the no-dropped-rows / matching-keys-together guarantee).
+        let schema = make_join_key_schema();
+        let cols = [1u32, 2u32]; // (I64, U128) join key — non-PK, stride 24.
+        let num_workers = 4;
+        // PK ascending (consolidated invariant). Rows 0 and 3 share the join key
+        // (-5, 100) → must land on the same worker.
+        let rows: &[(u64, i64, u128)] = &[
+            (1, -5,        100),
+            (2,  7,        100),
+            (3, -5,        100),
+            (4,  i64::MIN, 0),
+            (5,  3,        0xdead_beef_cafe_0001),
+            (6, -1,        1),
+        ];
+        let cb = make_join_key_batch(&schema, rows);
+
+        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols);
+        let expected_worker = |sb: &Batch, r: usize| -> usize {
+            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
+            worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
+        };
+
+        // Helper: assert every output row routed to the worker its packed key
+        // dictates, no rows dropped, and the shared-key rows co-located.
+        let check = |result: &[Batch], label: &str| {
+            assert_eq!(total_rows(result), rows.len(), "{label}: no dropped rows");
+            let mut worker_of_pk = std::collections::HashMap::new();
+            for (w, sb) in result.iter().enumerate() {
+                for r in 0..sb.count {
+                    assert_eq!(expected_worker(sb, r), w, "{label}: row routed to wrong worker");
+                    worker_of_pk.insert(sb.get_pk(r) as u64, w);
+                }
+            }
+            // Rows with pk=1 and pk=3 share the join key (-5, 100): same worker.
+            assert_eq!(
+                worker_of_pk.get(&1), worker_of_pk.get(&3),
+                "{label}: matching join keys must co-locate",
+            );
+        };
+
+        // (a) Non-consolidated path.
+        let repart = op_repartition_batches_mode(
+            &[Some(&cb)], &cols, &schema, num_workers, RouteMode::JoinPromote);
+        check(&repart, "op_repartition_batches_mode");
+
+        // (b) Consolidated merge-walk path (route_group).
+        let consol = op_relay_scatter_consolidated_mode(
+            &[Some(&cb)], &cols, &schema, num_workers, RouteMode::JoinPromote);
+        check(&consol, "op_relay_scatter_consolidated_mode");
     }
 }

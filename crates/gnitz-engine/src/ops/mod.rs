@@ -25,7 +25,7 @@ pub use join::{
     op_join_delta_trace, op_join_delta_trace_outer, op_semi_join_delta_delta,
     op_semi_join_delta_trace,
 };
-pub use linear::{op_filter, op_map, op_negate, op_null_extend, op_union, HASH_ROW_REINDEX};
+pub use linear::{op_filter, op_map, op_negate, op_null_extend, op_union};
 pub use reduce::{AggDescriptor, AggOp, op_gather_reduce, op_reduce};
 pub(crate) use reduce::is_single_col_natural_pk;
 pub use scan::op_scan_trace;

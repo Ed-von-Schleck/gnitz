@@ -777,11 +777,18 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 fn reindex_output_schema(in_schema: &SchemaDescriptor, reindex_cols: &[u16]) -> SchemaDescriptor {
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let pk_n = reindex_cols.len();
+    let n = in_schema.num_columns();
+    // Self-protecting: a future caller that skips `emit_node`'s guard would
+    // otherwise hit a bare slice OOB in the `cols[pk_n..pk_n + n]` copy below.
+    assert!(
+        pk_n + n <= crate::schema::MAX_COLUMNS,
+        "reindex_output_schema: {pk_n} + {n} columns exceed MAX_COLUMNS ({})",
+        crate::schema::MAX_COLUMNS,
+    );
     for (i, &c) in reindex_cols.iter().enumerate() {
         let out_tc = gnitz_wire::reindex_output_type_code(in_schema.columns[c as usize].type_code);
         cols[i] = SchemaColumn::new(out_tc, 0); // PK region: nullable = 0
     }
-    let n = in_schema.num_columns();
     cols[pk_n..pk_n + n].copy_from_slice(&in_schema.columns[..n]);
     let pk_idx: Vec<u32> = (0..pk_n as u32).collect();
     SchemaDescriptor::new(&cols[..pk_n + n], &pk_idx)
@@ -1141,14 +1148,22 @@ fn emit_node(
                         out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
                         return;
                     }
-                    // Compound (len > 1) reindex is representable and round-trips, but
-                    // cannot be *emitted* yet: the trace-side exchange router
-                    // (route_partition_key → extract_group_key for len > 1) does not
-                    // co-partition a packed compound key to the same worker as
-                    // partition_for_pk_bytes on the reindexed side, and the runtime
-                    // promoter / Instr::Map are still single-column. Fail the compile
-                    // cleanly rather than silently scatter join rows.
-                    if reindex_cols.len() > 1 {
+                    // The reindex output schema prepends `pk_n` synthetic PK
+                    // columns to every input column, written into a fixed
+                    // [_; MAX_COLUMNS] / [_; MAX_PK_COLUMNS] array. A hand-assembled
+                    // or planner-built list could exceed those bounds, or name a
+                    // column >= num_columns() (which `columns[c]` would read as a
+                    // zeroed slot — a silently wrong key). Fail the compile cleanly.
+                    // The byte stride needs no separate MAX_PK_BYTES check: each
+                    // output PK column is reindex_output_type_code(tc).wire_stride()
+                    // <= 16 bytes, so pk_n <= MAX_PK_COLUMNS (5) bounds the packed
+                    // stride at 5 × 16 = 80 = MAX_PK_BYTES (ReindexPacker::new's
+                    // assert is the tripwire).
+                    let pk_n = reindex_cols.len();
+                    if pk_n > crate::schema::MAX_PK_COLUMNS
+                        || pk_n + in_reg_schema.num_columns() > crate::schema::MAX_COLUMNS
+                        || reindex_cols.iter().any(|&c| c as usize >= in_reg_schema.num_columns())
+                    {
                         state.emit_failed = true;
                         return;
                     }
@@ -1162,14 +1177,14 @@ fn emit_node(
                         &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
-                    let rc = reindex_cols.first().map(|&c| c as i32).unwrap_or(-1);
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, rc, 0);
+                    let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema, &cols_u32, false, 0);
                 }
 
                 gnitz_wire::MapKind::HashRow(proj_cols, branch_id) => {
                     // Keep the listed columns as payload (positions 0..k), like a
                     // Projection, but prepend a synthetic U128 PK that op_map sets
-                    // to a hash of those payload columns (HASH_ROW_REINDEX path).
+                    // to a hash of those payload columns (reindex_hash path).
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
                     let src_types: Vec<u8> = src_indices.iter()
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
@@ -1186,7 +1201,7 @@ fn emit_node(
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema,
-                        crate::ops::HASH_ROW_REINDEX, *branch_id);
+                        &[], true, *branch_id);
                 }
 
                 gnitz_wire::MapKind::Projection(cols) => {
@@ -1200,7 +1215,7 @@ fn emit_node(
                     );
                     reg_schemas[reg_id as usize] = schema;
                     reg_kinds[reg_id as usize] = 0;
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, schema, -1, 0);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, schema, &[], false, 0);
                 }
 
                 gnitz_wire::MapKind::KeyOnly => {
@@ -1213,7 +1228,7 @@ fn emit_node(
                     );
                     reg_schemas[reg_id as usize] = s;
                     reg_kinds[reg_id as usize] = 0;
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, -1, 0);
+                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, &[], false, 0);
                 }
             }
         }
@@ -2947,14 +2962,38 @@ mod tests {
         }
     }
 
-    /// A compound (len > 1) reindex Map is representable and round-trips, but cannot
-    /// be *emitted* yet (the trace-side co-partition router and the runtime promoter
-    /// are still single-column). `build_plan` must fail the compile cleanly rather
-    /// than silently scatter join rows.
+    /// `reindex_output_schema` for a compound (len > 1) key: each output PK slot
+    /// takes its source column's `reindex_output_type_code`, the input columns
+    /// follow, and `pk_stride` is the sum of the per-column slot widths.
     #[test]
-    fn test_build_plan_compound_reindex_gated() {
-        // Valid 2-col copy program so decode_expr_blob succeeds and we reach the
-        // len > 1 gate (not the corrupt-blob abort).
+    fn test_reindex_output_schema_compound() {
+        // in_schema: [U64 pk, I32, U128]; reindex on (col1 I32, col2 U128).
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+            ],
+            &[0],
+        );
+        let out = reindex_output_schema(&in_schema, &[1u16, 2u16]);
+        assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
+        assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
+        assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
+        // Input columns follow the synthetic PK slots.
+        assert_eq!(out.num_columns(), 2 + 3);
+        assert_eq!(out.columns[2].type_code, type_code::U64);
+        assert_eq!(out.columns[3].type_code, type_code::I32);
+        assert_eq!(out.columns[4].type_code, type_code::U128);
+    }
+
+    /// A compound (len > 1) reindex Map now compiles end-to-end: the gate is
+    /// lifted and `emit_node` builds a 2-slot-PK node schema, so `build_plan`
+    /// returns `Some` (the sink's output schema matches the reindex output).
+    #[test]
+    fn test_build_plan_compound_reindex_accepted() {
+        // Valid 2-col copy program so decode_expr_blob succeeds.
         let mut eb = gnitz_core::ExprBuilder::new();
         eb.copy_col(type_code::U64 as u32, 0, 0);
         eb.copy_col(type_code::I64 as u32, 1, 1);
@@ -2967,17 +3006,52 @@ mod tests {
         }));
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
-        let loaded = make_loaded(nodes, edges);
+        let mut loaded = make_loaded(nodes, edges);
         let in_schema = SchemaDescriptor::new(
             &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
             &[0],
         );
+        // The sink validates against the reindex Map's output schema (2 synthetic
+        // PK slots [U64, I64] + the two input columns).
+        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16]);
         let ext = [ExternalTable { table_id: 99, schema: in_schema }];
         let ordered = loaded.ordered.clone();
         let result = build_plan(
             &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
         );
-        assert!(result.is_none(), "compound (len > 1) reindex must fail the compile");
+        assert!(result.is_some(), "compound (len > 1) reindex must compile after the gate lift");
+    }
+
+    /// A reindex list longer than `MAX_PK_COLUMNS` overflows the output schema's
+    /// fixed PK array; `emit_node` must fail the compile cleanly (`build_plan`
+    /// returns None) rather than panic or build a truncated key.
+    #[test]
+    fn test_build_plan_reindex_exceeds_max_pk_columns_rejected() {
+        // 6-column source, reindex on all 6 → pk_n (6) > MAX_PK_COLUMNS (5).
+        let mut eb = gnitz_core::ExprBuilder::new();
+        eb.copy_col(type_code::U64 as u32, 0, 0);
+        let blob = eb.build(0).encode();
+
+        let n_cols = crate::schema::MAX_PK_COLUMNS + 1;
+        let cols: Vec<SchemaColumn> =
+            (0..n_cols).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
+        let in_schema = SchemaDescriptor::new(&cols, &[0]);
+        let reindex_cols: Vec<u16> = (0..n_cols as u16).collect();
+
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+            program: blob, reindex_cols,
+        }));
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let ext = [ExternalTable { table_id: 99, schema: in_schema }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![],
+        );
+        assert!(result.is_none(), "reindex list > MAX_PK_COLUMNS must fail the compile");
     }
 
     // ── Item 29: scratch dir cleanup on compile failure ─────────────────────

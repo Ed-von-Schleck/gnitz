@@ -19,7 +19,10 @@ pub enum Instr {
     ScanTrace { trace_reg: u16, out_reg: u16, chunk_limit: i32 },
     SeekTrace { trace_reg: u16, key_reg: u16 },
     Filter { in_reg: u16, out_reg: u16, func_idx: u16 },
-    Map { in_reg: u16, out_reg: u16, func_idx: u16, out_schema_idx: u16, reindex_col: i32, branch_id: u8 },
+    Map {
+        in_reg: u16, out_reg: u16, func_idx: u16, out_schema_idx: u16,
+        reindex_off: u32, reindex_cnt: u16, reindex_hash: bool, branch_id: u8,
+    },
     Negate { in_reg: u16, out_reg: u16 },
     Union { in_a: u16, in_b: u16, has_b: bool, out_reg: u16 },
     Distinct { in_reg: u16, hist_reg: u16, out_reg: u16, hist_table_idx: i16 },
@@ -98,6 +101,7 @@ pub struct ProgramBuilder {
     schemas: Vec<SchemaDescriptor>,
     agg_descs: Vec<AggDescriptor>,
     group_cols: Vec<u32>,
+    reindex_cols: Vec<u32>,
     expr_progs: Vec<*const crate::expr::ExprProgram>,
 }
 
@@ -114,6 +118,7 @@ impl ProgramBuilder {
             schemas: Vec::new(),
             agg_descs: Vec::new(),
             group_cols: Vec::new(),
+            reindex_cols: Vec::new(),
             expr_progs: Vec::new(),
         }
     }
@@ -170,6 +175,12 @@ impl ProgramBuilder {
         (offset, cols.len() as u16)
     }
 
+    fn add_reindex_cols(&mut self, cols: &[u32]) -> (u32, u16) {
+        let offset = self.reindex_cols.len() as u32;
+        self.reindex_cols.extend_from_slice(cols);
+        (offset, cols.len() as u16)
+    }
+
     // ── Instruction methods ──────────────────────────────────────────────
 
     pub fn add_halt(&mut self) {
@@ -197,14 +208,20 @@ impl ProgramBuilder {
         self.instructions.push(Instr::Filter { in_reg, out_reg, func_idx });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_map(
         &mut self, in_reg: u16, out_reg: u16,
-        func_ptr: *const ScalarFuncKind, out_schema: SchemaDescriptor, reindex_col: i32,
+        func_ptr: *const ScalarFuncKind, out_schema: SchemaDescriptor,
+        reindex_cols: &[u32], reindex_hash: bool,
         branch_id: u8,
     ) {
         let func_idx = self.func_idx(func_ptr);
         let out_schema_idx = self.schema_idx(out_schema);
-        self.instructions.push(Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col, branch_id });
+        let (reindex_off, reindex_cnt) = self.add_reindex_cols(reindex_cols);
+        self.instructions.push(Instr::Map {
+            in_reg, out_reg, func_idx, out_schema_idx,
+            reindex_off, reindex_cnt, reindex_hash, branch_id,
+        });
     }
 
     pub fn add_negate(&mut self, in_reg: u16, out_reg: u16) {
@@ -405,6 +422,7 @@ impl ProgramBuilder {
             schemas: self.schemas,
             agg_descs: self.agg_descs,
             group_cols: self.group_cols,
+            reindex_cols: self.reindex_cols,
             expr_progs: self.expr_progs,
         };
 
@@ -456,6 +474,7 @@ impl ProgramBuilder {
             schemas: self.schemas,
             agg_descs: self.agg_descs,
             group_cols: self.group_cols,
+            reindex_cols: self.reindex_cols,
             expr_progs: self.expr_progs,
         };
 
@@ -589,6 +608,7 @@ pub struct Program {
     pub schemas: Vec<SchemaDescriptor>,
     pub agg_descs: Vec<AggDescriptor>,
     pub group_cols: Vec<u32>,
+    pub reindex_cols: Vec<u32>,
     pub expr_progs: Vec<*const crate::expr::ExprProgram>,
 }
 
@@ -838,7 +858,7 @@ pub fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col, branch_id } => {
+            Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_off, reindex_cnt, reindex_hash, branch_id } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
                 let in_schema = reg!(*in_reg).schema;
@@ -850,7 +870,9 @@ pub fn execute_epoch_multi(
                     out
                 } else {
                     let func = unsafe { &*func_ptr };
-                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, *reindex_col, *branch_id)
+                    let off = *reindex_off as usize;
+                    let reindex_cols = &program.reindex_cols[off..off + *reindex_cnt as usize];
+                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, reindex_cols, *reindex_hash, *branch_id)
                 };
                 reg_mut!(*out_reg).batch = result;
             }
@@ -1722,7 +1744,7 @@ mod tests {
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, func_ptr, out_schema, -1, 0);
+        builder.add_map(0, 1, func_ptr, out_schema, &[], false, 0);
         builder.add_halt();
 
         let input = make_batch_2col(in_schema, &[
@@ -2647,7 +2669,7 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, std::ptr::null(), schema, -1, 0);
+        builder.add_map(0, 1, std::ptr::null(), schema, &[], false, 0);
         builder.add_halt();
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
