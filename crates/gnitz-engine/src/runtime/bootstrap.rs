@@ -196,7 +196,7 @@ fn recover_from_sal(
 fn backfill_exchange_views(
     catalog: &mut CatalogEngine,
     dispatcher: &mut MasterDispatcher,
-) {
+) -> Result<(), String> {
     let table_ids = catalog.iter_user_table_ids();
     for vid in table_ids {
         if !catalog.dag.view_needs_exchange(vid) {
@@ -207,14 +207,10 @@ fn backfill_exchange_views(
             if !catalog.dag.tables.contains_key(&source_id) {
                 continue;
             }
-            if let Err(e) = dispatcher.fan_out_backfill(vid, source_id) {
-                let msg = format!("backfill error: {}\n", e);
-                unsafe {
-                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                }
-            }
+            dispatcher.fan_out_backfill(vid, source_id)?;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +525,11 @@ pub fn server_main(
     dispatcher.reset_sal(0, 1);
 
     // Backfill exchange views
-    backfill_exchange_views(catalog, dispatcher);
+    if let Err(e) = backfill_exchange_views(catalog, dispatcher) {
+        let msg = format!("Error: backfill failed: {}\n", e);
+        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        return 1;
+    }
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);

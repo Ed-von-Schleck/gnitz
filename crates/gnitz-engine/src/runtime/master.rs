@@ -555,6 +555,22 @@ impl MasterDispatcher {
         self.w2m.as_ref().expect("W2mReceiver already handed off to reactor")
     }
 
+    /// Liveness gate for the pre-reactor bootstrap wait loops. A crashed worker
+    /// (panic / OOM-kill / SIGKILL) leaves its `reader_seq` frozen, so `wait_for`
+    /// only ever times out and the wait loop would spin forever. Callers probe
+    /// before parking and surface the dead worker as an error instead of hanging
+    /// the master; `context` names the bootstrap phase ("before completing
+    /// recovery sync", "during backfill relay"). On these paths workers stay
+    /// alive after acking, so a reaped worker has not published the awaited
+    /// frame — no ack is lost.
+    fn fail_if_worker_dead(&mut self, context: &str) -> Result<(), String> {
+        let dead = self.check_workers();
+        if dead >= 0 {
+            return Err(format!("worker {dead} exited {context}"));
+        }
+        Ok(())
+    }
+
     /// Wait for one response from each worker. Bootstrap-only: runs
     /// before the reactor is up, so we drive each worker's ring via
     /// `W2mReceiver::wait_for` (sync FUTEX_WAIT on `reader_seq`). The
@@ -575,6 +591,7 @@ impl MasterDispatcher {
                         break;
                     }
                     None => {
+                        self.fail_if_worker_dead("before completing recovery sync")?;
                         let _ = self.w2m().wait_for(w, 1000);
                     }
                 }
@@ -629,6 +646,7 @@ impl MasterDispatcher {
                 }
             }
             if !progressed {
+                self.fail_if_worker_dead("during backfill relay")?;
                 // Wait for the first still-active worker to publish.
                 if let Some(next) = (0..nw).find(|&w| !collected[w]) {
                     let _ = self.w2m().wait_for(next, 1000);
@@ -1240,14 +1258,36 @@ impl MasterDispatcher {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn check_workers(&self) -> i32 {
+    pub fn check_workers(&mut self) -> i32 {
+        // Probe each worker by its own pid, not `waitpid(-1)`. A per-pid
+        // `waitpid` returns ECHILD — a detected death — even if the zombie was
+        // reaped elsewhere, whereas `waitpid(-1)` returns 0 ("some child is
+        // alive") and silently misses one worker's death while others run, so it
+        // would go blind the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is
+        // ever added. It also names the exact dead worker for the error/log.
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid <= 0 { continue; }
             let mut status: i32 = 0;
-            let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if rpid != 0 {
-                return w as i32;
+            loop {
+                let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if rpid > 0 {
+                    self.worker_pids[w] = 0;        // reaped — never waitpid it again
+                    return w as i32;
+                }
+                if rpid == 0 {
+                    break;                          // still running
+                }
+                // rpid == -1
+                let err = crate::runtime::sys::errno();
+                if err == libc::EINTR {
+                    continue;                       // signal, not death — retry
+                }
+                if err == libc::ECHILD {
+                    self.worker_pids[w] = 0;        // already gone
+                    return w as i32;
+                }
+                break;                              // unexpected errno: treat as alive
             }
         }
         -1
@@ -3302,5 +3342,148 @@ mod unique_filter_tests {
         assert!(filter.values.contains(&11u128));
         assert!(filter.values.contains(&22u128));
         assert_eq!(filter.values.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod worker_liveness_tests {
+    use super::*;
+    use crate::runtime::sal::SalWriter;
+    use crate::runtime::w2m::W2mReceiver;
+    use crate::runtime::w2m_ring;
+
+    const RING_CAP: usize = 64 * 1024;
+
+    // Build an inert dispatcher for the pre-reactor liveness-probe paths: real
+    // but empty W2M rings so the bootstrap wait loops can `try_read` (always
+    // None here, so they reach the park / no-progress arm that probes), a null
+    // SAL and catalog (untouched on the no-frame path), and the given worker
+    // pids. Returns the ring pointers so the caller can munmap after dropping
+    // the dispatcher (W2mReceiver holds the raw ptrs but does not own them).
+    fn probe_dispatcher(worker_pids: Vec<i32>) -> (MasterDispatcher, Vec<*mut u8>) {
+        let nw = worker_pids.len();
+        let mut ptrs = Vec::with_capacity(nw);
+        for _ in 0..nw {
+            let p = unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(), RING_CAP,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+                ) as *mut u8;
+                assert!(!p.is_null(), "mmap failed");
+                std::ptr::write_bytes(p, 0, RING_CAP);
+                w2m_ring::init_region_for_tests(p, RING_CAP as u64);
+                p
+            };
+            ptrs.push(p);
+        }
+        let disp = MasterDispatcher::new(
+            nw,
+            worker_pids,
+            std::ptr::null_mut(),
+            SalWriter::new(std::ptr::null_mut(), -1, 0, Vec::new()),
+            W2mReceiver::new(ptrs.clone()),
+        );
+        (disp, ptrs)
+    }
+
+    fn free_rings(ptrs: &[*mut u8]) {
+        for &p in ptrs {
+            unsafe { libc::munmap(p as *mut libc::c_void, RING_CAP); }
+        }
+    }
+
+    // Fork a child that exits immediately, then block-reap it. The pid is now a
+    // confirmed non-child, so a later `waitpid` on it yields ECHILD — a
+    // deterministic "dead" verdict with no race against the probe.
+    fn spawn_and_reap_dead() -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        pid
+    }
+
+    #[test]
+    fn check_workers_reports_neg1_for_live_worker() {
+        // Child blocks in pause() so it is unambiguously alive across the probe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let (mut disp, ptrs) = probe_dispatcher(vec![pid]);
+        assert_eq!(disp.check_workers(), -1, "a live worker must not be reported dead");
+        assert_eq!(disp.worker_pids[0], pid, "a live worker's pid must be retained");
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        drop(disp);
+        free_rings(&ptrs);
+    }
+
+    #[test]
+    fn check_workers_reaps_and_zeroes_then_does_not_re_report() {
+        // An exited child becomes a zombie; the detecting `waitpid(WNOHANG)`
+        // reaps it (rpid > 0) and must zero the slot so a second probe does not
+        // re-`waitpid` a non-child and re-report the same worker as dead.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let (mut disp, ptrs) = probe_dispatcher(vec![pid]);
+        // Bounded poll until the zombie is reaped by the probe (the child exits
+        // near-instantly). The bound keeps a regression from hanging the suite.
+        let mut detected = -1;
+        for _ in 0..2000 {
+            detected = disp.check_workers();
+            if detected >= 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(detected, 0, "the exited worker must be detected dead");
+        assert_eq!(disp.worker_pids[0], 0, "a reaped pid must be zeroed");
+        assert_eq!(disp.check_workers(), -1, "a zeroed worker must not be re-reported");
+        drop(disp);
+        free_rings(&ptrs);
+    }
+
+    #[test]
+    fn collect_acks_errors_when_worker_dies_before_acking() {
+        // Boot-recovery path: wait_all_workers finds an empty ring and reaches
+        // the park arm, whose liveness probe must surface the dead worker as a
+        // clean error instead of looping on `wait_for` forever.
+        let dead = spawn_and_reap_dead();
+        let (mut disp, ptrs) = probe_dispatcher(vec![dead]);
+        let err = disp.collect_acks().expect_err("a dead worker must fail ack collection");
+        assert!(err.contains("worker 0"), "error names the dead worker: {err}");
+        assert!(err.contains("recovery sync"), "error identifies the recovery path: {err}");
+        drop(disp);
+        free_rings(&ptrs);
+    }
+
+    #[test]
+    fn collect_acks_and_relay_errors_when_worker_dies_mid_backfill() {
+        // Backfill path: collect_acks_and_relay makes no progress on an empty
+        // ring and reaches the !progressed arm, whose probe must surface the
+        // dead worker.
+        let dead = spawn_and_reap_dead();
+        let (mut disp, ptrs) = probe_dispatcher(vec![dead]);
+        let err = disp.collect_acks_and_relay(0)
+            .expect_err("a dead worker must fail the backfill relay");
+        assert!(err.contains("worker 0"), "error names the dead worker: {err}");
+        assert!(err.contains("backfill relay"), "error identifies the backfill path: {err}");
+        drop(disp);
+        free_rings(&ptrs);
     }
 }
