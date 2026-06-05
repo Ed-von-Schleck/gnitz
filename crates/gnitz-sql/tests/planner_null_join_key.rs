@@ -12,14 +12,8 @@ use gnitz_core::{GnitzClient, ColData, PkColumn, CIRCUIT_NODES_TAB, OPCODE_FILTE
 use gnitz_sql::{SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 
-fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let sn = format!("snull{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
-    client.create_schema(&sn).unwrap();
-    (client, sn)
-}
+mod common;
+use common::*;
 
 fn view_id_of(results: &[SqlResult]) -> u64 {
     results

@@ -1,39 +1,10 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, ColData, Schema, ZSetBatch};
-use gnitz_sql::{SqlPlanner, SqlResult};
+use gnitz_sql::SqlPlanner;
 use gnitz_test_harness::ServerHandle;
 
-fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let sn = format!("ds{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
-    client.create_schema(&sn).unwrap();
-    (client, sn)
-}
-
-fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
-    let mut p = SqlPlanner::new(client, sn);
-    let mut res = p.execute(&format!("SELECT * FROM {}", view)).unwrap();
-    match res.pop().unwrap() {
-        SqlResult::Rows { schema, batch } => (schema, batch),
-        _ => panic!("expected Rows"),
-    }
-}
-
-fn col_idx(schema: &Schema, name: &str) -> usize {
-    schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
-        .unwrap_or_else(|| panic!("column '{}' not in {:?}", name,
-            schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()))
-}
-
-fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
-    match &batch.columns[col] {
-        ColData::Fixed(b) => i64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
-        other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
-    }
-}
+mod common;
+use common::*;
 
 // ── DISTINCT over a compound-PK source ───────────────────────────────
 // Membership is decided by the projected content hash (`_distinct_pk`),

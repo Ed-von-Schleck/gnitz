@@ -1,57 +1,10 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, ColData, Schema, ZSetBatch};
-use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
-fn must_err(r: Result<Vec<SqlResult>, GnitzSqlError>) -> GnitzSqlError {
-    match r { Ok(_) => panic!("expected error, got Ok"), Err(e) => e }
-}
-
-fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let sn = format!("gb{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
-    client.create_schema(&sn).unwrap();
-    (client, sn)
-}
-
-/// Read `SELECT * FROM view` and return its (schema, batch).
-fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
-    let mut p = SqlPlanner::new(client, sn);
-    let mut res = p.execute(&format!("SELECT * FROM {}", view)).unwrap();
-    match res.pop().unwrap() {
-        SqlResult::Rows { schema, batch } => (schema, batch),
-        other => panic!("expected Rows, got {:?}", matches!(other, SqlResult::Rows { .. })),
-    }
-}
-
-fn col_idx(schema: &Schema, name: &str) -> usize {
-    schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
-        .unwrap_or_else(|| panic!("column '{}' not in view schema {:?}",
-            name, schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()))
-}
-
-fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
-    match &batch.columns[col] {
-        ColData::Fixed(b) => i64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
-        other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
-    }
-}
-
-fn f64_at(batch: &ZSetBatch, col: usize, row: usize) -> f64 {
-    match &batch.columns[col] {
-        ColData::Fixed(b) => f64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
-        other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
-    }
-}
-
-/// Is the payload column at schema index `col` NULL in `row`? The null word
-/// is indexed by payload position (schema index minus the single PK column).
-fn is_null_at(batch: &ZSetBatch, payload_idx: usize, row: usize) -> bool {
-    (batch.nulls[row] >> payload_idx) & 1 != 0
-}
+mod common;
+use common::*;
 
 // ── item 42: AVG must ignore NULLs and never emit NaN/Infinity ───────
 //

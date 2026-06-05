@@ -1,17 +1,10 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::GnitzClient;
 use gnitz_sql::SqlPlanner;
 use gnitz_test_harness::ServerHandle;
 
-fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let sn = format!("pj{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
-    client.create_schema(&sn).unwrap();
-    (client, sn)
-}
+mod common;
+use common::*;
 
 // ── item 40: PK column move must preserve remaining order ─────────────
 

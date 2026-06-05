@@ -1,24 +1,10 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::GnitzClient;
-use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
-fn must_err(r: Result<Vec<SqlResult>, GnitzSqlError>) -> GnitzSqlError {
-    match r {
-        Ok(_)  => panic!("expected error, got Ok"),
-        Err(e) => e,
-    }
-}
-
-fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let sn = format!("vv{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
-    client.create_schema(&sn).unwrap();
-    (client, sn)
-}
+mod common;
+use common::*;
 
 // ── item 21: LIMIT/OFFSET in VIEW definitions ────────────────────────
 
