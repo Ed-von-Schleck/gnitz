@@ -527,6 +527,7 @@ fn test_drop_view_removes_directory() {
     bb.put_string("SELECT id FROM base"); // sql
     bb.put_string("");                    // cache_directory (hook computes real path)
     bb.put_u64(0);                        // created_lsn
+    bb.put_u64(0);                        // pk_col_idx (bare 0 → single-column PK [0])
     bb.end_row();
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 

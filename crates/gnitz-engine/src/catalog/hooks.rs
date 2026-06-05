@@ -265,9 +265,16 @@ impl CatalogEngine {
                     ));
                 }
 
+                // The view's physical PK is the persisted leading-k column list:
+                // a single synthetic hash column for join/set-op/distinct views,
+                // or the source PK passed through (0..k) for a plain projection
+                // over a compound-PK table. A bare `0` decodes back to `[0]`.
+                let pk = unpack_pk_cols(self.read_batch_u64(batch, i, VIEWTAB_PAY_PK_COL_IDX));
+                validate_pk_cols(&col_defs, &pk)?;
+
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
-                let view_schema = self.build_schema_from_col_defs(&col_defs, &[0]);
+                let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
 
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
                 let arena = partition_arena_size(num_parts);

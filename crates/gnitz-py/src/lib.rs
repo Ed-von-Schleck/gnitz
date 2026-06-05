@@ -1432,7 +1432,8 @@ impl PyGnitzClient {
         let circuit = circuit.inner.take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Circuit already consumed"))?;
         let rust_schema = py_schema_to_rust(py, &output_schema)?;
-        client!(self).create_view_with_circuit(schema_name, view_name, "", circuit, &rust_schema.columns)
+        // Hand-built circuits from the Python API emit a single output PK at slot 0.
+        client!(self).create_view_with_circuit(schema_name, view_name, "", circuit, &rust_schema.columns, &[0])
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 

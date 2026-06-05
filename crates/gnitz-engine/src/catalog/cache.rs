@@ -190,14 +190,16 @@ impl CatalogEngine {
 
             if weight > 0 {
                 // Malformed wire values (count 0 or 5..=15) are NOT defended
-                // here: hook_table_register fires immediately after this
-                // applier in the same call, retracts the row via the matching
-                // -1 weight, and removes the entry before any other code can
-                // observe it. `PkColList::as_slice` is panic-free regardless.
+                // here: hook_table_register / hook_view_register fires
+                // immediately after this applier in the same call, retracts the
+                // row via the matching -1 weight, and removes the entry before
+                // any other code can observe it. `PkColList::as_slice` is
+                // panic-free regardless. A view's PK is its persisted leading-k
+                // list (0..k for a compound-source projection, bare 0 otherwise).
                 let pk_list = if is_table {
                     unpack_pk_cols(self.read_batch_u64(batch, i, 3))
                 } else {
-                    PkColList::single(0) // views always pk_col=0
+                    unpack_pk_cols(self.read_batch_u64(batch, i, VIEWTAB_PAY_PK_COL_IDX))
                 };
                 // Invalidate only on a real change: retract-reinsert with an
                 // identical PK list would otherwise spuriously bump the version.

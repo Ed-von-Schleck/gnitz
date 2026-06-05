@@ -13,6 +13,7 @@ fn build_view_tab_row(dir: &str, vid: i64, name: &str) -> Batch {
     bb.put_string("");
     bb.put_string(&format!("{}/public/view_{}_{}", dir, name, vid));
     bb.put_u64(0);
+    bb.put_u64(0); // pk_col_idx (bare 0 → single-column PK [0])
     bb.end_row();
     bb.finish()
 }

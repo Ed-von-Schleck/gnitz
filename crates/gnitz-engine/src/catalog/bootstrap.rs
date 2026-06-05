@@ -144,6 +144,7 @@ impl CatalogEngine {
                     ("view_id", type_code::U64, 0), ("schema_id", type_code::U64, 0),
                     ("name", type_code::STRING, 0), ("sql_definition", type_code::STRING, 0),
                     ("cache_directory", type_code::STRING, 0), ("created_lsn", type_code::U64, 0),
+                    ("pk_col_idx", type_code::U64, 0),
                 ]),
                 (COL_TAB_ID, &[
                     ("column_id", type_code::U64, 0), ("owner_id", type_code::U64, 0),

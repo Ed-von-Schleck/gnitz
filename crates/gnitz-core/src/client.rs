@@ -113,6 +113,7 @@ struct ViewRecord {
     sql_definition:  String,
     cache_directory: String,
     created_lsn:     u64,
+    pk_col_idx:      u64,
 }
 
 // --- GnitzClient ---
@@ -434,7 +435,8 @@ impl GnitzClient {
         cb.sink(scan);
         let circuit = cb.build();
 
-        self.write_circuit_rows(schema_name, view_name, "", vid, circuit, output_columns)
+        // Minimal SCAN→SINK passthrough: single output PK at slot 0.
+        self.write_circuit_rows(schema_name, view_name, "", vid, circuit, output_columns, &[0])
     }
 
     pub fn create_view_with_circuit(
@@ -444,18 +446,25 @@ impl GnitzClient {
         sql_text: &str,
         circuit: Circuit,
         output_columns: &[ColumnDef],
+        pk_cols: &[u32],
     ) -> Result<u64, ClientError> {
         let vid = if circuit.view_id == 0 {
             self.conn.alloc_table_id()?
         } else {
             circuit.view_id
         };
-        self.write_circuit_rows(schema_name, view_name, sql_text, vid, circuit, output_columns)
+        self.write_circuit_rows(schema_name, view_name, sql_text, vid, circuit, output_columns, pk_cols)
     }
 
     /// Shared serialisation path for `create_view` / `create_view_with_circuit`.
     /// Writes columns, dependencies, the three circuit tables, and the view
     /// record (which must come last — it triggers the server-side hook).
+    ///
+    /// `pk_cols` is the view's physical PK column list — the leading `k` output
+    /// slots. It is `[0]` for every synthetic-PK view (join / set-op / distinct /
+    /// minimal passthrough) and `0..k` for a plain projection that passes a
+    /// compound source PK through.
+    #[allow(clippy::too_many_arguments)]
     fn write_circuit_rows(
         &mut self,
         schema_name: &str,
@@ -464,13 +473,27 @@ impl GnitzClient {
         vid: u64,
         circuit: Circuit,
         output_columns: &[ColumnDef],
+        pk_cols: &[u32],
     ) -> Result<u64, ClientError> {
-        // The view's first column is its physical PK — it has no null bitmap,
-        // so a nullable first column is internally inconsistent.
-        if output_columns.is_empty() || output_columns[0].is_nullable {
+        // The view's PK region is the leading `k` columns (pk_cols == 0..k); it
+        // has no null bitmap, so any nullable PK column is internally
+        // inconsistent. Validate every PK slot, not just the first.
+        if output_columns.is_empty() {
             return Err(ClientError::ServerError(
-                "View Primary Key column must not be nullable".into()
+                "View must have at least one output column".into()
             ));
+        }
+        for &p in pk_cols {
+            match output_columns.get(p as usize) {
+                Some(c) if !c.is_nullable => {}
+                Some(_) => return Err(ClientError::ServerError(
+                    "View Primary Key column must not be nullable".into()
+                )),
+                None => return Err(ClientError::ServerError(format!(
+                    "View PK column index {} out of range ({} output columns)",
+                    p, output_columns.len()
+                ))),
+            }
         }
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
@@ -595,8 +618,11 @@ impl GnitzClient {
             self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, s, &nc, &mut self.schema_cache)?;
         }
 
-        // 6. View record — must be last (triggers server-side hook + circuit compilation).
-        self.push_view_record(vid, schema_id, view_name, sql_text)?;
+        // 6. View record — must be last (triggers server-side hook + circuit
+        // compilation). Encode the view PK with the shared wire packer so the
+        // engine catalog decodes it identically to a TABLE_TAB PK.
+        let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
+        self.push_view_record(vid, schema_id, view_name, sql_text, pk_packed)?;
 
         Ok(vid)
     }
@@ -622,7 +648,8 @@ impl GnitzClient {
             .str_val(&vr.name)
             .str_val(&vr.sql_definition)
             .str_val(&vr.cache_directory)
-            .u64_val(vr.created_lsn);
+            .u64_val(vr.created_lsn)
+            .u64_val(vr.pk_col_idx);
         self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
 
         Ok(())
@@ -689,8 +716,10 @@ impl GnitzClient {
         })?;
         let record = find_view_record(&view_batch, schema_id, name)?;
         let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
-        // View PK is always the U128 hash column at index 0
-        Ok((record.vid, Schema { columns, pk_cols: vec![0] }))
+        // The view PK is the persisted leading-k column list: a single synthetic
+        // hash column for join/set-op/distinct views, or the source PK passed
+        // through (0..k) for a plain projection over a compound-PK table.
+        Ok((record.vid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }))
     }
 
     // --- Private helpers (delegating to module-level functions) ---
@@ -771,6 +800,7 @@ fn find_view_record(
             sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
             cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
             created_lsn:     col_u64(&batch.columns[5], i)?,
+            pk_col_idx:      col_u64(&batch.columns[6], i)?,
         });
     }
     Err(ClientError::ServerError(format!("View '{}' not found", view_name)))
@@ -803,7 +833,9 @@ impl GnitzClient {
         Ok(())
     }
 
-    fn push_view_record(&mut self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
+    fn push_view_record(
+        &mut self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str, pk_packed: u64,
+    ) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(view_s);
         BatchAppender::new(&mut vb, view_s)
@@ -812,7 +844,8 @@ impl GnitzClient {
             .str_val(view_name)
             .str_val(sql_text)
             .str_val("")
-            .u64_val(0);
+            .u64_val(0)
+            .u64_val(pk_packed);
         self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
         Ok(())
     }

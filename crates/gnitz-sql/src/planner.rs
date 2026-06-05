@@ -73,12 +73,14 @@ fn join_pk_output_type(left_key: TypeCode, right_key: TypeCode) -> TypeCode {
     if lo == ro { lo } else { TypeCode::U128 }
 }
 
-/// Reject the CREATE VIEW shapes that emit a *real* (source / natural / join)
-/// output PK from a compound-PK source: plain projection, equijoin, and
-/// GROUP BY. Lifting those needs the view storage layer — which registers
-/// every view with a hardcoded `pk_cols = &[0]` — and the planner reindex
-/// sites that call `pk_index_single()` to persist and honor a real per-view
-/// PK column list first.
+/// Reject the CREATE VIEW shapes that emit a *real* (natural / join) output PK
+/// from a compound-PK source and still hardcode a single output PK column:
+/// equijoin and GROUP BY. Lifting each needs the planner reindex sites that
+/// call `pk_index_single()` to honor a real per-view PK column list first.
+///
+/// Plain projection no longer calls this: it passes the full source PK through
+/// to the leading output slots and persists a real `pk_cols = 0..k` via the
+/// view-registration layer.
 ///
 /// Set-operation (`UNION`/`EXCEPT`/`INTERSECT`) and `SELECT DISTINCT` views
 /// are exempt: their output PK is a synthetic single-column `U128` content
@@ -238,6 +240,25 @@ fn resolve_fk_target(
     Ok((ref_tid, ref_col_idx as u64, parent_col_type))
 }
 
+/// Reject an output column list that names the same column twice. The binder's
+/// name->index lookup silently binds to the first match, so a duplicate would
+/// bind ambiguously for any downstream query. `context` names the DDL surface
+/// for the error message (e.g. "table definition", "CREATE VIEW projection").
+fn reject_duplicate_column_names<'a>(
+    names:   impl Iterator<Item = &'a str>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.to_lowercase()) {
+            return Err(GnitzSqlError::Plan(format!(
+                "duplicate column name '{name}' in {context}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn execute_create_table(
     client:      &mut GnitzClient,
     schema_name: &str,
@@ -248,17 +269,11 @@ fn execute_create_table(
 
     let sql_cols = &create.columns;
 
-    // Reject duplicate column names up front: the PK binder's name->index
-    // lookup silently binds to the first match, so a duplicate would produce a
-    // schema with two identically-named columns that bind ambiguously later.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for col in sql_cols.iter() {
-        if !seen.insert(col.name.value.to_lowercase()) {
-            return Err(GnitzSqlError::Plan(format!(
-                "duplicate column name '{}' in table definition", col.name.value
-            )));
-        }
-    }
+    // Reject duplicate column names up front, before the PK binder runs.
+    reject_duplicate_column_names(
+        sql_cols.iter().map(|c| c.name.value.as_str()),
+        "table definition",
+    )?;
 
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
@@ -586,7 +601,6 @@ fn execute_create_view(
     let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
 
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-    reject_compound_pk_view_source(&source_schema)?;
 
     // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
@@ -601,7 +615,26 @@ fn execute_create_view(
     // Build projection column list
     let (items, out_cols) = build_projection(&select.projection, &source_schema, binder)?;
 
-    let has_computed = items.iter().any(|i| matches!(i, ProjectionItem::Computed { .. }));
+    // The pass-through generalization can now emit the same name twice (SELECT
+    // name, name; or an alias landing on the auto-prepended PK). This keys on
+    // output *names*, so a duplicate PK *value* under distinct names (SELECT id,
+    // id AS id2) is unaffected and accepted.
+    reject_duplicate_column_names(
+        out_cols.iter().map(|c| c.name.as_str()),
+        "CREATE VIEW projection",
+    )?;
+
+    // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
+    // payload slot (>= k) that is a PK PassThrough is a duplicate PK value; a
+    // Computed is a derived column. Either forces the expr-map, which trusts the
+    // planner's declared schema (node_schema = out_schema) and writes/derives
+    // each payload slot explicitly — the pure projection path would silently drop
+    // a PK value requested as a payload column.
+    let k = source_schema.pk_count();
+    let needs_expr_map = items[k..].iter().any(|item| match item {
+        ProjectionItem::Computed { .. }         => true,
+        ProjectionItem::PassThrough { src_col }  => source_schema.is_pk_col(*src_col),
+    });
 
     // Allocate view_id
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
@@ -614,26 +647,24 @@ fn execute_create_view(
         None    => inp,
     };
 
-    let out_node = if has_computed {
-        // Expr-map: compile all payload items into one ExprProgram
+    let out_node = if needs_expr_map {
+        // Emit only the payload slots (k..); the k physical PK columns are carried
+        // by commit_row and must not appear in the program. payload_idx is the
+        // dense output payload position, matching out_cols[k + payload_idx].
         let mut eb = ExprBuilder::new();
-        let mut payload_idx = 0u32;
-        for item in &items {
-            if is_pk_item(item, &source_schema) { continue; }  // PK handled by commit_row
+        for (payload_idx, item) in items[k..].iter().enumerate() {
+            let payload_idx = payload_idx as u32;
             match item {
                 ProjectionItem::PassThrough { src_col } => {
                     let tc = source_schema.columns[*src_col].type_code as u32;
                     eb.copy_col(tc, *src_col as u32, payload_idx);
                 }
                 ProjectionItem::Computed { bound_expr, .. } => {
-                    let (reg, is_float) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
-                    if is_float {
-                        // EMIT writes via append_int which stores raw bits — correct for float
-                    }
+                    let (reg, _) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
+                    // EMIT writes the raw register bits via append_int — correct for float.
                     eb.emit_col(reg, payload_idx);
                 }
             }
-            payload_idx += 1;
         }
         let program = eb.build(0);  // result_reg unused — EMIT/COPY_COL write directly
         cb.map_expr(filtered, program)
@@ -642,21 +673,26 @@ fn execute_create_view(
                ProjectionItem::PassThrough { src_col } => *src_col != i,
                _ => false,
            }) {
-        // Pure column reorder/subset — use existing projection map
+        // Pure column reorder/subset — every payload item is a non-PK
+        // pass-through, so build_map_output_schema reproduces out_cols (PK region
+        // in pk_indices() order, then non-PK cols in projection order).
         let cols: Vec<usize> = items.iter().filter_map(|i| match i {
             ProjectionItem::PassThrough { src_col } => Some(*src_col),
             _ => None,
         }).collect();
         cb.map(filtered, &cols)
     } else {
-        // Identity — no map needed
+        // Identity — PK already at front, full width, no map needed.
         filtered
     };
 
     cb.sink(out_node);
     let circuit = cb.build();
 
-    client.create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols)
+    // The view's physical PK is the leading k columns (the source PK passed
+    // through in pk_indices() order). Persist exactly that.
+    let view_pk: Vec<u32> = (0..k as u32).collect();
+    client.create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -693,24 +729,11 @@ enum ProjectionItem {
     Computed { bound_expr: BoundExpr, _out_type: TypeCode },
 }
 
-fn is_pk_item(item: &ProjectionItem, schema: &Schema) -> bool {
-    matches!(item, ProjectionItem::PassThrough { src_col } if schema.is_pk_col(*src_col))
-}
-
-
 fn build_projection(
     projection:    &[SelectItem],
     source_schema: &Schema,
     binder:        &Binder<'_>,
 ) -> Result<(Vec<ProjectionItem>, Vec<ColumnDef>), GnitzSqlError> {
-    let is_wildcard = projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
-    if is_wildcard {
-        let items: Vec<ProjectionItem> = (0..source_schema.columns.len())
-            .map(|i| ProjectionItem::PassThrough { src_col: i })
-            .collect();
-        return Ok((items, source_schema.columns.clone()));
-    }
-
     let mut items: Vec<ProjectionItem> = Vec::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
 
@@ -726,6 +749,10 @@ fn build_projection(
                 out_cols.push(source_schema.columns[col_idx].clone());
             }
             SelectItem::Wildcard(_) => {
+                // No early return: `SELECT *` expands here and then flows through
+                // the PK-placement loop below, so the source PK is pinned to slots
+                // 0..k even when it is not the table's leading column. A PK already
+                // at the front degenerates to the verbatim identity order.
                 for i in 0..source_schema.columns.len() {
                     items.push(ProjectionItem::PassThrough { src_col: i });
                     out_cols.push(source_schema.columns[i].clone());
@@ -734,8 +761,8 @@ fn build_projection(
             SelectItem::ExprWithAlias { expr, alias } => {
                 let bound = binder.bind_expr(expr, source_schema)?;
                 // A direct column reference with an alias is a PassThrough with a
-                // renamed output column, not a computation — otherwise an aliased
-                // PK column would trip the "PK cannot be computed" guard below.
+                // renamed output column, not a computation — so an aliased PK
+                // column is found by the placement scan and moved like any other.
                 if let BoundExpr::ColRef(ci) = bound {
                     items.push(ProjectionItem::PassThrough { src_col: ci });
                     let mut col = source_schema.columns[ci].clone();
@@ -752,17 +779,24 @@ fn build_projection(
                 }
             }
             SelectItem::UnnamedExpr(expr) => {
-                // Try as column reference first (already handled above for Identifier),
-                // otherwise treat as computed expression
                 let bound = binder.bind_expr(expr, source_schema)?;
-                let out_type = bound.infer_type(source_schema);
-                let col_name = format!("_expr{}", idx);
-                items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
-                out_cols.push(ColumnDef {
-                    name: col_name,
-                    type_code: out_type,
-                    is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
-                });
+                // A qualified (t.col) or parenthesized ((col)) reference binds to
+                // a bare ColRef — a verbatim pass-through, like the aliased arm.
+                // Without this, a qualified PK column would be wrapped as Computed
+                // (and formerly rejected), and a qualified non-PK column would be
+                // renamed to _exprN and needlessly recomputed.
+                if let BoundExpr::ColRef(ci) = bound {
+                    items.push(ProjectionItem::PassThrough { src_col: ci });
+                    out_cols.push(source_schema.columns[ci].clone());
+                } else {
+                    let out_type = bound.infer_type(source_schema);
+                    items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
+                    out_cols.push(ColumnDef {
+                        name: format!("_expr{}", idx),
+                        type_code: out_type,
+                        is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
+                    });
+                }
             }
             _ => return Err(GnitzSqlError::Unsupported(
                 "unsupported SELECT item in CREATE VIEW projection".to_string()
@@ -770,35 +804,35 @@ fn build_projection(
         }
     }
 
-    // Ensure PK is present (as PassThrough) and first
-    let pk = source_schema.pk_index_single();
-    let pk_pos = items.iter().position(|i| matches!(i, ProjectionItem::PassThrough { src_col } if *src_col == pk));
-
-    match pk_pos {
-        Some(0) => { /* already first, good */ }
-        Some(pos) => {
-            // Move PK to front. A swap would relocate the old column-0 to `pos`,
-            // scrambling the remaining order; remove+insert shifts the rest left.
-            let pk_item = items.remove(pos);
-            items.insert(0, pk_item);
-            let pk_col = out_cols.remove(pos);
-            out_cols.insert(0, pk_col);
-        }
-        None => {
-            // PK not present — check if any computed item would shadow it
-            let pk_computed = items.iter().any(|i| {
-                if let ProjectionItem::Computed { bound_expr, .. } = i {
-                    matches!(bound_expr, BoundExpr::ColRef(c) if *c == pk)
-                } else { false }
-            });
-            if pk_computed {
-                return Err(GnitzSqlError::Unsupported(
-                    "PK column cannot be a computed expression in CREATE VIEW".to_string()
-                ));
+    // Pass the full source PK through to the view output: every source PK column
+    // occupies output slots 0..k in pk_indices() order, matching the engine's
+    // build_map_output_schema (which copies all PK columns to the front via
+    // copy_pk_columns_into). One loop serves every PK arity — k == 1 reduces to a
+    // single-column move-to-front.
+    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
+        // First occurrence is the canonical physical-PK slot; any later duplicate
+        // (SELECT pk, pk AS x) stays in the payload region and is materialized by
+        // the expr-map COPY_COL path.
+        let cur = items.iter().position(|i|
+            matches!(i, ProjectionItem::PassThrough { src_col } if *src_col == pk));
+        match cur {
+            Some(pos) if pos == target => { /* already in place */ }
+            Some(pos) => {
+                // pos > target here (slots 0..target already hold earlier PK
+                // columns); remove+insert shifts the spanned non-PK columns right
+                // by one and preserves their relative order — a swap would not.
+                let it  = items.remove(pos);
+                let col = out_cols.remove(pos);
+                items.insert(target, it);
+                out_cols.insert(target, col);
             }
-            // Auto-prepend PK
-            items.insert(0, ProjectionItem::PassThrough { src_col: pk });
-            out_cols.insert(0, source_schema.columns[pk].clone());
+            None => {
+                // The projection omits this PK column, or references it only
+                // through a computed expression (SELECT pk + 1). Either way the
+                // view carries the full source PK verbatim: auto-prepend it.
+                items.insert(target, ProjectionItem::PassThrough { src_col: pk });
+                out_cols.insert(target, source_schema.columns[pk].clone());
+            }
         }
     }
 
@@ -884,18 +918,20 @@ fn execute_create_join_view(
     )?;
     let k = left_join_cols.len();   // == right_join_cols.len(), 1..=MAX_PK_COLUMNS
 
-    // Composite (k ≥ 2) keys build a k-wide synthetic PK region, but view storage
-    // registers every view with `pk_cols = [0]` (a single PK column), so a k ≥ 2 view
-    // cannot be described end-to-end yet. Reject here so the feature fails closed
-    // at the planner with a clean error — before `alloc_table_id` or any circuit
-    // build, so no table id is consumed and no broken view is committed. This single
-    // gate is what the view-storage successor removes; the k-generalized circuit below
-    // is already in place behind it and is exercised at the extraction level by the
-    // in-module unit tests.
+    // Composite (k ≥ 2) keys build a k-wide synthetic `_join_pk` PK region. View
+    // storage can now persist a multi-column view PK, but this join path still
+    // registers its view with `pk_cols = [0]` and does not lift the compound-PK
+    // source guard above, so a k ≥ 2 join view cannot be described end-to-end yet.
+    // Reject here so the feature fails closed at the planner with a clean error —
+    // before `alloc_table_id` or any circuit build, so no table id is consumed and
+    // no broken view is committed. Removing this gate requires registering the
+    // join view with `pk_cols = 0..k`; the k-generalized circuit below is already
+    // in place behind it and is exercised at the extraction level by the in-module
+    // unit tests.
     if k > 1 {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: composite ({k}-column) equijoin keys are not yet supported \
-             (view storage must persist a multi-column view PK first); \
+             (the join view must register a multi-column output PK first); \
              use a single equijoin key column")));
     }
 
@@ -1134,7 +1170,8 @@ fn execute_create_join_view(
     cb.sink(sink_input);
     let circuit = cb.build();
 
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols)
+    // GROUP BY views still emit a single synthetic/natural output PK at slot 0.
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &[0])
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -1703,7 +1740,8 @@ fn execute_create_group_by_view(
     cb.sink(mapped);
     let circuit = cb.build();
 
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols)
+    // JOIN views emit a single synthetic join-key output PK at slot 0.
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &[0])
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -2205,7 +2243,8 @@ fn execute_create_set_op_view(
         out_cols_final.push(col);
     }
 
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final)
+    // Set-op views emit a synthetic single-column content-hash PK at slot 0.
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final, &[0])
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -2267,7 +2306,8 @@ fn execute_create_distinct_view(
     });
     out_cols.extend(proj_cols);
 
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols)
+    // DISTINCT views emit a synthetic single-column content-hash PK at slot 0.
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &[0])
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })

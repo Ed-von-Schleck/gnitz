@@ -775,8 +775,9 @@ pub unsafe extern "C" fn gnitz_create_view_with_circuit(
     let s = check_ptr!(output_schema, 0);
     if circuit.is_null() { set_error("null circuit"); return 0; }
     let graph = unsafe { Box::from_raw(circuit) }.0;
+    // The C API's hand-built circuits emit a single output PK at slot 0.
     match c.0.create_view_with_circuit(cstr(schema_name), cstr(view_name), "",
-                                        graph, &s.0.columns) {
+                                        graph, &s.0.columns, &[0]) {
         Ok(id) => id, Err(e) => { set_error(e); 0 }
     }
 }

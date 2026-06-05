@@ -78,6 +78,10 @@ pub fn view_tab_schema() -> &'static Schema {
             ColumnDef { name: "sql_definition".into(),   type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "cache_directory".into(),  type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ColumnDef { name: "created_lsn".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            // Packed view-PK column list (gnitz_wire::pack_pk_cols). A bare `0`
+            // (flag bit clear) decodes as the single-column PK `[0]`, so existing
+            // single-PK views and a freshly-bootstrapped row read back unchanged.
+            ColumnDef { name: "pk_col_idx".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_cols: vec![0],
     })

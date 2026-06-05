@@ -247,7 +247,8 @@ def test_compound_pk_mixed_inline_and_table_level_rejected(client):
 
 
 # ---------------------------------------------------------------------------
-# View / Index / FK against compound-PK source rejected
+# Views over a compound-PK source: a plain projection passes the full source PK
+# through and is accepted; GROUP BY / Index / FK are still rejected.
 # ---------------------------------------------------------------------------
 
 
@@ -259,15 +260,36 @@ def _make_compound_table(client, sn, name="src"):
     )
 
 
-def test_view_over_compound_pk_rejected(client):
+def test_view_over_compound_pk_simple_select_accepted(client):
+    """A plain `SELECT *` projection carries the compound source PK (a, b) through
+    to the view's leading output slots and round-trips data end to end."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
         _make_compound_table(client, sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql("CREATE VIEW v AS SELECT * FROM src", schema_name=sn)
-        assert "compound" in str(exc.value).lower()
+        client.execute_sql("CREATE VIEW v AS SELECT * FROM src", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql(
+            "INSERT INTO src (a, b, payload) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)",
+            schema_name=sn,
+        )
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted((r["a"], r["b"], r["payload"]) for r in rows) == [
+            (1, 1, 100), (1, 2, 200), (2, 1, 300),
+        ]
+
+        # A row sharing its first PK column with another is retracted distinctly.
+        client.execute_sql("DELETE FROM src WHERE a = 1 AND b = 1", schema_name=sn)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert sorted((r["a"], r["b"], r["payload"]) for r in rows) == [
+            (1, 2, 200), (2, 1, 300),
+        ]
     finally:
+        try:
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+        except Exception:
+            pass
         _cleanup(client, sn, "src")
 
 

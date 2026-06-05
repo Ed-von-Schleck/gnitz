@@ -627,6 +627,20 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
+        // Front-line agreement check: the Pk buffer variant must match the
+        // schema's PK arity. `empty_for_schema` always picks `Bytes` ⟺
+        // pk_count() >= 2 (a single PK column is <= 16 bytes), so this never
+        // fires on correct code — it is a cheap tripwire for exactly the
+        // planner/engine schema disagreement a compound-PK view could introduce.
+        // Without it a scalar/compound mismatch passes the stride check below
+        // and only surfaces as a deep panic in sort-merge/consolidation.
+        match &self.pks {
+            PkColumn::Bytes { .. } if schema.pk_count() < 2 =>
+                return Err("batch carries a wide PK buffer but schema PK is scalar".into()),
+            PkColumn::U64s(_) | PkColumn::U128s(_) if schema.pk_count() >= 2 =>
+                return Err("batch carries a scalar PK but schema PK is compound".into()),
+            _ => {}
+        }
         if let PkColumn::Bytes { stride, buf } = &self.pks {
             if *stride == 0 {
                 return Err("wide PK stride must be non-zero".into());

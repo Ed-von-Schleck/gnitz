@@ -434,7 +434,7 @@ fn test_create_view_with_nullable_first_column_rejected() {
         ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let err = client.create_view_with_circuit(&sn, "bad_view", "", circuit, &bad_out)
+    let err = client.create_view_with_circuit(&sn, "bad_view", "", circuit, &bad_out, &[0])
         .unwrap_err();
     let msg = format!("{:?}", err);
     assert!(msg.to_lowercase().contains("nullable"), "expected nullable-PK error, got: {}", msg);
@@ -451,16 +451,19 @@ fn create_compound_pk_table(client: &mut GnitzClient, sn: &str, table: &str) {
 }
 
 #[test]
-fn test_view_over_compound_pk_simple_select_rejected() {
+fn test_view_over_compound_pk_simple_select_accepted() {
+    // A plain projection passes the full source PK through to the leading output
+    // slots; the view carries the source's compound PK. (GROUP BY and JOIN over a
+    // compound-PK source are still rejected — see the tests below.)
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "cv_src");
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE VIEW cv_v AS SELECT * FROM cv_src"));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE VIEW cv_v AS SELECT * FROM cv_src").unwrap();
     }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "cv_v").unwrap();
+    assert_eq!(s.pk_indices(), &[0, 1], "view inherits the compound source PK");
 }
 
 #[test]

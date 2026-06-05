@@ -121,6 +121,10 @@ pub(super) const VIEWTAB_COL_NAME: usize = 2;
 pub(super) const VIEWTAB_COL_SQL_DEFINITION: usize = 3;
 pub(super) const VIEWTAB_COL_CACHE_DIRECTORY: usize = 4;
 pub(super) const VIEWTAB_COL_CREATED_LSN: usize = 5;
+pub(super) const VIEWTAB_COL_PK_COL_IDX: usize = 6;
+// Payload-column index (PK column 0 excluded) for the readers in
+// `apply_pk_col_of` / `hook_view_register`, mirroring the IDXTAB_PAY_* pattern.
+pub(crate) const VIEWTAB_PAY_PK_COL_IDX: usize = VIEWTAB_COL_PK_COL_IDX - 1;
 
 pub(super) const COLTAB_COL_OWNER_ID: usize = 1;
 pub(super) const COLTAB_COL_OWNER_KIND: usize = 2;
@@ -212,7 +216,9 @@ pub(super) const fn table_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), str_col(), str_col(), u64_col(), u64_col(), u64_col()], 0)
 }
 pub(super) const fn view_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), u64_col(), str_col(), str_col(), str_col(), u64_col()], 0)
+    // Trailing pk_col_idx (U64) carries the packed view-PK column list, mirroring
+    // TABLE_TAB. A bare `0` decodes as the single-column PK `[0]`.
+    make_schema(&[u64_col(), u64_col(), str_col(), str_col(), str_col(), u64_col(), u64_col()], 0)
 }
 pub(super) const fn col_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), u64_col(), u64_col(), u64_col()], 0)
