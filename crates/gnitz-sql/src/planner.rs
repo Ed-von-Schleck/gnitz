@@ -60,41 +60,6 @@ fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
-/// Catalog `_join_pk` type for an equijoin on the given (left, right) key types.
-/// Both reindex sides build `_join_pk` independently from their own key column
-/// via `TypeCode::reindex_output_type` (the engine derives the same per-side
-/// width), so the single persisted stride must agree with BOTH: narrow only when
-/// the two key types map to the same output width; otherwise keep the wide U128
-/// key so a mixed-width join fails loudly on the stride mismatch instead of
-/// silently dropping join rows.
-fn join_pk_output_type(left_key: TypeCode, right_key: TypeCode) -> TypeCode {
-    let lo = left_key.reindex_output_type();
-    let ro = right_key.reindex_output_type();
-    if lo == ro { lo } else { TypeCode::U128 }
-}
-
-/// Reject the CREATE VIEW shapes that emit a *real* (natural / join) output PK
-/// from a compound-PK source and still hardcode a single output PK column:
-/// equijoin and GROUP BY. Lifting each needs the planner reindex sites that
-/// call `pk_index_single()` to honor a real per-view PK column list first.
-///
-/// Plain projection no longer calls this: it passes the full source PK through
-/// to the leading output slots and persists a real `pk_cols = 0..k` via the
-/// view-registration layer.
-///
-/// Set-operation (`UNION`/`EXCEPT`/`INTERSECT`) and `SELECT DISTINCT` views
-/// are exempt: their output PK is a synthetic single-column `U128` content
-/// hash (`_set_pk` / `_distinct_pk`) whose width is independent of the source
-/// PK's arity, so they need no storage migration and never call this guard.
-fn reject_compound_pk_view_source(schema: &Schema) -> Result<(), GnitzSqlError> {
-    if schema.pk_count() >= 2 {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW over a compound-PK table is not yet supported".into()
-        ));
-    }
-    Ok(())
-}
-
 /// Resolve a REFERENCES clause to (fk_table_id, ref_col_idx, parent_col_type).
 /// The referenced column is a legal target iff it is the parent's lone PK
 /// column or it carries its own active UNIQUE index. Validates that
@@ -675,8 +640,13 @@ fn execute_create_view(
            }) {
         // Pure column reorder/subset — every payload item is a non-PK
         // pass-through, so build_map_output_schema reproduces out_cols (PK region
-        // in pk_indices() order, then non-PK cols in projection order).
-        let cols: Vec<usize> = items.iter().filter_map(|i| match i {
+        // in pk_indices() order, then non-PK cols in projection order). Pass only
+        // the payload items (`items[k..]`): the k PK slots are inherited verbatim
+        // by execute_map's bulk PK copy / build_map_output_schema's PK prepend.
+        // Including them would emit one ColMove per PK index with dst_payload set
+        // to the enumeration index, shifting every payload destination out of range
+        // (single-PK: payload OOB; compound-PK: SENTINEL stride past num_payload).
+        let cols: Vec<usize> = items[k..].iter().filter_map(|i| match i {
             ProjectionItem::PassThrough { src_col } => Some(*src_col),
             _ => None,
         }).collect();
@@ -893,9 +863,7 @@ fn execute_create_join_view(
 
     // Resolve both tables
     let (left_tid, left_schema) = binder.resolve(client, &left_name)?;
-    reject_compound_pk_view_source(&left_schema)?;
     let (right_tid, right_schema) = binder.resolve(client, &right_name)?;
-    reject_compound_pk_view_source(&right_schema)?;
 
     // The 2-term DBSP join formula assumes the left and right input deltas are
     // never simultaneously active. A self-join feeds the same delta to both
@@ -1059,20 +1027,20 @@ fn execute_create_join_view(
     // both sides derive it from `TypeCode::reindex_output_type` (gnitz-wire), so every
     // cross-process consumer re-derives the same stride from this single persisted
     // catalog value. validate_join_key_pair guarantees both sides of pair i reindex to
-    // the same output type, so join_pk_output_type always yields that common type.
+    // the same output type, so the left key's reindex_output_type is that common type.
     //
     // The first key column keeps the name `_join_pk` at k = 1 (the catalog name is not
     // referenced by any code, but preserving it keeps the shippable single-key view
     // byte-identical); composite keys use `_join_pk_{i}`.
     let mut out_cols: Vec<ColumnDef> = Vec::new();
-    for i in 0..k {
+    for (i, &lc) in left_join_cols.iter().enumerate() {
         let name = if k == 1 { "_join_pk".to_string() } else { format!("_join_pk_{i}") };
+        // validate_join_key_pair already errored unless both sides of pair i
+        // reindex to the same output type, so the left key's pre-validated
+        // reindex output type is the single persisted stride for both sides.
         out_cols.push(ColumnDef {
             name,
-            type_code: join_pk_output_type(
-                left_schema.columns[left_join_cols[i]].type_code,
-                right_schema.columns[right_join_cols[i]].type_code,
-            ),
+            type_code: left_schema.columns[lc].type_code.reindex_output_type(),
             is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
@@ -1180,6 +1148,29 @@ fn multi_null_filter_prog(
     schema:    &Schema,
     want_null: bool,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
+    // Caller invariant: cols is non-empty (at least one join key column) AND at
+    // least one entry is nullable (the outer guard in execute_create_join_view
+    // ensures both). Guard here so future callers fail loudly rather than
+    // panicking at cols[0].
+    if cols.is_empty() {
+        return Err(GnitzSqlError::Plan(
+            "multi_null_filter_prog: column list cannot be empty".into(),
+        ));
+    }
+    // Only nullable columns can ever satisfy IsNull or fail IsNotNull, so drop the
+    // NOT NULL columns to elide tautological (want_null=false) / contradictory
+    // (want_null=true) filter instructions. The caller (execute_create_join_view)
+    // only reaches this with ≥ 1 nullable key column, so `nullable` is non-empty on
+    // every real path; the `is_empty` fallback to the unfiltered `cols` still
+    // degrades correctly should that ever change — with every key NOT NULL,
+    // `c IS NOT NULL` is a tautology (keep all rows) and `c IS NULL` a contradiction
+    // (drop all), exactly right when no key can be NULL.
+    let nullable: Vec<usize> = cols.iter()
+        .copied()
+        .filter(|&c| schema.columns[c].is_nullable)
+        .collect();
+    let cols = if nullable.is_empty() { cols } else { &nullable[..] };
+
     let leaf = |c: usize| if want_null { BoundExpr::IsNull(c) } else { BoundExpr::IsNotNull(c) };
     let op = if want_null { BinOp::Or } else { BinOp::And };
     let mut expr = leaf(cols[0]);
@@ -1671,7 +1662,9 @@ fn execute_create_group_by_view(
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
     //    Reduce output: [pk, (group_cols...), agg0, agg1, ...]
     //    MAP inherits PK from input; ExprProgram writes payload columns only.
-    //    Output:        [pk(inherited), named_group_col0, ..., named_agg0, ...]
+    //    Natural-PK group cols are part of that inherited PK region — the alias
+    //    renames the PK slot in place (no payload copy). Synthetic-PK group cols
+    //    are written to payload. Output: [pk(inherited, renamed), …payload…].
     let mut post_map_eb = ExprBuilder::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     let mut payload_idx: u32 = 0;
@@ -1684,6 +1677,11 @@ fn execute_create_group_by_view(
         reduce_schema.columns[..reduce_schema.pk_cols.len()].iter().cloned()
     );
 
+    // Tracks which PK slots a natural-PK group col has already renamed in place,
+    // so a group column selected twice with a different alias falls back to a
+    // payload COPY_COL copy rather than silently overwriting the first alias.
+    let mut pk_renamed = vec![false; reduce_schema.pk_cols.len()];
+
     for si in &select_items {
         match si {
             GroupBySelectItem::GroupCol { src_col, name } => {
@@ -1694,18 +1692,40 @@ fn execute_create_group_by_view(
                     *src_col, group_set_eq_pk, single_col_natural_pk,
                     &source_schema, &group_col_indices);
                 let tc = reduce_schema.columns[reduce_col].type_code;
-                post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
-                out_cols.push(ColumnDef {
-                    name: name.clone(),
-                    type_code: tc,
-                    // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
-                    // the source col is non-nullable. Synthetic-PK path: propagate
-                    // source nullability — nothing forces NOT NULL.
-                    is_nullable: source_schema.columns[*src_col].is_nullable,
-                    fk_table_id: 0,
-                    fk_col_idx:  0,
-                });
-                payload_idx += 1;
+                // On both natural-PK paths `group_col_reduce_pos` returns a position
+                // within the dense PK region, so on the `is_natural` branch
+                // `reduce_col` always indexes a real PK slot in `out_cols` /
+                // `pk_renamed` (asserted below). `&&` short-circuits, so the index
+                // is only evaluated once `is_natural` holds — the synthetic path's
+                // larger `reduce_col` never reaches it.
+                let is_natural = group_set_eq_pk || single_col_natural_pk;
+                if is_natural && !pk_renamed[reduce_col] {
+                    // First projection of this group column: rename the PK slot
+                    // in-place. The MAP inherits the PK region verbatim — no
+                    // COPY_COL needed, and the column must not be re-pushed to
+                    // out_cols (it is already there from the PK-region extend).
+                    debug_assert!(
+                        reduce_col < reduce_schema.pk_cols.len(),
+                        "GROUP BY natural-PK rename: reduce_col {reduce_col} is not a PK slot \
+                         (pk_cols.len() = {})", reduce_schema.pk_cols.len(),
+                    );
+                    out_cols[reduce_col].name = name.clone();
+                    pk_renamed[reduce_col] = true;
+                } else {
+                    // Synthetic-PK path, or second projection of the same group column.
+                    post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
+                    out_cols.push(ColumnDef {
+                        name: name.clone(),
+                        type_code: tc,
+                        // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
+                        // the source col is non-nullable. Synthetic-PK path: propagate
+                        // source nullability — nothing forces NOT NULL.
+                        is_nullable: source_schema.columns[*src_col].is_nullable,
+                        fk_table_id: 0,
+                        fk_col_idx:  0,
+                    });
+                    payload_idx += 1;
+                }
             }
             GroupBySelectItem::Aggregate { agg_idx } => {
                 let m = &agg_mappings[*agg_idx];
@@ -1783,6 +1803,14 @@ fn execute_create_group_by_view(
     // 8. Sink
     cb.sink(mapped);
     let circuit = cb.build();
+
+    // A SELECT that names the same group column twice (e.g. `k, k AS k2` is fine,
+    // but `k, k` collides) must be caught cleanly rather than registering a view
+    // with duplicate column names.
+    reject_duplicate_column_names(
+        out_cols.iter().map(|c| c.name.as_str()),
+        "GROUP BY view",
+    )?;
 
     // The view's physical PK is the reduce output's PK region: the full source
     // PK (source-PK order) for a compound natural PK, else the lone leading
@@ -2369,26 +2397,6 @@ fn execute_create_distinct_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `join_pk_output_type` reconciles the two join sides: same narrow type →
-    /// narrow `_join_pk`; wide/string/float keys stay U128; mixed-width keys fall
-    /// back to the wide U128 key (the fail-loud guard against silent dropped join
-    /// rows). The per-side narrow-vs-U128 policy itself lives in gnitz-wire
-    /// (`TypeCode::reindex_output_type`) and is covered by its own test there.
-    #[test]
-    fn join_pk_output_type_reconciles_both_sides() {
-        // Same narrow type both sides → narrow (the behavioral win).
-        assert_eq!(join_pk_output_type(TypeCode::U64, TypeCode::U64), TypeCode::U64);
-        assert_eq!(join_pk_output_type(TypeCode::I64, TypeCode::I64), TypeCode::I64);
-        assert_eq!(join_pk_output_type(TypeCode::U32, TypeCode::U32), TypeCode::U32);
-        // Wide / string / float keys → U128.
-        assert_eq!(join_pk_output_type(TypeCode::String, TypeCode::String), TypeCode::U128);
-        assert_eq!(join_pk_output_type(TypeCode::U128, TypeCode::UUID), TypeCode::U128);
-        // Mixed widths / mixed sign → keep wide so the engine fails loudly rather
-        // than silently dropping rows on a stride mismatch.
-        assert_eq!(join_pk_output_type(TypeCode::U32, TypeCode::U64), TypeCode::U128);
-        assert_eq!(join_pk_output_type(TypeCode::U64, TypeCode::I64), TypeCode::U128);
-    }
 
     // ── Multi-column equijoin key extraction / validation ────────────────────
     //

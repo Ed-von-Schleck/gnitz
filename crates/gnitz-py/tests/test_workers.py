@@ -550,7 +550,9 @@ def test_copartitioned_view_no_exchange(client):
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
-        rows = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        # The group column `id` coincides with the source PK, so it is the view's
+        # natural PK column (read by name), not a duplicated payload column.
+        rows = {r["id"]: r["total"] for r in client.scan(vid) if r.weight > 0}
         for i in range(1, n + 1):
             assert rows.get(i) == i * 10, \
                 f"id={i}: expected {i * 10}, got {rows.get(i)}"

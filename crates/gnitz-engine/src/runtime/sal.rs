@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::sys as ipc_sys;
 use crate::sys;
-use crate::schema::{SchemaDescriptor, type_code};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, DirectWriter, carve_writer_slices, scatter_copy};
 use crate::util::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
 use crate::runtime::wire::{
@@ -209,13 +209,16 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 // Scatter-to-wire helpers
 // ---------------------------------------------------------------------------
 
-/// True when every column has a fixed-width 8-aligned stride and no STRING
-/// columns. Batches satisfying this can be scatter-encoded directly into SAL
-/// slots without intermediate per-worker Batch allocations.
+/// True when every column has a fixed-width 8-aligned stride and no German-string
+/// (STRING or BLOB) columns. Batches satisfying this can be scatter-encoded
+/// directly into SAL slots without intermediate per-worker Batch allocations.
+/// BLOB shares STRING's 16-byte struct with out-of-line heap bytes, so it must
+/// be excluded too — the fast path hands `scatter_copy` a 0-cap blob arena and
+/// asserts no blob bytes are written.
 pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     (0..schema.num_columns()).all(|ci| {
         let c = &schema.columns[ci];
-        c.type_code != type_code::STRING && c.size().is_multiple_of(8)
+        !gnitz_wire::is_german_string(c.type_code) && c.size().is_multiple_of(8)
     })
 }
 
@@ -483,7 +486,7 @@ pub(crate) unsafe fn sal_read_group_header(
 }
 
 /// Write a WAL data block for `count` rows into `data_slot` by scattering
-/// `indices` from `batch`. Assumes `schema_wire_safe` — no STRING columns,
+/// `indices` from `batch`. Assumes `schema_wire_safe` — no German-string columns,
 /// all strides are multiples of 8, so all align8 calls are no-ops.
 fn write_scattered_data_block(
     batch: &crate::storage::MemBatch<'_>,
@@ -534,7 +537,7 @@ fn write_scattered_data_block(
     // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
     let (_, rest) = data_slot.split_at_mut(header_dir_size);
     let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
-    // No STRING columns on this fast path; DirectWriter still wants a blob
+    // No German-string columns on this fast path; DirectWriter still wants a blob
     // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
     let mut empty_blob: Vec<u8> = Vec::new();
     let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, *schema, 0);
@@ -679,7 +682,7 @@ impl SalWriter {
     /// Scatter rows from `input_batch` directly into per-worker SAL slots using
     /// pre-computed `worker_indices`. Eliminates the two-copy path
     /// (scatter→intermediate Batch, then Batch→SAL slot) for schemas where
-    /// every column has a fixed-width 8-aligned stride and no STRING columns.
+    /// every column has a fixed-width 8-aligned stride and no German-string columns.
     ///
     /// Falls back to `write_group_direct` (two-copy) for other schemas.
     /// Does NOT sync/signal. `lsn` is supplied by the caller.

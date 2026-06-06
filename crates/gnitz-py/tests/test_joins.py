@@ -505,3 +505,148 @@ class TestJoins:
             assert got == expected, "multi-worker composite join must match a full recompute"
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    def test_inner_join_compound_pk_source_dml(self, client):
+        """Equijoin over compound-PK source tables, driven by INSERT/UPDATE/DELETE.
+        Both sources have `PRIMARY KEY (k1, k2)` / `(j1, j2)`; the join key is a
+        composite `(x, y)` drawn from non-PK columns. The compound source PK rides
+        as payload (k1, k2). After every DML tick the incremental view must equal a
+        full recompute. Under `make e2e` this runs at GNITZ_WORKERS=4, so the
+        compound source PK and the (x, y) join key are exchange-routed independently."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL, av BIGINT NOT NULL, "
+                "PRIMARY KEY (k1, k2))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (j1 BIGINT NOT NULL, j2 BIGINT NOT NULL, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL, bv BIGINT NOT NULL, "
+                "PRIMARY KEY (j1, j2))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.k1, a.k2, a.av, b.bv "
+                "FROM a JOIN b ON a.x = b.x AND a.y = b.y",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.pk_indices == [0, 1], "k=2 join PK is the two _join_pk columns"
+
+            # Mirror table state in Python; recompute the join after each tick.
+            a_state = {}  # (k1, k2) -> (x, y, av)
+            b_state = {}  # (j1, j2) -> (x, y, bv)
+
+            def expected():
+                return sorted(
+                    (k1, k2, av, bv)
+                    for (k1, k2), (ax, ay, av) in a_state.items()
+                    for (_j1, _j2), (bx, by, bv) in b_state.items()
+                    if ax == bx and ay == by
+                )
+
+            def got():
+                return sorted(
+                    (r["k1"], r["k2"], r["av"], r["bv"]) for r in _scan_dicts(client, vid)
+                )
+
+            # Tick 1: initial inserts.
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 1, 10, 100, 1), (2, 2, 20, 200, 2), (3, 3, 30, 300, 3)",
+                schema_name=sn,
+            )
+            a_state.update({(1, 1): (10, 100, 1), (2, 2): (20, 200, 2), (3, 3): (30, 300, 3)})
+            client.execute_sql(
+                "INSERT INTO b VALUES (5, 5, 10, 100, 11), (6, 6, 20, 999, 22), (7, 7, 30, 300, 33)",
+                schema_name=sn,
+            )
+            b_state.update({(5, 5): (10, 100, 11), (6, 6): (20, 999, 22), (7, 7): (30, 300, 33)})
+            assert got() == expected(), "initial INSERT join"
+
+            # Tick 2: UPDATE a payload column (av) — retract+insert, same key.
+            client.execute_sql("UPDATE a SET av = 111 WHERE k1 = 1 AND k2 = 1", schema_name=sn)
+            a_state[(1, 1)] = (10, 100, 111)
+            assert got() == expected(), "UPDATE a payload"
+
+            # Tick 3: UPDATE b's join key (y) so the (20, *) pair now matches.
+            client.execute_sql("UPDATE b SET y = 200 WHERE j1 = 6 AND j2 = 6", schema_name=sn)
+            b_state[(6, 6)] = (20, 200, 22)
+            assert got() == expected(), "UPDATE b join key completes a pair"
+
+            # Tick 4: DELETE a source row.
+            client.execute_sql("DELETE FROM a WHERE k1 = 3 AND k2 = 3", schema_name=sn)
+            del a_state[(3, 3)]
+            assert got() == expected(), "DELETE a row drops its join output"
+
+            # Tick 5: DELETE a b source row.
+            client.execute_sql("DELETE FROM b WHERE j1 = 5 AND j2 = 5", schema_name=sn)
+            del b_state[(5, 5)]
+            assert got() == expected(), "DELETE b row drops its join output"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    def test_inner_join_wide_compound_pk_source(self, client):
+        """Equijoin over a wide (3-column, 24-byte) compound source PK. Several
+        source rows share the first 16 OPK bytes (`(k1, k2)`) and differ only past
+        byte 16 (`k3`); they must survive ingest/scan as distinct and join
+        independently. Under `make e2e` (GNITZ_WORKERS=4) this exercises
+        multi-worker exchange of the wide source PK end-to-end."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, k3 BIGINT NOT NULL, "
+                "fk BIGINT NOT NULL, av BIGINT NOT NULL, PRIMARY KEY (k1, k2, k3))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.k1, a.k2, a.k3, a.av, b.bv "
+                "FROM a JOIN b ON a.fk = b.fk",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.pk_indices == [0], "single-key join PK is the lone _join_pk"
+
+            a_state = {}  # (k1, k2, k3) -> (fk, av)
+            b_state = {}  # id -> (fk, bv)
+
+            def expected():
+                return sorted(
+                    (k1, k2, k3, av, bv)
+                    for (k1, k2, k3), (afk, av) in a_state.items()
+                    for _id, (bfk, bv) in b_state.items()
+                    if afk == bfk
+                )
+
+            def got():
+                return sorted(
+                    (r["k1"], r["k2"], r["k3"], r["av"], r["bv"]) for r in _scan_dicts(client, vid)
+                )
+
+            # (1,1,1), (1,1,2), (1,1,3) share the first 16 OPK bytes; differ past byte 16.
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 1, 1, 7, 11), (1, 1, 2, 7, 22), (1, 1, 3, 9, 33)",
+                schema_name=sn,
+            )
+            a_state.update({(1, 1, 1): (7, 11), (1, 1, 2): (7, 22), (1, 1, 3): (9, 33)})
+            client.execute_sql("INSERT INTO b VALUES (1, 7, 70), (2, 9, 90)", schema_name=sn)
+            b_state.update({1: (7, 70), 2: (9, 90)})
+            assert got() == expected(), "wide compound source PK: rows sharing 16-byte prefix join distinctly"
+
+            # UPDATE one tie-break sibling's payload, DELETE another.
+            client.execute_sql("UPDATE a SET av = 222 WHERE k1 = 1 AND k2 = 1 AND k3 = 2", schema_name=sn)
+            a_state[(1, 1, 2)] = (7, 222)
+            assert got() == expected(), "UPDATE one tie-break sibling"
+
+            client.execute_sql("DELETE FROM a WHERE k1 = 1 AND k2 = 1 AND k3 = 1", schema_name=sn)
+            del a_state[(1, 1, 1)]
+            assert got() == expected(), "DELETE one tie-break sibling leaves the others intact"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])

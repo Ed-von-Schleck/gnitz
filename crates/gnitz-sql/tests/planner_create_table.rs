@@ -453,9 +453,9 @@ fn create_compound_pk_table(client: &mut GnitzClient, sn: &str, table: &str) {
 #[test]
 fn test_view_over_compound_pk_simple_select_accepted() {
     // A plain projection passes the full source PK through to the leading output
-    // slots; the view carries the source's compound PK. (GROUP BY over a
-    // compound-PK source is accepted too — see below; JOIN over a compound-PK
-    // *source* is still rejected — see the test further down.)
+    // slots; the view carries the source's compound PK. (GROUP BY and equijoin
+    // over a compound-PK source are accepted too — see the tests further down;
+    // a join view's output PK is the synthetic _join_pk, not the source PK.)
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "cv_src");
@@ -523,23 +523,23 @@ fn test_view_over_compound_pk_too_wide_rejected() {
 }
 
 #[test]
-fn test_view_over_compound_pk_join_rejected() {
+fn test_view_over_compound_pk_join_source_accepted() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "cv_jl");
-    // The other side single-PK so the rejection is unambiguously about cv_jl.
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE cv_jr (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
+        // Same-type (U64) key so the equijoin is valid. The compound source PK
+        // rides through the reindex as payload; the view's output PK is the lone
+        // synthetic _join_pk, independent of the source PK's arity.
+        p.execute("CREATE TABLE cv_jr (id BIGINT UNSIGNED PRIMARY KEY, v BIGINT)").unwrap();
+        p.execute(
+            "CREATE VIEW cv_j AS SELECT cv_jl.a, cv_jr.v FROM cv_jl JOIN cv_jr ON cv_jl.a = cv_jr.id"
+        ).unwrap();
     }
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE VIEW cv_j AS SELECT cv_jl.a FROM cv_jl JOIN cv_jr ON cv_jl.a = cv_jr.id"
-    ));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "cv_j").unwrap();
+    assert_eq!(s.pk_indices(), &[0],
+        "join view PK is the lone synthetic _join_pk, not the source compound PK");
 }
 
 #[test]

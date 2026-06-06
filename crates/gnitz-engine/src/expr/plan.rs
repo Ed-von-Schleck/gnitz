@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 
-use crate::schema::{type_code, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use super::program::{self as expr, ExprProgram, OutputColKind};
 use crate::storage::{Batch, MemBatch};
 use super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
@@ -67,8 +67,17 @@ impl ScalarFuncKind {
 /// Copy a single column from `in_batch` to `output`. `cm.src_pi` holds the
 /// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
 /// the dense payload index in the input batch. `cm.stride` is precomputed at
-/// construction time — the byte width of the destination column.
-fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
+/// construction time — the byte width of the destination column. `blob_cache` is
+/// shared across all ColMoves of one `execute_map` (and pooled across ticks via
+/// `BlobCacheGuard`) so identical STRING/BLOB heap spans are appended to the
+/// output blob at most once. It is `None` only when the output schema has no
+/// German-string column, in which case the STRING/BLOB branch is never reached.
+fn copy_column(
+    in_batch: &Batch,
+    output: &mut Batch,
+    cm: &ColMove,
+    mut blob_cache: Option<&mut crate::schema::BlobCache>,
+) {
     let n = in_batch.count;
     let stride = cm.stride as usize;
 
@@ -78,9 +87,9 @@ fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
         // for signed (sign-flipped) and big-endian-encoded columns.
         let dst = output.col_data_mut(cm.dst_payload);
         let pk_off = cm.pk_byte_offset as usize;
+        let mut le = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..n {
             let opk = in_batch.get_pk_bytes(row);
-            let mut le = [0u8; crate::schema::MAX_PK_BYTES];
             gnitz_wire::decode_pk_column(
                 &opk[pk_off..pk_off + stride],
                 cm.type_code,
@@ -88,14 +97,19 @@ fn copy_column(in_batch: &Batch, output: &mut Batch, cm: &ColMove) {
             );
             dst[row * stride..row * stride + stride].copy_from_slice(&le[..stride]);
         }
-    } else if cm.type_code == type_code::STRING {
+    } else if gnitz_wire::is_german_string(cm.type_code) {
+        // STRING and BLOB share the 16-byte German-string struct: a long
+        // (out-of-line) value's heap-offset field points into the source batch's
+        // blob region, so the bytes must be relocated into the output blob or the
+        // offsets dangle once the source batch is dropped. The shared BlobCache
+        // deduplicates identical spans across all columns/rows of this MAP.
         let in_pi = cm.src_pi as usize;
         let src_col = in_batch.col_data(in_pi);
-        output.blob.reserve(in_batch.blob.len());
         for row in 0..n {
             let off = row * stride;
             let cell = crate::schema::relocate_german_string_vec(
-                &src_col[off..off + stride], &in_batch.blob, &mut output.blob, None,
+                &src_col[off..off + stride], &in_batch.blob, &mut output.blob,
+                blob_cache.as_deref_mut(),
             );
             output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
         }
@@ -183,9 +197,10 @@ struct ColMove {
     /// the OPK bytes of a PK source column).
     type_code: u8,
     /// Precomputed byte width of the destination column. For non-PK copies
-    /// this equals the input column's stride (same type). For PK→payload
-    /// copies, the destination may be wider (e.g. U64→U128 reindex), so the
-    /// stride must come from the *output* schema.
+    /// this equals the input column's stride (same type). For PK→payload copies
+    /// the destination carries the same type as the source PK column
+    /// (`build_reindex_program` emits the source type code), so the stride —
+    /// taken from the *output* schema — equals the source OPK column's width.
     stride: u8,
     /// Byte offset of this column within the OPK PK region. Valid only when
     /// `src_pi == PAYLOAD_MAPPING_PK_SENTINEL`; 0 for single-column PKs.
@@ -233,10 +248,14 @@ fn filter_only(filter: FilterKernel) -> Plan {
     }
 }
 
-/// Stride for a single ColMove. `src_pi == SENTINEL` is the PK→payload case,
-/// where the destination column's width drives the stride (and may differ
-/// from the source — e.g. U64→U128). For non-PK copies, source and
-/// destination strides are equal (the column is being moved, not reshaped).
+/// Stride for a single ColMove. For non-PK copies (`src_pi != SENTINEL`),
+/// source and destination strides are equal — the column is moved, not
+/// reshaped. For PK→payload copies (`src_pi == SENTINEL`), the destination
+/// payload column must carry the same type as the source PK column:
+/// `build_reindex_program` emits the source type code and `reindex_output_schema`
+/// places the same type in the output payload, so the stride from `out_schema`
+/// is always identical to the source OPK column's byte width. Reading more
+/// bytes than the OPK column occupies would alias the next PK column.
 fn col_move_stride(
     src_pi: u8,
     dst_payload: usize,
@@ -527,9 +546,15 @@ impl Plan {
         }
         output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 
-        // Column moves
+        // Column moves. The dedup cache is drawn from the thread-local pool only
+        // when the output schema has a German-string column (else `get_mut()` is
+        // None and the STRING/BLOB copy path is never taken). Reserve the output
+        // blob once: dedup keeps it ≤ input blob size, so a single upfront reserve
+        // covers every STRING/BLOB ColMove and avoids per-column reallocation.
+        let mut blob_cache = crate::storage::BlobCacheGuard::acquire(out_schema, n);
+        output.blob.reserve(in_batch.blob.len());
         for cm in &self.col_moves {
-            copy_column(in_batch, &mut output, cm);
+            copy_column(in_batch, &mut output, cm, blob_cache.get_mut());
         }
 
         // EMIT_NULL columns — already zero-filled by with_schema

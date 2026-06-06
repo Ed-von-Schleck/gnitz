@@ -686,7 +686,11 @@ fn opt_fold_reduce_map(
         };
         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
         let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
-        if prog.is_sequential_copy_projection() {
+        // Skip folding any clean block copy regardless of offset; the
+        // authoritative identity-MAP elision below (with the schema-checked PK
+        // offset) handles it. No register schema exists in this early pass, so we
+        // cannot supply the PK count here.
+        if prog.sequential_copy_base().is_some() {
             continue;
         }
         if prog.code.len() <= 63 {
@@ -1141,7 +1145,10 @@ fn emit_node(
                     {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                         let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
-                        if prog.is_sequential_copy_projection() {
+                        // Elide only when the block copy skips exactly the inherited
+                        // PK region (`base == pk_count`): the MAP carries the PK
+                        // region verbatim and copies payload columns 1:1.
+                        if prog.sequential_copy_base() == Some(in_reg_schema.pk_indices().len()) {
                             out_reg_of.insert(nid, in_reg);
                             return;
                         }
@@ -2578,13 +2585,17 @@ mod tests {
         use crate::expr::ExprProgram;
         // num_regs covers the largest register index in the synthetic programs
         // below (9) so ExprProgram::new's register-bounds assert passes; this
-        // test exercises is_sequential_copy_projection, not register limits.
+        // test exercises sequential_copy_base, not register limits.
         let make = |code: Vec<i64>| ExprProgram::new(code, 16, 0, vec![]);
-        // COPY_COL has opcode 34
-        assert!(make(vec![34, 9, 1, 0, 34, 9, 2, 1]).is_sequential_copy_projection());
-        assert!(!make(vec![34, 9, 2, 0, 34, 9, 1, 1]).is_sequential_copy_projection()); // wrong order
-        assert!(!make(vec![34, 9, 1, 0, 35, 9, 2, 1]).is_sequential_copy_projection()); // wrong opcode
-        assert!(!make(vec![]).is_sequential_copy_projection()); // empty
+        // COPY_COL has opcode 34.
+        assert_eq!(make(vec![34, 9, 1, 0, 34, 9, 2, 1]).sequential_copy_base(), Some(1));
+        assert_eq!(make(vec![34, 9, 2, 0, 34, 9, 1, 1]).sequential_copy_base(), None); // sources not sequential
+        assert_eq!(make(vec![34, 9, 1, 0, 35, 9, 2, 1]).sequential_copy_base(), None); // wrong opcode
+        assert_eq!(make(vec![]).sequential_copy_base(), None);                          // empty
+        // Sequential sources but destinations swapped (1, 0) — a permutation, not an identity.
+        assert_eq!(make(vec![34, 9, 1, 1, 34, 9, 2, 0]).sequential_copy_base(), None);
+        // Compound PK (k = 2): finalize copies columns 2, 3 → destinations 0, 1.
+        assert_eq!(make(vec![34, 9, 2, 0, 34, 9, 3, 1]).sequential_copy_base(), Some(2));
     }
 
     #[test]

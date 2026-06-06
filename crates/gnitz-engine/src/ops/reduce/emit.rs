@@ -1,6 +1,6 @@
 //! Output row emitters: raw reduce rows, finalized rows, gather-reduce rows.
 
-use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{Batch, MemBatch};
 
 use super::super::util::write_string_from_batch;
@@ -94,7 +94,7 @@ pub(super) fn emit_reduce_row(
                     if (in_null >> src_pi) & 1 != 0 {
                         null_word |= 1u64 << out_pi;
                         output.fill_col_zero(out_pi, cs);
-                    } else if col.type_code == TypeCode::String as u8 {
+                    } else if gnitz_wire::is_german_string(col.type_code) {
                         write_string_from_batch(
                             output, out_pi,
                             input_mb, exemplar_row, src_pi,
@@ -171,7 +171,7 @@ pub(super) fn emit_finalized_row(
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
                             fin_output.fill_col_zero(fpi, cs);
-                        } else if raw_schema.columns[src_ci].type_code == TypeCode::String as u8 {
+                        } else if gnitz_wire::is_german_string(raw_schema.columns[src_ci].type_code) {
                             write_string_from_batch(
                                 fin_output, fpi,
                                 &raw_mb, raw_row, src_pi,
@@ -250,7 +250,7 @@ pub(super) fn emit_gather_row(
             if (in_null >> src_pi) & 1 != 0 {
                 null_word |= 1u64 << out_pi;
                 output.fill_col_zero(out_pi, cs);
-            } else if col.type_code == TypeCode::String as u8 {
+            } else if gnitz_wire::is_german_string(col.type_code) {
                 write_string_from_batch(
                     output, out_pi,
                     input_mb, exemplar_row, src_pi,

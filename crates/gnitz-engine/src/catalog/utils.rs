@@ -141,7 +141,7 @@ pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
         type_code::U64 => Ok(type_code::U64),
         type_code::I64 | type_code::U32 | type_code::I32 |
         type_code::U16 | type_code::I16 | type_code::U8 | type_code::I8 => Ok(type_code::U64),
-        type_code::F32 | type_code::F64 | type_code::STRING => {
+        type_code::F32 | type_code::F64 | type_code::STRING | type_code::BLOB => {
             Err(format!("Secondary index on column type {} not supported", field_type_code))
         }
         _ => Err(format!("Unknown column type code: {}", field_type_code)),

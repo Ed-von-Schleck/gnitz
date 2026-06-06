@@ -329,3 +329,54 @@ fn test_projection_wide_compound_pk_tie_break() {
         vec![vec![1,1,2,200], vec![1,2,1,300]],
         "deleting one tie-break sibling leaves the other intact");
 }
+
+// ── Pure pass-through subset that omits a non-PK column ────────────────
+//
+// A projection that drops a non-PK column (and adds no computed column) takes
+// the pure-projection branch, which builds a `cb.map` column list. That list
+// must contain only the non-PK payload indices: the PK region is inherited by
+// the bulk PK copy / build_map_output_schema's PK prepend. Passing PK indices
+// there shifts every payload destination out of range and crashes the worker.
+
+#[test]
+fn test_projection_single_pk_subset_omits_col() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL, c BIGINT NOT NULL)");
+    exec(&mut client, &sn, "CREATE VIEW v AS SELECT a, b FROM t");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(s.pk_indices(), &[0]);
+
+    exec(&mut client, &sn, "INSERT INTO t (a, b, c) VALUES (1, 10, 100), (2, 20, 200)");
+    assert_eq!(
+        payload_rows(&mut client, &sn, "v", &["b"]),
+        vec![vec![10], vec![20]],
+        "single-PK subset: b correct, c omitted, PK index not aliased into payload"
+    );
+}
+
+#[test]
+fn test_projection_compound_pk_subset_omits_col() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, \
+         d BIGINT NOT NULL, PRIMARY KEY (a, b))");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a, b, c FROM t");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(s.pk_indices(), &[0, 1]);
+
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, c, d) VALUES (1, 2, 10, 99), (3, 4, 20, 88)");
+    assert_eq!(
+        payload_rows(&mut client, &sn, "v", &["c"]),
+        vec![vec![10], vec![20]],
+        "c values correct; d omitted; no panic from PK indices in the cols slice"
+    );
+}

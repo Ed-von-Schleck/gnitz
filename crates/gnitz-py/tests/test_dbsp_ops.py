@@ -635,6 +635,61 @@ class TestDistinctOperator:
         client.drop_table(sn, tname)
         client.drop_schema(sn)
 
+    def test_map_projection_long_blob_relocates(self, client):
+        """A projection MAP that copies a long (out-of-line, > 12-byte) BLOB payload
+        column must relocate the heap bytes into the output batch's blob region. A
+        verbatim 16-byte struct copy leaves the cell's heap-offset pointing into the
+        source batch; once that batch is dropped (a later tick) the offset dangles
+        and the value reads back corrupt. BLOB shares the German-string layout but
+        is a distinct type code from STRING, so the reindex/MAP ColMove path must
+        cover BLOB explicitly. BLOB is only reachable via the binding layer (SQL DDL
+        rejects BLOB), so build the table/circuit here. Single-PK suffices."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("blb", gnitz.TypeCode.BLOB),
+            gnitz.ColumnDef("tag", gnitz.TypeCode.I64),
+        ]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        # Reorder [tag, blb] so the projection is NOT an identity copy — the BLOB
+        # column is copied through the ColMove path (copy_column), not elided.
+        cb = client.circuit_builder(source_table_id=tid)
+        out = cb.map(cb.input_delta(), projection=[2, 1])
+        cb.sink(out)
+        out_cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("tag", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("blb", gnitz.TypeCode.BLOB),
+        ]
+        vid = client.create_view_with_circuit(sn, "vb", cb.build(), out_cols)
+
+        blob1 = b"compound-pk-blob-payload-alpha-0123456789"  # > 12 bytes, out-of-line
+        blob2 = b"compound-pk-blob-payload-beta-9876543210"
+
+        # Tick 1: insert pk=1 with a long blob.
+        b = gnitz.ZSetBatch(schema)
+        b.append(pk=1, blb=blob1, tag=7, weight=1)
+        client.push(tid, b)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert {(r["tag"], bytes(r["blb"])) for r in rows} == {(7, blob1)}
+
+        # Tick 2: insert pk=2 — a separate source batch. The tick-1 source batch is
+        # now dropped; pk=1's view cell must still own its relocated bytes.
+        b = gnitz.ZSetBatch(schema)
+        b.append(pk=2, blb=blob2, tag=8, weight=1)
+        client.push(tid, b)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert {(r["tag"], bytes(r["blb"])) for r in rows} == {(7, blob1), (8, blob2)}, \
+            "long BLOB payload must round-trip intact after the source batch is dropped"
+
+        client.drop_view(sn, "vb")
+        client.drop_table(sn, tname)
+        client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # TestUnionOperator

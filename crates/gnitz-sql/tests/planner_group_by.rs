@@ -196,11 +196,11 @@ fn test_having_binds_correct_aggregate() {
 // Grouping by the full PK is `group_set_eq_pk` (each group a singleton); grouping
 // by one PK component is the single-natural path that actually aggregates.
 //
-// Reads use aliased projected group columns (ka/kb): the SELECT * result batch
-// keeps PK-region values in `batch.pks` (OPK-encoded), leaving the PK-region
-// `columns` slots empty. The post-reduce MAP re-emits each selected group column
-// as a payload column via the PK-region COPY_COL byte-decode, so reading the
-// aliased payload copy both retrieves the value and exercises that decode.
+// Group columns that coincide with the source PK become the view's natural PK
+// region: the post-reduce MAP inherits them verbatim and the alias renames the
+// PK slot in place (no duplicate payload copy). The SELECT * result batch holds
+// those values in `batch.pks`, which the client decodes back to native LE on
+// receive — so `payload_rows` reads them from the PK region by name.
 
 #[test]
 fn test_group_by_compound_pk_full_and_partial() {
@@ -319,4 +319,44 @@ fn test_group_by_compound_pk_multiworker() {
     let perm = payload_rows(&mut client, &sn, "g_perm", &["ka", "kb", "n"]);
     assert_eq!(perm, expected_singletons,
         "permuted full-PK GROUP BY shards in PK order — no rows dropped under W>1");
+}
+
+// ── GROUP BY view schema: no duplicate columns when group cols == source PK ───
+//
+// When the group set coincides with the source PK (natural-PK reduce path), the
+// post-reduce MAP inherits the PK region verbatim. The view schema must rename
+// those inherited PK slots in place, not re-emit each group column as a second
+// payload copy.
+
+#[test]
+fn test_group_by_compound_pk_source_no_dup_cols() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (k1, k2))");
+    exec(&mut client, &sn,
+        "CREATE VIEW vg AS SELECT k1, k2, SUM(v) AS total FROM t GROUP BY k1, k2");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "vg").unwrap();
+    // Schema must be exactly [k1, k2, total] — no duplicates.
+    assert_eq!(s.columns.len(), 3, "no duplicate columns: k1, k2, total only");
+    assert_eq!(s.columns[0].name, "k1");
+    assert_eq!(s.columns[1].name, "k2");
+    assert_eq!(s.columns[2].name, "total");
+    assert_eq!(s.pk_indices(), &[0, 1]);
+}
+
+#[test]
+fn test_group_by_natural_pk_source_no_dup_col() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW vg AS SELECT id, SUM(v) AS total FROM t GROUP BY id");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "vg").unwrap();
+    assert_eq!(s.columns.len(), 2, "no duplicate columns: id, total only");
+    assert_eq!(s.columns[0].name, "id");
+    assert_eq!(s.columns[1].name, "total");
 }

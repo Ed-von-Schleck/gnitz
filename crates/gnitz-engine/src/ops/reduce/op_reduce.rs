@@ -125,6 +125,8 @@ pub(super) fn cursor_matches_group(
             if cmp != std::cmp::Ordering::Equal {
                 return false;
             }
+        } else if desc.tc == TypeCode::Blob {
+            unreachable!("BLOB columns are not valid group-by keys")
         } else if cursor_bytes != exemplar_bytes {
             return false;
         }

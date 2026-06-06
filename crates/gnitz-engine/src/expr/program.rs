@@ -173,16 +173,32 @@ impl ExprProgram {
         true
     }
 
-    /// True iff every instruction is COPY_COL with source columns 1, 2, 3, … in order.
-    /// An identity projection that the compiler can elide.
-    pub(crate) fn is_sequential_copy_projection(&self) -> bool {
-        if self.code.is_empty() {
-            return false;
+    /// If every instruction is `COPY_COL` forming one contiguous block copy
+    /// `src = [base, base+1, …]` → `dst = [0, 1, 2, …]`, return `Some(base)`: the
+    /// source offset, i.e. the count of leading columns the program skips (the PK
+    /// region a finalize / identity MAP inherits verbatim rather than copying).
+    /// Otherwise `None`.
+    ///
+    /// Both checks are load-bearing. Sources must ascend from a single `base`
+    /// (`instr[2] == base + i`) AND destinations must be the dense `0, 1, 2, …`
+    /// (`instr[3] == i`): a program with sequential sources but permuted
+    /// destinations is a real permutation, not an identity, and eliding it would
+    /// silently scramble the column layout. Evaluated on the unresolved program,
+    /// so for a true finalize / identity MAP `base` equals the input register's PK
+    /// count (logical payload columns begin right after the PK region).
+    pub(crate) fn sequential_copy_base(&self) -> Option<usize> {
+        let base = self.code.chunks_exact(4).next()?[2];
+        if base < 0 {
+            // A negative `instr[2]` is the post-resolve PK sentinel; this helper
+            // only classifies pre-resolve logical-index programs.
+            return None;
         }
-        self.code
-            .chunks_exact(4)
-            .enumerate()
-            .all(|(i, instr)| instr[0] == EXPR_COPY_COL && instr[2] == (i + 1) as i64)
+        let ok = self.code.chunks_exact(4).enumerate().all(|(i, instr)| {
+            instr[0] == EXPR_COPY_COL
+                && instr[2] == base + i as i64   // sources base, base+1, …
+                && instr[3] == i as i64          // destinations 0, 1, 2, …
+        });
+        if ok { Some(base as usize) } else { None }
     }
 
     /// Classify each output-producing instruction in bytecode order.

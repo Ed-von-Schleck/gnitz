@@ -514,7 +514,7 @@ pub fn encode_wire_into_ipc(
 ///
 /// Pass `schema`/`prebuilt_schema_block` for the first chunk of a multi-chunk
 /// SCAN; pass `None` for both on continuation chunks (no schema block).
-/// Only valid for wire-safe schemas (no STRING columns).
+/// Only valid for wire-safe schemas (no German-string (STRING or BLOB) columns).
 pub fn wire_size_range(
     status: u32,
     error_msg: &[u8],

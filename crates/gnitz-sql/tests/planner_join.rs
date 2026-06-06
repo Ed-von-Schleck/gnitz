@@ -230,3 +230,174 @@ fn test_join_composite_two_pair_inner_data() {
         vec![vec![10, 100, 1, 11], vec![20, 200, 2, 44], vec![30, 300, 3, 33]],
         "incremental INNER join admits the newly-completed composite-key pair");
 }
+
+// ── Equijoin views over compound / wide-PK source tables ─────────────────────
+//
+// The output PK of an equijoin view is never the source PK — it is the synthetic
+// `_join_pk` derived from the equijoin key. A compound/wide source PK rides
+// through the reindex as ordinary payload (decoded to native values), so
+// `payload_rows` reads those columns directly; the synthetic `_join_pk` columns
+// are the PK region, asserted via `resolve_table_or_view_id(...).pk_indices()`.
+
+/// Single-key join over a compound-PK source: the compound source PK rides as
+/// payload and the output PK is the lone synthetic join column.
+#[test]
+fn test_join_compound_pk_source_single_key() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, fk BIGINT NOT NULL, av BIGINT NOT NULL, PRIMARY KEY (k1, k2))");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.k1, a.k2, a.av, b.bv FROM a JOIN b ON a.fk = b.fk");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), &[0], "single-key join over a compound-PK source: output PK is the lone _join_pk");
+
+    exec(&mut client, &sn,
+        "INSERT INTO a (k1, k2, fk, av) VALUES (1, 100, 7, 11), (2, 200, 9, 22)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70), (2, 9, 90)");
+
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "k2", "av", "bv"]),
+        vec![vec![1, 100, 11, 70], vec![2, 200, 22, 90]],
+        "compound source PK rides as payload, decoded to native values");
+}
+
+/// Composite join key over two compound-PK sources: output PK is the 2 synthetic
+/// `_join_pk` columns; the key is drawn from non-PK columns of both sides.
+#[test]
+fn test_join_compound_pk_source_composite_key() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL, av BIGINT NOT NULL, PRIMARY KEY (k1, k2))");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (j1 BIGINT NOT NULL, j2 BIGINT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL, bv BIGINT NOT NULL, PRIMARY KEY (j1, j2))");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.k1, a.av, b.bv FROM a JOIN b ON a.x = b.x AND a.y = b.y");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), &[0, 1], "k=2 join over compound sources: output PK is the two _join_pk cols");
+
+    exec(&mut client, &sn,
+        "INSERT INTO a (k1, k2, x, y, av) VALUES (1, 1, 10, 100, 1), (2, 2, 20, 200, 2)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (j1, j2, x, y, bv) VALUES (5, 5, 10, 100, 11), (6, 6, 20, 999, 22)");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "av", "bv"]),
+        vec![vec![1, 1, 11]],
+        "(20,200) vs (20,999) disagree on y — only (10,100) joins");
+
+    exec(&mut client, &sn, "INSERT INTO b (j1, j2, x, y, bv) VALUES (7, 7, 20, 200, 44)");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "av", "bv"]),
+        vec![vec![1, 1, 11], vec![2, 2, 44]],
+        "incremental join admits the newly-completed pair");
+}
+
+/// LEFT join whose left source has a compound PK: unmatched left rows emit
+/// `(left payload incl. compound PK, NULL right)`.
+#[test]
+fn test_join_compound_pk_source_left_outer() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, fk BIGINT NOT NULL, \
+         av BIGINT NOT NULL, PRIMARY KEY (k1, k2))");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.k1, a.k2, a.av, b.bv FROM a LEFT JOIN b ON a.fk = b.fk");
+
+    exec(&mut client, &sn,
+        "INSERT INTO a (k1, k2, fk, av) VALUES (1, 100, 7, 11), (2, 200, 9, 22)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)");
+
+    let (schema, batch) = read_view(&mut client, &sn, "v");
+    assert_eq!(batch.len(), 2);
+
+    let k1_ci  = col_idx(&schema, "k1");
+    let k2_ci  = col_idx(&schema, "k2");
+    let av_ci  = col_idx(&schema, "av");
+    let bv_ci  = col_idx(&schema, "bv");
+    // bv_payload_idx: schema [_join_pk(pk), k1, k2, av, bv]; 1 PK col; bv payload = bv_ci - 1
+    let bv_payload_idx = bv_ci - schema.pk_cols.len();
+
+    let (r_matched, r_unmatched) =
+        if i64_at(&batch, k1_ci, 0) == 1 { (0, 1) } else { (1, 0) };
+
+    // Matched row (fk=7)
+    assert!(!is_null_at(&batch, bv_payload_idx, r_matched));
+    assert_eq!(i64_at(&batch, bv_ci, r_matched), 70);
+
+    // Unmatched row (fk=9): compound source PK intact, right side null
+    assert_eq!(i64_at(&batch, k1_ci, r_unmatched), 2);
+    assert_eq!(i64_at(&batch, k2_ci, r_unmatched), 200);
+    assert_eq!(i64_at(&batch, av_ci, r_unmatched), 22);
+    assert!(is_null_at(&batch, bv_payload_idx, r_unmatched),
+        "unmatched left row: bv must be null");
+}
+
+/// Wide (> 16-byte) compound source PK: a 3-BIGINT PK (24-byte stride). Two source
+/// rows that share the first 16 OPK bytes and differ only past byte 16 must
+/// survive ingest/scan as distinct and join independently.
+#[test]
+fn test_join_compound_pk_source_wide_tiebreak() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, k3 BIGINT NOT NULL, \
+         fk BIGINT NOT NULL, av BIGINT NOT NULL, PRIMARY KEY (k1, k2, k3))");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.k1, a.k2, a.k3, a.av, b.bv FROM a JOIN b ON a.fk = b.fk");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), &[0]);
+
+    // (1,1,1) and (1,1,2) share the first 16 OPK bytes; differ only at byte 16+.
+    exec(&mut client, &sn,
+        "INSERT INTO a (k1, k2, k3, fk, av) VALUES (1, 1, 1, 7, 11), (1, 1, 2, 7, 22)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)");
+
+    assert_eq!(
+        payload_rows(&mut client, &sn, "v", &["k1", "k2", "k3", "av", "bv"]),
+        vec![vec![1, 1, 1, 11, 70], vec![1, 1, 2, 22, 70]],
+        "rows sharing first 16 OPK bytes survive as distinct and both join"
+    );
+}
+
+/// Incremental UPDATE / DELETE of source rows over a compound-PK source.
+#[test]
+fn test_join_compound_pk_source_update_delete() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, fk BIGINT NOT NULL, av BIGINT NOT NULL, PRIMARY KEY (k1, k2))");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.k1, a.k2, a.av, b.bv FROM a JOIN b ON a.fk = b.fk");
+
+    exec(&mut client, &sn,
+        "INSERT INTO a (k1, k2, fk, av) VALUES (1, 100, 7, 11), (2, 200, 9, 22)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70), (2, 9, 90)");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "k2", "av", "bv"]),
+        vec![vec![1, 100, 11, 70], vec![2, 200, 22, 90]]);
+
+    // UPDATE a source payload column: retract+insert reflected on next read.
+    exec(&mut client, &sn, "UPDATE a SET av = 111 WHERE k1 = 1 AND k2 = 100");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "k2", "av", "bv"]),
+        vec![vec![1, 100, 111, 70], vec![2, 200, 22, 90]],
+        "incremental UPDATE recomputes only the touched join row");
+
+    // DELETE a source row: removes its join output.
+    exec(&mut client, &sn, "DELETE FROM a WHERE k1 = 2 AND k2 = 200");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["k1", "k2", "av", "bv"]),
+        vec![vec![1, 100, 111, 70]],
+        "incremental DELETE drops the removed source row's join output");
+}
