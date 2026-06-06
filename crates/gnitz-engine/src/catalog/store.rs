@@ -218,6 +218,16 @@ impl CatalogEngine {
                              VIEW_TAB writes (see hooks.rs dispatch doc).",
                             name, vid));
                     }
+                    // Reject an over-wide view here — before apply_entity_by_qname
+                    // mutates the caches — so a rejected DDL leaves clean state,
+                    // mirroring the TABLE_TAB precheck above. hook_view_register
+                    // carries the same guard as the build_schema_from_col_defs
+                    // assert backstop.
+                    if col_count > crate::schema::MAX_COLUMNS {
+                        return Err(format!(
+                            "view '{}' (vid={}) has {} columns (max {})",
+                            name, vid, col_count, crate::schema::MAX_COLUMNS));
+                    }
                     self.precheck_qname_unique(sid, &name, vid)?;
                 }
                 IDX_TAB_ID => {

@@ -629,9 +629,11 @@ impl DagEngine {
                         _ => None,
                     };
                     if let Some(tid) = tid {
-                        if tid > 0 && shard_cols.len() == 1 {
+                        if tid > 0 {
                             if let Some(entry) = self.tables.get(&(tid as i64)) {
-                                if entry.schema.is_pk_col(shard_cols[0] as usize) {
+                                // Strict full-PK-sequence match: a single component
+                                // of a compound PK is not co-partitioned.
+                                if entry.schema.shard_cols_match_pk(&shard_cols) {
                                     is_co_partitioned = true;
                                 }
                             }

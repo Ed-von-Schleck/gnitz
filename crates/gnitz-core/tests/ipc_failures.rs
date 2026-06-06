@@ -143,9 +143,7 @@ fn assemble(
     if has_schema { flags |= FLAG_HAS_SCHEMA; }
     if has_data   { flags |= FLAG_HAS_DATA;   }
 
-    let mut h = Header::default();
-    h.target_id = target_id;
-    h.flags     = flags;
+    let h = Header { target_id, flags, ..Default::default() };
 
     let mut buf = encode_control_block(&h, "", &[]).unwrap();
     if let Some(sb) = schema_block { buf.extend_from_slice(&sb); }
@@ -252,9 +250,7 @@ fn test_has_data_without_has_schema() {
     let raw = RawClient::connect(&srv.sock_path);
 
     // FLAG_HAS_DATA without FLAG_HAS_SCHEMA is a protocol violation
-    let mut h = Header::default();
-    h.target_id = SCHEMA_TAB;
-    h.flags = FLAG_HAS_DATA;
+    let h = Header { target_id: SCHEMA_TAB, flags: FLAG_HAS_DATA, ..Default::default() };
     let ctrl = encode_control_block(&h, "", &[]).unwrap();
     let (status, _, _) = raw.send_recv(&ctrl);
     assert_eq!(status, STATUS_ERROR);
@@ -403,9 +399,7 @@ fn test_data_section_truncated() {
 
     let schema_block = make_schema_block(&schema);
     // Send FLAG_HAS_DATA but don't include the data WAL block at all
-    let mut h = Header::default();
-    h.target_id = tid;
-    h.flags = FLAG_HAS_SCHEMA | FLAG_HAS_DATA;
+    let h = Header { target_id: tid, flags: FLAG_HAS_SCHEMA | FLAG_HAS_DATA, ..Default::default() };
     let mut msg = encode_control_block(&h, "", &[]).unwrap();
     msg.extend_from_slice(&schema_block);
     // data block absent
@@ -626,9 +620,7 @@ fn test_scan_with_schema_but_no_data_is_scan() {
 fn test_scan_echoes_client_id() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let raw = RawClient::connect(&srv.sock_path);
-    let mut h = Header::default();
-    h.target_id = SCHEMA_TAB;
-    h.client_id = 123_456_789;
+    let h = Header { target_id: SCHEMA_TAB, client_id: 123_456_789, ..Default::default() };
     let msg = encode_control_block(&h, "", &[]).unwrap();
     let (status, _, resp) = raw.send_recv(&msg);
     assert_ok(status);

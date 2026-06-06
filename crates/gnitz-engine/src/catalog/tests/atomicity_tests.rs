@@ -219,6 +219,41 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── Part 1: VIEW_TAB, over-wide schema rejected cleanly ──────────────────────
+
+#[test]
+fn test_view_tab_too_many_cols_rejected() {
+    // An over-wide view must be rejected with a clean catalog error that leaves no
+    // orphaned cache/memtable state — mirroring the TABLE_TAB path, where the
+    // precheck rejects before apply_entity_by_qname mutates the caches.
+    // hook_view_register carries the same guard as the build_schema_from_col_defs
+    // assert backstop. This is the engine-side counterpart to the client guard in
+    // write_circuit_rows.
+    let dir = temp_dir("atomicity_view_too_many_cols");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let init_rows = count_records(&mut engine.sys_views);
+
+    let vid = engine.allocate_table_id();
+    // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
+    for i in 0..(crate::schema::MAX_COLUMNS as i64 + 1) {
+        write_col_at_index(&mut engine, vid, i, &u64_col_def(&format!("c{i}"))).unwrap();
+    }
+    let batch = build_view_tab_row(&dir, vid, "wideview");
+    let err = engine.ingest_to_family(VIEW_TAB_ID, &batch)
+        .expect_err("expected error for over-wide view");
+    assert!(err.contains("columns") && err.contains("max"),
+        "expected the column-count guard message, got: {err}");
+
+    assert!(!engine.caches.entity_by_qname.contains_key("public.wideview"),
+        "entity_by_qname must not contain the rejected view");
+    assert!(!engine.dag.tables.contains_key(&vid),
+        "dag.tables must not contain the rejected view");
+    assert_eq!(count_records(&mut engine.sys_views), init_rows,
+        "sys_views memtable must have no orphaned row");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── Part 1: IDX_TAB, non-existent owner ──────────────────────────────────────
 
 #[test]

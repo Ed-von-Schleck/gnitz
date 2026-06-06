@@ -102,41 +102,72 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 //     for system tables.
 //   * Packed list (flag bit set):
 //        bit 63        : PK_LIST_PACKED_FLAG
-//        bits [0..4)   : decoded count (1..=4 valid; >4 reserved for tests)
+//        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid; larger
+//                        counts are reserved for tests / malformed payloads)
 //        bits [4+7i..) : i-th column index, 7 bits each
 //
 // Both client (gnitz-core) and engine (gnitz-engine catalog) MUST share this
 // encoder/decoder so they cannot drift on the encoding.
 // ---------------------------------------------------------------------------
 
+/// Capacity of the persisted PK-list codec (`pack_pk_cols` / `PkColList`):
+/// the most PK columns a table or view PK may declare. The codec, both
+/// validators, and the two planner admission caps all derive from this one
+/// constant — raise or lower it and every dependent site follows, with the
+/// static guards below catching a value the encoding or schema layout can't
+/// hold.
+///
+/// Distinct from `MAX_PK_COLUMNS` (5), which sizes the engine's in-memory PK
+/// arrays and reserves one extra slot for the secondary-index column prefix.
+/// Keeping `PK_LIST_MAX_COLS < MAX_PK_COLUMNS` leaves that slot free for any
+/// table.
+pub const PK_LIST_MAX_COLS: usize = 4;
+
+// The packed u64 lays the decoded count in bits [0..4) and each column index in
+// a 7-bit field at bit 4 + 7*i; the packed flag occupies bit 63. Guard the
+// ceilings at compile time so bumping PK_LIST_MAX_COLS past what the encoding
+// (or the index-prefix reservation) can hold fails to build instead of
+// silently corrupting the catalog word.
+const _: () = assert!(PK_LIST_MAX_COLS >= 1);
+const _: () = assert!(PK_LIST_MAX_COLS <= 0xf,                 // count field is 4 bits
+    "PK_LIST_MAX_COLS overflows the 4-bit packed count field");
+const _: () = assert!(4 + 7 * PK_LIST_MAX_COLS <= 63,         // column fields clear the flag bit
+    "PK_LIST_MAX_COLS overflows the packed u64 column region");
+const _: () = assert!(PK_LIST_MAX_COLS < MAX_PK_COLUMNS,      // leave the index-prefix slot
+    "PK_LIST_MAX_COLS leaves no MAX_PK_COLUMNS slot for the secondary-index prefix");
+
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-/// Decoded PK column list — backing storage sized to 4 entries.
-/// `decoded_count()` returns the raw decoded count from the wire (may be 0
-/// or 5..=15 for a crafted packed value); `as_slice()` is panic-free and
-/// clamps the slice to at most 4 entries. Out-of-range counts must reach
-/// schema-validation code as `Err`, not as a panic here.
+/// Decoded PK column list — backing storage sized to `PK_LIST_MAX_COLS`
+/// entries. `decoded_count()` returns the raw decoded count from the wire
+/// (may be 0 or out of range for a crafted packed value); `as_slice()` is
+/// panic-free and clamps the slice to at most `PK_LIST_MAX_COLS` entries.
+/// Out-of-range counts must reach schema-validation code as `Err`, not as a
+/// panic here.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PkColList {
-    cols: [u32; 4],
+    cols: [u32; PK_LIST_MAX_COLS],
     len: usize,
 }
 
 impl PkColList {
     /// Single-column PK with `len = 1`.
     pub fn single(idx: u32) -> Self {
-        PkColList { cols: [idx, 0, 0, 0], len: 1 }
+        let mut cols = [0u32; PK_LIST_MAX_COLS];
+        cols[0] = idx;
+        PkColList { cols, len: 1 }
     }
-    /// The count exactly as decoded from the wire. May be 0 or >4 for a
-    /// malformed/crafted packed value — deliberately NOT clamped, because
-    /// `validate_pk_cols` gates on this raw value to reject out-of-range
-    /// counts. Not a safe slice length: iterate `as_slice()` instead.
+    /// The count exactly as decoded from the wire. May be 0 or larger than
+    /// `PK_LIST_MAX_COLS` for a malformed/crafted packed value — deliberately
+    /// NOT clamped, because `validate_pk_cols` gates on this raw value to
+    /// reject out-of-range counts. Not a safe slice length: iterate
+    /// `as_slice()` instead.
     pub fn decoded_count(&self) -> usize { self.len }
-    /// Always in bounds: indexes at most the 4-element backing array even
-    /// when the decoded count is out of range. A crafted wire count of
-    /// 5..=15 must NOT panic here — it has to survive long enough to
-    /// reach `validate_pk_cols` and be returned as `Err`.
-    pub fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(4)] }
+    /// Always in bounds: indexes at most the `PK_LIST_MAX_COLS`-element
+    /// backing array even when the decoded count is out of range. A crafted
+    /// over-range wire count must NOT panic here — it has to survive long
+    /// enough to reach `validate_pk_cols` and be returned as `Err`.
+    pub fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(PK_LIST_MAX_COLS)] }
 }
 
 /// Pack a PK column-index list into the persisted `u64` form. Panics on a
@@ -144,7 +175,10 @@ impl PkColList {
 /// catalog encoding; callers (client + engine) must reject out-of-range
 /// lists before calling this.
 pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
-    assert!((1..=4).contains(&pk_cols.len()), "pack_pk_cols: count out of range 1..=4");
+    assert!(
+        (1..=PK_LIST_MAX_COLS).contains(&pk_cols.len()),
+        "pack_pk_cols: count {} out of range 1..={PK_LIST_MAX_COLS}", pk_cols.len(),
+    );
     let mut v = pk_cols.len() as u64;            // bits [0..4)
     for (i, &c) in pk_cols.iter().enumerate() {
         assert!(c < 128, "pack_pk_cols: column index {c} exceeds 7-bit field");
@@ -161,11 +195,11 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
     if packed & PK_LIST_PACKED_FLAG == 0 {
         // Bare single index: an unmodified gnitz-core client, or an
         // engine-written system-table row (always bare `0`).
-        return PkColList { cols: [packed as u32, 0, 0, 0], len: 1 };
+        return PkColList::single(packed as u32);
     }
     let n = (packed & 0xf) as usize;             // 0..=15, validated later
-    let mut cols = [0u32; 4];
-    for (i, slot) in cols.iter_mut().enumerate().take(n.min(4)) {
+    let mut cols = [0u32; PK_LIST_MAX_COLS];
+    for (i, slot) in cols.iter_mut().enumerate().take(n.min(PK_LIST_MAX_COLS)) {
         *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
     }
     PkColList { cols, len: n }

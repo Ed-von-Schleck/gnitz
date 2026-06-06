@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1df4d8090a106b6429a28ff037a0c2269b5fa0485942b662bc9771591bd69c3f # shrinks to original = ArbSchema { pk_indices: [0], types: [1, 1], nullable: [0, 0] }
+cc 374ccbd3cac190fd54cc87c54bb24d3484db92395a0fc12596a090563d70860f # shrinks to original = ArbSchema { pk_indices: [0, 1, 2, 3, 4], types: [1, 1, 1, 1, 1], nullable: [0, 0, 0, 0, 0] }
+cc adb3b1552f9bd2a07aa08a0d1ad8ba266ad9ede5289769e18793448e5a57785f # shrinks to original = ArbSchema { pk_indices: [0, 1, 3, 4, 2], types: [1, 1, 1, 1, 1], nullable: [0, 0, 0, 0, 0] }

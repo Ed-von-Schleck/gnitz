@@ -300,7 +300,9 @@ impl SchemaDescriptor {
         self.num_columns as usize
     }
 
-    /// All PK column indices, in compound-key order. Today: always length 1.
+    /// All PK column indices, in compound-key order. Length is the PK arity:
+    /// 1 for a single-column PK, or the full sequence for a compound table PK
+    /// (and the co-partition analyzers compare against this whole sequence).
     #[inline]
     pub fn pk_indices(&self) -> &[u32] {
         &self.pk_indices[..self.pk_count as usize]
@@ -432,6 +434,21 @@ impl SchemaDescriptor {
     pub fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
         let pk = self.pk_indices();
         cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
+    }
+
+    /// True iff `cols` is exactly `pk_indices()` in schema order — strict
+    /// sequence equality, in contrast to the set-equality `group_cols_eq_pk`.
+    /// This is the co-partition contract the exchange router enforces
+    /// (`fill_worker_indices` routes by `partition_for_pk_bytes`, which hashes
+    /// the OPK bytes in schema order, only when the shard key is the full source
+    /// PK in that order): a derived operator sharded by the full source PK stays
+    /// co-partitioned with its source, whereas one component of a compound PK —
+    /// or a permuted PK — does not. The DAG/compiler co-partition analyzers carry
+    /// shard columns as `i32`, so this takes `&[i32]`; PK indices are small and
+    /// non-negative, so the per-element compare is exact.
+    pub fn shard_cols_match_pk(&self, cols: &[i32]) -> bool {
+        let pk = self.pk_indices();
+        cols.len() == pk.len() && cols.iter().zip(pk).all(|(&c, &p)| c == p as i32)
     }
 
     /// Byte offset of `col_idx` within the row's PK region. Walks

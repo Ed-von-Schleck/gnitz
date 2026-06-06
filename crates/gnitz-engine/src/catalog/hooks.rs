@@ -272,6 +272,19 @@ impl CatalogEngine {
                 let pk = unpack_pk_cols(self.read_batch_u64(batch, i, VIEWTAB_PAY_PK_COL_IDX));
                 validate_pk_cols(&col_defs, &pk)?;
 
+                // Mirror hook_table_register: reject an over-wide schema cleanly
+                // rather than letting build_schema_from_col_defs' assert abort the
+                // catalog/worker process. Compound-PK plain projection makes this
+                // reachable — projection prepends the k source PK columns, so
+                // SELECT * over a wide compound-PK table can cross MAX_COLUMNS.
+                if col_defs.len() > crate::schema::MAX_COLUMNS {
+                    return Err(format!(
+                        "catalog invariant violated: view '{}' (vid={}) has {} column defs (max {}); \
+                         type_codes={:?}",
+                        name, vid, col_defs.len(), crate::schema::MAX_COLUMNS,
+                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>()));
+                }
+
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
                 let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());

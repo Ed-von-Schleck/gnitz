@@ -56,22 +56,23 @@ pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
 pub(super) use gnitz_wire::PK_LIST_PACKED_FLAG;
 pub(crate) use gnitz_wire::PkColList;
 #[allow(unused_imports)]
-pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols};
+pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols, PK_LIST_MAX_COLS};
 
 /// Hard-validate a decoded PK list against the table's columns. Shared by
 /// the production wire path (`hook_table_register`) and the test-only
 /// `ddl.rs::create_table` so both reject identically rather than falling
 /// through to a `SchemaDescriptor::new` `assert!`. `pk.decoded_count()`
 /// (the raw decoded count, not the clamped slice length) is what gates
-/// 1..=4, so a crafted count of 5..=15 is rejected rather than silently
-/// truncated.
+/// `1..=PK_LIST_MAX_COLS`, so a crafted over-range count is rejected rather
+/// than silently truncated.
 pub(super) fn validate_pk_cols(
     col_defs: &[super::types::ColumnDef],
     pk: &PkColList,
 ) -> Result<(), String> {
-    if !(1..=4).contains(&pk.decoded_count()) {
+    if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk.decoded_count()) {
         return Err(format!(
-            "Primary Key column count {} out of range 1..=4", pk.decoded_count()));
+            "Primary Key column count {} out of range 1..={}",
+            pk.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
     }
     let cols = pk.as_slice();
     for (j, &c) in cols.iter().enumerate() {
@@ -96,8 +97,8 @@ pub(super) fn validate_pk_cols(
     // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` value
     // via `storage::batch::widen_pk_be`; wider compound PKs (stride > 16) route
     // through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`). The
-    // 4-column cap above bounds a valid PK at 64 bytes (four `U128`); MAX_PK_BYTES
-    // is the
+    // `PK_LIST_MAX_COLS` cap above bounds a valid PK at 64 bytes (four `U128` at
+    // the current cap of 4); MAX_PK_BYTES is the
     // ceiling, defending the catalog worker against a crafted `raw_store_ingest`
     // into `TABLE_TAB` whose decoded PK list packs an oversized region.
     // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
@@ -351,11 +352,12 @@ mod tests {
         assert_eq!(unpack_pk_cols(7).as_slice(), &[7]);
         assert_eq!(unpack_pk_cols(7).decoded_count(), 1);
 
-        // Malformed flag-set value with an out-of-range count: as_slice
-        // and decoded_count must be panic-free, slice clamped by min(4).
+        // Malformed flag-set value with an out-of-range count: as_slice and
+        // decoded_count must be panic-free, slice clamped to PK_LIST_MAX_COLS.
+        // `15` is the max the 4-bit count field can hold (independent of the cap).
         let malformed = unpack_pk_cols(PK_LIST_PACKED_FLAG | 15);
         assert_eq!(malformed.decoded_count(), 15);
-        assert_eq!(malformed.as_slice(), &[0, 0, 0, 0]);
+        assert_eq!(malformed.as_slice(), vec![0u32; PK_LIST_MAX_COLS].as_slice());
     }
 
     #[test]

@@ -167,19 +167,19 @@ class TestSchema:
             Schema(cols)
 
     def test_max_pk_columns_exceeded(self):
-        # MAX_PK_COLUMNS is 5; asking for 6 PK columns must be rejected.
-        cols = [ColumnDef(f"c{i}", TypeCode.U64) for i in range(6)]
-        with pytest.raises(ValueError, match="MAX_PK_COLUMNS"):
-            Schema(cols, pk_indices=list(range(6)))
+        # The FFI PK cap is PK_LIST_MAX_COLS (4) — the persisted PK-list codec
+        # width — so asking for 5 PK columns must be rejected.
+        cols = [ColumnDef(f"c{i}", TypeCode.U64) for i in range(5)]
+        with pytest.raises(ValueError, match="PK_LIST_MAX_COLS"):
+            Schema(cols, pk_indices=list(range(5)))
 
-    def test_pk_stride_exceeded(self):
-        # 5 × U128 = 80 bytes, exactly MAX_PK_BYTES → OK; add another wide
-        # column and we'd exceed the limit. The only way to trip the stride
-        # check before MAX_PK_COLUMNS is via wide types within the 5-column
-        # arity budget — so build 5 U128 PK columns plus a payload column,
-        # which is fine, then bump one to confirm exactly-at-the-limit works.
-        cols_ok = [ColumnDef(f"c{i}", TypeCode.U128) for i in range(5)]
-        Schema(cols_ok, pk_indices=list(range(5)))  # exactly MAX_PK_BYTES
+    def test_max_arity_wide_pk_accepted(self):
+        # The widest FFI PK is PK_LIST_MAX_COLS (4) columns; 4 × U128 = 64 bytes,
+        # within MAX_PK_BYTES (80), so the max-arity wide PK round-trips through
+        # validation. The PK-stride ceiling is unreachable from this surface: the
+        # 4-column cap bounds a U128 PK at 64 bytes, below the 80-byte limit.
+        cols_ok = [ColumnDef(f"c{i}", TypeCode.U128) for i in range(4)]
+        Schema(cols_ok, pk_indices=list(range(4)))
 
 
 class TestRow:

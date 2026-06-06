@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use super::error::ProtocolError;
 
 pub use gnitz_wire::TypeCode;
-pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS};
+pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
 /// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
@@ -139,12 +139,16 @@ impl Schema {
 
     /// Validate a candidate PK index list against the schema's arity and
     /// column count constraints. Shared by all FFI surfaces (capi, py) so the
-    /// rules — non-empty, ≤ `MAX_PK_COLUMNS`, all indices `< ncols`, no
+    /// rules — non-empty, ≤ `PK_LIST_MAX_COLS`, all indices `< ncols`, no
     /// duplicates — stay in one place. `ncols` is passed in because the C ABI
-    /// builds the PK list before adding columns.
+    /// builds the PK list before adding columns. The cap is the persisted
+    /// PK-list codec capacity (`PK_LIST_MAX_COLS`), not the wider in-memory
+    /// `MAX_PK_COLUMNS`: these surfaces never build the engine-internal
+    /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
+    /// PK they accept must round-trip through the codec.
     pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), &'static str> {
         if pk_cols.is_empty()                 { return Err("pk_cols must not be empty"); }
-        if pk_cols.len() > MAX_PK_COLUMNS     { return Err("pk_cols exceeds MAX_PK_COLUMNS"); }
+        if pk_cols.len() > PK_LIST_MAX_COLS   { return Err("pk_cols exceeds PK_LIST_MAX_COLS"); }
         if pk_cols.iter().any(|&c| c >= ncols) {
             return Err("pk_cols index out of range");
         }

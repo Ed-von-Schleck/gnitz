@@ -31,6 +31,13 @@ pub fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
     (client, sn)
 }
 
+/// Plan and execute a statement, asserting it succeeds. (`SqlResult` has no
+/// `Debug`, so the result Vec is simply unwrapped.)
+pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
+    let mut p = SqlPlanner::new(client, sn);
+    p.execute(sql).unwrap();
+}
+
 /// Read `SELECT * FROM view` and return its (schema, batch).
 pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
     let mut p = SqlPlanner::new(client, sn);
@@ -52,6 +59,20 @@ pub fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
         ColData::Fixed(b) => i64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
         other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
     }
+}
+
+/// Read a view's named (integer) payload columns into sorted row tuples, so a
+/// test can compare incremental view contents against an expected full recompute
+/// without decoding the OPK PK region by hand. Works for synthetic PK-region
+/// columns too (e.g. join `_join_pk` / reduce group cols re-emitted as payload).
+pub fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str]) -> Vec<Vec<i64>> {
+    let (schema, batch) = read_view(client, sn, view);
+    let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
+    let mut rows: Vec<Vec<i64>> = (0..batch.len())
+        .map(|r| idxs.iter().map(|&ci| i64_at(&batch, ci, r)).collect())
+        .collect();
+    rows.sort();
+    rows
 }
 
 pub fn f64_at(batch: &ZSetBatch, col: usize, row: usize) -> f64 {

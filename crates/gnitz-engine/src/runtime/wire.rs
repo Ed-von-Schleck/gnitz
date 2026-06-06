@@ -1238,15 +1238,19 @@ mod tests {
         }
     }
 
-    fn arb_schema() -> impl Strategy<Value = ArbSchema> {
-        // n_cols ≥ 1, so `1..=n_cols.min(MAX_PK_COLUMNS)` is never empty.
-        (1usize..=8).prop_flat_map(|n_cols| {
+    /// `max_pk` bounds the generated PK arity: the engine codec supports up to
+    /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
+    /// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that decode through the
+    /// client (`batch_to_schema` → `Schema::validate_pk_cols`) must stay within it.
+    fn arb_schema(max_pk: usize) -> impl Strategy<Value = ArbSchema> {
+        // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
+        (1usize..=8).prop_flat_map(move |n_cols| {
             (
                 Just(n_cols),
                 vec(arb_type_code(), n_cols),     // column types
                 vec(any::<bool>(), n_cols),       // nullability
                 vec(any::<u32>(), n_cols),        // permutation weights
-                1usize..=n_cols.min(MAX_PK_COLUMNS), // PK arity
+                1usize..=n_cols.min(max_pk),      // PK arity
             )
         })
         .prop_map(|(n_cols, types, nullables, weights, k)| {
@@ -1316,7 +1320,7 @@ mod tests {
     proptest! {
         /// Engine encoder → engine decoder.
         #[test]
-        fn schema_roundtrip_engine_codec(original in arb_schema()) {
+        fn schema_roundtrip_engine_codec(original in arb_schema(MAX_PK_COLUMNS)) {
             let original = &original.0;
             let names: Vec<Vec<u8>> = (0..original.num_columns())
                 .map(|i| format!("c{i}").into_bytes())
@@ -1330,7 +1334,7 @@ mod tests {
 
         /// Client encoder → client decoder.
         #[test]
-        fn schema_roundtrip_client_codec(original in arb_schema()) {
+        fn schema_roundtrip_client_codec(original in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
             use gnitz_core::protocol::codec::{schema_to_batch, batch_to_schema};
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::{
@@ -1350,7 +1354,7 @@ mod tests {
 
         /// Engine encoder → client decoder.
         #[test]
-        fn schema_cross_codec_engine_to_client(original in arb_schema()) {
+        fn schema_cross_codec_engine_to_client(original in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
             use gnitz_core::protocol::codec::batch_to_schema;
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::{decode_wal_block, VerifyChecksum};
@@ -1374,7 +1378,7 @@ mod tests {
 
         /// Client encoder → engine decoder.
         #[test]
-        fn schema_cross_codec_client_to_engine(original in arb_schema()) {
+        fn schema_cross_codec_client_to_engine(original in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
             use gnitz_core::protocol::codec::schema_to_batch;
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::encode_wal_block;

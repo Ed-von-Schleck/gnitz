@@ -152,49 +152,81 @@ fn test_join_reject_mixed_string_native() {
     assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "no view should be registered");
 }
 
-/// Planner rejection: a six-pair ON conjunction exceeds MAX_PK_COLUMNS (5).
+/// Planner rejection: an ON conjunction one wider than the codec cap is rejected
+/// as a clean `Unsupported` (not a `pack_pk_cols` panic). Written relative to
+/// `PK_LIST_MAX_COLS` so it tracks a future bump rather than hardcoding the count.
 #[test]
 fn test_join_reject_arity_cap() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, \
-               c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL, \
-               c3 BIGINT NOT NULL, c4 BIGINT NOT NULL, c5 BIGINT NOT NULL)").unwrap();
-    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, \
-               c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL, \
-               c3 BIGINT NOT NULL, c4 BIGINT NOT NULL, c5 BIGINT NOT NULL)").unwrap();
+    let n = gnitz_core::PK_LIST_MAX_COLS + 1; // one past the cap
+    let key_cols = (0..n).map(|i| format!("c{i} BIGINT NOT NULL")).collect::<Vec<_>>().join(", ");
+    p.execute(&format!("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})")).unwrap();
+    p.execute(&format!("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})")).unwrap();
 
-    let err = must_err(p.execute(
-        "CREATE VIEW v AS SELECT * FROM a JOIN b ON \
-         a.c0 = b.c0 AND a.c1 = b.c1 AND a.c2 = b.c2 AND \
-         a.c3 = b.c3 AND a.c4 = b.c4 AND a.c5 = b.c5"));
-    assert!(matches!(err, GnitzSqlError::Unsupported(_)), "expected Unsupported, got {:?}", err);
-    assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "no view should be registered");
-}
-
-/// k ≥ 2 fail-closed boundary: a type-valid two-pair CREATE VIEW is rejected by
-/// the planner gate (not by validate_join_key_pair). The error names "composite"
-/// to distinguish the gate from the type rejections above. No view is registered;
-/// the view-storage successor flips this to success deliberately.
-#[test]
-fn test_join_composite_two_pair_gated() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
-    let (mut client, sn) = make_planner(&srv);
-    let mut p = SqlPlanner::new(&mut client, &sn);
-
-    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)").unwrap();
-    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)").unwrap();
-
-    let err = must_err(p.execute(
-        "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.x = b.x AND a.y = b.y"));
+    let on = (0..n).map(|i| format!("a.c{i} = b.c{i}")).collect::<Vec<_>>().join(" AND ");
+    let err = must_err(p.execute(&format!("CREATE VIEW v AS SELECT * FROM a JOIN b ON {on}")));
     match err {
-        GnitzSqlError::Unsupported(s) => {
-            assert!(s.contains("composite") && s.contains("not yet supported"),
-                    "expected the composite-key gate message, got: {}", s);
-        }
+        GnitzSqlError::Unsupported(s) => assert!(
+            s.contains("equijoin key columns") && s.contains(&n.to_string()),
+            "expected the arity-cap message naming {n}, got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
     }
     assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "no view should be registered");
+}
+
+/// k = PK_LIST_MAX_COLS (the widest accepted composite key) registers cleanly,
+/// carrying a k-column synthetic `_join_pk`. Guards the accept side of the cap.
+#[test]
+fn test_join_max_arity_accepted() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let k = gnitz_core::PK_LIST_MAX_COLS;
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        let key_cols = (0..k).map(|i| format!("c{i} BIGINT NOT NULL")).collect::<Vec<_>>().join(", ");
+        p.execute(&format!("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})")).unwrap();
+        p.execute(&format!("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})")).unwrap();
+        let on = (0..k).map(|i| format!("a.c{i} = b.c{i}")).collect::<Vec<_>>().join(" AND ");
+        p.execute(&format!("CREATE VIEW v AS SELECT * FROM a JOIN b ON {on}")).unwrap();
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), (0..k).collect::<Vec<usize>>().as_slice(),
+        "the k synthetic _join_pk columns are the view PK");
+}
+
+/// k = 2 composite equijoin: the view registers with a 2-column synthetic
+/// `_join_pk`, and incremental INNER-join contents match a full recompute.
+/// (The prior fail-closed gate is removed; this is its deliberate successor.)
+#[test]
+fn test_join_composite_two_pair_inner_data() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, av BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(&mut client, &sn,
+        "CREATE VIEW v AS SELECT a.x, a.y, a.av, b.bv FROM a JOIN b ON a.x = b.x AND a.y = b.y");
+
+    // The view PK is the 2 synthetic join-key columns.
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), &[0, 1], "k=2 join PK is the two _join_pk columns");
+
+    // (x,y) matches: (10,100) a1·b1, (30,300) a3·b3. (20,*) differs in y → no match.
+    exec(&mut client, &sn,
+        "INSERT INTO a (id, x, y, av) VALUES (1, 10, 100, 1), (2, 20, 200, 2), (3, 30, 300, 3)");
+    exec(&mut client, &sn,
+        "INSERT INTO b (id, x, y, bv) VALUES (1, 10, 100, 11), (2, 20, 999, 22), (3, 30, 300, 33)");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["x", "y", "av", "bv"]),
+        vec![vec![10, 100, 1, 11], vec![30, 300, 3, 33]],
+        "INNER k=2 join keeps only rows agreeing on both key columns");
+
+    // Incremental: a later b row that completes the (20,200) pair must join in.
+    exec(&mut client, &sn, "INSERT INTO b (id, x, y, bv) VALUES (4, 20, 200, 44)");
+    assert_eq!(payload_rows(&mut client, &sn, "v", &["x", "y", "av", "bv"]),
+        vec![vec![10, 100, 1, 11], vec![20, 200, 2, 44], vec![30, 300, 3, 33]],
+        "incremental INNER join admits the newly-completed composite-key pair");
 }

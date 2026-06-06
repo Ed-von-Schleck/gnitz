@@ -411,3 +411,97 @@ class TestJoins:
             assert lids == set(range(1, n + 1)), f"unexpected lids: {lids}"
         finally:
             _cleanup(client, sn, tables=["left_t", "right_t"], views=["v"])
+
+    def test_inner_join_composite_key(self, client):
+        """Composite (k=2) equijoin `ON a.x = b.x AND a.y = b.y`. Only rows that
+        agree on BOTH key columns join; the view's PK is the 2-column synthetic
+        `_join_pk`. Includes an incremental insert that completes a pair."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, av BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.x, a.y, a.av, b.bv "
+                "FROM a JOIN b ON a.x = b.x AND a.y = b.y",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.pk_indices == [0, 1], "k=2 join PK is the two _join_pk columns"
+
+            # (10,100) and (30,300) match; (20,*) differs in y → no match.
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 10, 100, 1), (2, 20, 200, 2), (3, 30, 300, 3)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO b VALUES (1, 10, 100, 11), (2, 20, 999, 22), (3, 30, 300, 33)",
+                schema_name=sn,
+            )
+            rows = _scan_dicts(client, vid)
+            assert sorted((r["x"], r["y"], r["av"], r["bv"]) for r in rows) == [
+                (10, 100, 1, 11), (30, 300, 3, 33),
+            ], "INNER k=2 join keeps only rows agreeing on both key columns"
+
+            # Incremental: a b-row completing the (20,200) pair must join in.
+            client.execute_sql("INSERT INTO b VALUES (4, 20, 200, 44)", schema_name=sn)
+            rows = _scan_dicts(client, vid)
+            assert sorted((r["x"], r["y"], r["av"], r["bv"]) for r in rows) == [
+                (10, 100, 1, 11), (20, 200, 2, 44), (30, 300, 3, 33),
+            ], "incremental INNER join admits the newly-completed composite-key pair"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    @_NEEDS_MULTI
+    def test_inner_join_composite_key_multiworker(self, client):
+        """Composite (k=2) equijoin across multiple workers: the k-wide reindex
+        and exchange must co-locate rows that agree on the full (x, y) key. Both
+        sides are spread across hash buckets; every key value yields one match."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, av BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.x, a.y, a.av, b.bv "
+                "FROM a JOIN b ON a.x = b.x AND a.y = b.y",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            n = 20
+            a_vals = ", ".join(f"({i}, {i % 5}, {i % 7}, {i})" for i in range(1, n + 1))
+            # b carries the SAME (x, y) keys but distinct ids/payloads.
+            b_vals = ", ".join(f"({i + 100}, {i % 5}, {i % 7}, {i * 10})" for i in range(1, n + 1))
+            client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
+            client.execute_sql(f"INSERT INTO b VALUES {b_vals}", schema_name=sn)
+
+            rows = _scan_dicts(client, vid)
+            # Recompute the expected INNER join over the full (x, y) key.
+            a_rows = [(i % 5, i % 7, i) for i in range(1, n + 1)]
+            b_rows = [(i % 5, i % 7, i * 10) for i in range(1, n + 1)]
+            expected = sorted(
+                (ax, ay, av, bv)
+                for (ax, ay, av) in a_rows
+                for (bx, by, bv) in b_rows
+                if ax == bx and ay == by
+            )
+            got = sorted((r["x"], r["y"], r["av"], r["bv"]) for r in rows)
+            assert got == expected, "multi-worker composite join must match a full recompute"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])

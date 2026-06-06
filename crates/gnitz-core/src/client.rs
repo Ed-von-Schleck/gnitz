@@ -63,9 +63,9 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
 /// handles both the bare-scalar (pre-compound) row form and the packed
 /// compound form. Rejects a `decoded_count()` that doesn't match the
 /// returned slice length: that signals a malformed wire payload
-/// (count exceeding 4) that the server's `validate_pk_cols` would have
-/// rejected too — silently truncating here would hide the divergence
-/// from the client.
+/// (count exceeding `PK_LIST_MAX_COLS`) that the server's `validate_pk_cols`
+/// would have rejected too — silently truncating here would hide the
+/// divergence from the client.
 fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     let pkl = gnitz_wire::unpack_pk_cols(packed);
     let slice = pkl.as_slice();
@@ -76,7 +76,8 @@ fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     }
     if pkl.decoded_count() != slice.len() {
         return Err(ClientError::ServerError(format!(
-            "PK column count {} exceeds maximum 4", pkl.decoded_count()
+            "PK column count {} exceeds maximum {}",
+            pkl.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS
         )));
     }
     Ok(slice.iter().map(|&c| c as usize).collect())
@@ -350,9 +351,10 @@ impl GnitzClient {
         pk_cols: &[u32],
         unique_pk: bool,
     ) -> Result<u64, ClientError> {
-        if !(1..=4).contains(&pk_cols.len()) {
+        if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
             return Err(ClientError::ServerError(format!(
-                "create_table: PK column count {} out of range 1..=4", pk_cols.len(),
+                "create_table: PK column count {} out of range 1..={}",
+                pk_cols.len(), gnitz_wire::PK_LIST_MAX_COLS,
             )));
         }
 
@@ -482,6 +484,17 @@ impl GnitzClient {
             return Err(ClientError::ServerError(
                 "View must have at least one output column".into()
             ));
+        }
+        // Single choke point every view kind passes through: surface an over-wide
+        // output schema as a clean planner error before the DDL round-trip, rather
+        // than tripping the engine's build_schema_from_col_defs assert. (The JOIN
+        // path already rejects combined_cols > MAX_COLUMNS ahead of alloc_table_id;
+        // this covers plain projection, GROUP BY, set-op, and DISTINCT uniformly.)
+        if output_columns.len() > gnitz_wire::MAX_COLUMNS {
+            return Err(ClientError::ServerError(format!(
+                "View has {} output columns, exceeding the {}-column limit",
+                output_columns.len(), gnitz_wire::MAX_COLUMNS
+            )));
         }
         for &p in pk_cols {
             match output_columns.get(p as usize) {
@@ -905,18 +918,19 @@ mod tests {
 
     #[test]
     fn decode_pk_cols_rejects_overflow_count() {
-        // Hand-craft a packed value with the flag bit set and the count
-        // field claiming 5 columns. `as_slice()` clamps to 4 entries,
-        // but `decoded_count()` reports the malformed 5 — the client
-        // must surface that as an error instead of silently returning
-        // four columns.
-        let bad = gnitz_wire::PK_LIST_PACKED_FLAG | 5;
-        let err = decode_pk_cols(bad).expect_err("expected error on count=5");
+        // Craft a count one past the cap (still inside the 4-bit count field;
+        // the layout guard keeps PK_LIST_MAX_COLS ≤ 8). `as_slice()` clamps to
+        // PK_LIST_MAX_COLS, so the decoded_count/len divergence always fires and
+        // the client must surface it as an error instead of silently truncating.
+        let bad_count = gnitz_wire::PK_LIST_MAX_COLS + 1;
+        let bad = gnitz_wire::PK_LIST_PACKED_FLAG | bad_count as u64;
+        let err = decode_pk_cols(bad)
+            .expect_err(&format!("expected error on count={bad_count}"));
         match err {
-            ClientError::ServerError(s) => {
-                assert!(s.contains("5"), "expected '5' in message, got: {}", s);
-            }
-            other => panic!("expected ServerError, got {:?}", other),
+            ClientError::ServerError(s) => assert!(
+                s.contains(&bad_count.to_string()),
+                "expected '{bad_count}' in message, got: {s}"),
+            other => panic!("expected ServerError, got {other:?}"),
         }
     }
 }

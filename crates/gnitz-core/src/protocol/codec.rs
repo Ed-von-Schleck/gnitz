@@ -256,7 +256,7 @@ mod tests {
     fn test_batch_to_schema_too_many_pk_rejected() {
         use crate::protocol::error::ProtocolError;
         use crate::protocol::header::META_FLAG_IS_PK;
-        // MAX_PK_COLUMNS is 5; flag 6 columns as PK.
+        // PK_LIST_MAX_COLS is 4; flag 6 columns as PK.
         let mut batch = make_meta_batch(6);
         if let ColData::Fixed(ref mut v) = batch.columns[2] {
             for i in 0..6 {

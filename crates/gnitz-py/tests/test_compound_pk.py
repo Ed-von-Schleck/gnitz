@@ -293,18 +293,178 @@ def test_view_over_compound_pk_simple_select_accepted(client):
         _cleanup(client, sn, "src")
 
 
-def test_view_group_by_over_compound_pk_rejected(client):
+def _group_rows(client, vid, *cols):
+    """Read a view's named payload columns into a sorted list of tuples."""
+    rows = [r for r in client.scan(vid) if r.weight > 0]
+    return sorted(tuple(r[c] for c in cols) for r in rows)
+
+
+def test_view_group_by_over_compound_pk_accepted(client):
+    """GROUP BY over a compound-PK source is supported. Grouping by the full PK
+    (`group_set_eq_pk`) carries the compound PK through to the view; grouping by a
+    single PK component takes the single-natural-PK path. Both round-trip data;
+    the projected group columns are aliased so the payload copies read cleanly."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
-        _make_compound_table(client, sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, COUNT(*) AS n FROM src GROUP BY a",
-                schema_name=sn,
-            )
-        assert "compound" in str(exc.value).lower()
+        client.execute_sql(
+            "CREATE TABLE src (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        # Full-PK grouping → compound natural PK [0, 1].
+        client.execute_sql(
+            "CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n, SUM(v) AS s "
+            "FROM src GROUP BY a, b",
+            schema_name=sn,
+        )
+        # Single-component grouping → single natural PK [0]; aggregates across b.
+        client.execute_sql(
+            "CREATE VIEW g_part AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s "
+            "FROM src GROUP BY a",
+            schema_name=sn,
+        )
+        full_id, full_schema = client.resolve_table(sn, "g_full")
+        part_id, part_schema = client.resolve_table(sn, "g_part")
+        assert full_schema.pk_indices == [0, 1], "full-PK GROUP BY carries the compound PK"
+        assert part_schema.pk_indices == [0], "one-component GROUP BY → single natural PK"
+
+        client.execute_sql(
+            "INSERT INTO src (a, b, v) VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)",
+            schema_name=sn,
+        )
+        assert _group_rows(client, full_id, "ka", "kb", "n", "s") == [
+            (1, 1, 1, 10), (1, 2, 1, 20), (2, 1, 1, 30),
+        ]
+        assert _group_rows(client, part_id, "ka", "n", "s") == [
+            (1, 2, 30), (2, 1, 30),
+        ]
+
+        # Incremental: a new row under a=1 lifts that group's count/sum; the
+        # singleton full-PK view gains a row.
+        client.execute_sql("INSERT INTO src (a, b, v) VALUES (1, 3, 40)", schema_name=sn)
+        assert _group_rows(client, part_id, "ka", "n", "s") == [(1, 3, 70), (2, 1, 30)]
     finally:
+        for v in ("g_full", "g_part"):
+            try:
+                client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
+            except Exception:
+                pass
+        _cleanup(client, sn, "src")
+
+
+def test_view_group_by_compound_pk_permuted(client):
+    """GROUP BY b, a permutes the PK in the grouping list, but the reduce output
+    PK region is always source-PK order [a, b]. Values are chosen so a transposed
+    a/b mapping would be observable."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW gp AS SELECT a AS ka, b AS kb, SUM(v) AS s "
+            "FROM src GROUP BY b, a",
+            schema_name=sn,
+        )
+        vid, schema = client.resolve_table(sn, "gp")
+        assert schema.pk_indices == [0, 1], "permuted full-PK GROUP BY keeps source-order PK"
+        client.execute_sql(
+            "INSERT INTO src (a, b, v) VALUES (1, 7, 100), (2, 8, 200)", schema_name=sn,
+        )
+        # 'ka' must carry a's values and 'kb' carry b's — not transposed.
+        assert _group_rows(client, vid, "ka", "kb", "s") == [(1, 7, 100), (2, 8, 200)]
+    finally:
+        try:
+            client.execute_sql("DROP VIEW gp", schema_name=sn)
+        except Exception:
+            pass
+        _cleanup(client, sn, "src")
+
+
+def test_view_group_by_compound_pk_having(client):
+    """HAVING referencing a compound-PK group column by source name binds to the
+    correct reduce column. Values make an a-filter and a b-filter select different
+    groups, so a mis-binding would be observable."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW gh AS SELECT a AS ka, b AS kb, SUM(v) AS s "
+            "FROM src GROUP BY a, b HAVING a > 1",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "gh")[0]
+        client.execute_sql(
+            "INSERT INTO src (a, b, v) VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30)",
+            schema_name=sn,
+        )
+        # HAVING a > 1 keeps (2,2) and (3,1). A b>1 mis-binding would keep only (2,2).
+        assert _group_rows(client, vid, "ka", "kb", "s") == [(2, 2, 20), (3, 1, 30)]
+    finally:
+        try:
+            client.execute_sql("DROP VIEW gh", schema_name=sn)
+        except Exception:
+            pass
+        _cleanup(client, sn, "src")
+
+
+@_NEEDS_MULTI
+def test_view_group_by_compound_pk_multiworker(client):
+    """Change-C regression: a reduce sharding by ONE component of a compound PK
+    must run the in-circuit exchange (the source is partitioned by the FULL PK, so
+    same-`a` rows live on different workers). The old analyzers wrongly skipped it,
+    so each worker reduced a partial group — wrong only under multiple workers."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        # GROUP BY a (one PK component): the path the old analyzers wrongly skipped.
+        client.execute_sql(
+            "CREATE VIEW g_part AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s "
+            "FROM src GROUP BY a",
+            schema_name=sn,
+        )
+        # GROUP BY a, b (full PK, the co-partition-skip path): singletons.
+        client.execute_sql(
+            "CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n "
+            "FROM src GROUP BY a, b",
+            schema_name=sn,
+        )
+        part_id = client.resolve_table(sn, "g_part")[0]
+        full_id = client.resolve_table(sn, "g_full")[0]
+        # Repeated `a` across distinct `b` so same-`a` rows scatter by full-PK hash.
+        client.execute_sql(
+            "INSERT INTO src (a, b, v) VALUES "
+            "(1, 1, 10), (1, 2, 20), (1, 3, 30), (2, 1, 40), (2, 2, 50), (3, 1, 60)",
+            schema_name=sn,
+        )
+        # GROUP BY a must aggregate ACROSS workers: one row per a, full count/sum.
+        assert _group_rows(client, part_id, "ka", "n", "s") == [
+            (1, 3, 60), (2, 2, 90), (3, 1, 60),
+        ], "compound-PK GROUP BY a must aggregate every b across all workers"
+        # Full-PK grouping: 6 singleton groups, count 1 each.
+        assert _group_rows(client, full_id, "ka", "kb", "n") == [
+            (1, 1, 1), (1, 2, 1), (1, 3, 1), (2, 1, 1), (2, 2, 1), (3, 1, 1),
+        ]
+    finally:
+        for v in ("g_part", "g_full"):
+            try:
+                client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
+            except Exception:
+                pass
         _cleanup(client, sn, "src")
 
 

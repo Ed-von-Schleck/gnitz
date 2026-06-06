@@ -453,8 +453,9 @@ fn create_compound_pk_table(client: &mut GnitzClient, sn: &str, table: &str) {
 #[test]
 fn test_view_over_compound_pk_simple_select_accepted() {
     // A plain projection passes the full source PK through to the leading output
-    // slots; the view carries the source's compound PK. (GROUP BY and JOIN over a
-    // compound-PK source are still rejected — see the tests below.)
+    // slots; the view carries the source's compound PK. (GROUP BY over a
+    // compound-PK source is accepted too — see below; JOIN over a compound-PK
+    // *source* is still rejected — see the test further down.)
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "cv_src");
@@ -467,18 +468,58 @@ fn test_view_over_compound_pk_simple_select_accepted() {
 }
 
 #[test]
-fn test_view_over_compound_pk_group_by_rejected() {
+fn test_view_over_compound_pk_group_by_accepted() {
+    // GROUP BY over a compound-PK source is now supported. Grouping by the full
+    // PK (`group_set_eq_pk`) carries the compound PK through to the view; grouping
+    // by a single component takes the single-natural-PK path and registers `[0]`.
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "cv_src3");
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE VIEW cv_g AS SELECT a, COUNT(*) AS n FROM cv_src3 GROUP BY a"
-    ));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // Full-PK grouping → compound natural PK `[0, 1]`.
+        p.execute("CREATE VIEW cv_gfull AS SELECT a, b, COUNT(*) AS n \
+                   FROM cv_src3 GROUP BY a, b").unwrap();
+        // Single-component grouping → single natural PK `[0]`.
+        p.execute("CREATE VIEW cv_gone AS SELECT a, COUNT(*) AS n \
+                   FROM cv_src3 GROUP BY a").unwrap();
     }
+    let (_, sf) = client.resolve_table_or_view_id(&sn, "cv_gfull").unwrap();
+    assert_eq!(sf.pk_indices(), &[0, 1], "GROUP BY full compound PK carries it through");
+    let (_, so) = client.resolve_table_or_view_id(&sn, "cv_gone").unwrap();
+    assert_eq!(so.pk_indices(), &[0], "GROUP BY one PK component → single natural PK");
+}
+
+#[test]
+fn test_view_over_compound_pk_too_wide_rejected() {
+    // The uniform client guard in write_circuit_rows must reject a view whose
+    // output column count exceeds MAX_COLUMNS (65) cleanly, never tripping the
+    // engine's build_schema_from_col_defs assert. A compound-PK source plus a
+    // re-selection of both PK columns as extra payload pushes SELECT * (64 cols)
+    // to 66 output columns.
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    // 2 PK columns + 62 payload = 64 source columns.
+    let payload = (0..62).map(|i| format!("c{i} BIGINT NOT NULL")).collect::<Vec<_>>().join(", ");
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(&format!(
+            "CREATE TABLE wide (a BIGINT UNSIGNED, b BIGINT UNSIGNED, {payload}, PRIMARY KEY (a, b))"
+        )).unwrap();
+    }
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    // SELECT * (64) + the two PK columns re-emitted under new names = 66 > 65.
+    let err = must_err(p.execute(
+        "CREATE VIEW wv AS SELECT *, a AS da, b AS db FROM wide"));
+    match err {
+        GnitzSqlError::Exec(e) => {
+            let s = format!("{:?}", e);
+            assert!(s.contains("output columns") && s.contains("limit"),
+                    "expected the column-limit guard message, got: {}", s);
+        }
+        e => panic!("expected Exec (client column-limit guard), got {:?}", e),
+    }
+    assert!(client.resolve_table_or_view_id(&sn, "wv").is_err(), "no view should be registered");
 }
 
 #[test]

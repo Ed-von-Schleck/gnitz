@@ -188,3 +188,135 @@ fn test_having_binds_correct_aggregate() {
     assert_eq!(m2, 9, "surviving group must be the one with MAX(c2)=9");
     assert_eq!(g, 2, "surviving group must be g=2");
 }
+
+// ── GROUP BY over a compound-PK source ───────────────────────────────
+//
+// The reduce output carries the source PK in its 0..k region (source-PK order),
+// so a GROUP BY view over a compound-PK table persists a real multi-column PK.
+// Grouping by the full PK is `group_set_eq_pk` (each group a singleton); grouping
+// by one PK component is the single-natural path that actually aggregates.
+//
+// Reads use aliased projected group columns (ka/kb): the SELECT * result batch
+// keeps PK-region values in `batch.pks` (OPK-encoded), leaving the PK-region
+// `columns` slots empty. The post-reduce MAP re-emits each selected group column
+// as a payload column via the PK-region COPY_COL byte-decode, so reading the
+// aliased payload copy both retrieves the value and exercises that decode.
+
+#[test]
+fn test_group_by_compound_pk_full_and_partial() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b))");
+    // Full-PK grouping → compound natural PK [0, 1]; each (a,b) group a singleton.
+    exec(&mut client, &sn,
+        "CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY a, b");
+    // One-component grouping → single natural PK [0]; aggregates across b.
+    exec(&mut client, &sn,
+        "CREATE VIEW g_part AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY a");
+
+    let (_, sf) = client.resolve_table_or_view_id(&sn, "g_full").unwrap();
+    assert_eq!(sf.pk_indices(), &[0, 1], "full-PK GROUP BY carries the compound PK");
+    let (_, sp) = client.resolve_table_or_view_id(&sn, "g_part").unwrap();
+    assert_eq!(sp.pk_indices(), &[0], "one-component GROUP BY → single natural PK");
+
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, v) VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)");
+
+    assert_eq!(payload_rows(&mut client, &sn, "g_full", &["ka", "kb", "n", "s"]),
+        vec![vec![1, 1, 1, 10], vec![1, 2, 1, 20], vec![2, 1, 1, 30]],
+        "full-PK groups are singletons with the source PK passed through");
+    assert_eq!(payload_rows(&mut client, &sn, "g_part", &["ka", "n", "s"]),
+        vec![vec![1, 2, 30], vec![2, 1, 30]],
+        "a=1 aggregates the two b-rows (n=2, s=30); a=2 has one (n=1, s=30)");
+}
+
+#[test]
+fn test_group_by_compound_pk_permuted() {
+    // GROUP BY b, a permutes the PK in the grouping list, but the reduce output PK
+    // region is always source-PK order [a, b]. If the helper mapped by GROUP BY
+    // order instead, the a/b output values would transpose — values are chosen so
+    // that transposition is observable.
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b))");
+    exec(&mut client, &sn,
+        "CREATE VIEW gp AS SELECT a AS ka, b AS kb, SUM(v) AS s FROM t GROUP BY b, a");
+
+    let (_, s) = client.resolve_table_or_view_id(&sn, "gp").unwrap();
+    assert_eq!(s.pk_indices(), &[0, 1], "permuted full-PK GROUP BY still carries source-order PK");
+
+    // a ∈ {1,2}, b ∈ {7,8}; the (a,b) pairing must survive the permutation.
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, v) VALUES (1, 7, 100), (2, 8, 200)");
+    assert_eq!(payload_rows(&mut client, &sn, "gp", &["ka", "kb", "s"]),
+        vec![vec![1, 7, 100], vec![2, 8, 200]],
+        "output 'ka' carries a's values and 'kb' carries b's — not transposed");
+}
+
+#[test]
+fn test_having_over_compound_natural_pk() {
+    // HAVING references a compound-PK group column by name; it must bind to the
+    // correct reduce column via the shared helper. Values make an a-filter and a
+    // b-filter select different groups, so a mis-binding would be observable.
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b))");
+    exec(&mut client, &sn,
+        "CREATE VIEW gh AS SELECT a AS ka, b AS kb, SUM(v) AS s FROM t GROUP BY a, b HAVING a > 1");
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, v) VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30)");
+    // HAVING a > 1 keeps (2,2) and (3,1). (A b>1 mis-binding would keep only (2,2).)
+    assert_eq!(payload_rows(&mut client, &sn, "gh", &["ka", "kb", "s"]),
+        vec![vec![2, 2, 20], vec![3, 1, 30]],
+        "HAVING binds to group column 'a', not 'b'");
+}
+
+// Change C regression: a reduce that shards by one component of a compound PK
+// must run the in-circuit exchange (the source is partitioned by the FULL PK, so
+// same-`a` rows live on different workers). With the old analyzers the exchange
+// was skipped and each worker reduced a partial group — wrong only under W>1.
+// MUST run multi-worker.
+#[test]
+fn test_group_by_compound_pk_multiworker() {
+    let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b))");
+    // GROUP BY a (one PK component): the path the old analyzers wrongly skipped.
+    exec(&mut client, &sn,
+        "CREATE VIEW g_part AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY a");
+    // GROUP BY a, b (full PK, the co-partition-skip path): each group a singleton.
+    exec(&mut client, &sn,
+        "CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t GROUP BY a, b");
+    // GROUP BY b, a (PERMUTED full PK): group_set_eq_pk shards in PK order, so the
+    // view stays partitioned by its real PK (a, b). Without the PK-order shard
+    // normalization the shuffle hash-routes by (b, a) and the gather drops the
+    // rows that hashed to a different worker than their PK home — wrong only W>1.
+    exec(&mut client, &sn,
+        "CREATE VIEW g_perm AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t GROUP BY b, a");
+
+    // Repeated `a` across distinct `b` so same-`a` rows scatter by full-PK hash.
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, v) VALUES \
+         (1, 1, 10), (1, 2, 20), (1, 3, 30), (2, 1, 40), (2, 2, 50), (3, 1, 60)");
+
+    // GROUP BY a must aggregate ACROSS workers: one row per a with the full count.
+    let part = payload_rows(&mut client, &sn, "g_part", &["ka", "n", "s"]);
+    assert_eq!(part, vec![vec![1, 3, 60], vec![2, 2, 90], vec![3, 1, 60]],
+        "compound-PK GROUP BY a aggregates every b across all workers");
+    assert_eq!(part.len(), 3, "exactly one row per distinct a — no per-worker partial groups");
+
+    // GROUP BY full PK and its permutation: 6 singleton groups, count 1 each. The
+    // permuted view must return the SAME complete set (no rows dropped on gather).
+    let expected_singletons =
+        vec![vec![1,1,1], vec![1,2,1], vec![1,3,1], vec![2,1,1], vec![2,2,1], vec![3,1,1]];
+    let full = payload_rows(&mut client, &sn, "g_full", &["ka", "kb", "n"]);
+    assert_eq!(full, expected_singletons,
+        "full-PK GROUP BY is co-partitioned and stays correct");
+    let perm = payload_rows(&mut client, &sn, "g_perm", &["ka", "kb", "n"]);
+    assert_eq!(perm, expected_singletons,
+        "permuted full-PK GROUP BY shards in PK order — no rows dropped under W>1");
+}

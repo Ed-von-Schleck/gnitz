@@ -299,3 +299,59 @@ class TestLeftJoin:
             client.execute_sql("DROP TABLE customers", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+    def test_left_join_composite_key(self, client):
+        """Composite (k=2) LEFT JOIN `ON a.x = b.x AND a.y = b.y`: a left row that
+        matches on both key columns carries the right payload; one that matches on
+        neither (or only one) gets a NULL-filled right side."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, av BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
+                "y BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.x, a.y, a.av, b.bv "
+                "FROM a LEFT JOIN b ON a.x = b.x AND a.y = b.y",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.pk_indices == [0, 1], "k=2 LEFT join PK is the two _join_pk columns"
+
+            # b matches (10,100) and (30,300); (20,200) has no right match.
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 10, 100, 1), (2, 20, 200, 2), (3, 30, 300, 3)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO b VALUES (1, 10, 100, 11), (3, 30, 300, 33)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {(r["x"], r["y"]): r["bv"] for r in rows}
+            assert by_key == {(10, 100): 11, (20, 200): None, (30, 300): 33}, (
+                "matched left rows carry b.bv; the unmatched (20,200) row is NULL-filled"
+            )
+
+            # Incremental: insert the completing b-row → (20,200) becomes a real
+            # match and the NULL-fill is retracted.
+            client.execute_sql("INSERT INTO b VALUES (4, 20, 200, 44)", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {(r["x"], r["y"]): r["bv"] for r in rows}
+            assert by_key == {(10, 100): 11, (20, 200): 44, (30, 300): 33}, (
+                "a later matching b-row replaces the NULL-fill with the real join row"
+            )
+        finally:
+            for stmt in ("DROP VIEW v", "DROP TABLE a", "DROP TABLE b"):
+                try:
+                    client.execute_sql(stmt, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)

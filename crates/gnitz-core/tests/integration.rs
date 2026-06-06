@@ -1,5 +1,7 @@
 #![cfg(feature = "integration")]
 
+use std::sync::Arc;
+
 use gnitz_core::{Connection, SCHEMA_TAB, FIRST_USER_TABLE_ID};
 use gnitz_core::{GnitzClient, ExprBuilder, CircuitBuilder};
 use gnitz_core::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, PkColumn};
@@ -7,8 +9,9 @@ use gnitz_test_harness::ServerHandle;
 
 /// Build a fresh schema cache for tests that drive `Connection` directly.
 /// The production client (`GnitzClient`) owns this cache; raw-`Connection`
-/// callers must supply their own.
-fn fresh_cache() -> lru::LruCache<u64, (Schema, u16)> {
+/// callers must supply their own. The cache shares the decoded schema via
+/// `Arc`, matching the `Connection` push/scan signature.
+fn fresh_cache() -> lru::LruCache<u64, (Arc<Schema>, u16)> {
     lru::LruCache::new(std::num::NonZeroUsize::new(64).unwrap())
 }
 
@@ -387,7 +390,7 @@ fn test_filter_view() {
     let circuit = cb.build();
 
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
-    client.create_view_with_circuit("sv1", "filter_v", "", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv1", "filter_v", "", circuit, &table_schema.columns, &[0]).unwrap();
 
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(1u64, 10i64), (2, 30), (3, 50), (4, 70), (5, 90)] {
@@ -440,7 +443,7 @@ fn test_reduce_view() {
         ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    client.create_view_with_circuit("sv2", "reduce_v", "", circuit, &out_cols).unwrap();
+    client.create_view_with_circuit("sv2", "reduce_v", "", circuit, &out_cols, &[0]).unwrap();
 
     let table_schema = Schema { columns: cols, pk_cols: vec![0] };
     let mut batch = ZSetBatch::new(&table_schema);
@@ -509,7 +512,7 @@ fn test_join_view() {
         ColumnDef { name: "val_a".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val_b".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    client.create_view_with_circuit("sv3", "join_v", "", circuit, &view_cols).unwrap();
+    client.create_view_with_circuit("sv3", "join_v", "", circuit, &view_cols, &[0]).unwrap();
 
     // Push A rows: pk=1 (matches B), pk=4 (no match)
     let mut batch_a = ZSetBatch::new(&table_schema);
@@ -565,7 +568,7 @@ fn test_anti_join_view() {
     cb.sink(anti);
     let circuit = cb.build();
 
-    client.create_view_with_circuit("sv4", "antijoin_v", "", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv4", "antijoin_v", "", circuit, &table_schema.columns, &[0]).unwrap();
 
     // Push A rows: pk=1,2,3; only pk=3 has no match in B
     let mut batch_a = ZSetBatch::new(&table_schema);
@@ -654,7 +657,7 @@ fn test_incremental_update() {
         ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
-    client.create_view_with_circuit("sv6", "incr_v", "", circuit, &out_cols).unwrap();
+    client.create_view_with_circuit("sv6", "incr_v", "", circuit, &out_cols, &[0]).unwrap();
 
     // Tick 1: push pk=1,2 (group=1, vals=10,20) and pk=3,4 (group=2, vals=30,40)
     let mut batch = ZSetBatch::new(&table_schema);
@@ -731,7 +734,7 @@ fn test_bulk_filter() {
     let f   = cb.filter(inp, Some(expr));
     cb.sink(f);
     let circuit = cb.build();
-    client.create_view_with_circuit("bf1", "bfv1", "", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("bf1", "bfv1", "", circuit, &table_schema.columns, &[0]).unwrap();
 
     // Push 100 000 rows: pk=i, val=i
     let mut batch = ZSetBatch::new(&table_schema);
@@ -838,7 +841,7 @@ fn test_left_join_view() {
         ColumnDef { name: "val_a".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "val_b".into(), type_code: TypeCode::I64, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
     ];
-    client.create_view_with_circuit("sv7", "lj_v", "", circuit, &out_cols).unwrap();
+    client.create_view_with_circuit("sv7", "lj_v", "", circuit, &out_cols, &[0]).unwrap();
 
     // Push A: pk=1 matches B (val_b=100), pk=2 has no match in B
     let mut batch_a = ZSetBatch::new(&schema_a);
@@ -902,7 +905,7 @@ fn test_distinct_view() {
     cb.sink(deduped);
     let circuit = cb.build();
 
-    client.create_view_with_circuit("sv8", "distinct_v", "", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv8", "distinct_v", "", circuit, &table_schema.columns, &[0]).unwrap();
 
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(1u64, 10i64), (2, 20), (3, 30)] {
@@ -957,7 +960,7 @@ fn test_min_max_aggregate_view() {
         let inp = cb.input_delta();
         let red = cb.reduce(inp, &[1], 3, 2);
         cb.sink(red);
-        client.create_view_with_circuit("sv9", "min_v", "", cb.build(), &agg_out_cols("min_val")).unwrap();
+        client.create_view_with_circuit("sv9", "min_v", "", cb.build(), &agg_out_cols("min_val"), &[0]).unwrap();
     }
 
     // MAX view (agg_func_id = 4)
@@ -967,7 +970,7 @@ fn test_min_max_aggregate_view() {
         let inp = cb.input_delta();
         let red = cb.reduce(inp, &[1], 4, 2);
         cb.sink(red);
-        client.create_view_with_circuit("sv9", "max_v", "", cb.build(), &agg_out_cols("max_val")).unwrap();
+        client.create_view_with_circuit("sv9", "max_v", "", cb.build(), &agg_out_cols("max_val"), &[0]).unwrap();
     }
 
     // group=1: vals [10, 5, 20] → min=5, max=20

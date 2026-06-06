@@ -378,10 +378,10 @@ fn execute_create_table(
             "CREATE TABLE requires at least one PRIMARY KEY column".into()
         ));
     }
-    if pk_indices.len() > 4 {
-        return Err(GnitzSqlError::Unsupported(
-            "PRIMARY KEY supports at most 4 columns".into()
-        ));
+    if pk_indices.len() > gnitz_core::PK_LIST_MAX_COLS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "PRIMARY KEY supports at most {} columns", gnitz_core::PK_LIST_MAX_COLS
+        )));
     }
     for &i in &pk_indices {
         let tc = cols[i as usize].type_code;
@@ -916,24 +916,7 @@ fn execute_create_join_view(
     let (left_join_cols, right_join_cols) = extract_equijoin_keys(
         on_expr, &left_schema, &right_schema, &alias_map,
     )?;
-    let k = left_join_cols.len();   // == right_join_cols.len(), 1..=MAX_PK_COLUMNS
-
-    // Composite (k ≥ 2) keys build a k-wide synthetic `_join_pk` PK region. View
-    // storage can now persist a multi-column view PK, but this join path still
-    // registers its view with `pk_cols = [0]` and does not lift the compound-PK
-    // source guard above, so a k ≥ 2 join view cannot be described end-to-end yet.
-    // Reject here so the feature fails closed at the planner with a clean error —
-    // before `alloc_table_id` or any circuit build, so no table id is consumed and
-    // no broken view is committed. Removing this gate requires registering the
-    // join view with `pk_cols = 0..k`; the k-generalized circuit below is already
-    // in place behind it and is exercised at the extraction level by the in-module
-    // unit tests.
-    if k > 1 {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "JOIN ON: composite ({k}-column) equijoin keys are not yet supported \
-             (the join view must register a multi-column output PK first); \
-             use a single equijoin key column")));
-    }
+    let k = left_join_cols.len();   // == right_join_cols.len(), 1..=PK_LIST_MAX_COLS
 
     // The merged join output is [k _join_pk cols, left cols..., right cols...].
     // Reject before the server's schema build hits its hard column-count assertion.
@@ -1170,8 +1153,10 @@ fn execute_create_join_view(
     cb.sink(sink_input);
     let circuit = cb.build();
 
-    // GROUP BY views still emit a single synthetic/natural output PK at slot 0.
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &[0])
+    // The view's physical PK is the k synthetic `_join_pk` columns at slots 0..k
+    // (final_cols lists them first). At k = 1 this is the existing single `[0]`.
+    let view_pk: Vec<u32> = (0..k as u32).collect();
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -1275,13 +1260,15 @@ fn extract_equijoin_keys(
         return Err(GnitzSqlError::Bind(
             "JOIN ON must have at least one equijoin predicate".into()));
     }
-    // Each reindex key column occupies one PK slot; the engine's ReindexPacker
-    // hard-asserts the slot count against MAX_PK_COLUMNS. Reject here so an
-    // over-wide ON conjunction fails as a clean planner error, not a worker panic.
-    if left_cols.len() > gnitz_core::MAX_PK_COLUMNS {
+    // Each equijoin key column becomes one synthetic `_join_pk` output PK slot,
+    // persisted through the PK-list codec, which holds at most PK_LIST_MAX_COLS
+    // columns — the same cap CREATE TABLE enforces. Reject a wider ON conjunction
+    // here as a clean planner error rather than a `pack_pk_cols` panic at
+    // registration.
+    if left_cols.len() > gnitz_core::PK_LIST_MAX_COLS {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: at most {} equijoin key columns are supported (got {})",
-            gnitz_core::MAX_PK_COLUMNS, left_cols.len())));
+            gnitz_core::PK_LIST_MAX_COLS, left_cols.len())));
     }
     Ok((left_cols, right_cols))
 }
@@ -1395,6 +1382,36 @@ enum GroupBySelectItem {
     Aggregate { agg_idx: usize },
 }
 
+/// Reduce-output column index for a group column `src_col`, mirroring the
+/// reduce output schema and the engine's `build_reduce_output_schema`:
+///
+/// * `group_set_eq_pk` — the PK region holds the source PK columns in source-PK
+///   order; locate `src_col` there.
+/// * `single_col_natural_pk` — the lone group col is the PK at index 0.
+/// * synthetic `_group_pk` — group cols follow the U128 PK, in GROUP BY order.
+///
+/// The branch order mirrors `build_reduce_output_schema`'s decision tree
+/// (`group_set_eq_pk` → `single_col_natural_pk` → synthetic) so the helper and
+/// the reduce-schema build cannot drift. When both natural-PK flags hold
+/// (grouping by a single-column PK) both branches return 0, so correctness does
+/// not depend on the order.
+fn group_col_reduce_pos(
+    src_col:               usize,
+    group_set_eq_pk:       bool,
+    single_col_natural_pk: bool,
+    source_schema:         &Schema,
+    group_col_indices:     &[usize],
+) -> usize {
+    if group_set_eq_pk {
+        source_schema.pk_cols.iter().position(|&pi| pi == src_col)
+            .expect("group_set_eq_pk: every group col is a source PK col")
+    } else if single_col_natural_pk {
+        0
+    } else {
+        1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap()
+    }
+}
+
 fn execute_create_group_by_view(
     client:      &mut GnitzClient,
     schema_name: &str,
@@ -1406,7 +1423,12 @@ fn execute_create_group_by_view(
     // 1. Resolve source table
     let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-    reject_compound_pk_view_source(&source_schema)?;
+    // The compound-PK source guard is intentionally NOT applied here: the engine
+    // reduce output already emits a full compound natural-PK region
+    // (`build_reduce_output_schema` walks `pk_columns()` for `group_set_eq_pk`),
+    // the helpers below map group columns through `group_col_reduce_pos`, and the
+    // co-partition analyzers now compare the full PK sequence — so a reduce that
+    // shards by one component of a compound PK gets the exchange it needs.
 
     // 2. Parse GROUP BY → group column indices
     let group_exprs = match &select.group_by {
@@ -1565,7 +1587,6 @@ fn execute_create_group_by_view(
     //    output column positions silently.
     let group_set_eq_pk = source_schema.group_cols_eq_pk(&group_col_indices);
     let single_col_natural_pk = source_schema.is_single_col_natural_pk(&group_col_indices);
-    let use_natural_pk = group_set_eq_pk || single_col_natural_pk;
 
     // Build the reduce output schema (mirrors server's _build_reduce_output_schema).
     let mut reduce_schema_cols: Vec<ColumnDef> = Vec::new();
@@ -1587,14 +1608,10 @@ fn execute_create_group_by_view(
             reduce_schema_cols.push(source_schema.columns[gi].clone());
         }
     }
-    // First aggregate column lives immediately after the PK + (synthetic)
-    // group cols — the synthetic path adds the group cols as payload, the
-    // natural paths don't.
-    let agg_col_offset = if use_natural_pk {
-        reduce_schema_cols.len()
-    } else {
-        1 + group_col_indices.len()
-    };
+    // The aggregate columns are pushed next, so they start at the current width
+    // of the reduce schema: the PK region plus, on the synthetic path only, the
+    // group cols carried as payload.
+    let agg_col_offset = reduce_schema_cols.len();
     for &(op, col) in &agg_specs {
         // Mirror the engine's agg_output_type so the planner's virtual schema
         // matches the compiler's physical reduce schema (F64 for float SUM/MIN/MAX).
@@ -1627,8 +1644,29 @@ fn execute_create_group_by_view(
         inp
     };
 
-    // REDUCE — always use multi-agg path
-    let reduced = cb.reduce_multi(filtered, &group_col_indices, &agg_specs);
+    // REDUCE — always use multi-agg path.
+    //
+    // For `group_set_eq_pk`, shard/reindex the reduce by the group columns in
+    // source-PK (schema) order, not the user's GROUP BY order. The groups are
+    // identical under any permutation of the PK (each group is a PK singleton),
+    // and `build_reduce_output_schema` emits the output PK in source-PK order
+    // regardless — so this only normalizes the shard key. Without it a permuted
+    // grouping (e.g. `GROUP BY pk1, pk0`) shards by a non-PK-order key: the
+    // co-partition analyzer (correctly) declines to skip the exchange, the
+    // shuffle hash-routes by `[pk1, pk0]`, and the reduce output lands
+    // partitioned by `hash(pk1, pk0)` rather than by the view's declared PK
+    // `(pk0, pk1)` — so the multi-worker gather drops the rows that hashed to a
+    // different worker. Sharding in PK order keeps the reduce co-partitioned with
+    // the source (the exchange is skipped, or routes by `partition_for_pk_bytes`),
+    // so the view stays partitioned by its real PK. The non-eq-pk paths keep the
+    // user order: their synthetic/single-natural PK and reduce layout depend on
+    // it (`group_col_reduce_pos`'s synthetic branch indexes by GROUP BY order).
+    let reduce_group_cols: Vec<usize> = if group_set_eq_pk {
+        source_schema.pk_cols.clone()
+    } else {
+        group_col_indices.clone()
+    };
+    let reduced = cb.reduce_multi(filtered, &reduce_group_cols, &agg_specs);
 
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
     //    Reduce output: [pk, (group_cols...), agg0, agg1, ...]
@@ -1638,26 +1676,31 @@ fn execute_create_group_by_view(
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     let mut payload_idx: u32 = 0;
 
-    // PK column in output schema (inherited by MAP, not written by ExprProgram)
-    out_cols.push(reduce_schema.columns[0].clone());
+    // PK region in the output schema (inherited by MAP, not written by ExprProgram):
+    // the full source PK in source-PK order for a compound natural PK; the lone
+    // leading column for the single-natural / synthetic paths. `reduce_schema.pk_cols`
+    // is dense (`0..pk_count`), so the leading columns are exactly the PK region.
+    out_cols.extend(
+        reduce_schema.columns[..reduce_schema.pk_cols.len()].iter().cloned()
+    );
 
     for si in &select_items {
         match si {
             GroupBySelectItem::GroupCol { src_col, name } => {
-                // Find group col position in reduce output
-                let reduce_col = if use_natural_pk {
-                    0 // natural PK: group col is at index 0 (same as PK)
-                } else {
-                    // synthetic PK: group cols start at index 1
-                    1 + group_col_indices.iter().position(|&gi| gi == *src_col).unwrap()
-                };
+                // Find group col position in reduce output (routed through the
+                // shared helper so SELECT and HAVING cannot drift on the
+                // source-PK-order mapping a permuted `group_set_eq_pk` needs).
+                let reduce_col = group_col_reduce_pos(
+                    *src_col, group_set_eq_pk, single_col_natural_pk,
+                    &source_schema, &group_col_indices);
                 let tc = reduce_schema.columns[reduce_col].type_code;
                 post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
                 out_cols.push(ColumnDef {
                     name: name.clone(),
                     type_code: tc,
-                    // Natural-PK path: source col is non-nullable (asserted by use_natural_pk).
-                    // Synthetic-PK path: propagate source nullability — nothing forces NOT NULL.
+                    // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
+                    // the source col is non-nullable. Synthetic-PK path: propagate
+                    // source nullability — nothing forces NOT NULL.
                     is_nullable: source_schema.columns[*src_col].is_nullable,
                     fk_table_id: 0,
                     fk_col_idx:  0,
@@ -1720,10 +1763,11 @@ fn execute_create_group_by_view(
     //    SELECT aliases or omission) and aggregates that are not projected.
     let filtered_reduced = if let Some(having_expr) = &select.having {
         let bound = bind_having_expr(having_expr, &HavingCtx {
-            source_schema:     &source_schema,
-            group_col_indices: &group_col_indices,
-            use_natural_pk,
-            agg_mappings:      &agg_mappings,
+            source_schema:         &source_schema,
+            group_col_indices:     &group_col_indices,
+            group_set_eq_pk,
+            single_col_natural_pk,
+            agg_mappings:          &agg_mappings,
             agg_col_offset,
         })?;
         let mut heb = ExprBuilder::new();
@@ -1740,8 +1784,11 @@ fn execute_create_group_by_view(
     cb.sink(mapped);
     let circuit = cb.build();
 
-    // JOIN views emit a single synthetic join-key output PK at slot 0.
-    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &[0])
+    // The view's physical PK is the reduce output's PK region: the full source
+    // PK (source-PK order) for a compound natural PK, else the lone leading
+    // column. `reduce_schema.pk_cols` is dense (`0..pk_count`).
+    let view_pk: Vec<u32> = (0..reduce_schema.pk_cols.len() as u32).collect();
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -1864,11 +1911,12 @@ fn collect_having_aggs(
 /// itself is not needed for binding — the caller compiles the bound expression
 /// against it separately.)
 struct HavingCtx<'a> {
-    source_schema:     &'a Schema,
-    group_col_indices: &'a [usize],
-    use_natural_pk:    bool,
-    agg_mappings:      &'a [AggMapping],
-    agg_col_offset:    usize,
+    source_schema:         &'a Schema,
+    group_col_indices:     &'a [usize],
+    group_set_eq_pk:       bool,
+    single_col_natural_pk: bool,
+    agg_mappings:          &'a [AggMapping],
+    agg_col_offset:        usize,
 }
 
 /// Bind a HAVING expression against the reduce-output (grouped) relation —
@@ -1888,12 +1936,17 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
                 .ok_or_else(|| GnitzSqlError::Bind(
                     format!("HAVING: column '{}' not found", col_name)
                 ))?;
-            let gpos = ctx.group_col_indices.iter().position(|&gi| gi == src)
-                .ok_or_else(|| GnitzSqlError::Bind(format!(
+            // HAVING may only reference grouped columns. The old `position()`
+            // bound a local solely to compute `1 + gpos`, which now lives inside
+            // `group_col_reduce_pos`; binding it here would be a dead local.
+            if !ctx.group_col_indices.contains(&src) {
+                return Err(GnitzSqlError::Bind(format!(
                     "HAVING: column '{}' must appear in GROUP BY or an aggregate function",
-                    col_name,
-                )))?;
-            let reduce_col = if ctx.use_natural_pk { 0 } else { 1 + gpos };
+                    col_name)));
+            }
+            let reduce_col = group_col_reduce_pos(
+                src, ctx.group_set_eq_pk, ctx.single_col_natural_pk,
+                ctx.source_schema, ctx.group_col_indices);
             Ok(BoundExpr::ColRef(reduce_col))
         }
         Expr::Function(func) => {
@@ -2433,11 +2486,14 @@ mod tests {
         let r = vec![col("x", TypeCode::U64, false)];
         assert!(matches!(extract("a.x = b.x", l, r).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
-        // Six distinct pairs > MAX_PK_COLUMNS (5) → Unsupported (arity cap).
-        let wide: Vec<ColumnDef> = (0..6)
+        // One past the codec cap → Unsupported (arity cap). Built relative to
+        // PK_LIST_MAX_COLS so a future bump doesn't silently slacken the test.
+        let n = gnitz_core::PK_LIST_MAX_COLS + 1;
+        let wide: Vec<ColumnDef> = (0..n)
             .map(|i| col(&format!("c{i}"), TypeCode::U64, false)).collect();
-        let on6 = "a.c0=b.c0 AND a.c1=b.c1 AND a.c2=b.c2 AND a.c3=b.c3 AND a.c4=b.c4 AND a.c5=b.c5";
-        assert!(matches!(extract(on6, wide.clone(), wide).unwrap_err(),
+        let on_wide = (0..n).map(|i| format!("a.c{i}=b.c{i}"))
+            .collect::<Vec<_>>().join(" AND ");
+        assert!(matches!(extract(&on_wide, wide.clone(), wide).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
         // Both refs on the same table → Bind.
         assert!(matches!(extract("a.x = a.y", two_u64(), two_u64()).unwrap_err(),

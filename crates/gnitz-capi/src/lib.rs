@@ -186,7 +186,7 @@ pub unsafe extern "C" fn gnitz_schema_new(
     pk_cols:  *const u32,
 ) -> *mut GnitzSchema {
     clear_error();
-    if pk_cols.is_null() || pk_count == 0 || pk_count as usize > gnitz_core::MAX_PK_COLUMNS {
+    if pk_cols.is_null() || pk_count == 0 || pk_count as usize > gnitz_core::PK_LIST_MAX_COLS {
         set_error("gnitz_schema_new: invalid pk_count or null pk_cols");
         return std::ptr::null_mut();
     }
@@ -1450,9 +1450,12 @@ mod tests {
 
     #[test]
     fn schema_new_rejects_excess_pk_count() {
-        // MAX_PK_COLUMNS is 5; ask for 6.
-        let cols: [u32; 6] = [0, 1, 2, 3, 4, 5];
-        let sch = unsafe { gnitz_schema_new(6, cols.as_ptr()) };
+        // The FFI PK cap is PK_LIST_MAX_COLS (the persisted PK-list codec width);
+        // one past it must be rejected. Built relative to the constant so a future
+        // bump tracks here rather than hardcoding the count.
+        let n = gnitz_core::PK_LIST_MAX_COLS + 1;
+        let cols: Vec<u32> = (0..n as u32).collect();
+        let sch = unsafe { gnitz_schema_new(n as u32, cols.as_ptr()) };
         assert!(sch.is_null());
     }
 
@@ -1854,11 +1857,11 @@ mod tests {
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
-            buf.extend_from_slice(&(3.14f32).to_le_bytes());
+            buf.extend_from_slice(&(2.5f32).to_le_bytes());
         }
         let b = Box::into_raw(Box::new(GnitzBatch::from_parts(schema, batch)));
         let got = unsafe { gnitz_batch_get_f64(b, 1, 0) };
-        let expected = 3.14f32 as f64;
+        let expected = 2.5f32 as f64;
         assert!((got - expected).abs() < 1e-6, "F32 widened to f64: got {got}");
         unsafe { drop(Box::from_raw(b)); }
     }
@@ -1879,11 +1882,11 @@ mod tests {
         batch.weights.push(1);
         batch.nulls.push(0);
         if let ColData::Fixed(buf) = &mut batch.columns[1] {
-            buf.extend_from_slice(&(2.718281828f64).to_le_bytes());
+            buf.extend_from_slice(&(100.25f64).to_le_bytes());
         }
         let b = Box::into_raw(Box::new(GnitzBatch::from_parts(schema, batch)));
         let got = unsafe { gnitz_batch_get_f64(b, 1, 0) };
-        assert!((got - 2.718281828f64).abs() < 1e-10, "F64 read: got {got}");
+        assert!((got - 100.25f64).abs() < 1e-10, "F64 read: got {got}");
         unsafe { drop(Box::from_raw(b)); }
     }
 

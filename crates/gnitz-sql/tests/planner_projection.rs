@@ -11,24 +11,6 @@ fn names(s: &gnitz_core::Schema) -> Vec<String> {
     s.columns.iter().map(|c| c.name.to_lowercase()).collect()
 }
 
-/// Read a view's named (integer) payload columns into sorted row tuples, so a
-/// test can compare incremental view contents against an expected full recompute
-/// without decoding the OPK PK region by hand.
-fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str]) -> Vec<Vec<i64>> {
-    let (schema, batch) = read_view(client, sn, view);
-    let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
-    let mut rows: Vec<Vec<i64>> = (0..batch.len())
-        .map(|r| idxs.iter().map(|&ci| i64_at(&batch, ci, r)).collect())
-        .collect();
-    rows.sort();
-    rows
-}
-
-fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
-    let mut p = SqlPlanner::new(client, sn);
-    p.execute(sql).unwrap();
-}
-
 // ── item 40: PK column move must preserve remaining order ─────────────
 
 #[test]

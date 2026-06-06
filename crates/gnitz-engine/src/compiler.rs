@@ -523,11 +523,14 @@ fn compute_co_partitioned(
 ) -> HashSet<i64> {
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
-        if cols.len() == 1 {
-            if let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) {
-                if ext.schema.is_pk_col(cols[0] as usize) {
-                    co_partitioned.insert(tid);
-                }
+        if let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) {
+            // Co-partitioned only when the shard key is EXACTLY the source PK in
+            // schema order. One component of a compound PK does not co-partition:
+            // the source is partitioned by the full PK, so sharding by a single
+            // column leaves rows that agree on it (but differ in the rest of the
+            // PK) on different workers.
+            if ext.schema.shard_cols_match_pk(cols) {
+                co_partitioned.insert(tid);
             }
         }
     }
@@ -2412,6 +2415,41 @@ mod tests {
             gather_reduce_cols: HashMap::new(),
         };
         assert!(topo_sort(&mut loaded).is_err());
+    }
+
+    #[test]
+    fn test_compute_co_partitioned_strict_full_pk_sequence() {
+        // Compound PK (a, b) at columns 0, 1; column 2 is payload.
+        let compound = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        let ext = vec![ExternalTable { table_id: 7, schema: compound }];
+        let co = |cols: Vec<i32>| {
+            let mut m = HashMap::new();
+            m.insert(7i64, cols);
+            compute_co_partitioned(&m, &ext).contains(&7)
+        };
+        // Only the exact PK sequence in schema order co-partitions.
+        assert!(co(vec![0, 1]), "shard [pk0, pk1] equals pk_indices() → co-partitioned");
+        assert!(!co(vec![0]),    "shard [pk0] alone is not the full PK");
+        assert!(!co(vec![1]),    "shard [pk1] alone is not the full PK");
+        assert!(!co(vec![1, 0]), "permuted [pk1, pk0] != pk_indices() order");
+
+        // Single-PK source: [pk] stays co-partitioned (no regression).
+        let single = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        let ext1 = vec![ExternalTable { table_id: 9, schema: single }];
+        let mut m = HashMap::new();
+        m.insert(9i64, vec![0]);
+        assert!(compute_co_partitioned(&m, &ext1).contains(&9),
+            "single-PK shard [pk] stays co-partitioned");
     }
 
     #[test]
