@@ -4,54 +4,38 @@ use super::header::{
     META_FLAG_PK_POS_SHIFT, META_FLAG_PK_POS_MASK,
 };
 use super::types::{
-    ColData, ColumnDef, PkColumn, Schema, ZSetBatch, type_code_from_u64,
-    MAX_COLUMNS,
+    BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, meta_schema,
+    type_code_from_u64, MAX_COLUMNS,
 };
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
 pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
-    let ncols = schema.num_columns();
-    let mut pks: Vec<u64> = Vec::with_capacity(ncols);
-    let mut weights = Vec::with_capacity(ncols);
-    let mut nulls   = Vec::with_capacity(ncols);
+    let ms = meta_schema();
+    let mut batch = ZSetBatch::new(ms);
 
-    // META_SCHEMA: col_idx(pk=0), type_code(U64), flags(U64), name(String)
-    let mut type_code_bytes = Vec::with_capacity(ncols * 8);
-    let mut flags_bytes     = Vec::with_capacity(ncols * 8);
-    let mut names: Vec<Option<String>> = Vec::with_capacity(ncols);
-
-    for (ci, col) in schema.columns.iter().enumerate() {
-        pks.push(ci as u64);
-        weights.push(1i64);
-        nulls.push(0u64);
-
-        type_code_bytes.extend_from_slice(&(col.type_code as u64).to_le_bytes());
-
-        let mut flags: u64 = 0;
-        if col.is_nullable        { flags |= META_FLAG_NULLABLE; }
-        // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
-        // decodes back to the user-declared order.
-        if let Some(pos) = schema.pk_cols.iter().position(|&p| p == ci) {
-            flags |= META_FLAG_IS_PK;
-            flags |= (pos as u64) << META_FLAG_PK_POS_SHIFT;
+    // Route through the validated, schema-aware appender so the META_SCHEMA
+    // layout lives in exactly one place (`meta_schema()`). The cursor skips the
+    // `col_idx` PK column, so the chained values land in cols 1/2/3.
+    {
+        let mut appender = BatchAppender::new(&mut batch, ms);
+        for (ci, col) in schema.columns.iter().enumerate() {
+            let mut flags: u64 = 0;
+            if col.is_nullable { flags |= META_FLAG_NULLABLE; }
+            // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
+            // decodes back to the user-declared order.
+            if let Some(pos) = schema.pk_cols.iter().position(|&p| p == ci) {
+                flags |= META_FLAG_IS_PK;
+                flags |= (pos as u64) << META_FLAG_PK_POS_SHIFT;
+            }
+            appender.add_row(ci as u128, 1)
+                .u64_val(col.type_code as u64)
+                .u64_val(flags)
+                .str_val(&col.name);
         }
-        flags_bytes.extend_from_slice(&flags.to_le_bytes());
-
-        names.push(Some(col.name.clone()));
     }
 
-    ZSetBatch {
-        pks: PkColumn::U64s(pks),
-        weights,
-        nulls,
-        columns: vec![
-            ColData::Fixed(vec![]),          // col 0 = col_idx (pk placeholder)
-            ColData::Fixed(type_code_bytes), // col 1 = type_code
-            ColData::Fixed(flags_bytes),     // col 2 = flags
-            ColData::Strings(names),         // col 3 = name
-        ],
-    }
+    batch
 }
 
 /// Reconstruct a Schema from a META_SCHEMA-shaped ZSetBatch.
@@ -133,7 +117,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{ColData, PkColumn, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
+    use crate::protocol::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
     use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
 
     // ── type_code_from_u64 error paths ──────────────────────────────────────
@@ -163,28 +147,21 @@ mod tests {
     // ── batch_to_schema error paths ──────────────────────────────────────────
 
     /// Build a valid META_SCHEMA batch for `ncols` columns (all U64, col 0 is PK).
+    /// Routes through the real `schema_to_batch` encoder so the META_SCHEMA layout
+    /// is defined in exactly one place; the error-path tests then corrupt the
+    /// returned batch to exercise `batch_to_schema`'s validation.
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
-        use crate::protocol::header::META_FLAG_IS_PK;
-        let mut type_code_bytes = vec![];
-        let mut flags_bytes     = vec![];
-        let mut names           = vec![];
-        for i in 0..ncols {
-            type_code_bytes.extend_from_slice(&8u64.to_le_bytes()); // U64 = 8
-            let flags: u64 = if i == 0 { META_FLAG_IS_PK } else { 0 };
-            flags_bytes.extend_from_slice(&flags.to_le_bytes());
-            names.push(Some(format!("col{}", i)));
-        }
-        ZSetBatch {
-            pks:     PkColumn::U64s((0..ncols as u64).collect()),
-            weights: vec![1; ncols],
-            nulls:   vec![0; ncols],
-            columns: vec![
-                ColData::Fixed(vec![]),
-                ColData::Fixed(type_code_bytes),
-                ColData::Fixed(flags_bytes),
-                ColData::Strings(names),
-            ],
-        }
+        let schema = Schema {
+            columns: (0..ncols).map(|i| ColumnDef {
+                name:        format!("col{}", i),
+                type_code:   TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx:  0,
+            }).collect(),
+            pk_cols: vec![0],
+        };
+        schema_to_batch(&schema)
     }
 
     #[test]

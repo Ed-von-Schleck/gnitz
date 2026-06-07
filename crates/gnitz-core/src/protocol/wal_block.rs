@@ -52,44 +52,52 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
             debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
             let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
             let aligned = align8(buf.len());
-            buf.resize(aligned, 0);
-            buf.reserve(v.len() * pk_stride);
-            let mut opk = [0u8; 8];
+            let total = v.len() * pk_stride;
+            // Pre-size the destination and OPK-encode each PK directly into it,
+            // avoiding a per-row stack temp + extend_from_slice copy.
+            buf.resize(aligned + total, 0);
+            let mut w = aligned;
             for &x in v {
-                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut opk[..pk_stride]);
-                buf.extend_from_slice(&opk[..pk_stride]);
+                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut buf[w..w + pk_stride]);
+                w += pk_stride;
             }
-            (aligned as u32, (v.len() * pk_stride) as u32)
+            (aligned as u32, total as u32)
         }
         PkColumn::U128s(v) => {
             debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
             // U128 and UUID are always unsigned; OPK == big-endian, no sign flip.
+            // `to_be_bytes()` is the owned value (no stack temp to elide), but
+            // pre-sizing and writing in place matches the sibling branches and
+            // drops the per-row `extend_from_slice` grow path.
             let aligned = align8(buf.len());
-            buf.resize(aligned, 0);
-            buf.reserve(v.len() * 16);
+            let total = v.len() * 16;
+            buf.resize(aligned + total, 0);
+            let mut w = aligned;
             for &x in v {
-                buf.extend_from_slice(&x.to_be_bytes());
+                buf[w..w + 16].copy_from_slice(&x.to_be_bytes());
+                w += 16;
             }
-            (aligned as u32, (v.len() * 16) as u32)
+            (aligned as u32, total as u32)
         }
         // Wide compound PK: encode each column of each row to OPK in pk-list order.
         PkColumn::Bytes { buf: pk_buf, stride } => {
             let row_stride = *stride as usize;
             let row_count = pk_buf.len().checked_div(row_stride).unwrap_or(0);
             let aligned = align8(buf.len());
-            buf.resize(aligned, 0);
-            buf.reserve(pk_buf.len());
+            // Pre-size the destination and OPK-encode each column directly into
+            // it; `src` borrows the separate `pk_buf` Vec, so the immutable read
+            // and mutable write don't alias.
+            buf.resize(aligned + pk_buf.len(), 0);
             // Collect (col_size, type_code) once; avoids schema re-iteration per row.
             let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-            let mut opk = [0u8; gnitz_wire::MAX_PK_BYTES];
             for row in 0..row_count {
                 let src = &pk_buf[row * row_stride..(row + 1) * row_stride];
+                let dst_base = aligned + row * row_stride;
                 let mut off = 0;
                 for &(cs, tc) in &col_info {
-                    gnitz_wire::encode_pk_column(&src[off..off + cs], tc, &mut opk[off..off + cs]);
+                    gnitz_wire::encode_pk_column(&src[off..off + cs], tc, &mut buf[dst_base + off..dst_base + off + cs]);
                     off += cs;
                 }
-                buf.extend_from_slice(&opk[..row_stride]);
             }
             (aligned as u32, pk_buf.len() as u32)
         }

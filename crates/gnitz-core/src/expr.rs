@@ -175,212 +175,161 @@ impl ExprBuilder {
         self.code.extend_from_slice(&[op, dst, a1, a2]);
     }
 
-    pub fn load_col_int(&mut self, col_idx: usize) -> u32 {
+    /// Allocate a destination register, emit a two-operand op into it, return it.
+    fn binary_op(&mut self, op: u32, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
-        self.emit(EXPR_LOAD_COL_INT, dst, col_idx as u32, 0);
+        self.emit(op, dst, a, b);
         dst
     }
 
+    /// Allocate a destination register, emit a one-operand op into it, return it.
+    /// A unary op is just a binary op whose second operand is unused.
+    fn unary_op(&mut self, op: u32, a: u32) -> u32 {
+        self.binary_op(op, a, 0)
+    }
+
+    pub fn load_col_int(&mut self, col_idx: usize) -> u32 {
+        self.unary_op(EXPR_LOAD_COL_INT, col_idx as u32)
+    }
+
     pub fn load_col_float(&mut self, col_idx: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_LOAD_COL_FLOAT, dst, col_idx as u32, 0);
-        dst
+        self.unary_op(EXPR_LOAD_COL_FLOAT, col_idx as u32)
     }
 
     /// Full i64 constant. Low 32 bits in arg1, high 32 bits in arg2.
     /// Reconstructed as: `(a2 << 32) | (a1 & 0xFFFFFFFF)`.
     pub fn load_const(&mut self, value: i64) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_LOAD_CONST, dst, value as u32, (value >> 32) as u32);
-        dst
+        self.binary_op(EXPR_LOAD_CONST, value as u32, (value >> 32) as u32)
     }
 
     // --- Integer arithmetic ---
 
     pub fn add(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_ADD, dst, a, b);
-        dst
+        self.binary_op(EXPR_INT_ADD, a, b)
     }
 
     pub fn sub(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_SUB, dst, a, b);
-        dst
+        self.binary_op(EXPR_INT_SUB, a, b)
     }
 
     pub fn mul(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_MUL, dst, a, b);
-        dst
+        self.binary_op(EXPR_INT_MUL, a, b)
     }
 
     pub fn div(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_DIV, dst, a, b);
-        dst
+        self.binary_op(EXPR_INT_DIV, a, b)
     }
 
     pub fn modulo(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_MOD, dst, a, b);
-        dst
+        self.binary_op(EXPR_INT_MOD, a, b)
     }
 
     pub fn neg_int(&mut self, a: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_NEG, dst, a, 0);
-        dst
+        self.unary_op(EXPR_INT_NEG, a)
     }
 
     // --- Float arithmetic ---
 
     pub fn float_add(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FLOAT_ADD, dst, a, b);
-        dst
+        self.binary_op(EXPR_FLOAT_ADD, a, b)
     }
 
     pub fn float_sub(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FLOAT_SUB, dst, a, b);
-        dst
+        self.binary_op(EXPR_FLOAT_SUB, a, b)
     }
 
     pub fn float_mul(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FLOAT_MUL, dst, a, b);
-        dst
+        self.binary_op(EXPR_FLOAT_MUL, a, b)
     }
 
     pub fn float_div(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FLOAT_DIV, dst, a, b);
-        dst
+        self.binary_op(EXPR_FLOAT_DIV, a, b)
     }
 
     pub fn float_neg(&mut self, a: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FLOAT_NEG, dst, a, 0);
-        dst
+        self.unary_op(EXPR_FLOAT_NEG, a)
     }
 
     // --- Integer comparison ---
 
     pub fn cmp_eq(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_EQ, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_EQ, a, b)
     }
 
     pub fn cmp_ne(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_NE, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_NE, a, b)
     }
 
     pub fn cmp_gt(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_GT, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_GT, a, b)
     }
 
     pub fn cmp_ge(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_GE, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_GE, a, b)
     }
 
     pub fn cmp_lt(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_LT, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_LT, a, b)
     }
 
     pub fn cmp_le(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_CMP_LE, dst, a, b);
-        dst
+        self.binary_op(EXPR_CMP_LE, a, b)
     }
 
     // --- Float comparison ---
 
     pub fn fcmp_eq(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_EQ, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_EQ, a, b)
     }
 
     pub fn fcmp_ne(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_NE, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_NE, a, b)
     }
 
     pub fn fcmp_gt(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_GT, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_GT, a, b)
     }
 
     pub fn fcmp_ge(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_GE, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_GE, a, b)
     }
 
     pub fn fcmp_lt(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_LT, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_LT, a, b)
     }
 
     pub fn fcmp_le(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_FCMP_LE, dst, a, b);
-        dst
+        self.binary_op(EXPR_FCMP_LE, a, b)
     }
 
     // --- Boolean ---
 
     pub fn bool_and(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_BOOL_AND, dst, a, b);
-        dst
+        self.binary_op(EXPR_BOOL_AND, a, b)
     }
 
     pub fn bool_or(&mut self, a: u32, b: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_BOOL_OR, dst, a, b);
-        dst
+        self.binary_op(EXPR_BOOL_OR, a, b)
     }
 
     pub fn bool_not(&mut self, a: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_BOOL_NOT, dst, a, 0);
-        dst
+        self.unary_op(EXPR_BOOL_NOT, a)
     }
 
     // --- Null checks ---
 
     pub fn is_null(&mut self, col_idx: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_IS_NULL, dst, col_idx as u32, 0);
-        dst
+        self.unary_op(EXPR_IS_NULL, col_idx as u32)
     }
 
     pub fn is_not_null(&mut self, col_idx: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_IS_NOT_NULL, dst, col_idx as u32, 0);
-        dst
+        self.unary_op(EXPR_IS_NOT_NULL, col_idx as u32)
     }
 
     // --- Type conversion ---
 
     pub fn int_to_float(&mut self, src: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_INT_TO_FLOAT, dst, src, 0);
-        dst
+        self.unary_op(EXPR_INT_TO_FLOAT, src)
     }
 
     // --- Output opcodes ---
@@ -408,39 +357,27 @@ impl ExprBuilder {
     // --- String comparisons ---
 
     pub fn str_col_eq_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_EQ_CONST, dst, col_idx as u32, const_idx);
-        dst
+        self.binary_op(EXPR_STR_COL_EQ_CONST, col_idx as u32, const_idx)
     }
 
     pub fn str_col_lt_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_LT_CONST, dst, col_idx as u32, const_idx);
-        dst
+        self.binary_op(EXPR_STR_COL_LT_CONST, col_idx as u32, const_idx)
     }
 
     pub fn str_col_le_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_LE_CONST, dst, col_idx as u32, const_idx);
-        dst
+        self.binary_op(EXPR_STR_COL_LE_CONST, col_idx as u32, const_idx)
     }
 
     pub fn str_col_eq_col(&mut self, col_a: usize, col_b: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_EQ_COL, dst, col_a as u32, col_b as u32);
-        dst
+        self.binary_op(EXPR_STR_COL_EQ_COL, col_a as u32, col_b as u32)
     }
 
     pub fn str_col_lt_col(&mut self, col_a: usize, col_b: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_LT_COL, dst, col_a as u32, col_b as u32);
-        dst
+        self.binary_op(EXPR_STR_COL_LT_COL, col_a as u32, col_b as u32)
     }
 
     pub fn str_col_le_col(&mut self, col_a: usize, col_b: usize) -> u32 {
-        let dst = self.alloc_reg();
-        self.emit(EXPR_STR_COL_LE_COL, dst, col_a as u32, col_b as u32);
-        dst
+        self.binary_op(EXPR_STR_COL_LE_COL, col_a as u32, col_b as u32)
     }
 
     pub fn build(self, result_reg: u32) -> ExprProgram {

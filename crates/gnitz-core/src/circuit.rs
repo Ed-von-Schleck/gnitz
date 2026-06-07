@@ -50,11 +50,17 @@ impl Circuit {
     /// deliberately excluded (they're read-only lookups; updating them
     /// must NOT trigger view recalculation).
     pub fn dependencies(&self) -> Vec<TableId> {
-        let mut seen = std::collections::HashSet::new();
-        self.nodes.values()
-            .filter_map(|op| if let OpNode::ScanDelta(tid) = op { Some(*tid) } else { None })
-            .filter(|tid| seen.insert(*tid))
-            .collect()
+        // A view's dependency set is 1–4 entries; a linear `Vec::contains` dedup
+        // is alloc-free and beats a HashSet at this n (same small-n convention as
+        // `Schema::validate_pk_cols`). Iterating `nodes` in BTreeMap key order
+        // preserves the first-wins ordering of the prior HashSet-insert filter.
+        let mut deps: Vec<TableId> = Vec::new();
+        for op in self.nodes.values() {
+            if let OpNode::ScanDelta(tid) = op {
+                if !deps.contains(tid) { deps.push(*tid); }
+            }
+        }
+        deps
     }
 
     /// Materialise the circuit into the three-table row bundle. Pure
