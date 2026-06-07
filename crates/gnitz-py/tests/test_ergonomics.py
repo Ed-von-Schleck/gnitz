@@ -486,6 +486,30 @@ class TestZSetBatchExtend:
         client.drop_table(sn, "t")
         client.drop_schema(sn)
 
+    def test_extend_is_atomic_on_error(self):
+        """`extend` is all-or-nothing: a failure mid-iteration rolls the whole
+        batch back to its pre-call length, matching the single-row appends.
+
+        Pre-append one valid row, then extend with [good, bad] where `bad`
+        carries a type error on a later row. The good row gets queued before
+        `bad` fails, so per-row rollback alone would leave the batch at length 2
+        (1 pre-existing + 1 from the partial extend). Batch-level rollback must
+        bring it back to the pre-extend length of 1.
+        """
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, val=10)
+        assert len(batch) == 1
+        with pytest.raises(Exception):
+            batch.extend([{"pk": 2, "val": 20}, {"pk": 3, "val": "not-an-int"}])
+        assert len(batch) == 1
+        # The batch stays reusable after the rolled-back extend.
+        batch.extend([{"pk": 4, "val": 40}])
+        assert len(batch) == 2
+
 
 class TestScanResultMethods:
 

@@ -25,6 +25,15 @@ type ScanReadResult =
 
 pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 
+/// Map any `Display` error into a `GnitzError` PyErr. The orphan rule blocks
+/// `impl From<ClientError> for PyErr`, so this free helper carries the
+/// recurring `.map_err(|e| GnitzError::new_err(e.to_string()))` once. It is
+/// GnitzError-specific by design — `PyValueError`/`PyTypeError` sites keep
+/// their explicit construction.
+fn to_py_err<T, E: std::fmt::Display>(res: Result<T, E>) -> PyResult<T> {
+    res.map_err(|e| GnitzError::new_err(e.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // TypeCode — Python class whose class attributes mirror gnitz_client.TypeCode
 // ---------------------------------------------------------------------------
@@ -459,10 +468,14 @@ impl PyZSetBatch {
     }
 
     /// Run `body` against `self`; on error, roll the batch back to its
-    /// pre-call row count so a half-written row never escapes.
-    fn try_append_row<F>(&mut self, body: F) -> PyResult<()>
+    /// pre-call row count so a partial write never escapes. Used both per-row
+    /// (the single appends) and per-call (`extend_from_dicts` wraps its whole
+    /// loop), so every append path shares one all-or-nothing contract. Nesting
+    /// is safe: `rollback_to` only truncates, so an inner per-row rollback
+    /// followed by the outer batch-level rollback is idempotent.
+    fn with_rollback<F>(&mut self, body: F) -> PyResult<()>
     where F: FnOnce(&mut Self) -> PyResult<()> {
-        let n = self.batch.pks.len();
+        let n = self.batch.len();
         match body(self) {
             Ok(()) => Ok(()),
             Err(e) => { self.rollback_to(n); Err(e) }
@@ -474,7 +487,7 @@ impl PyZSetBatch {
         dict: &Bound<'_, PyDict>,
         weight: i64,
     ) -> PyResult<()> {
-        self.try_append_row(|s| {
+        self.with_rollback(|s| {
             let py = dict.py();
             s.append_pk_from_dict(py, dict)?;
             s.batch.weights.push(weight);
@@ -496,7 +509,7 @@ impl PyZSetBatch {
         values: &Bound<'_, PyList>,
         weight: i64,
     ) -> PyResult<()> {
-        self.try_append_row(|s| {
+        self.with_rollback(|s| {
             s.append_pk_from_list(values)?;
             s.batch.weights.push(weight);
             let mut nulls: u64 = 0;
@@ -561,17 +574,24 @@ impl PyZSetBatch {
         rows: Bound<'_, PyAny>,
         weight: i64,
     ) -> PyResult<()> {
-        let weight_key = pyo3::intern!(py, "_weight");
-        for row_item in rows.try_iter()? {
-            let row_item = row_item?;
-            let dict: &Bound<'_, PyDict> = row_item.downcast()?;
-            let row_weight = match dict.get_item(weight_key)? {
-                Some(w) => w.extract::<i64>()?,
-                None => weight,
-            };
-            self.append_from_dict_inner(dict, row_weight)?;
-        }
-        Ok(())
+        // Batch-level atomicity: `append_from_dict_inner` rolls back only the
+        // current row, so a failure on row N would otherwise leave rows 0..N in
+        // the batch. Wrapping the whole loop in `with_rollback` truncates back
+        // to the pre-call length on any error, giving `extend` the same
+        // all-or-nothing contract as the single-row appends.
+        self.with_rollback(|s| {
+            let weight_key = pyo3::intern!(py, "_weight");
+            for row_item in rows.try_iter()? {
+                let row_item = row_item?;
+                let dict: &Bound<'_, PyDict> = row_item.downcast()?;
+                let row_weight = match dict.get_item(weight_key)? {
+                    Some(w) => w.extract::<i64>()?,
+                    None => weight,
+                };
+                s.append_from_dict_inner(dict, row_weight)?;
+            }
+            Ok(())
+        })
     }
 
     #[getter]
@@ -715,13 +735,13 @@ fn pk_value_from_tuple(py: Python<'_>, schema: &Schema, col_idx: usize, t: &gnit
 /// Read one fixed-width value as a Python object (integers as int, floats as float).
 fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
     match tc {
-        TypeCode::U8   => (slice[0] as u64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::I8   => (slice[0] as i8 as i64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::U16  => (u16::from_le_bytes(slice.try_into().unwrap()) as u64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::I16  => (i16::from_le_bytes(slice.try_into().unwrap()) as i64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::U32  => (u32::from_le_bytes(slice.try_into().unwrap()) as u64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::I32  => (i32::from_le_bytes(slice.try_into().unwrap()) as i64).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::F32  => (f32::from_le_bytes(slice.try_into().unwrap()) as f64).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::U8   => slice[0].into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::I8   => (slice[0] as i8).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::U16  => u16::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::I16  => i16::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::U32  => u32::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::I32  => i32::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
+        TypeCode::F32  => f32::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::U64  => u64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::I64  => i64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::F64  => f64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
@@ -1043,12 +1063,12 @@ impl PyScanResult {
         Ok(obj)
     }
 
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyRowIterator> {
-        let (data_clone, fields, field_index, len) = match &self.data {
-            None => (None, PyTuple::empty(py).unbind(), Arc::new(HashMap::new()), 0),
-            Some(d) => (Some(Arc::clone(d)), d.fields.clone_ref(py), Arc::clone(&d.field_index), d.batch.len()),
+    fn __iter__(&self, _py: Python<'_>) -> PyResult<PyRowIterator> {
+        let (data_clone, len) = match &self.data {
+            None => (None, 0),
+            Some(d) => (Some(Arc::clone(d)), d.batch.len()),
         };
-        Ok(PyRowIterator { data: data_clone, fields, field_index, row_buf: Vec::new(), pos: 0, len })
+        Ok(PyRowIterator { data: data_clone, row_buf: Vec::new(), pos: 0, len })
     }
 
     fn __len__(&self) -> usize {
@@ -1235,8 +1255,6 @@ impl PyScanResult {
 #[pyclass]
 pub struct PyRowIterator {
     data:        Option<Arc<SharedBatchData>>,
-    fields:      Py<PyTuple>,
-    field_index: Arc<HashMap<String, usize>>,
     row_buf:     Vec<PyObject>,
     pos:         usize,
     len:         usize,
@@ -1258,10 +1276,10 @@ impl PyRowIterator {
 
         let values_tuple = PyTuple::new(py, &self.row_buf)?;
         let row = Py::new(py, PyRow {
-            fields: self.fields.clone_ref(py),
+            fields: data.fields.clone_ref(py),
             values: values_tuple.unbind(),
             weight,
-            field_index: Arc::clone(&self.field_index),
+            field_index: Arc::clone(&data.field_index),
         })?;
         Ok(Some(row.into_any()))
     }
@@ -1276,8 +1294,7 @@ fn response_to_py_tuple(
     py: Python<'_>,
     result: ClientResponse,
 ) -> PyResult<PyObject> {
-    let (opt_schema, opt_batch, view_lsn) = result
-        .map_err(|e| GnitzError::new_err(e.to_string()))?;
+    let (opt_schema, opt_batch, view_lsn) = to_py_err(result)?;
     let (py_schema, py_batch) = match (opt_schema, opt_batch) {
         (Some(s), Some(b)) => {
             let ps = rust_schema_to_py(py, s.as_ref())?.into_any();
@@ -1299,8 +1316,7 @@ fn response_to_lazy(
     py: Python<'_>,
     result: ClientResponse,
 ) -> PyResult<Py<PyScanResult>> {
-    let (opt_schema, opt_batch, view_lsn) = result
-        .map_err(|e| GnitzError::new_err(e.to_string()))?;
+    let (opt_schema, opt_batch, view_lsn) = to_py_err(result)?;
     let data = match opt_schema {
         Some(s) => {
             let b = opt_batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
@@ -1328,9 +1344,7 @@ pub struct PyGnitzClient {
 impl PyGnitzClient {
     #[new]
     pub fn new(socket_path: &str) -> PyResult<Self> {
-        GnitzClient::connect(socket_path)
-            .map(|c| PyGnitzClient { inner: Some(c) })
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(GnitzClient::connect(socket_path)).map(|c| PyGnitzClient { inner: Some(c) })
     }
 
     pub fn close(&mut self) {
@@ -1347,11 +1361,11 @@ impl PyGnitzClient {
     // ----- DDL -----
 
     pub fn create_schema(&mut self, name: &str) -> PyResult<u64> {
-        client!(self).create_schema(name).map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).create_schema(name))
     }
 
     pub fn drop_schema(&mut self, name: &str) -> PyResult<()> {
-        client!(self).drop_schema(name).map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).drop_schema(name))
     }
 
     #[pyo3(signature = (schema_name, table_name, columns, pk_col_idx = 0, unique_pk = true))]
@@ -1370,13 +1384,11 @@ impl PyGnitzClient {
         // PKs are reached through SQL DDL (`CREATE TABLE ... PRIMARY KEY
         // (a, b)`), not this surface.
         let pk_slice = [pk_col_idx as u32];
-        client!(self).create_table(schema_name, table_name, &cols, &pk_slice, unique_pk)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).create_table(schema_name, table_name, &cols, &pk_slice, unique_pk))
     }
 
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> PyResult<()> {
-        client!(self).drop_table(schema_name, table_name)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).drop_table(schema_name, table_name))
     }
 
     // ----- DML -----
@@ -1402,8 +1414,7 @@ impl PyGnitzClient {
                 "invalid conflict_mode '{}': expected 'update' or 'error'", other
             ))),
         };
-        client!(self).push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, mode)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, mode))
     }
 
     /// scan(target_id) -> (Schema | None, ZSetBatch | None, view_lsn: int)
@@ -1426,8 +1437,7 @@ impl PyGnitzClient {
             let t = pk_tuple_from_py_with_stride(pk_val, stride)?;
             pk_col.push_tuple(&t);
         }
-        client!(self).delete(target_id, &rust_schema, pk_col)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).delete(target_id, &rust_schema, pk_col))
     }
 
     // ----- Views -----
@@ -1439,8 +1449,7 @@ impl PyGnitzClient {
         output_schema: PyRef<'_, PySchema>,
     ) -> PyResult<u64> {
         let rust_schema = py_schema_to_rust(py, &output_schema)?;
-        client!(self).create_view(schema_name, view_name, source_table_id, &rust_schema.columns)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).create_view(schema_name, view_name, source_table_id, &rust_schema.columns))
     }
 
     /// create_view_with_circuit — CONSUMES circuit.
@@ -1454,13 +1463,11 @@ impl PyGnitzClient {
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Circuit already consumed"))?;
         let rust_schema = py_schema_to_rust(py, &output_schema)?;
         // Hand-built circuits from the Python API emit a single output PK at slot 0.
-        client!(self).create_view_with_circuit(schema_name, view_name, "", circuit, &rust_schema.columns, &[0])
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).create_view_with_circuit(schema_name, view_name, "", circuit, &rust_schema.columns, &[0]))
     }
 
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> PyResult<()> {
-        client!(self).drop_view(schema_name, view_name)
-            .map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).drop_view(schema_name, view_name))
     }
 
     /// resolve_table_id(schema_name, table_name) -> (tid: int, schema: Schema)
@@ -1468,8 +1475,7 @@ impl PyGnitzClient {
         &mut self, py: Python<'_>,
         schema_name: &str, table_name: &str,
     ) -> PyResult<PyObject> {
-        let (tid, schema) = client!(self).resolve_table_or_view_id(schema_name, table_name)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let (tid, schema) = to_py_err(client!(self).resolve_table_or_view_id(schema_name, table_name))?;
         let py_schema = rust_schema_to_py(py, &schema)?.into_any();
         let tid_obj   = tid.into_pyobject(py)?.into_any().unbind();
         Ok(PyTuple::new(py, [tid_obj, py_schema])?.into_any().unbind())
@@ -1477,12 +1483,12 @@ impl PyGnitzClient {
 
     /// allocate_table_id() — name matches py_client API
     pub fn allocate_table_id(&mut self) -> PyResult<u64> {
-        client!(self).alloc_table_id().map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).alloc_table_id())
     }
 
     /// allocate_schema_id()
     pub fn allocate_schema_id(&mut self) -> PyResult<u64> {
-        client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
+        to_py_err(client!(self).alloc_schema_id())
     }
 
     /// seek_by_index(table_id, col_idx, key) -> (Schema | None, ZSetBatch | None, view_lsn: int)
@@ -1529,8 +1535,7 @@ impl PyGnitzClient {
     pub fn execute_sql(&mut self, py: Python<'_>, schema_name: &str, sql: &str) -> PyResult<PyObject> {
         let client_ref = client!(self);
         let mut planner = SqlPlanner::new(client_ref, schema_name);
-        let results = planner.execute(sql)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let results = to_py_err(planner.execute(sql))?;
 
         let py_list = PyList::empty(py);
         for r in results {
@@ -1755,47 +1760,66 @@ fn encode_push_payload(
     gnitz_core::encode_message(target_id, client_id, 0, &gnitz_core::PkTuple::EMPTY, 0, Some(schema), Some(batch))
 }
 
-/// Build a `PkTuple` from a Python value for the wire-only `seek` paths,
-/// where no schema is available at the FFI boundary. An int extracts as a
-/// narrow 16-byte tuple — the high padding is inert because the server
-/// reads only the column's actual stride. Bytes are forwarded verbatim.
-fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
-    // bytes first: extract::<&[u8]>() rejects non-bytes in O(1), whereas
-    // extract_uuid_or_u128 invokes getattr("int") on failure (~100 ns).
-    if let Ok(bytes) = pk.extract::<&[u8]>() {
-        if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "pk bytes length out of range"));
-        }
-        return Ok(gnitz_core::PkTuple::from_bytes(bytes));
-    }
-    if let Ok(val) = extract_uuid_or_u128(pk) {
-        return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
-    }
-    Err(pyo3::exceptions::PyTypeError::new_err("pk must be int, uuid.UUID, UUID string, or bytes"))
+/// Which validation and integer-widening rules `pk_tuple_from_py_impl` applies.
+/// A named enum (rather than `Option<usize>`) so the two modes carry their own
+/// meaning at every match arm instead of in a comment.
+#[derive(Clone, Copy)]
+enum PkMode {
+    /// Schema PK stride is known (DML paths): byte PKs must equal `stride`
+    /// exactly, and ints widen to a `stride`-wide tuple matching the
+    /// `PkColumn` variant.
+    SchemaStride(usize),
+    /// Wire-only narrow seek with no schema at the FFI boundary: byte PKs are
+    /// bounded by `MAX_PK_BYTES`, and ints become a narrow 16-byte tuple (the
+    /// high padding is inert — the server reads only the column's stride).
+    WireNarrow,
 }
 
-/// Build a `PkTuple` from a Python value when the schema's PK stride is
-/// known (DML paths). Unlike `pk_tuple_from_py`, ints adopt the schema
-/// stride so the resulting tuple matches the `PkColumn` variant — bytes
-/// must also match the stride exactly.
-fn pk_tuple_from_py_with_stride(
-    pk: &Bound<'_, PyAny>, stride: usize,
+/// Shared body for the two PK-from-Python builders; `mode` selects the rules.
+fn pk_tuple_from_py_impl(
+    pk: &Bound<'_, PyAny>, mode: PkMode,
 ) -> PyResult<gnitz_core::PkTuple> {
     // bytes first: extract::<&[u8]>() rejects non-bytes in O(1), whereas
     // extract_uuid_or_u128 invokes getattr("int") on failure (~100 ns).
     if let Ok(bytes) = pk.extract::<&[u8]>() {
-        if bytes.len() != stride {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "pk bytes length {} != schema pk_stride {}", bytes.len(), stride
-            )));
+        match mode {
+            PkMode::SchemaStride(stride) => {
+                if bytes.len() != stride {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "pk bytes length {} != schema pk_stride {}", bytes.len(), stride
+                    )));
+                }
+            }
+            PkMode::WireNarrow => {
+                if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "pk bytes length out of range"));
+                }
+            }
         }
         return Ok(gnitz_core::PkTuple::from_bytes(bytes));
     }
     if let Ok(val) = extract_uuid_or_u128(pk) {
-        return Ok(gnitz_core::PkTuple::from_u128(stride as u8, val));
+        return Ok(match mode {
+            PkMode::SchemaStride(stride) => gnitz_core::PkTuple::from_u128(stride as u8, val),
+            PkMode::WireNarrow           => gnitz_core::PkTuple::from_u128_narrow(val),
+        });
     }
     Err(pyo3::exceptions::PyTypeError::new_err("pk must be int, uuid.UUID, UUID string, or bytes"))
+}
+
+/// Build a `PkTuple` from a Python value for the wire-only `seek` paths,
+/// where no schema is available at the FFI boundary.
+fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
+    pk_tuple_from_py_impl(pk, PkMode::WireNarrow)
+}
+
+/// Build a `PkTuple` from a Python value when the schema's PK stride is
+/// known (DML paths).
+fn pk_tuple_from_py_with_stride(
+    pk: &Bound<'_, PyAny>, stride: usize,
+) -> PyResult<gnitz_core::PkTuple> {
+    pk_tuple_from_py_impl(pk, PkMode::SchemaStride(stride))
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,6 +1864,20 @@ impl Drop for DupFd {
         unsafe { libc::shutdown(self.0, libc::SHUT_RDWR); }
         gnitz_core::close_fd(self.0);
     }
+}
+
+/// Sole owner of the connection's `sock_fd` from `connect` until the I/O
+/// thread exits, closing it on drop. This covers the setup error paths in
+/// `PyAsyncTransport::new` (handshake/dup failure → early return drops the
+/// guard) and any unwind through `async_io_loop` (e.g. a poisoned
+/// `schema_cache` lock or an `.unwrap()` while resolving futures). Unlike
+/// [`DupFd`] it only closes — it never `shutdown`s, because the
+/// wake-on-shutdown is the Python-side `DupFd`'s job and this fd's owner never
+/// shuts the socket down.
+struct SocketGuard(std::os::unix::io::RawFd);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) { gnitz_core::close_fd(self.0); }
 }
 
 #[pyclass(name = "AsyncTransport")]
@@ -1888,25 +1926,21 @@ impl PyAsyncTransport {
         set_result_fn: PyObject,
         set_exception_fn: PyObject,
     ) -> PyResult<Self> {
-        let sock_fd = gnitz_core::connect(socket_path)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        // Own the fd from birth so every early return below closes it via RAII
+        // rather than a manual `close_fd`; on success the guard is moved into
+        // the I/O thread, which closes it when it exits.
+        let sock = SocketGuard(to_py_err(gnitz_core::connect(socket_path))?);
+        let sock_fd = sock.0;
         // HELLO handshake on the calling thread — captures the negotiated
         // payload limit before the I/O thread starts queueing reads. Drop
         // the GIL across the blocking syscalls so other Python threads
         // can progress if the server is slow to respond.
-        let handshake = py.allow_threads(|| gnitz_core::hello_handshake(sock_fd));
-        let max_payload_len = match handshake {
-            Ok(limit) => limit as usize,
-            Err(e) => {
-                gnitz_core::close_fd(sock_fd);
-                return Err(GnitzError::new_err(e.to_string()));
-            }
-        };
+        let max_payload_len =
+            to_py_err(py.allow_threads(|| gnitz_core::hello_handshake(sock_fd)))? as usize;
 
         let raw_dup = unsafe { libc::dup(sock_fd) };
         if raw_dup < 0 {
             let err = std::io::Error::last_os_error();
-            gnitz_core::close_fd(sock_fd);
             return Err(GnitzError::new_err(format!("dup socket fd: {}", err)));
         }
         let dup_fd = DupFd(raw_dup);
@@ -1922,7 +1956,7 @@ impl PyAsyncTransport {
             Arc::new(Mutex::new(LruCache::new(ASYNC_SCHEMA_CACHE_CAP)));
         let cache_ref = Arc::clone(&schema_cache);
         let handle = std::thread::spawn(move || {
-            async_io_loop(sock_fd, max_payload_len, rx, loop_ref, sr_fn, se_fn, cache_ref);
+            async_io_loop(sock, max_payload_len, rx, loop_ref, sr_fn, se_fn, cache_ref);
         });
 
         Ok(PyAsyncTransport {
@@ -1938,8 +1972,7 @@ impl PyAsyncTransport {
     fn push(
         &self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>,
     ) -> PyResult<PyObject> {
-        let payload = encode_push_payload(self.client_id, target_id, batch.schema.as_ref(), &batch.batch)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let payload = to_py_err(encode_push_payload(self.client_id, target_id, batch.schema.as_ref(), &batch.batch))?;
         self.enqueue(py, payload, None, target_id, ResponseKind::Push)
     }
 
@@ -1954,9 +1987,9 @@ impl PyAsyncTransport {
                 None => (0u64, None),
             }
         };
-        let payload = gnitz_core::encode_message(
+        let payload = to_py_err(gnitz_core::encode_message(
             target_id, self.client_id, flags, &gnitz_core::PkTuple::EMPTY, 0, None, None,
-        ).map_err(|e| GnitzError::new_err(e.to_string()))?;
+        ))?;
         self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
 
@@ -1974,9 +2007,9 @@ impl PyAsyncTransport {
                 None => (gnitz_core::FLAG_SEEK, None),
             }
         };
-        let payload = gnitz_core::encode_message(
+        let payload = to_py_err(gnitz_core::encode_message(
             target_id, self.client_id, flags, &t, 0, None, None,
-        ).map_err(|e| GnitzError::new_err(e.to_string()))?;
+        ))?;
         self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
     }
 
@@ -2065,7 +2098,7 @@ enum LoopResult {
 }
 
 fn async_io_loop(
-    sock_fd:         std::os::unix::io::RawFd,
+    sock:            SocketGuard,
     max_payload_len: usize,
     rx:              std::sync::mpsc::Receiver<IoRequest>,
     loop_ref:        Py<PyAny>,
@@ -2074,6 +2107,11 @@ fn async_io_loop(
     schema_cache:    SchemaCache,
 ) {
     use std::collections::VecDeque;
+
+    // `sock` owns the fd for the whole loop: the two early returns and the
+    // normal `break` all fall through to its drop, which closes it — so an
+    // unwind through this loop cannot leak it either.
+    let sock_fd = sock.0;
 
     let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> =
         VecDeque::with_capacity(IO_BATCH_MAX);
@@ -2129,7 +2167,6 @@ fn async_io_loop(
                         (&se_fn, &fut, exc.clone_ref(py)));
                 }
             });
-            gnitz_core::close_fd(sock_fd);
             return;
         }
 
@@ -2237,12 +2274,9 @@ fn async_io_loop(
         });
 
         if conn_lost {
-            gnitz_core::close_fd(sock_fd);
             return;
         }
     }
-
-    gnitz_core::close_fd(sock_fd);
 }
 
 // ---------------------------------------------------------------------------
