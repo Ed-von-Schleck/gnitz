@@ -226,8 +226,31 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
         let wider = if wire_stride(l) >= wire_stride(r) { l } else { r };
         return Some(if wire_stride(wider) == 16 { type_code::U128 } else { wider });
     }
-    // Cross-sign integer keys (U* vs I*) — deferred: need sign-class promotion,
-    // and U64/U128-vs-signed need a signed-128 OPK type that does not exist yet.
+    // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
+    // both-signed, and both-unsigned pairs all returned above, so any remaining
+    // routable-int pair is opposite-sign.) The common type must be a SIGNED type
+    // (a) strictly wider than the unsigned operand — a signed type of equal width
+    // cannot represent the unsigned operand's full range, so distinct values
+    // would alias — and (b) at least as wide as the signed operand. The unsigned
+    // side zero-extends and the signed side sign-extends into it
+    // (`encode_pk_column_promoted`), so equal numeric values pack byte-identically.
+    // A U64 / U128 / UUID unsigned operand needs a signed-128 type that does not
+    // exist yet → None.
+    if is_routable_int(l) && is_routable_int(r) {
+        let (s, u) = if is_signed_int(l) { (l, r) } else { (r, l) };
+        let wu = wire_stride(u);
+        if wu <= 4 {
+            // wu ∈ {1,2,4}: the narrowest strictly-wider signed width is 2*wu;
+            // widen further if the signed operand is wider still.
+            let common_w = (wu * 2).max(wire_stride(s));
+            return Some(match common_w {
+                2 => type_code::I16,
+                4 => type_code::I32,
+                8 => type_code::I64,
+                _ => unreachable!("cross-sign common width {common_w} not in {{2,4,8}}"),
+            });
+        }
+    }
     None
 }
 
@@ -333,15 +356,35 @@ mod tests {
         }
     }
 
-    /// Cross-sign integer pairs (and the no-existing-type U64=I64 case) are
-    /// rejected pending signed-128 promotion. The one-sided string and float
-    /// cases are screened out earlier (in the planner) and are not this fn's job.
+    /// Cross-sign integer pairs whose unsigned operand is ≤ 4 bytes promote to the
+    /// narrowest signed type that faithfully holds both ranges: strictly wider than
+    /// the unsigned operand AND at least as wide as the signed operand. Symmetric.
     #[test]
-    fn join_key_common_type_rejects_cross_sign() {
+    fn join_key_common_type_accepts_cross_sign() {
+        use type_code::*;
+        let cases: &[(u8, u8, u8)] = &[
+            (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
+            (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
+            (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
+        ];
+        for &(u, s, t) in cases {
+            assert_eq!(join_key_common_type(u, s), Some(t),
+                "cross-sign common({u},{s}) should be {t}");
+            assert_eq!(join_key_common_type(s, u), Some(t),
+                "cross-sign common is symmetric for ({u},{s})");
+        }
+    }
+
+    /// The surviving cross-sign reject contract: the unsigned operand is 64-bit or
+    /// wider (`U64`/`U128`/`UUID`), whose faithful common type is a signed-128 type
+    /// that does not exist yet. The one-sided string and float cases are screened
+    /// out earlier (in the planner) and are not this fn's job.
+    #[test]
+    fn join_key_common_type_rejects_wide_unsigned_cross_sign() {
         use type_code::*;
         let reject: &[(u8, u8)] = &[
-            (U8, I8), (U8, I16), (U32, I32), (U64, I64),
-            (U64, I32), (I64, U32), (U128, I64), (UUID, I32),
+            (U64, I8), (U64, I16), (U64, I32), (U64, I64),
+            (U128, I8), (U128, I64), (UUID, I32), (UUID, I64),
         ];
         for &(l, r) in reject {
             assert_eq!(join_key_common_type(l, r), None, "({l},{r}) must reject");
@@ -379,13 +422,29 @@ mod tests {
         assert_eq!(carried_reindex_tc(I32, I64), I64);
         assert_eq!(carried_reindex_tc(U8, U64), U64);
         assert_eq!(carried_reindex_tc(U32, U128), U128);
-        // Round-trip: resolve(src, carried(src, T)) == T for any valid promotion.
+        // Round-trip: resolve(src, carried(src, T)) == T for any valid promotion,
+        // including cross-sign promotions where the source promotes to a wider
+        // signed type (e.g. the unsigned U8/U16/U32 sides and a same-sign signed
+        // side both landing on a signed T).
         for &(src, t) in &[
             (I8, I64), (I32, I32), (I32, I64), (U8, U64), (U32, U64),
             (U32, U128), (U64, U64), (STRING, U128), (U128, U128), (UUID, U128),
+            (U8, I16), (U16, I32), (U32, I64), (I32, I64),
         ] {
-            assert_eq!(resolve_reindex_type(src, carried_reindex_tc(src, t)), t,
+            let carried = carried_reindex_tc(src, t);
+            assert_eq!(resolve_reindex_type(src, carried), t,
                 "round-trip failed for src={src} T={t}");
+            // Idempotency of promotion: a *carried* (non-zero) target re-derives to
+            // itself through join_key_common_type. The engine compiler relies on
+            // exactly this to validate a carried `_join_pk` slot against the planner
+            // without re-implementing the sign/width ladder — so it must hold for
+            // every promotion a source can carry. (Self-deriving slots carry 0 and
+            // are validated by the per-column default policy, not this rule.)
+            if carried != 0 {
+                assert_eq!(join_key_common_type(src, t), Some(t),
+                    "promotion not idempotent for src={src} T={t}: \
+                     compiler carried-slot guard would diverge from the planner");
+            }
         }
     }
 }

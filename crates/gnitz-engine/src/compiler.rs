@@ -1207,10 +1207,18 @@ fn emit_node(
                         state.emit_failed = true;
                         return;
                     }
-                    // A carried target must be PK-eligible and a same-sign-class
-                    // *widening* of its source. The planner only ever carries a
-                    // wider same-sign T; a violation is a corrupt/forged catalog, so
-                    // abort the compile cleanly rather than panic in
+                    // A carried target `t` must be exactly the promotion the planner
+                    // derives for a key of this source type. Rather than re-deriving
+                    // the sign/width ladder by hand (and drifting from the planner),
+                    // validate against the single shared rule: `t` is a value-
+                    // preserving promotion of `src` iff `join_key_common_type` maps
+                    // the pair `(src, t)` back to `t`. The promotion is idempotent —
+                    // promoting a source against its own carried target is a no-op —
+                    // so this is exactly the planner's `carried_reindex_tc` contract
+                    // read back (a `#[test]` pins the idempotency). It also screens
+                    // PK-ineligible targets for free, since the function only ever
+                    // yields PK-eligible types. A mismatch means a corrupt/forged
+                    // catalog, so abort the compile cleanly rather than panic in
                     // encode_pk_column_promoted (a narrowing target would slice
                     // scratch[src_width..target_width] with src_width > target_width).
                     // Runs after the in-bounds column check above, so columns[c] is
@@ -1219,9 +1227,7 @@ fn emit_node(
                         let t = reindex_target_tcs.get(i).copied().unwrap_or(0);
                         t != 0 && {
                             let src = in_reg_schema.columns[c as usize].type_code;
-                            !gnitz_wire::is_pk_eligible(t)
-                                || gnitz_wire::wire_stride(t) < gnitz_wire::wire_stride(src)
-                                || gnitz_wire::is_signed_int(t) != gnitz_wire::is_signed_int(src)
+                            gnitz_wire::join_key_common_type(src, t) != Some(t)
                         }
                     });
                     if promotion_invalid {

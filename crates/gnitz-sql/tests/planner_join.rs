@@ -120,10 +120,38 @@ fn test_join_reject_float_key() {
     assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "no view should be registered");
 }
 
-/// Planner rejection: a cross-sign integer pair (U64 = I64). Co-partitioning a
-/// signed key with an unsigned one would need a signed-128 promotion type that
-/// does not exist yet, so the join is rejected at CREATE. (Same-sign cross-width
-/// pairs like U32 = U64 are now accepted via per-pair promotion.)
+/// Planner acceptance: a cross-sign integer pair whose unsigned side is ≤ 4 bytes
+/// (`INT UNSIGNED` = `BIGINT`, i.e. U32 = I64). The pair promotes to the narrowest
+/// signed type holding both ranges (I64) and co-partitions byte-for-byte, so
+/// CREATE VIEW succeeds and the view resolves.
+#[test]
+fn test_join_accept_cross_sign_narrow() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk INT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
+
+    let r = p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk");
+    assert!(r.is_ok(), "narrow cross-sign join (U32 = I64) should be accepted: {:?}", r.err());
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_ok(), "view should be registered");
+
+    // A second pair: TINYINT UNSIGNED (U8) = SMALLINT (I16), promoting to I16.
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, fk TINYINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, fk SMALLINT NOT NULL)").unwrap();
+    let r = p.execute("CREATE VIEW w AS SELECT * FROM c JOIN d ON c.fk = d.fk");
+    assert!(r.is_ok(), "narrow cross-sign join (U8 = I16) should be accepted: {:?}", r.err());
+    assert!(client.resolve_table_or_view_id(&sn, "w").is_ok(), "view should be registered");
+}
+
+/// Planner rejection: a cross-sign integer pair whose unsigned side is 64-bit or
+/// wider (`BIGINT UNSIGNED` = `BIGINT`, i.e. U64 = I64). Its faithful common type
+/// is a signed-128 type that does not exist yet, so the join is rejected at
+/// CREATE. (Narrow cross-sign pairs whose unsigned side is `U8`/`U16`/`U32` — like
+/// `INT UNSIGNED` = `BIGINT` — are now accepted via per-pair promotion; only the
+/// 64-bit+ unsigned side is deferred.)
 #[test]
 fn test_join_reject_cross_sign() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };

@@ -254,4 +254,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn cross_sign_copartitions() {
+        use type_code::{I8, I16, I32, I64, U8, U16, U32};
+        // (unsigned ≤4B, signed, promoted T) — the full in-scope acceptance table.
+        let cases = [
+            (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
+            (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
+            (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
+        ];
+        for (u, s, t) in cases {
+            // Equal logical values representable on BOTH sides (the overlap
+            // [0, min(u_max(u), s_max(s))]) pack byte-identically into T, so equal
+            // keys co-partition to the same worker and match in the join.
+            let hi = u_max(u).min(s_max(s));
+            for v in [0, 1, 127, hi - 1, hi] {
+                assert_copartition(v, u, s, t);
+            }
+            // Injectivity: across a spread drawn from both sides — including the
+            // native-byte aliasing trap (e.g. U8 255 and I8 -1 share all-0xFF
+            // native bytes; U8 200 and I8 -56 share byte 0xC8) — two promoted
+            // T-keys are byte-equal IFF the logical values are equal. No distinct
+            // values ever collide; no equal values ever diverge.
+            let tw = crate::wire_stride(t);
+            let probes: &[(i128, u8)] = &[
+                (0, u), (1, u), (127, u), (128, u), (200, u),
+                (u_max(u) - 1, u), (u_max(u), u),
+                (s_min(s), s), (-56, s), (-1, s), (0, s), (1, s), (127, s), (s_max(s), s),
+            ];
+            let mut seen: Vec<(i128, [u8; 16])> = Vec::new();
+            for &(val, tc) in probes {
+                let key = promote(val, tc, t);
+                for &(pv, pk) in &seen {
+                    assert_eq!(pk[..tw] == key[..tw], pv == val,
+                        "cross-sign T-key equal IFF value equal failed: \
+                         {val} vs {pv} (u={u} s={s} t={t})");
+                }
+                seen.push((val, key));
+            }
+        }
+    }
 }

@@ -1233,10 +1233,13 @@ fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzSqlError> {
 /// only join another German string: it reindexes to a 16-byte content hash, which
 /// is byte-incompatible with the native U128/UUID encoding even though both
 /// collapse to the U128 output type. The remaining pairs are resolved by
-/// `join_key_common_type`, which promotes same-sign-class integers of different
-/// widths to the wider type so the two reindex sides co-partition byte-for-byte
-/// and the `_join_pk` catalog stride matches both; cross-sign pairs (which would
-/// need signed-128 promotion) are rejected.
+/// `join_key_common_type`, which promotes integers of different widths (and now
+/// different sign classes, as long as the unsigned side is ≤ 4 bytes) to a common
+/// type that faithfully holds both ranges, so the two reindex sides co-partition
+/// byte-for-byte and the `_join_pk` catalog stride matches both. Only a cross-sign
+/// pair whose unsigned side is 64-bit or wider (`U64`/`U128`/`UUID`) stays
+/// rejected — its faithful common type is a signed-128 type that does not exist
+/// yet.
 fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
     for col in [left, right] {
         reject_float_key(col, "JOIN ON")?;
@@ -1255,8 +1258,8 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
         .map(|t| t as u8)
         .ok_or_else(|| GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
-             cross-sign integer keys (e.g. U64 = I64) need signed-128 promotion and are \
-             not yet supported",
+             a cross-sign pair whose unsigned side is 64-bit or wider (e.g. BIGINT UNSIGNED \
+             = BIGINT) needs signed-128 promotion and is not yet supported",
             left.name, left.type_code, right.name, right.type_code)))
 }
 
@@ -2592,6 +2595,18 @@ mod tests {
                                &col("b", TypeCode::U64, false)).unwrap(), TypeCode::U64 as u8);
         assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
                                &col("b", TypeCode::U128, false)).unwrap(), TypeCode::U128 as u8);
+        // Cross-sign pairs whose unsigned side is ≤ 4 bytes promote to the
+        // narrowest signed type holding both ranges.
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                               &col("b", TypeCode::I64, false)).unwrap(), TypeCode::I64 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U8, false),
+                               &col("b", TypeCode::I16, false)).unwrap(), TypeCode::I16 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U16, false),
+                               &col("b", TypeCode::I32, false)).unwrap(), TypeCode::I32 as u8);
+        // U32 = I32 needs the wider I64 (a signed type of equal width cannot hold
+        // U32's full range).
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                               &col("b", TypeCode::I32, false)).unwrap(), TypeCode::I64 as u8);
     }
 
     #[test]
@@ -2599,11 +2614,12 @@ mod tests {
         // Float column.
         assert!(validate_join_key_pair(&col("a", TypeCode::F64, false),
                                        &col("b", TypeCode::U64, false)).is_err());
-        // Cross-sign integer pair (would need signed-128 promotion).
+        // Cross-sign pair whose unsigned side is 64-bit or wider (would need a
+        // signed-128 promotion type that does not exist yet).
         assert!(validate_join_key_pair(&col("a", TypeCode::U64, false),
                                        &col("b", TypeCode::I64, false)).is_err());
-        assert!(validate_join_key_pair(&col("a", TypeCode::U32, false),
-                                       &col("b", TypeCode::I32, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::U128, false),
+                                       &col("b", TypeCode::I64, false)).is_err());
         // Mixed string/native — STRING = U128 both reindex to U128, so this is
         // caught *only* by the german-string check, not the common-type check.
         assert!(validate_join_key_pair(&col("a", TypeCode::String, false),
@@ -2628,6 +2644,12 @@ mod tests {
         let r = vec![col("x", TypeCode::U64, false)];
         let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
         assert_eq!(tcs, vec![TypeCode::U64 as u8]);
+
+        // Cross-sign: INT UNSIGNED (U32) = BIGINT (I64) → T = I64.
+        let l = vec![col("x", TypeCode::U32, false)];
+        let r = vec![col("x", TypeCode::I64, false)];
+        let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
+        assert_eq!(tcs, vec![TypeCode::I64 as u8]);
     }
 
     #[test]

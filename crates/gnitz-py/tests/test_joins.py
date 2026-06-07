@@ -690,10 +690,68 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
 
+    def test_inner_join_cross_sign_key(self, client):
+        """Cross-sign equijoin: INT UNSIGNED (U32) key = BIGINT (I64) key, promoted
+        to the signed common type I64. Equal numeric values pack byte-identically
+        (unsigned zero-extends, signed sign-extends) so they co-partition and join;
+        a value above i32::MAX exercises the unsigned-only region, and a NEGATIVE
+        BIGINT (with no unsigned counterpart) must never match. Inserts happen after
+        CREATE VIEW (delta-trace + scatter path); runs at the suite default
+        GNITZ_WORKERS=4 so the cross-worker co-partition path is covered."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # lt.k is INT UNSIGNED (U32); rt.k is BIGINT (I64). Promote to I64.
+            client.execute_sql(
+                "CREATE TABLE lt (id BIGINT NOT NULL PRIMARY KEY, k INT UNSIGNED NOT NULL, lv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE rt (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, rv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT lt.k AS lk, lt.lv, rt.rv "
+                "FROM lt JOIN rt ON lt.k = rt.k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.columns[0].type_code == gnitz.TypeCode.I64, \
+                f"_join_pk must be promoted to I64, got {vschema.columns[0].type_code}"
+
+            big = 4_000_000_000   # > i32::MAX, fits in U32 and I64
+            client.execute_sql(
+                f"INSERT INTO lt VALUES (1, 7, 10), (2, {big}, 20), (3, 0, 30), (4, 12345, 40)",
+                schema_name=sn,
+            )
+            # rt: matches for 7 and big; a NEGATIVE key -7 (no unsigned twin) and
+            # 999999 (no left twin) must not join.
+            client.execute_sql(
+                f"INSERT INTO rt VALUES (101, 7, 100), (102, {big}, 200), "
+                "(103, -7, 300), (104, 999999, 400)",
+                schema_name=sn,
+            )
+
+            def got():
+                return sorted((r["lk"], r["lv"], r["rv"]) for r in _scan_dicts(client, vid))
+
+            assert got() == sorted([(7, 10, 100), (big, 20, 200)]), \
+                f"cross-sign U32=I64 join mismatch: {got()}"
+
+            # Incremental: a new right row completing k=0 joins in; a negative right
+            # row must never collide with the unsigned 0 (distinct I64 OPK keys).
+            client.execute_sql("INSERT INTO rt VALUES (105, 0, 500), (106, -1, 600)", schema_name=sn)
+            assert got() == sorted([(7, 10, 100), (big, 20, 200), (0, 30, 500)]), \
+                f"incremental cross-sign match must appear and negatives must not: {got()}"
+        finally:
+            _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
+
     def test_join_cross_sign_rejected(self, client):
-        """A cross-sign integer key (BIGINT UNSIGNED = BIGINT, i.e. U64 = I64)
-        cannot co-partition without signed-128 promotion, so CREATE VIEW fails
-        with a clear planner error."""
+        """A cross-sign integer key whose UNSIGNED side is 64-bit or wider
+        (BIGINT UNSIGNED = BIGINT, i.e. U64 = I64) cannot co-partition without a
+        signed-128 promotion type that does not exist yet, so CREATE VIEW fails
+        with a clear planner error. (Narrow cross-sign pairs whose unsigned side is
+        U8/U16/U32 are accepted — see test_inner_join_cross_sign_key.)"""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

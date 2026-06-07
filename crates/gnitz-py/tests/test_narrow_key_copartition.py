@@ -60,6 +60,18 @@ _UNSIGNED = [
     ("INT UNSIGNED", [0, 1, 5, 4_000_000_000]),
 ]
 
+# Cross-sign twins: (customers PK type, orders column type, keys). One side is
+# signed, the other unsigned with the unsigned operand ≤ 4 bytes; the pair
+# promotes to the narrowest signed type holding both ranges. Keys are
+# non-negative and representable on BOTH sides, and include values above the
+# signed midpoint to exercise zero-extension of the unsigned operand.
+_CROSS_SIGN = [
+    ("INT UNSIGNED", "BIGINT", [0, 1, 5, 4_000_000_000]),
+    ("BIGINT", "INT UNSIGNED", [0, 1, 5, 4_000_000_000]),
+    ("SMALLINT", "TINYINT UNSIGNED", [0, 1, 5, 127]),
+    ("INT", "SMALLINT UNSIGNED", [0, 1, 5, 60000]),
+]
+
 
 class TestNarrowJoinKey:
     """`orders JOIN customers ON orders.cid = customers.id`: customers.id is a
@@ -101,6 +113,48 @@ class TestNarrowJoinKey:
             by_oid = {r["oid"]: r["tag"] for r in rows}
             for i in range(len(keys)):
                 assert by_oid[i] == 1000 + i, f"{key_type}: order {i} joined wrong customer"
+        finally:
+            _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
+
+    @pytest.mark.parametrize("cust_type,ord_type,keys", _CROSS_SIGN)
+    def test_join_on_cross_sign_key(self, client, cust_type, ord_type, keys):
+        """Cross-sign join: customers.id (PK, routes by raw value) and orders.cid
+        (non-PK, routes by extract_group_key) differ in sign class. Both sides
+        promote to a common signed type and must route the same value to the same
+        worker, so every order still finds its customer under multiple workers."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                f"CREATE TABLE customers (id {cust_type} NOT NULL PRIMARY KEY, tag BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid {ord_type} NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT orders.id AS oid, customers.tag AS tag "
+                "FROM orders JOIN customers ON orders.cid = customers.id",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            cust_sql = ",".join(f"({k}, {1000 + i})" for i, k in enumerate(keys))
+            client.execute_sql(f"INSERT INTO customers VALUES {cust_sql}", schema_name=sn)
+            ord_sql = ",".join(f"({i}, {k})" for i, k in enumerate(keys))
+            client.execute_sql(f"INSERT INTO orders VALUES {ord_sql}", schema_name=sn)
+
+            rows = _dicts(client, vid)
+            got = sorted(r["oid"] for r in rows)
+            assert got == sorted(range(len(keys))), (
+                f"{cust_type}={ord_type}: every order must join its customer; got {got}"
+            )
+            by_oid = {r["oid"]: r["tag"] for r in rows}
+            for i in range(len(keys)):
+                assert by_oid[i] == 1000 + i, (
+                    f"{cust_type}={ord_type}: order {i} joined wrong customer"
+                )
         finally:
             _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
 
