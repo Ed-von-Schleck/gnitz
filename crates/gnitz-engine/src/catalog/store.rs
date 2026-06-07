@@ -1081,15 +1081,19 @@ impl CatalogEngine {
         self.caches.fk_by_parent.get(&parent_id).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// True if column `col_idx` of `table_id` is covered by a UNIQUE secondary
-    /// index. A unique index yields at most one match for any value, so a
-    /// SEEK_BY_INDEX can be unicast to a single worker; a non-unique index's
-    /// matches scatter across workers and must be merged.
-    pub fn index_col_is_unique(&self, table_id: i64, col_idx: u32) -> bool {
+    /// The secondary index circuit on `col_idx` of `table_id`, if one exists.
+    /// Single source of truth for "does this column have an index, and is it
+    /// unique": the SEEK_BY_INDEX handler matches the `Option` once — `None`
+    /// answers STATUS_NO_INDEX (so the SQL planner falls back to a scan or a
+    /// CREATE INDEX hint without a prior catalog probe), `Some(ic)` routes by
+    /// `ic.is_unique` (unicast a unique match to one worker, broadcast-and-merge
+    /// a non-unique one). Returning the entry means callers scan the circuit
+    /// list once and cannot ask whether a non-existent index is unique.
+    pub fn index_circuit_for_col(
+        &self, table_id: i64, col_idx: u32,
+    ) -> Option<&crate::dag::IndexCircuitEntry> {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
-            .map(|ic| ic.is_unique)
-            .unwrap_or(false)
     }
 
     /// True if the table has at least one unique secondary index circuit.

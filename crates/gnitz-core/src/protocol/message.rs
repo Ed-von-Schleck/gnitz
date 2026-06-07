@@ -2,8 +2,8 @@ use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 use super::error::ProtocolError;
-use super::header::{Header, STATUS_ERROR, STATUS_OK, STATUS_SCHEMA_MISMATCH, FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
-    wire_flags_get_schema_version};
+use super::header::{Header, STATUS_ERROR, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX,
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, wire_flags_get_schema_version};
 use super::types::{ColData, PkColumn, PkTuple, Schema, ZSetBatch, meta_schema};
 use crate::types::schema_from_wire_cols;
 use super::codec::{schema_to_batch, batch_to_schema};
@@ -352,8 +352,9 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 
     let (schema, schema_batch, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
         (None, None, None, Some(error_msg))
-    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH {
-        // Schema-mismatch response: control-only frame, no schema/data/error.
+    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH
+           || ctrl_header.status == STATUS_NO_INDEX {
+        // Control-only frame: no schema, no data, no error text.
         (None, None, None, None)
     } else {
         (wire_schema, schema_batch, data_batch, None)

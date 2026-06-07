@@ -105,6 +105,10 @@ pub const STATUS_ERROR:          u32 = 1;
 /// Server-side version mismatch on schema-less PUSH: client must evict its
 /// schema cache entry for the target table and retry with the full schema.
 pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
+/// SEEK_BY_INDEX against a column with no secondary index. Control-only frame
+/// (no schema/data/error payload); the SQL planner uses it to fall back to a
+/// scan or a CREATE INDEX hint without a prior catalog probe.
+pub const STATUS_NO_INDEX: u32 = 3;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK:    u64 = 2;

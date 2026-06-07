@@ -52,12 +52,11 @@ pub fn resolve_unqualified_column(
 pub struct Binder<'a> {
     schema_name: &'a str,
     cache:       HashMap<String, (u64, Rc<Schema>)>,
-    index_cache: HashMap<(u64, usize), Option<(u64, bool)>>,
 }
 
 impl<'a> Binder<'a> {
     pub fn new(schema_name: &'a str) -> Self {
-        Binder { schema_name, cache: HashMap::new(), index_cache: HashMap::new() }
+        Binder { schema_name, cache: HashMap::new() }
     }
 
     pub fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
@@ -74,18 +73,6 @@ impl<'a> Binder<'a> {
     /// Cache a CTE or alias name as resolving to the given (table_id, schema).
     pub fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
         self.cache.insert(name, resolved);
-    }
-
-    pub fn find_index(
-        &mut self, client: &mut GnitzClient, table_id: u64, col_idx: usize,
-    ) -> Result<Option<(u64, bool)>, GnitzSqlError> {
-        if let Some(&cached) = self.index_cache.get(&(table_id, col_idx)) {
-            return Ok(cached);
-        }
-        let result = client.find_index_for_column(table_id, col_idx)
-            .map_err(GnitzSqlError::Exec)?;
-        self.index_cache.insert((table_id, col_idx), result);
-        Ok(result)
     }
 
     pub fn bind_expr(&self, expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {

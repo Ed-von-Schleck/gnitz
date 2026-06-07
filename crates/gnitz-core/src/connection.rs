@@ -5,7 +5,7 @@ use std::sync::Arc;
 use lru::LruCache;
 use crate::protocol::{
     Message, Schema, ZSetBatch, PkTuple,
-    STATUS_ERROR, STATUS_SCHEMA_MISMATCH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
     FLAG_CONTINUATION, WireConflictMode,
     wire_flags_set_conflict_mode, wire_flags_set_schema_version, wire_flags_get_schema_version,
@@ -39,6 +39,9 @@ fn new_client_id() -> u64 {
 fn check_response(msg: Message) -> Result<Message, ClientError> {
     if msg.status == STATUS_SCHEMA_MISMATCH {
         return Err(ClientError::SchemaMismatch);
+    }
+    if msg.status == STATUS_NO_INDEX {
+        return Err(ClientError::NoIndex);
     }
     if msg.status == STATUS_ERROR {
         // Fall back to the default text on an empty string, not only on None:

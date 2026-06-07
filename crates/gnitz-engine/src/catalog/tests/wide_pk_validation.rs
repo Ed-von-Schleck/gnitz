@@ -64,6 +64,29 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
     engine.dag.add_index_circuit(tid, 3, Box::new(idx), idx_schema, true);
 }
 
+// ── index_circuit_for_col existence + uniqueness lookup ────────────────
+
+#[test]
+fn index_circuit_for_col_finds_index_and_uniqueness() {
+    let dir = temp_dir("index_circuit_for_col");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let tid = engine.next_table_id;
+
+    // setup_wide_unique installs a UNIQUE secondary index on source col 3.
+    setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
+
+    // The indexed column resolves to its circuit, carrying the uniqueness flag.
+    let ic = engine.index_circuit_for_col(tid, 3).expect("indexed column must resolve");
+    assert!(ic.is_unique, "col 3 was created UNIQUE");
+    // An unindexed column resolves to nothing …
+    assert!(engine.index_circuit_for_col(tid, 0).is_none(), "unindexed column has no circuit");
+    // … and so does an unknown table.
+    assert!(engine.index_circuit_for_col(tid + 9999, 3).is_none(), "unknown table has no circuit");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── UNIQUE index, wide PK ──────────────────────────────────────────────
 
 #[test]

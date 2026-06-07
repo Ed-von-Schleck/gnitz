@@ -5,7 +5,7 @@ use sqlparser::ast::{
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
 use std::sync::Arc;
-use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode};
+use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode, ClientError};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::Binder;
@@ -358,21 +358,7 @@ fn client_side_merge_do_update(
                         append_column_value(&mut out.columns[ci], cv, col_def.type_code)?;
                     } else {
                         let stride = col_def.type_code.wire_stride();
-                        match (&existing_batch.columns[ci], &mut out.columns[ci]) {
-                            (ColData::Fixed(s), ColData::Fixed(d)) => {
-                                d.extend_from_slice(&s[0..stride]);
-                            }
-                            (ColData::Strings(s), ColData::Strings(d)) => {
-                                d.push(s[0].clone());
-                            }
-                            (ColData::Bytes(s), ColData::Bytes(d)) => {
-                                d.push(s[0].clone());
-                            }
-                            (ColData::U128s(s), ColData::U128s(d)) => {
-                                d.push(s[0]);
-                            }
-                            _ => unreachable!("mismatched ColData variants for column {}", ci),
-                        }
+                        existing_batch.columns[ci].push_row_from(0, stride, &mut out.columns[ci]);
                     }
                 }
                 out.nulls.push(null_bits);
@@ -698,19 +684,32 @@ pub fn execute_select(
 
     // Check WHERE clause
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
-        if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
-            client.seek(tid, &pk)?
-        } else if let Some((col_idx, key, residual)) =
-            try_extract_index_seek(client, where_expr, &schema, binder, tid, false)?
-        {
-            let (s, b, lsn) = client.seek_by_index(tid, col_idx as u64, key)?;
-            let (s2, b2) = apply_residual_filter((s, b), residual.as_ref(), &schema)?;
+        if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
+            let (s, b, lsn) = client.seek(tid, &pk)?;
+            let preds = bind_residuals(binder, &residual, &schema)?;
+            let (s2, b2) = apply_residual_filter((s, b), &preds, &schema)?;
             (s2, b2, lsn)
         } else {
-            return Err(GnitzSqlError::Unsupported(
-                "WHERE on non-indexed column not supported in direct SELECT; \
-                 use CREATE INDEX first, or CREATE VIEW for server-side filtering".to_string()
-            ));
+            let mut hit = None;
+            for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
+                match client.seek_by_index(tid, col_idx as u64, key) {
+                    Ok((s, b, lsn)) => {
+                        let preds = bind_residuals(binder, &residual, &schema)?;
+                        let (s2, b2) = apply_residual_filter((s, b), &preds, &schema)?;
+                        hit = Some((s2, b2, lsn));
+                        break;
+                    }
+                    Err(ClientError::NoIndex) => continue,
+                    Err(e) => return Err(GnitzSqlError::Exec(e)),
+                }
+            }
+            match hit {
+                Some(res) => res,
+                None => return Err(GnitzSqlError::Unsupported(
+                    "WHERE on non-indexed column not supported in direct SELECT; \
+                     use CREATE INDEX first, or CREATE VIEW for server-side filtering".to_string()
+                )),
+            }
         }
     } else {
         client.scan(tid)?
@@ -747,51 +746,63 @@ fn extract_limit(query: &Query) -> Option<usize> {
     }
 }
 
-/// Returns `Some(PkTuple)` when `expr` binds every PK column of `schema`
-/// to a literal via an `AND`-chain (or a single equality for a single-PK
-/// schema). Returns `None` otherwise. The AND-walk binds each PK column at
-/// most once and only when no non-PK column appears in the chain.
-fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<PkTuple> {
+/// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
+/// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
+/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact.
+fn flatten_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match expr {
+        Expr::Nested(inner) => flatten_conjuncts(inner, out),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            flatten_conjuncts(left, out);
+            flatten_conjuncts(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+/// `Some((pk_tuple, residual))` when the conjuncts of `expr` bind every PK
+/// column to a literal; `residual` holds the leftover conjuncts (non-PK
+/// equalities, ranges, an `OR`-group, a repeated PK column) to filter against
+/// the seeked row, and is empty when the `WHERE` is exactly the PK equality.
+/// `None` when the PK is not fully bound — the caller then tries a secondary
+/// index. This is what lets `WHERE pk = 1 AND name = 'x'` take the PK point
+/// lookup (residual `name = 'x'`) instead of degrading to a full scan.
+fn try_extract_pk_seek_residual<'e>(
+    expr:   &'e Expr,
+    schema: &Schema,
+) -> Option<(PkTuple, Vec<&'e Expr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(expr, &mut conjuncts);
+
     let stride = schema.pk_stride() as u8;
     let mut tuple = PkTuple::new(stride);
     let mut slot_set = [false; gnitz_core::MAX_PK_COLUMNS];
     let mut bound = 0usize;
+    let mut residual = Vec::new();
 
-    let ok = walk_and_tree(expr, schema, &mut |col_idx, val| -> bool {
-        // Single scan over pk_indices: locate pk_pos and sum preceding strides
-        // for the byte offset in one pass (vs. position() + pk_byte_offset()).
-        let mut pk_pos: Option<usize> = None;
-        let mut off = 0usize;
-        for (i, &pi) in schema.pk_indices().iter().enumerate() {
-            if pi == col_idx { pk_pos = Some(i); break; }
-            off += schema.columns[pi].type_code.wire_stride();
+    for &cand in &conjuncts {
+        // Consume `pk_col = literal` for an as-yet-unbound PK slot into the
+        // tuple; everything else (non-PK columns, non-equalities, a repeated PK
+        // column) routes to the residual.
+        let mut consumed = false;
+        if let Some((col_idx, val)) = try_col_eq_literal(cand, schema) {
+            if let Some(pk_pos) = schema.pk_indices().iter().position(|&pi| pi == col_idx) {
+                if !slot_set[pk_pos] {
+                    slot_set[pk_pos] = true;
+                    bound += 1;
+                    let off = schema.pk_byte_offset(col_idx);
+                    let w = schema.columns[col_idx].type_code.wire_stride();
+                    tuple.buf[off..off + w].copy_from_slice(&val.to_le_bytes()[..w]);
+                    consumed = true;
+                }
+            }
         }
-        let pk_pos = match pk_pos { Some(p) => p, None => return false };
-        if slot_set[pk_pos] { return false; }
-        slot_set[pk_pos] = true;
-        bound += 1;
-        let stride = schema.columns[col_idx].type_code.wire_stride();
-        tuple.buf[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
-        true
-    });
-
-    if ok && bound == schema.pk_count() { Some(tuple) } else { None }
-}
-
-fn walk_and_tree(
-    expr:   &Expr,
-    schema: &Schema,
-    f:      &mut impl FnMut(usize, u128) -> bool,
-) -> bool {
-    match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            walk_and_tree(left, schema, f) && walk_and_tree(right, schema, f)
+        if !consumed {
+            residual.push(cand);
         }
-        _ => match try_col_eq_literal(expr, schema) {
-            Some((col_idx, val)) => f(col_idx, val),
-            None                 => false,
-        },
     }
+
+    (bound == schema.pk_count()).then_some((tuple, residual))
 }
 
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
@@ -828,56 +839,88 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     Some((col_idx, key))
 }
 
-/// Returns Some((col_idx, key, residual)) when WHERE contains an equality on an indexed column.
-/// When `require_unique` is true, only matches indexes where `is_unique` is set.
-fn try_extract_index_seek(
-    client:         &mut GnitzClient,
-    expr:           &Expr,
-    schema:         &Schema,
-    binder:         &mut Binder<'_>,
-    table_id:       u64,
-    require_unique: bool,
-) -> Result<Option<(usize, u128, Option<BoundExpr>)>, GnitzSqlError> {
-    // Case 1: simple `col = literal`
-    if let Some((col_idx, key)) = try_col_eq_literal(expr, schema) {
-        if !schema.is_pk_col(col_idx) {
-            if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
-                if !require_unique || is_unique {
-                    return Ok(Some((col_idx, key, None)));
-                }
+/// Every non-PK `col = literal` seek candidate among the conjuncts of `expr`,
+/// each paired with the residual conjuncts (all the *other* conjuncts) to
+/// evaluate after the seek.
+///
+/// Pure syntax: no catalog probe, no binding, no I/O. The caller attempts each
+/// candidate's `seek_by_index` in turn and treats `ClientError::NoIndex` as
+/// "this column has no index — try the next candidate". Returning *all*
+/// candidates lets `WHERE unindexed = 1 AND indexed = 2` find the index whichever
+/// conjunct carries it; flattening the whole `AND`-tree extends that to
+/// three-or-more-way conjunctions. PK columns are skipped —
+/// `try_extract_pk_seek_residual` handles them first — and so are column types
+/// that can never carry a secondary index.
+fn collect_index_seek_candidates<'e>(
+    expr:   &'e Expr,
+    schema: &Schema,
+) -> Vec<(usize, u128, Vec<&'e Expr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(expr, &mut conjuncts);
+
+    let mut out = Vec::new();
+    for (i, &cand) in conjuncts.iter().enumerate() {
+        if let Some((col_idx, key)) = try_col_eq_literal(cand, schema) {
+            // A secondary index is only creatable on an `is_pk_eligible` integer
+            // scalar (validate_index_col_type), so a float/string/blob
+            // `col = <integer-literal>` — which try_col_eq_literal still matches,
+            // since parse_pk_literal_packed accepts an integer literal for any
+            // type — could only ever answer NoIndex. Skipping it (and the PK
+            // columns, handled first) avoids a guaranteed-futile round trip.
+            let tc = schema.columns[col_idx].type_code;
+            if !schema.is_pk_col(col_idx) && tc.is_pk_eligible() {
+                let residual = conjuncts.iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .map(|(_, &e)| e)
+                    .collect();
+                out.push((col_idx, key, residual));
             }
         }
     }
-    // Case 2: `(indexed_col = literal) AND rest`
-    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
-        for (candidate, other) in [
-            (left.as_ref(), right.as_ref()),
-            (right.as_ref(), left.as_ref()),
-        ] {
-            if let Some((col_idx, key)) = try_col_eq_literal(candidate, schema) {
-                if !schema.is_pk_col(col_idx) {
-                    if let Some((_, is_unique)) = binder.find_index(client, table_id, col_idx)? {
-                        if !require_unique || is_unique {
-                            let residual = binder.bind_expr(other, schema)?;
-                            return Ok(Some((col_idx, key, Some(residual))));
-                        }
-                    }
-                }
-            }
+    out
+}
+
+/// Bind the residual conjuncts collected as raw `&Expr` by the seek extractors
+/// into `BoundExpr`s, ready for per-row evaluation after a seek succeeds. Kept
+/// separate from extraction so candidates that never seek (wrong index, NoIndex)
+/// are never bound.
+fn bind_residuals(
+    binder:   &Binder<'_>,
+    residual: &[&Expr],
+    schema:   &Schema,
+) -> Result<Vec<BoundExpr>, GnitzSqlError> {
+    residual.iter().map(|&e| binder.bind_expr(e, schema)).collect()
+}
+
+/// True when row `i` of `batch` satisfies every residual predicate. An empty
+/// slice trivially passes; short-circuits on the first failing conjunct. Binding
+/// each conjunct independently and ANDing the results is equivalent to evaluating
+/// one `AND`-chain — `BinOp::And` returns `None` (→ `eval_pred_row` false) the
+/// moment either operand is NULL, so a NULL conjunct excludes the row either way
+/// — but needs no temporary `AND`-tree to be cloned and bound.
+fn row_passes_residuals(
+    preds:  &[BoundExpr],
+    batch:  &ZSetBatch,
+    i:      usize,
+    schema: &Schema,
+) -> Result<bool, GnitzSqlError> {
+    for p in preds {
+        if !eval_pred_row(p, batch, i, schema)? {
+            return Ok(false);
         }
     }
-    Ok(None)
+    Ok(true)
 }
 
 fn apply_residual_filter(
-    result:  (Option<Arc<Schema>>, Option<ZSetBatch>),
-    pred:    Option<&BoundExpr>,
-    schema:  &Schema,
+    result: (Option<Arc<Schema>>, Option<ZSetBatch>),
+    preds:  &[BoundExpr],
+    schema: &Schema,
 ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
-    let pred = match pred {
-        None => return Ok(result),
-        Some(p) => p,
-    };
+    if preds.is_empty() {
+        return Ok(result);
+    }
     let (schema_opt, batch_opt) = result;
     let batch = match batch_opt {
         None => return Ok((schema_opt, None)),
@@ -885,9 +928,8 @@ fn apply_residual_filter(
     };
     let actual_schema = schema_opt.as_deref().unwrap_or(schema);
     let mut new_batch = ZSetBatch::new(actual_schema);
-
     for i in 0..batch.pks.len() {
-        if eval_pred_row(pred, &batch, i, actual_schema)? {
+        if row_passes_residuals(preds, &batch, i, actual_schema)? {
             copy_batch_row(&batch, i, &mut new_batch, actual_schema);
         }
     }
@@ -1073,21 +1115,7 @@ fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schem
     dst.nulls.push(src.nulls[i]);
     for (_pi, ci, col_def) in schema.payload_columns() {
         let stride = col_def.type_code.wire_stride();
-        match (&src.columns[ci], &mut dst.columns[ci]) {
-            (ColData::Fixed(s), ColData::Fixed(d)) => {
-                d.extend_from_slice(&s[i * stride..(i + 1) * stride]);
-            }
-            (ColData::Strings(s), ColData::Strings(d)) => {
-                d.push(s[i].clone());
-            }
-            (ColData::Bytes(s), ColData::Bytes(d)) => {
-                d.push(s[i].clone());
-            }
-            (ColData::U128s(s), ColData::U128s(d)) => {
-                d.push(s[i]);
-            }
-            _ => unreachable!("mismatched ColData variants for column {}", ci),
-        }
+        src.columns[ci].push_row_from(i, stride, &mut dst.columns[ci]);
     }
 }
 
@@ -1383,14 +1411,7 @@ fn write_set_columns(
             append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
         } else {
             let stride = col_def.type_code.wire_stride();
-            match (&current.columns[ci], &mut dst.columns[ci]) {
-                (ColData::Fixed(s), ColData::Fixed(d)) => {
-                    d.extend_from_slice(&s[row_idx * stride..(row_idx + 1) * stride]);
-                }
-                (ColData::Strings(s), ColData::Strings(d)) => { d.push(s[row_idx].clone()); }
-                (ColData::U128s(s), ColData::U128s(d))     => { d.push(s[row_idx]); }
-                _ => unreachable!("mismatched ColData variants for column {}", ci),
-            }
+            current.columns[ci].push_row_from(row_idx, stride, &mut dst.columns[ci]);
         }
     }
     dst.nulls.push(null_bits);
@@ -1461,8 +1482,8 @@ pub fn execute_update(
     }
 
     if let Some(where_expr) = selection {
-        // Path 1: PK equality
-        if let Some(pk_tuple) = try_extract_pk_seek(where_expr, &schema) {
+        // Path 1: PK equality, with optional residual on non-PK conjuncts.
+        if let Some((pk_tuple, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
             let (schema_opt, batch_opt, _) = client.seek(table_id, &pk_tuple)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -1470,33 +1491,43 @@ pub fn execute_update(
                 Some(b) => b,
             };
             let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
+            let preds = bind_residuals(binder, &residual, &schema)?;
+            if !row_passes_residuals(&preds, &current, 0, actual_schema)? {
+                return Ok(SqlResult::RowsAffected { count: 0 });
+            }
             let mut new_batch = ZSetBatch::new(actual_schema);
             write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
             client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
             return Ok(SqlResult::RowsAffected { count: 1 });
         }
 
-        // Path 2: Unique index seek
-        if let Some((col_idx, key, residual)) =
-            try_extract_index_seek(client, where_expr, &schema, binder, table_id, true)?
-        {
-            let (schema_opt, batch_opt, _) =
-                client.seek_by_index(table_id, col_idx as u64, key)?;
+        // Path 2: secondary-index seek (any index, unique or not). Applies the
+        // residual per row and updates *all* matches. Falls through to Path 3
+        // when no candidate column carries an index.
+        for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
+            let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_idx as u64, key) {
+                Ok(r) => r,
+                Err(ClientError::NoIndex) => continue,
+                Err(e) => return Err(GnitzSqlError::Exec(e)),
+            };
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
             };
             let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
-            if let Some(pred) = residual {
-                if !eval_pred_row(&pred, &current, 0, actual_schema)? {
-                    return Ok(SqlResult::RowsAffected { count: 0 });
-                }
-            }
+            let preds = bind_residuals(binder, &residual, &schema)?;
             let mut new_batch = ZSetBatch::new(actual_schema);
-            write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
-            client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
-            return Ok(SqlResult::RowsAffected { count: 1 });
+            let mut count = 0usize;
+            for i in 0..current.pks.len() {
+                if !row_passes_residuals(&preds, &current, i, actual_schema)? { continue; }
+                write_set_columns(&current, i, &assignments, actual_schema, &mut new_batch)?;
+                count += 1;
+            }
+            if count > 0 {
+                client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
+            }
+            return Ok(SqlResult::RowsAffected { count });
         }
 
         // Path 3: Full scan with predicate
@@ -1579,12 +1610,19 @@ pub fn execute_delete(
             Ok(SqlResult::RowsAffected { count: n })
         }
         Some(where_expr) => {
-            // Path 1: PK equality — seek first for accurate count
-            if let Some(pk) = try_extract_pk_seek(where_expr, &schema) {
+            // Path 1: PK equality, with optional residual on non-PK conjuncts.
+            if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
                 let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
                 let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
-                let exists = batch_opt.is_some_and(|b| !b.pks.is_empty());
-                if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
+                let batch = match batch_opt {
+                    None => return Ok(SqlResult::RowsAffected { count: 0 }),
+                    Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                    Some(b) => b,
+                };
+                let preds = bind_residuals(binder, &residual, &schema)?;
+                if !row_passes_residuals(&preds, &batch, 0, actual_schema)? {
+                    return Ok(SqlResult::RowsAffected { count: 0 });
+                }
                 let pks = PkColumn::one_row(actual_schema, &pk);
                 client.delete(table_id, actual_schema, pks)?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
@@ -1602,27 +1640,33 @@ pub fn execute_delete(
                 return Ok(SqlResult::RowsAffected { count: n });
             }
 
-            // Path 3: Unique index seek
-            if let Some((col_idx, key, residual)) =
-                try_extract_index_seek(client, where_expr, &schema, binder, table_id, true)?
-            {
-                let (schema_opt, batch_opt, _) =
-                    client.seek_by_index(table_id, col_idx as u64, key)?;
+            // Path 3: secondary-index seek (any index, unique or not). Applies
+            // the residual per row and deletes *all* matches. Falls through to
+            // Path 4 when no candidate column carries an index.
+            for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
+                let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_idx as u64, key) {
+                    Ok(r) => r,
+                    Err(ClientError::NoIndex) => continue,
+                    Err(e) => return Err(GnitzSqlError::Exec(e)),
+                };
                 let actual_schema = schema_opt.as_deref().unwrap_or(&*schema);
                 let batch = match batch_opt {
                     None => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) if b.pks.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) => b,
                 };
-                if let Some(pred) = residual {
-                    if !eval_pred_row(&pred, &batch, 0, actual_schema)? {
-                        return Ok(SqlResult::RowsAffected { count: 0 });
-                    }
+                let preds = bind_residuals(binder, &residual, &schema)?;
+                let mut out_pks = PkColumn::empty_for_schema(actual_schema);
+                let mut count = 0usize;
+                for i in 0..batch.pks.len() {
+                    if !row_passes_residuals(&preds, &batch, i, actual_schema)? { continue; }
+                    out_pks.push_from(&batch.pks, i);
+                    count += 1;
                 }
-                let mut one_pk = PkColumn::empty_for_schema(actual_schema);
-                one_pk.push_from(&batch.pks, 0);
-                client.delete(table_id, actual_schema, one_pk)?;
-                return Ok(SqlResult::RowsAffected { count: 1 });
+                if count > 0 {
+                    client.delete(table_id, actual_schema, out_pks)?;
+                }
+                return Ok(SqlResult::RowsAffected { count });
             }
 
             // Path 4: Full scan with predicate
@@ -2277,7 +2321,8 @@ mod tests {
             op:   BinaryOperator::And,
             right: Box::new(eq_expr("b", num_expr("2"))),
         };
-        let pk = super::try_extract_pk_seek(&expr, &schema).expect("must bind");
+        let (pk, residual) = super::try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
+        assert!(residual.is_empty());
         assert_eq!(pk.stride, 16);
         let mut expect = [0u8; 16];
         expect[..8].copy_from_slice(&1u64.to_le_bytes());
@@ -2295,7 +2340,8 @@ mod tests {
             op:    BinaryOperator::And,
             right: Box::new(eq_expr("a", num_expr("1"))),
         };
-        let pk = super::try_extract_pk_seek(&expr, &schema).expect("must bind");
+        let (pk, residual) = super::try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
+        assert!(residual.is_empty());
         let mut expect = [0u8; 16];
         expect[..8].copy_from_slice(&1u64.to_le_bytes());
         expect[8..16].copy_from_slice(&2u64.to_le_bytes());
@@ -2306,31 +2352,121 @@ mod tests {
     fn compound_pk_try_extract_pk_seek_partial_returns_none() {
         let schema = compound_schema_u64_u64();
         let expr = eq_expr("a", num_expr("1"));   // only one of two PK cols
-        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+        assert!(super::try_extract_pk_seek_residual(&expr, &schema).is_none());
     }
 
     #[test]
-    fn compound_pk_try_extract_pk_seek_non_pk_in_chain_returns_none() {
+    fn compound_pk_try_extract_pk_seek_incomplete_pk_with_payload_returns_none() {
         let schema = compound_schema_u64_u64();
-        // (a = 1) AND (v = 9) — `v` is a payload column.
+        // (a = 1) AND (v = 9) — `a` binds, `v` is a payload conjunct that goes
+        // to the residual; the PK stays incomplete (`b` unbound) → None.
         let expr = Expr::BinaryOp {
             left: Box::new(eq_expr("a", num_expr("1"))),
             op:   BinaryOperator::And,
             right: Box::new(eq_expr("v", num_expr("9"))),
         };
-        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+        assert!(super::try_extract_pk_seek_residual(&expr, &schema).is_none());
     }
 
     #[test]
     fn compound_pk_try_extract_pk_seek_duplicate_binding_returns_none() {
         let schema = compound_schema_u64_u64();
-        // (a = 1) AND (a = 2) — duplicate binding of column 0.
+        // (a = 1) AND (a = 2) — duplicate binding of column 0; the second
+        // routes to the residual, so `b` stays unbound → None.
         let expr = Expr::BinaryOp {
             left: Box::new(eq_expr("a", num_expr("1"))),
             op:   BinaryOperator::And,
             right: Box::new(eq_expr("a", num_expr("2"))),
         };
-        assert!(super::try_extract_pk_seek(&expr, &schema).is_none());
+        assert!(super::try_extract_pk_seek_residual(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn pk_seek_residual_keeps_non_pk_conjunct() {
+        let schema = pk_schema(TypeCode::U64);
+        // id = 1 AND v = 9 → PK binds fully; `v = 9` becomes the residual.
+        let expr = Expr::BinaryOp {
+            left:  Box::new(eq_expr("id", num_expr("1"))),
+            op:    BinaryOperator::And,
+            right: Box::new(eq_expr("v",  num_expr("9"))),
+        };
+        let (pk, residual) = super::try_extract_pk_seek_residual(&expr, &schema).expect("PK binds");
+        assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+        assert_eq!(residual.len(), 1);
+    }
+
+    #[test]
+    fn collect_index_seek_candidates_skips_float_col() {
+        // `WHERE val = 1` on a float column emits no candidate: a secondary
+        // index can never cover it, so issuing a seek would be a guaranteed
+        // NoIndex round trip.
+        let schema = make_schema_col(TypeCode::F64);
+        let expr = eq_expr("val", num_expr("1"));
+        assert!(super::collect_index_seek_candidates(&expr, &schema).is_empty());
+    }
+
+    #[test]
+    fn collect_index_seek_candidates_flattens_and_tree() {
+        // pk(U64) + a,b,c (all U64, pk-eligible non-PK).
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("a",  TypeCode::U64, true),
+                col_def("b",  TypeCode::U64, true),
+                col_def("c",  TypeCode::U64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        // (a = 1 AND b = 2) AND c = 3 — left-assoc nesting.
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left:  Box::new(eq_expr("a", num_expr("1"))),
+                op:    BinaryOperator::And,
+                right: Box::new(eq_expr("b", num_expr("2"))),
+            }),
+            op:    BinaryOperator::And,
+            right: Box::new(eq_expr("c", num_expr("3"))),
+        };
+        let cands = super::collect_index_seek_candidates(&expr, &schema);
+        // All three conjuncts are candidates — would regress to just `c` under a
+        // two-way-only extractor.
+        let cols: Vec<usize> = cands.iter().map(|(c, _, _)| *c).collect();
+        assert_eq!(cols, vec![1, 2, 3]);
+        // Each candidate's residual is the other two conjuncts.
+        for (_, _, residual) in &cands {
+            assert_eq!(residual.len(), 2);
+        }
+    }
+
+    #[test]
+    fn write_set_columns_carries_blob_column_through() {
+        // UPDATE assigns `v` only; the unmodified BLOB column must carry
+        // through. Red against the missing `ColData::Bytes` arm (unreachable!).
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64,  false),
+                col_def("b",  TypeCode::Blob, true),
+                col_def("v",  TypeCode::I64,  true),
+            ],
+            pk_cols: vec![0],
+        };
+        let mut current = ZSetBatch::new(&schema);
+        current.pks.push_u128(1u128);
+        current.weights.push(1);
+        current.nulls.push(0);
+        if let ColData::Bytes(v) = &mut current.columns[1] { v.push(Some(vec![1, 2, 3])); }
+        if let ColData::Fixed(buf) = &mut current.columns[2] { buf.extend_from_slice(&7i64.to_le_bytes()); }
+
+        let assignments = vec![(2usize, BoundExpr::LitInt(99))];
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+
+        if let ColData::Bytes(v) = &dst.columns[1] {
+            assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
+        } else { panic!("expected Bytes column carried through"); }
+        if let ColData::Fixed(buf) = &dst.columns[2] {
+            assert_eq!(i64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
+        }
     }
 
     #[test]

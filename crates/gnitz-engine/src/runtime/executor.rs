@@ -24,7 +24,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_
                      TABLE_TAB_ID, IDX_TAB_ID,
                      IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE};
 use crate::runtime::committer::{self, CommitRequest};
-use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, SchemaWithVersion};
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
 use crate::runtime::reactor::{
     AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture, join_into,
@@ -624,7 +624,8 @@ async fn handle_message(
             }
             let server_version = shared.cat().get_schema_version(ctrl.target_id as i64);
             if client_version != server_version {
-                send_schema_mismatch(shared, fd, ctrl.target_id as i64, ctrl.client_id).await;
+                send_control_only(shared, fd, ctrl.target_id as i64, ctrl.client_id,
+                                  STATUS_SCHEMA_MISMATCH).await;
                 return;
             }
             let catalog_schema = shared.get_schema_desc(ctrl.target_id as i64);
@@ -829,7 +830,24 @@ async fn handle_seek_by_index(
                 return;
             }
         }
-        if shared.cat().index_col_is_unique(target_id, col_idx) {
+        // Single catalog scan classifies the column. The uniqueness flag is
+        // copied out immediately (`Option<bool>`), so no catalog borrow is held
+        // across the await in the no-index arm.
+        let is_unique = match shared.cat()
+            .index_circuit_for_col(target_id, col_idx)
+            .map(|ic| ic.is_unique)
+        {
+            Some(u) => u,
+            None => {
+                // No secondary index on this column: a dedicated control-only
+                // status, caught here with zero worker dispatch, so the SQL
+                // planner falls back to a scan or a CREATE INDEX hint without a
+                // prior catalog probe.
+                send_control_only(shared, fd, target_id, client_id, STATUS_NO_INDEX).await;
+                return;
+            }
+        };
+        if is_unique {
             // Unique index: at most one match, on a single worker. Forward that
             // worker's slot directly (1 round-trip) instead of broadcasting to
             // all workers and merging.
@@ -1238,11 +1256,15 @@ async fn send_ok_response(
     if rc < 0 { shared.reactor.close_fd(fd); }
 }
 
-async fn send_schema_mismatch(
-    shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64,
+/// Control-only reply carrying just a status code: no schema, no data, no error
+/// text. The schema-mismatch (`STATUS_SCHEMA_MISMATCH`) and no-index
+/// (`STATUS_NO_INDEX`) responses are byte-identical apart from the status, and
+/// the client treats each frame as a pure signal.
+async fn send_control_only(
+    shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64, status: u32,
 ) {
     let buf = encode_response_buffer(
-        target_id, client_id, None, STATUS_SCHEMA_MISMATCH, b"",
+        target_id, client_id, None, status, b"",
         None, 0, 0,
     );
     let rc = shared.reactor.send_buffer(fd, buf).await;

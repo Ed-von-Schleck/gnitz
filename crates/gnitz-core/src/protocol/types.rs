@@ -510,6 +510,45 @@ pub enum ColData {
     U128s(Vec<u128>),
 }
 
+impl ColData {
+    /// Append the element at row `idx` of `self` onto `dst`. Both columns are
+    /// built from the same schema, so they are always the same variant — a
+    /// mismatch is a construction bug, not a runtime condition. `fixed_stride`
+    /// is the per-element byte width, used only by the `Fixed` variant.
+    ///
+    /// Matching on `self` (rather than the `(self, dst)` pair under a `_`
+    /// wildcard) makes the compiler force every variant to be handled here:
+    /// adding a new `ColData` variant fails to compile until this copy path
+    /// covers it, instead of silently falling into a runtime panic — which is
+    /// exactly how the `Bytes` variant was once left uncopied.
+    pub fn push_row_from(&self, idx: usize, fixed_stride: usize, dst: &mut ColData) {
+        match self {
+            ColData::Fixed(s) => {
+                let ColData::Fixed(d) = dst else { variant_mismatch() };
+                d.extend_from_slice(&s[idx * fixed_stride..(idx + 1) * fixed_stride]);
+            }
+            ColData::Strings(s) => {
+                let ColData::Strings(d) = dst else { variant_mismatch() };
+                d.push(s[idx].clone());
+            }
+            ColData::Bytes(s) => {
+                let ColData::Bytes(d) = dst else { variant_mismatch() };
+                d.push(s[idx].clone());
+            }
+            ColData::U128s(s) => {
+                let ColData::U128s(d) = dst else { variant_mismatch() };
+                d.push(s[idx]);
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn variant_mismatch() -> ! {
+    panic!("ColData::push_row_from: source and destination column variants differ");
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
     pub pks:     PkColumn,

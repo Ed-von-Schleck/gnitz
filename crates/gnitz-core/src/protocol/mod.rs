@@ -18,7 +18,7 @@ pub use header::{
     wire_flags_set_conflict_mode, wire_flags_get_conflict_mode,
     wire_flags_set_schema_version, wire_flags_get_schema_version,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_CONTINUATION,
-    STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, META_FLAG_NULLABLE, META_FLAG_IS_PK,
     WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
     MAX_COLUMNS,
 };
