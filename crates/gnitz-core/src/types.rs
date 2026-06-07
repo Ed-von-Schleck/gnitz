@@ -119,7 +119,7 @@ pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_cols: &[
     Schema {
         columns: cols.iter().map(|c| ColumnDef {
             name:        c.name.into(),
-            type_code:   TypeCode::from_validated_u8(c.type_code),
+            type_code:   c.type_code,
             is_nullable: c.nullable,
             fk_table_id: 0,
             fk_col_idx:  0,

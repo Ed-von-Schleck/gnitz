@@ -309,7 +309,7 @@ pub(crate) fn load_circuit(
     let mut gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
 
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
-    let mut cols_by_node: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
+    let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
     {
         let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_node_cols)?;
@@ -320,14 +320,16 @@ pub(crate) fn load_circuit(
             let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
             let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema) as u64;
             let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema) as u64;
-            cols_by_node.entry(node_id).or_default().push((kind, position, v1, v2));
+            cols_by_node.entry(node_id).or_default().push(gnitz_wire::CircuitNodeColumn {
+                kind, position, value1: v1, value2: v2,
+            });
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
     }
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
     for v in cols_by_node.values_mut() {
-        v.sort_by_key(|&(kind, pos, _, _)| (kind, pos));
+        v.sort_by_key(|c| (c.kind, c.position));
     }
 
     // Phase 2: read CircuitNodes; call decode_op_node for each.
@@ -363,7 +365,10 @@ pub(crate) fn load_circuit(
             let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols).ok()?;
             if matches!(op, gnitz_wire::OpNode::GatherReduce) {
                 if let Some(c) = cols_by_node.get(&node_id) {
-                    gather_reduce_cols.insert(node_id, c.clone());
+                    // GatherReduce stays on the legacy tuple path (emit_gather_reduce)
+                    // until OpNode::GatherReduce gains a typed `agg` field.
+                    gather_reduce_cols.insert(node_id,
+                        c.iter().map(|c| (c.kind, c.position, c.value1, c.value2)).collect());
                 }
             }
             nodes.insert(node_id, op);
@@ -3251,7 +3256,7 @@ mod tests {
     fn wire_sys_schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
         let mut buf = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
         for (i, c) in cols.iter().enumerate() {
-            buf[i] = SchemaColumn::new(c.type_code, if c.nullable { 1 } else { 0 });
+            buf[i] = SchemaColumn::new(c.type_code as u8, if c.nullable { 1 } else { 0 });
         }
         SchemaDescriptor::new(&buf[..cols.len()], &[0, 1])
     }

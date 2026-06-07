@@ -199,7 +199,7 @@ const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> 
     let mut buf = [zero_col(); crate::schema::MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
-        buf[i] = SchemaColumn::new(cols[i].type_code, if cols[i].nullable { 1 } else { 0 });
+        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
         i += 1;
     }
     let (head, _) = buf.split_at(cols.len());

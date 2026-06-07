@@ -22,19 +22,19 @@
 //!   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
 //!   other      -- master-allocated, monotonic per request
 
-use crate::{type_code, WireSysCol};
+use crate::{TypeCode, WireSysCol};
 
 pub const CONTROL_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "msg_idx",      type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "status",       type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "client_id",    type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "target_id",    type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "flags",        type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "seek_pk",      type_code: type_code::U128,   nullable: false },
-    WireSysCol { name: "seek_col_idx", type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "request_id",   type_code: type_code::U64,    nullable: false },
-    WireSysCol { name: "error_msg",    type_code: type_code::STRING, nullable: true  },
-    WireSysCol { name: "seek_pk_extra", type_code: type_code::BLOB,   nullable: true  },
+    WireSysCol { name: "msg_idx",      type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "status",       type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "client_id",    type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "target_id",    type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "flags",        type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "seek_pk",      type_code: TypeCode::U128,   nullable: false },
+    WireSysCol { name: "seek_col_idx", type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "request_id",   type_code: TypeCode::U64,    nullable: false },
+    WireSysCol { name: "error_msg",    type_code: TypeCode::String, nullable: true  },
+    WireSysCol { name: "seek_pk_extra", type_code: TypeCode::Blob,   nullable: true  },
 ];
 
 pub const NUM_COLUMNS: usize = CONTROL_COLS.len();

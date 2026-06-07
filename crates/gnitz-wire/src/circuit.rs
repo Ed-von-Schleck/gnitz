@@ -198,6 +198,16 @@ pub enum OpNode {
     ClearDeltas,
 }
 
+/// One decoded row of the `CircuitNodeColumns` system table for a single node,
+/// sorted by (kind, position). `value1`/`value2` are interpreted per `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitNodeColumn {
+    pub kind: u64,
+    pub position: u16,
+    pub value1: u64,
+    pub value2: u64,
+}
+
 /// Reconstruct an `OpNode` from the three-table row bundle.
 ///
 /// `cols` is the sorted (kind, position, value1, value2) slice for this node,
@@ -209,27 +219,27 @@ pub fn decode_op_node(
     src_tab: Option<TableId>,
     reindex: Option<u16>,
     expr_blob: Option<Vec<u8>>,
-    cols: &[(u64, u16, u64, u64)],
+    cols: &[CircuitNodeColumn],
 ) -> Result<OpNode, String> {
     let collect_cols = |kind: u64| -> Vec<u16> {
         cols.iter()
-            .filter(|(k, _, _, _)| *k == kind)
-            .map(|(_, _, v1, _)| *v1 as u16)
+            .filter(|c| c.kind == kind)
+            .map(|c| c.value1 as u16)
             .collect()
     };
     let collect_typecodes = |kind: u64| -> Vec<u8> {
         cols.iter()
-            .filter(|(k, _, _, _)| *k == kind)
-            .map(|(_, _, v1, _)| *v1 as u8)
+            .filter(|c| c.kind == kind)
+            .map(|c| c.value1 as u8)
             .collect()
     };
     let collect_aggs = || -> Result<Vec<(AggFunc, u16)>, String> {
         cols.iter()
-            .filter(|(k, _, _, _)| *k == NODE_COL_KIND_AGG_SPEC)
-            .map(|(_, _, v1, v2)| {
-                AggFunc::from_wire(*v1)
-                    .ok_or_else(|| format!("unknown agg func id {}", v1))
-                    .map(|f| (f, *v2 as u16))
+            .filter(|c| c.kind == NODE_COL_KIND_AGG_SPEC)
+            .map(|c| {
+                AggFunc::from_wire(c.value1)
+                    .ok_or_else(|| format!("unknown agg func id {}", c.value1))
+                    .map(|f| (f, c.value2 as u16))
             })
             .collect()
     };
@@ -250,14 +260,14 @@ pub fn decode_op_node(
             // unknown code would otherwise survive as a bogus slot width).
             let mut reindex_cols: Vec<u16> = Vec::new();
             let mut reindex_target_tcs: Vec<u8> = Vec::new();
-            for &(kind, _, v1, v2) in cols {
-                if kind == NODE_COL_KIND_REINDEX {
-                    let tc = v2 as u8;
+            for c in cols {
+                if c.kind == NODE_COL_KIND_REINDEX {
+                    let tc = c.value2 as u8;
                     if tc != 0 && !crate::is_pk_eligible(tc) {
                         return Err(format!(
                             "MAP_EXPR reindex target type code {tc} is not PK-eligible"));
                     }
-                    reindex_cols.push(v1 as u16);
+                    reindex_cols.push(c.value1 as u16);
                     reindex_target_tcs.push(tc);
                 }
             }
@@ -273,8 +283,8 @@ pub fn decode_op_node(
         x if x == OPCODE_MAP_KEY_ONLY      => OpNode::Map(MapKind::KeyOnly),
         x if x == OPCODE_MAP_HASH_ROW      => {
             let branch_id = cols.iter()
-                .find(|(k, _, _, _)| *k == NODE_COL_KIND_BRANCH_ID)
-                .map(|(_, _, v1, _)| *v1 as u8)
+                .find(|c| c.kind == NODE_COL_KIND_BRANCH_ID)
+                .map(|c| c.value1 as u8)
                 .unwrap_or(0);
             OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ), branch_id))
         }
@@ -331,8 +341,8 @@ mod tests {
     #[test]
     fn decode_reindex_cols_from_kind_rows() {
         let cols = [
-            (NODE_COL_KIND_REINDEX, 0u16, 3u64, 0u64),
-            (NODE_COL_KIND_REINDEX, 1u16, 9u64, 0u64),
+            CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 0, value1: 3, value2: 0 },
+            CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 1, value1: 9, value2: 0 },
         ];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_cols_of(node), vec![3, 9]);
@@ -350,7 +360,7 @@ mod tests {
     /// (the cell is only consulted when no kind rows exist).
     #[test]
     fn decode_reindex_cols_kind_rows_win_over_cell() {
-        let cols = [(NODE_COL_KIND_REINDEX, 0u16, 4u64, 0u64)];
+        let cols = [CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 0, value1: 4, value2: 0 }];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_cols_of(node), vec![4]);
     }
@@ -360,8 +370,8 @@ mod tests {
     #[test]
     fn decode_reindex_target_tcs_from_value2() {
         let cols = [
-            (NODE_COL_KIND_REINDEX, 0u16, 3u64, 0u64),                       // T = derive
-            (NODE_COL_KIND_REINDEX, 1u16, 3u64, crate::type_code::I64 as u64),      // T = I64
+            CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 0, value1: 3, value2: 0 },                          // T = derive
+            CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 1, value1: 3, value2: crate::type_code::I64 as u64 }, // T = I64
         ];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
@@ -378,7 +388,7 @@ mod tests {
     /// decode trust boundary (here: a float code), not silently mis-strided.
     #[test]
     fn decode_rejects_non_pk_eligible_target_tc() {
-        let cols = [(NODE_COL_KIND_REINDEX, 0u16, 3u64, crate::type_code::F64 as u64)];
+        let cols = [CircuitNodeColumn { kind: NODE_COL_KIND_REINDEX, position: 0, value1: 3, value2: crate::type_code::F64 as u64 }];
         let err = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols)
             .unwrap_err();
         assert!(err.contains("not PK-eligible"), "got: {err}");

@@ -80,20 +80,22 @@ impl Circuit {
     pub fn from_rows(view_id: u64, rows: CircuitRows) -> Result<Self, String> {
         // Group node-column rows by node_id so each node sees the relevant slice.
         use std::collections::BTreeMap;
-        let mut per_node: BTreeMap<NodeId, Vec<(u64, u16, u64, u64)>> = BTreeMap::new();
+        let mut per_node: BTreeMap<NodeId, Vec<gnitz_wire::CircuitNodeColumn>> = BTreeMap::new();
         for (nid, kind, pos, v1, v2) in rows.node_columns {
-            per_node.entry(nid).or_default().push((kind, pos, v1, v2));
+            per_node.entry(nid).or_default().push(gnitz_wire::CircuitNodeColumn {
+                kind, position: pos, value1: v1, value2: v2,
+            });
         }
         // Sort each group by (kind, position) so the typed payloads come out
         // in the order callers wrote them — the load path relies on this for
         // group_cols / shard_cols / proj_cols / agg_specs / null_extend / reindex_cols.
         for v in per_node.values_mut() {
-            v.sort_by_key(|&(kind, pos, _, _)| (kind, pos));
+            v.sort_by_key(|c| (c.kind, c.position));
         }
 
         let mut nodes = BTreeMap::new();
         for (nid, opcode, src_tab, reindex, expr_blob) in rows.nodes {
-            let cols: Vec<(u64, u16, u64, u64)> = per_node.remove(&nid).unwrap_or_default();
+            let cols: Vec<gnitz_wire::CircuitNodeColumn> = per_node.remove(&nid).unwrap_or_default();
             let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, &cols)?;
             nodes.insert(nid, op);
         }

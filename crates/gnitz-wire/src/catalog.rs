@@ -2,7 +2,7 @@
 //! table column lists and IDs, schema sizing caps, and the compound-PK
 //! column-list codec for the persisted `TABLE_TAB.pk_col_idx` u64.
 
-use crate::type_code;
+use crate::TypeCode;
 
 // ---------------------------------------------------------------------------
 // System table column descriptors — shared single source of truth
@@ -10,7 +10,7 @@ use crate::type_code;
 
 pub struct WireSysCol {
     pub name:      &'static str,
-    pub type_code: u8,
+    pub type_code: TypeCode,
     pub nullable:  bool,
 }
 
@@ -21,31 +21,31 @@ pub struct WireSysCol {
 // decoded fields as payload so the engine's logical-column readers are
 // unchanged. PK = columns [0, 1].
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",      type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "sub",          type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "node_id",      type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "opcode",       type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "source_table", type_code: type_code::U64,  nullable: true  },
-    WireSysCol { name: "reindex_col",  type_code: type_code::U64,  nullable: true  },
-    WireSysCol { name: "expr_program", type_code: type_code::BLOB, nullable: true  },
+    WireSysCol { name: "view_id",      type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "sub",          type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "node_id",      type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "opcode",       type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "source_table", type_code: TypeCode::U64,  nullable: true  },
+    WireSysCol { name: "reindex_col",  type_code: TypeCode::U64,  nullable: true  },
+    WireSysCol { name: "expr_program", type_code: TypeCode::Blob, nullable: true  },
 ];
 
 pub const CIRCUIT_EDGES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",  type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "sub",      type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "dst_node", type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "dst_port", type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "src_node", type_code: type_code::U64,  nullable: false },
+    WireSysCol { name: "view_id",  type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "sub",      type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "dst_node", type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "dst_port", type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "src_node", type_code: TypeCode::U64,  nullable: false },
 ];
 
 pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",     type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "sub",         type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "node_id",     type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "kind",        type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "position",    type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "value1",      type_code: type_code::U64,  nullable: false },
-    WireSysCol { name: "value2",      type_code: type_code::U64,  nullable: false },
+    WireSysCol { name: "view_id",     type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "sub",         type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "node_id",     type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "kind",        type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "position",    type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "value1",      type_code: TypeCode::U64,  nullable: false },
+    WireSysCol { name: "value2",      type_code: TypeCode::U64,  nullable: false },
 ];
 
 // ---------------------------------------------------------------------------

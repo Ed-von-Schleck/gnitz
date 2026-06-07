@@ -13,6 +13,11 @@ pub const SHORT_STRING_THRESHOLD: usize = 12;
 ///           if len > 12: blob arena offset (u64 LE)
 pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let len = s.len();
+    // The 4-byte length field caps a string at u32::MAX bytes. Silently
+    // truncating `len as u32` would corrupt this persisted format, so reject
+    // an over-long string outright (a release-build assert, not debug-only).
+    assert!(len <= u32::MAX as usize,
+        "encode_german_string: length {len} exceeds u32::MAX");
     let mut st = [0u8; 16];
     st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
     if len == 0 {

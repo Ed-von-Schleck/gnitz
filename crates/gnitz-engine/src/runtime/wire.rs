@@ -54,7 +54,7 @@ pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
     let mut i = 0;
     while i < gnitz_wire::control::NUM_COLUMNS {
         let c = &gnitz_wire::control::CONTROL_COLS[i];
-        cols[i] = SchemaColumn::new(c.type_code, c.nullable as u8);
+        cols[i] = SchemaColumn::new(c.type_code as u8, c.nullable as u8);
         i += 1;
     }
     SchemaDescriptor::new(&cols, &[gnitz_wire::control::COL_MSG_IDX as u32])
