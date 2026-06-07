@@ -198,6 +198,11 @@ impl CatalogEngine {
                 if let Some(dir) = directory {
                     self.pending_dir_deletions.push(dir);
                 }
+                // Purge both per-table version counters AFTER the cascade above:
+                // cascade_retract_indices' apply_index_by_id bump and (on the
+                // non-rollback path) cascade_retract_columns' invalidate_col_names
+                // bump would otherwise `or_insert` them straight back.
+                self.caches.purge_table_versions(tid);
             }
         }
         Ok(())
@@ -331,6 +336,11 @@ impl CatalogEngine {
                 if let Some(dir) = directory {
                     self.pending_dir_deletions.push(dir);
                 }
+                // See hook_table_register: purge post-cascade so the cascade's
+                // own counter bumps can't re-create a dropped view's entries.
+                // In rollback cascade_retract_columns is skipped (schema_version
+                // not re-created) but the tail purge cleans both either way.
+                self.caches.purge_table_versions(vid);
             }
         }
         Ok(())

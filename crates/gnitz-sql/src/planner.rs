@@ -8,7 +8,7 @@ use sqlparser::ast::{
 };
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
-    GnitzClient, CircuitBuilder, ExprBuilder,
+    GnitzClient, IndexMeta, CircuitBuilder, ExprBuilder,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
 };
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
@@ -176,10 +176,8 @@ fn resolve_fk_target(
     let is_lone_pk = ref_schema.pk_count() == 1
         && ref_col_idx == ref_schema.pk_index_single();
     if !is_lone_pk {
-        match client.find_index_for_column(ref_tid, ref_col_idx)
-            .map_err(GnitzSqlError::Exec)?
-        {
-            Some((_, true)) => {}
+        match client.index_for_column(ref_tid, ref_col_idx).map_err(GnitzSqlError::Exec)? {
+            Some(IndexMeta { is_unique: true, .. }) => {}
             _ => return Err(GnitzSqlError::Unsupported(format!(
                 "FK against table '{}' must reference the primary key or a column \
                  with a UNIQUE index; column '{}' has neither",

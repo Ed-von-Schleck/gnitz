@@ -825,6 +825,20 @@ impl Reactor {
         self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static).await
     }
 
+    /// Send a one-shot response buffer, closing `fd` on transport failure.
+    /// This is the terminal action shared by every request handler: once the
+    /// reply is on the wire there is nothing left to do on the connection, so a
+    /// negative send rc (peer gone / write error) simply schedules the close.
+    pub async fn send_buffer_or_close(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) {
+        if self.send_buffer(fd, buf).await < 0 { self.close_fd(fd); }
+    }
+
+    /// `send_slot` counterpart of [`Self::send_buffer_or_close`]: forward a
+    /// worker ring slot as the final reply, closing `fd` on transport failure.
+    pub async fn send_slot_or_close(&self, fd: i32, slot: W2mSlot) {
+        if self.send_slot(fd, slot).await < 0 { self.close_fd(fd); }
+    }
+
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
     async fn send_buf_inner(
         &self, fd: i32,

@@ -6,9 +6,10 @@ use lru::LruCache;
 use crate::protocol::{
     Message, Schema, ZSetBatch, PkTuple,
     STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID, FLAG_GET_INDICES,
     FLAG_CONTINUATION, WireConflictMode,
     wire_flags_set_conflict_mode, wire_flags_set_schema_version, wire_flags_get_schema_version,
+    wire_flags_set_index_version, wire_flags_get_index_version,
     send_message, send_message_noschema, recv_message,
     connect as proto_connect,
     hello_handshake,
@@ -180,6 +181,23 @@ impl Connection {
         let msg = self.roundtrip_seek_by_index(table_id, col_idx, key, cache)?;
         let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
+    }
+
+    /// Pure transport for GET_INDICES: send the cached index epoch and receive
+    /// the server's reply on a dedicated path — `recv_message(fd, None, ..)`,
+    /// never `recv_message_cached_inner` — so the per-table `schema_cache` is
+    /// untouched. The reply is schema-bearing only when the list changed; the
+    /// "unchanged" reply carries no data and needs no schema. Returns the raw
+    /// `(data_batch, server_epoch)` and leaves the `IndexMeta` decode to
+    /// `GnitzClient`, where the `col_u64` helper lives.
+    pub(crate) fn fetch_indices(&mut self, table_id: u64, cached_epoch: u8)
+        -> Result<(Option<ZSetBatch>, u8), ClientError>
+    {
+        let flags = wire_flags_set_index_version(FLAG_GET_INDICES, cached_epoch);
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags,
+                     &PkTuple::EMPTY, 0, None, None)?;
+        let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
+        Ok((msg.data_batch, wire_flags_get_index_version(msg.flags)))
     }
 
     /// Receive one framed message, using the LRU cache to decode continuation

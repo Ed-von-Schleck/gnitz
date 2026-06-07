@@ -24,6 +24,14 @@ pub const FLAG_HAS_DATA:       u64 = 1 << 49;
 /// `recv_message` until they see a frame without this bit.
 pub const FLAG_CONTINUATION:   u64 = 1 << 52;
 
+/// GET_INDICES request flag. Client-only and never written to SAL, so it sits
+/// above the SAL mirror (bits 0-15) and the wire packed fields rather than in
+/// the request-flag run at 4..256 — all of bits 0-15 are already allocated.
+/// Bit 54 is the lowest free request bit (50/51/53 are the engine-internal
+/// FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED / FLAG_SCAN_LAST defined in
+/// `runtime/wire.rs`).
+pub const FLAG_GET_INDICES: u64 = 1 << 54;
+
 // ---------------------------------------------------------------------------
 // Wire-level packed fields: bits 16-39 of wire_flags
 // ---------------------------------------------------------------------------
@@ -34,10 +42,24 @@ pub const WIRE_CONFLICT_MODE_MASK:  u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
 /// Bits 24-39: schema version (16 bits). Value 0 = client has no cached schema.
 pub const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
 pub const WIRE_SCHEMA_VERSION_MASK:  u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
+/// Bits 40-47: index-metadata version (8 bits). 0 = client has no cached list.
+pub const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
+pub const WIRE_INDEX_VERSION_MASK:  u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
 
-// Compile-time guard: SAL flags (bits 0-15) must not overlap the wire-level
-// packed fields (bits 16-39).
-const _: () = assert!(SAL_FLAGS_MASK & (WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK) == 0);
+// Compile-time guard: SAL flags (bits 0-15) must stay clear of the wire-level
+// packed fields, those fields must not overlap each other, the packed fields
+// must not collide with the high boolean flags, and the GET_INDICES request
+// flag must avoid all of the above (catches a regression to a colliding bit at
+// compile time).
+const _: () = {
+    let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK | WIRE_INDEX_VERSION_MASK;
+    assert!(SAL_FLAGS_MASK & packed == 0);
+    assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
+    assert!(WIRE_SCHEMA_VERSION_MASK & WIRE_INDEX_VERSION_MASK == 0);
+    assert!(packed & (FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
+    assert!(FLAG_GET_INDICES & (SAL_FLAGS_MASK | packed
+            | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
+};
 
 #[inline]
 pub fn wire_flags_set_conflict_mode(flags: u64, mode: WireConflictMode) -> u64 {
@@ -54,6 +76,14 @@ pub fn wire_flags_set_schema_version(flags: u64, version: u16) -> u64 {
 #[inline]
 pub fn wire_flags_get_schema_version(flags: u64) -> u16 {
     ((flags & WIRE_SCHEMA_VERSION_MASK) >> WIRE_SCHEMA_VERSION_SHIFT) as u16
+}
+#[inline]
+pub fn wire_flags_set_index_version(flags: u64, version: u8) -> u64 {
+    (flags & !WIRE_INDEX_VERSION_MASK) | ((version as u64) << WIRE_INDEX_VERSION_SHIFT)
+}
+#[inline]
+pub fn wire_flags_get_index_version(flags: u64) -> u8 {
+    ((flags & WIRE_INDEX_VERSION_MASK) >> WIRE_INDEX_VERSION_SHIFT) as u8
 }
 /// Returns true when the server should include a schema block in its response.
 /// `client_version == 0` means the client has no cached schema; any non-zero

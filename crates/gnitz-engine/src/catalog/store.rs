@@ -1166,6 +1166,11 @@ impl CatalogEngine {
         self.caches.get_schema_version(table_id)
     }
 
+    /// Return the current index-metadata version for `table_id` (1 if unknown).
+    pub fn get_index_version(&self, table_id: i64) -> u8 {
+        self.caches.get_index_version(table_id)
+    }
+
     /// Store an encoded schema wire block in the cache, along with its
     /// derived wire properties. The two are written together so the
     /// invalidation in `clear_col_cache_no_bump` keeps them consistent.

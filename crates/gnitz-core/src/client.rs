@@ -119,9 +119,16 @@ struct ViewRecord {
 
 // --- GnitzClient ---
 
+/// A tiny owned secondary-index descriptor. `index_id` has no consumer, so it
+/// is omitted; `col_idx` is the unique key (the circuit list is deduped by
+/// column) and `is_unique` is the system's operative uniqueness truth.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexMeta { pub col_idx: u32, pub is_unique: bool }
+
 pub struct GnitzClient {
     conn:         Connection,
     schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
+    index_cache:  LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
 }
 
 impl GnitzClient {
@@ -129,6 +136,7 @@ impl GnitzClient {
         Ok(GnitzClient {
             conn:         Connection::connect(socket_path)?,
             schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
+            index_cache:  LruCache::new(SCHEMA_CACHE_CAP),
         })
     }
 
@@ -183,27 +191,44 @@ impl GnitzClient {
         self.conn.seek_by_index(table_id, col_idx, key, &mut self.schema_cache)
     }
 
-    pub fn find_index_for_column(
+    /// The secondary-index descriptor for `col_idx` of `table_id`, served from a
+    /// durable, epoch-validated cache instead of an `IDX_TAB` scan. The cache
+    /// holds the projected `(col_idx, is_unique)` circuit list at the server's
+    /// index epoch; a GET_INDICES round-trip either confirms it (unchanged) or
+    /// replaces it. `col_idx` is unique per row (the server dedups circuits by
+    /// column), so a plain `find` is exact.
+    ///
+    /// The reported uniqueness matches the server's authoritative pre-create FK
+    /// gate `validate_fk_column` exactly — both read `is_unique` off the same
+    /// `index_circuits` — so the cached client check can never accept an FK the
+    /// server would reject, nor reject one it would accept. (The old IDX_TAB
+    /// scan could diverge by reporting a phantom unique index masked by the
+    /// circuit dedup; the circuit list does not.)
+    pub fn index_for_column(
         &mut self, table_id: u64, col_idx: usize,
-    ) -> Result<Option<(u64, bool)>, ClientError> {
-        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
-        let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
-        // A column may be covered by both a unique and a non-unique index;
-        // prefer the UNIQUE one so a FK admission gate sees the right answer.
-        let mut found_non_unique = None;
-        for i in 0..idx_batch.len() {
-            if idx_batch.weights[i] <= 0 { continue; }
-            let owner_id       = col_u64(&idx_batch.columns[1], i)?;
-            let source_col_idx = col_u64(&idx_batch.columns[3], i)?;
-            if owner_id == table_id && source_col_idx == col_idx as u64 {
-                let index_id = idx_batch.pks.get(i) as u64;
-                if col_u64(&idx_batch.columns[5], i)? != 0 {
-                    return Ok(Some((index_id, true)));
+    ) -> Result<Option<IndexMeta>, ClientError> {
+        let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
+        let (batch, epoch) = self.conn.fetch_indices(table_id, cached_epoch)?;
+        let list = if epoch == cached_epoch && cached_epoch != 0 {
+            // Unchanged: the server only sends the no-data reply with a returned
+            // epoch equal to a non-zero cached epoch, so the entry is present.
+            self.index_cache.get(&table_id).map(|(l, _)| Arc::clone(l)).unwrap()
+        } else {
+            let mut fresh = Vec::new();
+            if let Some(b) = batch {                 // None ⇒ changed-to-empty list
+                for i in 0..b.len() {
+                    if b.weights[i] <= 0 { continue; }
+                    fresh.push(IndexMeta {
+                        col_idx:   b.pks.get(i) as u32,            // PK column
+                        is_unique: col_u64(&b.columns[1], i)? != 0,
+                    });
                 }
-                found_non_unique = Some((index_id, false));
             }
-        }
-        Ok(found_non_unique)
+            let rc = Arc::new(fresh);
+            self.index_cache.put(table_id, (Arc::clone(&rc), epoch));
+            rc
+        };
+        Ok(list.iter().find(|m| m.col_idx as usize == col_idx).copied())
     }
 
     pub fn create_index(

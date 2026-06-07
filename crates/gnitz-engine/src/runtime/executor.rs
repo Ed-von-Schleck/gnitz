@@ -22,9 +22,10 @@ use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
                      TABLE_TAB_ID, IDX_TAB_ID,
-                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE};
+                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE,
+                     BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES};
 use crate::runtime::committer::{self, CommitRequest};
-use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, SchemaWithVersion};
+use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_GET_INDICES, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
 use crate::runtime::reactor::{
     AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture, join_into,
@@ -696,6 +697,17 @@ async fn handle_message(
         return;
     }
 
+    // GET_INDICES must be routed before the generic empty-batch scan dispatch
+    // below, which keys only on target_id and would otherwise swallow it. The
+    // epoch read and the descriptor build both run under the catalog read lock,
+    // so there is no torn read between the epoch and the circuit list.
+    if flags & FLAG_GET_INDICES != 0 {
+        let _g = shared.catalog_rwlock.read().await;
+        handle_get_indices(shared, fd, client_id, target_id,
+                           ipc::wire_flags_get_index_version(flags)).await;
+        return;
+    }
+
     if target_id >= FIRST_USER_TABLE_ID && (!has_batch || batch_count == 0) {
         handle_scan(shared, fd, client_id, target_id, client_version).await;
         return;
@@ -792,10 +804,7 @@ async fn handle_seek(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
             target_id, pk, seek_pk_extra,
         ).await {
-            Ok(slot) => {
-                let rc = shared.reactor.send_slot(fd, slot).await;
-                if rc < 0 { shared.reactor.close_fd(fd); }
-            }
+            Ok(slot) => shared.reactor.send_slot_or_close(fd, slot).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
@@ -855,10 +864,7 @@ async fn handle_seek_by_index(
                 shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
                 target_id, col_idx, key,
             ).await {
-                Ok(slot) => {
-                    let rc = shared.reactor.send_slot(fd, slot).await;
-                    if rc < 0 { shared.reactor.close_fd(fd); }
-                }
+                Ok(slot) => shared.reactor.send_slot_or_close(fd, slot).await,
                 Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
             }
             return;
@@ -883,6 +889,51 @@ async fn handle_seek_by_index(
         let msg = format!("SEEK_BY_INDEX on system table {} is not supported", target_id);
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
     }
+}
+
+/// GET_INDICES: serve the client's durable, epoch-validated cache of a table's
+/// secondary-index metadata — the `(col_idx, is_unique)` set, projected from the
+/// DAG `index_circuits` (the system's operative truth for "is this column
+/// enforced-unique", identical to the server's own FK gate `validate_fk_column`).
+/// The client's cached epoch arrives in the index-version wire bits; on a match
+/// we reply "unchanged" (no schema, no data), otherwise the fresh list.
+async fn handle_get_indices(
+    shared: &Rc<Shared>, fd: i32, client_id: u64,
+    target_id: i64, client_epoch: u8,
+) {
+    let server_epoch = shared.cat().get_index_version(target_id);   // absent ⇒ 1
+    let flags = ipc::wire_flags_set_index_version(0, server_epoch);
+
+    // Warm hit (and the missing-table race, since both resolve to epoch 1 with
+    // an empty list): OK, no schema, no data → client keeps its cached Rc.
+    if client_epoch == server_epoch {
+        let buf = encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, 0, flags);
+        shared.reactor.send_buffer_or_close(fd, buf).await;
+        return;
+    }
+
+    // Changed / first fetch: project every index circuit (FK + non-unique
+    // included) to (col_idx PK, is_unique). The response always carries its own
+    // schema block on the data path, so the client decodes against the wire
+    // schema and never needs — or pollutes — the per-table schema cache.
+    let desc = index_meta_schema_desc();
+    // Build the schema block before the descriptor is moved into BatchBuilder.
+    let schema_block = ipc::build_schema_wire_block(&desc, &INDEX_META_COL_NAMES[..], target_id as u32);
+    let mut bb = BatchBuilder::new(desc);
+    if let Some(entry) = shared.cat().dag.tables.get(&target_id) {
+        for ic in &entry.index_circuits {
+            bb.begin_row(ic.col_idx as u128, 1);   // PK = col_idx (unique: deduped)
+            bb.put_u64(ic.is_unique as u64);        // payload: is_unique
+            bb.end_row();
+        }
+    }
+    let batch = bb.finish();
+    let result = if batch.count > 0 { Some(&batch) } else { None };
+    let buf = encode_response_buffer(
+        target_id, client_id, result, STATUS_OK, b"",
+        Some(schema_block.as_slice()), 0, flags,
+    );
+    shared.reactor.send_buffer_or_close(fd, buf).await;
 }
 
 async fn handle_scan(
@@ -957,8 +1008,7 @@ async fn handle_scan(
     match result {
         Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
-            let rc = shared.reactor.send_buffer(fd, terminal).await;
-            if rc < 0 { shared.reactor.close_fd(fd); }
+            shared.reactor.send_buffer_or_close(fd, terminal).await;
         }
         Ok(false) => {
             shared.reactor.close_fd(fd);
@@ -1252,8 +1302,7 @@ async fn send_ok_response(
         target_id, client_id, result, STATUS_OK, b"",
         schema_arg, seek_pk, flags,
     );
-    let rc = shared.reactor.send_buffer(fd, buf).await;
-    if rc < 0 { shared.reactor.close_fd(fd); }
+    shared.reactor.send_buffer_or_close(fd, buf).await;
 }
 
 /// Control-only reply carrying just a status code: no schema, no data, no error
@@ -1267,8 +1316,7 @@ async fn send_control_only(
         target_id, client_id, None, status, b"",
         None, 0, 0,
     );
-    let rc = shared.reactor.send_buffer(fd, buf).await;
-    if rc < 0 { shared.reactor.close_fd(fd); }
+    shared.reactor.send_buffer_or_close(fd, buf).await;
 }
 
 async fn send_error(
@@ -1282,8 +1330,7 @@ async fn send_error(
         target_id, client_id, None, STATUS_ERROR, error_msg,
         None, 0, 0,
     );
-    let rc = shared.reactor.send_buffer(fd, buf).await;
-    if rc < 0 { shared.reactor.close_fd(fd); }
+    shared.reactor.send_buffer_or_close(fd, buf).await;
 }
 
 async fn send_alloc(
@@ -1291,8 +1338,7 @@ async fn send_alloc(
 ) {
     // Alloc responses carry no schema block; schema version irrelevant.
     let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0, 0);
-    let rc = shared.reactor.send_buffer(fd, buf).await;
-    if rc < 0 { shared.reactor.close_fd(fd); }
+    shared.reactor.send_buffer_or_close(fd, buf).await;
 }
 
 // ---------------------------------------------------------------------------

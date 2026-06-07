@@ -15,7 +15,7 @@ pub use connection::{
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
-pub use client::GnitzClient;
+pub use client::{GnitzClient, IndexMeta};
 pub use protocol::{
     ProtocolError,
     TypeCode, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,

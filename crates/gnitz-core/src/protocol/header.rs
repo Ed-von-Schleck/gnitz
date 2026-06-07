@@ -1,6 +1,6 @@
 pub use gnitz_wire::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
-    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_GET_INDICES,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_CONTINUATION,
     STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX,
     META_FLAG_NULLABLE, META_FLAG_IS_PK,
@@ -10,6 +10,7 @@ pub use gnitz_wire::{
     WireConflictMode,
     wire_flags_set_conflict_mode, wire_flags_get_conflict_mode,
     wire_flags_set_schema_version, wire_flags_get_schema_version,
+    wire_flags_set_index_version, wire_flags_get_index_version,
     MAX_COLUMNS,
 };
 

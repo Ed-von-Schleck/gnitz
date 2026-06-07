@@ -909,6 +909,106 @@ fn test_seek_by_index_orphan_entry_terminates() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── index epoch: durable client-cache invalidation token ─────────────────
+//
+// Each owner-affecting IDX_TAB write bumps the per-table index epoch (wraps
+// 255 → 1, never 0). Clients echo their cached epoch in GET_INDICES; the server
+// re-sends the projected (col_idx, is_unique) list only on a mismatch. These
+// guard the §1 counter mechanics directly: bump on every index DDL, never 0,
+// and the post-cascade purge that stops a dropped tid from leaking a counter.
+
+#[test]
+fn index_version_bumps_on_create_and_drop_index() {
+    let dir = temp_dir("index_version_create_drop");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+
+    // No index DDL yet → the base epoch (absent ⇒ 1), never 0.
+    assert_eq!(engine.get_index_version(tid), 1);
+
+    engine.create_index("public.t", "val", false).unwrap();
+    let after_create = engine.get_index_version(tid);
+    assert!(after_create != 1 && after_create != 0,
+        "CREATE INDEX must move the epoch off the base, never to 0: got {after_create}");
+
+    let idx_name = make_secondary_index_name("public", "t", "val");
+    engine.drop_index(&idx_name).unwrap();
+    let after_drop = engine.get_index_version(tid);
+    assert!(after_drop != after_create && after_drop != 0,
+        "DROP INDEX must move the epoch again, never to 0: got {after_drop}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn index_version_bumps_on_unique_index() {
+    let dir = temp_dir("index_version_unique");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    assert_eq!(engine.get_index_version(tid), 1);
+    engine.create_index("public.t", "val", true).unwrap();   // UNIQUE
+    assert!(engine.get_index_version(tid) > 1,
+        "CREATE UNIQUE INDEX must bump the epoch");
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn index_version_bumps_on_fk_auto_index() {
+    // The FK auto-index is created with the child table; its IDX_TAB +1 must
+    // bump the child's epoch just like an explicit CREATE INDEX.
+    let dir = temp_dir("index_version_fk_auto");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let parent_cols = vec![u64_col_def("pk"), u64_col_def("name")];
+    let parent_tid = engine.create_table("public.parent", &parent_cols, &[0], true).unwrap();
+    let child_cols = vec![
+        u64_col_def("pk"),
+        ColumnDef {
+            name: "parent_ref".into(), type_code: type_code::U64,
+            is_nullable: false, fk_table_id: parent_tid, fk_col_idx: 0,
+        },
+    ];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+    assert!(engine.get_index_version(child_tid) > 1,
+        "FK auto-index creation must bump the child's index epoch");
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drop_table_purges_both_version_counters() {
+    // Regression for the post-cascade purge. Dropping a table must remove BOTH
+    // its index_version and schema_version entries. The drop cascade re-ingests
+    // IDX_TAB / COL_TAB retractions whose appliers `or_insert` the counters
+    // straight back, so a removal in apply_entity_by_id (which fires *before*
+    // the cascade) is immediately undone — leaking memory for a tid that is
+    // never reused. The purge runs at the tail of the drop hook, after the
+    // cascade, so both must end up absent.
+    let dir = temp_dir("drop_purges_versions");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    engine.create_index("public.t", "val", false).unwrap();
+
+    assert!(engine.caches.index_version.contains_key(&tid),
+        "live indexed table must have an index_version entry");
+    assert!(engine.caches.schema_version.contains_key(&tid),
+        "live table must have a schema_version entry");
+
+    engine.drop_table("public.t").unwrap();
+
+    assert!(!engine.caches.index_version.contains_key(&tid),
+        "index_version must be purged post-cascade (the index retraction re-creates it)");
+    assert!(!engine.caches.schema_version.contains_key(&tid),
+        "schema_version must be purged post-cascade (the column retraction re-creates it)");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── UNIQUE index on STRING/BLOB rejected at DDL ──────────────────────────
 
 #[test]

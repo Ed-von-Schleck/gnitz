@@ -779,3 +779,80 @@ class TestFkNonPkUniqueGather:
             assert seen == [2]
         finally:
             _cleanup(client, sn, "c", "p")
+
+
+class TestFkIndexEpochInvalidation:
+    """FK-target validation reads a durable, per-connection cache of the
+    parent's secondary-index metadata. A per-table index epoch makes that cache
+    correctly invalidate across connections: when another connection's DDL adds
+    (or drops) a UNIQUE index on the referenced column, the cached list must be
+    re-fetched on the next FK check rather than served stale."""
+
+    def test_unique_index_created_on_other_connection_is_observed(self, server):
+        # Connection B warms its index cache for the parent (no unique index on
+        # `code` yet → FK rejected). Connection A then adds the UNIQUE index,
+        # bumping the parent's index epoch. B's next FK check must see the stale
+        # epoch, re-fetch, and accept the FK it would otherwise wrongly reject.
+        sn = "s" + _uid()
+        with gnitz.connect(server) as a, gnitz.connect(server) as b:
+            try:
+                a.create_schema(sn)
+                a.execute_sql(
+                    "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                    "code BIGINT UNSIGNED NOT NULL)",
+                    schema_name=sn,
+                )
+                # B caches the parent's (empty) index list at the base epoch: no
+                # UNIQUE index on `code`, so an FK against it is rejected.
+                with pytest.raises(gnitz.GnitzError):
+                    b.execute_sql(
+                        "CREATE TABLE c1 (cid BIGINT PRIMARY KEY, "
+                        "ref BIGINT UNSIGNED REFERENCES p(code))",
+                        schema_name=sn,
+                    )
+                # A adds the UNIQUE index on a different connection → epoch bump.
+                a.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+                # B's cached epoch is now stale; the FK check must re-fetch and
+                # succeed. (Without the epoch, B would serve its stale empty
+                # cache and reject c2.)
+                b.execute_sql(
+                    "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, "
+                    "ref BIGINT UNSIGNED REFERENCES p(code))",
+                    schema_name=sn,
+                )
+                # Sanity: the resolved FK is actually enforced at insert time.
+                a.execute_sql("INSERT INTO p VALUES (1, 1000)", schema_name=sn)
+                b.execute_sql("INSERT INTO c2 VALUES (1, 1000)", schema_name=sn)
+                with pytest.raises(gnitz.GnitzError):
+                    b.execute_sql("INSERT INTO c2 VALUES (2, 9999)", schema_name=sn)
+            finally:
+                _cleanup(a, sn, "c2", "c1", "p")
+
+    def test_repeated_fk_checks_reuse_warm_cache(self, server):
+        # Two FK references to the same parent column on one connection: the
+        # second resolves against the warm index cache (unchanged epoch). Both
+        # must succeed identically — the warm "unchanged" reply must not corrupt
+        # or drop the cached list.
+        sn = "s" + _uid()
+        with gnitz.connect(server) as c:
+            try:
+                c.create_schema(sn)
+                c.execute_sql(
+                    "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                    "code BIGINT UNSIGNED NOT NULL)",
+                    schema_name=sn,
+                )
+                c.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+                c.execute_sql(
+                    "CREATE TABLE c1 (cid BIGINT PRIMARY KEY, "
+                    "ref BIGINT UNSIGNED REFERENCES p(code))",
+                    schema_name=sn,
+                )
+                # Second FK reference → warm-cache (unchanged) path on the client.
+                c.execute_sql(
+                    "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, "
+                    "ref BIGINT UNSIGNED REFERENCES p(code))",
+                    schema_name=sn,
+                )
+            finally:
+                _cleanup(c, sn, "c2", "c1", "p")

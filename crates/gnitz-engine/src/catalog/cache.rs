@@ -27,6 +27,12 @@ pub(crate) struct CatalogCacheSet {
     /// Absent entries implicitly resolve to version 1 (base version).
     /// Version 0 is reserved as "client has no cached schema".
     pub(crate) schema_version: FxHashMap<i64, u16>,
+    /// Per-table index-metadata version (wraps 255 → 1, never 0).
+    /// Absent ⇒ 1 (base). 0 is the client sentinel "no cached index list".
+    /// `u8` because it travels in 8 free wire bits (bits 40-47); a wider
+    /// counter truncated to 8 bits would both alias distinct values and emit
+    /// the reserved `0` sentinel on overflow.
+    pub(crate) index_version: FxHashMap<i64, u8>,
     pub(crate) index_by_name:    FxHashMap<String, i64>,
     pub(crate) index_by_id:      FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
@@ -41,6 +47,13 @@ pub(crate) struct CatalogCacheSet {
 #[inline]
 fn bump_schema_version(v: u16) -> u16 {
     if v == u16::MAX { 1 } else { v + 1 }
+}
+
+/// Increment an index-metadata version counter: wraps 255 → 1, never 0.
+/// 0 is reserved as the client sentinel meaning "no cached index list".
+#[inline]
+fn bump_index_version(v: u8) -> u8 {
+    if v == u8::MAX { 1 } else { v + 1 }
 }
 
 impl CatalogCacheSet {
@@ -69,6 +82,22 @@ impl CatalogCacheSet {
     /// Return the current schema version for `id`. Absent = version 1.
     pub(crate) fn get_schema_version(&self, id: i64) -> u16 {
         self.schema_version.get(&id).copied().unwrap_or(1)
+    }
+
+    /// Return the current index-metadata version for `id`. Absent = version 1.
+    pub(crate) fn get_index_version(&self, id: i64) -> u8 {
+        self.index_version.get(&id).copied().unwrap_or(1)
+    }
+
+    /// Drop both per-table version counters when a table/view is fully removed.
+    /// Call this at the tail of the drop hook — *after* the column / index
+    /// cascade, whose `invalidate_col_names` / `apply_index_by_id` bumps would
+    /// otherwise `or_insert` the counters straight back. Table ids are
+    /// monotonic and never reused, so a counter left behind here would become
+    /// permanent dead memory.
+    pub(crate) fn purge_table_versions(&mut self, id: i64) {
+        self.schema_version.remove(&id);
+        self.index_version.remove(&id);
     }
 }
 
@@ -142,8 +171,14 @@ impl CatalogEngine {
             } else {
                 // Table dropped: clear per-table cache entries without bumping the
                 // schema version (there is no new schema to advertise).
+                // `clear_col_cache_no_bump` is the only column-cache cleanup on
+                // the `in_rollback` path where `cascade_retract_columns` is
+                // skipped. The schema_version / index_version counters are NOT
+                // removed here: the column/index cascade fires AFTER this applier
+                // (apply_entity_by_id runs before hook_table_register) and would
+                // `or_insert` them straight back. They are purged post-cascade by
+                // `purge_table_versions` at the tail of the drop hook.
                 self.caches.clear_col_cache_no_bump(tid);
-                self.caches.schema_version.remove(&tid);
                 self.caches.entity_by_id.remove(&tid);
             }
         }
@@ -257,6 +292,16 @@ impl CatalogEngine {
                     if e.get().is_empty() { e.remove(); }
                 }
             }
+            // Bump unconditionally so DROP-then-recreate on the same column
+            // changes the epoch even when the net (col_idx, is_unique) set looks
+            // identical. Per-row (not per-batch) matches schema_version, which
+            // also bumps per row in apply_col_names_invalidate. Over-bumping
+            // within one DDL only ever costs a client a spurious re-fetch — it
+            // is never incorrect, because the epoch is always validated against
+            // a fresh fetch. The post-cascade purge (purge_table_versions)
+            // removes the entry an owner drop re-creates here.
+            let v = self.caches.index_version.entry(owner_id).or_insert(1);
+            *v = bump_index_version(*v);
         }
         Ok(())
     }

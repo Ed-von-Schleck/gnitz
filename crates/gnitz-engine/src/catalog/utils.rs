@@ -170,6 +170,16 @@ pub(crate) fn make_index_schema(
     SchemaDescriptor::new(&cols, &pk_indices)
 }
 
+/// Wire schema for the GET_INDICES descriptor list: `(col_idx PK, is_unique)`.
+/// `col_idx` is the PK (unique per the `index_circuits` dedup by column), so no
+/// synthetic ordinal is needed. The server ships this block on the data path;
+/// the client decodes against the wire schema and reads columns by position.
+pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
+    let u64c = SchemaColumn::new(type_code::U64, 0);
+    SchemaDescriptor::new(&[u64c, u64c], &[0])   // [col_idx (PK), is_unique]
+}
+pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"col_idx", b"is_unique"];
+
 /// Infix that marks an index as an internal FK-backing index. The single
 /// source of truth for both name construction and the DROP INDEX integrity
 /// guard that protects these indices.
