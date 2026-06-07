@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use sqlparser::ast::{
     Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Expr,
     SelectItem, TableFactor, JoinOperator, JoinConstraint, GroupByExpr,
@@ -876,9 +877,9 @@ fn execute_create_join_view(
     }
 
     // Build alias map for qualified column resolution
-    let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
-    alias_map.insert(left_alias.to_lowercase(), (left_tid, (*left_schema).clone(), 0));
-    alias_map.insert(right_alias.to_lowercase(), (right_tid, (*right_schema).clone(), left_schema.columns.len()));
+    let mut alias_map: JoinAliasMap = HashMap::new();
+    alias_map.insert(left_alias.to_lowercase(), (left_tid, Rc::clone(&left_schema), 0));
+    alias_map.insert(right_alias.to_lowercase(), (right_tid, Rc::clone(&right_schema), left_schema.columns.len()));
 
     // Extract equijoin keys + the per-pair common reindex output type `T`.
     let (left_join_cols, right_join_cols, target_tcs) = extract_equijoin_keys(
@@ -1267,6 +1268,11 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
 /// output type: `(left_cols, right_cols, target_tcs)`.
 type EquijoinKeys = (Vec<usize>, Vec<usize>, Vec<u8>);
 
+/// Alias map for JOIN column resolution: alias/name → (table_id, schema,
+/// global column offset). `Rc<Schema>` so the per-side schemas resolved by the
+/// binder are shared, not deep-cloned, into the map.
+type JoinAliasMap = HashMap<String, (u64, Rc<Schema>, usize)>;
+
 /// Extract the ordered list of equijoin key columns from an ON expression.
 /// Returns (left_cols, right_cols, target_tcs), per-table-relative, paired by
 /// position; `target_tcs[i]` is the pair's common reindex output type `T`.
@@ -1274,7 +1280,7 @@ fn extract_equijoin_keys(
     on_expr:      &Expr,
     left_schema:  &Schema,
     right_schema: &Schema,
-    alias_map:    &HashMap<String, (u64, Schema, usize)>,
+    alias_map:    &JoinAliasMap,
 ) -> Result<EquijoinKeys, GnitzSqlError> {
     let mut left_cols  = Vec::new();
     let mut right_cols = Vec::new();
@@ -1302,7 +1308,7 @@ fn collect_equijoin_keys(
     expr:         &Expr,
     left_schema:  &Schema,
     right_schema: &Schema,
-    alias_map:    &HashMap<String, (u64, Schema, usize)>,
+    alias_map:    &JoinAliasMap,
     left_cols:    &mut Vec<usize>,
     right_cols:   &mut Vec<usize>,
     target_tcs:   &mut Vec<u8>,
@@ -1359,7 +1365,7 @@ fn collect_equijoin_keys(
 /// Resolve a column reference in a JOIN ON clause to a global column index.
 fn resolve_join_col_ref(
     expr:         &Expr,
-    alias_map:    &HashMap<String, (u64, Schema, usize)>,
+    alias_map:    &JoinAliasMap,
 ) -> Result<usize, GnitzSqlError> {
     match expr {
         Expr::Nested(inner) => resolve_join_col_ref(inner, alias_map),
@@ -2477,13 +2483,13 @@ mod tests {
     fn join_ctx(
         left:  Vec<ColumnDef>,
         right: Vec<ColumnDef>,
-    ) -> (Schema, Schema, HashMap<String, (u64, Schema, usize)>) {
+    ) -> (Schema, Schema, JoinAliasMap) {
         let left_n = left.len();
         let left_schema  = Schema { columns: left,  pk_cols: vec![0] };
         let right_schema = Schema { columns: right, pk_cols: vec![0] };
         let mut am = HashMap::new();
-        am.insert("a".to_string(), (1u64, left_schema.clone(), 0usize));
-        am.insert("b".to_string(), (2u64, right_schema.clone(), left_n));
+        am.insert("a".to_string(), (1u64, Rc::new(left_schema.clone()), 0usize));
+        am.insert("b".to_string(), (2u64, Rc::new(right_schema.clone()), left_n));
         (left_schema, right_schema, am)
     }
 

@@ -14,7 +14,7 @@ use crate::logical_plan::{BoundExpr, BinOp, UnaryOp, AggFunc};
 pub fn resolve_qualified_column(
     table_alias: &str,
     col_name: &str,
-    tables: &HashMap<String, (u64, Schema, usize)>,
+    tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
 ) -> Result<usize, GnitzSqlError> {
     let (_, schema, offset) = tables.get(table_alias)
         .ok_or_else(|| GnitzSqlError::Bind(
@@ -31,7 +31,7 @@ pub fn resolve_qualified_column(
 /// Tries each table in order; errors on ambiguity.
 pub fn resolve_unqualified_column(
     col_name: &str,
-    tables: &HashMap<String, (u64, Schema, usize)>,
+    tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
 ) -> Result<usize, GnitzSqlError> {
     let mut found: Option<usize> = None;
     for (_, schema, offset) in tables.values() {

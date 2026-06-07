@@ -482,6 +482,38 @@ fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u
     }
 }
 
+/// A SQL literal extracted from an `Expr` for PK/seek routing. `Number`'s
+/// second field is `negated` (the literal sat under `UnaryOp(Minus, _)`);
+/// `Str` carries the unescaped single-quoted contents.
+enum SqlLiteral<'a> { Number(&'a str, bool), Str(&'a str), Null }
+
+/// Centralizes the `Expr::Value` / `UnaryOp(Minus, Number)` unwrap shared by
+/// the SEEK/INSERT parse sites (`parse_one_pk_literal`, `try_col_eq_literal`,
+/// `try_extract_pk_in`).
+///
+/// Matches `SingleQuotedString` only — NOT `DoubleQuotedString`: in
+/// `GenericDialect` a double-quoted token is an identifier, so treating
+/// `col = "x"` as a UUID seek literal would silently change which queries
+/// take the index fast path.
+fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
+    match expr {
+        Expr::Value(vws) => match &vws.value {
+            Value::Null                  => Some(SqlLiteral::Null),
+            Value::Number(n, _)          => Some(SqlLiteral::Number(n, false)),
+            Value::SingleQuotedString(s) => Some(SqlLiteral::Str(s)),
+            _ => None,
+        },
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match expr.as_ref() {
+            Expr::Value(vws) => match &vws.value {
+                Value::Number(n, _) => Some(SqlLiteral::Number(n, true)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Parse one PK column literal at `pk_expr` into its packed u128 form.
 /// Routes through `parse_pk_literal_packed` (numerics) or `parse_uuid_str`
 /// (UUID); the returned u128's low `wire_stride` bytes carry the column's
@@ -491,42 +523,26 @@ fn parse_one_pk_literal(
     tc: TypeCode,
     col_name: &str,
 ) -> Result<u128, GnitzSqlError> {
-    let (pk_expr, negated) = match pk_expr {
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
-        e => (e, false),
-    };
-    match pk_expr {
-        Expr::Value(vws) => match &vws.value {
-            Value::Number(n, _) => {
-                parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
-                    if negated && matches!(tc,
-                        TypeCode::U8 | TypeCode::U16 | TypeCode::U32
-                        | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
-                    ) {
-                        GnitzSqlError::Bind(format!(
-                            "PK column '{}' of type {:?} does not accept negative literals",
-                            col_name, tc))
-                    } else {
-                        let s_disp = if negated { format!("-{}", n) } else { n.clone() };
-                        GnitzSqlError::Bind(format!(
-                            "PK column '{}' value is not a valid {:?}: {}",
-                            col_name, tc, s_disp))
-                    }
-                })
-            }
-            Value::SingleQuotedString(s) if tc == TypeCode::UUID => {
-                if negated {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "PK column '{}' of type UUID does not accept negative literals",
-                        col_name
-                    )));
+    match extract_sql_literal(pk_expr) {
+        Some(SqlLiteral::Number(n, negated)) => {
+            parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
+                if negated && matches!(tc,
+                    TypeCode::U8 | TypeCode::U16 | TypeCode::U32
+                    | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
+                ) {
+                    GnitzSqlError::Bind(format!(
+                        "PK column '{}' of type {:?} does not accept negative literals",
+                        col_name, tc))
+                } else {
+                    let s_disp = if negated { format!("-{}", n) } else { n.to_string() };
+                    GnitzSqlError::Bind(format!(
+                        "PK column '{}' value is not a valid {:?}: {}",
+                        col_name, tc, s_disp))
                 }
-                parse_uuid_str(s)
-            }
-            _ => Err(GnitzSqlError::Bind(format!(
-                "PK column '{}' value must be a numeric literal", col_name
-            ))),
-        },
+            })
+        }
+        // UUID accepts a single-quoted UUID string; non-UUID PKs are numeric only.
+        Some(SqlLiteral::Str(s)) if tc == TypeCode::UUID => parse_uuid_str(s),
         _ => Err(GnitzSqlError::Bind(format!(
             "PK column '{}' value must be a numeric literal", col_name
         ))),
@@ -560,6 +576,17 @@ fn is_null_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Value(vws) if matches!(vws.value, Value::Null))
 }
 
+/// Append a NULL for column `col` of wire type `tc`. The NULL encoding is
+/// uniform across all four `ColData` variants, so INSERT and UPDATE share it.
+fn append_null(col: &mut ColData, tc: TypeCode) {
+    match col {
+        ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
+        ColData::Strings(v) => v.push(None),
+        ColData::Bytes(v)   => v.push(None),
+        ColData::U128s(v)   => v.push(0u128),
+    }
+}
+
 fn append_value_to_col(
     col:      &mut ColData,
     tc:       TypeCode,
@@ -575,15 +602,7 @@ fn append_value_to_col(
     match val_expr {
         Expr::Value(vws) => match &vws.value {
             Value::Null => {
-                match col {
-                    ColData::Strings(v) => { v.push(None); }
-                    ColData::Bytes(v) => { v.push(None); }
-                    ColData::Fixed(buf) => {
-                        let stride = tc.wire_stride();
-                        buf.extend(std::iter::repeat_n(0u8, stride));
-                    }
-                    ColData::U128s(v) => { v.push(0u128); }
-                }
+                append_null(col, tc);
                 Ok(())
             }
             Value::Number(n, _) => {
@@ -777,61 +796,36 @@ fn walk_and_tree(
 
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
 fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
-    match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-            // sqlparser represents negative number literals as UnaryOp(Minus, Number("N")).
-            let is_num_or_neg = |e: &Expr| match e {
-                Expr::Value(vws) => matches!(vws.value, Value::Number(_, _)),
-                Expr::UnaryOp { op: UnaryOperator::Minus, expr } =>
-                    matches!(expr.as_ref(), Expr::Value(vws) if matches!(vws.value, Value::Number(_, _))),
-                _ => false,
-            };
-            let is_str = |e: &Expr| matches!(e, Expr::Value(vws) if matches!(vws.value, Value::SingleQuotedString(_)));
+    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr else { return None; };
+    // The column may sit on either side; the literal is whatever
+    // `extract_sql_literal` accepts (numbers, optionally negated, or a
+    // single-quoted string — but never a double-quoted identifier).
+    let (col_id, lit) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(id), r) => (id, extract_sql_literal(r)?),
+        (l, Expr::Identifier(id)) => (id, extract_sql_literal(l)?),
+        _ => return None,
+    };
+    let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_id.value))?;
+    let col_tc = schema.columns[col_idx].type_code;
 
-            let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(_), r) if is_num_or_neg(r) || is_str(r) => (left.as_ref(), right.as_ref()),
-                (l, Expr::Identifier(_)) if is_num_or_neg(l) || is_str(l) => (right.as_ref(), left.as_ref()),
-                _ => return None,
-            };
-            let col_name = if let Expr::Identifier(id) = col_expr { &id.value } else { return None; };
-            let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
-            let col_tc = schema.columns[col_idx].type_code;
-
-            // UUID: accept single-quoted string literals
-            if col_tc == TypeCode::UUID {
-                if let Expr::Value(vws) = lit_expr {
-                    if let Value::SingleQuotedString(s) = &vws.value {
-                        return parse_uuid_str(s).ok().map(|v| (col_idx, v));
-                    }
-                    if let Value::Number(n, _) = &vws.value {
-                        return n.parse::<u128>().ok().map(|v| (col_idx, v));
-                    }
-                }
-                return None;
-            }
-
-            // Extract (negated, numeric_string) from the literal side.
-            let (negated, n_str): (bool, &str) = match lit_expr {
-                Expr::Value(vws) => {
-                    if let Value::Number(n, _) = &vws.value { (false, n.as_str()) } else { return None; }
-                }
-                Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-                    if let Expr::Value(vws) = expr.as_ref() {
-                        if let Value::Number(n, _) = &vws.value { (true, n.as_str()) } else { return None; }
-                    } else { return None; }
-                }
-                _ => return None,
-            };
-            // Secondary indexes store column values as zero-extended LE bytes
-            // cast to u64; for signed types we produce the same bit pattern by
-            // casting through the type's unsigned equivalent. Delegated to
-            // parse_pk_literal_packed so the three SEEK/INSERT parse sites
-            // cannot drift.
-            let key = parse_pk_literal_packed(col_tc, n_str, negated)?;
-            Some((col_idx, key))
-        }
-        _ => None,
+    // UUID: accept a single-quoted UUID string or a non-negated numeric u128
+    // (equivalent to the old `n.parse::<u128>()` via parse_pk_literal_packed).
+    if col_tc == TypeCode::UUID {
+        return match lit {
+            SqlLiteral::Str(s) => parse_uuid_str(s).ok().map(|v| (col_idx, v)),
+            SqlLiteral::Number(n, false) =>
+                parse_pk_literal_packed(TypeCode::UUID, n, false).map(|v| (col_idx, v)),
+            _ => None,
+        };
     }
+
+    // Non-UUID: numeric literal only. Secondary indexes store column values as
+    // zero-extended LE bytes cast to u64; for signed types we produce the same
+    // bit pattern by casting through the type's unsigned equivalent. Delegated
+    // to parse_pk_literal_packed so the three SEEK/INSERT parse sites cannot drift.
+    let SqlLiteral::Number(n_str, negated) = lit else { return None; };
+    let key = parse_pk_literal_packed(col_tc, n_str, negated)?;
+    Some((col_idx, key))
 }
 
 /// Returns Some((col_idx, key, residual)) when WHERE contains an equality on an indexed column.
@@ -1329,14 +1323,7 @@ fn eval_set_expr(
 
 fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
     match cv {
-        ColumnValue::Null => {
-            match col {
-                ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
-                ColData::Strings(v) => v.push(None),
-                ColData::Bytes(v)   => v.push(None),
-                ColData::U128s(v)   => v.push(0u128),
-            }
-        }
+        ColumnValue::Null => append_null(col, tc),
         ColumnValue::Int(i) => {
             match col {
                 ColData::Fixed(buf) => match tc {
@@ -1423,20 +1410,11 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
-            // Unwrap UnaryOp(Minus, Number) so signed PK lists like
-            // `IN (-1, -2)` can match the fast path; without this they
-            // fall through to the slow scan.
-            let (val_expr, negated) = match item {
-                Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (expr.as_ref(), true),
-                e => (e, false),
-            };
-            let n = match val_expr {
-                Expr::Value(vws) => match &vws.value {
-                    Value::Number(n, _) => n.as_str(),
-                    _ => return None,
-                },
-                _ => return None,
-            };
+            // Only optionally-negated numeric literals take the fast path; a
+            // string or NULL in the IN-list aborts to the slow scan. Routing
+            // through extract_sql_literal also unwraps `UnaryOp(Minus, Number)`
+            // so signed lists like `IN (-1, -2)` match without the slow path.
+            let SqlLiteral::Number(n, negated) = extract_sql_literal(item)? else { return None; };
             pks.push(parse_pk_literal_packed(pk_col.type_code, n, negated)?);
         }
         Some(pks)
@@ -2421,6 +2399,71 @@ mod tests {
                 assert_eq!(buf, &pk_bytes.to_vec());
             }
             _ => panic!("expected Bytes variant after copy"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // extract_sql_literal: SingleQuotedString-only (double-quoted is an
+    // identifier in GenericDialect, never a seek literal).
+    // ------------------------------------------------------------------
+
+    fn dquote_expr(s: &str) -> Expr {
+        Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::DoubleQuotedString(s.into()),
+            span:  sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    #[test]
+    fn test_double_quoted_not_a_uuid_seek_literal() {
+        // A single-quoted UUID is a valid seek key (see
+        // test_uuid_index_seek_string_literal); a double-quoted token is an
+        // identifier in GenericDialect, so it must NOT be treated as a literal.
+        let schema = uuid_schema_payload();
+        let sq = eq_expr("uid", uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(super::try_col_eq_literal(&sq, &schema).is_some(), "single-quoted UUID is a seek key");
+
+        let dq = eq_expr("uid", dquote_expr("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(super::try_col_eq_literal(&dq, &schema), None,
+                   "double-quoted token must not be parsed as a UUID seek literal");
+    }
+
+    #[test]
+    fn test_double_quoted_pk_value_rejected() {
+        // INSERT path: a double-quoted value in a UUID PK slot is not a literal.
+        let err = super::parse_one_pk_literal(
+            &dquote_expr("550e8400-e29b-41d4-a716-446655440000"),
+            TypeCode::UUID, "id",
+        ).expect_err("double-quoted UUID PK literal must be rejected");
+        assert!(err.to_string().contains("numeric literal"), "error: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // append_null: INSERT and UPDATE produce the byte-identical NULL
+    // encoding across every ColData variant.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_null_append_insert_update_identical_all_variants() {
+        let null_expr = Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::Null,
+            span:  sqlparser::tokenizer::Span::empty(),
+        });
+        // (fresh empty ColData, wire type, expected NULL encoding) per variant.
+        let cases: [(ColData, TypeCode, ColData); 4] = [
+            (ColData::Fixed(Vec::new()),   TypeCode::U32,    ColData::Fixed(vec![0u8; 4])),
+            (ColData::Strings(Vec::new()), TypeCode::String, ColData::Strings(vec![None])),
+            (ColData::Bytes(Vec::new()),   TypeCode::Blob,   ColData::Bytes(vec![None])),
+            (ColData::U128s(Vec::new()),   TypeCode::UUID,   ColData::U128s(vec![0u128])),
+        ];
+        for (empty, tc, expected) in cases {
+            let mut via_insert = empty.clone();
+            append_value_to_col(&mut via_insert, tc, &null_expr).unwrap();
+            let mut via_update = empty.clone();
+            append_column_value(&mut via_update, ColumnValue::Null, tc).unwrap();
+            assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
+            assert_eq!(via_update, expected, "UPDATE NULL encoding for {tc:?}");
+            assert_eq!(via_insert, via_update, "INSERT vs UPDATE NULL must match for {tc:?}");
         }
     }
 }
