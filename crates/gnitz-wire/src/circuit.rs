@@ -138,7 +138,14 @@ pub enum MapKind {
     /// each crate decodes it with its own decoder. `reindex_cols` lists the
     /// source columns, in key order, that become the synthetic PK for equijoin
     /// pre-indexing (empty for a plain compute map).
-    Expression { program: Vec<u8>, reindex_cols: Vec<u16> },
+    ///
+    /// `reindex_target_tcs` is parallel to `reindex_cols`: entry `i` is the
+    /// promoted key type code `T` for slot `i` of a cross-width equijoin key, or
+    /// `0` meaning "derive the slot type from the source column" (the legacy /
+    /// same-type path, byte-identical to pre-promotion circuits). It is empty for
+    /// a plain compute map and may be shorter than `reindex_cols` for legacy
+    /// circuits, where the missing entries default to `0`.
+    Expression { program: Vec<u8>, reindex_cols: Vec<u16>, reindex_target_tcs: Vec<u8> },
     /// Drop all payload columns, keep only PK and weight.
     KeyOnly,
     /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
@@ -234,12 +241,34 @@ pub fn decode_op_node(
         x if x == OPCODE_MAP_EXPR          => {
             let program = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
             // Reindex columns live in CircuitNodeColumns (NODE_COL_KIND_REINDEX),
-            // position-ordered so a compound key's column order is preserved. Fall
-            // back to the legacy single `reindex` cell for circuits persisted before
-            // the column-list migration (which wrote the cell and no kind rows).
-            let mut reindex_cols = collect_cols(NODE_COL_KIND_REINDEX);
-            if reindex_cols.is_empty() { reindex_cols.extend(reindex); }
-            OpNode::Map(MapKind::Expression { program, reindex_cols })
+            // position-ordered so a compound key's column order is preserved.
+            // `value1` is the source column, `value2` the promoted key type code
+            // `T` (`0` = derive from source). This decode is the trust boundary
+            // where catalog bytes become a typed node: reject a non-zero `value2`
+            // that is not a PK-eligible type code here, rather than letting it
+            // silently produce a wrong reindex output stride downstream (a float /
+            // unknown code would otherwise survive as a bogus slot width).
+            let mut reindex_cols: Vec<u16> = Vec::new();
+            let mut reindex_target_tcs: Vec<u8> = Vec::new();
+            for &(kind, _, v1, v2) in cols {
+                if kind == NODE_COL_KIND_REINDEX {
+                    let tc = v2 as u8;
+                    if tc != 0 && !crate::is_pk_eligible(tc) {
+                        return Err(format!(
+                            "MAP_EXPR reindex target type code {tc} is not PK-eligible"));
+                    }
+                    reindex_cols.push(v1 as u16);
+                    reindex_target_tcs.push(tc);
+                }
+            }
+            // Legacy single `reindex` cell (circuits persisted before the
+            // column-list migration wrote no kind rows): target tc derives from
+            // source (`0`).
+            if reindex_cols.is_empty() {
+                reindex_cols.extend(reindex);
+                reindex_target_tcs.resize(reindex_cols.len(), 0);
+            }
+            OpNode::Map(MapKind::Expression { program, reindex_cols, reindex_target_tcs })
         }
         x if x == OPCODE_MAP_KEY_ONLY      => OpNode::Map(MapKind::KeyOnly),
         x if x == OPCODE_MAP_HASH_ROW      => {
@@ -289,6 +318,14 @@ mod tests {
         }
     }
 
+    fn reindex_of(node: OpNode) -> (Vec<u16>, Vec<u8>) {
+        match node {
+            OpNode::Map(MapKind::Expression { reindex_cols, reindex_target_tcs, .. }) =>
+                (reindex_cols, reindex_target_tcs),
+            other => panic!("expected Map(Expression), got {other:?}"),
+        }
+    }
+
     /// MAP_EXPR reindex columns decode from NODE_COL_KIND_REINDEX rows in
     /// position order (value1 = source column).
     #[test]
@@ -316,5 +353,34 @@ mod tests {
         let cols = [(NODE_COL_KIND_REINDEX, 0u16, 4u64, 0u64)];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_cols_of(node), vec![4]);
+    }
+
+    /// A non-zero `value2` is the promoted key type code `T`, decoded parallel to
+    /// `reindex_cols`. A `value2 = 0` slot means "derive from source".
+    #[test]
+    fn decode_reindex_target_tcs_from_value2() {
+        let cols = [
+            (NODE_COL_KIND_REINDEX, 0u16, 3u64, 0u64),                       // T = derive
+            (NODE_COL_KIND_REINDEX, 1u16, 3u64, crate::type_code::I64 as u64),      // T = I64
+        ];
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
+        assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
+    }
+
+    /// The legacy single-cell fallback yields all-zero target tcs.
+    #[test]
+    fn decode_legacy_cell_yields_zero_target_tcs() {
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &[]).unwrap();
+        assert_eq!(reindex_of(node), (vec![7], vec![0]));
+    }
+
+    /// A non-zero `value2` that is not a PK-eligible type code is rejected at the
+    /// decode trust boundary (here: a float code), not silently mis-strided.
+    #[test]
+    fn decode_rejects_non_pk_eligible_target_tc() {
+        let cols = [(NODE_COL_KIND_REINDEX, 0u16, 3u64, crate::type_code::F64 as u64)];
+        let err = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols)
+            .unwrap_err();
+        assert!(err.contains("not PK-eligible"), "got: {err}");
     }
 }

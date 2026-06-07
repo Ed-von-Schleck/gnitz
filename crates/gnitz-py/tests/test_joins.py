@@ -506,6 +506,213 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
 
+    @_NEEDS_MULTI
+    def test_inner_join_cross_width_int_bigint(self, client):
+        """Cross-width SAME-SIGN equijoin: INT (I32) key = BIGINT (I64) key. The
+        planner promotes the pair to the wider type I64, OPK-encodes both sides'
+        key into the I64 slot, and the exchange co-partitions equal numeric values
+        across workers. Covers matching, non-matching, NEGATIVE values (signed
+        sign-extension), a duplicate key spanning workers, and a retraction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # left.k is INT (I32); right.k is BIGINT (I64).
+            client.execute_sql(
+                "CREATE TABLE lt (id BIGINT NOT NULL PRIMARY KEY, k INT NOT NULL, lv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE rt (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, rv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT lt.id AS lid, rt.id AS rid, lt.k AS lk, lt.lv, rt.rv "
+                "FROM lt JOIN rt ON lt.k = rt.k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            # The synthetic _join_pk is the promoted common type I64 (8 bytes).
+            assert vschema.columns[0].type_code == gnitz.TypeCode.I64, \
+                f"_join_pk must be promoted to I64, got {vschema.columns[0].type_code}"
+
+            # Keys: 5 matches, a negative key (-7) on both sides, and a duplicate
+            # key (3) that must co-locate. id 4 / 999 are non-matching.
+            client.execute_sql(
+                "INSERT INTO lt VALUES (1, 3, 10), (2, -7, 20), (3, 3, 30), "
+                "(4, 100, 40), (5, 0, 50)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO rt VALUES (101, 3, 1000), (102, -7, 2000), (103, 0, 3000), "
+                "(999, 555, 9000)",
+                schema_name=sn,
+            )
+
+            def got():
+                return sorted((r["lk"], r["lv"], r["rv"]) for r in _scan_dicts(client, vid))
+
+            # k=3 matches lt{1,3} × rt{101} = 2 rows; k=-7 matches lt{2}×rt{102};
+            # k=0 matches lt{5}×rt{103}; k=100,555 unmatched.
+            assert got() == sorted([
+                (3, 10, 1000), (3, 30, 1000), (-7, 20, 2000), (0, 50, 3000),
+            ]), f"cross-width INT=BIGINT join mismatch: {got()}"
+
+            # Retraction: DELETE the duplicate-key left row id=3 → its join row drops.
+            client.execute_sql("DELETE FROM lt WHERE id = 3", schema_name=sn)
+            assert got() == sorted([
+                (3, 10, 1000), (-7, 20, 2000), (0, 50, 3000),
+            ]), f"retraction must drop the deleted row's join output: {got()}"
+
+            # Incremental: a new right row completing k=100 must join in.
+            client.execute_sql("INSERT INTO rt VALUES (104, 100, 4000)", schema_name=sn)
+            assert got() == sorted([
+                (3, 10, 1000), (-7, 20, 2000), (0, 50, 3000), (100, 40, 4000),
+            ]), f"incremental cross-width match must appear: {got()}"
+        finally:
+            _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
+
+    @_NEEDS_MULTI
+    def test_inner_join_cross_width_u32_u64(self, client):
+        """Cross-width unsigned equijoin: INT UNSIGNED (U32) = BIGINT UNSIGNED
+        (U64), promoted to U64. Exercises large values near the U32 ceiling so
+        zero-extension into the wider slot is checked across workers."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE lt (id BIGINT NOT NULL PRIMARY KEY, k INT UNSIGNED NOT NULL, lv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE rt (id BIGINT NOT NULL PRIMARY KEY, k BIGINT UNSIGNED NOT NULL, rv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT lt.k AS lk, lt.lv, rt.rv "
+                "FROM lt JOIN rt ON lt.k = rt.k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.columns[0].type_code == gnitz.TypeCode.U64, \
+                f"_join_pk must be promoted to U64, got {vschema.columns[0].type_code}"
+
+            big = 4294967295   # u32::MAX
+            client.execute_sql(
+                f"INSERT INTO lt VALUES (1, 7, 10), (2, {big}, 20), (3, 0, 30)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"INSERT INTO rt VALUES (101, 7, 100), (102, {big}, 200), (103, 12345, 300)",
+                schema_name=sn,
+            )
+            got = sorted((r["lk"], r["lv"], r["rv"]) for r in _scan_dicts(client, vid))
+            assert got == sorted([(7, 10, 100), (big, 20, 200)]), \
+                f"cross-width U32=U64 join mismatch: {got}"
+        finally:
+            _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
+
+    @_NEEDS_MULTI
+    def test_inner_join_overlapping_key_cross_width(self, client):
+        """Overlapping key `ON a.x = b.p AND a.x = b.q`: the `a` side reindexes
+        `[x, x]` into two _join_pk slots. With a cross-width promotion on one slot,
+        the two slots carry distinct targets and the scatter must mirror the
+        trace packer slot-for-slot. A row joins only when b.p == b.q == a.x."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # a.x is INT (I32); b.p, b.q are BIGINT (I64). Both pairs promote to I64.
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL, av BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, p BIGINT NOT NULL, "
+                "q BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.x AS ax, a.av, b.bv "
+                "FROM a JOIN b ON a.x = b.p AND a.x = b.q",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            assert vschema.pk_indices == [0, 1], "overlapping key → 2-slot _join_pk"
+
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 5, 10), (2, 8, 20), (3, -4, 30)",
+                schema_name=sn,
+            )
+            # b rows: (5,5) matches a.x=5; (8,9) p!=q → no match; (-4,-4) matches.
+            client.execute_sql(
+                "INSERT INTO b VALUES (101, 5, 5, 100), (102, 8, 9, 200), (103, -4, -4, 300)",
+                schema_name=sn,
+            )
+            got = sorted((r["ax"], r["av"], r["bv"]) for r in _scan_dicts(client, vid))
+            assert got == sorted([(5, 10, 100), (-4, 30, 300)]), \
+                f"overlapping cross-width key join mismatch: {got}"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    @_NEEDS_MULTI
+    def test_left_join_cross_width_nullable_key(self, client):
+        """LEFT JOIN with a NULLABLE cross-width key exercises the sibling-Map path
+        (null-key bypass + not-null match side both reindex at the promoted width).
+        A NULL key emits NULL right columns; a present key joins; both co-partition."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # a.x is a NULLABLE INT (I32); b.k is BIGINT (I64). Promote to I64.
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x INT, av BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS aid, a.av, b.bv "
+                "FROM a LEFT JOIN b ON a.x = b.k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO b VALUES (101, 5, 100), (102, -3, 200)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 5, 10), (2, NULL, 20), (3, -3, 30), (4, 77, 40)",
+                schema_name=sn,
+            )
+            # id1 → match bv=100; id3 → match bv=200; id2 (NULL key) and id4 (no
+            # match) → NULL right (bv None).
+            got = sorted((r["aid"], r["av"], r["bv"]) for r in _scan_dicts(client, vid))
+            assert got == sorted([
+                (1, 10, 100), (2, 20, None), (3, 30, 200), (4, 40, None),
+            ]), f"LEFT JOIN cross-width nullable key mismatch: {got}"
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+    def test_join_cross_sign_rejected(self, client):
+        """A cross-sign integer key (BIGINT UNSIGNED = BIGINT, i.e. U64 = I64)
+        cannot co-partition without signed-128 promotion, so CREATE VIEW fails
+        with a clear planner error."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            with pytest.raises(Exception):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.k",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
     def test_inner_join_compound_pk_source_dml(self, client):
         """Equijoin over compound-PK source tables, driven by INSERT/UPDATE/DELETE.
         Both sources have `PRIMARY KEY (k1, k2)` / `(j1, j2)`; the join key is a

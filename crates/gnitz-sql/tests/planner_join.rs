@@ -120,16 +120,18 @@ fn test_join_reject_float_key() {
     assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "no view should be registered");
 }
 
-/// Planner rejection: an encoding-mismatched pair (U32 = U64). The two reindex
-/// sides emit different strides, so the join is rejected at CREATE.
+/// Planner rejection: a cross-sign integer pair (U64 = I64). Co-partitioning a
+/// signed key with an unsigned one would need a signed-128 promotion type that
+/// does not exist yet, so the join is rejected at CREATE. (Same-sign cross-width
+/// pairs like U32 = U64 are now accepted via per-pair promotion.)
 #[test]
-fn test_join_reject_encoding_mismatch() {
+fn test_join_reject_cross_sign() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk INT UNSIGNED NOT NULL)").unwrap();
-    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
 
     let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk"));
     assert!(matches!(err, GnitzSqlError::Unsupported(_)), "expected Unsupported, got {:?}", err);

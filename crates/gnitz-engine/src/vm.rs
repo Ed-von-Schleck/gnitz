@@ -102,6 +102,9 @@ pub struct ProgramBuilder {
     agg_descs: Vec<AggDescriptor>,
     group_cols: Vec<u32>,
     reindex_cols: Vec<u32>,
+    /// Parallel to `reindex_cols`: per-column carried promotion target tc
+    /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
+    reindex_target_tcs: Vec<u8>,
     expr_progs: Vec<*const crate::expr::ExprProgram>,
 }
 
@@ -119,6 +122,7 @@ impl ProgramBuilder {
             agg_descs: Vec::new(),
             group_cols: Vec::new(),
             reindex_cols: Vec::new(),
+            reindex_target_tcs: Vec::new(),
             expr_progs: Vec::new(),
         }
     }
@@ -175,9 +179,17 @@ impl ProgramBuilder {
         (offset, cols.len() as u16)
     }
 
-    fn add_reindex_cols(&mut self, cols: &[u32]) -> (u32, u16) {
+    fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
         let offset = self.reindex_cols.len() as u32;
+        // This is the only mutator of either pool, so they enter in lockstep.
+        debug_assert_eq!(self.reindex_target_tcs.len(), offset as usize,
+            "reindex pools must stay in lockstep");
         self.reindex_cols.extend_from_slice(cols);
+        // Keep the target-tc pool in lockstep with reindex_cols (same offset and
+        // count): a shorter or empty `target_tcs` zero-fills (= derive from source),
+        // so the `Instr::Map` slice always has one tc per reindex column.
+        self.reindex_target_tcs.extend_from_slice(target_tcs);
+        self.reindex_target_tcs.resize(self.reindex_cols.len(), 0);
         (offset, cols.len() as u16)
     }
 
@@ -212,12 +224,12 @@ impl ProgramBuilder {
     pub fn add_map(
         &mut self, in_reg: u16, out_reg: u16,
         func_ptr: *const ScalarFuncKind, out_schema: SchemaDescriptor,
-        reindex_cols: &[u32], reindex_hash: bool,
+        reindex_cols: &[u32], reindex_target_tcs: &[u8], reindex_hash: bool,
         branch_id: u8,
     ) {
         let func_idx = self.func_idx(func_ptr);
         let out_schema_idx = self.schema_idx(out_schema);
-        let (reindex_off, reindex_cnt) = self.add_reindex_cols(reindex_cols);
+        let (reindex_off, reindex_cnt) = self.add_reindex_cols(reindex_cols, reindex_target_tcs);
         self.instructions.push(Instr::Map {
             in_reg, out_reg, func_idx, out_schema_idx,
             reindex_off, reindex_cnt, reindex_hash, branch_id,
@@ -423,6 +435,7 @@ impl ProgramBuilder {
             agg_descs: self.agg_descs,
             group_cols: self.group_cols,
             reindex_cols: self.reindex_cols,
+            reindex_target_tcs: self.reindex_target_tcs,
             expr_progs: self.expr_progs,
         };
 
@@ -475,6 +488,7 @@ impl ProgramBuilder {
             agg_descs: self.agg_descs,
             group_cols: self.group_cols,
             reindex_cols: self.reindex_cols,
+            reindex_target_tcs: self.reindex_target_tcs,
             expr_progs: self.expr_progs,
         };
 
@@ -609,6 +623,9 @@ pub struct Program {
     pub agg_descs: Vec<AggDescriptor>,
     pub group_cols: Vec<u32>,
     pub reindex_cols: Vec<u32>,
+    /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
+    /// target tc (`0` = derive from source).
+    pub reindex_target_tcs: Vec<u8>,
     pub expr_progs: Vec<*const crate::expr::ExprProgram>,
 }
 
@@ -871,8 +888,10 @@ pub fn execute_epoch_multi(
                 } else {
                     let func = unsafe { &*func_ptr };
                     let off = *reindex_off as usize;
-                    let reindex_cols = &program.reindex_cols[off..off + *reindex_cnt as usize];
-                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, reindex_cols, *reindex_hash, *branch_id)
+                    let n = *reindex_cnt as usize;
+                    let reindex_cols = &program.reindex_cols[off..off + n];
+                    let target_tcs = &program.reindex_target_tcs[off..off + n];
+                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, reindex_cols, target_tcs, *reindex_hash, *branch_id)
                 };
                 reg_mut!(*out_reg).batch = result;
             }
@@ -1744,7 +1763,7 @@ mod tests {
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, func_ptr, out_schema, &[], false, 0);
+        builder.add_map(0, 1, func_ptr, out_schema, &[], &[], false, 0);
         builder.add_halt();
 
         let input = make_batch_2col(in_schema, &[
@@ -2669,7 +2688,7 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new(2);
-        builder.add_map(0, 1, std::ptr::null(), schema, &[], false, 0);
+        builder.add_map(0, 1, std::ptr::null(), schema, &[], &[], false, 0);
         builder.add_halt();
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);

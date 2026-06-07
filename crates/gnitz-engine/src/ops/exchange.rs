@@ -259,21 +259,33 @@ fn hash_row_for_partition(
     partition_for_key(key)
 }
 
-/// The packer that routes a compound (len > 1) `JoinPromote` scatter by the
-/// SAME packed OPK bytes the reindex Map writes as `_join_pk` — so the delta
-/// scatter and the reindexed trace co-partition byte-for-byte. Returns `None`
-/// for `len == 1` JoinPromote and every GroupKey scatter, which keep the
-/// `hash_row_for_partition` path (GROUP BY / set-op rows are never reindexed to
-/// a packed PK). Centralised so the two scatter implementations
-/// (`op_repartition_batches_mode` and `relay_scatter_merge_walk`) gate on the
-/// exact same predicate and cannot drift out of sync.
+/// Whether any key slot carries a cross-width promotion target (`tc != 0`). A
+/// promoted key packs at the wider `T`, so it must route through the
+/// `ReindexPacker` and must NOT take the native-PK fast-path. The one home of
+/// this predicate so `compound_join_packer` and the two scatter gates cannot
+/// drift apart.
+#[inline]
+fn key_is_promoted(target_tcs: &[u8]) -> bool {
+    target_tcs.iter().any(|&tc| tc != 0)
+}
+
+/// The packer that routes a `JoinPromote` scatter by the SAME packed OPK bytes
+/// the reindex Map writes as `_join_pk` — so the delta scatter and the reindexed
+/// trace co-partition byte-for-byte. Fires for a compound (len > 1) key OR any
+/// active cross-width promotion (a single promoted key must also pack at `T`, not
+/// route at its narrow source width). Returns `None` for a non-promoted single
+/// key and every GroupKey scatter, which keep the `hash_row_for_partition` path
+/// (GROUP BY / set-op rows are never reindexed to a packed PK). Centralised so the
+/// two scatter implementations (`op_repartition_batches_mode` and
+/// `relay_scatter_merge_walk`) gate on the exact same predicate and cannot drift.
 fn compound_join_packer(
     mode: RouteMode,
     col_indices: &[u32],
+    target_tcs: &[u8],
     schema: &SchemaDescriptor,
 ) -> Option<crate::ops::linear::ReindexPacker> {
-    (mode == RouteMode::JoinPromote && col_indices.len() > 1)
-        .then(|| crate::ops::linear::ReindexPacker::new(schema, col_indices))
+    (mode == RouteMode::JoinPromote && (col_indices.len() > 1 || key_is_promoted(target_tcs)))
+        .then(|| crate::ops::linear::ReindexPacker::new(schema, col_indices, target_tcs))
 }
 
 fn fill_worker_indices(
@@ -387,6 +399,7 @@ pub fn op_repartition_batch(
 pub(crate) fn op_repartition_batches_mode(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
+    target_tcs: &[u8],
     schema: &SchemaDescriptor,
     num_workers: usize,
     mode: RouteMode,
@@ -421,11 +434,14 @@ pub(crate) fn op_repartition_batches_mode(
         // so the partition matches `PartitionedTable::local_index`. Mixing
         // the hash-combine path with PK-existence checks would route rows
         // to the wrong worker.
-        let is_pk_routing = col_indices == schema.pk_indices();
-        // Compound JoinPromote routes by the packed `_join_pk` (see
+        // A promoted join key must not take the native-PK fast-path: its source PK
+        // bytes are at the narrow width while the trace `_join_pk` is `T`-wide, so
+        // the two would land on different workers. Route it through the packer.
+        let is_pk_routing = col_indices == schema.pk_indices() && !key_is_promoted(target_tcs);
+        // Compound/promoted JoinPromote routes by the packed `_join_pk` (see
         // `compound_join_packer`); the `pack_buf` is hoisted out of the row loop
         // because `pack_into` fully overwrites `buf[..out_stride]` each row.
-        let join_packer = compound_join_packer(mode, col_indices, schema);
+        let join_packer = compound_join_packer(mode, col_indices, target_tcs, schema);
         let mut pack_buf = [0u8; gnitz_wire::MAX_PK_BYTES];
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt { Some(m) => m, None => continue };
@@ -553,6 +569,7 @@ fn relay_walk_inner<'a, const DO_REFILL: bool, Sel, Route>(
 fn relay_scatter_merge_walk(
     mem_batches: &[Option<MemBatch<'_>>],
     col_indices: &[u32],
+    target_tcs: &[u8],
     schema: &SchemaDescriptor,
     num_workers: usize,
     worker_rows: &mut Vec<Vec<(u8, u32)>>,
@@ -596,16 +613,19 @@ fn relay_scatter_merge_walk(
     // `partition_for_key(get_pk value)` equals `partition_for_pk_bytes(OPK)`
     // (both reduce to `partition_for_key(widen_pk_be)`), so the value-cache
     // route path stays consistent.
-    let is_pk_routing = col_indices == schema.pk_indices();
+    // A promoted join key must not take the native-PK fast-path (its source PK is
+    // at the narrow width, the trace `_join_pk` is `T`-wide); route it through the
+    // packer so the two sides co-partition.
+    let is_pk_routing = col_indices == schema.pk_indices() && !key_is_promoted(target_tcs);
 
-    // Compound JoinPromote routes by the packed `_join_pk` (see
+    // Compound/promoted JoinPromote routes by the packed `_join_pk` (see
     // `compound_join_packer`) — the consolidated join path, exactly where
     // co-partition must hold. The packer is captured by shared ref so the
     // `route_group` closure stays `Copy` (`&T` is `Copy`), satisfying the
     // `Route: Fn + Copy` bound on `relay_walk_inner`; the per-row scratch buffer
     // therefore lives INSIDE the closure (a captured `&mut buf` would make it
     // non-`Copy`).
-    let join_packer = compound_join_packer(mode, col_indices, schema);
+    let join_packer = compound_join_packer(mode, col_indices, target_tcs, schema);
 
     // Route closures — 3-arg form. pk_val is the cached PK in the K-way
     // path and `get_pk(row)` in the bulk-drain (both narrow only).
@@ -719,12 +739,13 @@ pub fn op_relay_scatter_consolidated(
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
-    op_relay_scatter_consolidated_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
+    op_relay_scatter_consolidated_mode(sources, col_indices, &[], schema, num_workers, RouteMode::GroupKey)
 }
 
 pub(crate) fn op_relay_scatter_consolidated_mode(
     sources: &[Option<&ConsolidatedBatch>],
     col_indices: &[u32],
+    target_tcs: &[u8],
     schema: &SchemaDescriptor,
     num_workers: usize,
     mode: RouteMode,
@@ -754,7 +775,7 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
 
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        relay_scatter_merge_walk(&mem_batches, col_indices, schema, num_workers, &mut worker_rows, mode);
+        relay_scatter_merge_walk(&mem_batches, col_indices, target_tcs, schema, num_workers, &mut worker_rows, mode);
 
         let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
         (0..num_workers)
@@ -784,7 +805,7 @@ pub fn op_relay_scatter(
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
-    op_repartition_batches_mode(sources, col_indices, schema, num_workers, RouteMode::GroupKey)
+    op_repartition_batches_mode(sources, col_indices, &[], schema, num_workers, RouteMode::GroupKey)
 }
 
 /// Scatter a single batch across workers using multiple independent column
@@ -886,7 +907,7 @@ mod tests {
         // silently in release builds. The guard must be a hard assert.
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         let sources: Vec<Option<&Batch>> = vec![None; 257];
-        let _ = op_repartition_batches_mode(&sources, &[0], &schema, 4, RouteMode::GroupKey);
+        let _ = op_repartition_batches_mode(&sources, &[0], &[], &schema, 4, RouteMode::GroupKey);
     }
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -1423,7 +1444,7 @@ mod tests {
         // Single contributing source, PK routing: propagate both flags.
         let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let single: Vec<Option<&Batch>> = vec![Some(&b0)];
-        let out = op_repartition_batches_mode(&single, &[0u32], &schema, 4, RouteMode::GroupKey);
+        let out = op_repartition_batches_mode(&single, &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
             assert!(sb.sorted, "single-source PK-routed must inherit sorted");
             assert!(sb.consolidated, "single-source PK-routed must inherit consolidated");
@@ -1433,7 +1454,7 @@ mod tests {
         // not globally sorted, so nothing propagates.
         let b1 = make_batch(&schema, &[(4, 1, 40), (5, 1, 50), (6, 1, 60)]);
         let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-        let out = op_repartition_batches_mode(&multi, &[0u32], &schema, 4, RouteMode::GroupKey);
+        let out = op_repartition_batches_mode(&multi, &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
             assert!(!sb.sorted, "multi-source scatter must not claim sorted");
             assert!(!sb.consolidated, "multi-source scatter must not claim consolidated");
@@ -1756,7 +1777,7 @@ mod tests {
         ]);
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         // col_indices = [0, 1] = the full PK set → compound-PK routing.
-        let sub_batches = op_repartition_batches_mode(&sources, &[0u32, 1u32], &schema, num_workers, RouteMode::GroupKey);
+        let sub_batches = op_repartition_batches_mode(&sources, &[0u32, 1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 6);
         for (w, sb) in sub_batches.iter().enumerate() {
             for r in 0..sb.count {
@@ -1826,7 +1847,7 @@ mod tests {
         ];
         let cb = make_join_key_batch(&schema, rows);
 
-        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols);
+        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols, &[]);
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
@@ -1853,12 +1874,104 @@ mod tests {
 
         // (a) Non-consolidated path.
         let repart = op_repartition_batches_mode(
-            &[Some(&cb)], &cols, &schema, num_workers, RouteMode::JoinPromote);
+            &[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&repart, "op_repartition_batches_mode");
 
         // (b) Consolidated merge-walk path (route_group).
         let consol = op_relay_scatter_consolidated_mode(
-            &[Some(&cb)], &cols, &schema, num_workers, RouteMode::JoinPromote);
+            &[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&consol, "op_relay_scatter_consolidated_mode");
+    }
+
+    /// A SINGLE promoted join key (arity 1, carried `T != 0`) must also route
+    /// through the `ReindexPacker` — the packer fires on promotion, not just on a
+    /// compound key. Covers both a payload key (`Narrow` I32 → I64, including a
+    /// negative value so sign-extension is exercised) and a key that is the source
+    /// PK (`Pk` arm), where the native-PK fast-path must be GATED OFF so the row
+    /// routes by its `T`-wide `_join_pk`, not its narrow PK bytes.
+    #[test]
+    fn test_single_key_promote_scatter_copartitions() {
+        let num_workers = 4;
+
+        // ---- (1) Payload key: [U64 PK, I32 payload], reindex col1 → I64. ----
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I32, 0)],
+            &[0],
+        );
+        // PK ascending; rows pk=1 and pk=4 share key -5 → must co-locate.
+        let rows: &[(u64, i32)] = &[(1, -5), (2, 7), (3, i32::MIN), (4, -5), (5, 0), (6, -1)];
+        let mut b = Batch::with_schema(schema, rows.len());
+        for &(pk, key) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &key.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true; b.consolidated = true;
+        let cb = ConsolidatedBatch::new_unchecked(b);
+        let cols = [1u32];
+        let targets = [type_code::I64];
+
+        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols, &targets);
+        let expected_worker = |sb: &Batch, r: usize| -> usize {
+            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
+            worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
+        };
+        let check = |result: &[Batch], label: &str| {
+            assert_eq!(total_rows(result), rows.len(), "{label}: no dropped rows");
+            let mut worker_of_pk = std::collections::HashMap::new();
+            for (w, sb) in result.iter().enumerate() {
+                for r in 0..sb.count {
+                    assert_eq!(expected_worker(sb, r), w,
+                        "{label}: promoted single key routed to wrong worker");
+                    worker_of_pk.insert(sb.get_pk(r) as u64, w);
+                }
+            }
+            assert_eq!(worker_of_pk.get(&1), worker_of_pk.get(&4),
+                "{label}: equal promoted keys must co-locate");
+        };
+        let repart = op_repartition_batches_mode(
+            &[Some(&cb)], &cols, &targets, &schema, num_workers, RouteMode::JoinPromote);
+        check(&repart, "payload-key op_repartition_batches_mode");
+        let consol = op_relay_scatter_consolidated_mode(
+            &[Some(&cb)], &cols, &targets, &schema, num_workers, RouteMode::JoinPromote);
+        check(&consol, "payload-key op_relay_scatter_consolidated_mode");
+
+        // ---- (2) PK key: [I32 PK, U64 payload], reindex col0 → I64. The native
+        // PK fast-path must be gated off so routing uses the packed I64 key. ----
+        let pk_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::I32, 0), SchemaColumn::new(type_code::U64, 0)],
+            &[0],
+        );
+        let pk_rows: &[(i32, u64)] = &[(-5, 9), (-1, 9), (3, 9), (i32::MIN, 9)];
+        let mut pb = Batch::with_schema(pk_schema, pk_rows.len());
+        for &(pk, v) in pk_rows {
+            let mut opk = [0u8; 4];
+            gnitz_wire::encode_pk_column(&pk.to_le_bytes(), type_code::I32, &mut opk);
+            pb.extend_pk_bytes(&opk);
+            pb.extend_weight(&1i64.to_le_bytes());
+            pb.extend_null_bmp(&0u64.to_le_bytes());
+            pb.extend_col(0, &v.to_le_bytes());
+            pb.count += 1;
+        }
+        pb.sorted = true; pb.consolidated = true;
+        let pk_cb = ConsolidatedBatch::new_unchecked(pb);
+        let pk_cols = [0u32];
+        let pk_targets = [type_code::I64];
+        let pk_packer = crate::ops::linear::ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
+        let pk_repart = op_repartition_batches_mode(
+            &[Some(&pk_cb)], &pk_cols, &pk_targets, &pk_schema, num_workers, RouteMode::JoinPromote);
+        assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
+        for (w, sb) in pk_repart.iter().enumerate() {
+            for r in 0..sb.count {
+                let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+                pk_packer.pack_into(&mut buf[..pk_packer.out_stride], &sb.as_mem_batch(), r);
+                assert_eq!(
+                    worker_for_partition(partition_for_pk_bytes(&buf[..pk_packer.out_stride]), num_workers),
+                    w, "PK-key fast-path must be gated: routed by native PK not packed T");
+            }
+        }
     }
 }

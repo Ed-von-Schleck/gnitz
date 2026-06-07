@@ -124,12 +124,23 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Map(MapKind::Projection(cols)) => {
             ((OPCODE_MAP_PROJ, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
         }
-        OpNode::Map(MapKind::Expression { program, reindex_cols }) => {
+        OpNode::Map(MapKind::Expression { program, reindex_cols, reindex_target_tcs }) => {
             // Reindex columns now live in CircuitNodeColumns; the legacy single-cell
             // `reindex` slot stays None (the physical column persists for back-compat
             // but is no longer written).
-            ((OPCODE_MAP_EXPR, None, None, Some(program)),
-             encode_col_list(NODE_COL_KIND_REINDEX, reindex_cols))
+            //
+            // value1 = column index, value2 = promoted target type code (0 = derive
+            // from source). Hand-rolled (not encode_col_list) so the shared
+            // PROJ/HashRow helper stays a pure index list; the planner writes 0 on a
+            // side already at T, keeping same-type / U128-vs-UUID / string circuits
+            // byte-identical.
+            let kind_rows: Vec<(u64, u16, u64, u64)> = reindex_cols.iter().enumerate()
+                .map(|(i, &col)| {
+                    let v2 = reindex_target_tcs.get(i).copied().unwrap_or(0) as u64;
+                    (NODE_COL_KIND_REINDEX, i as u16, col as u64, v2)
+                })
+                .collect();
+            ((OPCODE_MAP_EXPR, None, None, Some(program)), kind_rows)
         }
         OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
         OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
@@ -242,7 +253,9 @@ impl CircuitBuilder {
 
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
         let blob = program.encode();
-        let nid = self.alloc_node(OpNode::Map(MapKind::Expression { program: blob, reindex_cols: Vec::new() }));
+        let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
+            program: blob, reindex_cols: Vec::new(), reindex_target_tcs: Vec::new(),
+        }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
@@ -250,11 +263,24 @@ impl CircuitBuilder {
     /// Map with PK reindexing (equijoin pre-indexing). The new synthetic PK is built
     /// from `reindex_cols` of the input schema, in the given order. Pass a one-element
     /// slice for a single-column join key.
-    pub fn map_reindex(&mut self, input: NodeId, reindex_cols: &[usize], program: ExprProgram) -> NodeId {
+    ///
+    /// `target_tcs` is parallel to `reindex_cols`: entry `i` is the promoted key
+    /// type code `T` for a cross-width equijoin key slot, or `0` to derive the slot
+    /// type from the source column (the same-type / legacy path). Pass an empty
+    /// slice (or all-zero) for a non-promoted reindex; the result is byte-identical
+    /// to the pre-promotion serialization.
+    pub fn map_reindex(
+        &mut self,
+        input: NodeId,
+        reindex_cols: &[usize],
+        target_tcs: &[u8],
+        program: ExprProgram,
+    ) -> NodeId {
         let blob = program.encode();
         let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
             program: blob,
             reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
+            reindex_target_tcs: target_tcs.to_vec(),
         }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
@@ -471,7 +497,7 @@ mod tests {
         let (c1, c2) = (2usize, 5usize);
         let mut cb = CircuitBuilder::new(7, 100);
         let input = cb.input_delta();
-        let map_nid = cb.map_reindex(input, &[c1, c2], empty_prog());
+        let map_nid = cb.map_reindex(input, &[c1, c2], &[], empty_prog());
         let circuit = cb.build();
 
         let rows = circuit.into_rows();
@@ -493,6 +519,37 @@ mod tests {
         match decoded.nodes.get(&map_nid) {
             Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) => {
                 assert_eq!(*reindex_cols, vec![c1 as u16, c2 as u16], "order must be preserved");
+            }
+            other => panic!("expected Map(Expression), got {other:?}"),
+        }
+    }
+
+    /// A cross-width reindex carries a per-slot promoted target type code `T` in
+    /// `value2`; it survives into_rows → from_rows parallel to the columns. A `0`
+    /// slot means "derive from source".
+    #[test]
+    fn reindex_target_tcs_roundtrip() {
+        use gnitz_wire::type_code;
+        let mut cb = CircuitBuilder::new(7, 100);
+        let input = cb.input_delta();
+        // Overlapping key [x, x] with distinct per-slot targets: slot 0 derives,
+        // slot 1 promotes to I64.
+        let map_nid = cb.map_reindex(input, &[3, 3], &[0, type_code::I64], empty_prog());
+        let rows = cb.build().into_rows();
+
+        let mut reindex_rows: Vec<_> = rows.node_columns.iter()
+            .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
+            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
+            .collect();
+        reindex_rows.sort_by_key(|&(pos, _, _)| pos);
+        assert_eq!(reindex_rows,
+            vec![(0, 3, 0), (1, 3, type_code::I64 as u64)]);
+
+        let decoded = Circuit::from_rows(7, rows).expect("from_rows");
+        match decoded.nodes.get(&map_nid) {
+            Some(OpNode::Map(MapKind::Expression { reindex_cols, reindex_target_tcs, .. })) => {
+                assert_eq!(*reindex_cols, vec![3, 3]);
+                assert_eq!(*reindex_target_tcs, vec![0, type_code::I64]);
             }
             other => panic!("expected Map(Expression), got {other:?}"),
         }

@@ -713,11 +713,21 @@ impl MasterDispatcher {
         // reindex key so a row lands on the worker that owns its `_join_pk`
         // partition; a GROUP BY / set-op exchange scatter routes by the group
         // key (consistent with op_reduce's output PK). See `RouteMode`.
-        let (shard_cols, is_join) = if source_id > 0 {
-            let cols = cat.dag.get_join_shard_cols(view_id, source_id);
-            if cols.is_empty() { (cat.dag.get_shard_cols(view_id), false) } else { (cols, true) }
+        // A join-shard scatter carries (reindex col, carried promotion target tc)
+        // pairs; a GROUP BY / set-op scatter carries plain shard cols (no
+        // promotion). Split the pairs into a column list + a parallel target-tc
+        // list for the scatter packer.
+        let (shard_cols, target_tcs, is_join): (Vec<i32>, Vec<u8>, bool) = if source_id > 0 {
+            let pairs = cat.dag.get_join_shard_cols(view_id, source_id);
+            if pairs.is_empty() {
+                (cat.dag.get_shard_cols(view_id), Vec::new(), false)
+            } else {
+                let cols = pairs.iter().map(|&(c, _)| c).collect();
+                let tcs = pairs.iter().map(|&(_, t)| t).collect();
+                (cols, tcs, true)
+            }
         } else {
-            (cat.dag.get_shard_cols(view_id), false)
+            (cat.dag.get_shard_cols(view_id), Vec::new(), false)
         };
 
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
@@ -732,11 +742,11 @@ impl MasterDispatcher {
         let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
         let dest_batches = match consolidated_sources {
             Some(sources) => {
-                op_relay_scatter_consolidated_mode(&sources, &col_indices, &schema, self.num_workers, mode)
+                op_relay_scatter_consolidated_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
             }
             None => {
                 let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
-                op_repartition_batches_mode(&sources, &col_indices, &schema, self.num_workers, mode)
+                op_repartition_batches_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
             }
         };
 

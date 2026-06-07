@@ -1,4 +1,4 @@
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 /// Hash a 128-bit key to a 64-bit hash via XXH3-64.
 #[inline]
@@ -12,6 +12,15 @@ pub fn hash_u128(pk: u128) -> u64 {
 #[inline]
 pub fn checksum(data: &[u8]) -> u64 {
     xxh3_64(data)
+}
+
+/// XXH3-128 over arbitrary bytes (no seed). Full 128-bit image — use where a
+/// 64-bit birthday bound is too low, e.g. a string content join key (a 64-bit
+/// hash widened to 128 bits has a ~2^32-row collision window that would silently
+/// equijoin distinct strings).
+#[inline]
+pub fn checksum_128(data: &[u8]) -> u128 {
+    xxh3_128(data)
 }
 
 #[cfg(test)]
@@ -45,6 +54,18 @@ mod tests {
         for k in [0u128, 1, 42, u64::MAX as u128, pk(7, 13), pk(u64::MAX, 1), u128::MAX] {
             assert_eq!(hash_u128(k), checksum(&k.to_le_bytes()));
         }
+    }
+
+    #[test]
+    fn checksum_128_full_image_deterministic_and_distinct() {
+        // Deterministic, and the full 128-bit image is populated (not a 64-bit
+        // hash widened to 128 bits) — the high half is non-zero for typical input.
+        let a = checksum_128(b"hello world");
+        assert_eq!(a, checksum_128(b"hello world"));
+        assert_ne!(a, checksum_128(b"hello worle"));
+        assert_ne!(a >> 64, 0, "128-bit hash must populate the high half");
+        // Distinct content → distinct 128-bit keys (no truncation collision).
+        assert_ne!(checksum_128(b"abc"), checksum_128(b"abd"));
     }
 
     #[test]

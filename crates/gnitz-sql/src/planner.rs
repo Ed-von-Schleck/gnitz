@@ -880,11 +880,25 @@ fn execute_create_join_view(
     alias_map.insert(left_alias.to_lowercase(), (left_tid, (*left_schema).clone(), 0));
     alias_map.insert(right_alias.to_lowercase(), (right_tid, (*right_schema).clone(), left_schema.columns.len()));
 
-    // Extract equijoin keys
-    let (left_join_cols, right_join_cols) = extract_equijoin_keys(
+    // Extract equijoin keys + the per-pair common reindex output type `T`.
+    let (left_join_cols, right_join_cols, target_tcs) = extract_equijoin_keys(
         on_expr, &left_schema, &right_schema, &alias_map,
     )?;
     let k = left_join_cols.len();   // == right_join_cols.len(), 1..=PK_LIST_MAX_COLS
+
+    // Per-side carried target tc for each key pair: `T_i` only when the side's own
+    // self-derived reindex output type differs from `T_i` (a cross-width promotion
+    // on that side), else `0` (self-derive). The `0` keeps same-type / U128-vs-UUID
+    // / string circuits byte-identical to the pre-promotion serialization. The
+    // encode rule lives in `carried_reindex_tc`, the round-trip inverse of the
+    // engine's `resolve_reindex_type`.
+    let side_tcs = |cols: &[usize], schema: &Schema| -> Vec<u8> {
+        cols.iter().zip(&target_tcs).map(|(&c, &t)| {
+            schema.columns[c].type_code.carried_reindex_tc(TypeCode::from_validated_u8(t))
+        }).collect()
+    };
+    let left_target_tcs  = side_tcs(&left_join_cols,  &left_schema);
+    let right_target_tcs = side_tcs(&right_join_cols, &right_schema);
 
     // The merged join output is [k _join_pk cols, left cols..., right cols...].
     // Reject before the server's schema build hits its hard column-count assertion.
@@ -931,7 +945,7 @@ fn execute_create_join_view(
     } else {
         input_b
     };
-    let reindex_b = cb.map_reindex(input_b, &right_join_cols, right_reindex_prog);
+    let reindex_b = cb.map_reindex(input_b, &right_join_cols, &right_target_tcs, right_reindex_prog);
 
     // Preserved (left) side.
     //   INNER join: a left row with any NULL key component matches nothing — drop it.
@@ -956,12 +970,15 @@ fn execute_create_join_view(
         } else {
             let left_null = cb.filter(
                 input_a, Some(multi_null_filter_prog(&left_join_cols, &left_schema, true)?));
+            // MUST use the same left_target_tcs as reindex_a, else this branch
+            // reindexes at the source width and the downstream UNION merges two
+            // different `_join_pk` strides.
             let left_null_ri = cb.map_reindex(
-                left_null, &left_join_cols, build_reindex_program(&left_schema));
+                left_null, &left_join_cols, &left_target_tcs, build_reindex_program(&left_schema));
             (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
         }
     };
-    let reindex_a = cb.map_reindex(input_a_match, &left_join_cols, left_reindex_prog);
+    let reindex_a = cb.map_reindex(input_a_match, &left_join_cols, &left_target_tcs, left_reindex_prog);
 
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
@@ -1023,24 +1040,23 @@ fn execute_create_join_view(
     //   col k..k+left_n: all A columns (in A schema order)
     //   col k+left_n..k+left_n+right_n: all B columns (in B schema order)
     //
-    // Each synthetic PK column's width must match the engine's reindex output width:
-    // both sides derive it from `TypeCode::reindex_output_type` (gnitz-wire), so every
-    // cross-process consumer re-derives the same stride from this single persisted
-    // catalog value. validate_join_key_pair guarantees both sides of pair i reindex to
-    // the same output type, so the left key's reindex_output_type is that common type.
+    // Each synthetic PK column's type is the pair's `join_key_common_type` `T_i`
+    // (returned by validate_join_key_pair): the single persisted stride that both
+    // sides' reindex Maps and every cross-process consumer re-derive. For a
+    // same-type pair `T_i` equals the source's reindex_output_type, so the catalog
+    // value is unchanged; for a cross-width pair it is the wider promoted type.
     //
     // The first key column keeps the name `_join_pk` at k = 1 (the catalog name is not
     // referenced by any code, but preserving it keeps the shippable single-key view
     // byte-identical); composite keys use `_join_pk_{i}`.
     let mut out_cols: Vec<ColumnDef> = Vec::new();
-    for (i, &lc) in left_join_cols.iter().enumerate() {
+    for (i, &t) in target_tcs.iter().enumerate() {
         let name = if k == 1 { "_join_pk".to_string() } else { format!("_join_pk_{i}") };
-        // validate_join_key_pair already errored unless both sides of pair i
-        // reindex to the same output type, so the left key's pre-validated
-        // reindex output type is the single persisted stride for both sides.
         out_cols.push(ColumnDef {
             name,
-            type_code: left_schema.columns[lc].type_code.reindex_output_type(),
+            // The pair's common type T_i — the single persisted stride both sides'
+            // reindex Maps and every cross-process consumer re-derive.
+            type_code: TypeCode::from_validated_u8(t),
             is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
@@ -1196,15 +1212,17 @@ fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
 
-/// Validate one equijoin key pair. Float keys are rejected outright (IEEE-754
-/// -0.0/+0.0 compare byte-unequal and NaN has no canonical form). A German string
-/// (STRING/BLOB) may only join another German string: it reindexes to a 16-byte
-/// content hash, which is byte-incompatible with the native U128/UUID encoding
-/// even though both collapse to the U128 output type. The remaining pairs must
-/// reindex to the *same* output type: equal output type ⇒ identical OPK stride AND
-/// sign encoding, so the two reindex sides co-partition and merge byte-for-byte
-/// and the `_join_pk` catalog stride matches both.
-fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<(), GnitzSqlError> {
+/// Validate one equijoin key pair and return the pair's common reindex output
+/// type `T`. Float keys are rejected outright (IEEE-754 -0.0/+0.0 compare
+/// byte-unequal and NaN has no canonical form). A German string (STRING/BLOB) may
+/// only join another German string: it reindexes to a 16-byte content hash, which
+/// is byte-incompatible with the native U128/UUID encoding even though both
+/// collapse to the U128 output type. The remaining pairs are resolved by
+/// `join_key_common_type`, which promotes same-sign-class integers of different
+/// widths to the wider type so the two reindex sides co-partition byte-for-byte
+/// and the `_join_pk` catalog stride matches both; cross-sign pairs (which would
+/// need signed-128 promotion) are rejected.
+fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
     for col in [left, right] {
         if col.type_code.is_float() {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -1214,39 +1232,42 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<(), Gni
         }
     }
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
-    // 16-byte native value. Both collapse to the U128 output type, so the stride
-    // check below cannot tell them apart — but a content hash never equals a native
-    // integer, so the join would silently match nothing.
+    // 16-byte native value. Both collapse to the U128 output type, so
+    // `join_key_common_type` cannot tell them apart — but a content hash never
+    // equals a native integer, so the join would silently match nothing.
     if left.type_code.is_german_string() != right.type_code.is_german_string() {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: cannot equijoin string/blob column '{}' ({:?}) with non-string \
              column '{}' ({:?}); a string content hash never matches a native key",
             left.name, left.type_code, right.name, right.type_code)));
     }
-    let lo = left.type_code.reindex_output_type();
-    let ro = right.type_code.reindex_output_type();
-    if lo != ro {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) reindex to \
-             incompatible key encodings ({:?} vs {:?}); both sides of an equijoin \
-             key must share an identical width and sign encoding",
-            left.name, left.type_code, right.name, right.type_code, lo, ro)));
-    }
-    Ok(())
+    left.type_code.join_key_common_type(right.type_code)
+        .map(|t| t as u8)
+        .ok_or_else(|| GnitzSqlError::Unsupported(format!(
+            "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
+             cross-sign integer keys (e.g. U64 = I64) need signed-128 promotion and are \
+             not yet supported",
+            left.name, left.type_code, right.name, right.type_code)))
 }
 
+/// Per-position-paired equijoin key columns plus the per-pair common reindex
+/// output type: `(left_cols, right_cols, target_tcs)`.
+type EquijoinKeys = (Vec<usize>, Vec<usize>, Vec<u8>);
+
 /// Extract the ordered list of equijoin key columns from an ON expression.
-/// Returns (left_cols, right_cols), per-table-relative, paired by position.
+/// Returns (left_cols, right_cols, target_tcs), per-table-relative, paired by
+/// position; `target_tcs[i]` is the pair's common reindex output type `T`.
 fn extract_equijoin_keys(
     on_expr:      &Expr,
     left_schema:  &Schema,
     right_schema: &Schema,
     alias_map:    &HashMap<String, (u64, Schema, usize)>,
-) -> Result<(Vec<usize>, Vec<usize>), GnitzSqlError> {
+) -> Result<EquijoinKeys, GnitzSqlError> {
     let mut left_cols  = Vec::new();
     let mut right_cols = Vec::new();
+    let mut target_tcs = Vec::new();
     collect_equijoin_keys(on_expr, left_schema, right_schema, alias_map,
-                          &mut left_cols, &mut right_cols)?;
+                          &mut left_cols, &mut right_cols, &mut target_tcs)?;
     if left_cols.is_empty() {
         return Err(GnitzSqlError::Bind(
             "JOIN ON must have at least one equijoin predicate".into()));
@@ -1261,7 +1282,7 @@ fn extract_equijoin_keys(
             "JOIN ON: at most {} equijoin key columns are supported (got {})",
             gnitz_core::PK_LIST_MAX_COLS, left_cols.len())));
     }
-    Ok((left_cols, right_cols))
+    Ok((left_cols, right_cols, target_tcs))
 }
 
 fn collect_equijoin_keys(
@@ -1271,6 +1292,7 @@ fn collect_equijoin_keys(
     alias_map:    &HashMap<String, (u64, Schema, usize)>,
     left_cols:    &mut Vec<usize>,
     right_cols:   &mut Vec<usize>,
+    target_tcs:   &mut Vec<u8>,
 ) -> Result<(), GnitzSqlError> {
     match expr {
         // Parentheses: `ON (a.x = b.x) AND a.y = b.y`, `ON (a.x = b.x AND a.y = b.y)`.
@@ -1281,11 +1303,11 @@ fn collect_equijoin_keys(
         // predicate path was the lone gap among the predicate binders. (The view
         // *output* projection is a separate path and is not covered here.)
         Expr::Nested(inner) => {
-            collect_equijoin_keys(inner, left_schema, right_schema, alias_map, left_cols, right_cols)?;
+            collect_equijoin_keys(inner, left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
         }
         Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
-            collect_equijoin_keys(left,  left_schema, right_schema, alias_map, left_cols, right_cols)?;
-            collect_equijoin_keys(right, left_schema, right_schema, alias_map, left_cols, right_cols)?;
+            collect_equijoin_keys(left,  left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
+            collect_equijoin_keys(right, left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
         }
         Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
             let l = resolve_join_col_ref(left,  alias_map)?;  // global index
@@ -1308,9 +1330,12 @@ fn collect_equijoin_keys(
             if left_cols.iter().zip(right_cols.iter()).any(|(&pl, &pr)| pl == li && pr == ri) {
                 return Ok(());
             }
-            validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
+            // Push T only on the same path that pushes (li, ri) — after the dup
+            // early-return — so the three vectors stay parallel.
+            let t = validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
             left_cols.push(li);
             right_cols.push(ri);
+            target_tcs.push(t);
         }
         _ => return Err(GnitzSqlError::Unsupported(
             "JOIN ON: only an AND-conjunction of column equijoins is supported".into())),
@@ -2440,6 +2465,17 @@ mod tests {
         right: Vec<ColumnDef>,
     ) -> Result<(Vec<usize>, Vec<usize>), GnitzSqlError> {
         let (ls, rs, am) = join_ctx(left, right);
+        extract_equijoin_keys(&parse_on(on), &ls, &rs, &am).map(|(l, r, _)| (l, r))
+    }
+
+    /// Like `extract` but also returns the per-pair common reindex output type
+    /// `T`, for cross-width promotion assertions.
+    fn extract_with_tcs(
+        on: &str,
+        left:  Vec<ColumnDef>,
+        right: Vec<ColumnDef>,
+    ) -> Result<super::EquijoinKeys, GnitzSqlError> {
+        let (ls, rs, am) = join_ctx(left, right);
         extract_equijoin_keys(&parse_on(on), &ls, &rs, &am)
     }
 
@@ -2489,9 +2525,9 @@ mod tests {
         let fl = vec![col("x", TypeCode::F64, false), col("y", TypeCode::U64, false)];
         assert!(matches!(extract("a.x = b.x", fl.clone(), fl).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
-        // Encoding-mismatched pair U32 = U64 → Unsupported.
-        let l = vec![col("x", TypeCode::U32, false)];
-        let r = vec![col("x", TypeCode::U64, false)];
+        // Cross-sign pair U64 = I64 → Unsupported (needs signed-128 promotion).
+        let l = vec![col("x", TypeCode::U64, false)];
+        let r = vec![col("x", TypeCode::I64, false)];
         assert!(matches!(extract("a.x = b.x", l, r).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
         // One past the codec cap → Unsupported (arity cap). Built relative to
@@ -2513,14 +2549,24 @@ mod tests {
 
     #[test]
     fn validate_pair_accepts_compatible() {
-        validate_join_key_pair(&col("a", TypeCode::U64, false),
-                               &col("b", TypeCode::U64, false)).unwrap();
+        // Same-type pairs: T == the source reindex output type.
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U64, false),
+                               &col("b", TypeCode::U64, false)).unwrap(), TypeCode::U64 as u8);
         validate_join_key_pair(&col("a", TypeCode::String, false),
                                &col("b", TypeCode::String, false)).unwrap();
         validate_join_key_pair(&col("a", TypeCode::String, false),
                                &col("b", TypeCode::Blob, false)).unwrap();
-        validate_join_key_pair(&col("a", TypeCode::U128, false),
-                               &col("b", TypeCode::UUID, false)).unwrap();
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U128, false),
+                               &col("b", TypeCode::UUID, false)).unwrap(), TypeCode::U128 as u8);
+        // Cross-width same-sign pairs promote to the wider type.
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::I32, false),
+                               &col("b", TypeCode::I64, false)).unwrap(), TypeCode::I64 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                               &col("b", TypeCode::U64, false)).unwrap(), TypeCode::U64 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U8, false),
+                               &col("b", TypeCode::U64, false)).unwrap(), TypeCode::U64 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                               &col("b", TypeCode::U128, false)).unwrap(), TypeCode::U128 as u8);
     }
 
     #[test]
@@ -2528,17 +2574,35 @@ mod tests {
         // Float column.
         assert!(validate_join_key_pair(&col("a", TypeCode::F64, false),
                                        &col("b", TypeCode::U64, false)).is_err());
-        // Different reindex_output_type.
-        assert!(validate_join_key_pair(&col("a", TypeCode::U32, false),
-                                       &col("b", TypeCode::U64, false)).is_err());
+        // Cross-sign integer pair (would need signed-128 promotion).
         assert!(validate_join_key_pair(&col("a", TypeCode::U64, false),
                                        &col("b", TypeCode::I64, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::U32, false),
+                                       &col("b", TypeCode::I32, false)).is_err());
         // Mixed string/native — STRING = U128 both reindex to U128, so this is
-        // caught *only* by the german-string check, not the output-type check.
+        // caught *only* by the german-string check, not the common-type check.
         assert!(validate_join_key_pair(&col("a", TypeCode::String, false),
                                        &col("b", TypeCode::U128, false)).is_err());
         assert!(validate_join_key_pair(&col("a", TypeCode::String, false),
                                        &col("b", TypeCode::I64, false)).is_err());
+    }
+
+    /// Cross-width promotion threads `T` into both per-side carried tcs and the
+    /// `_join_pk` stamp: extract returns the promoted common type per pair.
+    #[test]
+    fn extract_keys_cross_width_promotes() {
+        // INT (I32) = BIGINT (I64) → T = I64.
+        let l = vec![col("x", TypeCode::I32, false)];
+        let r = vec![col("x", TypeCode::I64, false)];
+        let (lc, rc, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
+        assert_eq!((lc, rc), (vec![0], vec![0]));
+        assert_eq!(tcs, vec![TypeCode::I64 as u8]);
+
+        // U32 = U64 → T = U64.
+        let l = vec![col("x", TypeCode::U32, false)];
+        let r = vec![col("x", TypeCode::U64, false)];
+        let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
+        assert_eq!(tcs, vec![TypeCode::U64 as u8]);
     }
 
     #[test]

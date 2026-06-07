@@ -326,7 +326,9 @@ pub struct DagEngine {
     source_map: FxHashMap<i64, Vec<i64>>,    // view_id → [source_table_ids]
     dep_map_valid: bool,
     shard_cols_cache: FxHashMap<i64, Vec<i32>>,
-    join_shard_cols_cache: FxHashMap<(i64, i64), Vec<i32>>,
+    // Each entry is (reindex column, carried promotion target tc) — the carried
+    // tc is non-zero for a cross-width join key and threads to the scatter packer.
+    join_shard_cols_cache: FxHashMap<(i64, i64), Vec<(i32, u8)>>,
     exchange_info_cache: FxHashMap<i64, ExchangeInfo>,
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
@@ -553,8 +555,10 @@ impl DagEngine {
         shard_cols
     }
 
-    /// Get join shard columns for a specific source within a view.
-    pub fn get_join_shard_cols(&mut self, view_id: i64, source_id: i64) -> Vec<i32> {
+    /// Get join shard columns for a specific source within a view, each paired
+    /// with its carried promotion target tc (`0` = no promotion / derive from
+    /// source). The pairs mirror the trace-side reindex Map slot-for-slot.
+    pub fn get_join_shard_cols(&mut self, view_id: i64, source_id: i64) -> Vec<(i32, u8)> {
         // Called once per join source per tick on the master's serialized
         // exchange-relay path; cache the result so the hot path skips the
         // full load_circuit + topo_sort (O(V+E) with several allocations).
@@ -566,7 +570,7 @@ impl DagEngine {
         cols
     }
 
-    fn compute_join_shard_cols(&self, view_id: i64, source_id: i64) -> Vec<i32> {
+    fn compute_join_shard_cols(&self, view_id: i64, source_id: i64) -> Vec<(i32, u8)> {
         let loaded = self.load_meta_circuit(view_id);
 
         // Find the scan node (ScanTrace or ScanDelta) for this source.
