@@ -6,7 +6,9 @@ use crate::storage::{
     scatter_copy,
 };
 
-use super::super::util::{GroupKeyExtractor, extract_group_key, extract_group_key_cursor};
+use super::super::util::{
+    GroupKeyExtractor, cmp_col_window, extract_group_key, extract_group_key_cursor,
+};
 use super::agg::{
     Accumulator, AggDescriptor, apply_agg_from_value_index, is_single_col_natural_pk,
 };
@@ -81,6 +83,14 @@ pub(super) fn cursor_matches_group(
     let cursor_null_word = cursor.current_null_word;
     let exemplar_null_word = exemplar_mb.get_null_word(exemplar_row);
 
+    // Hoisted once: the cursor's blob arena backs any German-string group column.
+    let cursor_blob = cursor.blob_ptr();
+    let cursor_blob_slice: &[u8] = if cursor_blob.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) }
+    };
+
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
             // Raw byte equality suffices here (no order, no signed
@@ -116,18 +126,12 @@ pub(super) fn cursor_matches_group(
         let cursor_bytes = unsafe { std::slice::from_raw_parts(cursor_ptr, cs) };
         let exemplar_bytes = exemplar_mb.get_col_ptr(exemplar_row, pi, cs);
 
-        if desc.tc == TypeCode::String {
-            let cursor_blob = cursor.blob_ptr();
-            let cmp = crate::schema::compare_german_strings(
-                cursor_bytes, if cursor_blob.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) } },
-                exemplar_bytes, exemplar_mb.blob,
-            );
-            if cmp != std::cmp::Ordering::Equal {
-                return false;
-            }
-        } else if desc.tc == TypeCode::Blob {
-            unreachable!("BLOB columns are not valid group-by keys")
-        } else if cursor_bytes != exemplar_bytes {
+        // Group membership is an equality test, but byte-equality and typed
+        // equality coincide for every fixed-width type (and BLOB/STRING must
+        // compare by content), so the shared comparator is exactly right here.
+        if cmp_col_window(cursor_bytes, cursor_blob_slice, exemplar_bytes, exemplar_mb.blob, desc.tc)
+            != std::cmp::Ordering::Equal
+        {
             return false;
         }
     }

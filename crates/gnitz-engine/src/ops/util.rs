@@ -1,9 +1,9 @@
 //! Shared helpers used by ≥2 sub-modules.
 
+use xxhash_rust::xxh3::Xxh3Default;
+
 use crate::schema::{SchemaDescriptor, TypeCode, type_code};
-use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::storage::{Batch, MemBatch, ReadCursor};
-use crate::xxh;
 
 /// Compare two equal-length LE byte windows of a fixed-width column under
 /// the given `TypeCode`. Unifies the per-TypeCode dispatch used by reduce's
@@ -31,6 +31,28 @@ pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Orderi
         TypeCode::String | TypeCode::Blob => {
             unreachable!("cmp_typed_le: caller must dispatch String/Blob separately")
         }
+    }
+}
+
+/// Compare two equal-width column windows of type `tc`, dispatching German
+/// strings (STRING/BLOB) to content comparison through their backing blob
+/// arenas and every fixed-width type to [`cmp_typed_le`]. The blob slices back
+/// each side's German-string heap tail (ignored for non-string columns).
+///
+/// This is the single home for the "STRING and BLOB share the 16-byte layout,
+/// so `cmp_typed_le` panics on them and they must be compared by content" rule;
+/// the group-by and payload comparators all route through here rather than
+/// re-spelling the dispatch (a missed site panics the engine on a BLOB key).
+#[inline]
+pub(super) fn cmp_col_window(
+    a: &[u8], a_blob: &[u8],
+    b: &[u8], b_blob: &[u8],
+    tc: TypeCode,
+) -> std::cmp::Ordering {
+    if tc.is_german_string() {
+        crate::schema::compare_german_strings(a, a_blob, b, b_blob)
+    } else {
+        cmp_typed_le(a, b, tc)
     }
 }
 
@@ -118,23 +140,11 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                 let c_ptr = cursor.col_ptr(ci, cs);
                 let c_bytes = unsafe { std::slice::from_raw_parts(c_ptr, cs) };
                 let b_bytes = batch.get_col_ptr(row, pi, cs);
-
-                // German strings (STRING/BLOB) compare via compare_german_strings;
-                // cmp_typed_le's String/Blob arm is `unreachable!`, so they must
-                // be dispatched here or a BLOB payload column panics the engine.
-                if gnitz_wire::is_german_string(col.type_code) {
-                    crate::schema::compare_german_strings(
-                        c_bytes,
-                        cursor_blob_slice,
-                        b_bytes,
-                        batch.blob,
-                    )
-                } else {
-                    cmp_typed_le(
-                        c_bytes, b_bytes,
-                        TypeCode::from_validated_u8(col.type_code),
-                    )
-                }
+                cmp_col_window(
+                    c_bytes, cursor_blob_slice,
+                    b_bytes, batch.blob,
+                    TypeCode::from_validated_u8(col.type_code),
+                )
             }
         };
 
@@ -351,15 +361,17 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
 // Group key helpers (shared by reduce, exchange)
 // ---------------------------------------------------------------------------
 
-/// Murmur3 64-bit finalizer.
+/// Feed a German-string column's content into `hasher` as a length-prefixed
+/// byte run: a 4-byte LE length, then the content (following the heap pointer
+/// for long strings). The length prefix keeps "ab"+"c" from aliasing "a"+"bc"
+/// across adjacent columns. Shared by the group-key fold below and the set-op
+/// row-identity hash (`reindex_hash_row`); the two MUST agree byte-for-byte so a
+/// string key routes to — and dedups against — the partition it belongs to.
 #[inline]
-fn mix64(mut v: u64) -> u64 {
-    v ^= v >> 33;
-    v = v.wrapping_mul(0xFF51AFD7ED558CCD);
-    v ^= v >> 33;
-    v = v.wrapping_mul(0xC4CEB9FE1A85EC53);
-    v ^= v >> 33;
-    v
+pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes: &[u8], blob: &[u8]) {
+    let content = crate::schema::german_string_content(struct_bytes, blob);
+    hasher.update(&(content.len() as u32).to_le_bytes());
+    hasher.update(content);
 }
 
 /// Minimal row accessor shared by `extract_group_key` over a `MemBatch` row and
@@ -482,63 +494,58 @@ fn extract_group_key_row<R: GroupKeyRow>(
         }
     }
 
+    // Fold path: multi-column GROUP BY, a single STRING/BLOB column, or a single
+    // nullable int/U128/UUID column. Stream the same canonical per-column
+    // material into a true 128-bit Xxh3 digest, gaining full 128-bit entropy
+    // (matching reindex_hash_row). Order-sensitivity comes from the stream
+    // itself: every column emits exactly one null marker before its content, so
+    // (a, b) ≠ (b, a) and (NULL, v) ≠ (v, NULL) without an explicit index byte,
+    // and STRING content is length-prefixed so "ab"+"c" can't alias "a"+"bc".
     let null_word = row.null_word();
-    let mut h: u64 = 0x9E3779B97F4A7C15; // golden ratio seed
-    for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
+    // Function-local streaming hasher: `Xxh3Default::new()` only copies the
+    // initial accumulator (the 256-byte buffer is `MaybeUninit`), so it is as
+    // cheap as `reset()` — no thread-local or per-row reuse needed.
+    let mut hasher = Xxh3Default::new();
+    for &c_idx_u32 in group_by_cols {
         let c_idx = c_idx_u32 as usize;
         let tc = schema.columns[c_idx].type_code;
-        let col_hash = if schema.is_pk_col(c_idx) {
-            // Canonical per-column key from the addressed PK column's OPK bytes,
-            // so it hashes identically whether stored as a PK column here or a
-            // native-LE payload FK on the join's other side (the payload arm
-            // below applies the matching encode+widen).
+        if schema.is_pk_col(c_idx) {
+            // PK columns are non-nullable; canonical OPK-derived route key, so
+            // a PK sub-column hashes like the same value as a payload FK on a
+            // join's other side.
             let off = schema.pk_byte_offset(c_idx) as usize;
             let cs = schema.columns[c_idx].size() as usize;
             let key = crate::schema::pk_route_key(row.pk_bytes(), off, cs);
-            if tc == type_code::U128 || tc == type_code::UUID {
-                let lo = key as u64;
-                let hi = (key >> 64) as u64;
-                mix64(lo ^ mix64(hi))
-            } else {
-                mix64(key as u64)
-            }
+            hasher.update(&[1u8]); // non-null marker
+            hasher.update(&key.to_le_bytes());
+            continue;
+        }
+        let pi = schema.payload_idx(c_idx);
+        let is_null = schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0;
+        // `size()` is already 16 for STRING/BLOB/U128/UUID (all share the wide
+        // 16-byte layout), so no per-type width fixup is needed here.
+        let cs = schema.columns[c_idx].size() as usize;
+        // A null payload bit OR a missing backing slot (cursor invariant
+        // violation, never on the batch path) both hash as a bare NULL marker
+        // — no deref.
+        let bytes = if is_null { None } else { row.payload_bytes(schema, c_idx, cs) };
+        let Some(b) = bytes else { hasher.update(&[0u8]); continue }; // null marker
+        hasher.update(&[1u8]); // non-null marker
+        if gnitz_wire::is_german_string(tc) {
+            // STRING and BLOB both hash length-prefixed content via the shared
+            // helper (matching reindex_hash_row); load-bearing for BLOB grouping
+            // keys (Fix C), not only STRING.
+            hash_german_string_content(&mut hasher, b, row.blob());
+        } else if tc == type_code::U128 || tc == type_code::UUID {
+            hasher.update(&b[..16]);
         } else {
-            let pi = schema.payload_idx(c_idx);
-            if schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0 {
-                // NULL — position-dependent constant keeps (NULL, v) distinct from (v, NULL).
-                h = mix64(h ^ 0xDEAD_BEEF_DEAD_BEEF ^ (i as u64));
-                continue;
-            }
-            let cs = if tc == TYPE_STRING || tc == type_code::U128 || tc == type_code::UUID {
-                16
-            } else {
-                schema.columns[c_idx].size() as usize
-            };
-            // A null ptr here means the non-null bit disagrees with the backing
-            // store (cursor invariant violation) — fold a position-dependent
-            // constant rather than dereference. Never taken on the batch path.
-            let Some(bytes) = row.payload_bytes(schema, c_idx, cs) else {
-                h = mix64(h ^ 0xDEAD_BEEF_DEAD_BEEF ^ (i as u64));
-                continue;
-            };
-            if tc == TYPE_STRING {
-                let content = crate::schema::german_string_content(bytes, row.blob());
-                if content.is_empty() { 0u64 } else { xxh::checksum(content) }
-            } else if tc == type_code::U128 || tc == type_code::UUID {
-                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                mix64(lo ^ mix64(hi))
-            } else {
-                // Native-LE payload int: encode+widen (payload_route_key) so a
-                // payload FK column hashes like the same value stored as a PK
-                // column (sign-flipped for signed), matching the PK arm above.
-                mix64(crate::schema::payload_route_key(bytes, 0, cs, tc) as u64)
-            }
-        };
-        h = mix64(h ^ col_hash ^ (i as u64));
+            // Canonical (sign-flipped/widened) value: a payload FK hashes like
+            // the same value stored as a PK column (matches the is_pk_col arm).
+            let key = crate::schema::payload_route_key(b, 0, cs, tc);
+            hasher.update(&key.to_le_bytes());
+        }
     }
-    let h_hi = mix64(h ^ (group_by_cols.len() as u64));
-    ((h_hi as u128) << 64) | (h as u128)
+    hasher.digest128()
 }
 
 #[cfg(test)]

@@ -1059,3 +1059,241 @@ class TestReducePathRegressions:
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+
+class TestGroupByKeyCorrectness:
+    """GROUP BY key correctness: float keys rejected (Fix A), the group identity
+    is a true 128-bit hash (Fix B), and BLOB grouping keys work end-to-end (Fix
+    C). Run with GNITZ_WORKERS=4 so the exchange scatter (which routes by the
+    same group identity) is exercised."""
+
+    def test_float_group_by_key_rejected(self, client):
+        """Fix A1: a float grouping key splits -0.0/+0.0 and distinct-NaN bit
+        patterns into separate groups (and routes them to distinct workers), so
+        the DDL must be rejected with a clear error."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  f DOUBLE NOT NULL,"
+                "  v BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT f, COUNT(*) AS n FROM t GROUP BY f",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_string_group_by_many_keys_retraction(self, client):
+        """Fix B: a single-STRING GROUP BY takes the synthetic _group_pk path,
+        whose routing/stored identity is now a full 128-bit Xxh3 fold (was a
+        64-bit hash widened to u128, a ~2^32 birthday bound that could merge two
+        distinct groups → silently wrong aggregation). Many distinct string keys
+        must aggregate correctly across workers, and a DELETE must update the
+        affected group only."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  s TEXT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT s, COUNT(*) AS n, SUM(val) AS total "
+                "FROM t GROUP BY s",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # 50 distinct string groups, 2 rows each.
+            pk = 0
+            exp_count = {}
+            exp_sum = {}
+            rows_sql = []
+            for g in range(50):
+                key = f"group-key-{g:04d}"
+                for k in range(2):
+                    pk += 1
+                    val = g * 10 + k
+                    rows_sql.append(f"({pk}, '{key}', {val})")
+                    exp_count[key] = exp_count.get(key, 0) + 1
+                    exp_sum[key] = exp_sum.get(key, 0) + val
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
+            )
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
+            assert len(by_key) == 50, (
+                f"every distinct string key must be its own group (no hash-collision "
+                f"merge): got {len(by_key)} groups"
+            )
+            for key in exp_count:
+                assert by_key[key] == (exp_count[key], exp_sum[key]), (
+                    f"group {key!r}: expected (count, sum)="
+                    f"{(exp_count[key], exp_sum[key])}, got {by_key[key]}"
+                )
+
+            # Retraction: DELETE one contributing row of group-key-0001 (pk=4,
+            # val=11). That group's count 2→1 and sum 21→10.
+            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
+            assert by_key["group-key-0001"] == (1, 10), (
+                f"after deleting one row, group must update: got {by_key['group-key-0001']}"
+            )
+            # An untouched group is unchanged.
+            assert by_key["group-key-0002"] == (2, exp_sum["group-key-0002"])
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_multi_col_group_by_sum_retraction(self, client):
+        """Fix B: a multi-column GROUP BY routes through the 128-bit fold for its
+        exchange scatter and stored _group_pk. Many distinct (a, b) keys must
+        aggregate correctly across workers, with a DELETE updating one group."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  a BIGINT NOT NULL,"
+                "  b BIGINT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, COUNT(*) AS n, SUM(val) AS total "
+                "FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            pk = 0
+            exp_sum = {}
+            rows_sql = []
+            for a in range(8):
+                for b in range(8):
+                    for k in range(2):
+                        pk += 1
+                        val = a * 1000 + b * 10 + k
+                        rows_sql.append(f"({pk}, {a}, {b}, {val})")
+                        exp_sum[(a, b)] = exp_sum.get((a, b), 0) + val
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
+            )
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
+            assert len(by_key) == 64, (
+                f"every distinct (a,b) must be its own group: got {len(by_key)}"
+            )
+            for key, s in exp_sum.items():
+                assert by_key[key] == (2, s), (
+                    f"group {key}: expected (2, {s}), got {by_key[key]}"
+                )
+
+            # Delete pk=1 → group (0,0) row val=0. count 2→1, sum drops by 0's val.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
+            assert by_key[(0, 0)] == (1, exp_sum[(0, 0)] - 0), (
+                f"after delete, group (0,0) must update: got {by_key[(0, 0)]}"
+            )
+            assert by_key[(7, 7)] == (2, exp_sum[(7, 7)]), "untouched group unchanged"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_blob_group_by_max_retraction(self, client):
+        """Fix C: a BLOB grouping key works end-to-end. BLOB shares the 16-byte
+        German-string layout with STRING; the two group-membership compares
+        (cursor_matches_group, compare_by_group_cols) now dispatch BLOB by
+        content instead of `unreachable!`-ing. SQL DDL rejects BLOB, so build the
+        table/circuit via the binding layer (like test_distinct_blob_payload).
+        Long (>12-byte) blobs sharing a prefix force the heap-tail compare; MAX
+        is non-linear so the trace replay runs cursor_matches_group on BLOB."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("grp", gnitz.TypeCode.BLOB),
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+        ]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        cb = client.circuit_builder(source_table_id=tid)
+        # group_by col 1 (BLOB), MAX (agg_func_id=4) on col 2 (val).
+        red = cb.reduce(cb.input_delta(), group_by_cols=[1], agg_func_id=4, agg_col_idx=2)
+        cb.sink(red)
+        out_cols = [
+            gnitz.ColumnDef("gpk", gnitz.TypeCode.U128, primary_key=True),
+            gnitz.ColumnDef("grp", gnitz.TypeCode.BLOB),
+            gnitz.ColumnDef("mx", gnitz.TypeCode.I64),
+        ]
+        vid = client.create_view_with_circuit(sn, "vb", cb.build(), out_cols)
+
+        try:
+            # 20 distinct long blobs sharing the "blob-group-payload-" prefix;
+            # 2 rows each with vals {g*10, g*10+5} → MAX = g*10+5.
+            def blob_for(g):
+                return f"blob-group-payload-{g:04d}".encode()
+
+            pk = 0
+            b = gnitz.ZSetBatch(schema)
+            for g in range(20):
+                for k in range(2):
+                    pk += 1
+                    b.append(pk=pk, grp=blob_for(g), val=g * 10 + k * 5, weight=1)
+            client.push(tid, b)
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_blob = {bytes(r["grp"]): r["mx"] for r in rows}
+            assert len(by_blob) == 20, (
+                f"every distinct blob must be its own group (full-content compare, "
+                f"not 4-byte-prefix): got {len(by_blob)}"
+            )
+            for g in range(20):
+                assert by_blob[blob_for(g)] == g * 10 + 5, (
+                    f"blob {g}: MAX must be {g * 10 + 5}, got {by_blob[blob_for(g)]}"
+                )
+
+            # Retraction: remove the val=(g*10+5) row from blob 3 (pk=8) → MAX of
+            # that group drops from 35 to 30. The replay scans the trace via
+            # cursor_matches_group on the BLOB column.
+            rb = gnitz.ZSetBatch(schema)
+            rb.append(pk=8, grp=blob_for(3), val=3 * 10 + 5, weight=-1)
+            client.push(tid, rb)
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            by_blob = {bytes(r["grp"]): r["mx"] for r in rows}
+            assert by_blob[blob_for(3)] == 30, (
+                f"after retracting the max row, blob 3's MAX must drop to 30, got "
+                f"{by_blob[blob_for(3)]}"
+            )
+            # An untouched blob is unchanged.
+            assert by_blob[blob_for(7)] == 7 * 10 + 5
+
+            client.drop_view(sn, "vb")
+            client.drop_table(sn, tname)
+        finally:
+            client.drop_schema(sn)

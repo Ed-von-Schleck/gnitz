@@ -535,3 +535,32 @@ fn test_direct_self_join_still_rejected() {
         e => panic!("expected Unsupported, got {:?}", e),
     }
 }
+
+// ── float set-op row-identity rejection (Fix A2) ─────────────────────
+//
+// A set operation's row identity hashes each projected column's raw IEEE-754
+// bytes (reindex_hash_row), so a float column splits -0.0/+0.0 and distinct-NaN
+// rows that SQL set semantics treat as equal. UNION/EXCEPT/INTERSECT over a
+// float column must be rejected; a non-float set-op still succeeds.
+
+#[test]
+fn test_set_op_float_column_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)").unwrap();
+
+    for op in ["UNION", "EXCEPT", "INTERSECT"] {
+        let err = must_err(p.execute(&format!(
+            "CREATE VIEW vbad AS SELECT d FROM a {op} SELECT d FROM b"
+        )));
+        assert!(
+            matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
+            "expected float-identity Unsupported for {op}, got {:?}", err,
+        );
+    }
+
+    // A non-float set-op still succeeds.
+    p.execute("CREATE VIEW vg AS SELECT g FROM a UNION SELECT g FROM b").unwrap();
+}

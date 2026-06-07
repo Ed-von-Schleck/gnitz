@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_sql::SqlPlanner;
+use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
 mod common;
@@ -124,4 +124,39 @@ fn test_select_distinct_projects_and_dedups() {
     let mut vals: Vec<i64> = (0..batch.len()).map(|r| i64_at(&batch, c1, r)).collect();
     vals.sort();
     assert_eq!(vals, vec![7, 9], "distinct c1 values must be {{7, 9}}");
+}
+
+// ── float DISTINCT row-identity rejection (Fix A2) ───────────────────
+//
+// A DISTINCT identity hashes each projected column's raw IEEE-754 bytes
+// (reindex_hash_row), so a float column splits -0.0/+0.0 and distinct-NaN rows
+// that SQL set semantics treat as equal. Both the explicit projection and the
+// `SELECT DISTINCT *` early-return path must reject it.
+
+#[test]
+fn test_select_distinct_float_column_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)"
+    ).unwrap();
+
+    // Explicit float projection.
+    let err = must_err(p.execute("CREATE VIEW v AS SELECT DISTINCT d FROM t"));
+    assert!(
+        matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
+        "expected float-identity Unsupported, got {:?}", err,
+    );
+
+    // `SELECT DISTINCT *` over a table with a float column hits the all-* early
+    // return, which must also be guarded.
+    let err2 = must_err(p.execute("CREATE VIEW v2 AS SELECT DISTINCT * FROM t"));
+    assert!(
+        matches!(&err2, GnitzSqlError::Unsupported(s) if s.contains("float")),
+        "expected float-identity Unsupported for DISTINCT *, got {:?}", err2,
+    );
+
+    // A non-float DISTINCT still succeeds.
+    p.execute("CREATE VIEW v3 AS SELECT DISTINCT g FROM t").unwrap();
 }

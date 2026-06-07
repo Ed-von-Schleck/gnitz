@@ -488,10 +488,7 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
                 if is_null { continue; }
                 if gnitz_wire::is_german_string(col.type_code) {
                     let sb = mb.get_col_ptr(row, pi, 16);
-                    let content = crate::schema::german_string_content(sb, mb.blob);
-                    // Length-prefix the content so "ab"+"c" can't alias "a"+"bc".
-                    hasher.update(&(content.len() as u32).to_le_bytes());
-                    hasher.update(content);
+                    super::util::hash_german_string_content(&mut hasher, sb, mb.blob);
                 } else {
                     let cs = col.size() as usize;
                     hasher.update(mb.get_col_ptr(row, pi, cs));

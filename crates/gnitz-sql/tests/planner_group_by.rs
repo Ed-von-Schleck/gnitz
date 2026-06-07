@@ -360,3 +360,37 @@ fn test_group_by_natural_pk_source_no_dup_col() {
     assert_eq!(s.columns[0].name, "id");
     assert_eq!(s.columns[1].name, "total");
 }
+
+// ── float GROUP BY key rejection (Fix A1) ────────────────────────────
+//
+// A float grouping key splits -0.0/+0.0 and distinct-NaN bit patterns into
+// separate groups (and routes them to distinct workers), violating SQL grouping
+// where -0.0 = +0.0. Mirrors the PK / join-key float exclusions. STRING and
+// integer keys are unaffected.
+
+#[test]
+fn test_group_by_float_key_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    // FLOAT → F32, DOUBLE → F64; both must be rejected as grouping keys.
+    p.execute(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, f FLOAT NOT NULL, d DOUBLE NOT NULL, v BIGINT NOT NULL)"
+    ).unwrap();
+    for col in ["f", "d"] {
+        let err = must_err(p.execute(&format!(
+            "CREATE VIEW vbad AS SELECT {col}, COUNT(*) AS n FROM t GROUP BY {col}"
+        )));
+        assert!(
+            matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
+            "expected float-key Unsupported for GROUP BY {col}, got {:?}", err,
+        );
+    }
+
+    // A non-float (integer / string) group key still succeeds.
+    p.execute(
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, s TEXT NOT NULL, v BIGINT NOT NULL)"
+    ).unwrap();
+    p.execute("CREATE VIEW vi AS SELECT g, COUNT(*) AS n FROM u GROUP BY g").unwrap();
+    p.execute("CREATE VIEW vs AS SELECT s, COUNT(*) AS n FROM u GROUP BY s").unwrap();
+}

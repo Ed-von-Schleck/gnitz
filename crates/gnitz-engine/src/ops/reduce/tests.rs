@@ -2,8 +2,8 @@
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
 use crate::schema::{
-    PAYLOAD_MAPPING_PK_SENTINEL, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD,
-    TypeCode, type_code,
+    PAYLOAD_MAPPING_PK_SENTINEL, SchemaColumn, SchemaDescriptor, TypeCode, encode_german_string,
+    type_code,
 };
 use crate::storage::{Batch, ConsolidatedBatch};
 
@@ -106,7 +106,6 @@ fn make_reduce_str_out_schema() -> SchemaDescriptor {
 }
 
 /// Build a 3-column Batch (U64 pk, I64 grp, STRING val) from tuples.
-/// All strings must be <= 12 bytes (inline, no blob needed).
 fn make_batch_3col_grp_str(
     schema: &SchemaDescriptor,
     rows: &[(u64, i64, i64, &str)],
@@ -119,11 +118,7 @@ fn make_batch_3col_grp_str(
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &grp.to_le_bytes());
-        let bytes = val.as_bytes();
-        assert!(bytes.len() <= SHORT_STRING_THRESHOLD, "use inline strings only");
-        let mut gs = [0u8; 16];
-        gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-        gs[4..4 + bytes.len()].copy_from_slice(bytes);
+        let gs = encode_german_string(val.as_bytes(), &mut b.blob);
         b.extend_col(1, &gs);
         b.count += 1;
     }
@@ -4805,20 +4800,13 @@ fn extract_group_key_cursor_matches_batch() {
             &[0],
         );
         let pi = schema.payload_idx(1);
-        let make_gs = |s: &str| -> [u8; 16] {
-            let bytes = s.as_bytes();
-            assert!(bytes.len() <= crate::schema::SHORT_STRING_THRESHOLD);
-            let mut gs = [0u8; 16];
-            gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-            gs[4..4 + bytes.len()].copy_from_slice(bytes);
-            gs
-        };
         let mut b = Batch::with_schema(schema, 3);
         for (pk, s) in [(1u64, ""), (2, "hello"), (3, "zebra")] {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(pi, &make_gs(s));
+            let gs = encode_german_string(s.as_bytes(), &mut b.blob);
+            b.extend_col(pi, &gs);
             b.count += 1;
         }
         b.sorted = true;
@@ -5253,4 +5241,230 @@ fn fallback_trace_rewind_at_most_once() {
 
     // Correctness: MIN per group = min(g*10, g*10+5) = g*10 (trace value).
     assert_eq!(out.count, num_groups, "must emit one row per group");
+}
+
+// -----------------------------------------------------------------------
+// Fix B: true 128-bit group identity (collision resistance + full width).
+//
+// The fold path (multi-column GROUP BY / single STRING key) now streams the
+// canonical per-column material into an Xxh3 digest128, so it carries a full
+// 128 bits of entropy. The previous mix64 fold compressed to a 64-bit `h` and
+// lifted to u128 bijectively, so it had only 2^64 cardinality — a ~2^32
+// birthday bound past which a collision merges two distinct group keys into one
+// group (silently wrong aggregation). The single-column int/PK fast paths are
+// exact and stay byte-identical (pinned by the *_bit_identical /
+// *_canonical_widen tests, unchanged above).
+// -----------------------------------------------------------------------
+
+/// 3-col schema: U64 pk | I64 c1 | STRING c2 (both non-PK group columns).
+fn make_schema_u64_i64_str() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    )
+}
+
+#[test]
+fn test_extract_group_key_128bit_collision_resistance() {
+    use std::collections::HashSet;
+    let schema = make_schema_u64_i64_str();
+
+    let pi_c1 = schema.payload_idx(1);
+    let pi_c2 = schema.payload_idx(2);
+
+    // Sweep many distinct (c1, c2) multi-column keys. Each (i, j) is a distinct
+    // group; the 128-bit fold must map them to distinct u128 with no collision.
+    let mut b = Batch::with_schema(schema, 1);
+    let mut expected = 0usize;
+    for i in 0..64i64 {
+        for j in 0..64u32 {
+            b.extend_pk((expected as u128) + 1);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(pi_c1, &i.to_le_bytes());
+            let gs = encode_german_string(format!("k{j}").as_bytes(), &mut b.blob);
+            b.extend_col(pi_c2, &gs);
+            b.count += 1;
+            expected += 1;
+        }
+    }
+    let mb = b.as_mem_batch();
+
+    let mut keys: HashSet<u128> = HashSet::new();
+    let mut his: HashSet<u64> = HashSet::new();
+    let mut los: HashSet<u64> = HashSet::new();
+    for row in 0..b.count {
+        let k = extract_group_key(&mb, row, &schema, &[1u32, 2u32]);
+        keys.insert(k);
+        his.insert((k >> 64) as u64);
+        los.insert(k as u64);
+    }
+    assert_eq!(
+        keys.len(), expected,
+        "all distinct multi-column keys must hash to distinct 128-bit values (no collision)",
+    );
+    // The full 128-bit width is used: both halves carry real hash output. A
+    // 64-bit-then-zero-extended key would pin the high half constant; the old
+    // bijective lift would make the high half a deterministic image of the low
+    // half. For 4096 keys well under the 2^32 birthday bound, an independent
+    // 128-bit digest leaves each half collision-free.
+    assert_eq!(his.len(), expected, "high 64 bits must be full-entropy (no truncation collision)");
+    assert_eq!(los.len(), expected, "low 64 bits must be full-entropy (no truncation collision)");
+
+    // Determinism: the same row hashes identically across calls (reused hasher).
+    assert_eq!(
+        extract_group_key(&mb, 0, &schema, &[1u32, 2u32]),
+        extract_group_key(&mb, 0, &schema, &[1u32, 2u32]),
+        "same row must hash identically",
+    );
+
+    // Cursor and batch paths must still agree on the fold (German-string arm).
+    assert_group_key_cursor_matches_batch(&b, &schema, &[1u32, 2u32]);
+}
+
+// -----------------------------------------------------------------------
+// Fix C: BLOB as a grouping key.
+//
+// BLOB shares the 16-byte German-string layout with STRING; the two
+// group-membership compares (cursor_matches_group, compare_by_group_cols) now
+// dispatch BLOB through compare_german_strings instead of `unreachable!`-ing.
+// Mirrors test_distinct_blob_payload_no_panic. Long (>12-byte) blobs that share
+// a 4-byte prefix force the full-content heap tail comparison.
+// -----------------------------------------------------------------------
+
+/// Schema: U64 pk | BLOB grp | I64 val. BLOB is the (non-PK) grouping key.
+fn make_schema_u64_blob_grp_i64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::BLOB, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Build a (pk, weight, blob, val) batch. Blobs > 12 bytes go to the heap (long
+/// form); shorter blobs stay inline — both exercise german_string_content. Rows
+/// are passed in PK order so the batch is validly sorted+consolidated for use as
+/// a trace cursor.
+fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], i64)]) -> Batch {
+    let pi_grp = schema.payload_idx(1);
+    let pi_val = schema.payload_idx(2);
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, w, blob, val) in rows {
+        let gs = encode_german_string(blob, &mut b.blob);
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(pi_grp, &gs);
+        b.extend_col(pi_val, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.sorted = true;
+    b.consolidated = true;
+    b
+}
+
+#[test]
+fn test_compare_by_group_cols_blob_no_panic() {
+    // Two long blobs sharing the 4-byte prefix "PREF" and the same length, so
+    // compare_german_strings must walk the heap tail (not just the inline
+    // prefix). Pre-fix this `unreachable!`s; post-fix it orders by content.
+    let schema = make_schema_u64_blob_grp_i64();
+    let blob_a: &[u8] = b"PREF_aaaaaaaaaa"; // 15 bytes
+    let blob_b: &[u8] = b"PREF_bbbbbbbbbb"; // 15 bytes, same prefix+length
+    assert_eq!(blob_a.len(), blob_b.len());
+    assert_eq!(&blob_a[..4], &blob_b[..4]);
+    let batch = make_batch_blob_grp_i64(&schema, &[(1, 1, blob_a, 10), (2, 1, blob_b, 20)]);
+    let mb = batch.as_mem_batch();
+    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
+    let descs = &descs_arr[..descs_len];
+
+    assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Less,
+        "blob_a < blob_b by content tail");
+    assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
+    assert_eq!(compare_by_group_cols(&mb, 0, 0, descs), std::cmp::Ordering::Equal,
+        "same blob compares equal");
+
+    // The hash path (Fix B's German-string arm) and the cursor compare must
+    // agree with the batch compare on this BLOB key.
+    assert_group_key_cursor_matches_batch(&batch, &schema, &[1u32]);
+    let k0 = extract_group_key(&mb, 0, &schema, &[1u32]);
+    let k1 = extract_group_key(&mb, 1, &schema, &[1u32]);
+    assert_ne!(k0, k1, "distinct blobs must hash to distinct group keys");
+}
+
+#[test]
+fn test_reduce_max_blob_group_retraction() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // GROUP BY a long BLOB column, MAX(I64 val). MAX is non-linear and there is
+    // no AVI/GI, so the trace replay routes through cursor_matches_group — the
+    // compare that `unreachable!`'d on BLOB before Fix C. Two distinct long
+    // blobs sharing a 4-byte prefix must group separately, never panic.
+    let in_schema = make_schema_u64_blob_grp_i64();
+    // Output: synthetic U128 _group_pk | BLOB grp | I64 max (nullable).
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::BLOB, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let agg = AggDescriptor {
+        col_idx: 2, agg_op: AggOp::Max, col_type_code: TypeCode::I64, _pad: [0; 2],
+    };
+
+    let blob_a: &[u8] = b"PREFIX_AAAAAAAAAA"; // 17 bytes (long)
+    let blob_b: &[u8] = b"PREFIX_BBBBBBBBBB"; // 17 bytes, same prefix+length
+    assert_eq!(&blob_a[..6], &blob_b[..6], "shared prefix forces heap tail compare");
+
+    // Tick 1: blob_a → {10, 30}, blob_b → {20}. Empty trace.
+    let tick1: &[(u64, i64, &[u8], i64)] =
+        &[(1, 1, blob_a, 10), (2, 1, blob_a, 30), (3, 1, blob_b, 20)];
+    let delta1 = make_batch_blob_grp_i64(&in_schema, tick1);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch1 = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (out1, _) = op_reduce(
+        &delta1, None, to_ch1.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    assert_eq!(out1.count, 2, "two distinct blobs → two groups (must not merge on shared prefix)");
+    let maxes1: std::collections::BTreeSet<i64> = (0..out1.count)
+        .map(|i| crate::util::read_i64_le(out1.col_data(1), i * 8))
+        .collect();
+    assert_eq!(maxes1, [20i64, 30].into_iter().collect(),
+        "MAX(blob_a)=30, MAX(blob_b)=20");
+
+    // Tick 2: retract the val=30 row from blob_a → MAX(blob_a) 30 → 10. The
+    // replay scans the trace (tick1 rows) via cursor_matches_group on the BLOB.
+    let ti_batch = Rc::new(make_batch_blob_grp_i64(&in_schema, tick1));
+    let to_batch = Rc::new(out1);
+    // Retraction: weight -1 on the val=30 blob_a row.
+    let delta2 = make_batch_blob_grp_i64(&in_schema, &[(2, -1, blob_a, 30)]);
+    let mut ti_ch2 = CursorHandle::from_owned(&[ti_batch], in_schema);
+    let mut to_ch2 = CursorHandle::from_owned(&[to_batch], out_schema);
+    let (out2, _) = op_reduce(
+        &delta2,
+        Some(ti_ch2.cursor_mut()),
+        to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &[agg],
+        None, false, TypeCode::U64, None, 0, None, None,
+    );
+    // blob_a's MAX updates 30 → 10: retract old (30, w=-1) + insert new (10, w=+1).
+    // blob_b is untouched.
+    let retract = (0..out2.count).find(|&i| out2.get_weight(i) < 0)
+        .map(|i| crate::util::read_i64_le(out2.col_data(1), i * 8));
+    let insert = (0..out2.count).find(|&i| out2.get_weight(i) > 0)
+        .map(|i| crate::util::read_i64_le(out2.col_data(1), i * 8));
+    assert_eq!(retract, Some(30), "retract old MAX(blob_a)=30");
+    assert_eq!(insert, Some(10), "insert new MAX(blob_a)=10 after the 30 row is gone");
 }

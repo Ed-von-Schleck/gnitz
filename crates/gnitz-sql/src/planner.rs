@@ -1212,6 +1212,21 @@ fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
 
+/// Reject a float column used as any hashed key — a GROUP BY grouping key, a
+/// DISTINCT/set-op row identity, or an equijoin key. All of these hash the
+/// column's raw IEEE-754 bytes, so -0.0/+0.0 and distinct-NaN bit patterns split
+/// values that are numerically equal (and route them to distinct workers). `role`
+/// names the offending clause for the error message.
+fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzSqlError> {
+    if col.type_code.is_float() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{role}: float column '{}' cannot be a key \
+             (IEEE-754 -0.0/+0.0 and NaN break key equality)",
+            col.name)));
+    }
+    Ok(())
+}
+
 /// Validate one equijoin key pair and return the pair's common reindex output
 /// type `T`. Float keys are rejected outright (IEEE-754 -0.0/+0.0 compare
 /// byte-unequal and NaN has no canonical form). A German string (STRING/BLOB) may
@@ -1224,12 +1239,7 @@ fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
 /// need signed-128 promotion) are rejected.
 fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
     for col in [left, right] {
-        if col.type_code.is_float() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "JOIN ON: float column '{}' cannot be a join key \
-                 (IEEE-754 -0.0/+0.0 and NaN break byte-equal key matching)",
-                col.name)));
-        }
+        reject_float_key(col, "JOIN ON")?;
     }
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
     // 16-byte native value. Both collapse to the U128 output type, so
@@ -1460,6 +1470,7 @@ fn execute_create_group_by_view(
                     .ok_or_else(|| GnitzSqlError::Bind(
                         format!("GROUP BY column '{}' not found", id.value)
                     ))?;
+                reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
                 group_col_indices.push(idx);
             }
             _ => return Err(GnitzSqlError::Unsupported(
@@ -2154,6 +2165,7 @@ fn resolve_set_projection(
 ) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
     if projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_))) {
         let indices: Vec<usize> = (0..source_schema.columns.len()).collect();
+        reject_float_keys(source_schema, &indices)?;
         return Ok((indices, source_schema.columns.clone()));
     }
     let mut indices: Vec<usize> = Vec::new();
@@ -2195,7 +2207,20 @@ fn resolve_set_projection(
             )),
         }
     }
+    // Single chokepoint: every projected column lands in `indices`, so one pass
+    // here rejects a float row-identity key regardless of which SELECT-item arm
+    // produced it (a new arm is covered automatically).
+    reject_float_keys(source_schema, &indices)?;
     Ok((indices, out_cols))
+}
+
+/// Reject any float column among `indices` as a row-identity key. See
+/// [`reject_float_key`] for why floats break set/DISTINCT membership.
+fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Result<(), GnitzSqlError> {
+    for &ci in indices {
+        reject_float_key(&source_schema.columns[ci], "SELECT DISTINCT / set operation")?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,7 +9,7 @@ use crate::storage::{
     scatter_copy, write_to_batch,
 };
 
-use super::super::util::cmp_typed_le;
+use super::super::util::cmp_col_window;
 
 /// Pre-computed per-column sort descriptor to avoid repeated schema lookups.
 ///
@@ -70,18 +70,13 @@ pub(super) fn compare_by_group_cols(
             (false, false) => {}
         }
 
-        let ord = if desc.tc == TypeCode::String {
-            let a_bytes = mb.get_col_ptr(row_a, pi, 16);
-            let b_bytes = mb.get_col_ptr(row_b, pi, 16);
-            crate::schema::compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
-        } else if desc.tc == TypeCode::Blob {
-            unreachable!("BLOB columns are not valid group-by keys")
-        } else {
-            let cs = desc.cs as usize;
-            let a = mb.get_col_ptr(row_a, pi, cs);
-            let b = mb.get_col_ptr(row_b, pi, cs);
-            cmp_typed_le(a, b, desc.tc)
-        };
+        // SortDesc.cs is already tc.stride() = 16 for STRING/BLOB (build_sort_descs),
+        // so a single `cs`-wide read feeds both the German-string content compare
+        // and the fixed-width path; mb.blob backs both rows' string tails.
+        let cs = desc.cs as usize;
+        let a = mb.get_col_ptr(row_a, pi, cs);
+        let b = mb.get_col_ptr(row_b, pi, cs);
+        let ord = cmp_col_window(a, mb.blob, b, mb.blob, desc.tc);
         if ord != Ordering::Equal {
             return ord;
         }
