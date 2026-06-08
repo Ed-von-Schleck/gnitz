@@ -1,5 +1,7 @@
 use super::*;
 use crate::schema::{pk_native_key, payload_native_key};
+use rustc_hash::{FxHashSet, FxHashMap};
+use crate::storage::PkBuf;
 
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
@@ -161,6 +163,53 @@ impl CatalogEngine {
             None
         };
 
+        // Any retraction in the batch? Computed once: the per-index `retracted`
+        // set is populated only when a retraction exists, so insert-only batches
+        // pay nothing.
+        let has_retractions = (0..batch.count).any(|r| batch.get_weight(r) < 0);
+
+        // PKs the batch upserts: net-positive aggregate weight. On a unique_pk
+        // table enforce_unique_pk retracts such a PK's committed row (and its old
+        // unique value) at apply, so a committed holder that is itself an upserted
+        // PK frees its value — what makes a bulk shift like `UPDATE t SET u = u + 1`
+        // valid. The net-positive rule (not "has any +1 row") matches the
+        // distributed path's `existing_pks`, so the two validators agree even on
+        // an unconsolidated batch that carries both a +1 and a -1 for one PK.
+        // Empty on non-unique_pk tables (no enforce_unique_pk), so the implicit
+        // exemption never fires there.
+        //
+        // Insert-only batches (the hot path) carry no `-1`, so every positive row
+        // is already net-positive — skip the aggregation map entirely and collect
+        // PKs directly; only a mixed-sign batch needs the net pass.
+        let mut upserted_pks: FxHashSet<PkBuf> = FxHashSet::default();
+        if entry.unique_pk {
+            if has_retractions {
+                let mut net: FxHashMap<PkBuf, i64> =
+                    FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+                for r in 0..batch.count {
+                    let w = batch.get_weight(r);
+                    if w == 0 { continue; }
+                    *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r)))
+                        .or_insert(0) += w;
+                }
+                upserted_pks =
+                    net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
+            } else {
+                upserted_pks.reserve(batch.count);
+                for r in 0..batch.count {
+                    if batch.get_weight(r) > 0 {
+                        upserted_pks.insert(
+                            PkBuf::from_bytes(batch.get_pk_bytes(r)));
+                    }
+                }
+            }
+        }
+
+        // (source PK, value) pairs retracted in this batch over the current
+        // index's column. Allocation reused across indices via `clear` (the key
+        // is index-specific, so the *contents* are rebuilt per index).
+        let mut retracted: FxHashSet<(PkBuf, u128)> = FxHashSet::default();
+
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
             let source_col_idx = ic.col_idx as usize;
@@ -180,6 +229,20 @@ impl CatalogEngine {
                 schema.payload_idx(source_col_idx)
             };
 
+            // Decode the indexed column to its canonical u128 key. `get_pk` is the
+            // OPK-widened value, which `index_opk_prefix` below would re-OPK-encode
+            // — wrong for a signed single PK (double sign flip). `pk_native_key` is
+            // correct for all widths and equals `get_pk` for unsigned single PKs; a
+            // payload column reads from `col_data`, not the packed PK.
+            let key_at = |row: usize| -> u128 {
+                if is_pk_col {
+                    pk_native_key(batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
+                } else {
+                    payload_native_key(
+                        batch.col_data(payload_col), row * col_size, col_size, col_type)
+                }
+            };
+
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
             let idx_key_type = ic.index_schema.columns[0].type_code;
             let idx_table = ic.table_mut();
@@ -187,7 +250,28 @@ impl CatalogEngine {
 
             // The canonical u128 key uniquely identifies the indexed value for
             // every type we accept (pk_native_key/payload_native_key map to ≤16 bytes).
-            let mut seen: HashSet<u128> = HashSet::with_capacity(batch.count);
+            let mut seen: FxHashSet<u128> =
+                FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+
+            // A batch may atomically move a unique value between PKs (transfer)
+            // or swap two values; the committed index still holds the old entry
+            // (validation is pre-apply), so a collision against a value retracted
+            // *by its current holder* is transient. Pairing on the holder PK —
+            // not the value alone — stops a forged `P_other/v@-1` naming a
+            // non-holder from exempting a real `P2/v@+1`.
+            retracted.clear();
+            if has_retractions {
+                for row in 0..batch.count {
+                    if batch.get_weight(row) >= 0 { continue; }
+                    if !is_pk_col {
+                        let null_word = batch.get_null_word(row);
+                        if null_word & (1u64 << payload_col) != 0 { continue; }
+                    }
+                    let key_u128 = key_at(row);
+                    retracted.insert((
+                        PkBuf::from_bytes(batch.get_pk_bytes(row)), key_u128));
+                }
+            }
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
@@ -198,8 +282,17 @@ impl CatalogEngine {
                     if null_word & (1u64 << payload_col) != 0 { continue; }
                 }
 
-                // UPSERT iff the row's PK already has a live base-table row.
-                let is_upsert = if !entry.unique_pk {
+                // UPSERT iff the row's PK is a net-positive PK in this batch AND
+                // already has a live base-table row. The net-positive gate (not
+                // bare committedness) matches the distributed `existing_pks`: a PK
+                // carrying both a +1 and a -1 (net ≤ 0) has an order-dependent
+                // surviving state under enforce_unique_pk, so both validators
+                // decline to treat it as an upsert. The membership test
+                // short-circuits before the committed probe, so a non-upserted PK
+                // pays no seek.
+                let is_upsert = if !entry.unique_pk
+                    || !upserted_pks.contains(batch.get_pk_bytes(row))
+                {
                     false
                 } else if wide {
                     let row_pk_bytes = batch.get_pk_bytes(row);
@@ -216,18 +309,7 @@ impl CatalogEngine {
                     entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
                 };
 
-                // Decode the indexed PK column OPK→native. `get_pk` is the
-                // OPK-widened value, which `index_opk_prefix` below would
-                // re-OPK-encode — wrong for a signed single PK (double sign flip).
-                // `pk_native_key` is correct for all widths and equals `get_pk`
-                // for unsigned single PKs.
-                let key_u128 = if is_pk_col {
-                    pk_native_key(
-                        batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
-                } else {
-                    let col_data = batch.col_data(payload_col);
-                    payload_native_key(col_data, row * col_size, col_size, col_type)
-                };
+                let key_u128 = key_at(row);
 
                 if !seen.insert(key_u128) {
                     return Err(self.unique_violation_err(table_id, source_col_idx, true));
@@ -243,16 +325,22 @@ impl CatalogEngine {
                 }
                 let pk_bytes = cursor.cursor.current_pk_bytes();
 
-                // Is the existing index entry the SAME source row (whose old
-                // entry enforce_unique_pk retracts under an UPSERT)? Compare the
-                // full source PK by raw bytes; at any width truncating to 16
-                // bytes would misread two wide PKs sharing a 16-byte prefix as
-                // the same row.
+                // The committed holder's full source PK. Slice by raw bytes; at
+                // any width truncating to 16 bytes would misread two wide PKs
+                // sharing a 16-byte prefix as the same row.
                 debug_assert!(pk_bytes.len() >= idx_key_size + src_pk_stride);
                 let existing_src_pk = &pk_bytes[idx_key_size..idx_key_size + src_pk_stride];
-                let matches_existing = existing_src_pk == batch.get_pk_bytes(row);
 
-                if is_upsert && matches_existing { continue; }
+                // `seen` already barred two live rows sharing this value. Exempt
+                // the committed collision only when the holder releases the value
+                // in this batch: it explicitly retracts (PK, value) here, or — on
+                // a unique_pk table and only when this row is itself an upsert —
+                // the holder is also an upserted PK, so enforce_unique_pk frees
+                // the value at apply. The `upserted_pks` membership test subsumes
+                // the same-PK upsert case (the row's own PK is a positive PK).
+                if retracted.contains(
+                    &(PkBuf::from_bytes(existing_src_pk), key_u128)) { continue; }
+                if is_upsert && upserted_pks.contains(existing_src_pk) { continue; }
 
                 return Err(self.unique_violation_err(table_id, source_col_idx, false));
             }

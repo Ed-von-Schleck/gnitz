@@ -95,9 +95,16 @@ enum P2Label {
         /// Byte width of the index table's PK (the indexed column). Used to
         /// look up the index key in the `HashSet<PkBuf>` result set.
         idx_pk_stride: u8,
-        /// (index-column key, row PK). The index column is always ≤ 16
-        /// bytes (→ `u128`); the row PK is byte-form to support wide PKs.
-        upsert_keys: Vec<(u128, PkBuf)>,
+        /// (index value, is_upsert) per pending verify. `is_upsert` is true only
+        /// for a genuine upsert target (net-positive committed PK); it gates the
+        /// implicit exemption so a fresh-PK row routed here by `retracted_vals`
+        /// cannot ride a holder's implicit retraction.
+        upsert_keys: Vec<(u128, bool)>,
+        /// (source PK, value) pairs retracted in this batch (value in the same
+        /// key space as `upsert_keys`). At the verify a different holder is exempt
+        /// only when it is retracting the value here; combined with the holder
+        /// being an upserted PK (`existing_pks`), this also admits a bulk shift.
+        retracted_pairs: FxHashSet<(PkBuf, u128)>,
     },
     /// UPDATE retired a referenced UNIQUE value that is still present in a
     /// child index: a non-empty result set is a RESTRICT violation.
@@ -1943,6 +1950,12 @@ impl MasterDispatcher {
         let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p2_labels: Vec<P2Label> = Vec::new();
 
+        // Index-independent; computed once. `retracted_vals` allocation is reused
+        // across indices (`retracted_pairs` is moved into the label below, so it
+        // is rebuilt each index).
+        let has_retractions = (0..batch.count).any(|i| batch.get_weight(i) < 0);
+        let mut retracted_vals: FxHashSet<u128> = FxHashSet::default();
+
         for ci in 0..n_circuits {
             let (col_idx, type_code, idx_schema) = unsafe {
                 let disp = &mut *disp_ptr;
@@ -1971,11 +1984,55 @@ impl MasterDispatcher {
                 source_schema.pk_byte_offset(source_col) as usize
             } else { 0 };
 
-            // Index-column key is always ≤ 16 bytes → u128. Row PK is byte-form
-            // (PkBuf) to support wide PKs.
-            let mut upsert_keys: Vec<(u128, PkBuf)> = Vec::new();
-            let mut check_keys: Vec<u128> = Vec::new();
-            let mut seen: FxHashSet<u128> = FxHashSet::default();
+            // Decode the indexed column to its canonical u128 key. `get_pk` yields
+            // the OPK-widened value (sign-flipped for signed), which the downstream
+            // `index_opk_prefix` would re-OPK-encode — seeking the wrong key for a
+            // signed single PK. `pk_native_key` is correct for every width/signedness
+            // and equals `get_pk` for unsigned singles; a payload column reads from
+            // `col_data`.
+            let key_at = |i: usize| -> u128 {
+                if is_pk_col {
+                    pk_native_key(batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
+                } else {
+                    payload_native_key(
+                        batch.col_data(src_payload_idx), i * col_size, col_size, type_code)
+                }
+            };
+
+            // Index-column key is always ≤ 16 bytes → u128. `upsert_keys` carries
+            // the row's own `is_upsert` flag (the row PK is no longer read at the
+            // verify). `check_keys`/`seen` take every positive row on a pure
+            // INSERT — size them to `batch.count` to skip growth reallocs on the
+            // hot path; `upsert_keys` stays `Vec::new()` (empty on an insert-only
+            // batch).
+            let mut upsert_keys: Vec<(u128, bool)> = Vec::new();
+            let mut check_keys: Vec<u128> = Vec::with_capacity(batch.count);
+            let mut seen: FxHashSet<u128> =
+                FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+
+            // `retracted_vals` routes a fresh-PK insertion of a retracted value
+            // into the verify path (where the holder is discovered);
+            // `retracted_pairs` carries the precise `(holder PK, value)` check into
+            // it. `retracted_pairs` is moved into the label below (so it is rebuilt
+            // per index), and is sized only when the batch actually retracts.
+            retracted_vals.clear();
+            let mut retracted_pairs: FxHashSet<(PkBuf, u128)> = if has_retractions {
+                FxHashSet::with_capacity_and_hasher(batch.count, Default::default())
+            } else {
+                FxHashSet::default()
+            };
+            if has_retractions {
+                for i in 0..batch.count {
+                    if batch.get_weight(i) >= 0 { continue; }
+                    if !is_pk_col {
+                        let null_word = batch.get_null_word(i);
+                        if null_word & (1u64 << src_payload_idx) != 0 { continue; }
+                    }
+                    let key = key_at(i);
+                    retracted_vals.insert(key);
+                    retracted_pairs.insert((PkBuf::from_bytes(batch.get_pk_bytes(i)), key));
+                }
+            }
 
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
@@ -1985,18 +2042,7 @@ impl MasterDispatcher {
                     if null_word & (1u64 << src_payload_idx) != 0 { continue; }
                 }
 
-                // Decode the indexed PK column OPK→native. `get_pk` yields the
-                // OPK-widened value (sign-flipped for signed), which the
-                // downstream `index_opk_prefix` would re-OPK-encode — seeking the
-                // wrong key for a signed single PK. `pk_native_key` is correct for
-                // every width/signedness and equals `get_pk` for unsigned singles.
-                let key = if is_pk_col {
-                    pk_native_key(
-                        batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
-                } else {
-                    let col_data = batch.col_data(src_payload_idx);
-                    payload_native_key(col_data, i * col_size, col_size, type_code)
-                };
+                let key = key_at(i);
 
                 // In-batch duplicate detection runs for ALL positive-weight
                 // rows, INCLUDING UPSERTs: two rows setting the same new unique
@@ -2008,9 +2054,19 @@ impl MasterDispatcher {
                     });
                 }
 
-                // Zero-copy lookup via Borrow<[u8]>.
-                if existing_pks.contains(batch.get_pk_bytes(i)) {
-                    upsert_keys.push((key, PkBuf::from_bytes(batch.get_pk_bytes(i))));
+                // UPSERT (committed PK on a unique_pk table — enforce_unique_pk
+                // retracts the old row at apply) OR a fresh insertion whose value
+                // is explicitly retracted in this batch (transfer onto a fresh PK):
+                // both need per-holder verification. On a non-unique_pk table an
+                // existing PK is NOT an upsert (no enforce_unique_pk), so it must
+                // take the broadcast path where any committed hit is a violation.
+                let is_upsert = unique_pk && existing_pks.contains(batch.get_pk_bytes(i));
+                if is_upsert || retracted_vals.contains(&key) {
+                    // Carry the row's own `is_upsert`: a fresh-PK row routed here by
+                    // a value in `retracted_vals` must get only the
+                    // explicit-retraction exemption at the verify, never the
+                    // implicit one.
+                    upsert_keys.push((key, is_upsert));
                     continue;
                 }
                 check_keys.push(key);
@@ -2043,7 +2099,8 @@ impl MasterDispatcher {
                 let idx_key_type = idx_schema.columns[0].type_code;
                 let idx_key_size = idx_schema.columns[0].size() as usize;
                 p2_labels.push(P2Label::Upsert {
-                    col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride, upsert_keys,
+                    col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride,
+                    upsert_keys, retracted_pairs,
                 });
                 p2_checks.push(PipelinedCheck {
                     target_id,
@@ -2099,14 +2156,18 @@ impl MasterDispatcher {
                         ));
                     }
                 }
-                P2Label::Upsert { col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride, upsert_keys } => {
+                P2Label::Upsert { col_idx, source_col, idx_key_type, idx_key_size,
+                                  idx_pk_stride, upsert_keys, retracted_pairs } => {
                     // Fan out all seeks before collecting: sal_excl is released
                     // before each reply wait, so the seek futures run
                     // concurrently rather than serializing one RTT per key.
                     let occupied = &p2_results[idx];
-                    let mut pk_is: Vec<PkBuf> = Vec::new();
+                    // Each pending entry carries the index value and the row's own
+                    // `is_upsert` flag; the row PK no longer participates (the
+                    // same-PK case is subsumed by `existing_pks.contains(found_pk)`).
+                    let mut pending: Vec<(u128, bool)> = Vec::new();
                     let mut futs = Vec::new();
-                    for &(key_pk, pk_i) in upsert_keys {
+                    for &(key_pk, is_upsert) in upsert_keys {
                         // occupied holds index-table PKs as the probe wrote them:
                         // index_opk_prefix(native key) ++ zero suffix — i.e. OPK
                         // bytes, not native LE. Reproduce that encoding exactly
@@ -2115,14 +2176,14 @@ impl MasterDispatcher {
                         // wide index PKs).
                         let buf = crate::schema::index_opk_prefix(key_pk, *idx_key_type, *idx_key_size);
                         if !occupied.contains(&buf[..*idx_pk_stride as usize]) { continue; }
-                        pk_is.push(pk_i);
+                        pending.push((key_pk, is_upsert));
                         // async fn futures are !Unpin; box-pin for join_all_unpin.
                         futs.push(Box::pin(Self::fan_out_seek_by_index_async(
                             disp_ptr, reactor, sal_excl, target_id, *col_idx, key_pk,
                         )));
                     }
                     let slots = crate::runtime::reactor::join_all_unpin(futs).await;
-                    for (pk_i, slot_result) in pk_is.into_iter().zip(slots) {
+                    for ((key_pk, is_upsert), slot_result) in pending.into_iter().zip(slots) {
                         let slot = slot_result?;
                         let ctrl = peek_control_block(slot.bytes())
                             .map_err(|e| e.to_string())?;
@@ -2131,10 +2192,31 @@ impl MasterDispatcher {
                                 slot.bytes(), ctrl.block_size, ctrl, None,
                             ).map_err(|e| e.to_string())?;
                             if let Some(ref found) = zc.data_batch {
-                                if found.count > 0 && found.get_pk_bytes(0) != pk_i.pk_bytes() {
-                                    return Err(unsafe {
-                                        (*disp_ptr).unique_violation_err(target_id, *source_col, false)
-                                    });
+                                if found.count > 0 {
+                                    let found_pk = found.get_pk_bytes(0);
+                                    // The committed holder is acceptable only if it
+                                    // releases this value in this batch. Implicit
+                                    // release (holder is itself an upserted PK, so
+                                    // enforce_unique_pk retracts its committed row —
+                                    // covers a same-PK re-upsert and a bulk shift)
+                                    // applies ONLY when the colliding row is also an
+                                    // upsert: `is_upsert` implies `unique_pk &&
+                                    // existing_pks.contains(row_pk)`. A fresh-PK row
+                                    // routed here by `retracted_vals` has
+                                    // is_upsert=false, so it cannot ride the holder's
+                                    // implicit retraction and land a second live
+                                    // holder. Explicit release (holder retracts this
+                                    // exact (PK, value) pair) needs no such gate and
+                                    // admits a transfer onto a fresh PK. `seen`
+                                    // already barred two live rows sharing the value.
+                                    let exempt = (is_upsert && existing_pks.contains(found_pk))
+                                        || retracted_pairs.contains(
+                                            &(PkBuf::from_bytes(found_pk), key_pk));
+                                    if !exempt {
+                                        return Err(unsafe {
+                                            (*disp_ptr).unique_violation_err(target_id, *source_col, false)
+                                        });
+                                    }
                                 }
                             }
                         }

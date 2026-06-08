@@ -1255,3 +1255,167 @@ class TestCreateUniqueIndexValidation:
                 _drop_all(c_ddl, sn,
                           indices=[f"{sn}__t__idx_val"],
                           tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestAtomicUniqueTransfers
+#
+# A single delta batch may rearrange unique values among rows so the post-batch
+# state is unique, even though validation runs pre-apply against committed
+# storage. The distributed validator must accept atomic transfers/swaps/bulk
+# shifts while rejecting genuine and forged-retraction duplicates, and must
+# reject a same-value insert on a non-unique_pk table (which it previously
+# misclassified as a same-PK upsert and silently accepted).
+# ---------------------------------------------------------------------------
+
+class TestAtomicUniqueTransfers:
+    def _raw_table(self, client, sn, cols, unique_pk=True):
+        """Create a raw table named `t` + a SQL unique index on `val`.
+        Returns (tid, schema)."""
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "t", cols, unique_pk=unique_pk)
+        client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+        return tid, schema
+
+    def test_sql_bulk_shift_accepted(self, client):
+        """`UPDATE t SET val = val + 1` on a dense sequence ships one batch of
+        same-PK +1 upserts with no retraction; the holder of each new value is
+        the previous row, itself upserted off it. Must succeed (form 2)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT UNIQUE)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", schema_name=sn)
+            client.execute_sql("UPDATE t SET val = val + 1", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            assert rows == [(1, 2), (2, 3), (3, 4)], rows
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_sql_bulk_swap_accepted(self, client):
+        """`UPDATE t SET val = 3 - val` swaps two rows' unique values in one batch
+        of same-PK +1 upserts. Must succeed (form 2)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT UNIQUE)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 2)", schema_name=sn)
+            client.execute_sql("UPDATE t SET val = 3 - val", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            assert rows == [(1, 2), (2, 1)], rows
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_raw_transfer_accepted(self, client):
+        """One batch {retract P1/5, insert P2/5} moves a unique value to a fresh
+        PK; the committed holder P1 releases it via explicit retraction. Must
+        succeed (form 1)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=5)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=5, weight=-1)
+            b.append(pk=2, val=5, weight=1)
+            client.push(tid, b)  # must succeed
+            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            assert rows == [(2, 5)], rows
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_raw_genuine_duplicate_rejected(self, client):
+        """A fresh-PK insertion of a still-held value with no retraction freeing
+        it is a genuine duplicate — rejected."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=5)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=3, val=5, weight=1)  # no retraction frees val=5
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_raw_forged_retraction_rejected(self, client):
+        """The exemption keys on (holder PK, value): a retraction naming a
+        non-holder must not let a real duplicate through."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=5)  # only pk=1 holds 5
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=3, val=5, weight=-1)  # forged: pk=3 does not hold 5
+            b.append(pk=2, val=5, weight=1)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_raw_forged_retraction_freed_by_upserted_holder_rejected(self, client):
+        """`{P2/7@+1, P4/6@+1, P3/6@-1}` over committed `P2/6`: P4/6 is a fresh
+        insert routed to the verify by 6 ∈ retracted_vals. The holder P2 is
+        upserted (to 7), but P4 is not an upsert (is_upsert gate) and the
+        retraction names P3, so neither exemption fires — rejected."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=2, val=6)  # committed holder of 6
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=2, val=7, weight=1)   # P2 upserted off 6
+            b.append(pk=4, val=6, weight=1)   # fresh insert of 6
+            b.append(pk=3, val=6, weight=-1)  # forged retraction names P3
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_non_unique_pk_same_value_rejected(self, client):
+        """A second live row at an already-held PK and value on a non-unique_pk
+        table must be rejected (form 3); the distributed validator previously
+        misclassified it as a same-PK upsert and committed two live holders."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("id", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+                    gnitz.ColumnDef("data", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols, unique_pk=False)
+            b = gnitz.ZSetBatch(schema)
+            b.append(id=1, val=5, data=100)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(id=1, val=5, data=200, weight=1)  # second live row at val=5
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])

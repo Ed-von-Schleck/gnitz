@@ -309,6 +309,295 @@ fn test_validate_unique_indices_distinct_values_ok() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── atomic transfer / swap / bulk-shift validation tests ─────────────────
+//
+// A single delta batch may rearrange unique values among rows so the
+// post-batch state is unique, even though validation runs pre-apply against
+// committed storage. These lock in the exemption rule: a committed collision is
+// exempt only when the holder releases the value in this batch (explicit
+// retraction of its (PK, value), or — on a unique_pk table, for an upsert row —
+// the holder being itself an upserted PK).
+
+#[test]
+fn test_validate_unique_transfer_accepted() {
+    let dir = temp_dir("catalog_uidx_transfer");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap(); // non-unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P1/val=5.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Transfer val=5 from P1 to P2 in one batch: {retract P1/5, insert P2/5}.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, -1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_ok(), "transfer should be accepted: {:?}", result);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_swap_accepted() {
+    let dir = temp_dir("catalog_uidx_swap");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P1/val=5, P2/val=6.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(6); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Explicit swap: retract both, re-insert crossed.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, -1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, -1); bb.put_u64(6); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(6); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_ok(), "swap should be accepted: {:?}", result);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_bulk_shift_accepted() {
+    let dir = temp_dir("catalog_uidx_bulk_shift");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed dense sequence: (1,1),(2,2),(3,3).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(1); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(2); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(3); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // `UPDATE t SET val = val + 1`: same-PK +1 upserts, no retraction. The holder
+    // of each new value is the previous row, itself upserted off that value.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(2); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(3); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(4); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_ok(), "bulk shift should be accepted: {:?}", result);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_bulk_swap_accepted() {
+    let dir = temp_dir("catalog_uidx_bulk_swap");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: (1,1),(2,2).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(1); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(2); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // `UPDATE t SET val = 3 - val`: same-PK +1 upserts swapping the two values.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(2); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(1); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_ok(), "bulk swap should be accepted: {:?}", result);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_genuine_duplicate_rejected() {
+    let dir = temp_dir("catalog_uidx_genuine_dup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P1/val=5.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // P2/val=5 with no retraction freeing 5 → genuine duplicate.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Unique index violation"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_holder_touched_value_not_retracted_rejected() {
+    let dir = temp_dir("catalog_uidx_holder_touched");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap(); // non-unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P1/val=5.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // {P1/val=7, P2/val=5}: P1 is touched but val=5 is NOT retracted, and there is
+    // no enforce_unique_pk on a non-unique_pk table, so P2/5 is a genuine dup.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(7); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Unique index violation"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_forged_retraction_rejected() {
+    let dir = temp_dir("catalog_uidx_forged_retraction");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P1/val=5.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // {retract P3/5, insert P2/5}: the retraction names P3, which does NOT hold
+    // val=5 (P1 does). The exemption keys on (holder PK, value), so it does not
+    // fire and P2/5 is rejected.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(3u128, -1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Unique index violation"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_forged_retraction_freed_by_upserted_holder_rejected() {
+    let dir = temp_dir("catalog_uidx_forged_upserted");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: P2/val=6.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(2u128, 1); bb.put_u64(6); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // {P2/val=7, P4/val=6, retract P3/6}: P4/6 is a FRESH insert (not an upsert)
+    // routed to the verify by 6 ∈ retracted_vals. Holder P2 is upserted (to 7) but
+    // the is_upsert gate withholds the implicit exemption from the fresh P4, and
+    // the retraction names P3 not P2, so neither exemption fires.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(2u128, 1); bb.put_u64(7); bb.end_row();
+    bb.begin_row(4u128, 1); bb.put_u64(6); bb.end_row();
+    bb.begin_row(3u128, -1); bb.put_u64(6); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Unique index violation"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_net_zero_pk_not_upsert_rejected() {
+    let dir = temp_dir("catalog_uidx_net_zero");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Committed: (1,5),(2,6).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(6); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // {P1/val=6, retract P1/5, P2/val=7}: P1 carries both a +1 and a -1 (net 0),
+    // so it is not net-positive and not an upsert. P1/6 then collides with P2's
+    // committed val=6, freed only implicitly — rejected.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(6); bb.end_row();
+    bb.begin_row(1u128, -1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(7); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Unique index violation"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_validate_unique_two_insert_same_value_rejected_despite_retraction() {
+    let dir = temp_dir("catalog_uidx_two_insert_dup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // {retract P9/7, insert P1/5, insert P2/5}: the two +1 rows sharing val=5 trip
+    // the `seen` set before any exemption is consulted.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(9u128, -1); bb.put_u64(7); bb.end_row();
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("duplicate in batch"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── seek_by_index tests ──────────────────────────────────────────
 
 #[test]
