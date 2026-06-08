@@ -99,28 +99,10 @@ impl BatchBuilder {
 
 // ---------------------------------------------------------------------------
 // Identifier validation
+//
+// `FK_INDEX_INFIX` and `validate_user_identifier` live in `gnitz-wire` (shared
+// with the SQL planner) and are re-bound in `catalog/mod.rs`.
 // ---------------------------------------------------------------------------
-
-fn is_valid_ident_char(ch: u8) -> bool {
-    ch.is_ascii_alphanumeric() || ch == b'_'
-}
-
-pub(crate) fn validate_user_identifier(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Identifier cannot be empty".into());
-    }
-    if name.as_bytes()[0] == b'_' {
-        return Err(format!(
-            "User identifiers cannot start with '_' (reserved for system prefix): {}", name
-        ));
-    }
-    for &ch in name.as_bytes() {
-        if !is_valid_ident_char(ch) {
-            return Err(format!("Identifier contains invalid characters: {}", name));
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str, &'a str) {
     if let Some(dot_pos) = name.find('.') {
@@ -179,11 +161,6 @@ pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
     SchemaDescriptor::new(&[u64c, u64c], &[0])   // [col_idx (PK), is_unique]
 }
 pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"col_idx", b"is_unique"];
-
-/// Infix that marks an index as an internal FK-backing index. The single
-/// source of truth for both name construction and the DROP INDEX integrity
-/// guard that protects these indices.
-pub(crate) const FK_INDEX_INFIX: &str = "__fk_";
 
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
     format!("{}__{}{}{}", schema_name, table_name, FK_INDEX_INFIX, col_name)

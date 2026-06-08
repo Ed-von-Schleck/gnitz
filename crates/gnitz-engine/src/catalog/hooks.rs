@@ -385,11 +385,21 @@ impl CatalogEngine {
                     self.next_index_id = idx_id + 1;
                 }
 
-                // Use dag presence check since apply_index_by_name may have already fired
-                let already_registered = self.dag.tables.get(&owner_id)
-                    .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
-                    .unwrap_or(false);
-                if already_registered { continue; }
+                // One circuit per column (dedup by col_idx). If an incumbent
+                // exists, don't build a second table — but a UNIQUE newcomer over
+                // a non-unique incumbent must promote it. Promotion is
+                // order-independent (the circuit is unique iff ANY index on the
+                // column is unique), so replay reconstructs an identical result
+                // regardless of index_id ordering.
+                let incumbent_unique = self.dag.tables.get(&owner_id)
+                    .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == source_col_idx))
+                    .map(|ic| ic.is_unique);
+                if let Some(was_unique) = incumbent_unique {
+                    if is_unique && !was_unique {
+                        self.promote_index_to_unique(owner_id, source_col_idx)?;
+                    }
+                    continue;
+                }
 
                 let entry = self.dag.tables.get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
@@ -419,23 +429,52 @@ impl CatalogEngine {
                 if !self.in_rollback {
                     self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
                 }
-                self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
+                self.dag.add_index_circuit(owner_id, source_col_idx, idx_id, idx_table_box, idx_schema, is_unique);
 
                 // Only truncate after all fallible steps succeed.
                 self.pending_dir_deletions.truncate(cleanup_idx);
             } else {
-                let is_registered = self.dag.tables.get(&owner_id)
-                    .map(|e| e.index_circuits.iter().any(|ic| ic.col_idx == source_col_idx))
-                    .unwrap_or(false);
-                if is_registered {
-                    let owner_dir = self.dag.tables.get(&owner_id)
-                        .map(|e| e.directory.clone()).unwrap_or_default();
+                // DROP INDEX: determine what remains for this column in sys_indices
+                // (the -1 row has already been applied to sys_indices by
+                // ingest_to_family before fire_hooks runs, so its net weight is 0
+                // and the scan skips it).
+                let (has_any, remains_unique) =
+                    self.check_remaining_index_uniqueness(owner_id, source_col_idx);
+                if has_any {
+                    // Another index (e.g. the FK auto-index) still covers this
+                    // column. Demote the circuit rather than destroying it.
+                    self.dag.set_index_circuit_uniqueness(owner_id, source_col_idx, remains_unique);
+                } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id)
+                    .and_then(|e| e.index_circuits.iter()
+                        .find(|ic| ic.col_idx == source_col_idx)
+                        .map(|ic| (e.directory.clone(), ic.index_id)))
+                {
+                    // No index remains on the column — drop the circuit. Use the
+                    // creating index_id for the directory path, not the dropped
+                    // index_id: when a second index promoted an incumbent circuit,
+                    // the real directory on disk carries the first registrant's id.
                     self.dag.remove_index_circuit(owner_id, source_col_idx);
-                    self.pending_dir_deletions.push(index_dir(&owner_dir, idx_id));
+                    self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
                 }
             }
         }
         Ok(())
+    }
+
+    /// Scan sys_indices (after the -1 retraction has already been applied by
+    /// ingest_to_family before fire_hooks runs) to find any remaining index rows
+    /// on `owner_id` / `col_idx`. Returns `(has_any, remains_unique)` to drive
+    /// circuit demotion or deletion in `hook_index_register`'s retraction branch.
+    fn check_remaining_index_uniqueness(
+        &self, owner_id: i64, col_idx: u32,
+    ) -> (bool, bool) {
+        let mut has_any = false;
+        let mut remains_unique = false;
+        self.for_each_index_on_column(owner_id, col_idx as usize, |_row_id, is_uniq| {
+            has_any = true;
+            remains_unique |= is_uniq;
+        });
+        (has_any, remains_unique)
     }
 
     fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {

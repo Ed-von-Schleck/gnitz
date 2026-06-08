@@ -223,6 +223,23 @@ fn reject_duplicate_column_names<'a>(
     Ok(())
 }
 
+/// Validate a user-supplied name destined to become an index name — a CREATE
+/// INDEX name or a UNIQUE/constraint name that maps to a secondary index.
+/// Beyond the general identifier rules, the reserved `__fk_` infix is rejected:
+/// such a name would collide with internal FK-backing index names and persist as
+/// undroppable (`drop_index` refuses it). The infix check is scoped here rather
+/// than in `validate_user_identifier`, which also guards table/column/schema
+/// names that may legitimately contain `__fk_`.
+fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
+    gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)?;
+    if name.contains(gnitz_core::FK_INDEX_INFIX) {
+        return Err(GnitzSqlError::Plan(format!(
+            "Index/constraint names cannot contain the reserved '{}' infix",
+            gnitz_core::FK_INDEX_INFIX)));
+    }
+    Ok(())
+}
+
 fn execute_create_table(
     client:      &mut GnitzClient,
     schema_name: &str,
@@ -259,6 +276,11 @@ fn execute_create_table(
     //     before the engine catalog reports the same.
     let mut pk_indices: Vec<u32> = Vec::new();
     let mut pk_decl_seen = false;
+    // Columns carrying a UNIQUE constraint, paired with the user-specified
+    // constraint name (if any). Column-level `UNIQUE` carries no name, so it is
+    // always collected with `None`; only table-level `CONSTRAINT <name>
+    // UNIQUE(col)` supplies one.
+    let mut unique_cols: Vec<(u32, Option<String>)> = Vec::new();
 
     // Table-level PRIMARY KEY (...). Done before the inline pass so an
     // unknown column name produces a Bind error rather than being eclipsed
@@ -285,17 +307,26 @@ fn execute_create_table(
         }
     }
 
-    // Phase 3 — inline column PRIMARY KEY + FOREIGN KEY.
+    // Phase 3a — gather all inline column-level PRIMARY KEYs first, so that
+    // `pk_indices` is fully populated before any FK is resolved. A
+    // self-referencing FK declared before its inline PK column would otherwise
+    // see an empty `pk_indices` and fail spuriously.
+    for (i, col) in sql_cols.iter().enumerate() {
+        for opt in &col.options {
+            if let ColumnOption::Unique { is_primary: true, .. } = &opt.option {
+                if pk_decl_seen {
+                    return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+                }
+                pk_decl_seen = true;
+                pk_indices.push(i as u32);
+            }
+        }
+    }
+
+    // Phase 3b — resolve inline FOREIGN KEYs and collect column-level UNIQUE.
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
             match &opt.option {
-                ColumnOption::Unique { is_primary: true, .. } => {
-                    if pk_decl_seen {
-                        return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
-                    }
-                    pk_decl_seen = true;
-                    pk_indices.push(i as u32);
-                }
                 ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
                     let (tid, idx, parent_pk_type) = resolve_fk_target(
                         client, schema_name, foreign_table, referred_columns, cols[i].type_code,
@@ -304,6 +335,11 @@ fn execute_create_table(
                     cols[i].fk_table_id = tid;
                     cols[i].fk_col_idx  = idx;
                     cols[i].type_code   = parent_pk_type;
+                }
+                ColumnOption::Unique { is_primary: false, .. }
+                    if !unique_cols.iter().any(|(c, _)| *c == i as u32) =>
+                {
+                    unique_cols.push((i as u32, None));
                 }
                 _ => {}
             }
@@ -331,6 +367,35 @@ fn execute_create_table(
             cols[col_idx].fk_table_id = tid;
             cols[col_idx].fk_col_idx  = idx;
             cols[col_idx].type_code   = parent_pk_type;
+        }
+    }
+
+    // Phase 5 — table-level UNIQUE constraints (single-column only). The engine
+    // has no composite secondary index and `create_index` is single-column, so
+    // multi-column UNIQUE is rejected rather than silently dropped.
+    for constraint in &create.constraints {
+        if let TableConstraint::Unique { name: name_ident, columns, .. } = constraint {
+            if columns.is_empty() {
+                return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
+            }
+            if columns.len() != 1 {
+                return Err(GnitzSqlError::Unsupported(
+                    "multi-column UNIQUE constraints are not supported".into()));
+            }
+            let col_name = &columns[0].value;
+            let idx = cols.iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "UNIQUE column '{}' not found in table definition", col_name)))?;
+            if unique_cols.iter().any(|(c, _)| *c == idx as u32) {
+                return Err(GnitzSqlError::Plan(format!(
+                    "duplicate UNIQUE constraint on column '{}'", col_name)));
+            }
+            let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
+            if let Some(ref name) = constraint_name {
+                validate_user_index_name(name)?;
+            }
+            unique_cols.push((idx as u32, constraint_name));
         }
     }
 
@@ -383,8 +448,47 @@ fn execute_create_table(
         cols[i as usize].is_nullable = false;
     }
 
+    // A lone-PK column is already unique; drop a redundant secondary unique
+    // index on it. A compound-PK member declared UNIQUE is NOT individually
+    // unique, so a UNIQUE on it is meaningful and is kept (the engine supports
+    // unique indices on PK columns).
+    let lone_pk = (pk_indices.len() == 1).then(|| pk_indices[0]);
+    unique_cols.retain(|(c, _)| Some(*c) != lone_pk);
+
+    // Pre-validate index-eligibility BEFORE create_table: DDL is not
+    // transactional, so a type error after the table is created would leave an
+    // orphan table. `is_pk_eligible` is the exact index-eligible allow-list, so
+    // this one gate covers every rejected type. A UNIQUE+FK column always
+    // passes — its type was rewritten to the parent's (integer) PK type above.
+    for (c, _) in &unique_cols {
+        let tc = cols[*c as usize].type_code;
+        if !tc.is_pk_eligible() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "UNIQUE column '{}' of type {:?} is not supported \
+                 (UNIQUE requires a fixed-width integer, U128, or UUID column; \
+                 String, Blob, and float columns cannot carry a UNIQUE index)",
+                cols[*c as usize].name, tc)));
+        }
+    }
+
     let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true)
         .map_err(GnitzSqlError::Exec)?;
+
+    // Unique secondary indices: created after the table exists (create_index
+    // requires the table id). Types were pre-validated, and the base table is
+    // empty, so create_index here cannot fail on a bad type or duplicate data —
+    // only on transport-level errors. On failure, best-effort drop_table to
+    // avoid an orphaned table with missing constraints (DDL is not
+    // transactional across the create_table / create_index boundary).
+    for (c, constraint_name) in &unique_cols {
+        if let Err(e) = client.create_index(
+            schema_name, &table_name, &cols[*c as usize].name, true,
+            constraint_name.as_deref(),
+        ) {
+            let _ = client.drop_table(schema_name, &table_name);
+            return Err(GnitzSqlError::Exec(e));
+        }
+    }
 
     Ok(SqlResult::TableCreated { table_id: tid })
 }
@@ -674,6 +778,16 @@ fn execute_create_index(
 ) -> Result<SqlResult, GnitzSqlError> {
     let table_name = extract_name(&ci.table_name, "CREATE INDEX")?;
 
+    // A user-supplied index name flows through to the IDX_TAB row so
+    // `DROP INDEX <name>` resolves it. Validate it before anything else: a
+    // malformed or `__fk_`-infixed name would persist and be undroppable.
+    let explicit_name = ci.name.as_ref()
+        .map(|n| extract_name(n, "CREATE INDEX"))
+        .transpose()?;
+    if let Some(ref name) = explicit_name {
+        validate_user_index_name(name)?;
+    }
+
     if ci.columns.len() != 1 {
         return Err(GnitzSqlError::Unsupported(
             "CREATE INDEX: only single-column indices supported".to_string()
@@ -687,8 +801,9 @@ fn execute_create_index(
     };
     let is_unique = ci.unique;
 
-    let index_id = client.create_index(schema_name, &table_name, &col_name, is_unique)
-        .map_err(GnitzSqlError::Exec)?;
+    let index_id = client.create_index(
+        schema_name, &table_name, &col_name, is_unique, explicit_name.as_deref(),
+    ).map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::IndexCreated { index_id })
 }
@@ -1139,6 +1254,17 @@ fn execute_create_join_view(
     // The view's physical PK is the k synthetic `_join_pk` columns at slots 0..k
     // (final_cols lists them first). At k = 1 this is the existing single `[0]`.
     let view_pk: Vec<u32> = (0..k as u32).collect();
+    // Reject duplicate output names from explicit user aliases (e.g.
+    // `SELECT l.a AS x, r.b AS x`). A `SELECT *` join legitimately surfaces
+    // same-named columns from both sides (both tables' `id`); that is the
+    // established wildcard contract, so the guard applies only to explicit
+    // projections.
+    if !is_wildcard {
+        reject_duplicate_column_names(
+            final_cols.iter().map(|c| c.name.as_str()),
+            "join view",
+        )?;
+    }
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
@@ -1807,7 +1933,13 @@ fn execute_create_group_by_view(
                     post_map_eb.copy_col(tc as u32, agg_col, payload_idx);
                     out_cols.push(ColumnDef {
                         name: m.output_name.clone(), type_code: m.output_type,
-                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+                        // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
+                        // the null bit when the accumulator is_zero(), since it skips
+                        // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
+                        // (0, never NULL). Match emit.rs so a schema-driven decoder
+                        // reads NULL instead of raw zero bytes.
+                        is_nullable: matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
+                        fk_table_id: 0, fk_col_idx: 0,
                     });
                     payload_idx += 1;
                 }
@@ -2380,6 +2512,10 @@ fn execute_create_set_op_view(
         };
         out_cols_final.push(col);
     }
+    reject_duplicate_column_names(
+        out_cols_final.iter().map(|c| c.name.as_str()),
+        "set operation view",
+    )?;
 
     // Set-op views emit a synthetic single-column content-hash PK at slot 0.
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final, &[0])
@@ -2443,6 +2579,10 @@ fn execute_create_distinct_view(
         name: "_distinct_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
     out_cols.extend(proj_cols);
+    reject_duplicate_column_names(
+        out_cols.iter().map(|c| c.name.as_str()),
+        "SELECT DISTINCT view",
+    )?;
 
     // DISTINCT views emit a synthetic single-column content-hash PK at slot 0.
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &[0])

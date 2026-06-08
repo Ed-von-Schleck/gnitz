@@ -394,3 +394,72 @@ fn test_group_by_float_key_rejected() {
     p.execute("CREATE VIEW vi AS SELECT g, COUNT(*) AS n FROM u GROUP BY g").unwrap();
     p.execute("CREATE VIEW vs AS SELECT s, COUNT(*) AS n FROM u GROUP BY s").unwrap();
 }
+
+// ── Aggregate output-column nullability (SUM/MIN/MAX vs COUNT) ────────
+//
+// emit.rs sets the null bit on a direct aggregate output when the accumulator
+// is_zero() (an all-NULL group), so SUM/MIN/MAX can emit NULL while COUNT /
+// COUNT_NON_NULL always emit an integer. The view schema's nullability must
+// match, or a schema-driven decoder reads raw zero bytes as a live value.
+
+#[test]
+fn test_aggregate_output_nullability_schema() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE agg_t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, x BIGINT)"
+        ).unwrap();
+        p.execute(
+            "CREATE VIEW agg_v AS SELECT g, SUM(x) AS sx, MIN(x) AS mnx, MAX(x) AS mxx, \
+             COUNT(x) AS cx, COUNT(*) AS ca FROM agg_t GROUP BY g"
+        ).unwrap();
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "agg_v").unwrap();
+    let nullable = |name: &str| {
+        s.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)).unwrap().is_nullable
+    };
+    assert!(nullable("sx"),  "SUM output must be nullable");
+    assert!(nullable("mnx"), "MIN output must be nullable");
+    assert!(nullable("mxx"), "MAX output must be nullable");
+    assert!(!nullable("cx"), "COUNT(x) output must be non-nullable");
+    assert!(!nullable("ca"), "COUNT(*) output must be non-nullable");
+}
+
+#[test]
+fn test_aggregate_all_null_group_emits_null() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // g UNSIGNED NOT NULL → natural-PK path (g is the lone PK at slot 0).
+        p.execute(
+            "CREATE TABLE an_t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, x BIGINT)"
+        ).unwrap();
+        // COUNT(*) keeps the group alive even though every x is NULL — without a
+        // count-of-rows aggregate a from-inception all-NULL group is suppressed.
+        p.execute(
+            "CREATE VIEW an_v AS SELECT g, SUM(x) AS sx, MIN(x) AS mnx, MAX(x) AS mxx, \
+             COUNT(x) AS cx, COUNT(*) AS ca FROM an_t GROUP BY g"
+        ).unwrap();
+        // One group (g=5) whose only rows have x = NULL.
+        p.execute("INSERT INTO an_t (id, g, x) VALUES (1, 5, NULL)").unwrap();
+        p.execute("INSERT INTO an_t (id, g, x) VALUES (2, 5, NULL)").unwrap();
+    }
+    let (schema, batch) = read_view(&mut client, &sn, "an_v");
+    assert_eq!(batch.len(), 1, "the group is kept alive by COUNT(*)");
+    let pk = schema.pk_cols.len();
+    let cx = col_idx(&schema, "cx");
+    let ca = col_idx(&schema, "ca");
+    // SUM/MIN/MAX over an all-NULL group read as NULL — the schema marks these
+    // columns nullable (§8), so a decoder surfaces NULL rather than zero bytes.
+    assert!(is_null_at(&batch, col_idx(&schema, "sx") - pk, 0), "SUM of all-NULL group must be NULL");
+    assert!(is_null_at(&batch, col_idx(&schema, "mnx") - pk, 0), "MIN of all-NULL group must be NULL");
+    assert!(is_null_at(&batch, col_idx(&schema, "mxx") - pk, 0), "MAX of all-NULL group must be NULL");
+    // COUNT columns decode to integers: COUNT(x)=0, COUNT(*)=2. (emit.rs sets the
+    // raw null bit on a zero COUNT_NON_NULL accumulator, but the schema marks
+    // COUNT non-nullable so the zero bytes decode as the correct count of 0.)
+    assert_eq!(i64_at(&batch, cx, 0), 0, "COUNT(x) of all-NULL group must decode to 0");
+    assert_eq!(i64_at(&batch, ca, 0), 2, "COUNT(*) must count both rows");
+}

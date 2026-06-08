@@ -160,3 +160,19 @@ fn test_select_distinct_float_column_rejected() {
     // A non-float DISTINCT still succeeds.
     p.execute("CREATE VIEW v3 AS SELECT DISTINCT g FROM t").unwrap();
 }
+
+// ── Duplicate output column names rejected (DISTINCT view) ────────────
+
+#[test]
+fn test_distinct_duplicate_output_columns_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE di_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v_di_dup AS SELECT DISTINCT a AS x, b AS x FROM di_dup"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}

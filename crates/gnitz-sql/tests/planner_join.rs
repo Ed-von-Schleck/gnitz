@@ -431,3 +431,21 @@ fn test_join_compound_pk_source_update_delete() {
         vec![vec![1, 100, 111, 70]],
         "incremental DELETE drops the removed source row's join output");
 }
+
+// ── Duplicate output column names rejected (join view) ────────────────
+
+#[test]
+fn test_join_duplicate_output_columns_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE jl_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE jr_dup (id BIGINT PRIMARY KEY, b BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v_jn_dup AS SELECT jl_dup.a AS x, jr_dup.b AS x \
+         FROM jl_dup JOIN jr_dup ON jl_dup.id = jr_dup.id"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}

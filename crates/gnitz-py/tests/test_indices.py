@@ -519,6 +519,24 @@ class TestIndexIntegrity:
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
 
+    def test_column_unique_constraint_enforced(self, client):
+        """A column-level UNIQUE in CREATE TABLE creates a unique index and
+        rejects duplicate values end-to-end (the silent-discard defect)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, val BIGINT UNIQUE)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO u VALUES (1, 1)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO u VALUES (2, 1)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__u__idx_val"],
+                      tables=["u"])
+
     def test_unique_index_anticorrelated_multi_source(self, client):
         """Unique-constraint check must hold across an anti-correlated,
         multi-source index.

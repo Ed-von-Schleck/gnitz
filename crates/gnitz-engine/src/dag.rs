@@ -231,6 +231,11 @@ impl IndexCircuitEntry {
 /// Owns the index Table via Box — dropping the entry drops the table.
 pub struct IndexCircuitEntry {
     pub col_idx: u32,
+    /// The index_id of the IDX_TAB row that caused Table::new to be called.
+    /// When a second index promotes an incumbent circuit (UNIQUE+FK case), no
+    /// new directory is created; this field identifies the actual on-disk path
+    /// so the retraction branch queues the correct directory for deletion.
+    pub index_id: i64,
     pub index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
     pub is_unique: bool,
@@ -402,6 +407,7 @@ impl DagEngine {
         &mut self,
         table_id: i64,
         col_idx: u32,
+        index_id: i64,
         index_table: Box<Table>,
         index_schema: SchemaDescriptor,
         is_unique: bool,
@@ -409,6 +415,7 @@ impl DagEngine {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             entry.index_circuits.push(IndexCircuitEntry {
                 col_idx,
+                index_id,
                 index_table: UnsafeCell::new(index_table),
                 index_schema,
                 is_unique,
@@ -420,6 +427,20 @@ impl DagEngine {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             // retain() drops non-matching entries, which drops Box<Table> automatically.
             entry.index_circuits.retain(|ic| ic.col_idx != col_idx);
+        }
+    }
+
+    /// Set the uniqueness flag of the index circuit on `col_idx` in place (the
+    /// circuit list is deduped by col_idx, so at most one entry matches).
+    /// Promotion (`true`) folds a UNIQUE index into an existing non-unique
+    /// circuit when both target the same column; demotion (`false`) is used by
+    /// the DROP INDEX retraction path when the UNIQUE index is dropped but
+    /// another index (e.g. an FK auto-index) still covers the column.
+    pub fn set_index_circuit_uniqueness(&mut self, table_id: i64, col_idx: u32, is_unique: bool) {
+        if let Some(entry) = self.tables.get_mut(&table_id) {
+            if let Some(ic) = entry.index_circuits.iter_mut().find(|ic| ic.col_idx == col_idx) {
+                ic.is_unique = is_unique;
+            }
         }
     }
 
@@ -827,10 +848,10 @@ impl DagEngine {
         let effective_batch = if unique_pk {
             if !ptbl_ptr.is_null() {
                 let ptable = unsafe { &mut *ptbl_ptr };
-                self.enforce_unique_pk_partitioned(ptable, &schema, batch)
+                Self::enforce_unique_pk_partitioned(ptable, &schema, batch)
             } else if !tbl_ptr.is_null() {
                 let table = unsafe { &mut *tbl_ptr };
-                self.enforce_unique_pk(table, &schema, batch)
+                Self::enforce_unique_pk(table, &schema, batch)
             } else {
                 batch
             }
@@ -1597,7 +1618,6 @@ impl DagEngine {
     /// for every PK width. Never round-trips through a native `u128` (which
     /// `opk_key` would re-encode, double-flipping the sign bit for signed PKs).
     fn enforce_unique_pk(
-        &self,
         table: &mut Table,
         schema: &SchemaDescriptor,
         batch: Batch,
@@ -1651,7 +1671,6 @@ impl DagEngine {
     /// so the probe would match no stored row and the retraction would be
     /// silently dropped).
     fn enforce_unique_pk_partitioned(
-        &self,
         ptable: &mut PartitionedTable,
         schema: &SchemaDescriptor,
         batch: Batch,
@@ -1902,7 +1921,7 @@ mod tests {
         let tbl = make_test_table("idx_parent");
         dag.register_table(50, StoreHandle::Single(UnsafeCell::new(tbl)), schema, 0, false, String::new());
         let idx_tbl = make_test_table("idx_child");
-        dag.add_index_circuit(50, 2, idx_tbl, schema, false);
+        dag.add_index_circuit(50, 2, 999, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
 
         dag.remove_index_circuit(50, 2);
@@ -1948,7 +1967,7 @@ mod tests {
         let idx_tbl = Box::new(
             Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, true).unwrap(),
         );
-        dag.add_index_circuit(70, 1, idx_tbl, idx_schema, false);
+        dag.add_index_circuit(70, 1, 999, idx_tbl, idx_schema, false);
 
         // Put one row in the index table's memtable.
         {
@@ -2020,8 +2039,7 @@ mod tests {
         del.extend_col(0, &100i64.to_le_bytes());
         del.count += 1;
 
-        let dag = DagEngine::new();
-        let effective = dag.enforce_unique_pk_partitioned(&mut pt, &schema, del);
+        let effective = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, del);
 
         // The store row must have been *found*: the effective batch carries a
         // single net -1 for PK=-5 with the stored payload. (`retract_pk_bytes` is

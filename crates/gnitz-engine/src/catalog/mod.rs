@@ -59,9 +59,10 @@ use sys_tables::*;
 
 // Re-export types needed by other modules.
 pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
-pub(crate) use utils::{BatchBuilder, validate_user_identifier, parse_qualified_name,
+pub(crate) use gnitz_wire::{FK_INDEX_INFIX, validate_user_identifier};
+pub(crate) use utils::{BatchBuilder, parse_qualified_name,
                        index_meta_schema_desc, INDEX_META_COL_NAMES,
-                       make_fk_index_name, FK_INDEX_INFIX, make_secondary_index_name, ingest_batch_into,
+                       make_fk_index_name, make_secondary_index_name, ingest_batch_into,
                        schema_dir, table_dir, view_dir, index_dir,
                        is_index_dir_name, is_table_dir_name, subdir_names,
                        ensure_dir, fsync_dir,

@@ -314,6 +314,13 @@ impl CatalogEngine {
                 undo.end_row();
                 let undo_batch = undo.finish();
                 let _ = self.ingest_to_family_no_broadcast(IDX_TAB_ID, &undo_batch);
+                // The hook pre-staged the index directory into
+                // pending_dir_deletions before Table::new; when backfill_index
+                // fails the circuit is never registered, so the -1 retraction
+                // hook does not queue the directory and it would leak. Drain
+                // here (existence-guarded remove_dir_all; safe even if Table::new
+                // failed before creating the directory).
+                self.drain_pending_dir_deletions();
                 return Err(e);
             }
         }
@@ -421,29 +428,44 @@ impl CatalogEngine {
         if projected.count == 0 { return Ok(()); }
 
         if is_unique {
-            // Compound-PK index layout: index PK is `(indexed_key, src_pk…)`.
-            // Uniqueness applies to the leading `indexed_key` slot only —
-            // two rows differing only in their source-PK suffix represent
-            // two source rows sharing the indexed value. `make_index_schema`
-            // always promotes the leading key to ≤16 bytes, so a u128 dedup
-            // token suffices (zero-padded LE for narrower types).
             let key_size = idx_schema.columns[0].size() as usize;
-            debug_assert!(key_size <= 16,
-                "unique index key size {} exceeds 16-byte dedup buffer", key_size);
-            let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
-            for row in 0..projected.count {
-                if projected.get_weight(row) <= 0 { continue; }
-                let pk_bytes = projected.get_pk_bytes(row);
-                let mut buf = [0u8; 16];
-                buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);
-                if !seen.insert(u128::from_le_bytes(buf)) {
-                    return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
-                }
+            if projected_has_dup_keys(&projected, key_size) {
+                return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
             }
         }
 
         let table = unsafe { &mut *idx_table };
         let _ = table.ingest_owned_batch(projected);
+        Ok(())
+    }
+
+    /// Promote the existing index circuit on `col_idx` to unique, after verifying
+    /// the committed base rows contain no duplicate keys. Used when a UNIQUE index
+    /// registers over a column that already has a circuit (an FK auto-index, or a
+    /// prior non-unique index): the per-column dedup keeps one circuit, so the
+    /// uniqueness is folded into the incumbent — no second index table is built
+    /// (`make_index_schema` does not depend on `is_unique`; uniqueness is the flag
+    /// plus the duplicate check, not a different storage layout). Empty base table
+    /// → pure flag flip. Skips the scan during catalog replay
+    /// (cascade_enabled = false) because data was validated at original write time
+    /// (mirrors the same guard in `hook_cascade_fk`).
+    pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_idx: u32) -> Result<(), String> {
+        if self.caches.cascade_enabled {
+            let owner_schema = self.dag.tables.get(&owner_id).map(|e| e.schema)
+                .ok_or_else(|| format!("Index promote: owner table {} not found", owner_id))?;
+            let key_type = get_index_key_type(owner_schema.columns[col_idx as usize].type_code)?;
+            let idx_schema = make_index_schema(key_type, &owner_schema);
+            let scan = self.scan_store(owner_id, &owner_schema);
+            if scan.count > 0 {
+                let projected = DagEngine::batch_project_index(
+                    &scan, col_idx, &owner_schema, &idx_schema);
+                let key_size = idx_schema.columns[0].size() as usize;
+                if projected_has_dup_keys(&projected, key_size) {
+                    return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
+                }
+            }
+        }
+        self.dag.set_index_circuit_uniqueness(owner_id, col_idx, true);
         Ok(())
     }
 
@@ -551,4 +573,29 @@ impl CatalogEngine {
         Ok(())
     }
 
+}
+
+/// True if two positive-weight rows in a projected index batch share the same
+/// leading index key (the first `key_size` bytes of the index PK).
+///
+/// Compound-PK index layout: index PK is `(indexed_key, src_pk…)`. Uniqueness
+/// applies to the leading `indexed_key` slot only — two rows differing only in
+/// their source-PK suffix represent two source rows sharing the indexed value.
+/// `make_index_schema` always promotes the leading key to ≤16 bytes, so a u128
+/// dedup token suffices (zero-padded LE for narrower types).
+///
+/// Shared by `backfill_index` (fresh unique index) and `promote_index_to_unique`
+/// (UNIQUE folded into an existing circuit) so both gate on the same predicate.
+fn projected_has_dup_keys(projected: &Batch, key_size: usize) -> bool {
+    debug_assert!(key_size <= 16,
+        "unique index key size {} exceeds 16-byte dedup buffer", key_size);
+    let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
+    for row in 0..projected.count {
+        if projected.get_weight(row) <= 0 { continue; }
+        let pk_bytes = projected.get_pk_bytes(row);
+        let mut buf = [0u8; 16];
+        buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);
+        if !seen.insert(u128::from_le_bytes(buf)) { return true; }
+    }
+    false
 }

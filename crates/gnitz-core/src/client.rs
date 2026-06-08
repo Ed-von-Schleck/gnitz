@@ -233,6 +233,7 @@ impl GnitzClient {
 
     pub fn create_index(
         &mut self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
+        explicit_name: Option<&str>,
     ) -> Result<u64, ClientError> {
         let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
         let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
@@ -241,7 +242,12 @@ impl GnitzClient {
             ))?;
         validate_index_col_type(schema.columns[col_idx].type_code)?;
 
-        let index_name = format!("{}__{}__idx_{}", schema_name, table_name, col_name);
+        // A user-supplied constraint/index name flows verbatim into the IDX_TAB
+        // row so `DROP INDEX <name>` resolves it; otherwise fall back to the
+        // auto-generated `schema__table__idx_col` name.
+        let index_name = explicit_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}__{}__idx_{}", schema_name, table_name, col_name));
         let index_id = self.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();

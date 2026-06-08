@@ -589,3 +589,261 @@ fn test_on_conflict_no_target_accepted_on_compound_pk() {
         "INSERT INTO conf_t2 (a, b, payload) VALUES (1, 2, 3) ON CONFLICT DO NOTHING"
     ).unwrap();
 }
+
+// ── Column-level / table-level UNIQUE constraints ────────────────────
+
+/// Index uniqueness for `table.col`, looked up via the same `index_for_column`
+/// path the FK admission gate uses. `None` = no index on the column.
+fn unique_on(client: &mut GnitzClient, sn: &str, table: &str, col: &str) -> Option<bool> {
+    let (tid, schema) = client.resolve_table_id(sn, table).unwrap();
+    let ci = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col)).unwrap();
+    client.index_for_column(tid, ci).unwrap().map(|m| m.is_unique)
+}
+
+#[test]
+fn test_column_level_unique_creates_index() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE u (id BIGINT PRIMARY KEY, val BIGINT UNIQUE)").unwrap();
+    }
+    assert_eq!(unique_on(&mut client, &sn, "u", "val"), Some(true),
+        "column-level UNIQUE must create a unique secondary index on val");
+}
+
+#[test]
+fn test_table_level_unique_single_column() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ut (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a))").unwrap();
+    }
+    assert_eq!(unique_on(&mut client, &sn, "ut", "a"), Some(true));
+}
+
+#[test]
+fn test_named_unique_constraint_droppable_by_name() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE un (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT u_a UNIQUE(a))").unwrap();
+    }
+    assert_eq!(unique_on(&mut client, &sn, "un", "a"), Some(true));
+    {
+        // The constraint name is the index name, so DROP INDEX u_a removes it.
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("DROP INDEX u_a").unwrap();
+    }
+    assert_eq!(unique_on(&mut client, &sn, "un", "a"), None,
+        "dropping the named constraint removes the uniqueness index");
+}
+
+#[test]
+fn test_multi_column_unique_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE um (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, UNIQUE(a, b))"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("multi-column UNIQUE"), "got: {}", s),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+}
+
+#[test]
+fn test_duplicate_unique_constraint_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE ud (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), UNIQUE(a))"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate UNIQUE"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+#[test]
+fn test_unique_text_column_rejected_no_orphan() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE ux (id BIGINT PRIMARY KEY, name TEXT UNIQUE)"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("'name'"), "got: {}", s),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+    // Pre-validation runs before create_table, so no orphan table is left.
+    assert!(client.resolve_table_id(&sn, "ux").is_err(),
+        "type rejection must happen before the table is created");
+}
+
+#[test]
+fn test_lone_pk_unique_no_secondary_index() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ul (id BIGINT PRIMARY KEY UNIQUE, v BIGINT)").unwrap();
+    }
+    // The lone PK is already unique; the redundant secondary index is dropped.
+    assert_eq!(unique_on(&mut client, &sn, "ul", "id"), None);
+}
+
+#[test]
+fn test_compound_pk_member_unique_creates_index() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute(
+            "CREATE TABLE uc (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY(a, b), UNIQUE(a))"
+        ).unwrap();
+    }
+    // A compound-PK member is not individually unique, so UNIQUE(a) is kept.
+    assert_eq!(unique_on(&mut client, &sn, "uc", "a"), Some(true));
+}
+
+#[test]
+fn test_unique_plus_fk_same_column() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE par (x BIGINT PRIMARY KEY)").unwrap();
+        // refc is both an FK (non-unique auto-index, registered first) and UNIQUE.
+        // The unique index must promote the FK circuit, not be deduped away.
+        p.execute(
+            "CREATE TABLE chl (id BIGINT PRIMARY KEY, refc BIGINT UNIQUE REFERENCES par(x))"
+        ).unwrap();
+    }
+    assert_eq!(unique_on(&mut client, &sn, "chl", "refc"), Some(true),
+        "the UNIQUE index must promote the incumbent FK circuit to unique");
+}
+
+#[test]
+fn test_self_ref_fk_before_inline_pk() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        // The FK column is declared before the inline PK. Phase 3a populates
+        // pk_indices before Phase 3b resolves the self-referencing FK, so this
+        // no longer fails spuriously.
+        p.execute("CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)").unwrap();
+    }
+    let s = schema_after_create(&mut client, &sn, "sref");
+    assert!(s.columns[s.pk_index_single()].name.eq_ignore_ascii_case("id"),
+        "id must be the lone PK");
+}
+
+#[test]
+fn test_reserved_fk_infix_constraint_name_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a))"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+#[test]
+fn test_invalid_identifier_constraint_name_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute(
+        "CREATE TABLE ui (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT _my_idx UNIQUE(a))"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("cannot start with '_'"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+#[test]
+fn test_drop_index_permitted_on_lone_pk_when_fk_referenced() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE pidx (id BIGINT PRIMARY KEY)").unwrap();
+        p.execute("CREATE TABLE cidx (cid BIGINT PRIMARY KEY, p BIGINT REFERENCES pidx(id))").unwrap();
+        // A redundant unique index on the lone PK column of the FK target.
+        p.execute("CREATE UNIQUE INDEX pidx_uq ON pidx(id)").unwrap();
+        // The lone PK guarantees uniqueness even without the secondary index,
+        // so the drop is permitted despite the FK reference.
+        p.execute("DROP INDEX pidx_uq").unwrap();
+    }
+}
+
+// ── CREATE INDEX naming ──────────────────────────────────────────────
+
+#[test]
+fn test_create_index_named_droppable_by_name() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ni (id BIGINT PRIMARY KEY, col BIGINT)").unwrap();
+        p.execute("CREATE INDEX my_idx ON ni(col)").unwrap();
+    }
+    {
+        // The auto-generated name does not exist; only the user name resolves.
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        let err = must_err(p.execute(&format!("DROP INDEX {sn}__ni__idx_col")));
+        assert!(matches!(err, GnitzSqlError::Exec(_)), "auto-name must not resolve, got {:?}", err);
+        p.execute("DROP INDEX my_idx").unwrap();
+    }
+}
+
+#[test]
+fn test_create_index_unnamed_droppable_by_autoname() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ai (id BIGINT PRIMARY KEY, col BIGINT)").unwrap();
+        p.execute("CREATE INDEX ON ai(col)").unwrap();
+        p.execute(&format!("DROP INDEX {sn}__ai__idx_col")).unwrap();
+    }
+}
+
+#[test]
+fn test_create_index_reserved_infix_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ri (id BIGINT PRIMARY KEY, col BIGINT)").unwrap();
+    }
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute("CREATE INDEX my__fk_thing ON ri(col)"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+#[test]
+fn test_create_index_invalid_identifier_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ii (id BIGINT PRIMARY KEY, col BIGINT)").unwrap();
+    }
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    let err = must_err(p.execute("CREATE INDEX _bad ON ii(col)"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("cannot start with '_'"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}

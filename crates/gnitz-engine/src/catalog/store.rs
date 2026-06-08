@@ -146,6 +146,30 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Visit every positive-weight `sys_indices` row whose owner/source-column
+    /// match `(owner_id, col_idx)`, invoking `f(index_id, is_unique)` for each.
+    /// Centralises the IDX_TAB cursor walk shared by the DROP INDEX uniqueness
+    /// checks (the drop-time FK guard in `precheck_sys_ingest` and the
+    /// post-retraction circuit demotion in `hook_index_register`). Rows that have
+    /// already netted to zero weight are skipped by the cursor.
+    pub(crate) fn for_each_index_on_column(
+        &self, owner_id: i64, col_idx: usize, mut f: impl FnMut(i64, bool),
+    ) {
+        let mut cursor = self.sys_indices.open_cursor();
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
+                let row_col   = cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX) as usize;
+                if row_owner == owner_id && row_col == col_idx {
+                    let row_id  = cursor.cursor.current_key as u64 as i64;
+                    let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
+                    f(row_id, is_uniq);
+                }
+            }
+            cursor.cursor.advance();
+        }
+    }
+
     /// Validate a system-table write before any mutation (memtable or hooks).
     /// Covers both positive-weight (CREATE) invariants and negative-weight (DROP)
     /// integrity guards so that no invalid state is ever written.
@@ -301,9 +325,33 @@ impl CatalogEngine {
                      cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX) as usize)
                 };
                 if self.fk_children_of(owner_id).iter().any(|r| r.parent_col_idx == src_col) {
-                    let (sn, tn) = self.caches.entity_by_id.get(&owner_id).cloned().unwrap_or_default();
-                    return Err(format!(
-                        "Integrity violation: index on '{}.{}' is referenced by a foreign key", sn, tn));
+                    // The FK target column must retain uniqueness for FK child
+                    // inserts to validate. The drop is allowed when uniqueness is
+                    // structurally preserved: the column is the lone PK (the PK
+                    // itself guarantees uniqueness), or another unique secondary
+                    // index survives the drop.
+                    let is_lone_pk = self.dag.tables.get(&owner_id).is_some_and(|e| {
+                        let pk = e.schema.pk_indices();
+                        pk.len() == 1 && pk[0] as usize == src_col
+                    });
+                    if !is_lone_pk {
+                        // Scan sys_indices (pre-drop: the rows being dropped are
+                        // still present) for any other unique index on this column
+                        // that would survive (exclude every id in this drop batch).
+                        let mut unique_remains = false;
+                        self.for_each_index_on_column(owner_id, src_col, |row_id, is_uniq| {
+                            if is_uniq && drop_ids.binary_search(&row_id).is_err() {
+                                unique_remains = true;
+                            }
+                        });
+                        if !unique_remains {
+                            let (sn, tn) = self.caches.entity_by_id.get(&owner_id)
+                                .cloned().unwrap_or_default();
+                            return Err(format!(
+                                "Integrity violation: index on '{sn}.{tn}' is referenced by a \
+                                 foreign key and no unique index would remain on the column"));
+                        }
+                    }
                 }
             }
             return Ok(());

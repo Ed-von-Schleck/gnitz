@@ -159,23 +159,34 @@ impl CatalogEngine {
                     ("name", type_code::STRING, 0), ("is_unique", type_code::U64, 0),
                     ("cache_directory", type_code::STRING, 0),
                 ]),
+                // _view_deps: compound PK (view_id, dep_table_id) at cols [0, 1];
+                // dep_view_id is the only payload. All three columns are
+                // non-nullable U64.
+                (DEP_TAB_ID, &[
+                    ("view_id",      type_code::U64, 0),
+                    ("dep_table_id", type_code::U64, 0),
+                    ("dep_view_id",  type_code::U64, 0),
+                ]),
                 (SEQ_TAB_ID, &[("seq_id", type_code::U64, 0), ("next_val", type_code::U64, 0)]),
+                // Circuit tables use a real compound PK (view_id: U64, sub: U64)
+                // at cols [0, 1] — two U64 fields, NOT a single synthetic U128 —
+                // matching the actual wire schemas (CIRCUIT_*_COLS in gnitz-wire).
                 (CIRCUIT_NODES_TAB_ID, &[
-                    ("node_pk",      type_code::U128, 0), ("view_id",      type_code::U64, 0),
-                    ("node_id",      type_code::U64, 0),  ("opcode",       type_code::U64, 0),
-                    ("source_table", type_code::U64, 1),  ("reindex_col",  type_code::U64, 1),
+                    ("view_id",      type_code::U64,  0), ("sub",          type_code::U64,  0),
+                    ("node_id",      type_code::U64,  0), ("opcode",       type_code::U64,  0),
+                    ("source_table", type_code::U64,  1), ("reindex_col",  type_code::U64,  1),
                     ("expr_program", type_code::BLOB, 1),
                 ]),
                 (CIRCUIT_EDGES_TAB_ID, &[
-                    ("edge_pk",  type_code::U128, 0), ("view_id",  type_code::U64, 0),
-                    ("dst_node", type_code::U64, 0),  ("dst_port", type_code::U64, 0),
+                    ("view_id",  type_code::U64, 0), ("sub",      type_code::U64, 0),
+                    ("dst_node", type_code::U64, 0), ("dst_port", type_code::U64, 0),
                     ("src_node", type_code::U64, 0),
                 ]),
                 (CIRCUIT_NODE_COLUMNS_TAB_ID, &[
-                    ("node_col_pk", type_code::U128, 0), ("view_id",  type_code::U64, 0),
-                    ("node_id",     type_code::U64, 0),  ("kind",     type_code::U64, 0),
-                    ("position",    type_code::U64, 0),  ("value1",   type_code::U64, 0),
-                    ("value2",      type_code::U64, 0),
+                    ("view_id",  type_code::U64, 0), ("sub",      type_code::U64, 0),
+                    ("node_id",  type_code::U64, 0), ("kind",     type_code::U64, 0),
+                    ("position", type_code::U64, 0), ("value1",   type_code::U64, 0),
+                    ("value2",   type_code::U64, 0),
                 ]),
             ];
 

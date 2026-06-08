@@ -213,64 +213,9 @@ fn test_fk_self_reference() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_fk_parent_restrict_blocks_delete ────────────────────────────
-
-#[test]
-fn test_fk_parent_restrict_blocks_delete() {
-    let dir = temp_dir("fk_restrict");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-
-    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
-    let child_cols = vec![
-        u64_col_def("cid"),
-        ColumnDef { name: "fk".into(), type_code: type_code::U64, is_nullable: false,
-                    fk_table_id: parent_tid, fk_col_idx: 0 },
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
-
-    // Insert parent PK=10
-    let ps = engine.get_schema(parent_tid).unwrap();
-    let mut pbb = BatchBuilder::new(ps);
-    pbb.begin_row(10u128, 1);
-    pbb.end_row();
-    engine.dag.ingest_to_family(parent_tid, pbb.finish());
-    let _ = engine.dag.flush(parent_tid);
-
-    // Insert child FK=10
-    let cs = engine.get_schema(child_tid).unwrap();
-    let mut cbb = BatchBuilder::new(cs);
-    cbb.begin_row(1u128, 1);
-    cbb.put_u64(10);
-    cbb.end_row();
-    let cbatch = cbb.finish();
-    assert!(engine.validate_fk_inline(child_tid, &cbatch).is_ok());
-    engine.dag.ingest_to_family(child_tid, cbatch);
-    let _ = engine.dag.flush(child_tid);
-
-    // Retract parent PK=10 — should be blocked by RESTRICT
-    let mut del = BatchBuilder::new(ps);
-    del.begin_row(10u128, -1);
-    del.end_row();
-    let del_batch = del.finish();
-    let result = engine.validate_fk_parent_restrict(parent_tid, &del_batch);
-    assert!(result.is_err(), "DELETE parent with existing child should fail");
-    assert!(result.unwrap_err().contains("Foreign Key violation"));
-
-    // Retract parent PK=99 (no child references it) — should succeed
-    let mut del2 = BatchBuilder::new(ps);
-    del2.begin_row(99u128, -1);
-    del2.end_row();
-    assert!(engine.validate_fk_parent_restrict(parent_tid, &del2.finish()).is_ok());
-
-    // Insert-only batch on parent table — RESTRICT should be a no-op
-    let mut ins = BatchBuilder::new(ps);
-    ins.begin_row(20u128, 1);
-    ins.end_row();
-    assert!(engine.validate_fk_parent_restrict(parent_tid, &ins.finish()).is_ok());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
+// (test_fk_parent_restrict_blocks_delete removed: it existed only to exercise
+// the deleted, buggy test-only `validate_fk_parent_restrict`. FK
+// RESTRICT-on-DELETE is covered end-to-end by gnitz-py/tests/test_fk.py.)
 
 // ── test_fk_parent_map_cleanup ──────────────────────────────────────
 
@@ -328,28 +273,6 @@ fn test_fk_multiple_children_same_parent() {
 
     // Cannot drop parent while either child exists
     assert!(engine.drop_table("public.parent").is_err());
-
-    // Insert parent + child1 row, verify RESTRICT
-    let ps = engine.get_schema(parent_tid).unwrap();
-    let mut pbb = BatchBuilder::new(ps);
-    pbb.begin_row(10u128, 1);
-    pbb.end_row();
-    engine.dag.ingest_to_family(parent_tid, pbb.finish());
-    let _ = engine.dag.flush(parent_tid);
-
-    let cs = engine.get_schema(child1_tid).unwrap();
-    let mut cbb = BatchBuilder::new(cs);
-    cbb.begin_row(1u128, 1);
-    cbb.put_u64(10);
-    cbb.end_row();
-    engine.dag.ingest_to_family(child1_tid, cbb.finish());
-    let _ = engine.dag.flush(child1_tid);
-
-    // DELETE parent blocked by child1
-    let mut del = BatchBuilder::new(ps);
-    del.begin_row(10u128, -1);
-    del.end_row();
-    assert!(engine.validate_fk_parent_restrict(parent_tid, &del.finish()).is_err());
 
     // Drop child1 — still blocked by child2
     engine.drop_table("public.child1").unwrap();

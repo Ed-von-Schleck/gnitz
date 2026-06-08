@@ -72,6 +72,37 @@ pub const OWNER_KIND_TABLE: u64 = 0;
 pub const OWNER_KIND_VIEW:  u64 = 1;
 
 // ---------------------------------------------------------------------------
+// Identifier validation (shared between the SQL planner and the engine)
+// ---------------------------------------------------------------------------
+
+/// Infix marking an index as an internal FK-backing index. User identifiers may
+/// not contain it — such a name would be undroppable (`drop_index` rejects it).
+pub const FK_INDEX_INFIX: &str = "__fk_";
+
+fn is_valid_ident_char(ch: u8) -> bool {
+    ch.is_ascii_alphanumeric() || ch == b'_'
+}
+
+/// Reject empty names, names starting with `_` (reserved for the system prefix),
+/// and names with characters outside `[A-Za-z0-9_]`.
+pub fn validate_user_identifier(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Identifier cannot be empty".into());
+    }
+    if name.as_bytes()[0] == b'_' {
+        return Err(format!(
+            "User identifiers cannot start with '_' (reserved for system prefix): {}",
+            name));
+    }
+    for &ch in name.as_bytes() {
+        if !is_valid_ident_char(ch) {
+            return Err(format!("Identifier contains invalid characters: {}", name));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Schema sizing caps
 // ---------------------------------------------------------------------------
 

@@ -264,7 +264,12 @@ impl PkColumn {
             // tables whose PK is (view_id, sub).
             PkColumn::Bytes { stride, buf } => {
                 let s = *stride as usize;
-                debug_assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
+                // Promoted from debug_assert to a full assert: in release the
+                // slice `pk.to_le_bytes()[..s]` would otherwise OOB-panic with an
+                // opaque "index out of range" message. This Bytes arm is reached
+                // only by cold catalog circuit-table writes, so the branch cost is
+                // irrelevant; a clear, attributable failure is worth it.
+                assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
                 buf.extend_from_slice(&pk.to_le_bytes()[..s]);
             }
         }
@@ -752,6 +757,24 @@ impl ZSetBatch {
                 }
             }
         }
+        // A null bit on a NOT NULL payload column would make FK/unique validation
+        // skip the value (treating it as absent) while consolidation and decoders
+        // read the raw bytes as live data — an inconsistency the schema forbids.
+        // Reject it. `pi` is the dense payload index (null-bitmap bit position),
+        // matching the convention the FK/unique skips use.
+        let mut not_null_mask: u64 = 0;
+        for (pi, _ci, col_def) in schema.payload_columns() {
+            if !col_def.is_nullable {
+                not_null_mask |= 1u64 << pi;
+            }
+        }
+        if not_null_mask != 0 {
+            for (row, &word) in self.nulls.iter().enumerate() {
+                if word & not_null_mask != 0 {
+                    return Err(format!("row {row} sets a null bit on a NOT NULL column"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1205,6 +1228,49 @@ mod tests {
         // Fixed column 1 is empty (needs 8 bytes) — mismatch
         let err = batch.validate(&schema).unwrap_err();
         assert!(err.contains("Fixed"));
+    }
+
+    #[test]
+    fn test_validate_rejects_null_bit_on_not_null_column() {
+        // A null bit on a NOT NULL payload column must be rejected: FK/unique
+        // validation would skip the value while decoders read it as live data.
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            a.add_row(1u128, 1).i64_val(10);
+        }
+        assert!(batch.validate(&schema).is_ok(), "clean batch must pass");
+        // Flip the null bit on payload col 0 (`v`, NOT NULL) → rejected.
+        batch.nulls[0] |= 1 << 0;
+        let err = batch.validate(&schema).unwrap_err();
+        assert!(err.contains("NOT NULL"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_allows_null_bit_on_nullable_column() {
+        // The same null bit on a NULLABLE payload column is fine.
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            a.add_row(1u128, 1).i64_val(10);
+        }
+        batch.nulls[0] |= 1 << 0;
+        assert!(batch.validate(&schema).is_ok(),
+            "a null bit on a nullable column must be accepted");
     }
 
     /// A two-column wide-PK schema whose `Bytes` PK buffer is not a whole

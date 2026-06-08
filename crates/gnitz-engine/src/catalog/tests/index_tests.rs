@@ -1038,3 +1038,259 @@ fn test_create_unique_index_on_string_blob_rejected() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── UNIQUE+FK promotion / demotion (column-level unique constraint) ───────
+//
+// A column that is BOTH a foreign key and UNIQUE registers its FK auto-index
+// (non-unique) first; the later unique index must PROMOTE that incumbent
+// circuit, not be deduped away. DROP INDEX of the user unique index must DEMOTE
+// (the FK auto-index remains), not destroy the circuit.
+
+use std::path::Path;
+
+/// Uniqueness of the index circuit on `col`, or `None` if no circuit exists.
+fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
+    let n = engine.get_index_circuit_count(tid);
+    (0..n).filter_map(|i| engine.get_index_circuit_info(tid, i))
+        .find(|(c, _, _)| *c == col)
+        .map(|(_, u, _)| u)
+}
+
+/// Count `idx_*` sub-directories under a table directory.
+fn count_idx_dirs(tbl_dir: &str) -> usize {
+    std::fs::read_dir(tbl_dir)
+        .map(|rd| rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("idx_"))
+            .count())
+        .unwrap_or(0)
+}
+
+fn fk_col_def(name: &str, parent_tid: i64, parent_col: u32) -> ColumnDef {
+    ColumnDef {
+        name: name.into(), type_code: type_code::U64, is_nullable: false,
+        fk_table_id: parent_tid, fk_col_idx: parent_col,
+    }
+}
+
+#[test]
+fn test_promote_unique_index_over_fk_column_empty() {
+    let dir = temp_dir("promote_unique_fk_empty");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // FK auto-index registered (non-unique) on col 1 at create time.
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
+
+    // A UNIQUE index over the same column promotes the incumbent circuit; on an
+    // empty table this is a pure flag flip (no duplicate data to scan).
+    engine.create_index("public.child", "refc", true).unwrap();
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true),
+        "the UNIQUE index must promote the FK circuit to unique");
+
+    // Enforcement: a batch-internal duplicate on refc is now rejected.
+    let schema = engine.get_schema(child_tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(7); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(7); bb.end_row();
+    assert!(engine.validate_unique_indices(child_tid, &bb.finish()).is_err(),
+        "promoted unique index must reject duplicate refc values");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_over_fk_column_distinct_data_promotes() {
+    // Masking-bug regression (clean data): CREATE UNIQUE INDEX over an FK column
+    // populated with distinct values must promote and enforce, not be masked.
+    let dir = temp_dir("promote_unique_fk_distinct");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // Seed DISTINCT refc values (ingest_to_family bypasses FK validation).
+    let schema = engine.get_schema(child_tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(20); bb.end_row();
+    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
+    engine.flush_family(child_tid).unwrap();
+
+    engine.create_index("public.child", "refc", true).unwrap();
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_over_fk_column_duplicate_data_rejected() {
+    // Masking-bug regression (dirty data): CREATE UNIQUE INDEX over an FK column
+    // with DUPLICATE values must fail and net sys_indices back to zero, instead
+    // of silently dropping the constraint.
+    let dir = temp_dir("promote_unique_fk_dup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // Seed DUPLICATE refc values.
+    let schema = engine.get_schema(child_tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(42); bb.end_row();
+    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
+    engine.flush_family(child_tid).unwrap();
+
+    let before = count_records(&mut engine.sys_indices);
+    let r = engine.create_index("public.child", "refc", true);
+    assert!(r.is_err(), "unique index over duplicate FK data must fail");
+    assert_eq!(count_records(&mut engine.sys_indices), before,
+        "the failed unique index row must net out of sys_indices");
+    // The incumbent FK circuit stays non-unique (promotion never committed).
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_drop_unique_index_on_fk_column_demotes() {
+    // Dropping the user unique index of a UNIQUE+FK column must DEMOTE the
+    // circuit (the FK auto-index still covers the column), not destroy it.
+    let dir = temp_dir("demote_unique_fk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    engine.create_index("public.child", "refc", true).unwrap();
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
+
+    let user_idx = make_secondary_index_name("public", "child", "refc");
+    let fk_idx = make_fk_index_name("public", "child", "refc");
+    engine.drop_index(&user_idx).unwrap();
+
+    // Circuit remains (col 1 still indexed) but is no longer unique; the FK
+    // auto-index survives so FK lookups keep working.
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false),
+        "circuit must be demoted, not destroyed");
+    assert!(engine.has_index_by_name(&fk_idx),
+        "the FK auto-index must survive the unique-index drop");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
+    // The UNIQUE index promotes the FK circuit and builds NO second directory —
+    // the circuit's directory carries the FK index's id. Dropping the unique
+    // index must NOT delete that shared directory (the FK still needs it); a
+    // subsequent drop_table removes the whole table dir, leaving no orphan.
+    let dir = temp_dir("dir_correct_unique_fk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+    engine.create_index("public.child", "refc", true).unwrap();
+
+    let tbl_dir = format!("{}/public/child_{}", dir, child_tid);
+    assert_eq!(count_idx_dirs(&tbl_dir), 1,
+        "promotion must reuse the FK index directory, not build a second one");
+
+    // Drop the user unique index: demotion keeps the FK directory in place.
+    let user_idx = make_secondary_index_name("public", "child", "refc");
+    engine.drop_index(&user_idx).unwrap();
+    engine.drain_pending_dir_deletions();
+    assert_eq!(count_idx_dirs(&tbl_dir), 1,
+        "dropping the unique index must not delete the shared FK directory");
+
+    // drop_table cascades the FK index (using the circuit's creating index_id
+    // for the deletion path) and removes the whole table directory.
+    engine.drop_table("public.child").unwrap();
+    engine.drain_pending_dir_deletions();
+    assert!(!Path::new(&tbl_dir).exists(), "no orphan idx_* dir may remain");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_failed_create_index_leaves_no_directory() {
+    // A unique create_index that fails on duplicate data must drain the
+    // pre-staged index directory, leaving no orphan idx_* dir on disk.
+    let dir = temp_dir("failed_create_index_dir");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(9); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_u64(9); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let tbl_dir = format!("{}/public/t_{}", dir, tid);
+    assert!(engine.create_index("public.t", "val", true).is_err());
+    assert_eq!(count_idx_dirs(&tbl_dir), 0,
+        "a failed unique create_index must leave no index directory behind");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_drop_index_permitted_on_lone_pk_target() {
+    // A redundant unique index on a lone-PK column that is an FK target may be
+    // dropped: the PK itself preserves uniqueness for FK child validation.
+    let dir = temp_dir("drop_idx_lone_pk_fk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("p", parent_tid, 0)];
+    engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // Redundant unique index on the parent's lone PK column.
+    engine.create_index("public.parent", "id", true).unwrap();
+    let idx = make_secondary_index_name("public", "parent", "id");
+    engine.drop_index(&idx).expect("drop must be permitted: lone PK preserves uniqueness");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
+    // A non-PK FK-target column with a unique index cannot have that index
+    // dropped while a child references it and no other unique index survives.
+    let dir = temp_dir("drop_idx_nonpk_fk_blocked");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Parent (id PK, email) with a UNIQUE index on the non-PK `email` column.
+    let parent_cols = vec![u64_col_def("id"), u64_col_def("email")];
+    let parent_tid = engine.create_table("public.parent", &parent_cols, &[0], true).unwrap();
+    engine.create_index("public.parent", "email", true).unwrap();
+
+    // Child references parent.email (col 1), legal because email is unique.
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("e", parent_tid, 1)];
+    engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    let idx = make_secondary_index_name("public", "parent", "email");
+    let r = engine.drop_index(&idx);
+    assert!(r.is_err(), "dropping the sole unique index on an FK target must be blocked");
+    assert!(r.unwrap_err().contains("no unique index would remain"),
+        "error must explain the uniqueness requirement");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

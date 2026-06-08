@@ -564,3 +564,20 @@ fn test_set_op_float_column_rejected() {
     // A non-float set-op still succeeds.
     p.execute("CREATE VIEW vg AS SELECT g FROM a UNION SELECT g FROM b").unwrap();
 }
+
+// ── Duplicate output column names rejected (set-op view) ──────────────
+
+#[test]
+fn test_set_op_duplicate_output_columns_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE so_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW v_so_dup AS SELECT a AS x, b AS x FROM so_dup \
+         UNION SELECT a AS x, b AS x FROM so_dup"));
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
