@@ -283,14 +283,15 @@ fn test_schema_invalid_type_code_zero() {
 }
 
 #[test]
-fn test_schema_invalid_type_code_15() {
-    // Type code 13 became UUID after this test was written; 15 is now
-    // the first unassigned code after BLOB (14), the standard sentinel
-    // for "no such type".
+fn test_schema_invalid_type_code_16() {
+    // This test seeks the first unassigned type code as the "no such type"
+    // sentinel. The target keeps moving as new types are added: 13 became UUID,
+    // then 15 became I128 (gnitz-wire `type_code`), so 16 is now the first
+    // unassigned code after I128 (15). Bump it when a 16th type is defined.
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
-    let sb = make_schema_block_bad_type(&schema, 1, 15);
+    let sb = make_schema_block_bad_type(&schema, 1, 16);
     let msg = assemble(SCHEMA_TAB, Some(sb), None);
     let (status, err, _) = raw.send_recv(&msg);
     assert_err(status, &err, &["type code"]);

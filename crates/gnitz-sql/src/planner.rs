@@ -12,7 +12,7 @@ use gnitz_core::{
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
 };
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
-use crate::binder::{Binder, resolve_qualified_column, resolve_unqualified_column};
+use crate::binder::{Binder, resolve_qualified_column, resolve_unqualified_column, find_unique_column};
 use crate::types::sql_type_to_typecode;
 use crate::expr::compile_bound_expr;
 use crate::logical_plan::{BoundExpr, BinOp, AggFunc};
@@ -43,7 +43,7 @@ pub fn execute_statement(
             dml::execute_select(client, schema_name, query, &mut binder)
         }
         Statement::CreateIndex(ci) => {
-            execute_create_index(client, schema_name, ci)
+            execute_create_index(client, schema_name, ci, &mut binder)
         }
         Statement::Update { .. } => dml::execute_update(client, schema_name, stmt, &mut binder),
         Statement::Delete(_)     => dml::execute_delete(client, schema_name, stmt, &mut binder),
@@ -481,10 +481,10 @@ fn execute_create_table(
     // avoid an orphaned table with missing constraints (DDL is not
     // transactional across the create_table / create_index boundary).
     for (c, constraint_name) in &unique_cols {
-        if let Err(e) = client.create_index(
-            schema_name, &table_name, &cols[*c as usize].name, true,
-            constraint_name.as_deref(),
-        ) {
+        let col = &cols[*c as usize];
+        let index_name = constraint_name.clone()
+            .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col.name));
+        if let Err(e) = client.create_index(tid, *c as usize, col.type_code, &index_name, true) {
             let _ = client.drop_table(schema_name, &table_name);
             return Err(GnitzSqlError::Exec(e));
         }
@@ -576,12 +576,24 @@ fn execute_create_view(
             // would be silently discarded by the alias mechanism and return wrong
             // rows, so reject it explicitly. (Compiling an arbitrary CTE body as a
             // sub-plan is a separate, unimplemented feature.)
+            // Positional identity: `*`, or one identifier per source column in
+            // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as
+            // `CompoundIdentifier` and is the same positional pass-through — match
+            // `parts[1]` against each source column. This stays a positional
+            // identity test (never a name→index lookup), so a dup-named source
+            // simply fails the per-position compare and is rejected.
             let proj_is_identity = cte_select.projection.iter()
                     .all(|p| matches!(p, SelectItem::Wildcard(_)))
                 || (cte_select.projection.len() == cte_schema.columns.len()
                     && cte_select.projection.iter().enumerate().all(|(i, item)| {
-                        matches!(item, SelectItem::UnnamedExpr(Expr::Identifier(id))
-                            if cte_schema.columns[i].name.eq_ignore_ascii_case(&id.value))
+                        let want = &cte_schema.columns[i].name;
+                        match item {
+                            SelectItem::UnnamedExpr(Expr::Identifier(id)) =>
+                                id.value.eq_ignore_ascii_case(want),
+                            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 =>
+                                parts[1].value.eq_ignore_ascii_case(want),
+                            _ => false,
+                        }
                     }));
             let has_group_by = matches!(&cte_select.group_by,
                 GroupByExpr::Expressions(e, _) if !e.is_empty());
@@ -681,16 +693,25 @@ fn execute_create_view(
     };
 
     // Build projection column list
+    let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
     let (items, out_cols) = build_projection(&select.projection, &source_schema, binder)?;
 
     // The pass-through generalization can now emit the same name twice (SELECT
     // name, name; or an alias landing on the auto-prepended PK). This keys on
     // output *names*, so a duplicate PK *value* under distinct names (SELECT id,
     // id AS id2) is unaffected and accepted.
-    reject_duplicate_column_names(
-        out_cols.iter().map(|c| c.name.as_str()),
-        "CREATE VIEW projection",
-    )?;
+    //
+    // A `SELECT *` over a dup-named source (a join view surfacing both sides'
+    // `id`) legitimately carries the duplicate names through positionally — the
+    // same wildcard contract as `execute_create_join_view`. Gate the guard on
+    // `!is_wildcard` so only an *explicit* projection that produces a duplicate
+    // (`SELECT name, name`) errors.
+    if !is_wildcard {
+        reject_duplicate_column_names(
+            out_cols.iter().map(|c| c.name.as_str()),
+            "CREATE VIEW projection",
+        )?;
+    }
 
     // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
     // payload slot (>= k) that is a PK PassThrough is a duplicate PK value; a
@@ -771,10 +792,19 @@ fn execute_create_view(
     Ok(SqlResult::ViewCreated { view_id })
 }
 
+/// Catalog name for an auto-generated (unnamed) secondary index:
+/// `{schema}__{table}__idx_{col}`. `DROP INDEX <name>` resolves this exact
+/// string, so the format is a stable contract (the drop-by-name tests in
+/// `planner_create_table` pin it).
+fn default_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
+    format!("{schema_name}__{table_name}__idx_{col_name}")
+}
+
 fn execute_create_index(
     client:      &mut GnitzClient,
     schema_name: &str,
     ci:          &sqlparser::ast::CreateIndex,
+    binder:      &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let table_name = extract_name(&ci.table_name, "CREATE INDEX")?;
 
@@ -801,8 +831,21 @@ fn execute_create_index(
     };
     let is_unique = ci.unique;
 
+    // Resolve the target as a base table: this rejects a view (read-only — a
+    // view's store is maintained solely by its circuit, so indexing a snapshot of
+    // derived data has no defined semantics) with a precise error, and yields the
+    // schema used to resolve the indexed column. The client write below takes the
+    // already-resolved (table_id, col_idx), so the name is resolved exactly once.
+    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
+    let col_idx = find_unique_column(&schema.columns, &col_name)?
+        .ok_or_else(|| GnitzSqlError::Bind(
+            format!("column '{}' not found", col_name)
+        ))?;
+    let index_name = explicit_name
+        .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col_name));
+
     let index_id = client.create_index(
-        schema_name, &table_name, &col_name, is_unique, explicit_name.as_deref(),
+        table_id, col_idx, schema.columns[col_idx].type_code, &index_name, is_unique,
     ).map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::IndexCreated { index_id })
@@ -824,8 +867,7 @@ fn build_projection(
     for (idx, item) in projection.iter().enumerate() {
         match item {
             SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let col_idx = source_schema.columns.iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                let col_idx = find_unique_column(&source_schema.columns, &ident.value)?
                     .ok_or_else(|| GnitzSqlError::Bind(
                         format!("column '{}' not found", ident.value)
                     ))?;
@@ -1597,8 +1639,7 @@ fn execute_create_group_by_view(
     for ge in group_exprs {
         match ge {
             Expr::Identifier(id) => {
-                let idx = source_schema.columns.iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                let idx = find_unique_column(&source_schema.columns, &id.value)?
                     .ok_or_else(|| GnitzSqlError::Bind(
                         format!("GROUP BY column '{}' not found", id.value)
                     ))?;
@@ -2134,8 +2175,7 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
             // (natural-PK grouping puts the lone group col at the PK index 0; the
             // synthetic path lays group cols out after the U128 _group_pk).
             let col_name = &ident.value;
-            let src = ctx.source_schema.columns.iter()
-                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            let src = find_unique_column(&ctx.source_schema.columns, col_name)?
                 .ok_or_else(|| GnitzSqlError::Bind(
                     format!("HAVING: column '{}' not found", col_name)
                 ))?;
@@ -2226,8 +2266,7 @@ fn extract_func_arg_col(func: &sqlparser::ast::Function, schema: &Schema) -> Res
             match &list.args[0] {
                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(None),
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
-                    let idx = schema.columns.iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                    let idx = find_unique_column(&schema.columns, &id.value)?
                         .ok_or_else(|| GnitzSqlError::Bind(
                             format!("column '{}' not found", id.value)
                         ))?;

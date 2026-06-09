@@ -83,3 +83,19 @@ fn test_cte_plain_passthrough_accepted() {
     p.execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t) SELECT a FROM cte").unwrap();
     assert!(client.resolve_table_or_view_id(&sn, "v").is_ok());
 }
+
+#[test]
+fn test_cte_qualified_identity_passthrough_accepted() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)").unwrap();
+    // A qualified projection (`t.a, t.b`) is a positional identity pass-through,
+    // equivalent to `SELECT *`. The identity check accepts the
+    // `CompoundIdentifier` form by comparing `parts[1]` against each source
+    // column in order (§5.3) — it stays a positional test, never a name lookup.
+    p.execute("CREATE VIEW v AS WITH cte AS (SELECT t.a, t.b FROM t) SELECT * FROM cte").unwrap();
+    let (_, schema) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"], "qualified CTE pass-through must preserve column order");
+}

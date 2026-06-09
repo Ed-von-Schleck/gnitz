@@ -231,23 +231,21 @@ impl GnitzClient {
         Ok(list.iter().find(|m| m.col_idx as usize == col_idx).copied())
     }
 
+    /// Persist a secondary-index catalog row over an already-resolved base table.
+    ///
+    /// Resolution and view-rejection are the caller's responsibility: an index
+    /// may only back a base table — a view is a read-only derived relation whose
+    /// store is maintained solely by its circuit, so indexing a snapshot of
+    /// derived data has no defined semantics — and the SQL layer rejects a view
+    /// target with a precise error before reaching here. `col_idx`/`col_type`
+    /// identify the indexed column within the resolved table; `index_name` is the
+    /// final catalog name (auto-generated or user-supplied) that `DROP INDEX`
+    /// resolves against.
     pub fn create_index(
-        &mut self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
-        explicit_name: Option<&str>,
+        &mut self, table_id: u64, col_idx: usize, col_type: TypeCode, index_name: &str,
+        is_unique: bool,
     ) -> Result<u64, ClientError> {
-        let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
-        let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
-            .ok_or_else(|| ClientError::ServerError(
-                format!("column '{}' not found in table '{}'", col_name, table_name)
-            ))?;
-        validate_index_col_type(schema.columns[col_idx].type_code)?;
-
-        // A user-supplied constraint/index name flows verbatim into the IDX_TAB
-        // row so `DROP INDEX <name>` resolves it; otherwise fall back to the
-        // auto-generated `schema__table__idx_col` name.
-        let index_name = explicit_name
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{}__{}__idx_{}", schema_name, table_name, col_name));
+        validate_index_col_type(col_type)?;
         let index_id = self.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();
@@ -257,7 +255,7 @@ impl GnitzClient {
             .u64_val(table_id)
             .u64_val(0)
             .u64_val(col_idx as u64)
-            .str_val(&index_name)
+            .str_val(index_name)
             .u64_val(is_unique as u64)
             .str_val("");
 

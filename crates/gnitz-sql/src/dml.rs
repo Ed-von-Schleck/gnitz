@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode, ClientError};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
-use crate::binder::Binder;
+use crate::binder::{Binder, find_unique_column};
 use crate::logical_plan::BoundExpr;
 use crate::SqlResult;
 
@@ -94,7 +94,7 @@ pub fn execute_insert(
     // Extract table name, row source, and ON CONFLICT action.
     let (table_name_str, rows, on_insert) = extract_insert_parts(stmt)?;
 
-    let (tid, schema) = binder.resolve(client, &table_name_str)?;
+    let (tid, schema) = binder.resolve_base_table(client, &table_name_str)?;
 
     // Resolve the ON CONFLICT clause into a `ConflictPlan`.
     let plan = match on_insert {
@@ -705,10 +705,18 @@ pub fn execute_select(
             }
             match hit {
                 Some(res) => res,
-                None => return Err(GnitzSqlError::Unsupported(
-                    "WHERE on non-indexed column not supported in direct SELECT; \
-                     use CREATE INDEX first, or CREATE VIEW for server-side filtering".to_string()
-                )),
+                None => {
+                    // No index served this WHERE. Bind it first so an ambiguous or
+                    // unknown column raises its exact Bind error (a SELECT * join
+                    // view can carry two same-named columns) instead of the generic
+                    // "non-indexed" message. Direct SELECT — unlike UPDATE/DELETE —
+                    // has no predicate full-scan fallback that would bind it.
+                    binder.bind_expr(where_expr, &schema)?;
+                    return Err(GnitzSqlError::Unsupported(
+                        "WHERE on non-indexed column not supported in direct SELECT; \
+                         use CREATE INDEX first, or CREATE VIEW for server-side filtering".to_string()
+                    ));
+                }
             }
         }
     } else {
@@ -816,7 +824,10 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
         (l, Expr::Identifier(id)) => (id, extract_sql_literal(l)?),
         _ => return None,
     };
-    let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_id.value))?;
+    // Ambiguous (a dup-named `SELECT *` view) OR absent → None → fast path
+    // declined; the WHERE then falls through to a bind that raises the precise
+    // error rather than seeking the wrong column.
+    let col_idx = find_unique_column(&schema.columns, &col_id.value).ok().flatten()?;
     let col_tc = schema.columns[col_idx].type_code;
 
     // UUID: accept a single-quoted UUID string or a non-negated numeric u128
@@ -1137,7 +1148,7 @@ fn apply_projection(
     for item in projection {
         match item {
             SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                let idx = find_unique_column(&schema.columns, &ident.value)?
                     .ok_or_else(|| GnitzSqlError::Bind(
                         format!("column '{}' not found in projection", ident.value)
                     ))?;
@@ -1461,7 +1472,7 @@ pub fn execute_update(
 
     let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
 
-    let (table_id, schema) = binder.resolve(client, &table_name)?;
+    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
     // Bind SET assignments; reject any assignment to the PK column
     let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
@@ -1593,7 +1604,7 @@ pub fn execute_delete(
     }
     let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
 
-    let (table_id, schema) = binder.resolve(client, &table_name)?;
+    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
     match &del.selection {
         None => {
