@@ -16,6 +16,7 @@ pub mod type_code {
     pub const U128:   u8 = 12;
     pub const UUID:   u8 = 13;
     pub const BLOB:   u8 = 14;
+    pub const I128:   u8 = 15;
 }
 
 /// Typed column type code enum, mirroring the `type_code::*` constants.
@@ -40,6 +41,7 @@ pub enum TypeCode {
     U128   = type_code::U128,
     UUID   = type_code::UUID,
     Blob   = type_code::BLOB,
+    I128   = type_code::I128,
 }
 
 impl TypeCode {
@@ -69,6 +71,7 @@ impl TypeCode {
             tc::U128   => Some(TypeCode::U128),
             tc::UUID   => Some(TypeCode::UUID),
             tc::BLOB   => Some(TypeCode::Blob),
+            tc::I128   => Some(TypeCode::I128),
             _          => None,
         }
     }
@@ -80,7 +83,7 @@ impl TypeCode {
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
             TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
-            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob => 16,
+            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => 16,
         }
     }
 
@@ -104,13 +107,16 @@ impl TypeCode {
     /// region, and IEEE-754 floats break the byte-equal contract (-0.0/+0.0
     /// compare unequal byte-wise but equal numerically, and NaN bit patterns
     /// have no single canonical form). Allow-list (not deny-list) so new
-    /// variants are PK-ineligible until explicitly vetted.
+    /// variants are PK-ineligible until explicitly vetted. Integer scalars are
+    /// eligible: U8..U64, I8..I64, U128, UUID, I128 (the last produced only as a
+    /// cross-sign equijoin `_join_pk`, never via DDL).
     pub const fn is_pk_eligible(&self) -> bool {
         matches!(
             self,
             TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
                 | TypeCode::U128 | TypeCode::UUID
-                | TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64,
+                | TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
+                | TypeCode::I128,
         )
     }
 
@@ -169,11 +175,11 @@ pub fn is_german_string(tc: u8) -> bool {
 }
 
 /// Whether a raw wire type code is a *signed* fixed-width integer
-/// (I8/I16/I32/I64). The order-preserving encoders/comparators flip the sign
-/// bit for these so two's-complement negatives sort below non-negatives.
+/// (I8/I16/I32/I64/I128). The order-preserving encoders/comparators flip the
+/// sign bit for these so two's-complement negatives sort below non-negatives.
 /// Unsigned, float, string, and unknown codes are not signed.
 pub const fn is_signed_int(tc: u8) -> bool {
-    matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64)
+    matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 | type_code::I128)
 }
 
 /// Whether a raw wire type code is a fixed-width integer of ≤ 8 bytes
@@ -192,7 +198,11 @@ pub const fn is_fixed_int(tc: u8) -> bool {
 /// a raw `type_code` (mirrors the free `is_fixed_int`/`wire_stride`). See that
 /// method for the width policy and the engine ↔ planner lockstep it anchors.
 pub const fn reindex_output_type_code(tc: u8) -> u8 {
-    if is_fixed_int(tc) { tc } else { type_code::U128 }
+    // ≤8-byte ints and the signed-128 join key keep their own width-and-sign slot;
+    // every other wide/non-int type (U128/UUID, the STRING/BLOB hash, floats)
+    // collapses to the unsigned 16-byte U128 key.
+    if is_fixed_int(tc) || tc == type_code::I128 { tc }
+    else { type_code::U128 }
 }
 
 /// Common reindex output type code for an equijoin key pair, or `None` if the
@@ -234,22 +244,19 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     // would alias — and (b) at least as wide as the signed operand. The unsigned
     // side zero-extends and the signed side sign-extends into it
     // (`encode_pk_column_promoted`), so equal numeric values pack byte-identically.
-    // A U64 / U128 / UUID unsigned operand needs a signed-128 type that does not
-    // exist yet → None.
+    // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
+    // signed-256 type that does not exist → None.
     if is_routable_int(l) && is_routable_int(r) {
         let (s, u) = if is_signed_int(l) { (l, r) } else { (r, l) };
-        let wu = wire_stride(u);
-        if wu <= 4 {
-            // wu ∈ {1,2,4}: the narrowest strictly-wider signed width is 2*wu;
-            // widen further if the signed operand is wider still.
-            let common_w = (wu * 2).max(wire_stride(s));
-            return Some(match common_w {
-                2 => type_code::I16,
-                4 => type_code::I32,
-                8 => type_code::I64,
-                _ => unreachable!("cross-sign common width {common_w} not in {{2,4,8}}"),
-            });
-        }
+        let common_w = (wire_stride(u) * 2).max(wire_stride(s));
+        return match common_w {
+            2  => Some(type_code::I16),
+            4  => Some(type_code::I32),
+            8  => Some(type_code::I64),
+            16 => Some(type_code::I128),
+            // wu == 16 (U128/UUID) ⇒ common_w == 32: a signed-256 type, none exists.
+            _  => None,
+        };
     }
     None
 }
@@ -279,11 +286,11 @@ pub const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
 
 /// Whether a raw wire type code is any integer-valued fixed-width type that
 /// `payload_route_key` can encode as an order-preserving routing key:
-/// U8..U64, I8..I64, plus the 16-byte U128/UUID. The superset of `is_fixed_int`
-/// that also admits the wide integer types. Floats, strings, and blobs route via
-/// the content-hash path instead, so they are excluded.
+/// U8..U64, I8..I64, plus the 16-byte U128/UUID/I128. The superset of
+/// `is_fixed_int` that also admits the wide integer types. Floats, strings, and
+/// blobs route via the content-hash path instead, so they are excluded.
 pub const fn is_routable_int(tc: u8) -> bool {
-    is_fixed_int(tc) || matches!(tc, type_code::U128 | type_code::UUID)
+    is_fixed_int(tc) || matches!(tc, type_code::U128 | type_code::UUID | type_code::I128)
 }
 
 /// Wire stride (byte width) for a column type code.
@@ -294,7 +301,7 @@ pub const fn wire_stride(tc: u8) -> usize {
         3 | 4           => 2,   // U16, I16
         5..=7           => 4,   // U32, I32, F32
         8..=10          => 8,   // U64, I64, F64
-        11..=14           => 16,  // STRING, U128, UUID, BLOB
+        11..=15           => 16,  // STRING, U128, UUID, BLOB, I128
         _                 => 8,
     }
 }
@@ -325,6 +332,10 @@ mod tests {
             assert_eq!(tc.reindex_output_type(), TypeCode::U128, "{tc:?} collapses to U128");
             assert_eq!(reindex_output_type_code(tc as u8), type_code::U128);
         }
+        // I128 keeps width 16 WITH its sign (a signed-16 reindex slot), unlike the
+        // unsigned 16-byte types that collapse to U128.
+        assert_eq!(TypeCode::I128.reindex_output_type(), TypeCode::I128);
+        assert_eq!(reindex_output_type_code(type_code::I128), type_code::I128);
     }
 
     /// Every accepted same-sign-class ladder pair promotes to the wider type
@@ -336,6 +347,8 @@ mod tests {
             // signed ladder → wider signed
             (I8, I16, I16), (I8, I32, I32), (I8, I64, I64),
             (I16, I32, I32), (I16, I64, I64), (I32, I64, I64),
+            // signed ladder reaching the new 16-byte signed type
+            (I8, I128, I128), (I64, I128, I128), (I128, I128, I128),
             // unsigned ladder → wider unsigned
             (U8, U16, U16), (U8, U32, U32), (U8, U64, U64),
             (U16, U32, U32), (U16, U64, U64), (U32, U64, U64),
@@ -356,9 +369,10 @@ mod tests {
         }
     }
 
-    /// Cross-sign integer pairs whose unsigned operand is ≤ 4 bytes promote to the
-    /// narrowest signed type that faithfully holds both ranges: strictly wider than
-    /// the unsigned operand AND at least as wide as the signed operand. Symmetric.
+    /// Cross-sign integer pairs whose unsigned operand is ≤ 8 bytes (`U64`) promote
+    /// to the narrowest signed type that faithfully holds both ranges: strictly
+    /// wider than the unsigned operand AND at least as wide as the signed operand. A
+    /// `U64` unsigned side carries the pair to the new signed-128 type. Symmetric.
     #[test]
     fn join_key_common_type_accepts_cross_sign() {
         use type_code::*;
@@ -366,6 +380,8 @@ mod tests {
             (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
             (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
             (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
+            // U64 unsigned side ⇒ the signed-128 common type.
+            (U64, I8, I128), (U64, I16, I128), (U64, I32, I128), (U64, I64, I128),
         ];
         for &(u, s, t) in cases {
             assert_eq!(join_key_common_type(u, s), Some(t),
@@ -375,16 +391,19 @@ mod tests {
         }
     }
 
-    /// The surviving cross-sign reject contract: the unsigned operand is 64-bit or
-    /// wider (`U64`/`U128`/`UUID`), whose faithful common type is a signed-128 type
-    /// that does not exist yet. The one-sided string and float cases are screened
-    /// out earlier (in the planner) and are not this fn's job.
+    /// The surviving cross-sign reject contract: the unsigned operand is 128-bit
+    /// (`U128`/`UUID`), whose faithful common type is a signed-256 type that does
+    /// not exist. (A `U64` unsigned side now promotes to `I128` — see
+    /// `join_key_common_type_accepts_cross_sign`.) The one-sided string and float
+    /// cases are screened out earlier (in the planner) and are not this fn's job.
     #[test]
     fn join_key_common_type_rejects_wide_unsigned_cross_sign() {
         use type_code::*;
         let reject: &[(u8, u8)] = &[
-            (U64, I8), (U64, I16), (U64, I32), (U64, I64),
             (U128, I8), (U128, I64), (UUID, I32), (UUID, I64),
+            // a 128-bit unsigned side paired with the signed-128 type still has no
+            // faithful (signed-256) common type.
+            (U128, I128), (UUID, I128),
         ];
         for &(l, r) in reject {
             assert_eq!(join_key_common_type(l, r), None, "({l},{r}) must reject");
@@ -430,6 +449,9 @@ mod tests {
             (I8, I64), (I32, I32), (I32, I64), (U8, U64), (U32, U64),
             (U32, U128), (U64, U64), (STRING, U128), (U128, U128), (UUID, U128),
             (U8, I16), (U16, I32), (U32, I64), (I32, I64),
+            // cross-sign and same-sign promotions reaching the signed-128 slot:
+            // the unsigned U64 side and every signed side land on I128.
+            (U64, I128), (I8, I128), (I16, I128), (I32, I128), (I64, I128),
         ] {
             let carried = carried_reindex_tc(src, t);
             assert_eq!(resolve_reindex_type(src, carried), t,

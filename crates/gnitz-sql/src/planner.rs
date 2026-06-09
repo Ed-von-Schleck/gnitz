@@ -57,7 +57,7 @@ fn is_integer_type(tc: TypeCode) -> bool {
     matches!(tc,
         TypeCode::I8  | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
         | TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
-        | TypeCode::U128
+        | TypeCode::U128 | TypeCode::I128
     )
 }
 
@@ -1358,13 +1358,12 @@ fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzSqlError> {
 /// only join another German string: it reindexes to a 16-byte content hash, which
 /// is byte-incompatible with the native U128/UUID encoding even though both
 /// collapse to the U128 output type. The remaining pairs are resolved by
-/// `join_key_common_type`, which promotes integers of different widths (and now
-/// different sign classes, as long as the unsigned side is ≤ 4 bytes) to a common
-/// type that faithfully holds both ranges, so the two reindex sides co-partition
-/// byte-for-byte and the `_join_pk` catalog stride matches both. Only a cross-sign
-/// pair whose unsigned side is 64-bit or wider (`U64`/`U128`/`UUID`) stays
-/// rejected — its faithful common type is a signed-128 type that does not exist
-/// yet.
+/// `join_key_common_type`, which promotes integers of different widths (and
+/// different sign classes, as long as the unsigned side is ≤ 8 bytes (`U64`)) to a
+/// common type that faithfully holds both ranges, so the two reindex sides
+/// co-partition byte-for-byte and the `_join_pk` catalog stride matches both. Only
+/// a cross-sign pair whose unsigned side is 128-bit (`U128`/`UUID`) stays
+/// rejected — its faithful common type is a signed-256 type that does not exist.
 fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
     for col in [left, right] {
         reject_float_key(col, "JOIN ON")?;
@@ -1383,8 +1382,8 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
         .map(|t| t as u8)
         .ok_or_else(|| GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
-             a cross-sign pair whose unsigned side is 64-bit or wider (e.g. BIGINT UNSIGNED \
-             = BIGINT) needs signed-128 promotion and is not yet supported",
+             a cross-sign pair whose unsigned side is 128-bit (e.g. DECIMAL(38,0)/UUID \
+             joined with a signed integer) needs a signed-256 type that does not exist",
             left.name, left.type_code, right.name, right.type_code)))
 }
 
@@ -1673,7 +1672,8 @@ fn execute_create_group_by_view(
                             // them unreachable. CountNonNull only counts
                             // presence, so it accepts any type.
                             if matches!(func, AggFunc::Sum | AggFunc::Avg)
-                                && (!is_numeric || matches!(tc, TypeCode::U128 | TypeCode::UUID))
+                                && (!is_numeric || matches!(tc,
+                                    TypeCode::U128 | TypeCode::UUID | TypeCode::I128))
                             {
                                 return Err(GnitzSqlError::Bind(format!(
                                     "{:?} is not supported on column type {:?} ('{}')",
@@ -1683,7 +1683,7 @@ fn execute_create_group_by_view(
                         }
                         AggFunc::Min | AggFunc::Max => {
                             if matches!(tc, TypeCode::String | TypeCode::Blob
-                                | TypeCode::U128 | TypeCode::UUID) {
+                                | TypeCode::U128 | TypeCode::UUID | TypeCode::I128) {
                                 return Err(GnitzSqlError::Bind(format!(
                                     "{:?} is not supported on column type {:?} ('{}')",
                                     func, tc, source_schema.columns[c].name,
@@ -2697,8 +2697,10 @@ mod tests {
         let fl = vec![col("x", TypeCode::F64, false), col("y", TypeCode::U64, false)];
         assert!(matches!(extract("a.x = b.x", fl.clone(), fl).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
-        // Cross-sign pair U64 = I64 → Unsupported (needs signed-128 promotion).
-        let l = vec![col("x", TypeCode::U64, false)];
+        // Cross-sign pair U128 = I64 → Unsupported (needs a signed-256 type that
+        // does not exist). (U64 = I64 now promotes to I128 — see
+        // `extract_keys_cross_sign_u64_promotes`.)
+        let l = vec![col("x", TypeCode::U128, false)];
         let r = vec![col("x", TypeCode::I64, false)];
         assert!(matches!(extract("a.x = b.x", l, r).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
@@ -2739,7 +2741,7 @@ mod tests {
                                &col("b", TypeCode::U64, false)).unwrap(), TypeCode::U64 as u8);
         assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
                                &col("b", TypeCode::U128, false)).unwrap(), TypeCode::U128 as u8);
-        // Cross-sign pairs whose unsigned side is ≤ 4 bytes promote to the
+        // Cross-sign pairs whose unsigned side is ≤ 8 bytes (U64) promote to the
         // narrowest signed type holding both ranges.
         assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
                                &col("b", TypeCode::I64, false)).unwrap(), TypeCode::I64 as u8);
@@ -2751,6 +2753,11 @@ mod tests {
         // U32's full range).
         assert_eq!(validate_join_key_pair(&col("a", TypeCode::U32, false),
                                &col("b", TypeCode::I32, false)).unwrap(), TypeCode::I64 as u8);
+        // U64 cross-sign with any signed integer ⇒ the signed-128 common type.
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U64, false),
+                               &col("b", TypeCode::I64, false)).unwrap(), TypeCode::I128 as u8);
+        assert_eq!(validate_join_key_pair(&col("a", TypeCode::U64, false),
+                               &col("b", TypeCode::I8, false)).unwrap(), TypeCode::I128 as u8);
     }
 
     #[test]
@@ -2758,11 +2765,11 @@ mod tests {
         // Float column.
         assert!(validate_join_key_pair(&col("a", TypeCode::F64, false),
                                        &col("b", TypeCode::U64, false)).is_err());
-        // Cross-sign pair whose unsigned side is 64-bit or wider (would need a
-        // signed-128 promotion type that does not exist yet).
-        assert!(validate_join_key_pair(&col("a", TypeCode::U64, false),
-                                       &col("b", TypeCode::I64, false)).is_err());
+        // Cross-sign pair whose unsigned side is 128-bit (would need a signed-256
+        // type that does not exist). (U64 = I64 now promotes to I128.)
         assert!(validate_join_key_pair(&col("a", TypeCode::U128, false),
+                                       &col("b", TypeCode::I64, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::UUID, false),
                                        &col("b", TypeCode::I64, false)).is_err());
         // Mixed string/native — STRING = U128 both reindex to U128, so this is
         // caught *only* by the german-string check, not the common-type check.
@@ -2794,6 +2801,20 @@ mod tests {
         let r = vec![col("x", TypeCode::I64, false)];
         let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
         assert_eq!(tcs, vec![TypeCode::I64 as u8]);
+    }
+
+    /// BIGINT UNSIGNED (U64) cross-sign joined with any signed integer promotes to
+    /// the signed-128 common type `I128`, the new capability of this feature.
+    #[test]
+    fn extract_keys_cross_sign_u64_promotes() {
+        for signed in [TypeCode::I8, TypeCode::I16, TypeCode::I32, TypeCode::I64] {
+            let l = vec![col("x", TypeCode::U64, false)];
+            let r = vec![col("x", signed, false)];
+            let (lc, rc, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
+            assert_eq!((lc, rc), (vec![0], vec![0]));
+            assert_eq!(tcs, vec![TypeCode::I128 as u8],
+                "U64 = {signed:?} must promote to I128");
+        }
     }
 
     #[test]

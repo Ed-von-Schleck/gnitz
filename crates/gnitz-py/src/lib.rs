@@ -372,6 +372,10 @@ impl PyZSetBatch {
                 let v = extract_uuid_or_u128(val)?;
                 t.buf[off..off + 16].copy_from_slice(&v.to_le_bytes());
             }
+            TypeCode::I128 => {
+                let v = val.extract::<i128>()? as u128;
+                t.buf[off..off + 16].copy_from_slice(&v.to_le_bytes());
+            }
             _ => write_fixed_le_into(&mut t.buf[off..off + s], tc, val)?,
         }
         Ok(())
@@ -434,6 +438,11 @@ impl PyZSetBatch {
             TypeCode::U128 | TypeCode::UUID => {
                 if let ColData::U128s(v) = &mut self.batch.columns[ci] {
                     v.push(extract_uuid_or_u128(val)?);
+                }
+            }
+            TypeCode::I128 => {
+                if let ColData::U128s(v) = &mut self.batch.columns[ci] {
+                    v.push(val.extract::<i128>()? as u128);
                 }
             }
             tc => {
@@ -596,7 +605,7 @@ impl PyZSetBatch {
 
     #[getter]
     pub fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        pk_column_to_pylist(py, &self.batch.pks)
+        pk_column_to_pylist(py, &self.schema, &self.batch.pks)
     }
     #[getter]
     pub fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
@@ -671,7 +680,7 @@ fn write_fixed_le_into(dst: &mut [u8], tc: TypeCode, item: &Bound<'_, PyAny>) ->
         TypeCode::U64  => dst.copy_from_slice(&item.extract::<u64>()?.to_le_bytes()),
         TypeCode::I64  => dst.copy_from_slice(&item.extract::<i64>()?.to_le_bytes()),
         TypeCode::F64  => dst.copy_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob =>
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 =>
             unreachable!("handled before write_fixed_le_into"),
     }
     Ok(())
@@ -689,7 +698,7 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
 /// variants surface as `list[int]`; compound (`Bytes`) variants surface as
 /// `list[bytes]` — one packed PK region per row. Shared between PyZSetBatch
 /// and PyRustBatch so both surfaces report the same shape.
-fn pk_column_to_pylist(py: Python<'_>, pks: &PkColumn) -> PyResult<Py<PyList>> {
+fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, pks: &PkColumn) -> PyResult<Py<PyList>> {
     match pks {
         PkColumn::Bytes { stride, buf } => {
             let s = *stride as usize;
@@ -701,8 +710,17 @@ fn pk_column_to_pylist(py: Python<'_>, pks: &PkColumn) -> PyResult<Py<PyList>> {
             Ok(PyList::new(py, items)?.unbind())
         }
         _ => {
-            let vals: Vec<u128> = (0..pks.len()).map(|i| pks.get(i)).collect();
-            Ok(PyList::new(py, &vals)?.unbind())
+            // The non-Bytes variants are single-column PKs. A lone I128 PK is
+            // stored as u128 bits (U128s) but must surface as a signed int.
+            let signed = schema.pk_cols.len() == 1
+                && schema.columns[schema.pk_cols[0]].type_code == TypeCode::I128;
+            if signed {
+                let vals: Vec<i128> = (0..pks.len()).map(|i| pks.get(i) as i128).collect();
+                Ok(PyList::new(py, &vals)?.unbind())
+            } else {
+                let vals: Vec<u128> = (0..pks.len()).map(|i| pks.get(i)).collect();
+                Ok(PyList::new(py, &vals)?.unbind())
+            }
         }
     }
 }
@@ -728,6 +746,12 @@ fn pk_value_from_tuple(py: Python<'_>, schema: &Schema, col_idx: usize, t: &gnit
             u128::from_le_bytes(b)
                 .into_pyobject(py).unwrap().into_any().unbind()
         }
+        TypeCode::I128 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(bytes);
+            i128::from_le_bytes(b)
+                .into_pyobject(py).unwrap().into_any().unbind()
+        }
         _ => read_fixed_le(py, tc, bytes),
     }
 }
@@ -745,8 +769,21 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
         TypeCode::U64  => u64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::I64  => i64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
         TypeCode::F64  => f64::from_le_bytes(slice.try_into().unwrap()).into_pyobject(py).unwrap().into_any().unbind(),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob => unreachable!(),
+        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => unreachable!(),
     }
+}
+
+/// Surface one `ColData::U128s` element as the Python object its column type
+/// dictates. The three 16-byte integer types share u128 storage but differ at
+/// the surface: UUID → canonical string, I128 → signed int, everything else
+/// (U128) → unsigned int. Single source of truth for that decision across every
+/// read path (row build, batch columns, scan columns).
+fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<PyObject> {
+    Ok(match tc {
+        TypeCode::UUID => format_uuid(x).into_pyobject(py)?.into_any().unbind(),
+        TypeCode::I128 => (x as i128).into_pyobject(py)?.into_any().unbind(),
+        _              => x.into_pyobject(py)?.into_any().unbind(),
+    })
 }
 
 /// Convert a Rust ZSetBatch + Schema into a Python ZSetBatch (used by non-lazy scan/seek).
@@ -771,13 +808,11 @@ fn rust_batch_to_py(
 /// Per-column decode metadata, every field a pure function of the `Schema`.
 /// Computed once via [`ColLayout::for_schema`] and reused across every row of a
 /// batch, hoisting the schema lookups out of the per-row build loop. Naming the
-/// bundle (rather than scattering four parallel `Vec`s) keeps it the single place
+/// bundle (rather than scattering parallel `Vec`s) keeps it the single place
 /// the derivation lives — and the obvious place to memoize per cached schema if
 /// the per-batch recompute ever shows up in a profile.
 #[derive(Default)]
 struct ColLayout {
-    /// `type_code == UUID`, per column.
-    is_uuid:     Vec<bool>,
     /// `schema.is_pk_col(ci)`, per column.
     is_pk:       Vec<bool>,
     /// `schema.payload_idx(ci)` for non-PK cols; 0 for PK cols (unused).
@@ -792,7 +827,6 @@ impl ColLayout {
         let payload_idx: Vec<usize> = (0..s.columns.len())
             .map(|ci| if is_pk[ci] { 0 } else { s.payload_idx(ci) }).collect();
         ColLayout {
-            is_uuid: s.columns.iter().map(|c| c.type_code == TypeCode::UUID).collect(),
             is_pk,
             payload_idx,
             wire_stride: s.columns.iter().map(|c| c.type_code.wire_stride()).collect(),
@@ -839,7 +873,7 @@ fn make_shared_batch_data(
 }
 
 /// Build Python values for a single row from Rust data, appending to `out`. The
-/// per-column metadata (PK/UUID flags, payload index, wire stride) and the schema
+/// per-column metadata (PK flag, payload index, wire stride) and the schema
 /// + batch all live in `data`, so it is threaded as one borrow rather than seven.
 fn build_row_values_into(
     py:   Python<'_>,
@@ -879,11 +913,7 @@ fn build_row_values_into(
                         None    => out.push(py.None()),
                     },
                     ColData::U128s(v) => {
-                        if layout.is_uuid[ci] {
-                            out.push(format_uuid(v[row]).into_pyobject(py)?.into_any().unbind());
-                        } else {
-                            out.push(v[row].into_pyobject(py)?.into_any().unbind());
-                        }
+                        out.push(u128_value_to_py(py, v[row], schema.columns[ci].type_code)?);
                     }
                 }
             }
@@ -914,7 +944,7 @@ impl PyRustBatch {
         if let Some(ref cached) = self.cached_pks {
             return Ok(cached.clone_ref(py));
         }
-        let list = pk_column_to_pylist(py, &self.data.batch.pks)?;
+        let list = pk_column_to_pylist(py, &self.data.schema, &self.data.batch.pks)?;
         self.cached_pks = Some(list.clone_ref(py));
         Ok(list)
     }
@@ -996,15 +1026,9 @@ fn rust_batch_columns_to_py(
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
             ColData::U128s(v) => {
-                let is_uuid = col_def.type_code == TypeCode::UUID;
+                let tc = col_def.type_code;
                 let items: Vec<PyObject> = v.iter()
-                    .map(|&x| {
-                        if is_uuid {
-                            Ok(format_uuid(x).into_pyobject(py)?.into_any().unbind())
-                        } else {
-                            Ok(x.into_pyobject(py)?.into_any().unbind())
-                        }
-                    })
+                    .map(|&x| u128_value_to_py(py, x, tc))
                     .collect::<PyResult<_>>()?;
                 col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
@@ -1229,17 +1253,13 @@ impl PyScanResult {
                 Ok(PyList::new(py, items)?.unbind())
             }
             ColData::U128s(v) => {
-                let is_uuid = data.schema.columns[col_idx].type_code == TypeCode::UUID;
+                let tc = data.schema.columns[col_idx].type_code;
                 let items: Vec<PyObject> = v.iter().enumerate()
                     .map(|(i, &x)| {
                         if nulls[i] & null_bit != 0 {
                             return Ok(py.None());
                         }
-                        if is_uuid {
-                            Ok(format_uuid(x).into_pyobject(py)?.into_any().unbind())
-                        } else {
-                            Ok(x.into_pyobject(py)?.into_any().unbind())
-                        }
+                        u128_value_to_py(py, x, tc)
                     })
                     .collect::<PyResult<_>>()?;
                 Ok(PyList::new(py, items)?.unbind())

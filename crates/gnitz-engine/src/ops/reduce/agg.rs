@@ -370,7 +370,8 @@ fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
             i64::from_le_bytes(bytes[..8].try_into().unwrap()),
         TypeCode::String =>
             i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob =>
+        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob
+        | TypeCode::I128 =>
             unreachable!("decode_signed: non-integer/string type"),
     }
 }
@@ -385,7 +386,8 @@ fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
             f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
         TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
         TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob =>
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob |
+        TypeCode::I128 =>
             unreachable!("decode_float: non-float type"),
     }
 }

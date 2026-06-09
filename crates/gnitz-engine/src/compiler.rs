@@ -910,7 +910,7 @@ fn build_reduce_output_schema(
 }
 
 fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob)
+    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128)
 }
 
 /// AVI stores the group key as a fixed-width byte prefix. A group key is
@@ -930,12 +930,10 @@ fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
         if col.nullable != 0 {
             return false;
         }
-        if !matches!(
-            TypeCode::from_validated_u8(col.type_code),
-            TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
-            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
-            TypeCode::U128 | TypeCode::UUID
-        ) {
+        // A byte-prefix group key is exactly a valid PK-column type: fixed-width,
+        // non-float, byte-comparable. Reuse the single PK-eligibility predicate
+        // rather than re-listing the variants here.
+        if !TypeCode::from_validated_u8(col.type_code).is_pk_eligible() {
             return false; // STRING / BLOB / F32 / F64 — fall back to trace scan
         }
         stride += col.size() as usize;

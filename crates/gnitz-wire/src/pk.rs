@@ -184,6 +184,33 @@ mod tests {
         assert!(mk(256) < mk(u64::MAX));
     }
 
+    #[test]
+    fn decode_pk_column_roundtrips_i128() {
+        // The signed-128 join-key type: every value (including bit-127 negatives)
+        // must survive encode→decode, and the 2^63/2^64 boundaries that
+        // distinguish a U64 image from an I64 image round-trip too.
+        for v in [
+            i128::MIN, -1i128, 0, 1, i128::MAX,
+            1i128 << 63, (1i128 << 63) - 1, 1i128 << 64, (1i128 << 64) - 1,
+        ] {
+            roundtrip(type_code::I128, &v.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn opk_order_equiv_signed_i128() {
+        // -3 < -1 < 2 < 2^64 must hold byte-lexicographically after I128 encoding
+        // (the signed sign-flip puts negatives below non-negatives at 16-byte width).
+        let mk = |v: i128| {
+            let mut o = [0u8; 16];
+            encode_pk_column(&v.to_le_bytes(), type_code::I128, &mut o);
+            o
+        };
+        assert!(mk(-3) < mk(-1));
+        assert!(mk(-1) < mk(2));
+        assert!(mk(2) < mk(1i128 << 64));
+    }
+
     /// `encode_pk_column_promoted` with `src_tc == target_tc` is exactly
     /// `encode_pk_column` — the identity / back-compat path.
     #[test]
@@ -192,6 +219,7 @@ mod tests {
             (type_code::I8, 1usize), (type_code::I16, 2), (type_code::I32, 4),
             (type_code::I64, 8), (type_code::U8, 1), (type_code::U16, 2),
             (type_code::U32, 4), (type_code::U64, 8), (type_code::U128, 16),
+            (type_code::I128, 16),
         ] {
             for v in [0i128, 1, -1, 127, -128, i64::MIN as i128, i64::MAX as i128] {
                 let le = v.to_le_bytes();
@@ -257,12 +285,14 @@ mod tests {
 
     #[test]
     fn cross_sign_copartitions() {
-        use type_code::{I8, I16, I32, I64, U8, U16, U32};
-        // (unsigned ≤4B, signed, promoted T) — the full in-scope acceptance table.
+        use type_code::{I8, I16, I32, I64, I128, U8, U16, U32, U64};
+        // (unsigned ≤8B, signed, promoted T) — the full in-scope acceptance table.
+        // The U64 rows exercise the new signed-128 target at 16-byte width.
         let cases = [
             (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
             (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
             (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
+            (U64, I8, I128), (U64, I16, I128), (U64, I32, I128), (U64, I64, I128),
         ];
         for (u, s, t) in cases {
             // Equal logical values representable on BOTH sides (the overlap

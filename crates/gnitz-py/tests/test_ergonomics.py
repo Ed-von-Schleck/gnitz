@@ -46,7 +46,7 @@ class TestTypeCode:
     def test_all_values_present(self):
         assert {tc.name for tc in TypeCode} == {
             "U8", "I8", "U16", "I16", "U32", "I32", "F32",
-            "U64", "I64", "F64", "STRING", "U128", "UUID", "BLOB",
+            "U64", "I64", "F64", "STRING", "U128", "UUID", "BLOB", "I128",
         }
 
     def test_blob_constant(self):

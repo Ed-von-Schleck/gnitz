@@ -1216,6 +1216,7 @@ mod tests {
             Just(type_code::I64), Just(type_code::F64),
             Just(type_code::U128), Just(type_code::UUID),
             Just(type_code::STRING), Just(type_code::BLOB),
+            Just(type_code::I128),
         ]
     }
 

@@ -218,7 +218,14 @@ pub enum PkColumn {
 
 impl PkColumn {
     pub fn for_type(tc: TypeCode) -> Self {
-        if tc == TypeCode::U128 || tc == TypeCode::UUID { PkColumn::U128s(vec![]) } else { PkColumn::U64s(vec![]) }
+        // I128 (a cross-sign `_join_pk`) is a 16-byte key: store its native bits
+        // as u128 like U128/UUID; the signed interpretation happens only at the
+        // value-surfacing boundary (gnitz-py).
+        if tc == TypeCode::U128 || tc == TypeCode::UUID || tc == TypeCode::I128 {
+            PkColumn::U128s(vec![])
+        } else {
+            PkColumn::U64s(vec![])
+        }
     }
     pub fn len(&self) -> usize {
         match self {
@@ -572,7 +579,7 @@ impl ZSetBatch {
                 match col.type_code {
                     TypeCode::String => ColData::Strings(vec![]),
                     TypeCode::Blob => ColData::Bytes(vec![]),
-                    TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![]),
+                    TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
                     _                => ColData::Fixed(vec![]),
                 }
             }

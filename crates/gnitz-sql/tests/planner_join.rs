@@ -146,19 +146,34 @@ fn test_join_accept_cross_sign_narrow() {
     assert!(client.resolve_table_or_view_id(&sn, "w").is_ok(), "view should be registered");
 }
 
-/// Planner rejection: a cross-sign integer pair whose unsigned side is 64-bit or
-/// wider (`BIGINT UNSIGNED` = `BIGINT`, i.e. U64 = I64). Its faithful common type
-/// is a signed-128 type that does not exist yet, so the join is rejected at
-/// CREATE. (Narrow cross-sign pairs whose unsigned side is `U8`/`U16`/`U32` — like
-/// `INT UNSIGNED` = `BIGINT` — are now accepted via per-pair promotion; only the
-/// 64-bit+ unsigned side is deferred.)
+/// Planner acceptance: a cross-sign pair whose unsigned side is `U64`
+/// (`BIGINT UNSIGNED` = `BIGINT`, i.e. U64 = I64). Its faithful common type is the
+/// signed-128 type `I128`; the pair promotes to it and co-partitions byte-for-byte,
+/// so CREATE VIEW succeeds and the view resolves.
+#[test]
+fn test_join_accept_cross_sign_u64() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
+
+    let r = p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk");
+    assert!(r.is_ok(), "cross-sign join (U64 = I64) should be accepted: {:?}", r.err());
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_ok(), "view should be registered");
+}
+
+/// Planner rejection: the surviving cross-sign reject — the unsigned side is
+/// 128-bit (`DECIMAL(38,0)`/`UUID` = a signed integer). Its faithful common type
+/// is a signed-256 type that does not exist, so the join is rejected at CREATE.
 #[test]
 fn test_join_reject_cross_sign() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk DECIMAL(38,0) NOT NULL)").unwrap();
     p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
 
     let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk"));

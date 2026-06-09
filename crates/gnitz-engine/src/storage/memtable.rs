@@ -947,6 +947,33 @@ mod tests {
         assert_eq!(u128_hi, 0xCAFEBABE);
     }
 
+    /// An I128 payload column (a cross-sign `_join_pk` surfaced into a payload
+    /// slot) round-trips through the lo/hi split in `append_row_simple`. Guards
+    /// against the pre-fix `_` arm, which sliced `[u8;8][..16]` (OOB panic).
+    #[test]
+    fn test_append_row_simple_i128_payload() {
+        let schema = make_schema_cols(&[
+            (type_code::U64, 0),   // pk
+            (type_code::I128, 0),  // pi 0: I128 payload
+        ], 0);
+        let mut batch = Batch::with_schema(schema, 1);
+        // A negative value with bits in both halves: bit 127 set. The I128 column
+        // is the first (and only) payload column, so lo/hi are indexed at pi = 0.
+        let v: i128 = -0x0123_4567_89AB_CDEF_1122_3344_5566_7788;
+        let bits = v as u128;
+        let lo = vec![(bits as u64) as i64];
+        let hi = vec![(bits >> 64) as u64];
+        let ptrs = vec![std::ptr::null::<u8>(); 1];
+        let lens = vec![0u32; 1];
+        unsafe {
+            batch.append_row_simple(7, 1, 0, &lo, &hi, &ptrs, &lens);
+        }
+        assert_eq!(batch.count, 1);
+        let stored = batch.get_col_ptr(0, 0, 16);
+        let got = i128::from_le_bytes(stored.try_into().unwrap());
+        assert_eq!(got, v, "I128 payload must round-trip through the lo/hi split");
+    }
+
     /// Verify that `append_row` substitutes an empty string when the
     /// declared length would read past the end of `blob_src`. This matches
     /// `relocate_string_cell` and prevents silent corruption from emitting

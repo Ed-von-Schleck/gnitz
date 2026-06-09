@@ -9,6 +9,7 @@ use crate::schema::{
     compare_german_strings, read_signed, SchemaDescriptor,
     type_code::{
         BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64,
+        I128 as TYPE_I128,
         STRING as TYPE_STRING,
         U8 as TYPE_U8, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64,
         U128 as TYPE_U128, UUID as TYPE_UUID,
@@ -71,6 +72,16 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
                 let bb = src_b.get_col_ptr(row_b, payload_col, 16);
                 let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
                 let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
+                va.cmp(&vb)
+            }
+            TYPE_I128 => {
+                // A cross-sign `_join_pk` surfaced into a payload slot. Stored
+                // native-LE like U128, but ordered as a signed two's-complement
+                // value — reuse the U128 double-load idiom, then compare as i128.
+                let ba = src_a.get_col_ptr(row_a, payload_col, 16);
+                let bb = src_b.get_col_ptr(row_b, payload_col, 16);
+                let va = (((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128)) as i128;
+                let vb = (((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128)) as i128;
                 va.cmp(&vb)
             }
             TYPE_U64 => {
@@ -444,6 +455,31 @@ mod tests {
         let batch = single_col_batch(&[0, 0], col0);
         // 1 < (1 << 64)
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
+    }
+
+    /// A 16-byte I128 payload column (a cross-sign `_join_pk` surfaced into a
+    /// payload slot) must order as a SIGNED two's-complement value: -1 < 0 < 1.
+    /// The pre-fix wildcard arm hit `read_signed(.., 16)` => unreachable!, and an
+    /// unsigned-u128 reading would sort -1 (= u128::MAX bits) above 0 and 1.
+    #[test]
+    fn test_compare_rows_i128_signed() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I128, 0),
+            ],
+            &[0],
+        );
+        let mut col0 = Vec::new();
+        for v in [-1i128, 0, 1] {
+            col0.extend_from_slice(&v.to_le_bytes());
+        }
+        let batch = single_col_batch(&[0, 0, 0], col0);
+        // -1 < 0 < 1 (signed), not unsigned (where -1's bits = u128::MAX > 0, 1).
+        assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
+        assert_eq!(compare_rows(&schema, &batch, 1, &batch, 2), Ordering::Less);
+        assert_eq!(compare_rows(&schema, &batch, 0, &batch, 2), Ordering::Less);
+        assert_eq!(compare_rows(&schema, &batch, 2, &batch, 0), Ordering::Greater);
     }
 
     // Item 10: distinct UUID payloads must not collapse to Equal. The wildcard
@@ -838,6 +874,11 @@ mod tests {
                     let vb = u128::from_le_bytes(b[off..off + 16].try_into().unwrap());
                     va.cmp(&vb)
                 }
+                type_code::I128 => {
+                    let va = i128::from_le_bytes(a[off..off + 16].try_into().unwrap());
+                    let vb = i128::from_le_bytes(b[off..off + 16].try_into().unwrap());
+                    va.cmp(&vb)
+                }
                 type_code::U64 | type_code::U32 | type_code::U16 | type_code::U8 => {
                     use crate::schema::read_unsigned;
                     read_unsigned(&a[off..], cs).cmp(&read_unsigned(&b[off..], cs))
@@ -892,6 +933,29 @@ mod tests {
             cmp_pk_le(&s, &1u64.to_le_bytes(), &256u64.to_le_bytes()),
             Ordering::Less,
         );
+    }
+
+    /// A single I128 PK column: the OPK memcmp order at rest must equal the typed
+    /// SIGNED i128 order, across the sign boundary and the 2^63/2^64 width
+    /// boundaries that distinguish a U64 image from an I64 image.
+    #[test]
+    fn compare_pk_bytes_single_i128() {
+        let s = pk_only_schema(&[type_code::I128]);
+        let vals: [i128; 7] = [
+            i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX,
+        ];
+        for i in 0..vals.len() {
+            for j in 0..vals.len() {
+                let a = vals[i].to_le_bytes();
+                let b = vals[j].to_le_bytes();
+                assert_eq!(
+                    cmp_pk_le(&s, &a, &b),
+                    vals[i].cmp(&vals[j]),
+                    "I128 PK order mismatch at ({i}, {j})",
+                );
+                assert_opk_equivalence(&s, &a, &b);
+            }
+        }
     }
 
     #[test]

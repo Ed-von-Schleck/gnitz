@@ -16,6 +16,10 @@ pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Orderi
     match tc {
         TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(a.try_into().unwrap())
             .cmp(&u128::from_le_bytes(b.try_into().unwrap())),
+        // I128 payload (a cross-sign `_join_pk` surfaced into a payload slot) is
+        // stored native-LE and compares as a signed two's-complement value.
+        TypeCode::I128 => i128::from_le_bytes(a.try_into().unwrap())
+            .cmp(&i128::from_le_bytes(b.try_into().unwrap())),
         TypeCode::F64 => f64::from_le_bytes(a.try_into().unwrap())
             .total_cmp(&f64::from_le_bytes(b.try_into().unwrap())),
         TypeCode::F32 => f32::from_le_bytes(a.try_into().unwrap())
@@ -354,6 +358,9 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
         TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
         | TypeCode::U128 | TypeCode::UUID | TypeCode::String => e,
         TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
+        TypeCode::I128 => unreachable!(
+            "I128 is excluded from the AVI by agg_value_idx_eligible (16-byte value \
+             cannot order-encode into the 8-byte slot)"),
     }
 }
 

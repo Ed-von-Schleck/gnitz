@@ -16,3 +16,4 @@ class TypeCode(IntEnum):
     U128   = 12
     UUID   = 13
     BLOB   = 14
+    I128   = 15

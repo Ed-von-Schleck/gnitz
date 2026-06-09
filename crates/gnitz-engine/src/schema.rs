@@ -564,7 +564,8 @@ pub(crate) fn payload_route_key(
     match TypeCode::from_validated_u8(type_code_val) {
         TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
         TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16
-        | TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 => {
+        | TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
+        | TypeCode::I128 => {
             let mut opk = [0u8; 16];
             gnitz_wire::encode_pk_column(src, type_code_val, &mut opk[..col_size]);
             gnitz_wire::widen_pk_be(&opk[..col_size], col_size)
@@ -616,7 +617,7 @@ pub(crate) fn payload_native_key(
         col_data.len(), offset + col_size,
     );
     match TypeCode::from_validated_u8(type_code_val) {
-        TypeCode::U128 | TypeCode::UUID => {
+        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
             u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
         }
         _ => {

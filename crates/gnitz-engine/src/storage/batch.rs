@@ -1256,7 +1256,7 @@ impl Batch {
                         let f32_val = f64_val as f32;
                         self.extend_col(pi, &f32_val.to_le_bytes());
                     }
-                    crate::schema::type_code::U128 => {
+                    crate::schema::type_code::U128 | crate::schema::type_code::I128 => {
                         let mut bytes = [0u8; 16];
                         bytes[..8].copy_from_slice(&(lo_values[pi] as u64).to_le_bytes());
                         bytes[8..].copy_from_slice(&hi_values[pi].to_le_bytes());

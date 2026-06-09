@@ -82,7 +82,7 @@ pub(super) fn validate_pk_cols(
         let cd = &col_defs[c as usize];
         if !gnitz_wire::is_pk_eligible(cd.type_code) {
             return Err(format!(
-                "Primary Key must be a fixed-width integer, U128, or UUID column; \
+                "Primary Key must be a fixed-width integer, U128, UUID, or I128 column; \
                  got type_code={} (String, Blob, and float columns cannot be PK)",
                 cd.type_code
             ));

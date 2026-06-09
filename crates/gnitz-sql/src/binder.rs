@@ -240,7 +240,8 @@ impl<'a> Binder<'a> {
                                         let arg_ty = bound.infer_type(schema);
                                         if matches!(arg_ty,
                                             TypeCode::U128 | TypeCode::UUID
-                                            | TypeCode::Blob | TypeCode::String)
+                                            | TypeCode::Blob | TypeCode::String
+                                            | TypeCode::I128)
                                         {
                                             return Err(GnitzSqlError::Unsupported(
                                                 format!("{}: not supported on {:?} columns",
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn test_binder_rejects_min_max_unsupported_types() {
         let binder = Binder::new("s");
-        for &tc in &[TypeCode::U128, TypeCode::UUID, TypeCode::Blob, TypeCode::String] {
+        for &tc in &[TypeCode::U128, TypeCode::UUID, TypeCode::Blob, TypeCode::String, TypeCode::I128] {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
                 let expr = parse(&format!("{}(c)", fname));

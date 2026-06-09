@@ -130,11 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_type_code_15() {
-        // 15 is the first unassigned type-code value after BLOB (14).
+    fn test_unknown_type_code_16() {
+        // 16 is the first unassigned type-code value after I128 (15).
         use crate::protocol::error::ProtocolError;
         use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(type_code_from_u64(15), Err(ProtocolError::UnknownTypeCode(15))));
+        assert!(matches!(type_code_from_u64(16), Err(ProtocolError::UnknownTypeCode(16))));
     }
 
     #[test]

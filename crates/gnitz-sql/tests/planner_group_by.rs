@@ -141,6 +141,29 @@ fn test_min_uuid_rejected() {
         "expected clean rejection, got {:?}", err);
 }
 
+/// A GROUP BY over a cross-sign `U64 = I64` join view aggregates its `_join_pk`,
+/// which is the signed-128 type `I128`. A 16-byte value cannot be order-encoded
+/// into the AVI slot or accumulated in the 64-bit aggregate slot, so MIN/MAX/SUM/
+/// AVG over it must be rejected cleanly at bind time — this guards the engine's
+/// `decode_signed(I128)` / `decode_float(I128)` `unreachable!` panics.
+#[test]
+fn test_agg_i128_join_pk_rejected() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)").unwrap();
+    // The join's `_join_pk` is I128 (the cross-sign common type).
+    p.execute("CREATE VIEW jv AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.fk = b.fk").unwrap();
+    for func in ["MIN", "MAX", "SUM", "AVG"] {
+        let err = must_err(p.execute(&format!(
+            "CREATE VIEW v_{func} AS SELECT aid, {func}(_join_pk) AS x FROM jv GROUP BY aid"
+        )));
+        assert!(matches!(err, GnitzSqlError::Bind(_) | GnitzSqlError::Unsupported(_)),
+            "expected clean rejection for {func}(_join_pk:I128), got {:?}", err);
+    }
+}
+
 // ── item 12 + 34: float SUM and AVG ──────────────────────────────────
 
 #[test]

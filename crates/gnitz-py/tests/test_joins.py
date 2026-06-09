@@ -747,16 +747,17 @@ class TestJoins:
             _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
 
     def test_join_cross_sign_rejected(self, client):
-        """A cross-sign integer key whose UNSIGNED side is 64-bit or wider
-        (BIGINT UNSIGNED = BIGINT, i.e. U64 = I64) cannot co-partition without a
-        signed-128 promotion type that does not exist yet, so CREATE VIEW fails
-        with a clear planner error. (Narrow cross-sign pairs whose unsigned side is
-        U8/U16/U32 are accepted — see test_inner_join_cross_sign_key.)"""
+        """The surviving cross-sign reject: a key whose UNSIGNED side is 128-bit
+        (DECIMAL(38,0) = BIGINT, i.e. U128 = I64) would need a signed-256 type that
+        does not exist, so CREATE VIEW fails with a clear planner error. (Cross-sign
+        pairs whose unsigned side is U8/U16/U32 promote to a wider signed type, and
+        U64 promotes to the signed-128 type I128 — both accepted; see
+        test_inner_join_cross_sign_key and test_i128_cross_sign_join.)"""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT UNSIGNED NOT NULL)",
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k DECIMAL(38,0) NOT NULL)",
                 schema_name=sn,
             )
             client.execute_sql(

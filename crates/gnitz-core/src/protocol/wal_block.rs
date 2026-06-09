@@ -65,16 +65,17 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
         }
         PkColumn::U128s(v) => {
             debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
-            // U128 and UUID are always unsigned; OPK == big-endian, no sign flip.
-            // `to_be_bytes()` is the owned value (no stack temp to elide), but
-            // pre-sizing and writing in place matches the sibling branches and
-            // drops the per-row `extend_from_slice` grow path.
+            // A lone 16-byte PK is U128/UUID (unsigned: OPK == big-endian) or I128
+            // (signed: OPK == big-endian with the leading sign bit flipped). Encode
+            // via encode_pk_column so the flip is applied for I128; for the unsigned
+            // types it is byte-identical to the prior `x.to_be_bytes()`.
+            let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
             let aligned = align8(buf.len());
             let total = v.len() * 16;
             buf.resize(aligned + total, 0);
             let mut w = aligned;
             for &x in v {
-                buf[w..w + 16].copy_from_slice(&x.to_be_bytes());
+                gnitz_wire::encode_pk_column(&x.to_le_bytes(), pk_tc, &mut buf[w..w + 16]);
                 w += 16;
             }
             (aligned as u32, total as u32)
@@ -215,10 +216,10 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 }
                 col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
-            TypeCode::U128 | TypeCode::UUID => {
+            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
                 let vals = match &batch.columns[ci] {
                     ColData::U128s(v) => v,
-                    _ => panic!("encode_wal_block: expected U128s for U128/UUID column {}", ci),
+                    _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {}", ci),
                 };
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for &v in vals {
@@ -437,14 +438,19 @@ pub fn decode_wal_block(
         }
         PkColumn::U64s(v)
     } else {
-        // U128 / UUID: always unsigned, OPK == big-endian. Swap back to native LE.
+        // Lone 16-byte PK: U128/UUID (unsigned) or I128 (signed). decode_pk_column
+        // reverses both — a plain byte-swap for the unsigned types (identical to the
+        // prior from_be_bytes) and a byte-swap plus sign-flip for I128.
+        let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
+        let mut le = [0u8; 16];
         for i in 0..count {
             let base = pk_off + i * 16;
             if base + 16 > total_size {
                 return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
             }
-            v.push(u128::from_be_bytes(data[base..base + 16].try_into().unwrap()));
+            gnitz_wire::decode_pk_column(&data[base..base + 16], pk_tc, &mut le);
+            v.push(u128::from_le_bytes(le));
         }
         PkColumn::U128s(v)
     };
@@ -536,11 +542,11 @@ pub fn decode_wal_block(
                 }
                 columns.push(ColData::Bytes(vals));
             }
-            TypeCode::U128 | TypeCode::UUID => {
+            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
                 let expected_sz = count * 16;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "U128/UUID column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
+                        "U128/UUID/I128 column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
                     )));
                 }
                 let mut vals: Vec<u128> = Vec::with_capacity(count);
@@ -789,6 +795,68 @@ mod tests {
         match &decoded.columns[1] {
             ColData::U128s(got) => assert_eq!(got, &vals),
             _ => panic!("expected U128s"),
+        }
+    }
+
+    /// A schema whose lone PK column is the signed-128 join-key type `I128`,
+    /// with a second I128 payload column (the `SELECT _join_pk AS dup` shape).
+    fn i128_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::I128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(),  type_code: TypeCode::I128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// Wide single-column I128 PK + payload round-trip. Pre-fix, the PK decode took
+    /// the raw `from_be_bytes` "always unsigned" shortcut, so a signed key came back
+    /// off by 2^127 (e.g. -1 → 2^127 - 1). The §4.6.1 OPK round-trip fixes that; the
+    /// payload arm grouping fixes the `Fixed`-fallthrough. Both must surface the
+    /// exact signed bits across the sign and 2^63/2^64 width boundaries.
+    #[test]
+    fn test_encode_decode_i128_signed_roundtrip() {
+        // for_type must pick U128s (16-byte storage), not the U64s truncation that
+        // produced "weights length != row count".
+        assert!(matches!(PkColumn::for_type(TypeCode::I128), PkColumn::U128s(_)));
+
+        let schema = i128_schema();
+        let signed: Vec<i128> = vec![
+            i128::MIN, -1, 0, 1, i128::MAX,
+            1i128 << 63, (1i128 << 63) - 1, 1i128 << 64, (1i128 << 64) - 1,
+        ];
+        // PkColumn / ColData::U128s hold the native bits as u128.
+        let bits: Vec<u128> = signed.iter().map(|&x| x as u128).collect();
+        let n = bits.len();
+
+        let batch = ZSetBatch {
+            pks: PkColumn::U128s(bits.clone()),
+            weights: vec![1; n],
+            nulls: vec![0; n],
+            columns: vec![ColData::Fixed(vec![]), ColData::U128s(bits.clone())],
+        };
+
+        let encoded = encode_wal_block(&schema, 3, &batch);
+        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        assert_eq!(tid, 3);
+
+        // (a) No PK-variant drift: a lone 16-byte PK stays U128s.
+        let pk_bits = match &decoded.pks {
+            PkColumn::U128s(v) => v,
+            other => panic!("I128 PK must decode to U128s, got {other:?}"),
+        };
+        // (b) Each signed value survives — reinterpret the recovered bits as i128.
+        let got_pk: Vec<i128> = pk_bits.iter().map(|&x| x as i128).collect();
+        assert_eq!(got_pk, signed, "I128 PK sign-flip must round-trip");
+
+        // The I128 payload arm must decode to U128s with the exact native bits.
+        match &decoded.columns[1] {
+            ColData::U128s(got) => {
+                let got_signed: Vec<i128> = got.iter().map(|&x| x as i128).collect();
+                assert_eq!(got_signed, signed, "I128 payload must round-trip");
+            }
+            other => panic!("I128 payload must decode to U128s, got {other:?}"),
         }
     }
 
