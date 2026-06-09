@@ -18,8 +18,8 @@ impl CatalogEngine {
         bb.end_row();
         let batch = bb.finish();
 
-        // Ingest into schemas family (triggers hook)
-        self.ingest_to_family(SCHEMA_TAB_ID, &batch)?;
+        // Submit the schemas-family delta (triggers hook).
+        self.submit(SysFamily::Schema, batch)?;
 
         self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
         Ok(())
@@ -55,7 +55,7 @@ impl CatalogEngine {
         bb.end_row();
         let batch = bb.finish();
 
-        self.ingest_to_family(SCHEMA_TAB_ID, &batch)?;
+        self.submit(SysFamily::Schema, batch)?;
         Ok(())
     }
 
@@ -186,7 +186,7 @@ impl CatalogEngine {
             bb.put_u64(flags);
             bb.end_row();
             let batch = bb.finish();
-            self.ingest_to_family(TABLE_TAB_ID, &batch)?;
+            self.submit(SysFamily::Table, batch)?;
         }
 
         self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
@@ -202,12 +202,12 @@ impl CatalogEngine {
         let tid = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
-        let schema = table_tab_schema();
-        let batch = retract_single_row(&self.sys_tables, &schema, tid as u128);
-        if batch.count == 0 {
-            return Err(format!("Table does not exist: {}", qualified));
-        }
-        self.ingest_to_family(TABLE_TAB_ID, &batch)
+        // Retract only the TABLE_TAB row. Its -1 fires hook_table_register,
+        // which cascades cascade_retract_indices + cascade_retract_columns. The
+        // cascade lives in the hook (not inline) so WAL replay and worker sync —
+        // which re-apply the -1 without calling drop_table — clean up
+        // identically.
+        self.submit_retraction(SysFamily::Table, tid as u128)
     }
 
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
@@ -220,26 +220,17 @@ impl CatalogEngine {
 
         self.dag.invalidate(vid);
 
-        // Remove the view's dependency rows from sys_view_deps first. dag.dep_map
-        // is rebuilt by scanning sys_view_deps; ghost entries for a dropped view
-        // would accumulate and force re-evaluation of dead dependencies on every
-        // upstream change. Route through ingest_to_family so dep retractions
-        // enter pending_broadcasts and are visible to compensate_stage_a rollback.
-        let dep_batch = retract_rows_by_view(&self.sys_view_deps, &dep_tab_schema(), vid as u64);
-        if dep_batch.count > 0 {
-            self.ingest_to_family(DEP_TAB_ID, &dep_batch)?;
-        }
-
-        let schema = view_tab_schema();
-        let batch = retract_single_row(&self.sys_views, &schema, vid as u128);
-        if batch.count == 0 {
-            return Err(format!("View does not exist: {}", qualified));
-        }
-        self.ingest_to_family(VIEW_TAB_ID, &batch)?;
-        // hook_view_register queues the view's directory into
-        // pending_dir_deletions; the executor removes it after the DDL zone is
-        // durable. (No synchronous delete: that would race the WAL fdatasync.)
-        Ok(())
+        // Retract only the VIEW_TAB row. Its -1 fires hook_view_register, which
+        // cascades cascade_retract_circuit_and_deps (sys_circuit_* AND
+        // sys_view_deps) + cascade_retract_columns, and queues the view
+        // directory for deferred deletion (the executor removes it after the DDL
+        // zone is durable — no synchronous delete that would race the WAL
+        // fdatasync). dag.invalidate(vid) only clears the plan caches — it does
+        // NOT unregister the view — so the cascade's dag.tables.contains_key(vid)
+        // guard holds and the -1 cleans up identically on replay and worker sync.
+        // The view's sys_view_deps rows are retracted by that cascade, so no
+        // separate DEP_TAB retraction is needed here.
+        self.submit_retraction(SysFamily::View, vid as u128)
     }
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
@@ -295,14 +286,14 @@ impl CatalogEngine {
             bb.put_string("");
             bb.end_row();
             let batch = bb.finish();
-            if let Err(e) = self.ingest_to_family(IDX_TAB_ID, &batch) {
+            if let Err(e) = self.submit(SysFamily::Index, batch) {
                 // The +1 failed in hook_index_register *before* it was enqueued
                 // into pending_broadcasts, so it was never broadcast to workers.
-                // Route the undo through ingest_to_family_no_broadcast: it fires
-                // the cache-reversal hooks (index_by_name / index_by_id) but does
-                // NOT enqueue the −1. Broadcasting the −1 would deliver a phantom
-                // retraction to workers that never saw the +1, leaving an
-                // orphaned negative-weight row in their sys_indices.
+                // Route the undo through submit_local: it fires the cache-reversal
+                // hooks (index_by_name / index_by_id) but does NOT enqueue the −1.
+                // Broadcasting the −1 would deliver a phantom retraction to
+                // workers that never saw the +1, leaving an orphaned
+                // negative-weight row in their sys_indices.
                 let mut undo = BatchBuilder::new(schema);
                 undo.begin_row(index_id as u128, -1);
                 undo.put_u64(owner_id as u64);
@@ -313,7 +304,7 @@ impl CatalogEngine {
                 undo.put_string("");
                 undo.end_row();
                 let undo_batch = undo.finish();
-                let _ = self.ingest_to_family_no_broadcast(IDX_TAB_ID, &undo_batch);
+                let _ = self.submit_local(SysFamily::Index, undo_batch);
                 // The hook pre-staged the index directory into
                 // pending_dir_deletions before Table::new; when backfill_index
                 // fails the circuit is never registered, so the -1 retraction
@@ -336,36 +327,10 @@ impl CatalogEngine {
         let idx_id = *self.caches.index_by_name.get(index_name)
             .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
 
-        // Read the full index record from sys_indices to retract it
-        // (sys_indices has a single U64 PK; seek by the zero-extended id).
-        let mut cursor = self.sys_indices.open_cursor();
-        // sys_indices has a single U64 PK; OPK == big-endian.
-        cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
-
-        if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
-            return Err(format!("Index {} not found in catalog", index_name));
-        }
-
-        let owner_id = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
-        let owner_kind = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_KIND);
-        let source_col_idx = cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX);
-        let name = cursor_read_string(&cursor, IDXTAB_COL_NAME);
-        let is_unique = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE);
-        let cache_dir = cursor_read_string(&cursor, IDXTAB_COL_CACHE_DIRECTORY);
-
-        let schema = idx_tab_schema();
-        let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(idx_id as u128, -1);
-        bb.put_u64(owner_id as u64);
-        bb.put_u64(owner_kind);
-        bb.put_u64(source_col_idx);
-        bb.put_string(&name);
-        bb.put_u64(is_unique);
-        bb.put_string(&cache_dir);
-        bb.end_row();
-        let batch = bb.finish();
-        self.ingest_to_family(IDX_TAB_ID, &batch)?;
-        Ok(())
+        // precheck_sys_ingest enforces the FK-target uniqueness guard on the -1;
+        // the cascade (circuit demotion/deletion) is the applier's reaction in
+        // hook_index_register.
+        self.submit_retraction(SysFamily::Index, idx_id as u128)
     }
 
     // -- View backfill (scan source, feed through plan) --------------------
@@ -501,16 +466,16 @@ impl CatalogEngine {
             bb.put_string("");                     // cache_directory
             bb.end_row();
             let batch = bb.finish();
-            // hook_cascade_fk fires on both master and workers, so each side
-            // computes its own FK indices locally. Routing this through
-            // `ingest_to_family` would broadcast IDX_TAB before TABLE_TAB and
-            // duplicate the rows the worker already produced.
-            ingest_batch_into(&mut self.sys_indices, &batch);
-            if let Err(e) = self.fire_hooks(IDX_TAB_ID, &batch) {
-                // The +1 is already in sys_indices but its directory/cache
-                // setup failed. Reverse the storage write and re-fire hooks on
-                // the −1 so any partial cache updates are undone; otherwise the
-                // next boot's replay opens a missing index directory and crashes.
+            // hook_cascade_fk fires on master and every worker, so each side
+            // creates its own FK indices locally; submit_local applies + fires
+            // hooks without a broadcast. submit would broadcast IDX_TAB before
+            // TABLE_TAB and duplicate the rows the worker already produced.
+            if let Err(e) = self.submit_local(SysFamily::Index, batch) {
+                // The +1 reached sys_indices but its directory/cache setup failed
+                // and was never broadcast. Submit the matching -1 locally to
+                // reverse the storage write and any partial cache updates;
+                // otherwise the next boot's replay opens a missing index
+                // directory and crashes.
                 let mut ub = BatchBuilder::new(idx_schema);
                 ub.begin_row(index_id as u128, -1);
                 ub.put_u64(table_id as u64);
@@ -521,8 +486,7 @@ impl CatalogEngine {
                 ub.put_string("");
                 ub.end_row();
                 let undo = ub.finish();
-                ingest_batch_into(&mut self.sys_indices, &undo);
-                self.fire_hooks(IDX_TAB_ID, &undo).ok();
+                let _ = self.submit_local(SysFamily::Index, undo);
                 return Err(e);
             }
 
@@ -554,7 +518,7 @@ impl CatalogEngine {
 
     pub(crate) fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
-        self.ingest_to_family(COL_TAB_ID, &batch)
+        self.submit(SysFamily::Column, batch)
     }
 
     pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) -> Result<(), String> {
@@ -568,7 +532,7 @@ impl CatalogEngine {
         }
         let batch = bb.finish();
         if batch.count > 0 {
-            self.ingest_to_family(DEP_TAB_ID, &batch)?;
+            self.submit(SysFamily::ViewDep, batch)?;
         }
         Ok(())
     }
@@ -589,7 +553,8 @@ impl CatalogEngine {
 fn projected_has_dup_keys(projected: &Batch, key_size: usize) -> bool {
     debug_assert!(key_size <= 16,
         "unique index key size {} exceeds 16-byte dedup buffer", key_size);
-    let mut seen: HashSet<u128> = HashSet::with_capacity(projected.count);
+    let mut seen: rustc_hash::FxHashSet<u128> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(projected.count, Default::default());
     for row in 0..projected.count {
         if projected.get_weight(row) <= 0 { continue; }
         let pk_bytes = projected.get_pk_bytes(row);

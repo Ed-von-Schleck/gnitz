@@ -43,14 +43,17 @@ impl CatalogEngine {
     // Retraction dependencies to be aware of:
     //   * apply_entity_by_qname reads entity_by_id on retract → must fire before apply_entity_by_id.
 
-    pub(crate) fn fire_hooks(&mut self, sys_table_id: i64, batch: &Batch) -> Result<(), String> {
-        match sys_table_id {
-            SCHEMA_TAB_ID => {
+    pub(crate) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        // Exhaustive over `SysFamily`: a newly-added family is a compile error
+        // here, not a silently-skipped `_` arm. The no-op families
+        // (Sequence/Circuit*) are named, not swallowed by a wildcard.
+        match family {
+            SysFamily::Schema => {
                 self.apply_schema_by_name(batch)?;
                 self.apply_schema_by_id(batch)?;
                 self.hook_schema_dir(batch)?;
             }
-            TABLE_TAB_ID => {
+            SysFamily::Table => {
                 self.apply_entity_by_qname(batch)?;
                 self.apply_entity_by_id(batch)?;
                 self.apply_schema_of(TABLE_TAB_ID, batch)?;
@@ -59,29 +62,35 @@ impl CatalogEngine {
                 self.apply_needs_lock(TABLE_TAB_ID, batch)?;
                 self.hook_cascade_fk(batch)?;
             }
-            VIEW_TAB_ID => {
+            SysFamily::View => {
                 self.apply_entity_by_qname(batch)?;
                 self.apply_entity_by_id(batch)?;
                 self.apply_schema_of(VIEW_TAB_ID, batch)?;
                 self.apply_pk_col_of(VIEW_TAB_ID, batch)?;
                 self.hook_view_register(batch)?;
             }
-            COL_TAB_ID => {
+            SysFamily::Column => {
                 self.apply_col_names_invalidate(batch)?;
                 self.apply_fk_by_child(batch)?;
                 self.apply_fk_by_parent(batch)?;
                 self.apply_needs_lock(COL_TAB_ID, batch)?;
             }
-            IDX_TAB_ID => {
+            SysFamily::Index => {
                 self.apply_index_by_name(batch)?;
                 self.apply_index_by_id(batch)?;
                 self.hook_index_register(batch)?;
                 self.apply_needs_lock(IDX_TAB_ID, batch)?;
             }
-            DEP_TAB_ID => {
+            SysFamily::ViewDep => {
                 self.dag.invalidate_dep_map();
             }
-            _ => {}
+            // No cache/side-effect reactions: sequences are master-only
+            // bookkeeping, and the circuit graph is loaded by `load_circuit`,
+            // not by hooks.
+            SysFamily::Sequence
+            | SysFamily::CircuitNodes
+            | SysFamily::CircuitEdges
+            | SysFamily::CircuitNodeColumns => {}
         }
         Ok(())
     }
@@ -226,7 +235,7 @@ impl CatalogEngine {
             for idx_id in idx_ids {
                 let batch = retract_single_row(&self.sys_indices, &schema, idx_id as u128);
                 if batch.count > 0 {
-                    self.ingest_to_family(IDX_TAB_ID, &batch)?;
+                    self.submit(SysFamily::Index, batch)?;
                 }
             }
             Ok(())
@@ -243,7 +252,7 @@ impl CatalogEngine {
             pack_column_id(owner_id + 1, 0) as u128,
         );
         if batch.count > 0 {
-            self.ingest_to_family(COL_TAB_ID, &batch)?;
+            self.submit(SysFamily::Column, batch)?;
         }
         Ok(())
     }
@@ -348,19 +357,19 @@ impl CatalogEngine {
 
     fn cascade_retract_circuit_and_deps(&mut self, vid: i64) -> Result<(), String> {
         let view_id = vid as u64;
-        for tab_id in [
-            CIRCUIT_NODES_TAB_ID,
-            CIRCUIT_EDGES_TAB_ID,
-            CIRCUIT_NODE_COLUMNS_TAB_ID,
-            DEP_TAB_ID,
+        for family in [
+            SysFamily::CircuitNodes,
+            SysFamily::CircuitEdges,
+            SysFamily::CircuitNodeColumns,
+            SysFamily::ViewDep,
         ] {
-            let schema = sys_tab_schema(tab_id);
+            let schema = sys_tab_schema(family.id());
             let batch = {
-                let table = self.sys_table(tab_id).unwrap();
+                let table = self.sys_table(family.id()).unwrap();
                 retract_rows_by_view(table, &schema, view_id)
             };
             if batch.count > 0 {
-                self.ingest_to_family(tab_id, &batch)?;
+                self.submit(family, batch)?;
             }
         }
         Ok(())

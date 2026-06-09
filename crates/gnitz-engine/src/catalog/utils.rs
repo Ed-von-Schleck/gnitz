@@ -281,31 +281,6 @@ pub(crate) fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> S
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-/// Scan `table` for rows whose `schema_col` equals `sid`, returning a
-/// `"schema.name"` qualified string for each hit via `id_to_qualified`.
-pub(crate) fn collect_for_schema(
-    table: &mut Table,
-    schema_col: usize,
-    sid: i64,
-    id_to_qualified: &HashMap<i64, (String, String)>,
-) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut c = table.open_cursor();
-    while c.cursor.valid {
-        if c.cursor.current_weight > 0 {
-            let row_sid = cursor_read_u64(&c, schema_col) as i64;
-            if row_sid == sid {
-                let eid = c.cursor.current_key as u64 as i64;
-                if let Some((sn, en)) = id_to_qualified.get(&eid) {
-                    result.push(format!("{}.{}", sn, en));
-                }
-            }
-        }
-        c.cursor.advance();
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------
 // Helper: filesystem
 // ---------------------------------------------------------------------------

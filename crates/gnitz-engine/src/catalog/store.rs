@@ -21,6 +21,58 @@ const SYS_TABLE_IDS: &[i64] = &[
     CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID, CIRCUIT_NODE_COLUMNS_TAB_ID,
 ];
 
+/// The only handle the DDL/imperative layer has on catalog state: submit one
+/// system-family delta. It cannot name a `sys_*` table, so DDL code physically
+/// cannot mutate a dependent family except by emitting a delta that flows
+/// through the single precheck → persist → `fire_hooks` → broadcast path —
+/// identical on live apply, WAL replay, and worker sync. The cascades that drop
+/// columns/indices/circuit rows are the applier's declared reaction to a
+/// retraction, fired from inside `fire_hooks`, not the emitter's concern.
+pub(crate) trait CatalogDeltaSink {
+    /// Apply one system-family delta and enqueue it for broadcast: precheck →
+    /// storage write → `fire_hooks` → enqueue. The batch is taken by value so
+    /// the applier moves it straight into `pending_broadcasts` (one storage
+    /// clone, no hooks clone).
+    fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String>;
+
+    /// Apply locally without enqueuing a broadcast. ONLY for rows the workers
+    /// already produce themselves (FK indices auto-created from the same
+    /// `TABLE_TAB` delta) and for rollback compensation. Re-broadcasting these
+    /// would deliver phantom deltas. Documented and audited; not a general escape.
+    fn submit_local(&mut self, family: SysFamily, batch: Batch) -> Result<(), String>;
+}
+
+impl CatalogDeltaSink for CatalogEngine {
+    fn submit(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+        if self.in_rollback {
+            // During rollback all cascade writes must bypass pending_broadcasts
+            // so no compensating row is re-broadcast to workers.
+            return self.submit_local(family, batch);
+        }
+        let id = family.id();
+        // Reject BEFORE any WAL write; avoids dangling retractions that would
+        // later trip replay_catalog.
+        self.precheck_sys_ingest(id, &batch)?;
+        // Apply + fire hooks, pinning this zone's writes to the DDL zone LSN.
+        self.apply_local(family, &mut batch, self.ddl_zone_lsn)?;
+
+        // Enqueue after hooks so nested cascade pushes land first and the
+        // executor broadcasts children → parent. Drop empty batches so
+        // worker-side no-op cascades don't accumulate unread entries.
+        if batch.count > 0 {
+            self.pending_broadcasts.push((id, batch));
+        }
+        Ok(())
+    }
+
+    fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+        // No LSN pin: local applies are rollback compensation or rows the
+        // workers already produce, neither of which owns this zone's durability.
+        self.apply_local(family, &mut batch, 0)
+        // Deliberately no push to pending_broadcasts.
+    }
+}
+
 impl CatalogEngine {
     // -- System table accessor -----------------------------------------------
 
@@ -57,45 +109,37 @@ impl CatalogEngine {
         }
     }
 
+    /// Apply one delta to its family's storage and fire the reaction hooks —
+    /// the shared tail of [`CatalogDeltaSink::submit`] / `submit_local`. When
+    /// `pin_lsn > 0` it pins the family's `current_lsn` to the DDL zone LSN so
+    /// recovery's dedup check (`msg.lsn <= flushed`) matches the SAL group LSN;
+    /// `ingest_lsn` is seeded above every table's `current_lsn` at boot, so the
+    /// direct assignment never regresses the counter. Does NOT broadcast.
+    fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: u64) -> Result<(), String> {
+        let id = family.id();
+        let table = self.sys_table_mut(id)
+            .expect("SysFamily::id() maps to a known sys table");
+        ingest_batch_into(table, batch);
+        if pin_lsn > 0 {
+            table.current_lsn = pin_lsn;
+        }
+        batch.set_schema(sys_tab_schema(id));
+        self.fire_hooks(family, batch)
+    }
+
     // -- Server ingestion / scan / seek / flush -----------------------------
 
     /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
-    /// System tables go through precheck → ingest → hooks → broadcast-queue.
-    /// User tables delegate to `DagEngine::ingest_to_family`.
+    /// System tables go through the [`CatalogDeltaSink::submit`] applied-delta
+    /// path (precheck → ingest → hooks → broadcast-queue). User tables delegate
+    /// to `DagEngine::ingest_by_ref`. This `&Batch` entry serves external/wire
+    /// callers that hold a borrow; the DDL emitters call `submit` directly with
+    /// an owned batch to skip the clone.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
-            if self.in_rollback {
-                // During rollback all cascade writes must bypass pending_broadcasts
-                // so no compensating row is re-broadcast to workers.
-                return self.ingest_to_family_no_broadcast(table_id, batch);
-            }
-            // Reject BEFORE any WAL write; avoids dangling retractions that
-            // would later trip replay_catalog.
-            self.precheck_sys_ingest(table_id, batch)?;
-
-            let schema = sys_tab_schema(table_id);
-            let zone_lsn = self.ddl_zone_lsn;
-            let table = self.sys_table_mut(table_id)
-                .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
-            ingest_batch_into(table, batch);
-            // Pin every cascading write in the same zone to the same LSN so
-            // recovery's dedup check (`msg.lsn <= flushed`) matches the SAL
-            // group LSN. ingest_lsn is seeded above every table's current_lsn
-            // at boot, so direct assignment never regresses the counter.
-            if zone_lsn > 0 {
-                table.current_lsn = zone_lsn;
-            }
-            let mut batch_for_hooks = batch.clone();
-            batch_for_hooks.set_schema(schema);
-            self.fire_hooks(table_id, &batch_for_hooks)?;
-
-            // Enqueue after hooks so nested cascade pushes land first and the
-            // executor broadcasts children → parent. Drop empty batches so
-            // worker-side no-op cascades don't accumulate unread entries.
-            if batch_for_hooks.count > 0 {
-                self.pending_broadcasts.push((table_id, batch_for_hooks));
-            }
-            Ok(())
+            let family = SysFamily::from_id(table_id)
+                .ok_or_else(|| format!("Unknown system family {}", table_id))?;
+            self.submit(family, batch.clone())
         } else {
             let rc = self.dag.ingest_by_ref(table_id, batch);
             if rc < 0 {
@@ -106,28 +150,26 @@ impl CatalogEngine {
         }
     }
 
-    /// Like `ingest_to_family` for a system table, but does NOT enqueue the
-    /// batch into `pending_broadcasts`. Used by `create_index`'s rollback: the
-    /// failed +1 was never broadcast (hook_index_register failed before the
-    /// enqueue), so broadcasting the compensating −1 would deliver a phantom
-    /// retraction to workers and leave an orphaned negative-weight row. The
-    /// hooks still fire so the master-side caches (index_by_name/index_by_id)
-    /// are reversed.
-    pub(crate) fn ingest_to_family_no_broadcast(
-        &mut self,
-        table_id: i64,
-        batch: &Batch,
-    ) -> Result<(), String> {
-        // Only valid for system tables.
-        debug_assert!(table_id < FIRST_USER_TABLE_ID);
-        let schema = sys_tab_schema(table_id);
-        let table = self.sys_table_mut(table_id)
-            .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
-        ingest_batch_into(table, batch);
-        let mut batch_for_hooks = batch.clone();
-        batch_for_hooks.set_schema(schema);
-        self.fire_hooks(table_id, &batch_for_hooks)
-        // Deliberately no push to pending_broadcasts.
+    /// Emit the single retraction delta for `pk` in `family`: seek the live row,
+    /// copy it with weight −1, and submit it through the one applied-delta path.
+    /// The drop cascade is the applier's reaction to that −1 (fired from
+    /// `fire_hooks`), not the caller's concern. Uses the immutable `sys_table`
+    /// accessor because `retract_single_row` only reads; the `submit` move comes
+    /// after. `retract_single_row` returns an empty batch when the PK is absent
+    /// or already retracted; emitters resolve the friendly "does not exist"
+    /// message from the caches before calling, so the `count == 0` arm only
+    /// fires on cache/storage divergence.
+    pub(crate) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
+        let schema = sys_tab_schema(family.id());
+        let batch = {
+            let table = self.sys_table(family.id())
+                .expect("SysFamily::id() maps to a known sys table");
+            retract_single_row(table, &schema, pk)
+        };
+        if batch.count == 0 {
+            return Err("Entity does not exist in catalog".into());
+        }
+        self.submit(family, batch)
     }
 
     /// Reject a CREATE whose qualified `schema.name` collides with an existing
@@ -654,13 +696,15 @@ impl CatalogEngine {
 
         // Replay each with negated weight through the no-broadcast path.
         // fire_hooks still fires so caches, dag.tables, and pending_dir_deletions
-        // are updated. The in_rollback gate in ingest_to_family ensures any
-        // cascade that calls back into ingest_to_family also bypasses broadcasts.
+        // are updated. The in_rollback gate in `submit` ensures any cascade that
+        // calls back into `submit` also bypasses broadcasts.
         self.in_rollback = true;
         let result = (|| -> Result<(), String> {
             for (tid, mut batch) in rollback_list {
                 Self::negate_batch_in_place(&mut batch);
-                self.ingest_to_family_no_broadcast(tid, &batch)?;
+                let family = SysFamily::from_id(tid)
+                    .ok_or_else(|| format!("rollback: unknown system family {}", tid))?;
+                self.submit_local(family, batch)?;
             }
             Ok(())
         })();
@@ -995,12 +1039,11 @@ impl CatalogEngine {
     /// Workers receive DDL deltas from master and need to update their registry
     /// without writing to WAL (master owns durability).
     pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        if table_id >= FIRST_USER_TABLE_ID {
-            return Err("ddl_sync only for system tables".into());
-        }
+        let family = SysFamily::from_id(table_id)
+            .ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         // Fire hooks first (borrow only); the ingest below moves `batch`.
         // Hooks have no observable ordering dependency on the storage write.
-        self.fire_hooks(table_id, &batch)?;
+        self.fire_hooks(family, &batch)?;
         let table = self.sys_table_mut(table_id)
             .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
         let _ = table.ingest_owned_batch_memonly(batch);

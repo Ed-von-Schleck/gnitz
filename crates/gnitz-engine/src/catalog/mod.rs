@@ -40,7 +40,6 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::rc::Rc;
 
@@ -73,6 +72,8 @@ pub(crate) use utils::{BatchBuilder, parse_qualified_name,
                        retract_rows_by_view,
                        retract_rows_in_pk_range};
 pub(crate) use cache::CatalogCacheSet;
+pub(crate) use sys_tables::SysFamily;
+pub(crate) use store::CatalogDeltaSink;
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

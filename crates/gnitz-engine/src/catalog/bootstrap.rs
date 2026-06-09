@@ -344,11 +344,13 @@ impl CatalogEngine {
             SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID | IDX_TAB_ID => {}
             _ => return Ok(()),
         }
+        let family = SysFamily::from_id(sys_table_id)
+            .expect("from_id covers the match arms above");
         let table = self.sys_table_mut(sys_table_id)
             .expect("sys_table_mut covers the match arms above");
         let arc = table.full_scan();
         if arc.count > 0 {
-            self.fire_hooks(sys_table_id, &arc)?;
+            self.fire_hooks(family, &arc)?;
         }
         Ok(())
     }

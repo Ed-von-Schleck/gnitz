@@ -554,3 +554,76 @@ fn test_drop_view_removes_directory() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── test_drop_view_cascades_columns_and_view_deps ────────────────────
+// DROP VIEW retracts only the VIEW_TAB row; the cascade in hook_view_register
+// must clean up BOTH the view's sys_columns rows and its sys_view_deps rows.
+// The sys_view_deps assertion is the regression guard for removing drop_view's
+// manual dep retraction — it proves the VIEW_TAB cascade
+// (cascade_retract_circuit_and_deps) still clears the dep rows on its own.
+
+#[test]
+fn test_drop_view_cascades_columns_and_view_deps() {
+    let dir = temp_dir("drop_view_cascade");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let base_tid = engine.create_table("public.base", &[u64_col_def("id")], &[0], true).unwrap();
+
+    // Baseline: system + base-table column rows; no view-dep rows yet.
+    let base_cols = count_records(&mut engine.sys_columns);
+    let base_deps = count_records(&mut engine.sys_view_deps);
+
+    // Register a view (column records precede the VIEW_TAB row) and a
+    // dependency row on the base table.
+    let vid = engine.next_table_id;
+    let view_cols = vec![u64_col_def("id")];
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
+
+    let mut bb = BatchBuilder::new(view_tab_schema());
+    bb.begin_row(vid as u128, 1);
+    bb.put_u64(PUBLIC_SCHEMA_ID as u64);  // schema_id
+    bb.put_string("depview");             // name
+    bb.put_string("SELECT id FROM base"); // sql
+    bb.put_string("");                    // cache_directory
+    bb.put_u64(0);                        // created_lsn
+    bb.put_u64(0);                        // pk_col_idx
+    bb.end_row();
+    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+
+    engine.write_view_deps(vid, &[base_tid]).unwrap();
+
+    assert!(count_records(&mut engine.sys_columns) > base_cols,
+        "view column rows must be present before drop");
+    assert!(count_records(&mut engine.sys_view_deps) > base_deps,
+        "view-dep row must be present before drop");
+
+    // Drop the view: the VIEW_TAB -1 cascade must retract both families.
+    engine.drop_view("public.depview").unwrap();
+    engine.drain_pending_dir_deletions();
+
+    assert_eq!(count_records(&mut engine.sys_columns), base_cols,
+        "sys_columns must return to baseline after drop_view (column cascade)");
+    assert_eq!(count_records(&mut engine.sys_view_deps), base_deps,
+        "sys_view_deps must return to baseline after drop_view (dep cascade)");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── ddl_emitters_use_no_raw_handle_capability ────────────────────────
+// Capability guard: the DDL emitters mutate catalog state only through
+// submit / submit_local / submit_retraction. They must never name a `sys_*`
+// handle directly — no `ingest_batch_into`, no `sys_table_mut`, no direct
+// `self.sys_*` field access. A violation reintroduces the fused capability the
+// applier/emitter split removed, so it fails here.
+
+#[test]
+fn ddl_emitters_use_no_raw_handle_capability() {
+    let src = include_str!("../ddl.rs");
+    assert!(!src.contains("ingest_batch_into"),
+        "ddl.rs must not call ingest_batch_into — route writes through submit/submit_local");
+    assert!(!src.contains("sys_table_mut"),
+        "ddl.rs must not call sys_table_mut — the emitters cannot name a sys_* handle");
+    assert!(!src.contains("self.sys_"),
+        "ddl.rs must not touch a sys_* handle directly — emit a delta via submit instead");
+}

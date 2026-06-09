@@ -324,6 +324,63 @@ pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Typed system family
+// ---------------------------------------------------------------------------
+
+/// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
+/// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
+/// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
+/// Convert to/from `i64` only at the storage edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SysFamily {
+    Schema,
+    Table,
+    View,
+    Column,
+    Index,
+    ViewDep,
+    Sequence,
+    CircuitNodes,
+    CircuitEdges,
+    CircuitNodeColumns,
+}
+
+impl SysFamily {
+    /// The `*_TAB_ID` constant for this family.
+    pub(crate) const fn id(self) -> i64 {
+        match self {
+            SysFamily::Schema             => SCHEMA_TAB_ID,
+            SysFamily::Table              => TABLE_TAB_ID,
+            SysFamily::View               => VIEW_TAB_ID,
+            SysFamily::Column             => COL_TAB_ID,
+            SysFamily::Index              => IDX_TAB_ID,
+            SysFamily::ViewDep            => DEP_TAB_ID,
+            SysFamily::Sequence           => SEQ_TAB_ID,
+            SysFamily::CircuitNodes       => CIRCUIT_NODES_TAB_ID,
+            SysFamily::CircuitEdges       => CIRCUIT_EDGES_TAB_ID,
+            SysFamily::CircuitNodeColumns => CIRCUIT_NODE_COLUMNS_TAB_ID,
+        }
+    }
+
+    /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
+    pub(crate) const fn from_id(id: i64) -> Option<Self> {
+        match id {
+            SCHEMA_TAB_ID                => Some(SysFamily::Schema),
+            TABLE_TAB_ID                 => Some(SysFamily::Table),
+            VIEW_TAB_ID                  => Some(SysFamily::View),
+            COL_TAB_ID                   => Some(SysFamily::Column),
+            IDX_TAB_ID                   => Some(SysFamily::Index),
+            DEP_TAB_ID                   => Some(SysFamily::ViewDep),
+            SEQ_TAB_ID                   => Some(SysFamily::Sequence),
+            CIRCUIT_NODES_TAB_ID         => Some(SysFamily::CircuitNodes),
+            CIRCUIT_EDGES_TAB_ID         => Some(SysFamily::CircuitEdges),
+            CIRCUIT_NODE_COLUMNS_TAB_ID  => Some(SysFamily::CircuitNodeColumns),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
