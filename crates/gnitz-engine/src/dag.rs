@@ -1736,10 +1736,13 @@ impl DagEngine {
                 if let Some(&prev_pos) = seen.get(pkb) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
                     seen.remove(pkb);
-                } else if !found {
-                    // Not in store and not in batch — pass through as-is
-                    effective.append_batch(&batch, row, row + 1);
                 }
+                // No `else`: a retraction of a key that is neither present in the
+                // store (`found`) nor inserted earlier in this batch (`seen`) has
+                // nothing to cancel. Passing it through would store a
+                // negative-weight phantom row, violating base-table positivity;
+                // dropping it is also idempotent under delete replay (a redundant
+                // retraction of an already-removed row).
             }
         }
 
@@ -2053,6 +2056,72 @@ mod tests {
         // negative-PK row then nets to zero and is gone.
         pt.ingest_owned_batch(effective).unwrap();
         assert!(!pt.has_pk_bytes(&opk), "stored negative-PK row must be gone after retraction");
+    }
+
+    // Positivity regression: a retraction of a key that is absent (never inserted)
+    // or tombstoned (inserted then removed) must NOT pass a negative-weight phantom
+    // row through to the store. Pre-fix the `else if !found` arm appended the raw
+    // `(-1, filler)` row, leaving a base table at net weight -1.
+    #[test]
+    fn test_enforce_unique_pk_partitioned_absent_key_drops_phantom() {
+        use crate::schema::{SchemaColumn, type_code};
+        crate::util::raise_fd_limit_for_tests();
+
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0), // signed PK
+                SchemaColumn::new(type_code::I64, 0), // payload
+            ],
+            &[0],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("enforce_absent");
+        let mut pt = crate::storage::PartitionedTable::new(
+            tdir.to_str().unwrap(), "enforce_absent", schema, 1234, 256, false, 0, 256,
+            crate::storage::partition_arena_size(256),
+        ).unwrap();
+
+        // Seed an unrelated row (PK=-5) so the store is non-empty.
+        let mut seed = Batch::with_schema(schema, 1);
+        seed.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
+        seed.extend_weight(&1i64.to_le_bytes());
+        seed.extend_null_bmp(&0u64.to_le_bytes());
+        seed.extend_col(0, &100i64.to_le_bytes());
+        seed.count += 1;
+        pt.ingest_owned_batch(seed).unwrap();
+
+        let retract_pk7 = || {
+            let mut del = Batch::with_schema(schema, 1);
+            del.extend_pk_opk(&schema, &[7u128]);
+            del.extend_weight(&(-1i64).to_le_bytes());
+            del.extend_null_bmp(&0u64.to_le_bytes());
+            del.extend_col(0, &0i64.to_le_bytes());
+            del.count += 1;
+            del
+        };
+
+        // Case 1 — absent key: PK=7 was never inserted. The phantom pass-through
+        // is dropped, so the effective batch is empty.
+        let effective = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, retract_pk7());
+        assert_eq!(effective.count, 0, "absent-key retraction must emit no phantom row");
+
+        // Case 2 — tombstoned key: insert PK=7, retract to net zero, then retract
+        // a second time. The first retraction finds the stored row (count 1); the
+        // second finds nothing and emits no phantom.
+        let mut ins = Batch::with_schema(schema, 1);
+        ins.extend_pk_opk(&schema, &[7u128]);
+        ins.extend_weight(&1i64.to_le_bytes());
+        ins.extend_null_bmp(&0u64.to_le_bytes());
+        ins.extend_col(0, &42i64.to_le_bytes());
+        ins.count += 1;
+        pt.ingest_owned_batch(ins).unwrap();
+
+        let eff1 = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, retract_pk7());
+        assert_eq!(eff1.count, 1, "retracting a present key emits the stored-row retraction");
+        pt.ingest_owned_batch(eff1).unwrap(); // PK=7 now nets to zero (tombstoned)
+
+        let eff2 = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, retract_pk7());
+        assert_eq!(eff2.count, 0, "tombstoned-key retraction must emit no phantom row");
     }
 
     // Spawn a clean subprocess to verify that vm_epoch_result calls

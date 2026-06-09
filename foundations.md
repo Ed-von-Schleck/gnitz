@@ -61,8 +61,9 @@ row is (pk_lo, pk_hi, weight, null_word, col_0, col_1, ...). Multiple
 rows may share the same PK if their payloads differ.
 
 **PK uniqueness is not a general invariant.** The 128-bit PK slot is a
-sort/routing key. It is unique for base table batches (DML-enforced)
-and reduce output (one row per group). It is NOT unique for
+sort/routing key. It is unique for base table batches (DML-enforced — every
+SQL-created table is registered `unique_pk`) and reduce output
+(one row per group). It is NOT unique for
 intermediate batches: `map_reindex` overwrites the PK slot with a
 join/group column value, and join output inherits the left input's PK.
 Multiple output rows may share the same PK with different payloads.

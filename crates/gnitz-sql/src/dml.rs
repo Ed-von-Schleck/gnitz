@@ -135,17 +135,22 @@ pub fn execute_insert(
     let n = rows.len();
 
     for row in rows {
+        // Standard SQL rejects a VALUES row whose arity differs from the column
+        // count: too few values, or excess trailing values that were previously
+        // discarded silently. INSERT here is full-row positional (no column
+        // list), so this guard makes every per-column index below in-bounds.
+        if row.len() != schema.columns.len() {
+            return Err(GnitzSqlError::Bind(format!(
+                "INSERT specifies {} value(s) but table '{}' has {} column(s)",
+                row.len(), table_name_str, schema.columns.len()
+            )));
+        }
         let pk = extract_pk_value(row, &schema)?;
         batch.pks.push_tuple(&pk);
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
         for (payload_idx, ci, col_def) in schema.payload_columns() {
-            if ci >= row.len() {
-                return Err(GnitzSqlError::Bind(
-                    format!("not enough values in INSERT row (column {})", ci)
-                ));
-            }
             let val_expr = &row[ci];
             // Check if this value is NULL and set the null bitmap
             if is_null_expr(val_expr) {
@@ -197,18 +202,9 @@ fn bind_do_update_assignments(
     binder: &mut Binder<'_>,
 ) -> Result<Vec<(usize, BoundUpdateExpr)>, GnitzSqlError> {
     let mut out = Vec::with_capacity(raw.len());
+    let mut seen: Vec<usize> = Vec::with_capacity(raw.len());
     for assignment in raw {
-        let col_name = extract_assignment_col_name(assignment)?;
-        let col_idx = schema.columns.iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&col_name))
-            .ok_or_else(|| GnitzSqlError::Bind(format!(
-                "column '{}' not found in ON CONFLICT DO UPDATE SET", col_name
-            )))?;
-        if schema.is_pk_col(col_idx) {
-            return Err(GnitzSqlError::Unsupported(
-                "cannot assign to primary key column in ON CONFLICT DO UPDATE".to_string()
-            ));
-        }
+        let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
         // Recognize EXCLUDED.col as a special form. sqlparser parses it
         // as a CompoundIdentifier: `EXCLUDED`.`col`.
         let value = bind_do_update_rhs(&assignment.value, schema, binder)?;
@@ -1047,6 +1043,25 @@ fn eval_expr(
              use CREATE INDEX or CREATE VIEW".to_string()
         )),
         BoundExpr::BinOp(l, op, r) => {
+            // SQL 3VL: short-circuit before propagating NULL.
+            // TRUE OR any = TRUE; FALSE AND any = FALSE — regardless of NULL.
+            match op {
+                BinOp::Or => {
+                    let lv = eval_expr(l, batch, i, schema)?;
+                    if lv.is_some_and(|v| v != 0) { return Ok(Some(1)); }
+                    let rv = eval_expr(r, batch, i, schema)?;
+                    if rv.is_some_and(|v| v != 0) { return Ok(Some(1)); }
+                    return Ok(if lv.is_some() && rv.is_some() { Some(0) } else { None });
+                }
+                BinOp::And => {
+                    let lv = eval_expr(l, batch, i, schema)?;
+                    if lv == Some(0) { return Ok(Some(0)); }
+                    let rv = eval_expr(r, batch, i, schema)?;
+                    if rv == Some(0) { return Ok(Some(0)); }
+                    return Ok(if lv.is_some() && rv.is_some() { Some(1) } else { None });
+                }
+                _ => {}
+            }
             let lv = match eval_expr(l, batch, i, schema)? {
                 None => return Ok(None),
                 Some(v) => v,
@@ -1068,8 +1083,7 @@ fn eval_expr(
                 BinOp::Ge  => (lv >= rv) as i64,
                 BinOp::Lt  => (lv <  rv) as i64,
                 BinOp::Le  => (lv <= rv) as i64,
-                BinOp::And => ((lv != 0) && (rv != 0)) as i64,
-                BinOp::Or  => ((lv != 0) || (rv != 0)) as i64,
+                BinOp::And | BinOp::Or => unreachable!(),
             }))
         }
         BoundExpr::UnaryOp(op, e) => {
@@ -1374,13 +1388,48 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
     Ok(())
 }
 
-fn extract_assignment_col_name(assignment: &Assignment) -> Result<String, GnitzSqlError> {
+fn extract_assignment_col_name(
+    assignment: &Assignment,
+    clause: &str,
+) -> Result<String, GnitzSqlError> {
     match &assignment.target {
-        AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, "UPDATE SET"),
-        _ => Err(GnitzSqlError::Unsupported(
-            "only simple column assignments supported in UPDATE SET".to_string()
-        )),
+        AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, clause),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "only simple column assignments supported in {}", clause
+        ))),
     }
+}
+
+/// Resolve and validate one `col = expr` SET-list target — shared by UPDATE and
+/// ON CONFLICT DO UPDATE, which differ only in the RHS binding and the `clause`
+/// label used in messages. Extracts the column name, resolves it to a column
+/// index, rejects a PK target, and rejects a column already present in `seen`
+/// (recording it there on success so the next duplicate is caught). Both clauses
+/// enforce the same SQL rules: no PK writes, no duplicate columns.
+fn resolve_set_target(
+    assignment: &Assignment,
+    schema: &Schema,
+    seen: &mut Vec<usize>,
+    clause: &str,
+) -> Result<usize, GnitzSqlError> {
+    let col_name = extract_assignment_col_name(assignment, clause)?;
+    let col_idx = schema.columns.iter()
+        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+        .ok_or_else(|| GnitzSqlError::Bind(format!(
+            "column '{}' not found in {}", col_name, clause
+        )))?;
+    if schema.is_pk_col(col_idx) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot assign to primary key column in {}", clause
+        )));
+    }
+    if seen.contains(&col_idx) {
+        return Err(GnitzSqlError::Bind(format!(
+            "multiple assignments to column '{}' in {}", col_name, clause
+        )));
+    }
+    seen.push(col_idx);
+    Ok(col_idx)
 }
 
 fn write_set_columns(
@@ -1465,20 +1514,11 @@ pub fn execute_update(
 
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
-    // Bind SET assignments; reject any assignment to the PK column
+    // Bind SET assignments; reject PK writes and duplicate columns.
     let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
+    let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
-        let col_name = extract_assignment_col_name(assignment)?;
-        let col_idx = schema.columns.iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&col_name))
-            .ok_or_else(|| GnitzSqlError::Bind(
-                format!("column '{}' not found in UPDATE SET", col_name)
-            ))?;
-        if schema.is_pk_col(col_idx) {
-            return Err(GnitzSqlError::Unsupported(
-                "cannot UPDATE primary key column".to_string()
-            ));
-        }
+        let col_idx = resolve_set_target(assignment, &schema, &mut seen, "UPDATE SET")?;
         let bound_val = binder.bind_expr(&assignment.value, &schema)?;
         assignments.push((col_idx, bound_val));
     }
@@ -1630,16 +1670,33 @@ pub fn execute_delete(
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
-            // Path 2: PK IN list (single-PK only; try_extract_pk_in returns
-            // None for compound PK, so we never reach the push_u128 path).
+            // Path 2: PK IN list (single-PK only; try_extract_pk_in returns None
+            // for a compound PK). Seek each key and retract only those that exist,
+            // so RowsAffected reports rows actually removed rather than the raw
+            // list length, with a repeated key counted once. (Positivity is not at
+            // stake here — the engine's enforce_unique_pk_partitioned already drops
+            // a retraction of an absent/tombstoned key; this seek is purely about
+            // an accurate count.) PkTuple::from_u128 produces the same seek key
+            // Path 1 builds for `pk = v` (low `pk_stride` bytes = the column's
+            // native LE bytes).
             if let Some(pks) = try_extract_pk_in(where_expr, &schema) {
-                let n = pks.len();
-                if n > 0 {
-                    let mut pk_col = PkColumn::empty_for_schema(&schema);
-                    for v in pks { pk_col.push_u128(v); }
+                let stride = schema.pk_stride() as u8;
+                let mut seen: std::collections::HashSet<u128> =
+                    std::collections::HashSet::with_capacity(pks.len());
+                let mut pk_col = PkColumn::empty_for_schema(&schema);
+                for v in pks {
+                    if !seen.insert(v) { continue; }            // intra-list dedup
+                    let pk = PkTuple::from_u128(stride, v);
+                    let (_schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
+                    if batch_opt.as_ref().is_some_and(|b| !b.pks.is_empty()) {
+                        pk_col.push_u128(v);
+                    }
+                }
+                let count = pk_col.len();
+                if count > 0 {
                     client.delete(table_id, &schema, pk_col)?;
                 }
-                return Ok(SqlResult::RowsAffected { count: n });
+                return Ok(SqlResult::RowsAffected { count });
             }
 
             // Path 3: secondary-index seek (any index, unique or not). Applies

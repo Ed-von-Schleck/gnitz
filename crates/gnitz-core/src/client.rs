@@ -246,6 +246,25 @@ impl GnitzClient {
         is_unique: bool,
     ) -> Result<u64, ClientError> {
         validate_index_col_type(col_type)?;
+
+        // Reject a duplicate name before allocating an index_id: a duplicate would
+        // create an undroppable orphan in IDX_TAB (`drop_index_by_name` returns
+        // after the first match, leaving the second row with a catalog entry but no
+        // circuit). Mirrors the engine DDL path's `index_by_name` check, which the
+        // client push otherwise bypasses.
+        let (_, existing, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
+        if let Some(idx_batch) = existing {
+            for i in 0..idx_batch.len() {
+                if idx_batch.weights[i] <= 0 { continue; }
+                let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
+                if name == index_name {
+                    return Err(ClientError::ServerError(format!(
+                        "index '{}' already exists", index_name
+                    )));
+                }
+            }
+        }
+
         let index_id = self.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();

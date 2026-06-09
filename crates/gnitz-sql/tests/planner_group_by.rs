@@ -486,3 +486,33 @@ fn test_aggregate_all_null_group_emits_null() {
     assert_eq!(i64_at(&batch, cx, 0), 0, "COUNT(x) of all-NULL group must decode to 0");
     assert_eq!(i64_at(&batch, ca, 0), 2, "COUNT(*) must count both rows");
 }
+
+// ── HAVING wildcard aggregate: SUM(*)/MIN(*)/MAX(*)/AVG(*) must error, not panic ──
+//
+// Only COUNT(*) accepts a wildcard. For every other aggregate `having_agg_func`
+// resolves `arg_col = None`, which `push_agg_specs` would `arg_col.unwrap()` —
+// panicking the server process. The guard returns a plan error instead.
+
+#[test]
+fn having_wildcard_agg_returns_error_not_panic() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+
+    let sqls = [
+        "CREATE VIEW vs AS SELECT id, SUM(v) FROM t GROUP BY id HAVING SUM(*) > 0",
+        "CREATE VIEW vmn AS SELECT id, MIN(v) FROM t GROUP BY id HAVING MIN(*) > 0",
+        "CREATE VIEW vmx AS SELECT id, MAX(v) FROM t GROUP BY id HAVING MAX(*) > 0",
+        "CREATE VIEW va AS SELECT id, AVG(v) FROM t GROUP BY id HAVING AVG(*) > 0",
+    ];
+    for sql in &sqls {
+        assert!(
+            try_exec(&mut client, &sn, sql).is_err(),
+            "expected plan error for wildcard aggregate in HAVING, got Ok for: {}", sql
+        );
+    }
+
+    // COUNT(*) in HAVING remains valid.
+    exec(&mut client, &sn,
+        "CREATE VIEW vc AS SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 0");
+}

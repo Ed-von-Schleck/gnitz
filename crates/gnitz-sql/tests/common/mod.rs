@@ -38,6 +38,27 @@ pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
     p.execute(sql).unwrap();
 }
 
+/// Plan and execute a statement, returning the planner result so a test can
+/// assert it errors (`.is_err()`) or inspect the variant.
+pub fn try_exec(
+    client: &mut GnitzClient,
+    sn: &str,
+    sql: &str,
+) -> Result<Vec<SqlResult>, GnitzSqlError> {
+    let mut p = SqlPlanner::new(client, sn);
+    p.execute(sql)
+}
+
+/// Execute a single statement expected to return `RowsAffected`, returning the
+/// reported row count.
+pub fn affected(client: &mut GnitzClient, sn: &str, sql: &str) -> usize {
+    let mut p = SqlPlanner::new(client, sn);
+    match p.execute(sql).unwrap().pop().unwrap() {
+        SqlResult::RowsAffected { count } => count,
+        _ => panic!("expected RowsAffected"),
+    }
+}
+
 /// Read `SELECT * FROM view` and return its (schema, batch).
 pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
     let mut p = SqlPlanner::new(client, sn);

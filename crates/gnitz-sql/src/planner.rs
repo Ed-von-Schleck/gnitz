@@ -1688,17 +1688,6 @@ fn execute_create_group_by_view(
                     },
                     None => None,
                 };
-                // SUM/MIN/MAX/COUNT_NON_NULL/AVG require an argument column. The
-                // binder normally rejects no-argument calls, but guard against a
-                // None reaching the unwraps below (panic → dead server thread).
-                if matches!(func, AggFunc::Sum | AggFunc::Min | AggFunc::Max
-                        | AggFunc::CountNonNull | AggFunc::Avg)
-                    && src_col.is_none()
-                {
-                    return Err(GnitzSqlError::Plan(format!(
-                        "{:?} requires an argument column", func
-                    )));
-                }
                 // Reject aggregates whose source column type is meaningless for
                 // the function: numeric aggregates need a numeric column, and
                 // MIN/MAX need an orderable column (the engine's decode_signed
@@ -1738,7 +1727,7 @@ fn execute_create_group_by_view(
                 let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
-                let is_avg = push_agg_specs(*func, src_col, &mut agg_specs);
+                let is_avg = push_agg_specs(*func, src_col, &mut agg_specs)?;
                 let out_name = alias.unwrap_or_else(|| {
                     let prefix = match func {
                         AggFunc::Count | AggFunc::CountNonNull => "_count",
@@ -2084,8 +2073,17 @@ fn push_agg_specs(
     agg_func: AggFunc,
     arg_col: Option<usize>,
     agg_specs: &mut Vec<(u64, usize)>,
-) -> bool {
-    match agg_func {
+) -> Result<bool, GnitzSqlError> {
+    // Every aggregate except COUNT(*) needs a column argument, which the specs
+    // below unwrap. Validating here — the single source of truth for spec
+    // layout — covers both the SELECT-list and HAVING callers, so neither needs
+    // its own wildcard guard and a future caller cannot reintroduce the panic.
+    if !matches!(agg_func, AggFunc::Count) && arg_col.is_none() {
+        return Err(GnitzSqlError::Plan(format!(
+            "{:?} requires an argument column; only COUNT(*) accepts a wildcard", agg_func
+        )));
+    }
+    Ok(match agg_func {
         AggFunc::Count => { agg_specs.push((AGG_COUNT, 0)); false }
         AggFunc::CountNonNull => { agg_specs.push((AGG_COUNT_NON_NULL, arg_col.unwrap())); false }
         AggFunc::Sum => { agg_specs.push((AGG_SUM, arg_col.unwrap())); false }
@@ -2097,7 +2095,7 @@ fn push_agg_specs(
             agg_specs.push((AGG_COUNT_NON_NULL, c));
             true
         }
-    }
+    })
 }
 
 /// Push the agg_specs + AggMapping for one HAVING-only aggregate (one absent
@@ -2110,16 +2108,17 @@ fn append_having_agg(
     source_schema: &Schema,
     agg_specs: &mut Vec<(u64, usize)>,
     agg_mappings: &mut Vec<AggMapping>,
-) {
+) -> Result<(), GnitzSqlError> {
     let out_type = agg_result_type(agg_func, arg_col, source_schema);
     let agg_idx = agg_mappings.len();
     let start = agg_specs.len();
-    let is_avg = push_agg_specs(agg_func, arg_col, agg_specs);
+    let is_avg = push_agg_specs(agg_func, arg_col, agg_specs)?;
     agg_mappings.push(AggMapping {
         specs_start: start, is_avg,
         output_name: format!("_having_agg{}", agg_idx),
         output_type: out_type, agg_func, arg_col,
     });
+    Ok(())
 }
 
 /// Recursively collect aggregate calls referenced in a HAVING expression,
@@ -2134,7 +2133,7 @@ fn collect_having_aggs(
         Expr::Function(func) => {
             let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
             if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
-                append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings);
+                append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings)?;
             }
             Ok(())
         }
