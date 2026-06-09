@@ -170,16 +170,15 @@ impl StoreHandle {
     /// (partition_idx, FlushWork) per partition that produced deferred
     /// work; for Single/Borrowed `partition_idx` is always 0.
     pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
-        match self {
-            StoreHandle::Single(t) => match t.get_mut().flush_prepare(true)? {
-                FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-                FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
-            },
-            StoreHandle::Borrowed(ptr) => match unsafe { &mut **ptr }.flush_prepare(true)? {
-                FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-                FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
-            },
-            StoreHandle::Partitioned(cell) => cell.get_mut().flush_prepare(),
+        let table: &mut Table = match self {
+            StoreHandle::Single(t) => t.get_mut().as_mut(),
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
+            StoreHandle::Partitioned(cell) => return cell.get_mut().flush_prepare(),
+        };
+        let durable = table.is_durable();
+        match table.flush_prepare(durable)? {
+            FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
+            FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
         }
     }
 

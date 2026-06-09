@@ -43,7 +43,7 @@ fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
 /// iteration is lazy and stops at the first non-matching row, visiting only the
 /// matching rows. Factors out the per-run exact-match scan shared by every PK
 /// lookup so callers never re-derive the bound check or the index step.
-fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+pub(crate) fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     let start = run_exact_match_start_bytes(run, key);
     (start..run.count).take_while(move |&lo| run.get_pk_bytes(lo) == key)
 }
@@ -69,6 +69,20 @@ fn consolidate_batches(
     result.sorted = true;
     result.consolidated = true;
     result
+}
+
+/// Fold flushed runs (each individually (PK,payload)-sorted) into one run.
+/// Single-run input is returned by clone (no merge). Used by `Table` to
+/// consolidate `in_memory_l0` (the in-heap non-durable flush run set).
+pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) -> Rc<Batch> {
+    if runs.len() == 1 {
+        return Rc::clone(&runs[0]);
+    }
+    let sorted: Vec<SortedMemBatch> = runs
+        .iter()
+        .map(|r| r.as_sorted_mem_batch().expect("flushed runs are sorted"))
+        .collect();
+    Rc::new(consolidate_batches(&sorted, schema))
 }
 
 

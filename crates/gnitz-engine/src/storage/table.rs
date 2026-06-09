@@ -10,7 +10,7 @@ use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use crate::util::{fdatasync_eintr, fsync_eintr};
-use super::memtable::MemTable;
+use super::memtable::{self, MemTable};
 use super::batch::Batch;
 #[cfg(test)]
 use super::batch::ConsolidatedBatch;
@@ -19,6 +19,17 @@ use super::read_cursor::{self, CursorHandle};
 use super::shard_file::{self, PkUniqueChecker};
 use super::shard_index::{PendingShard, ShardIndex};
 use super::shard_reader::MappedShard;
+
+/// Fold `in_memory_l0` once it exceeds this many runs. Mirrors the disk
+/// `L0_COMPACT_THRESHOLD`; keeps cursor source count and per-lookup run scans
+/// small, and folds cross-flush retraction churn down to net state.
+const INMEM_COMPACT_THRESHOLD: usize = 4;
+
+/// Hard per-table (per child `Table` = per partition) heap ceiling for
+/// `in_memory_l0`. A flush that would exceed it folds first; if the folded net
+/// state still exceeds it, the run set spills to a real `eph_shard`. Bounds heap
+/// at this value per table at all times.
+const EPHEMERAL_INMEM_CEILING: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Two-phase flush API
@@ -125,6 +136,17 @@ pub struct Table {
     /// if `PkUniqueChecker` confirms the invariant. Must only be set for base tables
     /// with a user-defined PK constraint enforced by the DML layer.
     can_tag_pk_unique: bool,
+
+    /// Flushed runs of a non-durable table, held in heap instead of on disk.
+    /// Populated only when `flush_prepare` is called with `durable == false`.
+    /// Empty for every durable table (base tables, master system tables): those
+    /// always flush through the disk branch.
+    in_memory_l0: Vec<Rc<Batch>>,
+
+    /// Test-only override for `EPHEMERAL_INMEM_CEILING`, so spill paths can be
+    /// exercised without ingesting megabytes. `None` in production.
+    #[cfg(test)]
+    inmem_ceiling_override: Option<usize>,
 }
 
 impl Table {
@@ -163,6 +185,9 @@ impl Table {
             found_source: FoundSource::None,
             cached_full_scan: None,
             can_tag_pk_unique: false,
+            in_memory_l0: Vec::new(),
+            #[cfg(test)]
+            inmem_ceiling_override: None,
         };
 
         if durable {
@@ -198,7 +223,9 @@ impl Table {
     }
 
     /// Ingest an already-constructed Batch without WAL (worker DDL sync /
-    /// memonly index population). Forces ephemeral flushes on overflow.
+    /// memonly index population). Forces ephemeral flushes on overflow; that
+    /// ephemeral overflow now lands in `in_memory_l0` (heap), not a shard file,
+    /// unless it breaches `EPHEMERAL_INMEM_CEILING` and spills.
     pub fn ingest_owned_batch_memonly(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.upsert_owned_and_maybe_flush(batch, true)
     }
@@ -237,6 +264,14 @@ impl Table {
     // Flush
     // ------------------------------------------------------------------
 
+    /// Whether this table flushes durably (manifest-tracked shards). Base and
+    /// master system tables are durable; view child tables and index circuits
+    /// are not. Lets callers route each table through `flush_prepare(durable)`
+    /// with its own durability instead of a hardcoded `true`.
+    pub fn is_durable(&self) -> bool {
+        self.durable
+    }
+
     /// Flush memtable to shard.  Persistent tables also update manifest.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
         self.flush_inner(self.durable, true)
@@ -269,16 +304,19 @@ impl Table {
 
     /// Phase 1 of two-phase flush.
     ///
-    /// `durable=true` and a non-empty consolidated snapshot:
+    /// `durable == false` (index circuits, views, worker memonly overflow) with
+    /// a non-empty consolidated snapshot:
+    ///   append the snapshot to `in_memory_l0` — no file I/O, no manifest. The
+    ///   memtable IS reset. The run set is folded once it passes
+    ///   `INMEM_COMPACT_THRESHOLD`, and spilled to a real `eph_shard` only when
+    ///   `in_memory_bytes()` exceeds `EPHEMERAL_INMEM_CEILING` (the spill path
+    ///   restores page-cache reclaimability for the rare oversized table).
+    ///   `DoneInline` is returned.
+    ///
+    /// `durable == true` and a non-empty consolidated snapshot:
     ///   write shard `.tmp` (no fdatasync), open MappedShard against it for
     ///   metadata, write manifest `.tmp`, return `Pending(FlushWork)`. The
     ///   memtable is NOT reset.
-    ///
-    /// `durable=false` (index circuits, ephemeral overflow flushes) with a
-    /// non-empty consolidated snapshot:
-    ///   write the shard inline via `write_shard_streaming(durable=false)` —
-    ///   no fdatasync, no manifest. Memtable IS reset and `DoneInline` is
-    ///   returned.
     ///
     /// Empty memtable or `consolidated.count == 0`:
     ///   reset memtable and return `Empty`. The cancelled rows are still
@@ -295,22 +333,19 @@ impl Table {
             return Ok(FlushOutcome::Empty);
         }
 
-        let (shard_name, lsn_max) = if durable {
-            (
-                format!("shard_{}_{}.db", self.table_id, self.current_lsn),
-                self.current_lsn.saturating_sub(1),
-            )
-        } else {
-            self.flush_seq += 1;
-            let pid = unsafe { libc::getpid() };
-            (
-                format!(
-                    "eph_shard_{}_{}_{}_{}.db",
-                    self.table_id, pid, self.flush_seq, self.current_lsn
-                ),
-                0,
-            )
-        };
+        if !durable {
+            // In-memory ephemeral flush: no file I/O. `snapshot` is the
+            // (PK,payload)-consolidated run; the memtable references it until
+            // reset(), after which `in_memory_l0` keeps it alive.
+            self.cached_full_scan = None;
+            self.in_memory_l0.push(snapshot);
+            self.memtable.reset();
+            self.enforce_inmem_bound()?;
+            return Ok(FlushOutcome::DoneInline);
+        }
+
+        let shard_name = format!("shard_{}_{}.db", self.table_id, self.current_lsn);
+        let lsn_max = self.current_lsn.saturating_sub(1);
 
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let regions = snapshot.regions();
@@ -327,23 +362,10 @@ impl Table {
             0
         };
 
-        // Owned for this flush only. The non-durable branch closes it before
-        // returning; the durable branch moves ownership into `ShardRename`
-        // (whose Drop closes it on a rollback) and hands it to the committer.
+        // Owned for this flush only. The durable branch moves ownership into
+        // `ShardRename` (whose Drop closes it on a rollback) and hands it to the
+        // committer.
         let dirfd = self.open_dirfd()?;
-
-        if !durable {
-            let res = shard_file::write_shard_streaming(
-                dirfd, &name_c, self.table_id, snapshot.count as u32,
-                &regions, false, flush_flags,
-            );
-            unsafe { libc::close(dirfd); }
-            res?;
-            let final_full = format!("{}/{}", self.directory, shard_name);
-            self.shard_index.add_shard(&final_full, 0, 0)?;
-            self.memtable.reset();
-            return Ok(FlushOutcome::DoneInline);
-        }
 
         let prepared = match shard_file::write_shard_streaming_prepare(
             dirfd, &name_c, self.table_id, snapshot.count as u32, &regions, flush_flags,
@@ -478,6 +500,131 @@ impl Table {
     }
 
     // ------------------------------------------------------------------
+    // In-memory ephemeral run set (non-durable flushes)
+    // ------------------------------------------------------------------
+
+    /// The effective per-table heap ceiling — `EPHEMERAL_INMEM_CEILING` in
+    /// production, or the test override when one is set.
+    fn inmem_ceiling(&self) -> usize {
+        #[cfg(test)]
+        {
+            if let Some(c) = self.inmem_ceiling_override {
+                return c;
+            }
+        }
+        EPHEMERAL_INMEM_CEILING
+    }
+
+    /// Heap footprint of `in_memory_l0` — the byte total that drives the spill
+    /// ceiling. Recomputed on demand rather than cached: the run set is bounded
+    /// by `INMEM_COMPACT_THRESHOLD`, so this is a handful of `total_bytes()`
+    /// arithmetic calls, with no cached field for every mutation of
+    /// `in_memory_l0` to keep in sync.
+    fn in_memory_bytes(&self) -> usize {
+        self.in_memory_l0.iter().map(|r| r.total_bytes()).sum()
+    }
+
+    /// Keep `in_memory_l0` bounded after a non-durable flush. Called by
+    /// `flush_prepare`'s in-memory branch (the only site that grows the set),
+    /// so on return `in_memory_l0.len() <= INMEM_COMPACT_THRESHOLD` and
+    /// `in_memory_bytes() <= EPHEMERAL_INMEM_CEILING` always hold.
+    fn enforce_inmem_bound(&mut self) -> Result<(), StorageError> {
+        if self.in_memory_l0.len() > INMEM_COMPACT_THRESHOLD {
+            self.compact_in_memory();
+        }
+        if self.in_memory_bytes() > self.inmem_ceiling() {
+            self.spill_in_memory_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Fold `in_memory_l0` to a single net-state run. Reuses the memtable's
+    /// N-way consolidation primitive; drops net-zero (PK,payload) rows.
+    fn compact_in_memory(&mut self) {
+        if self.in_memory_l0.len() <= 1 {
+            return;
+        }
+        let merged = memtable::consolidate_runs(&self.in_memory_l0, &self.schema);
+        self.in_memory_l0.clear();
+        if merged.count > 0 {
+            self.in_memory_l0.push(merged);
+        }
+    }
+
+    /// Ceiling breach: fold to net state first. Folding cancels cross-flush
+    /// churn (an insert in flush N against its retraction in N+1) and can
+    /// reclaim enough to fall back under the ceiling — in which case this
+    /// returns without touching disk. Otherwise write the folded run to a real
+    /// `eph_shard` (the historical non-durable disk path), register it, drop it
+    /// from heap, then compact the disk tier.
+    ///
+    /// After a spill the table carries disk runs + future heap runs; cross-tier
+    /// churn does NOT fold (neither `compact_in_memory`, which is heap-only, nor
+    /// `run_compact`, which is disk-only, sees both). This is bounded: it only
+    /// occurs for tables that breached the ceiling, affects disk footprint not
+    /// heap (heap stays <= ceiling by construction), and the disk tier still
+    /// self-compacts. Eliminating it would need a unified disk+heap compaction —
+    /// out of scope.
+    ///
+    /// Transactional. The consolidated run stays in `in_memory_l0` until the
+    /// shard is both written and registered; heap is dropped only on the commit
+    /// path. A `write_shard_streaming` failure leaves the run in heap for retry
+    /// with nothing on disk to clean up; an `add_shard` failure unlinks the
+    /// just-written shard before returning. No error can lose the integrated
+    /// state or strand an orphan file.
+    fn spill_in_memory_to_disk(&mut self) -> Result<(), StorageError> {
+        self.compact_in_memory();
+        // Folding may have dropped the net state back under the ceiling (heavy
+        // churn cancels to near-nothing); if so there is nothing to spill.
+        if self.in_memory_bytes() <= self.inmem_ceiling() {
+            return Ok(());
+        }
+        // Above the ceiling the byte total is > 0, so `compact_in_memory` left
+        // exactly one net-state run (count > 0) in heap — `flush_prepare` never
+        // enqueues an empty snapshot and `compact_in_memory` only re-pushes
+        // `merged.count > 0`. Borrow it — do not remove — so a write/register
+        // failure below leaves heap intact for retry.
+        let run = Rc::clone(
+            self.in_memory_l0
+                .first()
+                .expect("compaction leaves one net-state run when above the spill ceiling"),
+        );
+
+        self.flush_seq += 1;
+        let pid = unsafe { libc::getpid() };
+        let shard_name = format!(
+            "eph_shard_{}_{}_{}_{}.db",
+            self.table_id, pid, self.flush_seq, self.current_lsn
+        );
+        let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
+
+        let dirfd = self.open_dirfd()?;
+        let res = shard_file::write_shard_streaming(
+            dirfd, &name_c, self.table_id, run.count as u32, &run.regions(), false, 0,
+        );
+        unsafe { libc::close(dirfd); }
+        res?; // Write failed: heap still owns `run`; no on-disk residue.
+
+        let final_full = format!("{}/{}", self.directory, shard_name);
+        if let Err(e) = self.shard_index.add_shard(&final_full, 0, 0) {
+            // Registration failed: unlink the shard we wrote, keep heap intact.
+            let _ = std::fs::remove_file(&final_full);
+            return Err(e);
+        }
+
+        // Commit: the run is on disk and registered — safe to drop from heap.
+        self.in_memory_l0.clear();
+
+        // Bound the spilled disk L0. A repeatedly-spilling table is read only
+        // via the non-compacting `open_cursor`, so without this its `eph_shard`s
+        // accumulate unbounded and every cursor merges them all.
+        // `compact_if_needed` is a no-op until the disk tier crosses its own
+        // threshold and skips the manifest (None) for this non-durable table.
+        self.compact_if_needed()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Cursor
     // ------------------------------------------------------------------
 
@@ -490,9 +637,15 @@ impl Table {
     /// FLUSH, foreground checkpoint, etc.). The snapshot-driven cursor itself
     /// doesn't care whether L0 has accumulated past the compact threshold.
     pub fn open_cursor(&self) -> CursorHandle {
-        let snapshots = self.memtable.snapshot_runs();
+        let mt = self.memtable.snapshot_runs();
         let shard_arcs = self.shard_index.all_shard_arcs();
-        read_cursor::create_cursor_from_snapshots(snapshots, &shard_arcs, self.schema)
+        if self.in_memory_l0.is_empty() {
+            return read_cursor::create_cursor_from_snapshots(mt, &shard_arcs, self.schema);
+        }
+        let mut snaps: Vec<Rc<Batch>> = Vec::with_capacity(mt.len() + self.in_memory_l0.len());
+        snaps.extend(mt.iter().cloned());
+        snaps.extend(self.in_memory_l0.iter().cloned());
+        read_cursor::create_cursor_from_snapshots(&snaps, &shard_arcs, self.schema)
     }
 
     /// Open a cursor after running `compact_if_needed`. Intended for
@@ -526,6 +679,12 @@ impl Table {
         self.memtable.snapshot_runs()
     }
 
+    /// Borrow the non-durable in-memory flush runs (for PartitionedTable cursor
+    /// gathering). Empty for every durable table.
+    pub fn in_memory_runs(&self) -> &[Rc<Batch>] {
+        &self.in_memory_l0
+    }
+
     /// Get all shard Rcs (for PartitionedTable cursor gathering).
     pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
@@ -535,6 +694,13 @@ impl Table {
     #[cfg(test)]
     pub fn memtable_is_empty(&self) -> bool {
         self.memtable.is_empty()
+    }
+
+    /// Test helper: shrink the per-table heap ceiling so spill paths can be
+    /// exercised without ingesting megabytes.
+    #[cfg(test)]
+    pub fn set_inmem_ceiling_for_test(&mut self, bytes: usize) {
+        self.inmem_ceiling_override = Some(bytes);
     }
 
     /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
@@ -558,13 +724,30 @@ impl Table {
     /// sorted-run lookup at every PK width (a wide-PK probe matches the 16-byte
     /// prefix the insert side hashed, so there are no false negatives).
     pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
-        let mut mt_w: i64 = 0;
+        let mut w: i64 = 0;
         if self.memtable.may_contain_pk(key) {
-            let (w, _, _) = self.memtable.lookup_pk_bytes(key);
-            mt_w = w;
+            let (mt_w, _, _) = self.memtable.lookup_pk_bytes(key);
+            w += mt_w;
         }
         let (shard_w, _) = self.scan_shards_for_pk_bytes(key, false);
-        mt_w + shard_w > 0
+        w += shard_w;
+        // A non-durable table can hold positive-weight rows only in
+        // `in_memory_l0` (after a flush, before any spill), so it must be
+        // scanned too. No-op for durable tables (`in_memory_l0` empty).
+        w += self.scan_inmem_weight(key);
+        w > 0
+    }
+
+    /// Net weight for `key` across `in_memory_l0`. Empty (returns 0) for every
+    /// durable table.
+    fn scan_inmem_weight(&self, key: &[u8]) -> i64 {
+        let mut w = 0;
+        for run in &self.in_memory_l0 {
+            for lo in memtable::run_pk_match_rows(run, key) {
+                w += run.get_weight(lo);
+            }
+        }
+        w
     }
 
     /// Look up a PK for retraction.  Returns (net_weight, found).
@@ -584,6 +767,16 @@ impl Table {
     /// accessors expose the live (PK, payload) row. The OPK-keyed memtable
     /// bloom gates the run lookup at every PK width.
     pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
+        // Reached only on `unique_pk` base tables (via
+        // `enforce_unique_pk_partitioned`), which are always durable and never
+        // acquire `in_memory_l0`. `get_weight_for_row_bytes` /
+        // `scan_shards_for_pk_bytes` (the found-row path) likewise scan only the
+        // memtable and disk shards; a future caller on an in-memory-bearing
+        // table must extend them and add a `FoundSource::InMemRun` variant.
+        debug_assert!(
+            self.in_memory_l0.is_empty(),
+            "retract_pk_bytes is base-table-only; base tables never flush in-memory",
+        );
         self.found_source = FoundSource::None;
 
         let (mt_w, _, mt_row_count) =
@@ -787,6 +980,12 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
     // compaction outputs (shard_* and hcomp_*) that may have been left by a
     // previous process.  All three patterns include table_id, so only this
     // table's files are touched even when tables share the same directory.
+    //
+    // In steady state a non-durable table writes no shard files at all — its
+    // flushes land in `in_memory_l0` (heap). This sweep reclaims (a) spill-path
+    // `eph_shard_*` left by a crashed prior process, (b) pre-upgrade
+    // `eph_shard_*`/`shard_*` from before in-memory flushes existed, and
+    // (c) `hcomp_*` from disk compaction of spilled data — not routine flushes.
     let eph_prefix   = format!("eph_shard_{}_",  table_id);
     let shard_prefix = format!("shard_{}_",      table_id);
     let hcomp_prefix = format!("hcomp_{}_",      table_id);
@@ -842,6 +1041,31 @@ mod tests {
             batch.consolidated = false;
         }
         batch
+    }
+
+    /// Count files named `eph_shard_*` directly in `dir`.
+    fn count_eph_shards(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("eph_shard_"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn no_eph_shard(dir: &std::path::Path) -> bool {
+        count_eph_shards(dir) == 0
+    }
+
+    /// Materialize `open_cursor` into a (pk -> net_weight) map.
+    fn materialize_weights(t: &Table) -> std::collections::HashMap<u64, i64> {
+        let mut out = std::collections::HashMap::new();
+        let batch = t.open_cursor().cursor.materialize();
+        for i in 0..batch.count {
+            out.insert(batch.get_pk(i) as u64, batch.get_weight(i));
+        }
+        out
     }
 
     #[test]
@@ -945,8 +1169,11 @@ mod tests {
         let tdir = dir.path().join("compact_test");
         let schema = make_u64_i64_schema();
 
+        // Durable: each flush writes a real `shard_*` so `run_compact` (L0→L1)
+        // is exercised. Under non-durable flush these tiny rows would stay in
+        // `in_memory_l0` and never reach the disk compaction path.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 500, 256, false,
+            tdir.to_str().unwrap(), "test", schema, 500, 256, true,
         ).unwrap();
 
         // Create enough flushes to trigger compaction
@@ -1078,11 +1305,20 @@ mod tests {
 
         t.ingest_owned_batch(make_batch(&[(3, 1, 30), (4, 1, 40)])).unwrap();
 
-        assert!(t.memtable_is_empty(), "overflow post-check must auto-flush to shard");
+        assert!(t.memtable_is_empty(), "overflow post-check must auto-flush");
+        // Non-durable flushes land in the in-memory run set, not disk shards.
         assert!(
-            !t.all_shard_arcs().is_empty(),
-            "at least one L0 shard must exist after overflow flush",
+            !t.in_memory_runs().is_empty(),
+            "at least one in-memory L0 run must exist after overflow flush",
         );
+        assert!(
+            t.all_shard_arcs().is_empty(),
+            "sub-ceiling ephemeral flush must not write a disk shard",
+        );
+        // Data from both batches must still be readable.
+        for pk in [1u128, 2, 3, 4] {
+            assert!(t.has_pk(pk), "PK {pk} must survive the in-memory flush");
+        }
     }
 
     /// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → retract_pk.
@@ -1093,8 +1329,11 @@ mod tests {
         let tdir = dir.path().join("retract_shard_fallback");
         let schema = make_u64_i64_schema();
 
+        // Durable: `retract_pk` is base-table-only (base tables are durable), so
+        // the flushed rows must land in a real shard for the shard-fallback path
+        // under test — not `in_memory_l0` (which a non-durable flush would use).
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, true,
         ).unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
@@ -1183,9 +1422,9 @@ mod tests {
         assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
     }
 
-    /// Non-durable `flush_prepare` performs the inline write itself and
-    /// returns `DoneInline`; the memtable is reset and the shard is visible
-    /// to subsequent reads via the in-memory shard index.
+    /// Non-durable `flush_prepare` consolidates the snapshot into the in-memory
+    /// run set and returns `DoneInline`; the memtable is reset, no shard file is
+    /// written, and the rows stay visible to subsequent reads.
     #[test]
     fn flush_prepare_non_durable_done_inline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1203,6 +1442,8 @@ mod tests {
             FlushOutcome::Pending(_) => panic!("expected DoneInline, got Pending"),
         }
         assert!(t.memtable_is_empty(), "memtable must be reset after non-durable flush_prepare");
+        assert!(!t.in_memory_runs().is_empty(), "snapshot must land in in_memory_l0");
+        assert!(no_eph_shard(&tdir), "non-durable flush must not write an eph_shard file");
         assert!(t.has_pk(10));
         assert!(t.has_pk(20));
     }
@@ -1249,8 +1490,12 @@ mod tests {
             b
         };
 
+        // Durable: this exercises `retract_pk_bytes` over flushed data, which is
+        // base-table-only (base tables are durable). A durable flush writes a
+        // real shard so the shard scan path is what's tested; a non-durable
+        // flush would route the rows into `in_memory_l0` instead.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, true,
         ).unwrap();
 
         // Two prefix-twins (1,1,100)/(1,1,200) and a distinct (2,0,0).
@@ -1288,5 +1533,215 @@ mod tests {
         assert!(!found2);
 
         t.close();
+    }
+
+    // ── In-memory ephemeral flush (durable=false) ────────────────────────
+
+    /// A sub-ceiling non-durable flush writes no file at all; rows are served
+    /// from `in_memory_l0` via the cursor.
+    #[test]
+    fn nondurable_flush_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("no_file_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)])).unwrap();
+        assert!(matches!(t.flush_prepare(false).unwrap(), FlushOutcome::DoneInline));
+
+        let shard_files: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("eph_shard_") || n.starts_with("shard_"))
+            .collect();
+        assert!(shard_files.is_empty(), "non-durable flush wrote files: {shard_files:?}");
+        assert!(t.all_shard_arcs().is_empty());
+        assert!(!t.in_memory_runs().is_empty());
+
+        let w = materialize_weights(&t);
+        assert_eq!(w.get(&10), Some(&1));
+        assert_eq!(w.get(&20), Some(&1));
+        assert_eq!(w.get(&30), Some(&1));
+    }
+
+    /// Cross-flush churn (insert in one flush, retraction in another) folds at
+    /// `INMEM_COMPACT_THRESHOLD` to net state — the cancelled key is gone, not
+    /// accumulated.
+    #[test]
+    fn nondurable_cross_flush_fold_nets_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("cross_fold_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+
+        // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
+        // run until the threshold folds them. Net weight is 0.
+        for i in 0..6 {
+            let w = if i % 2 == 0 { 1 } else { -1 };
+            t.ingest_owned_batch(make_batch(&[(7, w, 70)])).unwrap();
+            assert!(t.flush().unwrap());
+        }
+        assert!(!t.has_pk(7), "net-zero key must not be present");
+        let weights = materialize_weights(&t);
+        assert!(!weights.contains_key(&7), "net-zero key folds away (0 rows)");
+        assert!(
+            t.in_memory_runs().len() <= INMEM_COMPACT_THRESHOLD,
+            "run set must stay folded",
+        );
+        assert!(no_eph_shard(&tdir), "churn must not spill (tiny, sub-ceiling)");
+    }
+
+    /// More than `INMEM_COMPACT_THRESHOLD` distinct-key flushes keep the run
+    /// count bounded by folding, and every key survives.
+    #[test]
+    fn nondurable_run_count_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("run_bound_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+
+        let n = INMEM_COMPACT_THRESHOLD as u64 + 4;
+        for k in 0..n {
+            t.ingest_owned_batch(make_batch(&[(k, 1, (k * 10) as i64)])).unwrap();
+            assert!(t.flush().unwrap());
+            assert!(
+                t.in_memory_runs().len() <= INMEM_COMPACT_THRESHOLD,
+                "run count exceeded threshold after flush {k}",
+            );
+        }
+        for k in 0..n {
+            assert!(t.has_pk(k as u128), "key {k} must survive folding");
+        }
+    }
+
+    /// A flush past `EPHEMERAL_INMEM_CEILING` (shrunk via the test seam) spills
+    /// the folded run to an `eph_shard`, drains heap, and keeps rows readable.
+    #[test]
+    fn nondurable_ceiling_spill_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("ceiling_spill_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+        t.set_inmem_ceiling_for_test(100); // < one flush (~10 rows × 32 B)
+
+        let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
+        t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        assert!(t.flush().unwrap());
+
+        assert!(count_eph_shards(&tdir) > 0, "ceiling breach must spill to an eph_shard");
+        assert_eq!(t.in_memory_bytes(), 0, "heap drained after spill");
+        assert!(t.in_memory_runs().is_empty());
+        assert!(!t.all_shard_arcs().is_empty());
+        for k in 0..10u128 {
+            assert!(t.has_pk(k), "row {k} must remain readable from disk after spill");
+        }
+    }
+
+    /// Repeated over-ceiling flushes keep the on-disk eph_shard count bounded
+    /// (the spill path's `compact_if_needed` folds L0→L1 and cleans up), and all
+    /// rows across rounds stay correct.
+    #[test]
+    fn nondurable_repeated_spill_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("repeated_spill_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+        t.set_inmem_ceiling_for_test(100);
+
+        const ROUNDS: u64 = 20;
+        const PER: u64 = 10;
+        for r in 0..ROUNDS {
+            let rows: Vec<(u64, i64, i64)> = (0..PER)
+                .map(|j| (r * PER + j, 1, ((r * PER + j) * 10) as i64))
+                .collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+            assert!(t.flush().unwrap());
+            assert_eq!(t.in_memory_bytes(), 0, "round {r}: heap drained after spill");
+            // Raw eph_shards do not accumulate with rounds — disk L0 self-folds.
+            assert!(
+                count_eph_shards(&tdir) <= 5,
+                "round {r}: {} eph_shards accumulated", count_eph_shards(&tdir),
+            );
+        }
+
+        let weights = materialize_weights(&t);
+        assert_eq!(weights.len() as u64, ROUNDS * PER, "all rows present");
+        assert!(weights.values().all(|&w| w == 1), "every row nets +1");
+    }
+
+    /// `has_pk` reflects net weight held only in `in_memory_l0`: true after an
+    /// insert flush, false after the net-zero retraction flush.
+    #[test]
+    fn nondurable_has_pk_over_in_memory_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("has_pk_inmem_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+
+        t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
+        assert!(t.flush().unwrap());
+        assert!(t.memtable_is_empty());
+        assert!(t.has_pk(5), "in-memory positive-weight row must be found");
+
+        t.ingest_owned_batch(make_batch(&[(5, -1, 50)])).unwrap();
+        assert!(t.flush().unwrap());
+        assert!(!t.has_pk(5), "net-zero key across in-memory runs must be absent");
+    }
+
+    /// After a spill, fresh heap runs coexist with disk shards; `open_cursor`
+    /// returns their union with correct net weights, including a cross-tier
+    /// retraction (heap retraction cancelling a disk insert).
+    #[test]
+    fn nondurable_mixed_disk_and_heap_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("mixed_read_test");
+        let schema = make_u64_i64_schema();
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+        ).unwrap();
+
+        // Force keys 0..10 to disk.
+        t.set_inmem_ceiling_for_test(100);
+        let disk_rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
+        t.ingest_owned_batch(make_batch(&disk_rows)).unwrap();
+        assert!(t.flush().unwrap());
+        assert!(!t.all_shard_arcs().is_empty(), "first flush must spill to disk");
+        assert_eq!(t.in_memory_bytes(), 0);
+
+        // Raise ceiling so subsequent flushes stay in heap.
+        t.set_inmem_ceiling_for_test(usize::MAX);
+        let heap_rows: Vec<(u64, i64, i64)> = (100..105).map(|k| (k, 1, (k * 10) as i64)).collect();
+        t.ingest_owned_batch(make_batch(&heap_rows)).unwrap();
+        assert!(t.flush().unwrap());
+        assert!(!t.in_memory_runs().is_empty(), "second flush stays in heap");
+
+        // Cross-tier retraction: cancel disk key 3 (payload 30) from heap.
+        t.ingest_owned_batch(make_batch(&[(3, -1, 30)])).unwrap();
+        assert!(t.flush().unwrap());
+
+        assert!(!t.has_pk(3), "disk insert + heap retraction nets zero");
+        let weights = materialize_weights(&t);
+        for k in 0..10u64 {
+            if k == 3 {
+                assert!(!weights.contains_key(&3), "retracted disk key must be gone");
+            } else {
+                assert_eq!(weights.get(&k), Some(&1), "disk key {k}");
+            }
+        }
+        for k in 100..105u64 {
+            assert_eq!(weights.get(&k), Some(&1), "heap key {k}");
+        }
     }
 }

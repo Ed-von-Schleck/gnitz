@@ -175,6 +175,7 @@ impl PartitionedTable {
         let mut all_shard_arcs: Vec<Rc<MappedShard>> = Vec::new();
         for table in &self.tables {
             all_snapshots.extend(table.snapshot_runs().iter().cloned());
+            all_snapshots.extend(table.in_memory_runs().iter().cloned());
             all_shard_arcs.extend(table.all_shard_arcs());
         }
         read_cursor::create_cursor_from_snapshots(
@@ -202,6 +203,7 @@ impl PartitionedTable {
         for table in &mut self.tables {
             table.compact_if_needed()?;
             all_snapshots.extend(table.snapshot_runs().iter().cloned());
+            all_snapshots.extend(table.in_memory_runs().iter().cloned());
             all_shard_arcs.append(&mut table.all_shard_arcs());
         }
 
@@ -312,7 +314,11 @@ impl PartitionedTable {
     pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
         let mut works = Vec::new();
         for (i, table) in self.tables.iter_mut().enumerate() {
-            match table.flush_prepare(true)? {
+            // Honor each child's own durability. Base-table children are
+            // durable (return `Pending`); non-durable view children flush
+            // in-memory (return `DoneInline`) and stop writing throwaway shards
+            // at checkpoint.
+            match table.flush_prepare(table.is_durable())? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => {}
                 FlushOutcome::Pending(w) => works.push((i, *w)),
             }
@@ -716,5 +722,113 @@ mod tests {
         // Must not panic and must report the cleared-found default.
         assert_eq!(pt.found_null_word(), 0);
         assert!(pt.found_col_ptr(0, 8).is_null());
+    }
+
+    // ── In-memory ephemeral flush across partitions ──────────────────────
+
+    /// Recursively count files under `root` whose name satisfies `pred`.
+    fn count_tree(root: &std::path::Path, pred: impl Fn(&str) -> bool + Copy) -> usize {
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    n += count_tree(&path, pred);
+                } else if let Some(name) = e.file_name().to_str() {
+                    if pred(name) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// A durable `PartitionedTable` still routes flushes through the durable
+    /// branch: `flush_prepare` returns `Pending` work and writes shard `.tmp`
+    /// files. Guards against the durability fix over-broadening to base tables.
+    #[test]
+    fn flush_prepare_durable_returns_pending() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("pt_durable_flush");
+        let schema = make_schema();
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 800, 256, true, 0, 256,
+            partition_arena_size(256),
+        ).unwrap();
+
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)])).unwrap();
+        let works = pt.flush_prepare().unwrap();
+        assert!(!works.is_empty(), "durable table must return Pending work");
+        assert!(
+            count_tree(&tdir, |n| n.ends_with(".tmp")) > 0,
+            "durable flush_prepare must write shard/manifest .tmp files",
+        );
+        // FlushWork::drop unlinks the .tmp files; memtable was not reset on prepare.
+        drop(works);
+        assert!(pt.has_pk(10) && pt.has_pk(20) && pt.has_pk(30));
+    }
+
+    /// A non-durable `PartitionedTable` flushes every child in-memory:
+    /// `flush_prepare` returns no work, writes no shard/manifest file, and the
+    /// rows stay readable.
+    #[test]
+    fn flush_prepare_nondurable_no_work_no_files() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("pt_nondurable_flush");
+        let schema = make_schema();
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 810, 256, false, 0, 256,
+            partition_arena_size(256),
+        ).unwrap();
+
+        pt.ingest_owned_batch(
+            make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]),
+        ).unwrap();
+        let works = pt.flush_prepare().unwrap();
+        assert!(works.is_empty(), "non-durable table must return no Pending work");
+        assert_eq!(
+            count_tree(&tdir, |n| n.starts_with("shard_") || n.starts_with("eph_shard_")),
+            0, "non-durable checkpoint flush must write no shard files",
+        );
+        assert_eq!(count_tree(&tdir, |n| n == "manifest.bin"), 0);
+        for pk in [10u128, 20, 30, 40] {
+            assert!(pt.has_pk(pk), "pk {pk} must be readable after in-memory flush");
+        }
+    }
+
+    /// `create_cursor_compacting` (the operator-state / `ScanTrace` read path)
+    /// must surface each partition's `in_memory_l0`, not just `open_cursor`.
+    /// Fails pre-fix (multi-partition branch dropped `in_memory_runs`).
+    #[test]
+    #[allow(clippy::disallowed_methods)] // the test's whole point is this read path
+    fn create_cursor_compacting_gathers_in_memory_runs() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("pt_ccc_inmem");
+        let schema = make_schema();
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 820, 256, false, 0, 256,
+            partition_arena_size(256),
+        ).unwrap();
+
+        let rows: Vec<(u64, i64, i64)> = (0..50).map(|i| (i * 7 + 3, 1, (i * 10) as i64)).collect();
+        pt.ingest_owned_batch(make_batch(&rows)).unwrap();
+
+        // Flush all partitions into in_memory_l0; memtables now empty.
+        assert!(pt.flush_prepare().unwrap().is_empty());
+
+        let batch = pt.create_cursor_compacting().unwrap().cursor.materialize();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..batch.count {
+            assert_eq!(batch.get_weight(i), 1);
+            seen.insert(batch.get_pk(i) as u64);
+        }
+        for &(pk, _, _) in &rows {
+            assert!(seen.contains(&pk), "pk {pk} missing from create_cursor_compacting");
+        }
+        assert_eq!(seen.len(), rows.len(), "all rows surfaced via compacting cursor");
     }
 }

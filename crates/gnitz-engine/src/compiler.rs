@@ -14,6 +14,12 @@ use crate::vm::{ProgramBuilder, VmHandle};
 /// history, `IntegrateTrace`) are named under the view directory, which all
 /// forked workers share via the same `base_dir`; embedding the rank keeps each
 /// worker's ephemeral shard isolated so siblings don't clobber each other.
+///
+/// These scratch tables now flush in-memory (`in_memory_l0`), so the rank only
+/// matters when a table *spills* past `EPHEMERAL_INMEM_CEILING` (which still
+/// writes `eph_shard_*` files into the shared tree) and at construction-time
+/// `erase_stale_shards`. Retained for those paths; a future change that removed
+/// spill entirely could revisit it.
 pub static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Set the calling process's worker rank. Called post-fork before any view is
