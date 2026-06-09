@@ -3,6 +3,53 @@ use crate::schema::{pk_native_key, payload_native_key};
 use rustc_hash::{FxHashSet, FxHashMap};
 use crate::storage::PkBuf;
 
+/// Resolves once where a logical column physically lives in a batch row — the
+/// packed PK region (non-nullable) or a payload slot (NULL-skippable) — then
+/// reads its canonical u128 key per row. A PK column has no payload slot, so
+/// `payload_idx` would return the PK sentinel and `col_data(sentinel)` would
+/// read out of bounds; this reads from the PK region via `pk_native_key`
+/// instead. `pk_native_key` (not the OPK-widened `get_pk`) is correct for every
+/// width and signedness — `get_pk` would feed a re-OPK-encode and double-flip a
+/// signed single PK. Shared by the FK and unique-index inline validators, which
+/// both need exactly this PK-vs-payload read.
+struct ColKeyReader {
+    is_pk: bool,
+    col_size: usize,
+    type_code: u8,
+    /// Byte offset within the packed PK region (PK columns only).
+    pk_off: usize,
+    /// Dense payload slot, or `usize::MAX` for a PK column (payload columns only).
+    payload_col: usize,
+}
+
+impl ColKeyReader {
+    fn resolve(schema: &SchemaDescriptor, col_idx: usize) -> Self {
+        let is_pk = schema.is_pk_col(col_idx);
+        Self {
+            is_pk,
+            col_size: schema.columns[col_idx].size() as usize,
+            type_code: schema.columns[col_idx].type_code,
+            pk_off: if is_pk { schema.pk_byte_offset(col_idx) as usize } else { 0 },
+            payload_col: if is_pk { usize::MAX } else { schema.payload_idx(col_idx) },
+        }
+    }
+
+    /// The row's canonical u128 key, or `None` when the column is a payload
+    /// column holding NULL (PK columns are non-nullable and never yield `None`).
+    #[inline]
+    fn key_at(&self, batch: &Batch, row: usize) -> Option<u128> {
+        if self.is_pk {
+            Some(pk_native_key(batch.get_pk_bytes(row), self.pk_off, self.col_size, self.type_code))
+        } else {
+            if batch.get_null_word(row) & (1u64 << self.payload_col) != 0 {
+                return None;
+            }
+            Some(payload_native_key(
+                batch.col_data(self.payload_col), row * self.col_size, self.col_size, self.type_code))
+        }
+    }
+}
+
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
 
@@ -93,18 +140,16 @@ impl CatalogEngine {
                         "FK target {} col {} has no UNIQUE index", target_id, target_col_idx))?)
             };
             let idx_key_size = idx_ic.map(|ic| ic.index_schema.columns[0].size() as usize);
+            let idx_key_type = idx_ic.map(|ic| ic.index_schema.columns[0].type_code);
+
+            // The child FK column may itself be a PK column, so resolve the
+            // PK-vs-payload read once per constraint (hoisted out of the row
+            // loop). Mirrors the distributed FK gate in master.rs.
+            let reader = ColKeyReader::resolve(&schema, col_idx);
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
-
-                let null_word = batch.get_null_word(row);
-                let payload_col = schema.payload_idx(col_idx);
-                if null_word & (1u64 << payload_col) != 0 { continue; }
-
-                let col_type = schema.columns[col_idx].type_code;
-                let col_size = schema.columns[col_idx].size() as usize;
-                let col_data = batch.col_data(payload_col);
-                let fk_key = payload_native_key(col_data, row * col_size, col_size, col_type);
+                let Some(fk_key) = reader.key_at(batch, row) else { continue };
 
                 let found = if is_lone_pk {
                     target_entry.handle.has_pk(fk_key)
@@ -116,7 +161,7 @@ impl CatalogEngine {
                     // whole leading column (idx_key_size), not a source-width LE
                     // prefix.
                     let opk = crate::schema::index_opk_prefix(
-                        fk_key, ic.index_schema.columns[0].type_code, ks);
+                        fk_key, idx_key_type.unwrap(), ks);
                     ic.table_mut().open_cursor().cursor
                         .seek_first_positive_with_prefix(&opk[..ks])
                 };
@@ -210,48 +255,26 @@ impl CatalogEngine {
         // is index-specific, so the *contents* are rebuilt per index).
         let mut retracted: FxHashSet<(PkBuf, u128)> = FxHashSet::default();
 
+        // Reused across indices like `retracted`; cleared per index. The
+        // canonical u128 key identifies the indexed value for every accepted
+        // type (pk_native_key/payload_native_key map to ≤16 bytes).
+        let mut seen: FxHashSet<u128> =
+            FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
+            seen.clear();
             let source_col_idx = ic.col_idx as usize;
-            let col_type = schema.columns[source_col_idx].type_code;
-            let col_size = schema.columns[source_col_idx].size() as usize;
             // A unique index may be on a PK column (e.g. a single member of a
-            // compound PK). Then the value lives in the packed PK, not a payload
-            // column — payload_idx/col_data would panic, and a compound PK must
-            // be sliced to the indexed column.
-            let is_pk_col = schema.is_pk_col(source_col_idx);
-            let pk_field_off = if is_pk_col {
-                schema.pk_byte_offset(source_col_idx) as usize
-            } else { 0 };
-            let payload_col = if is_pk_col {
-                usize::MAX
-            } else {
-                schema.payload_idx(source_col_idx)
-            };
-
-            // Decode the indexed column to its canonical u128 key. `get_pk` is the
-            // OPK-widened value, which `index_opk_prefix` below would re-OPK-encode
-            // — wrong for a signed single PK (double sign flip). `pk_native_key` is
-            // correct for all widths and equals `get_pk` for unsigned single PKs; a
-            // payload column reads from `col_data`, not the packed PK.
-            let key_at = |row: usize| -> u128 {
-                if is_pk_col {
-                    pk_native_key(batch.get_pk_bytes(row), pk_field_off, col_size, col_type)
-                } else {
-                    payload_native_key(
-                        batch.col_data(payload_col), row * col_size, col_size, col_type)
-                }
-            };
+            // compound PK), whose value lives in the packed PK, not a payload
+            // slot. `reader.key_at` resolves that once and returns `None` for a
+            // NULL payload column (PK columns are non-nullable).
+            let reader = ColKeyReader::resolve(&schema, source_col_idx);
 
             let idx_key_size = ic.index_schema.columns[0].size() as usize;
             let idx_key_type = ic.index_schema.columns[0].type_code;
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
-
-            // The canonical u128 key uniquely identifies the indexed value for
-            // every type we accept (pk_native_key/payload_native_key map to ≤16 bytes).
-            let mut seen: FxHashSet<u128> =
-                FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
             // A batch may atomically move a unique value between PKs (transfer)
             // or swap two values; the committed index still holds the old entry
@@ -263,11 +286,7 @@ impl CatalogEngine {
             if has_retractions {
                 for row in 0..batch.count {
                     if batch.get_weight(row) >= 0 { continue; }
-                    if !is_pk_col {
-                        let null_word = batch.get_null_word(row);
-                        if null_word & (1u64 << payload_col) != 0 { continue; }
-                    }
-                    let key_u128 = key_at(row);
+                    let Some(key_u128) = reader.key_at(batch, row) else { continue };
                     retracted.insert((
                         PkBuf::from_bytes(batch.get_pk_bytes(row)), key_u128));
                 }
@@ -275,12 +294,8 @@ impl CatalogEngine {
 
             for row in 0..batch.count {
                 if batch.get_weight(row) <= 0 { continue; }
-
-                // PK columns are non-nullable; only payload columns can be NULL.
-                if !is_pk_col {
-                    let null_word = batch.get_null_word(row);
-                    if null_word & (1u64 << payload_col) != 0 { continue; }
-                }
+                // PK columns are non-nullable; a NULL payload column is skipped.
+                let Some(key_u128) = reader.key_at(batch, row) else { continue };
 
                 // UPSERT iff the row's PK is a net-positive PK in this batch AND
                 // already has a live base-table row. The net-positive gate (not
@@ -308,8 +323,6 @@ impl CatalogEngine {
                     // misclassified as a fresh insert.
                     entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
                 };
-
-                let key_u128 = key_at(row);
 
                 if !seen.insert(key_u128) {
                     return Err(self.unique_violation_err(table_id, source_col_idx, true));

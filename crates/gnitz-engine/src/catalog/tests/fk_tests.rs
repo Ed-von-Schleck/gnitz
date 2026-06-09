@@ -332,3 +332,51 @@ fn test_fk_u128() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── test_fk_inline_child_pk_column_is_fk ─────────────────────────────
+// A child whose LONE PK column is itself the FK into the parent (a junction
+// table keyed by its FK). The FK value lives in the PK region — there is no
+// payload slot — so `validate_fk_inline` must read it from the PK, not via
+// `payload_idx` (which returns the PK sentinel and reads out of bounds). The
+// present-key case panics on the sentinel without the PK-column fix.
+
+#[test]
+fn test_fk_inline_child_pk_column_is_fk() {
+    let dir = temp_dir("fk_pk_col_is_fk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("pid")], &[0], true).unwrap();
+
+    let child_cols = vec![
+        ColumnDef { name: "pid_fk".into(), type_code: type_code::U64, is_nullable: false,
+                    fk_table_id: parent_tid, fk_col_idx: 0 },
+    ];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // Insert a parent row with pid = 10.
+    let parent_schema = engine.get_schema(parent_tid).unwrap();
+    let mut pbb = BatchBuilder::new(parent_schema);
+    pbb.begin_row(10u128, 1);
+    pbb.end_row();
+    engine.dag.ingest_to_family(parent_tid, pbb.finish());
+    let _ = engine.dag.flush(parent_tid);
+
+    let child_schema = engine.get_schema(child_tid).unwrap();
+
+    // Present parent key: child PK = 10 references the existing parent row.
+    let mut ok = BatchBuilder::new(child_schema);
+    ok.begin_row(10u128, 1);
+    ok.end_row();
+    assert!(engine.validate_fk_inline(child_tid, &ok.finish()).is_ok(),
+        "child PK=10 must validate against the present parent key");
+
+    // Absent parent key: child PK = 99 has no parent row → violation.
+    let mut bad = BatchBuilder::new(child_schema);
+    bad.begin_row(99u128, 1);
+    bad.end_row();
+    assert!(engine.validate_fk_inline(child_tid, &bad.finish()).is_err(),
+        "child PK=99 must be rejected (no matching parent key)");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
