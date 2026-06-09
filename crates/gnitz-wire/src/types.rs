@@ -194,6 +194,55 @@ pub const fn is_fixed_int(tc: u8) -> bool {
     )
 }
 
+/// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
+/// domain on which "decode little-endian bytes → i64" is total. Construct via
+/// `from_type_code`; *holding* a `FixedInt` is proof the column is a narrow
+/// integer, so `decode_le_i64` needs no wildcard and cannot panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedInt { U8, I8, U16, I16, U32, I32, U64, I64 }
+
+impl FixedInt {
+    /// Exhaustive over `TypeCode` (no `_` arm): a new `TypeCode` variant is a
+    /// compile error here until someone decides whether it is a narrow integer.
+    pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
+        match tc {
+            TypeCode::U8  => Some(Self::U8),  TypeCode::I8  => Some(Self::I8),
+            TypeCode::U16 => Some(Self::U16), TypeCode::I16 => Some(Self::I16),
+            TypeCode::U32 => Some(Self::U32), TypeCode::I32 => Some(Self::I32),
+            TypeCode::U64 => Some(Self::U64), TypeCode::I64 => Some(Self::I64),
+            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID
+            | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
+        }
+    }
+
+    /// Byte width (1/2/4/8).
+    pub const fn width(self) -> usize {
+        match self {
+            Self::U8 | Self::I8   => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 => 4,
+            Self::U64 | Self::I64 => 8,
+        }
+    }
+
+    /// Decode the leading `width()` little-endian bytes of `b` as this integer,
+    /// sign- or zero-extended into `i64`. Total: every arm is a real ≤8-byte
+    /// integer with a pinned width, so `try_into` cannot fail.
+    pub fn decode_le_i64(self, b: &[u8]) -> i64 {
+        debug_assert!(b.len() >= self.width());
+        match self {
+            Self::U8  => b[0] as i64,
+            Self::I8  => b[0] as i8 as i64,
+            Self::U16 => u16::from_le_bytes(b[..2].try_into().unwrap()) as i64,
+            Self::I16 => i16::from_le_bytes(b[..2].try_into().unwrap()) as i64,
+            Self::U32 => u32::from_le_bytes(b[..4].try_into().unwrap()) as i64,
+            Self::I32 => i32::from_le_bytes(b[..4].try_into().unwrap()) as i64,
+            Self::U64 => u64::from_le_bytes(b[..8].try_into().unwrap()) as i64,
+            Self::I64 => i64::from_le_bytes(b[..8].try_into().unwrap()),
+        }
+    }
+}
+
 /// u8-based counterpart to [`TypeCode::reindex_output_type`] for callers holding
 /// a raw `type_code` (mirrors the free `is_fixed_int`/`wire_stride`). See that
 /// method for the width policy and the engine ↔ planner lockstep it anchors.
@@ -468,5 +517,43 @@ mod tests {
                      compiler carried-slot guard would diverge from the planner");
             }
         }
+    }
+
+    #[test]
+    fn fixed_int_predicate_matches_witness() {
+        use TypeCode::*;
+        for tc in [U8, I8, U16, I16, U32, I32, F32, U64, I64, F64,
+                   String, U128, UUID, Blob, I128] {
+            assert_eq!(is_fixed_int(tc as u8), FixedInt::from_type_code(tc).is_some(),
+                "mismatch for {tc:?}");
+        }
+    }
+
+    #[test]
+    fn fixed_int_from_type_code_coverage() {
+        assert!(FixedInt::from_type_code(TypeCode::U8).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::I8).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::U16).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::I16).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::U32).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::I32).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::U64).is_some());
+        assert!(FixedInt::from_type_code(TypeCode::I64).is_some());
+        for tc in [TypeCode::F32, TypeCode::F64, TypeCode::U128, TypeCode::UUID,
+                   TypeCode::String, TypeCode::Blob, TypeCode::I128] {
+            assert!(FixedInt::from_type_code(tc).is_none(), "{tc:?} should be None");
+        }
+    }
+
+    #[test]
+    fn fixed_int_decode_le_i64_round_trips() {
+        assert_eq!(FixedInt::U8.decode_le_i64(&[0xff]), 255i64);
+        assert_eq!(FixedInt::I8.decode_le_i64(&[0xff]), -1i64);
+        assert_eq!(FixedInt::U16.decode_le_i64(&[0xff, 0x00]), 255i64);
+        assert_eq!(FixedInt::I16.decode_le_i64(&[0x00, 0x80]), i16::MIN as i64);
+        assert_eq!(FixedInt::U32.decode_le_i64(&[0xff, 0xff, 0xff, 0xff]), u32::MAX as i64);
+        assert_eq!(FixedInt::I32.decode_le_i64(&[0x00, 0x00, 0x00, 0x80]), i32::MIN as i64);
+        assert_eq!(FixedInt::U64.decode_le_i64(&u64::MAX.to_le_bytes()), -1i64);
+        assert_eq!(FixedInt::I64.decode_le_i64(&i64::MIN.to_le_bytes()), i64::MIN);
     }
 }

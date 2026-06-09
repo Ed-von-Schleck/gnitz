@@ -5,7 +5,7 @@ use sqlparser::ast::{
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
 use std::sync::Arc;
-use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, WireConflictMode, ClientError};
+use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, FixedInt, WireConflictMode, ClientError};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::{Binder, find_unique_column};
@@ -952,20 +952,12 @@ enum ColumnValue { Int(i64), Str(String), Null }
 /// Decode the native LE bytes of a PK column into an i64. U128/UUID don't fit
 /// through the i64 return shape and are rejected.
 fn decode_pk_bytes_to_i64(tc: TypeCode, slice: &[u8]) -> Result<i64, GnitzSqlError> {
-    Ok(match tc {
-        TypeCode::I8  => slice[0] as i8 as i64,
-        TypeCode::U8  => slice[0] as i64,
-        TypeCode::I16 => i16::from_le_bytes(slice[..2].try_into().unwrap()) as i64,
-        TypeCode::U16 => u16::from_le_bytes(slice[..2].try_into().unwrap()) as i64,
-        TypeCode::I32 => i32::from_le_bytes(slice[..4].try_into().unwrap()) as i64,
-        TypeCode::U32 => u32::from_le_bytes(slice[..4].try_into().unwrap()) as i64,
-        TypeCode::I64 => i64::from_le_bytes(slice[..8].try_into().unwrap()),
-        TypeCode::U64 => u64::from_le_bytes(slice[..8].try_into().unwrap()) as i64,
-        _ => return Err(GnitzSqlError::Unsupported(format!(
-            "residual filter on PK column of type {:?} not supported; \
-             use `pk = literal` to seek instead", tc
-        ))),
-    })
+    FixedInt::from_type_code(tc)
+        .map(|ft| ft.decode_le_i64(slice))
+        .ok_or_else(|| GnitzSqlError::Unsupported(format!(
+            "residual filter on PK column of type {tc:?} not supported; \
+             use `pk = literal` to seek instead"
+        )))
 }
 
 fn eval_pred_row(
@@ -1020,23 +1012,16 @@ fn eval_expr(
                 return Ok(None);
             }
             match &batch.columns[*c] {
-                ColData::Fixed(buf) => {
-                    let stride = col_def.type_code.wire_stride();
-                    let start  = i * stride;
-                    let slice  = &buf[start..start + stride];
-                    // Decode using the actual type code so unsigned columns
-                    // are not sign-extended through an intermediate signed cast.
-                    let v: i64 = match col_def.type_code {
-                        TypeCode::U8  => slice[0] as i64,
-                        TypeCode::I8  => slice[0] as i8 as i64,
-                        TypeCode::U16 => u16::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        TypeCode::I16 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        TypeCode::U32 => u32::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        TypeCode::I32 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
-                        _             => i64::from_le_bytes(slice.try_into().unwrap()),
-                    };
-                    Ok(Some(v))
-                }
+                ColData::Fixed(buf) => match FixedInt::from_type_code(col_def.type_code) {
+                    Some(ft) => {
+                        let stride = ft.width();
+                        let start  = i * stride;
+                        Ok(Some(ft.decode_le_i64(&buf[start..start + stride])))
+                    }
+                    None => Err(GnitzSqlError::Unsupported(format!(
+                        "residual filter on {:?} column not supported", col_def.type_code
+                    ))),
+                },
                 ColData::Strings(_) => Err(GnitzSqlError::Unsupported(
                     "residual filter on string column not supported".to_string()
                 )),
@@ -1442,12 +1427,18 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
         if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
-            // Only optionally-negated numeric literals take the fast path; a
-            // string or NULL in the IN-list aborts to the slow scan. Routing
-            // through extract_sql_literal also unwraps `UnaryOp(Minus, Number)`
-            // so signed lists like `IN (-1, -2)` match without the slow path.
-            let SqlLiteral::Number(n, negated) = extract_sql_literal(item)? else { return None; };
-            pks.push(parse_pk_literal_packed(pk_col.type_code, n, negated)?);
+            // Optionally-negated numerics, plus single-quoted UUID strings for a
+            // UUID PK — exactly the literals `try_col_eq_literal` accepts for the
+            // `=` seek, so `IN (…)` and `= …` route identically. A NULL, a
+            // non-literal, or an unparseable UUID aborts to the slow scan.
+            let v = match extract_sql_literal(item)? {
+                SqlLiteral::Number(n, negated) =>
+                    parse_pk_literal_packed(pk_col.type_code, n, negated)?,
+                SqlLiteral::Str(s) if pk_col.type_code == TypeCode::UUID =>
+                    parse_uuid_str(s).ok()?,
+                _ => return None,
+            };
+            pks.push(v);
         }
         Some(pks)
     } else {
@@ -1966,7 +1957,7 @@ mod tests {
         let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
         let pk = super::extract_pk_value(&row, &schema).unwrap();
         // UUID PK has stride 16; the parsed u128 lives in the low 16 bytes.
-        assert_eq!(pk.to_u128_narrow(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
+        assert_eq!(pk.to_u128().unwrap(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
     }
 
     #[test]
@@ -2139,7 +2130,7 @@ mod tests {
         let row = vec![literal.clone(), num_expr("0")];
         let got_insert = super::extract_pk_value(&row, &schema)
             .unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-        assert_eq!(got_insert.to_u128_narrow(), expected, "extract_pk_value");
+        assert_eq!(got_insert.to_u128().unwrap(), expected, "extract_pk_value");
 
         // 2. try_col_eq_literal (WHERE pk = literal).
         let where_expr = eq_expr("id", literal.clone());
@@ -2583,6 +2574,82 @@ mod tests {
             TypeCode::UUID, "id",
         ).expect_err("double-quoted UUID PK literal must be rejected");
         assert!(err.to_string().contains("numeric literal"), "error: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // eval_expr — Site A: F32/F64 payload returns Err(Unsupported);
+    // U64 high-bit regression.
+    // ------------------------------------------------------------------
+
+    fn float_col_schema(tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![col_def("pk", TypeCode::U64, false), col_def("v", tc, false)],
+            pk_cols: vec![0],
+        }
+    }
+
+    #[test]
+    fn eval_expr_f32_payload_returns_unsupported() {
+        let schema = float_col_schema(TypeCode::F32);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1); batch.weights.push(1); batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        let err = super::eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn eval_expr_f64_payload_returns_unsupported() {
+        let schema = float_col_schema(TypeCode::F64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1); batch.weights.push(1); batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&1.0f64.to_le_bytes());
+        }
+        let err = super::eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn eval_expr_u64_high_bit_decodes_correctly() {
+        // U64 with the high bit set: the new path must produce the same bitcast
+        // as the old path. In i64, this is -1.
+        let schema = float_col_schema(TypeCode::U64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1); batch.weights.push(1); batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        }
+        let got = super::eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(-1i64), "U64::MAX must bitcast to -1i64 via new path");
+    }
+
+    // ------------------------------------------------------------------
+    // try_extract_pk_in — UUID string literals take the fast path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_extract_pk_in_uuid_string_list_fast_path() {
+        let schema = uuid_schema_pk();
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let expected = 0x550e8400_e29b_41d4_a716_446655440000_u128;
+        let expr = in_list_expr("id", vec![uuid_str_expr(uuid_str)]);
+        let got = super::try_extract_pk_in(&expr, &schema)
+            .expect("UUID string IN-list should take fast path");
+        assert_eq!(got, vec![expected]);
+    }
+
+    #[test]
+    fn try_extract_pk_in_uuid_invalid_string_falls_back() {
+        let schema = uuid_schema_pk();
+        let expr = in_list_expr("id", vec![
+            uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
+            uuid_str_expr("not-a-uuid"),
+        ]);
+        assert!(super::try_extract_pk_in(&expr, &schema).is_none(),
+            "invalid UUID in list should fall back to slow scan");
     }
 
     // ------------------------------------------------------------------

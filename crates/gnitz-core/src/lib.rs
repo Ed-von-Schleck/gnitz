@@ -19,7 +19,7 @@ pub use client::{GnitzClient, IndexMeta};
 pub use gnitz_wire::{FK_INDEX_INFIX, validate_user_identifier};
 pub use protocol::{
     ProtocolError,
-    TypeCode, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
+    TypeCode, FixedInt, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,
     MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,
     Header,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,

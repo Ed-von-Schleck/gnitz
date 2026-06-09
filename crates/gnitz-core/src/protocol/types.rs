@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use super::error::ProtocolError;
 
-pub use gnitz_wire::TypeCode;
+pub use gnitz_wire::{TypeCode, FixedInt};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
@@ -442,7 +442,15 @@ impl PkTuple {
     /// Used by all FFI paths that pass packed PK regions through opaque
     /// byte buffers.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        debug_assert!(bytes.len() <= MAX_PK_BYTES);
+        // Hard assert (not debug-only): `bytes` is an externally-controlled FFI
+        // length, and in release `t.buf[..bytes.len()]` would OOB-panic (or, for
+        // len ≥ 256, `bytes.len() as u8` would silently truncate the stride first).
+        // The assert bounds the length, making the `as u8` cast lossless.
+        assert!(
+            bytes.len() <= MAX_PK_BYTES,
+            "PkTuple::from_bytes: length {} exceeds MAX_PK_BYTES {MAX_PK_BYTES}",
+            bytes.len(),
+        );
         let mut t = Self::new(bytes.len() as u8);
         t.buf[..bytes.len()].copy_from_slice(bytes);
         t
@@ -451,14 +459,14 @@ impl PkTuple {
     /// On-wire PK region bytes 0..stride.
     pub fn as_bytes(&self) -> &[u8] { &self.buf[..self.stride as usize] }
 
-    /// Reconstruct a u128 from the low `stride` bytes. Wide PKs (stride > 16)
-    /// have no scalar projection; debug-asserts. Used at the narrow-PK
-    /// fast path that still routes through `PkColumn::push_u128`.
-    pub fn to_u128_narrow(&self) -> u128 {
-        debug_assert!(self.stride as usize <= 16);
-        let mut b = [0u8; 16];
-        b[..self.stride as usize].copy_from_slice(self.as_bytes());
-        u128::from_le_bytes(b)
+    /// The PK's value as a `u128`, or `None` for a wide PK (stride > 16) that
+    /// has no scalar projection and must use the byte path (`split_wire`).
+    pub fn to_u128(&self) -> Option<u128> {
+        (self.stride as usize <= 16).then(|| {
+            let mut b = [0u8; 16];
+            b[..self.stride as usize].copy_from_slice(self.as_bytes());
+            u128::from_le_bytes(b)
+        })
     }
 
     /// Split the tuple into the wire form `(seek_pk: u128, seek_pk_extra: &[u8])`.
@@ -791,22 +799,37 @@ impl ZSetBatch {
 /// Columns are appended in non-PK order: the cursor automatically skips the PK
 /// column index, so callers supply only payload values.
 pub struct BatchAppender<'a> {
-    batch:  &'a mut ZSetBatch,
-    schema: &'a Schema,
-    cursor: usize,
+    batch:      &'a mut ZSetBatch,
+    schema:     &'a Schema,
+    cursor:     usize,
+    row_active: bool,
 }
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
-        BatchAppender { batch, schema, cursor: 0 }
+        BatchAppender { batch, schema, cursor: 0, row_active: false }
     }
 
     /// Start a new row with the given primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
+        // Each row must receive exactly `num_payload_cols()` payload pushes before
+        // the next `add_row`. Symmetric counterpart to `col_index`'s over-push
+        // assert; an under-pushed row otherwise desyncs the column vectors and
+        // only surfaces later as an un-attributed `ZSetBatch::validate` length
+        // error. `debug_assert` (not `assert`): `validate` already rejects the bad
+        // batch totally and safely, so this is a diagnostic, not a safety guard.
+        // `row_active` exempts the first `add_row` without assuming the batch started
+        // empty.
+        debug_assert!(
+            !self.row_active || self.cursor == self.schema.num_payload_cols(),
+            "BatchAppender::add_row: previous row got {} of {} payload columns",
+            self.cursor, self.schema.num_payload_cols(),
+        );
         self.batch.pks.push_u128(pk);
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
+        self.row_active = true;
         self
     }
 
@@ -854,6 +877,17 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
+    /// Mark column `ci` NULL in the current row's null bitmap. The read side
+    /// (`eval_expr`, the WAL encoder) gates on `nulls[row] & (1 << payload_idx)`
+    /// and consults the `Option` only when that bit is clear, so a pushed `None`
+    /// and the bitmap must agree. Setting the bit here makes `str_null`/`bytes_null`
+    /// self-sufficient — no out-of-band `null_mask` call required.
+    fn mark_current_null(&mut self, ci: usize) {
+        let pi = self.schema.payload_idx(ci);
+        *self.batch.nulls.last_mut()
+            .expect("BatchAppender: mark_current_null called before add_row") |= 1u64 << pi;
+    }
+
     /// Append a SQL NULL to the next Strings column.
     pub fn str_null(&mut self) -> &mut Self {
         let ci = self.col_index();
@@ -861,6 +895,7 @@ impl<'a> BatchAppender<'a> {
             ColData::Strings(v) => v.push(None),
             _ => panic!("BatchAppender: str_null called on non-Strings column at schema index {}", ci),
         }
+        self.mark_current_null(ci);
         self.cursor += 1;
         self
     }
@@ -883,6 +918,7 @@ impl<'a> BatchAppender<'a> {
             ColData::Bytes(v) => v.push(None),
             _ => panic!("BatchAppender: bytes_null called on non-Bytes column at schema index {}", ci),
         }
+        self.mark_current_null(ci);
         self.cursor += 1;
         self
     }
@@ -1667,5 +1703,114 @@ mod tests {
             a.add_row(2u128, -1).i64_val(20).str_null();
         }
         assert!(batch.validate(&schema).is_ok());
+    }
+
+    // --- Site B: PkTuple::to_u128 ---
+
+    #[test]
+    fn pk_tuple_to_u128_narrow() {
+        let uuid_bytes: [u8; 16] = [
+            0x00, 0x44, 0x44, 0x55, 0x16, 0xa7, 0xd4, 0x41,
+            0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x0e, 0x55,
+        ];
+        let t = PkTuple::from_bytes(&uuid_bytes);
+        assert_eq!(t.to_u128(), Some(u128::from_le_bytes(uuid_bytes)));
+    }
+
+    #[test]
+    fn pk_tuple_to_u128_wide_returns_none() {
+        // stride 24 = three U64 PKs; no scalar projection.
+        let t = PkTuple::from_bytes(&[0u8; 24]);
+        assert_eq!(t.to_u128(), None);
+    }
+
+    // --- Site C: PkTuple::from_bytes ---
+
+    #[test]
+    fn pk_tuple_from_bytes_max_accepts() {
+        let bytes = vec![0xabu8; MAX_PK_BYTES];
+        let t = PkTuple::from_bytes(&bytes);
+        assert_eq!(t.stride as usize, MAX_PK_BYTES);
+    }
+
+    #[test]
+    #[should_panic(expected = "PkTuple::from_bytes: length")]
+    fn pk_tuple_from_bytes_over_panics() {
+        PkTuple::from_bytes(&[0u8; MAX_PK_BYTES + 1]);
+    }
+
+    // --- §5.1: str_null / bytes_null set the null bitmap bit ---
+
+    fn nullable_str_blob_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(),    type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(),    type_code: TypeCode::Blob,   is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    #[test]
+    fn str_null_sets_null_bit() {
+        let schema = nullable_str_blob_schema();
+        // payload_idx(col 1 = String) = 0 → bit 0; payload_idx(col 2 = Blob) = 1 → bit 1
+        let str_bit  = 1u64 << schema.payload_idx(1);
+        let blob_bit = 1u64 << schema.payload_idx(2);
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            a.add_row(1, 1).str_null().bytes_null();
+        }
+        assert_eq!(batch.nulls[0], str_bit | blob_bit, "both null bits must be set");
+        assert!(batch.validate(&schema).is_ok());
+    }
+
+    #[test]
+    fn str_null_self_sufficiency_round_trips_as_null() {
+        use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
+        let schema = nullable_str_blob_schema();
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            // No null_mask call — str_null / bytes_null must be self-sufficient.
+            a.add_row(42, 1).str_null().bytes_null();
+        }
+        let encoded = encode_wal_block(&schema, 1, &batch);
+        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
+        // The read side gates on the bitmap, so both columns must decode as NULL.
+        assert_eq!(&decoded.columns[1], &ColData::Strings(vec![None]), "String must decode as NULL");
+        assert_eq!(&decoded.columns[2], &ColData::Bytes(vec![None]),   "Blob must decode as NULL");
+    }
+
+    // --- §5.2: add_row under-push tripwire ---
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "BatchAppender::add_row: previous row got")]
+    fn add_row_under_push_trips_tripwire() {
+        let schema = nullable_str_blob_schema(); // 2 payload columns
+        let mut batch = ZSetBatch::new(&schema);
+        let mut a = BatchAppender::new(&mut batch, &schema);
+        a.add_row(1, 1).str_null(); // only 1 of 2 payload cols pushed
+        a.add_row(2, 1);            // should panic: previous row incomplete
+    }
+
+    #[test]
+    fn add_row_over_populated_batch_no_false_trip() {
+        // Build a batch first, then attach a fresh appender; the first add_row
+        // must not trip the under-push debug_assert (row_active starts false).
+        let schema = nullable_str_blob_schema();
+        let mut batch = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            a.add_row(1, 1).str_val("x").bytes_val(b"y");
+        }
+        // Fresh appender over the already-populated batch.
+        let mut a2 = BatchAppender::new(&mut batch, &schema);
+        a2.add_row(2, 1).str_val("z").bytes_val(b"w"); // must not panic
+        assert_eq!(batch.pks.len(), 2);
     }
 }
