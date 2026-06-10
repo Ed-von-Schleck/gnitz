@@ -4551,7 +4551,7 @@ fn avi_full_path_min_max_across_high_byte() {
     let seed = |for_max: bool, table_id: u32| -> i64 {
         let avi_schema = make_avi_schema(&in_schema, &group_by);
         let mut avi_t = Table::new(
-            tmp.path().to_str().unwrap(), "avi", avi_schema, table_id, 1 << 20, false,
+            tmp.path().to_str().unwrap(), "avi", avi_schema, table_id, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
         let avi = AviDesc {
             table: &mut avi_t as *mut Table,

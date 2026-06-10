@@ -127,6 +127,41 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Build the partitioned storage for a top-level relation. Durability and
+    /// Pk-unique tagging are derived from `kind`, so a relation cannot be
+    /// (e.g.) ephemeral-but-Pk-tagged. Only user relations are built here
+    /// (system catalog tables are plain single `Table`s built at bootstrap),
+    /// so the partition count is always `NUM_PARTITIONS`.
+    /// The pre-stage/truncate crash-cleanup that wraps the call in
+    /// `hook_table_register`/`hook_view_register` (`pending_dir_deletions` push then
+    /// truncate) is deliberately left at each call site: this helper takes `&self`
+    /// and is pure construction, so callers own crash-cleanup. Hoisting it would need
+    /// `&mut self` and still would not unify with the index path, whose cleanup also
+    /// wraps `backfill_index`.
+    fn build_partitioned_storage(
+        &self,
+        kind: RelationKind,
+        directory: &str,
+        name: &str,
+        id: i64,
+        schema: SchemaDescriptor,
+    ) -> Result<PartitionedTable, String> {
+        let mut pt = PartitionedTable::new(
+            directory, name, schema, id as u32, NUM_PARTITIONS,
+            kind.persistence(), self.active_part_start, self.active_part_end,
+            partition_arena_size(NUM_PARTITIONS),
+        ).map_err(|e| format!("Failed to create '{}': error {} (dir={})", name, e, directory))?;
+        if kind.is_base_table() {
+            // Tag base-table shards as PkUnique so the read cursor can skip
+            // payload comparison on a cross-source PK tie. Every base table
+            // enables tagging regardless of its `unique_pk` flag — the
+            // flush-time checker only marks shards whose data is actually
+            // unique.
+            pt.enable_pk_unique_tagging();
+        }
+        Ok(pt)
+    }
+
     fn hook_table_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
@@ -168,31 +203,24 @@ impl CatalogEngine {
                 let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
                 let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
 
-                let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
-                let arena = partition_arena_size(num_parts);
-                gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, num_parts);
+                // One kind drives the whole property bundle: durability and
+                // Pk-unique tagging.
+                let kind = RelationKind::BaseTable { unique_pk: is_unique };
+                gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, NUM_PARTITIONS);
                 // Pre-stage for cleanup so that if Stage-A fails after the table
                 // directory is created, compensate_stage_a's drain removes it.
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let mut pt = PartitionedTable::new(
-                    &directory, &name, tbl_schema, tid as u32, num_parts,
-                    true, self.active_part_start, self.active_part_end, arena,
-                ).map_err(|e| format!("Failed to create table '{}': error {} (dir={})", name, e, directory))?;
-                // User base tables have a user-defined PK enforced by the DML
-                // layer; tag their flushed/compacted shards as PkUnique so the
-                // read cursor can skip payload comparison on a cross-source PK tie.
-                pt.enable_pk_unique_tagging();
+                let pt = self.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema)?;
                 // Success: remove the pre-staged entry.
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
                 fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-                self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, 0, is_unique, directory);
+                self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, kind, 0, directory);
                 if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
-            } else if self.dag.tables.contains_key(&tid) {
+            } else if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
-                let directory = self.dag.tables.get(&tid).map(|e| e.directory.clone());
                 // cascade_retract_indices cleans up any in-transaction FK indices
                 // (those were never broadcast and must be physically removed).
                 // During rollback the in_rollback gate in ingest_to_family ensures
@@ -204,9 +232,7 @@ impl CatalogEngine {
                     self.cascade_retract_columns(tid)?;
                 }
                 self.dag.unregister_table(tid);
-                if let Some(dir) = directory {
-                    self.pending_dir_deletions.push(dir);
-                }
+                self.pending_dir_deletions.push(directory);
                 // Purge both per-table version counters AFTER the cascade above:
                 // cascade_retract_indices' apply_index_by_id bump and (on the
                 // non-rollback path) cascade_retract_columns' invalidate_col_names
@@ -303,14 +329,11 @@ impl CatalogEngine {
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
                 let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
 
-                let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
-                let arena = partition_arena_size(num_parts);
+                // See hook_table_register: one kind drives the bundle.
+                let kind = RelationKind::View;
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let et = PartitionedTable::new(
-                    &directory, &name, view_schema, vid as u32, num_parts,
-                    false, self.active_part_start, self.active_part_end, arena,
-                ).map_err(|e| format!("Failed to create view '{}': error {}", name, e))?;
+                let et = self.build_partitioned_storage(kind, &directory, &name, vid, view_schema)?;
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
                 let source_ids = self.dag.get_source_ids(vid);
@@ -320,7 +343,7 @@ impl CatalogEngine {
                     .max()
                     .unwrap_or(0);
 
-                self.dag.register_table(vid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))), view_schema, max_depth, false, directory);
+                self.dag.register_table(vid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))), view_schema, kind, max_depth, directory);
                 if vid + 1 > self.next_table_id { self.next_table_id = vid + 1; }
 
                 // During DROP VIEW rollback the partition files are intact; re-pushing
@@ -332,8 +355,7 @@ impl CatalogEngine {
                 {
                     self.backfill_view(vid);
                 }
-            } else if self.dag.tables.contains_key(&vid) {
-                let directory = self.dag.tables.get(&vid).map(|e| e.directory.clone());
+            } else if let Some(directory) = self.dag.tables.get(&vid).map(|e| e.directory.clone()) {
                 // During CREATE VIEW rollback the circuit/dep and column records
                 // were committed by prior RPCs; retracting them here would diverge
                 // master from workers.
@@ -342,9 +364,7 @@ impl CatalogEngine {
                     self.cascade_retract_columns(vid)?;
                 }
                 self.dag.unregister_table(vid);
-                if let Some(dir) = directory {
-                    self.pending_dir_deletions.push(dir);
-                }
+                self.pending_dir_deletions.push(directory);
                 // See hook_table_register: purge post-cascade so the cascade's
                 // own counter bumps can't re-create a dropped view's entries.
                 // In rollback cascade_retract_columns is skipped (schema_version
@@ -412,6 +432,15 @@ impl CatalogEngine {
 
                 let entry = self.dag.tables.get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
+                // Boot replay and worker ddl_sync reach this hook without
+                // precheck_sys_ingest, so re-reject a non-base-table owner
+                // here: a persisted or broadcast IDX_TAB row naming a view
+                // would otherwise register a circuit that backfills once and
+                // then silently serves stale results (index projection runs
+                // only on the base-table DML paths).
+                if !entry.kind.is_base_table() {
+                    return Err(format!("Index: owner {} is not a base table", owner_id));
+                }
                 let owner_schema = entry.schema;
                 let source_col_type = owner_schema.columns[source_col_idx as usize].type_code;
 
@@ -430,7 +459,7 @@ impl CatalogEngine {
 
                 let idx_table = Table::new(
                     &idx_dir, &format!("_idx_{}", idx_id), idx_schema, idx_id as u32,
-                    SYS_TABLE_ARENA, false,
+                    SYS_TABLE_ARENA, Persistence::Ephemeral,
                 ).map_err(|e| format!("Failed to create index table: error {}", e))?;
 
                 let mut idx_table_box = Box::new(idx_table);

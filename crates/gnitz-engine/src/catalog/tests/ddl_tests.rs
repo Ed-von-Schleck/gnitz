@@ -520,16 +520,8 @@ fn test_drop_view_removes_directory() {
     let view_cols = vec![u64_col_def("id")];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
-    let mut bb = BatchBuilder::new(view_tab_schema());
-    bb.begin_row(vid as u128, 1);
-    bb.put_u64(PUBLIC_SCHEMA_ID as u64);  // schema_id
-    bb.put_string("myview");              // name
-    bb.put_string("SELECT id FROM base"); // sql
-    bb.put_string("");                    // cache_directory (hook computes real path)
-    bb.put_u64(0);                        // created_lsn
-    bb.put_u64(0);                        // pk_col_idx (bare 0 → single-column PK [0])
-    bb.end_row();
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    let batch = build_view_tab_row(vid, "myview", "SELECT id FROM base");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     // The register hook created the physical view directory on disk.
     let view_dir = engine.dag.tables.get(&vid)
@@ -579,16 +571,8 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     let view_cols = vec![u64_col_def("id")];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
-    let mut bb = BatchBuilder::new(view_tab_schema());
-    bb.begin_row(vid as u128, 1);
-    bb.put_u64(PUBLIC_SCHEMA_ID as u64);  // schema_id
-    bb.put_string("depview");             // name
-    bb.put_string("SELECT id FROM base"); // sql
-    bb.put_string("");                    // cache_directory
-    bb.put_u64(0);                        // created_lsn
-    bb.put_u64(0);                        // pk_col_idx
-    bb.end_row();
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    let batch = build_view_tab_row(vid, "depview", "SELECT id FROM base");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     engine.write_view_deps(vid, &[base_tid]).unwrap();
 

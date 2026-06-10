@@ -157,6 +157,7 @@ impl CatalogEngine {
 
         let schema = entry.schema;
         let wide = schema.pk_is_wide();
+        let unique_pk = entry.unique_pk();
         let src_pk_stride = schema.pk_stride() as usize;
         // Borrows `batch` (the `&Batch` param), independent of the `&mut self`
         // cache reads below.
@@ -165,7 +166,7 @@ impl CatalogEngine {
         // One base-table cursor, reused across every row's UPSERT probe on the
         // wide path. The narrow `has_pk(u128)` probe is cheaper (memtable bloom
         // + shard scan, no merge), so narrow keeps it and opens no cursor.
-        let mut base_cursor = if entry.unique_pk && wide {
+        let mut base_cursor = if unique_pk && wide {
             Some(entry.handle.open_cursor())
         } else {
             None
@@ -190,7 +191,7 @@ impl CatalogEngine {
         // is already net-positive — skip the aggregation map entirely and collect
         // PKs directly; only a mixed-sign batch needs the net pass.
         let mut upserted_pks: FxHashSet<PkBuf> = FxHashSet::default();
-        if entry.unique_pk {
+        if unique_pk {
             if has_retractions {
                 let mut net: FxHashMap<PkBuf, i64> =
                     FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
@@ -270,7 +271,7 @@ impl CatalogEngine {
                 // decline to treat it as an upsert. The membership test
                 // short-circuits before the committed probe, so a non-upserted PK
                 // pays no seek.
-                let is_upsert = if !entry.unique_pk
+                let is_upsert = if !unique_pk
                     || !upserted_pks.contains(batch.get_pk_bytes(row))
                 {
                     false

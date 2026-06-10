@@ -5,19 +5,6 @@ use std::fs;
 // Helpers (supplement the shared helpers in mod.rs)
 // ---------------------------------------------------------------------------
 
-fn build_view_tab_row(dir: &str, vid: i64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(view_tab_schema());
-    bb.begin_row(vid as u128, 1);
-    bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-    bb.put_string(name);
-    bb.put_string("");
-    bb.put_string(&format!("{}/public/view_{}_{}", dir, name, vid));
-    bb.put_u64(0);
-    bb.put_u64(0); // pk_col_idx (bare 0 → single-column PK [0])
-    bb.end_row();
-    bb.finish()
-}
-
 fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str, is_unique: bool) -> Batch {
     let mut bb = BatchBuilder::new(idx_tab_schema());
     bb.begin_row(idx_id as u128, 1);
@@ -202,7 +189,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
 
     let vid = engine.allocate_table_id();
     // No column records for vid.
-    let batch = build_view_tab_row(&dir, vid, "badview");
+    let batch = build_view_tab_row(vid, "badview", "");
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
     assert!(result.is_err(),
         "expected error for VIEW_TAB with no column records");
@@ -238,7 +225,7 @@ fn test_view_tab_too_many_cols_rejected() {
     for i in 0..(crate::schema::MAX_COLUMNS as i64 + 1) {
         write_col_at_index(&mut engine, vid, i, &u64_col_def(&format!("c{i}"))).unwrap();
     }
-    let batch = build_view_tab_row(&dir, vid, "wideview");
+    let batch = build_view_tab_row(vid, "wideview", "");
     let err = engine.ingest_to_family(VIEW_TAB_ID, &batch)
         .expect_err("expected error for over-wide view");
     assert!(err.contains("columns") && err.contains("max"),
@@ -278,6 +265,48 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         "index_by_id must not contain bad index after rejected DDL");
     assert_eq!(count_records(&mut engine.sys_indices), init_rows,
         "sys_indices memtable must have no orphaned row (dirty before fix)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Part 1: IDX_TAB, view owner ──────────────────────────────────────────────
+
+#[test]
+fn test_idx_tab_view_owner_rejected() {
+    // Only base tables can own a secondary index: index projection runs only
+    // on the base-table DML paths, so an index registered on a view would
+    // backfill once and then silently serve stale results. The SQL binder
+    // rejects CREATE INDEX on a view by name resolution; this is the
+    // engine-side guard for a raw IDX_TAB push naming a view owner.
+    let dir = temp_dir("atomicity_idx_view_owner");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    engine.create_table("public.base", &[u64_col_def("id")], &[0], true).unwrap();
+
+    // Register a view via the raw system-table path (no circuit needed — the
+    // precheck must fire before any backfill).
+    let vid = engine.allocate_table_id();
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &[u64_col_def("id")]).unwrap();
+    let batch = build_view_tab_row(vid, "vowner", "");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    assert!(engine.dag.tables.contains_key(&vid), "view registered");
+
+    let init_rows = count_records(&mut engine.sys_indices);
+    let idx_id = engine.allocate_index_id();
+    let batch = build_idx_tab_row(idx_id, vid, 0, "idx_on_view", false);
+    let err = engine.ingest_to_family(IDX_TAB_ID, &batch)
+        .expect_err("IDX_TAB row naming a view owner must be rejected");
+    assert!(err.contains("not a base table"),
+        "expected the owner-kind guard message, got: {err}");
+
+    assert!(!engine.caches.index_by_name.contains_key("idx_on_view"),
+        "index_by_name must not contain the rejected index");
+    assert!(!engine.caches.index_by_id.contains_key(&idx_id),
+        "index_by_id must not contain the rejected index");
+    assert_eq!(count_records(&mut engine.sys_indices), init_rows,
+        "sys_indices must have no orphaned row");
+    assert!(engine.dag.tables.get(&vid).unwrap().index_circuits.is_empty(),
+        "the view must not gain an index circuit");
 
     let _ = fs::remove_dir_all(&dir);
 }

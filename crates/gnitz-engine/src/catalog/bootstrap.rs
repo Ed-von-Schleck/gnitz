@@ -11,11 +11,13 @@ impl CatalogEngine {
         let sys_dir = format!("{}/{}", base_dir, SYS_CATALOG_DIRNAME);
         ensure_dir(&sys_dir)?;
 
-        // Create system tables (persistent, single-partition)
+        // Create system tables (single-partition; durability derived from the
+        // kind they are later registered under).
         let create_sys_table = |info: &SysTabInfo| -> Result<Box<Table>, String> {
             let dir = format!("{}/{}", sys_dir, info.subdir);
             let schema = sys_tab_schema(info.id);
-            Table::new(&dir, info.name, schema, info.id as u32, SYS_TABLE_ARENA, true)
+            Table::new(&dir, info.name, schema, info.id as u32, SYS_TABLE_ARENA,
+                       RelationKind::SystemCatalog.persistence())
                 .map(Box::new)
                 .map_err(|e| format!("Failed to create system table '{}': error {}", info.name, e))
         };
@@ -304,8 +306,8 @@ impl CatalogEngine {
                 info.id,
                 StoreHandle::Borrowed(table_ptrs[i]),
                 schema,
+                RelationKind::SystemCatalog,
                 0,
-                false,
                 dir,
             );
         }
@@ -375,16 +377,16 @@ impl CatalogEngine {
     }
 
     pub fn close(&mut self) {
-        // Flush and close all user tables before clearing DagEngine
-        for (&tid, entry) in self.dag.tables.iter_mut() {
-            if tid < FIRST_USER_TABLE_ID { continue; }
-            match &mut entry.handle {
-                StoreHandle::Single(t) => { let _ = t.get_mut().flush(); }
-                StoreHandle::Partitioned(cell) => { let pt = cell.get_mut(); let _ = pt.flush(); pt.close(); }
-                StoreHandle::Borrowed(_) => {} // system tables flushed below
+        // Flush and close all user tables before clearing DagEngine.
+        // System tables hold Borrowed handles and are flushed below.
+        for entry in self.dag.tables.values_mut() {
+            if let StoreHandle::Partitioned(cell) = &mut entry.handle {
+                let pt = cell.get_mut();
+                let _ = pt.flush();
+                pt.close();
             }
         }
-        // tables.clear() in dag.close() drops Box<Table>/Box<PartitionedTable> automatically.
+        // tables.clear() in dag.close() drops Box<PartitionedTable> automatically.
         self.dag.close();
         self.flush_all_system_tables();
     }

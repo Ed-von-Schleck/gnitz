@@ -6,9 +6,9 @@
 //! `seek_family_bytes` on the wide path.
 
 use super::*;
-use crate::dag::{DagEngine, StoreHandle};
+use crate::dag::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-use crate::storage::{Batch, Table};
+use crate::storage::{Batch, Persistence, Table};
 
 fn u64c() -> SchemaColumn { SchemaColumn::new(type_code::U64, 0) }
 
@@ -45,13 +45,14 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 /// the `val` column (source col 3), seeded with `base_rows` in both the base
 /// table and the projected index. Bypasses `create_table` (stride gate) and
 /// `ingest_to_family` (the `enforce_unique_pk` u128 keying panics on a wide
-/// PK), populating the underlying tables directly.
-fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
+/// PK), populating the underlying tables directly. The dag borrows the base
+/// table; the caller must keep the returned Box alive for the engine's use.
+fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) -> Box<Table> {
     let schema = wide_unique_schema();
     let idx_schema = make_index_schema(get_index_key_type(type_code::U64).unwrap(), &schema);
 
-    let mut base = Table::new(&format!("{dir}/base"), "base", schema, tid as u32, 256 * 1024, false).unwrap();
-    let mut idx = Table::new(&format!("{dir}/idx"), "idx", idx_schema, tid as u32 + 1, 256 * 1024, false).unwrap();
+    let mut base = Box::new(Table::new(&format!("{dir}/base"), "base", schema, tid as u32, 256 * 1024, Persistence::Ephemeral).unwrap());
+    let mut idx = Table::new(&format!("{dir}/idx"), "idx", idx_schema, tid as u32 + 1, 256 * 1024, Persistence::Ephemeral).unwrap();
 
     let bb = wide_val_batch(&schema, base_rows);
     let idx_batch = DagEngine::batch_project_index(&bb, 3, &schema, &idx_schema);
@@ -60,8 +61,9 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    engine.dag.register_table(tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(base))), schema, 0, true, dir.to_string());
+    engine.dag.register_table(tid, StoreHandle::Borrowed(&mut *base as *mut Table), schema, RelationKind::BaseTable { unique_pk: true }, 0, dir.to_string());
     engine.dag.add_index_circuit(tid, 3, tid + 1, Box::new(idx), idx_schema, true);
+    base
 }
 
 // ── index_circuit_for_col existence + uniqueness lookup ────────────────
@@ -73,7 +75,7 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     let tid = engine.next_table_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
-    setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
+    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine.index_circuit_for_col(tid, 3).expect("indexed column must resolve");
@@ -96,7 +98,7 @@ fn wide_unique_rejects_duplicate_value() {
     let tid = engine.next_table_id;
 
     // Base row: pk=(1,1,1), val=42.
-    setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
+    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
     let schema = wide_unique_schema();
 
     // New row with a DIFFERENT wide PK but the SAME indexed value → duplicate.
@@ -119,7 +121,7 @@ fn wide_unique_prefix_collision_no_false_upsert() {
     // differ past byte 16 (c differs), carrying DIFFERENT indexed values.
     let pk_a = pk24(7, 7, 100);
     let pk_b = pk24(7, 7, 200);
-    setup_wide_unique(&mut engine, tid, &dir, &[(pk_a, 10, 1), (pk_b, 42, 1)]);
+    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk_a, 10, 1), (pk_b, 42, 1)]);
     let schema = wide_unique_schema();
 
     // UPSERT row A (its PK already lives in the base table) with B's value 42.
@@ -143,7 +145,7 @@ fn wide_unique_genuine_upsert_admitted() {
 
     // Base row: pk=(5,6,7), val=42.
     let pk = pk24(5, 6, 7);
-    setup_wide_unique(&mut engine, tid, &dir, &[(pk, 42, 1)]);
+    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk, 42, 1)]);
     let schema = wide_unique_schema();
 
     // Re-insert the SAME wide PK with the unchanged indexed value. The existing
@@ -174,10 +176,10 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
-    let mut pbase = Table::new(&format!("{dir}/p_base"), "pbase", parent_schema, parent_tid as u32, 256 * 1024, false).unwrap();
+    let mut pbase = Table::new(&format!("{dir}/p_base"), "pbase", parent_schema, parent_tid as u32, 256 * 1024, Persistence::Ephemeral).unwrap();
     pbase.ingest_owned_batch(pb).unwrap();
     pbase.flush().unwrap();
-    engine.dag.register_table(parent_tid, StoreHandle::Single(std::cell::UnsafeCell::new(Box::new(pbase))), parent_schema, 0, true, dir.clone());
+    engine.dag.register_table(parent_tid, StoreHandle::Borrowed(&mut pbase as *mut Table), parent_schema, RelationKind::BaseTable { unique_pk: true }, 0, dir.clone());
 
     // seek_family_bytes must resolve the committed parent row by full PK bytes.
     let seen = engine.seek_family_bytes(parent_tid, &parent_pk).unwrap();

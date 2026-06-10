@@ -411,7 +411,7 @@ impl CatalogEngine {
         let fk_child_count = self.caches.fk_by_child.get(&tid).map_or(0, |v| v.len());
         let fk_parent_count = self.caches.fk_by_parent.get(&tid).map_or(0, |v| v.len());
         let (has_unique_index, unique_pk) = self.dag.tables.get(&tid)
-            .map_or((false, false), |e| (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk));
+            .map_or((false, false), |e| (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk()));
         
         let needs = fk_child_count > 0 || fk_parent_count > 0 || has_unique_index || unique_pk;
         if needs {

@@ -304,6 +304,20 @@ impl CatalogEngine {
                     let entry = self.dag.tables.get(&owner_id)
                         .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
 
+                    // Only base tables can own a secondary index: index
+                    // projection runs only on the base-table DML paths
+                    // (`ingest_store_and_indices`); view deltas land via the
+                    // circuit-evaluation terminal-view moves, which never
+                    // project into `index_circuits`. An index on a view would
+                    // backfill once and then silently serve stale results. The
+                    // SQL binder rejects this by name resolution; this precheck
+                    // rejects a raw wire push before the row is persisted or
+                    // broadcast, and `hook_index_register` re-checks for the
+                    // paths that skip precheck (boot replay, worker ddl_sync).
+                    if !entry.kind.is_base_table() {
+                        return Err(format!("Index: owner {} is not a base table", owner_id));
+                    }
+
                     if source_col_idx >= entry.schema.num_columns() {
                         return Err(format!(
                             "Index: column index {} out of bounds for table '{}' \
@@ -1089,20 +1103,20 @@ impl CatalogEngine {
         self.active_part_end = end;
     }
 
-    /// Close all partitions in user tables (master after fork).
+    /// Close all partitions in user tables (master after fork). System tables
+    /// hold Borrowed (non-partitioned) handles, so the filter is the handle.
     pub fn close_user_table_partitions(&mut self) {
-        for (&tid, entry) in &self.dag.tables {
-            if tid < FIRST_USER_TABLE_ID { continue; }
+        for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
                 ptable.close_all_partitions();
             }
         }
     }
 
-    /// Trim worker partitions to assigned range.
+    /// Trim worker partitions to assigned range. System tables hold Borrowed
+    /// (non-partitioned) handles, so the filter is the handle.
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
-        for (&tid, entry) in &self.dag.tables {
-            if tid < FIRST_USER_TABLE_ID { continue; }
+        for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
                 ptable.close_partitions_outside(start, end);
             }
@@ -1201,7 +1215,7 @@ impl CatalogEngine {
     /// an against-store PK rejection broadcast.
     pub fn table_has_unique_pk(&self, table_id: i64) -> bool {
         self.dag.tables.get(&table_id)
-            .map(|e| e.unique_pk)
+            .map(|e| e.unique_pk())
             .unwrap_or(false)
     }
 

@@ -336,12 +336,17 @@ impl CatalogEngine {
     // -- View backfill (scan source, feed through plan) --------------------
 
     pub(crate) fn backfill_view(&mut self, vid: i64) {
+        // Backfill is the sole population of ephemeral storage (erased at
+        // open). Running it against a durable relation would double-count the
+        // shards loaded from its manifest.
+        debug_assert!(
+            self.dag.tables.get(&vid).is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
+            "backfill_view on durable relation {vid}: would double-count loaded shards",
+        );
         if !self.dag.ensure_compiled(vid) { return; }
 
         let source_ids = self.dag.get_source_ids(vid);
         for source_id in source_ids {
-            if !self.dag.tables.contains_key(&source_id) { continue; }
-
             let entry = match self.dag.tables.get(&source_id) {
                 Some(e) => e,
                 None => continue,
@@ -379,6 +384,13 @@ impl CatalogEngine {
         idx_table: *mut Table,
         idx_schema: &SchemaDescriptor,
     ) -> Result<(), String> {
+        // The relation rebuilt here is the *index table* (`owner_id` is the
+        // indexed relation, a durable base table). Backfilling into durable
+        // storage would double-count its loaded shards on the next open.
+        debug_assert!(
+            unsafe { &*idx_table }.persistence() == Persistence::Ephemeral,
+            "backfill_index into durable storage (owner {owner_id}): would double-count",
+        );
         let entry = match self.dag.tables.get(&owner_id) {
             Some(e) => e,
             None => return Ok(()),

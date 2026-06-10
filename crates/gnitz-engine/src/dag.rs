@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable, SubPlan};
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PkBuf, Table, PartitionedTable, StorageError};
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, PkBuf, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
 
@@ -13,17 +13,10 @@ use crate::vm;
 // Store handle — views vs base tables
 // ---------------------------------------------------------------------------
 
-/// Distinguishes ephemeral (view) stores from partitioned (base table) stores.
-/// Owned variants (Single, Partitioned) drop the underlying storage on Drop.
-/// The Borrowed variant holds a non-owning pointer for system tables owned
-/// by CatalogEngine directly.
+/// Storage handle of a registered relation. The owned variant drops the
+/// underlying storage on Drop; the Borrowed variant holds a non-owning
+/// pointer for system tables owned by CatalogEngine directly.
 pub enum StoreHandle {
-    /// Owned single Table — used by views in single-worker mode. Wrapped in
-    /// `UnsafeCell` for the same reason as `Partitioned`: the interior-mutable
-    /// accessors mutate through a pointer derived from a shared `&self`, which
-    /// is UB under Stacked Borrows unless the data sits behind an `UnsafeCell`.
-    #[allow(dead_code)]
-    Single(UnsafeCell<Box<Table>>),
     /// Owned PartitionedTable — used by base tables and views. Wrapped in
     /// `UnsafeCell` so the interior-mutable accessors can hand out `&mut`
     /// through a shared `&self` without violating Stacked Borrows (a raw
@@ -39,15 +32,12 @@ pub enum StoreHandle {
 unsafe impl Send for StoreHandle {}
 
 impl StoreHandle {
-    /// Get a raw pointer to the Table (Single/Borrowed), or null for Partitioned.
-    /// SAFETY: the Box outlives any synchronous call using the pointer.
-    /// The caller must ensure no aliasing &mut references exist.
+    /// Get a raw pointer to the Table (Borrowed), or null for Partitioned.
+    /// SAFETY: the owner keeps the Table alive across any synchronous call
+    /// using the pointer. The caller must ensure no aliasing &mut references
+    /// exist.
     pub fn table_ptr(&self) -> *mut Table {
         match self {
-            StoreHandle::Single(t) => {
-                let bx: &mut Box<Table> = unsafe { &mut *t.get() };
-                bx.as_mut() as *mut Table
-            }
             StoreHandle::Borrowed(ptr) => *ptr,
             StoreHandle::Partitioned(_) => std::ptr::null_mut(),
         }
@@ -160,7 +150,6 @@ impl StoreHandle {
     /// Dispatched flush across all variants.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
         match self {
-            StoreHandle::Single(t) => t.get_mut().flush(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
             StoreHandle::Partitioned(cell) => cell.get_mut().flush(),
         }
@@ -168,15 +157,13 @@ impl StoreHandle {
 
     /// Dispatched Phase 1 across all variants. Returns one
     /// (partition_idx, FlushWork) per partition that produced deferred
-    /// work; for Single/Borrowed `partition_idx` is always 0.
+    /// work; for Borrowed `partition_idx` is always 0.
     pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
         let table: &mut Table = match self {
-            StoreHandle::Single(t) => t.get_mut().as_mut(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
             StoreHandle::Partitioned(cell) => return cell.get_mut().flush_prepare(),
         };
-        let durable = table.is_durable();
-        match table.flush_prepare(durable)? {
+        match table.flush_prepare()? {
             FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
             FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
         }
@@ -189,7 +176,6 @@ impl StoreHandle {
         works: Vec<(usize, FlushWork)>,
     ) -> Result<Vec<libc::c_int>, StorageError> {
         let t: &mut Table = match self {
-            StoreHandle::Single(t) => t.get_mut().as_mut(),
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
             StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),
         };
@@ -203,7 +189,6 @@ impl StoreHandle {
     /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).
     pub fn current_lsn(&self) -> u64 {
         match self {
-            StoreHandle::Single(t) => unsafe { &*t.get() }.current_lsn,
             StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).current_lsn() },
         }
@@ -241,16 +226,75 @@ pub struct IndexCircuitEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Relation kind — what a top-level relation *is*
+// ---------------------------------------------------------------------------
+
+/// What a top-level relation *is*. Bundles every per-kind property that used
+/// to be set independently, so the nonsense combinations are unconstructable:
+/// a durable relation that also rebuilds from source (double count), an
+/// ephemeral one that never rebuilds (permanently empty), a view that tags
+/// Pk-unique.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RelationKind {
+    /// System catalog table: durable, single-partition, never rebuilt from
+    /// upstream sources (it has none; recovery is LSN-gated SAL replay).
+    SystemCatalog,
+    /// User base table: durable, partitioned, never rebuilt from upstream
+    /// sources; owns a DML-enforced PK. `unique_pk` is the enforcement flag.
+    BaseTable { unique_pk: bool },
+    /// Materialised view: ephemeral, partitioned, rebuilt from its sources via
+    /// the compiled circuit at open and on live CREATE.
+    View,
+}
+
+// Niche-optimised to the width of the `unique_pk: bool` it replaced, so
+// `TableEntry` does not grow and the ingest hot path touches no extra
+// cache line.
+const _: () = assert!(std::mem::size_of::<RelationKind>() == 1);
+
+impl RelationKind {
+    /// Storage durability. Durable kinds load shards from the manifest;
+    /// ephemeral kinds erase on open and live in memory.
+    #[inline]
+    pub fn persistence(self) -> Persistence {
+        match self {
+            RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => Persistence::Durable,
+            RelationKind::View => Persistence::Ephemeral,
+        }
+    }
+
+    /// True iff this is a user base table (of either `unique_pk` flavor).
+    /// Gates what only base tables do: own secondary index circuits (index
+    /// projection runs only on the base-table DML paths) and tag
+    /// flushed/compacted shards Pk-unique.
+    #[inline]
+    pub fn is_base_table(self) -> bool {
+        matches!(self, RelationKind::BaseTable { .. })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Table entry — per-table metadata in the entity registry
 // ---------------------------------------------------------------------------
 
 pub struct TableEntry {
     pub handle: StoreHandle,
     pub schema: SchemaDescriptor,
+    pub kind: RelationKind,
     pub depth: i32,
-    pub unique_pk: bool,
     pub directory: String,
     pub index_circuits: Vec<IndexCircuitEntry>,
+}
+
+impl TableEntry {
+    /// The kind's `unique_pk` enforcement flag — true only for a base table
+    /// created with a DML-enforced PK; false elsewhere (no `enforce_unique_pk`
+    /// runs there). `#[inline]` keeps the hot `ingest_by_ref`/
+    /// `ingest_returning_effective` path a trivial match.
+    #[inline]
+    pub fn unique_pk(&self) -> bool {
+        matches!(self.kind, RelationKind::BaseTable { unique_pk: true })
+    }
 }
 
 /// Type alias — the cache stores CompileOutput directly.
@@ -379,15 +423,15 @@ impl DagEngine {
         table_id: i64,
         handle: StoreHandle,
         schema: SchemaDescriptor,
+        kind: RelationKind,
         depth: i32,
-        unique_pk: bool,
         directory: String,
     ) {
         self.tables.insert(table_id, TableEntry {
             handle,
             schema,
+            kind,
             depth,
-            unique_pk,
             directory,
             index_circuits: Vec::new(),
         });
@@ -806,12 +850,12 @@ impl DagEngine {
     /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
     /// For unique_pk tables, falls back to cloning + `ingest_returning_effective`.
     pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> i32 {
-        let entry = match self.tables.get(&table_id) {
+        let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return -1,
         };
 
-        if entry.unique_pk {
+        if entry.unique_pk() {
             return self.ingest_to_family(table_id, batch.clone_batch());
         }
 
@@ -820,8 +864,6 @@ impl DagEngine {
         }
 
         let schema = entry.schema;
-
-        let entry = self.tables.get_mut(&table_id).unwrap();
         Self::ingest_store_and_indices(entry, &schema, batch);
 
         0
@@ -840,7 +882,7 @@ impl DagEngine {
         };
 
         let schema = entry.schema;
-        let unique_pk = entry.unique_pk;
+        let unique_pk = entry.unique_pk();
         let tbl_ptr = entry.handle.table_ptr();
         let ptbl_ptr = entry.handle.ptable_ptr();
 
@@ -924,9 +966,10 @@ impl DagEngine {
         let works = entry.handle.flush_prepare()
             .map_err(|_| format!("flush_prepare failed for table_id={}", table_id))?;
         for ic in &mut entry.index_circuits {
-            // Index tables are non-durable; this is an inline write that
-            // returns DoneInline/Empty and resets the memtable. No FlushWork.
-            match ic.table_mut().flush_prepare(false) {
+            // Index tables are created Ephemeral, so this is an inline write
+            // that returns DoneInline/Empty and resets the memtable. A Pending
+            // means a durable index table snuck in — reject it.
+            match ic.table_mut().flush_prepare() {
                 Ok(FlushOutcome::Empty) | Ok(FlushOutcome::DoneInline) => {}
                 Ok(FlushOutcome::Pending(_)) => {
                     return Err(format!(
@@ -1852,7 +1895,7 @@ mod tests {
         let schema = SchemaDescriptor::default();
         let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
-        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, false).unwrap())
+        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, Persistence::Ephemeral).unwrap())
     }
 
     #[test]
@@ -1867,8 +1910,8 @@ mod tests {
     fn test_register_unregister_table() {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
-        let tbl = make_test_table("reg_unreg");
-        dag.register_table(100, StoreHandle::Single(UnsafeCell::new(tbl)), schema, 0, false, String::new());
+        let mut tbl = make_test_table("reg_unreg");
+        dag.register_table(100, StoreHandle::Borrowed(&mut *tbl as *mut Table), schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
         assert!(dag.tables.contains_key(&100));
 
         dag.unregister_table(100);
@@ -1904,8 +1947,8 @@ mod tests {
     fn test_add_remove_index_circuit() {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
-        let tbl = make_test_table("idx_parent");
-        dag.register_table(50, StoreHandle::Single(UnsafeCell::new(tbl)), schema, 0, false, String::new());
+        let mut tbl = make_test_table("idx_parent");
+        dag.register_table(50, StoreHandle::Borrowed(&mut *tbl as *mut Table), schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
         let idx_tbl = make_test_table("idx_child");
         dag.add_index_circuit(50, 2, 999, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
@@ -1943,15 +1986,15 @@ mod tests {
     fn test_flush_includes_index_circuits() {
         let mut dag = DagEngine::new();
         let parent_schema = SchemaDescriptor::default();
-        let tbl = make_test_table("flush_ic_parent");
-        dag.register_table(70, StoreHandle::Single(UnsafeCell::new(tbl)), parent_schema, 0, false, String::new());
+        let mut tbl = make_test_table("flush_ic_parent");
+        dag.register_table(70, StoreHandle::Borrowed(&mut *tbl as *mut Table), parent_schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
 
         // Durable index table: flush writes shard_*.db only if called.
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
         let idx_dir = dag_test_dir("flush_ic_idx");
         let _ = std::fs::remove_dir_all(&idx_dir);
         let idx_tbl = Box::new(
-            Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, true).unwrap(),
+            Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, Persistence::Durable).unwrap(),
         );
         dag.add_index_circuit(70, 1, 999, idx_tbl, idx_schema, false);
 
@@ -2001,7 +2044,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_signed");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_signed", schema, 1234, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "enforce_signed", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
             crate::storage::partition_arena_size(256),
         ).unwrap();
 
@@ -2060,7 +2103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_absent");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_absent", schema, 1234, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "enforce_absent", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
             crate::storage::partition_arena_size(256),
         ).unwrap();
 

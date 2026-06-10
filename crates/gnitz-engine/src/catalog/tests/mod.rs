@@ -7,6 +7,7 @@ mod index_tests;
 mod engine_tests;
 mod wide_pk_validation;
 mod dir_deletion_tests;
+mod reopen_rebuild_tests;
 
 use super::*;
 use super::sys_tables::*;
@@ -66,6 +67,24 @@ fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) 
     bb.put_u64(raw_pk_cols);
     bb.put_u64(0); // created_lsn
     bb.put_u64(0); // flags
+    bb.end_row();
+    bb.finish()
+}
+
+/// Build a raw VIEW_TAB row for tests that register a view via the raw
+/// system-table path. `sql` is stored verbatim; cache_directory is left empty
+/// (the register hook computes the real view directory itself and neither
+/// column is read back by the appliers). The bare `0` pk_col_idx decodes back
+/// to a single-column PK `[0]`.
+fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
+    let mut bb = BatchBuilder::new(view_tab_schema());
+    bb.begin_row(vid as u128, 1);
+    bb.put_u64(PUBLIC_SCHEMA_ID as u64);
+    bb.put_string(view_name);
+    bb.put_string(sql);
+    bb.put_string(""); // cache_directory
+    bb.put_u64(0);     // created_lsn
+    bb.put_u64(0);     // pk_col_idx
     bb.end_row();
     bb.finish()
 }

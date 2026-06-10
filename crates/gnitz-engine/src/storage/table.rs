@@ -32,6 +32,26 @@ const INMEM_COMPACT_THRESHOLD: usize = 4;
 const EPHEMERAL_INMEM_CEILING: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// How a relation's storage behaves across a restart. The single fact that
+/// `Table::new` and the boot rebuild read — they can no longer disagree the
+/// way a positional `durable: bool` let them. (The worker memonly path may
+/// still force an individual *flush* to `Ephemeral` on a `Durable` system
+/// table — workers persist only their own user-table partitions durably —
+/// but that override is internal to `Table`; every public flush entry point
+/// honors the table's own persistence.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Persistence {
+    /// Shards are loaded from the manifest at open and flushed to disk.
+    Durable,
+    /// Storage is erased at open and held only in memory; the relation is
+    /// rebuilt from its sources.
+    Ephemeral,
+}
+
+// ---------------------------------------------------------------------------
 // Two-phase flush API
 // ---------------------------------------------------------------------------
 
@@ -123,7 +143,7 @@ pub struct Table {
     table_id: u32,
     directory: String,
 
-    durable: bool,
+    persistence: Persistence,
     manifest_path: Option<String>,
 
     flush_seq: u32,
@@ -138,9 +158,9 @@ pub struct Table {
     can_tag_pk_unique: bool,
 
     /// Flushed runs of a non-durable table, held in heap instead of on disk.
-    /// Populated only when `flush_prepare` is called with `durable == false`.
-    /// Empty for every durable table (base tables, master system tables): those
-    /// always flush through the disk branch.
+    /// Populated only when `flush_prepare` is called with
+    /// `Persistence::Ephemeral`. Empty for every durable table (base tables,
+    /// master system tables): those always flush through the disk branch.
     in_memory_l0: Vec<Rc<Batch>>,
 
     /// Test-only override for `EPHEMERAL_INMEM_CEILING`, so spill paths can be
@@ -150,14 +170,14 @@ pub struct Table {
 }
 
 impl Table {
-    /// Create a new table.  `durable=true` enables manifest (persistent).
+    /// Create a new table.  `Persistence::Durable` enables manifest (persistent).
     pub fn new(
         dir: &str,
         _name: &str,
         schema: SchemaDescriptor,
         table_id: u32,
         arena_size: u64,
-        durable: bool,
+        persistence: Persistence,
     ) -> Result<Self, StorageError> {
         let dir_c = ensure_dir(dir)?;
 
@@ -165,7 +185,7 @@ impl Table {
         set_nocow_dir(&dir_c);
 
         // Erase stale ephemeral shards (prefix-matched)
-        if !durable {
+        if persistence == Persistence::Ephemeral {
             erase_stale_shards(dir, table_id);
         }
 
@@ -178,7 +198,7 @@ impl Table {
             schema,
             table_id,
             directory: dir.to_string(),
-            durable,
+            persistence,
             manifest_path: None,
             flush_seq: 0,
             current_lsn: 1,
@@ -190,7 +210,7 @@ impl Table {
             inmem_ceiling_override: None,
         };
 
-        if durable {
+        if persistence == Persistence::Durable {
             let manifest_path = format!("{}/manifest.bin", dir);
             table.shard_index.load_manifest(&manifest_path)?;
             table.shard_index.gc_orphans();
@@ -241,21 +261,21 @@ impl Table {
         self.found_source = FoundSource::None;
         self.cached_full_scan = None;
 
-        let durable = !force_ephemeral && self.durable;
-        if durable {
+        let eff = if force_ephemeral { Persistence::Ephemeral } else { self.persistence };
+        if eff == Persistence::Durable {
             self.current_lsn += 1;
         }
 
         let consolidated = batch.into_consolidated(&self.schema);
         if self.memtable.should_flush() {
-            self.flush_inner(durable, true)?;
+            self.flush_inner(eff, true)?;
         }
         // The should_flush() pre-check above ensures runs_bytes is either 0
         // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
         // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
         self.memtable.upsert_sorted_batch(consolidated)?;
         if self.memtable.should_flush() {
-            self.flush_inner(durable, true)?;
+            self.flush_inner(eff, true)?;
         }
         Ok(())
     }
@@ -264,17 +284,15 @@ impl Table {
     // Flush
     // ------------------------------------------------------------------
 
-    /// Whether this table flushes durably (manifest-tracked shards). Base and
-    /// master system tables are durable; view child tables and index circuits
-    /// are not. Lets callers route each table through `flush_prepare(durable)`
-    /// with its own durability instead of a hardcoded `true`.
-    pub fn is_durable(&self) -> bool {
-        self.durable
+    /// This table's intrinsic persistence. Base and master system tables are
+    /// `Durable`; view child tables and index circuits are `Ephemeral`.
+    pub fn persistence(&self) -> Persistence {
+        self.persistence
     }
 
     /// Flush memtable to shard.  Persistent tables also update manifest.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(self.durable, true)
+        self.flush_inner(self.persistence, true)
     }
 
     /// Flush with durable shard naming and manifest update, regardless of
@@ -282,7 +300,7 @@ impl Table {
     /// provides durability) but still need manifest-tracked shards so
     /// the data survives restart.
     pub fn flush_durable(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(true, true)
+        self.flush_inner(Persistence::Durable, true)
     }
 
     /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
@@ -302,10 +320,10 @@ impl Table {
         Ok(fd)
     }
 
-    /// Phase 1 of two-phase flush.
+    /// Phase 1 of two-phase flush, honoring the table's intrinsic persistence.
     ///
-    /// `durable == false` (index circuits, views, worker memonly overflow) with
-    /// a non-empty consolidated snapshot:
+    /// `Ephemeral` (index circuits, views) with a non-empty consolidated
+    /// snapshot:
     ///   append the snapshot to `in_memory_l0` — no file I/O, no manifest. The
     ///   memtable IS reset. The run set is folded once it passes
     ///   `INMEM_COMPACT_THRESHOLD`, and spilled to a real `eph_shard` only when
@@ -313,7 +331,7 @@ impl Table {
     ///   restores page-cache reclaimability for the rare oversized table).
     ///   `DoneInline` is returned.
     ///
-    /// `durable == true` and a non-empty consolidated snapshot:
+    /// `Durable` and a non-empty consolidated snapshot:
     ///   write shard `.tmp` (no fdatasync), open MappedShard against it for
     ///   metadata, write manifest `.tmp`, return `Pending(FlushWork)`. The
     ///   memtable is NOT reset.
@@ -321,7 +339,15 @@ impl Table {
     /// Empty memtable or `consolidated.count == 0`:
     ///   reset memtable and return `Empty`. The cancelled rows are still
     ///   recoverable from the SAL.
-    pub fn flush_prepare(&mut self, durable: bool) -> Result<FlushOutcome, StorageError> {
+    pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
+        self.flush_prepare_with(self.persistence)
+    }
+
+    /// `flush_prepare` with an explicit per-flush persistence. Internal only:
+    /// the sole override of the table's own value is the worker memonly path
+    /// (`ingest_owned_batch_memonly` forces `Ephemeral` overflow flushes on a
+    /// `Durable` system table — master owns durability via the SAL).
+    fn flush_prepare_with(&mut self, persistence: Persistence) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
             return Ok(FlushOutcome::Empty);
@@ -333,7 +359,7 @@ impl Table {
             return Ok(FlushOutcome::Empty);
         }
 
-        if !durable {
+        if persistence == Persistence::Ephemeral {
             // In-memory ephemeral flush: no file I/O. `snapshot` is the
             // (PK,payload)-consolidated run; the memtable references it until
             // reset(), after which `in_memory_l0` keeps it alive.
@@ -463,8 +489,8 @@ impl Table {
         Ok(dirfd)
     }
 
-    fn flush_inner(&mut self, durable: bool, sync_dir: bool) -> Result<bool, StorageError> {
-        match self.flush_prepare(durable)? {
+    fn flush_inner(&mut self, persistence: Persistence, sync_dir: bool) -> Result<bool, StorageError> {
+        match self.flush_prepare_with(persistence)? {
             FlushOutcome::Empty => Ok(false),
             FlushOutcome::DoneInline => Ok(true),
             FlushOutcome::Pending(mut work) => {
@@ -1075,7 +1101,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         assert!(t.memtable_is_empty());
@@ -1102,7 +1128,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
@@ -1113,7 +1139,7 @@ mod tests {
 
         // Re-open and recover
         let mut t2 = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
         ).unwrap();
 
         // Data should be in shards via manifest
@@ -1129,7 +1155,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 300, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 300, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)])).unwrap();
@@ -1147,7 +1173,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 400, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 400, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
@@ -1173,7 +1199,7 @@ mod tests {
         // is exercised. Under non-durable flush these tiny rows would stay in
         // `in_memory_l0` and never reach the disk compaction path.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 500, 256, true,
+            tdir.to_str().unwrap(), "test", schema, 500, 256, Persistence::Durable,
         ).unwrap();
 
         // Create enough flushes to trigger compaction
@@ -1200,7 +1226,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 600, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 600, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
@@ -1233,7 +1259,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 700, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 700, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         // Build a reverse-sorted batch (PK order: 30, 20, 10).
@@ -1262,7 +1288,7 @@ mod tests {
 
         // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 900, 40, false,
+            tdir.to_str().unwrap(), "test", schema, 900, 40, Persistence::Ephemeral,
         ).unwrap();
 
         // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
@@ -1297,7 +1323,7 @@ mod tests {
         // First call: 2 rows = 64 bytes, below threshold → no flush.
         // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1200, 128, false,
+            tdir.to_str().unwrap(), "test", schema, 1200, 128, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(1, 1, 10), (2, 1, 20)])).unwrap();
@@ -1333,7 +1359,7 @@ mod tests {
         // the flushed rows must land in a real shard for the shard-fallback path
         // under test — not `in_memory_l0` (which a non-durable flush would use).
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, Persistence::Durable,
         ).unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
@@ -1368,12 +1394,12 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1100, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 1100, 1 << 20, Persistence::Durable,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
-        match t.flush_prepare(true).unwrap() {
+        match t.flush_prepare().unwrap() {
             FlushOutcome::Pending(work) => {
                 let dir_entries: Vec<String> = std::fs::read_dir(&tdir).unwrap()
                     .filter_map(|e| e.ok())
@@ -1416,7 +1442,7 @@ mod tests {
         std::fs::write(&stray, b"orphan").unwrap();
 
         let result = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
         );
         assert!(result.is_err(), "Table::new must fail on corrupted manifest");
         assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
@@ -1432,11 +1458,11 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1200, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 1200, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
-        match t.flush_prepare(false).unwrap() {
+        match t.flush_prepare().unwrap() {
             FlushOutcome::DoneInline => {}
             FlushOutcome::Empty => panic!("expected DoneInline, got Empty"),
             FlushOutcome::Pending(_) => panic!("expected DoneInline, got Pending"),
@@ -1495,7 +1521,7 @@ mod tests {
         // real shard so the shard scan path is what's tested; a non-durable
         // flush would route the rows into `in_memory_l0` instead.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, true,
+            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, Persistence::Durable,
         ).unwrap();
 
         // Two prefix-twins (1,1,100)/(1,1,200) and a distinct (2,0,0).
@@ -1545,11 +1571,11 @@ mod tests {
         let tdir = dir.path().join("no_file_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)])).unwrap();
-        assert!(matches!(t.flush_prepare(false).unwrap(), FlushOutcome::DoneInline));
+        assert!(matches!(t.flush_prepare().unwrap(), FlushOutcome::DoneInline));
 
         let shard_files: Vec<String> = std::fs::read_dir(&tdir).unwrap()
             .flatten()
@@ -1575,7 +1601,7 @@ mod tests {
         let tdir = dir.path().join("cross_fold_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
@@ -1603,7 +1629,7 @@ mod tests {
         let tdir = dir.path().join("run_bound_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         let n = INMEM_COMPACT_THRESHOLD as u64 + 4;
@@ -1628,7 +1654,7 @@ mod tests {
         let tdir = dir.path().join("ceiling_spill_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
         t.set_inmem_ceiling_for_test(100); // < one flush (~10 rows × 32 B)
 
@@ -1654,7 +1680,7 @@ mod tests {
         let tdir = dir.path().join("repeated_spill_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
         t.set_inmem_ceiling_for_test(100);
 
@@ -1687,7 +1713,7 @@ mod tests {
         let tdir = dir.path().join("has_pk_inmem_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
@@ -1709,7 +1735,7 @@ mod tests {
         let tdir = dir.path().join("mixed_read_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
         ).unwrap();
 
         // Force keys 0..10 to disk.

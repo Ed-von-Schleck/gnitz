@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
 use crate::ops::{AggDescriptor, AggOp};
-use crate::storage::{CursorHandle, Table, ReadCursor};
+use crate::storage::{CursorHandle, Persistence, Table, ReadCursor};
 use crate::vm::{ProgramBuilder, VmHandle};
 
 /// Process-local worker rank, set once per forked worker (and left at 0 in the
@@ -1026,7 +1026,7 @@ fn create_child_table(
     // Track the path before creating so cleanup also removes a partially
     // created directory if Table::new fails.
     state.scratch_dirs.push(child_dir.clone());
-    Table::new(&child_dir, child_name, schema, table_id, 256 * 1024, false)
+    Table::new(&child_dir, child_name, schema, table_id, 256 * 1024, Persistence::Ephemeral)
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,7 +1697,7 @@ fn emit_reduce(
             // `state.scratch_dirs`, and `remove_dir_all` is recursive.
             let gi_dir = format!("{}/_gidx", child_scratch_dir(view_dir, &tr_in_name));
             if let Ok(gi_table) = Table::new(
-                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, false,
+                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, Persistence::Ephemeral,
             ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));
@@ -3304,7 +3304,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
+        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(nodes_schema);
             bb.begin_row(pk(1), 1);
@@ -3316,9 +3316,9 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, false).unwrap();
+        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut edges_tab; // empty
-        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, false).unwrap();
+        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut cols_tab; // empty
 
         let result = load_circuit(
@@ -3346,7 +3346,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, false).unwrap();
+        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(nodes_schema);
             // node 0: ScanDelta(source 99)
@@ -3367,7 +3367,7 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, false).unwrap();
+        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(edges_schema);
             // Edge 0 → 7, but node 7 does not exist.
@@ -3378,7 +3378,7 @@ mod tests {
             bb.end_row();
             edges_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, false).unwrap();
+        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut cols_tab;
 
         let result = load_circuit(

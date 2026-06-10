@@ -1797,7 +1797,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("dist_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "hist", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "hist", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let table_ptr = &mut table as *mut Table;
@@ -1869,7 +1869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         // Ingest trace data
@@ -1919,7 +1919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_multi_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         // Ingest 3 trace rows with same PK but different payloads
@@ -1967,7 +1967,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cursor_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "test", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let batch = make_batch(schema, &[
@@ -2025,7 +2025,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("antijoin_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         // Trace has pk=1 and pk=3
@@ -2073,7 +2073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("semijoin_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let trace_batch = make_batch(schema, &[
@@ -2129,7 +2129,7 @@ mod tests {
         // trace_out table
         let tout_dir = dir.path().join("tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "tr_out", out_schema, 0, 1 << 20, false,
+            tout_dir.to_str().unwrap(), "tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let trace_out_ptr = &mut trace_out_table as *mut Table;
@@ -2137,7 +2137,7 @@ mod tests {
         // trace_in table (for non-linear agg, but SUM is linear — still test the path)
         let tin_dir = dir.path().join("tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "tr_in", in_schema, 0, 1 << 20, false,
+            tin_dir.to_str().unwrap(), "tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let trace_in_ptr = &mut trace_in_table as *mut Table;
@@ -2338,7 +2338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("seek_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         let trace_batch = make_batch(schema, &[
@@ -2459,7 +2459,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("complement_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
 
         // Trace has pk=1, pk=3, pk=5
@@ -2589,13 +2589,13 @@ mod tests {
 
         let tout_dir = dir.path().join("ma_tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "ma_tr_out", out_schema, 0, 1 << 20, false,
+            tout_dir.to_str().unwrap(), "ma_tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
 
         let tin_dir = dir.path().join("ma_tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "ma_tr_in", in_schema, 0, 1 << 20, false,
+            tin_dir.to_str().unwrap(), "ma_tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
@@ -2791,13 +2791,13 @@ mod tests {
 
         let tout_dir = dir.path().join("sv_tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "sv_tr_out", out_schema, 0, 1 << 20, false,
+            tout_dir.to_str().unwrap(), "sv_tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
 
         let tin_dir = dir.path().join("sv_tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "sv_tr_in", in_schema, 0, 1 << 20, false,
+            tin_dir.to_str().unwrap(), "sv_tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         ).unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
@@ -2869,7 +2869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("stale_cursor_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "ext", schema, 0, 1 << 20, false,
+            tdir.to_str().unwrap(), "ext", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
         )
         .unwrap();
 

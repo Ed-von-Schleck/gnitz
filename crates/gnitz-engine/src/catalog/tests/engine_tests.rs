@@ -13,11 +13,11 @@ fn test_enforce_unique_pk() {
     ensure_dir(&dir).unwrap();
     let schema = make_schema(&[u64_col(), u64_col()], 0); // id (PK), val
     let tdir = format!("{}/upk_table", dir);
-    let mut table = Table::new(&tdir, "upk", schema, 100, SYS_TABLE_ARENA, false).unwrap();
+    let mut table = Table::new(&tdir, "upk", schema, 100, SYS_TABLE_ARENA, crate::storage::Persistence::Ephemeral).unwrap();
 
     let mut dag = DagEngine::new();
     let table_ptr = &mut table as *mut Table;
-    dag.register_table(100, StoreHandle::Borrowed(table_ptr), schema, 0, true, tdir.clone());
+    dag.register_table(100, StoreHandle::Borrowed(table_ptr), schema, RelationKind::BaseTable { unique_pk: true }, 0, tdir.clone());
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);

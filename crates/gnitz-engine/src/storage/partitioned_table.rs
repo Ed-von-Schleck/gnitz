@@ -11,7 +11,7 @@ use super::batch::Batch;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
-use super::table::{self, FlushOutcome, FlushWork, Table};
+use super::table::{self, FlushOutcome, FlushWork, Persistence, Table};
 use super::columnar;
 
 thread_local! {
@@ -41,7 +41,7 @@ impl PartitionedTable {
         schema: SchemaDescriptor,
         table_id: u32,
         num_partitions: u32,
-        durable: bool,
+        persistence: Persistence,
         part_start: u32,
         part_end: u32,
         arena_size: u64,
@@ -76,7 +76,7 @@ impl PartitionedTable {
             } else {
                 format!("{}/part_{}", dir, p)
             };
-            let t = Table::new(&part_dir, name, schema, table_id, arena_size, durable)?;
+            let t = Table::new(&part_dir, name, schema, table_id, arena_size, persistence)?;
             tables.push(t);
         }
 
@@ -314,11 +314,11 @@ impl PartitionedTable {
     pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
         let mut works = Vec::new();
         for (i, table) in self.tables.iter_mut().enumerate() {
-            // Honor each child's own durability. Base-table children are
+            // Each child honors its own durability. Base-table children are
             // durable (return `Pending`); non-durable view children flush
             // in-memory (return `DoneInline`) and stop writing throwaway shards
             // at checkpoint.
-            match table.flush_prepare(table.is_durable())? {
+            match table.flush_prepare()? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => {}
                 FlushOutcome::Pending(w) => works.push((i, *w)),
             }
@@ -503,7 +503,7 @@ mod tests {
         let tdir = dir.path().join("sp_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1, false, 0, 1,
+            tdir.to_str().unwrap(), "test", schema, 100, 1, Persistence::Ephemeral, 0, 1,
             partition_arena_size(1),
         ).unwrap();
 
@@ -522,7 +522,7 @@ mod tests {
         let tdir = dir.path().join("mp_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 200, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -542,7 +542,7 @@ mod tests {
         let tdir = dir.path().join("mc_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 300, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 300, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -560,7 +560,7 @@ mod tests {
         let tdir = dir.path().join("rt_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 400, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 400, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -645,7 +645,7 @@ mod tests {
         // We feed only PKs that route elsewhere, so this exercises the new
         // wide *routing* loop end-to-end with no downstream Table ingest.
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 700, 256, false, 0, 1,
+            tdir.to_str().unwrap(), "test", schema, 700, 256, Persistence::Ephemeral, 0, 1,
             partition_arena_size(256),
         ).unwrap();
 
@@ -683,7 +683,7 @@ mod tests {
         let tdir = dir.path().join("cpo_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 500, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 500, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -703,7 +703,7 @@ mod tests {
         let tdir = dir.path().join("cpo_stale_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 600, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 600, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -754,7 +754,7 @@ mod tests {
         let tdir = dir.path().join("pt_durable_flush");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 800, 256, true, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 800, 256, Persistence::Durable, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -780,7 +780,7 @@ mod tests {
         let tdir = dir.path().join("pt_nondurable_flush");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 810, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 810, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 
@@ -810,7 +810,7 @@ mod tests {
         let tdir = dir.path().join("pt_ccc_inmem");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 820, 256, false, 0, 256,
+            tdir.to_str().unwrap(), "test", schema, 820, 256, Persistence::Ephemeral, 0, 256,
             partition_arena_size(256),
         ).unwrap();
 

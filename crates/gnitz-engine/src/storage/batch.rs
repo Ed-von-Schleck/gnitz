@@ -2268,7 +2268,7 @@ mod tests {
             &[0],
         );
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1, false, 0, 1,
+            tdir.to_str().unwrap(), "test", schema, 100, 1, crate::storage::Persistence::Ephemeral, 0, 1,
             crate::storage::partition_arena_size(1),
         ).unwrap();
 

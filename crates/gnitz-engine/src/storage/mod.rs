@@ -24,7 +24,7 @@ pub(crate) mod batch_pool;
 mod error;
 
 // ── Public API ──────────────────────────────────────────────────────────────
-pub use table::{Table, FlushOutcome, FlushWork};
+pub use table::{Table, FlushOutcome, FlushWork, Persistence};
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
 pub use read_cursor::CursorHandle;
 pub use batch::{Batch, ConsolidatedBatch, write_to_batch, decode_mem_batch_from_wal_block};

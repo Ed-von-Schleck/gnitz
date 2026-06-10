@@ -44,8 +44,8 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-use crate::dag::{DagEngine, StoreHandle};
-use crate::storage::{Batch, PartitionedTable, partition_arena_size, CursorHandle, Table};
+use crate::dag::{DagEngine, RelationKind, StoreHandle};
+use crate::storage::{Batch, PartitionedTable, Persistence, partition_arena_size, CursorHandle, Table};
 
 // Re-export items used by other crate modules.
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};

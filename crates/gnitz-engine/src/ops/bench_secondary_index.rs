@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use super::index::{AviDesc, GiDesc, GI_GC_BYTES, make_avi_schema, make_gi_schema, op_integrate_with_indexes};
 use super::util::{AVI_AV_BYTES, GroupKeyExtractor, IndexColExtractor, encode_ordered};
 use crate::schema::{MAX_PK_BYTES, SchemaColumn, SchemaDescriptor, TypeCode, type_code};
-use crate::storage::{Batch, Table};
+use crate::storage::{Batch, Persistence, Table};
 
 const N_ROWS: usize = 500_000;
 const N_GROUPS: u64 = 10_000;
@@ -105,7 +105,7 @@ fn time_upsert(tmp: &std::path::Path, schema: SchemaDescriptor, base_id: u32, mu
     let mut total = Duration::ZERO;
     for i in 0..=ITERS as u32 {
         let pre = build_pre();
-        let mut t = Table::new(tmp.to_str().unwrap(), "u", schema, base_id + i, arena(), false).unwrap();
+        let mut t = Table::new(tmp.to_str().unwrap(), "u", schema, base_id + i, arena(), Persistence::Ephemeral).unwrap();
         let start = Instant::now();
         t.ingest_owned_batch_memonly(pre).unwrap();
         if i > 0 {
@@ -169,7 +169,7 @@ fn secondary_index_bench_gi_decomposition() {
     // Cross-check the layered sum against the real public entry point.
     let mut id = 1000u32;
     let full = time(|| {
-        let mut t = Table::new(tmp.path().to_str().unwrap(), "gi", gi_schema, id, arena(), false).unwrap();
+        let mut t = Table::new(tmp.path().to_str().unwrap(), "gi", gi_schema, id, arena(), Persistence::Ephemeral).unwrap();
         id += 1;
         let gi = GiDesc { table: &mut t as *mut Table, col_idx: 1 };
         op_integrate_with_indexes(&input, None, &schema, Some(&gi), None).unwrap();
@@ -202,7 +202,7 @@ fn secondary_index_bench_gi_incremental() {
     let gi_schema = make_gi_schema(&schema);
     let tmp = tempfile::tempdir().unwrap();
     let mut t =
-        Table::new(tmp.path().to_str().unwrap(), "gi_inc", gi_schema, 0, arena(), false).unwrap();
+        Table::new(tmp.path().to_str().unwrap(), "gi_inc", gi_schema, 0, arena(), Persistence::Ephemeral).unwrap();
 
     let mut pk: u64 = 0;
     let mut write_t = Duration::ZERO;
@@ -329,7 +329,7 @@ fn secondary_index_bench_avi_decomposition() {
 
     let mut id = 2000u32;
     let full = time(|| {
-        let mut t = Table::new(tmp.path().to_str().unwrap(), "avi", avi_schema, id, arena(), false).unwrap();
+        let mut t = Table::new(tmp.path().to_str().unwrap(), "avi", avi_schema, id, arena(), Persistence::Ephemeral).unwrap();
         id += 1;
         let avi = AviDesc {
             table: &mut t as *mut Table,
