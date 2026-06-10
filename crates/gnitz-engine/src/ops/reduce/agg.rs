@@ -1,6 +1,6 @@
 //! Aggregate opcodes, descriptors, accumulator state, and AVI lookup.
 
-use crate::schema::{SchemaDescriptor, TypeCode};
+use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{MemBatch, ReadCursor};
 
 // ---------------------------------------------------------------------------
@@ -80,33 +80,20 @@ pub(super) struct Accumulator {
     acc: i64,
     col_type_code: TypeCode,
     agg_op: AggOp,
-    /// Payload index when `!is_pk_col`; byte offset within the PK region
-    /// when `is_pk_col`. The fields are disjoint by `is_pk_col`, so a
-    /// single byte slot covers both.
-    pi_or_pk_off: u8,
-    col_size: u8,
-    is_pk_col: bool,
+    /// Where the aggregated column's value lives in a row (PK byte offset or
+    /// dense payload slot). Resolved once; the per-row read goes through it.
+    loc: ColumnLocator,
     has_value: bool,
 }
 
 impl Accumulator {
     pub(super) fn new(desc: &AggDescriptor, schema: &SchemaDescriptor) -> Self {
-        let col_idx = desc.col_idx as usize;
-        let is_pk_col = schema.is_pk_col(col_idx);
-        let tc = desc.col_type_code;
-        let pi_or_pk_off = if is_pk_col {
-            schema.pk_byte_offset(col_idx)
-        } else {
-            schema.try_payload_idx(col_idx).expect("non-PK in the else arm of is_pk_col") as u8
-        };
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
-            col_type_code: tc,
-            pi_or_pk_off,
-            col_size: tc.stride(),
-            is_pk_col,
+            col_type_code: desc.col_type_code,
+            loc: schema.locate(desc.col_idx as usize),
         }
     }
 
@@ -151,15 +138,10 @@ impl Accumulator {
             return;
         }
 
-        let slot = self.pi_or_pk_off as usize;
-
         // Null gate for nullable payload columns. PK columns are never null
-        // (catalog rule), so the probe is skipped for is_pk_col.
-        if !self.is_pk_col {
-            let null_word = mb.get_null_word(row);
-            if (null_word >> slot) & 1 != 0 {
-                return;
-            }
+        // (catalog rule), so `is_null` returns false for them.
+        if self.loc.is_null(mb, row) {
+            return;
         }
 
         // COUNT_NON_NULL: presence established (PK, or non-null payload above).
@@ -171,7 +153,7 @@ impl Accumulator {
         }
 
         let tc = self.col_type_code;
-        let cs = self.col_size as usize;
+        let cs = self.loc.size();
         // SUM/MIN/MAX accumulate into an i64/u64 slot; the planner rejects
         // U128/UUID/BLOB sources for these (decode_signed/decode_float mark them
         // unreachable). STRING is also rejected by the planner, but decode_signed
@@ -185,12 +167,13 @@ impl Accumulator {
 
         // PK regions hold OPK (order-preserving big-endian) bytes; decode the
         // addressed PK column back to native little-endian before aggregating.
+        // A payload column is already native-LE, so `bytes()` is used verbatim.
         let pk_le_buf;
-        let bytes: &[u8] = if self.is_pk_col {
-            pk_le_buf = gnitz_wire::decode_pk_column_owned(&mb.get_pk_bytes(row)[slot..slot + cs], tc as u8);
+        let bytes: &[u8] = if self.loc.is_pk() {
+            pk_le_buf = gnitz_wire::decode_pk_column_owned(self.loc.bytes(mb, row), tc as u8);
             &pk_le_buf[..cs]
         } else {
-            mb.get_col_ptr(row, slot, cs)
+            self.loc.bytes(mb, row)
         };
 
         let first = !self.has_value;

@@ -532,6 +532,13 @@ impl ColumnLocator {
     #[inline]
     pub(crate) fn is_pk(&self) -> bool { matches!(self, ColumnLocator::Pk { .. }) }
 
+    #[inline]
+    pub(crate) fn type_code(&self) -> u8 {
+        match *self {
+            ColumnLocator::Pk { type_code, .. } | ColumnLocator::Payload { type_code, .. } => type_code,
+        }
+    }
+
     /// True iff this column is NULL in `row`. PK columns are never null.
     #[inline]
     pub(crate) fn is_null(&self, mb: &MemBatch, row: usize) -> bool {
@@ -572,6 +579,24 @@ impl ColumnLocator {
                 pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
             ColumnLocator::Payload { slot, size, type_code } =>
                 payload_native_key(mb.get_col_ptr(row, slot as usize, size as usize), 0, size as usize, type_code),
+        }
+    }
+
+    /// Canonical sign-aware *routing* key for the value in `row` — the form
+    /// `partition_for_pk_bytes` and the index routing cache compare on, and the
+    /// routing counterpart to [`Self::native_key`]. A PK column widens its OPK
+    /// bytes; a payload column OPK-encodes then widens, so equal logical values
+    /// route to the same partition whether stored as a PK or a payload column.
+    /// Callers must `is_null`-gate first. STRING/BLOB have no order-preserving
+    /// routing image (this returns `payload_route_key`'s raw low-8-byte image for
+    /// them); a caller routing by string content hashes it before reaching here.
+    #[inline]
+    pub(crate) fn route_key(&self, mb: &MemBatch, row: usize) -> u128 {
+        match *self {
+            ColumnLocator::Pk { byte_off, size, .. } =>
+                pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize),
+            ColumnLocator::Payload { slot, size, type_code } =>
+                payload_route_key(mb.get_col_ptr(row, slot as usize, size as usize), 0, size as usize, type_code),
         }
     }
 }

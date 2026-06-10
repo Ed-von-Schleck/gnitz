@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, type_code};
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
@@ -559,24 +559,24 @@ enum PromoteKind {
 
 impl PkPromoter {
     pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
-        if schema.is_pk_col(col_idx) {
-            let off = schema.pk_byte_offset(col_idx) as usize;
-            let cs = schema.columns[col_idx].size() as usize;
-            let tc = schema.columns[col_idx].type_code;
-            return PkPromoter { kind: PromoteKind::Pk { off, cs, tc } };
-        }
-        let tc = schema.columns[col_idx].type_code;
-        let pi = schema.try_payload_idx(col_idx)
-            .expect("non-PK: PK columns early-return above");
-        let kind = match tc {
-            type_code::U128 | type_code::UUID => PromoteKind::Wide { pi },
-            // BLOB shares the 16-byte German-string struct layout with STRING,
-            // so it must take the same hash path (not the narrow ≤8-byte copy).
-            type_code::STRING | type_code::BLOB => PromoteKind::String { pi },
-            // All ≤8-byte integer and float types: OPK-encode the native value
-            // (sign-flip for signed integers), matching extract_col_key's
-            // payload arm. Float bit patterns OPK-encode as their unsigned image.
-            _ => PromoteKind::Narrow { pi, cs: crate::schema::type_size(tc) as usize, tc },
+        let kind = match schema.locate(col_idx) {
+            ColumnLocator::Pk { byte_off, size, type_code } =>
+                PromoteKind::Pk { off: byte_off as usize, cs: size as usize, tc: type_code },
+            ColumnLocator::Payload { slot, size, type_code } => {
+                let pi = slot as usize;
+                match type_code {
+                    type_code::U128 | type_code::UUID => PromoteKind::Wide { pi },
+                    // BLOB shares the 16-byte German-string struct layout with
+                    // STRING, so it must take the same hash path (not the narrow
+                    // ≤8-byte copy).
+                    type_code::STRING | type_code::BLOB => PromoteKind::String { pi },
+                    // All ≤8-byte integer and float types: OPK-encode the native
+                    // value (sign-flip for signed integers), matching
+                    // extract_col_key's payload arm. Float bit patterns OPK-encode
+                    // as their unsigned image.
+                    _ => PromoteKind::Narrow { pi, cs: size as usize, tc: type_code },
+                }
+            }
         };
         PkPromoter { kind }
     }

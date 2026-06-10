@@ -33,58 +33,30 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
 /// Extract the routing key for `col_idx` from row `row` of `mb`.
 /// STRING columns are hashed to u64 (stored as u128); all others use the full value.
 fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
-    if schema.is_pk_col(col_idx) {
-        // PK region holds OPK bytes. `widen_pk_be` here matches
-        // `partition_for_pk_bytes` (which also calls `widen_pk_be`), giving the
-        // native value for unsigned and the sign-flipped value for signed.
-        // Decoding to native LE would disagree with `partition_for_pk_bytes` on
-        // signed PKs (it has no schema and cannot decode).
-        let offset = schema.pk_byte_offset(col_idx) as usize;
-        let bytes = mb.get_pk_bytes(row);
-        let col_size = schema.columns[col_idx].size() as usize;
-        return gnitz_wire::widen_pk_be(&bytes[offset..offset + col_size], col_size);
-    }
-    let pi = schema.try_payload_idx(col_idx).expect("non-PK: PK columns early-return above");
+    let loc = schema.locate(col_idx);
     // NULL values shard together. Return 0 without touching the slot: a NULL
     // string/blob column's German-string length field is uninitialized, and a
-    // garbage length > SHORT_STRING_THRESHOLD would drive a wild heap read. The
-    // null bitmap covers every non-PK payload column, so the bit is always valid.
-    let null_word = mb.get_null_word(row);
-    if (null_word >> pi) & 1 != 0 {
+    // garbage length > SHORT_STRING_THRESHOLD would drive a wild heap read. PK
+    // columns are never null, so this only fires for a payload column.
+    if loc.is_null(mb, row) {
         return 0u128;
     }
-    let col = &schema.columns[col_idx];
-    let col_size = col.size() as usize;
-    if gnitz_wire::is_german_string(col.type_code) {
-        // German strings have the 16-byte header layout (col_size = 16); the
-        // generic else-branch's 8-byte buffer would panic.
-        let struct_bytes = mb.get_col_ptr(row, pi, 16);
-        let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-        if length == 0 {
-            0u128
-        } else if length <= crate::schema::SHORT_STRING_THRESHOLD {
-            crate::xxh::checksum(&struct_bytes[4..4 + length]) as u128
-        } else {
-            let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-            crate::xxh::checksum(crate::schema::long_string_bytes(mb.blob, heap_offset, length)) as u128
-        }
-    } else if col.type_code == crate::schema::type_code::U128
-        || col.type_code == crate::schema::type_code::UUID
-    {
-        // UUID and U128 are distinct type codes sharing the same 16-byte stride;
-        // UUID must take the wide path or the 8-byte else-branch buffer panics.
-        let bytes = mb.get_col_ptr(row, pi, 16);
-        u128::from_le_bytes(bytes[0..16].try_into().unwrap())
-    } else {
-        // Integer payload column (e.g. an FK joining to an integer PK): the
-        // value is native LE. OPK-encode it, then `widen_pk_be`, so the result
-        // agrees with `partition_for_pk_bytes(OPK)` on the PK side — including
-        // signed columns, where a raw LE read would route to the wrong worker.
-        let bytes = mb.get_col_ptr(row, pi, col_size);
-        let mut opk = [0u8; 16];
-        gnitz_wire::encode_pk_column(&bytes[..col_size], col.type_code, &mut opk[..col_size]);
-        gnitz_wire::widen_pk_be(&opk[..col_size], col_size)
+    // German strings have no order-preserving routing image; route by a content
+    // hash (a raw byte image would alias distinct strings sharing a prefix). PK
+    // columns are never STRING/BLOB, so `is_german_string` already implies a
+    // payload column. A 64-bit hash widened to u128 is deliberate: this key feeds
+    // only the index-routing cache, whose string seeks fall back to broadcast
+    // (`index_route_key` returns None for STRING/BLOB), so it need not match the
+    // 128-bit join-scatter image `german_string_promote_key` produces.
+    if gnitz_wire::is_german_string(loc.type_code()) {
+        let content = crate::schema::german_string_content(loc.bytes(mb, row), mb.blob);
+        return if content.is_empty() { 0u128 } else { crate::xxh::checksum(content) as u128 };
     }
+    // PK column → widen its OPK bytes; integer / U128 / UUID payload → OPK-encode
+    // then widen. Both agree with `partition_for_pk_bytes` on the PK side
+    // (including the sign-flip for signed columns). Matched by `index_route_key`,
+    // which rebuilds this same key from a native seek value.
+    loc.route_key(mb, row)
 }
 
 /// Build a 256-entry partition→worker lookup table, hoisting the division out
@@ -210,19 +182,17 @@ fn route_partition_key(
         let col = &schema.columns[c_idx];
         let tc = col.type_code;
         if !schema.is_pk_col(c_idx) {
+            let loc = schema.locate(c_idx);
             if crate::schema::is_routable_int(tc) {
-                let cs = col.size() as usize;
-                let pi = schema.try_payload_idx(c_idx).expect("non-PK: guarded by !is_pk_col");
-                let ptr = mb.get_col_ptr(row, pi, cs);
-                return crate::schema::payload_route_key(ptr, 0, cs, tc);
+                // OPK-encode+widen the native value (sign-flip for signed), so it
+                // agrees with the `_join_pk` `PkPromoter::promote_into` writes.
+                return loc.route_key(mb, row);
             }
             // A string join key reindexes to the same content hash; route by it
             // so the row co-locates with its `_join_pk` partition. A NULL string
             // is a zeroed struct → empty content → 0, matching promote_into.
             if gnitz_wire::is_german_string(tc) {
-                let pi = schema.try_payload_idx(c_idx).expect("non-PK: guarded by !is_pk_col");
-                let struct_bytes = mb.get_col_ptr(row, pi, 16);
-                return crate::ops::linear::german_string_promote_key(struct_bytes, mb.blob);
+                return crate::ops::linear::german_string_promote_key(loc.bytes(mb, row), mb.blob);
             }
         }
     }
