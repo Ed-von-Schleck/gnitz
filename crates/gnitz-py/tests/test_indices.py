@@ -1420,6 +1420,27 @@ class TestAtomicUniqueTransfers:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
+    def test_non_unique_pk_weight2_row_rejected(self, client):
+        """A single fresh-value row at weight=2 on a non-unique_pk table is two
+        live instances — the same violation as two +1 rows of the value, which
+        the in-batch check rejects; the consolidated encoding must not slip."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("id", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid, schema = self._raw_table(client, sn, cols, unique_pk=False)
+            b = gnitz.ZSetBatch(schema)
+            b.append(id=1, val=5, weight=2)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+            # The same row at unit weight passes.
+            b = gnitz.ZSetBatch(schema)
+            b.append(id=1, val=5, weight=1)
+            client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # TestUniqueIndexCreatePreflight
@@ -1681,3 +1702,78 @@ class TestUniqueIndexCreatePreflight:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_pk", f"{sn}__t__idx_val"],
                       tables=["t"])
+
+    def _non_unique_pk_table(self, client, sn):
+        """Raw table `t` without unique_pk enforcement. Returns (tid, schema)."""
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid = client.create_table(sn, "t", cols, unique_pk=False)
+        return tid, gnitz.Schema(cols)
+
+    def test_preexisting_consolidated_duplicate_rejected(self, client):
+        """The identical (PK, payload) row pushed twice consolidates into ONE
+        weight-2 row — two live instances of its key that never surface as two
+        rows. The pre-flight must reject it, exactly as the same insert is
+        rejected once the index exists."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._non_unique_pk_table(client, sn)
+            for _ in range(2):
+                b = gnitz.ZSetBatch(schema)
+                b.append(pk=1, val=10)
+                client.push(tid, b)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_preexisting_weight2_row_rejected(self, client):
+        """A single push can carry weight=2 directly — the same consolidated
+        state as pushing the row twice; the pre-flight must reject it."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._non_unique_pk_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10, weight=2)
+            client.push(tid, b)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+            # Control: distinct values on the same kind of table still pass.
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10, weight=-2)  # clear the duplicate
+            b.append(pk=2, val=20)
+            client.push(tid, b)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_unique_pk_weight2_push_collapses_to_one_instance(self, client):
+        """On a unique_pk table a pushed weight ≥ 2 is the row repeated: it
+        must collapse to ONE live instance (repeated upsert of itself), a
+        single delete must remove it entirely, and the sole-PK-column unique
+        index stays trivially creatable (the PK short-circuit's premise)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            schema = gnitz.Schema(cols)
+            tid = client.create_table(sn, "t", cols, unique_pk=True)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10, weight=2)
+            client.push(tid, b)
+            rows = [(r.pk, r.weight) for r in client.scan(tid) if r.weight > 0]
+            assert rows == [(1, 1)], rows
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10, weight=-1)
+            client.push(tid, b)
+            assert [r for r in client.scan(tid) if r.weight > 0] == []
+            client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_pk"], tables=["t"])

@@ -231,7 +231,7 @@ fn extract_into_filter(
     batch: &crate::storage::MemBatch<'_>,
     loc: ColumnLocator,
 ) {
-    for_each_index_key(batch, loc, |key| {
+    for_each_index_key(batch, loc, |key, _w| {
         filter.insert(key);
         !filter.capped // stop walking once the filter caps
     });
@@ -1443,7 +1443,9 @@ impl MasterDispatcher {
                         if w == 0 { continue; }
                         let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
                         entry.0 += w;
-                        if w > 0 { entry.1 += 1; }
+                        // A +w row is w insertions of the PK; Error mode must
+                        // reject it like the w separate +1 rows it encodes.
+                        if w > 0 { entry.1 += if w > 1 { 2 } else { 1 }; }
                     }
                     if needs_pk_rejection {
                         for (&pk, &(_, pos_count)) in m.iter() {
@@ -1470,7 +1472,9 @@ impl MasterDispatcher {
                     if w == 0 { continue; }
                     let entry = m.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert((0, 0));
                     entry.0 += w;
-                    if w > 0 { entry.1 += 1; }
+                    // A +w row is w insertions of the PK; Error mode must
+                    // reject it like the w separate +1 rows it encodes.
+                    if w > 0 { entry.1 += if w > 1 { 2 } else { 1 }; }
                 }
                 if needs_pk_rejection {
                     for (pk, &(_, pos_count)) in m.iter() {
@@ -1928,11 +1932,22 @@ impl MasterDispatcher {
             }
 
             for i in 0..batch.count {
-                if batch.get_weight(i) <= 0 { continue; }
+                let w = batch.get_weight(i);
+                if w <= 0 { continue; }
 
                 if loc.is_null(&mb, i) { continue; }
 
                 let key = loc.native_key(&mb, i);
+
+                // One row at weight w is the value w times. On a non-unique_pk
+                // table that is w live instances (enforce_unique_pk collapses
+                // it to one on unique_pk tables) — the same violation as w
+                // separate +1 rows, which `seen` below rejects.
+                if !unique_pk && w > 1 {
+                    return Err(unsafe {
+                        (*disp_ptr).unique_violation_err(target_id, source_col, true)
+                    });
+                }
 
                 // In-batch duplicate detection runs for ALL positive-weight
                 // rows, INCLUDING UPSERTs: two rows setting the same new unique

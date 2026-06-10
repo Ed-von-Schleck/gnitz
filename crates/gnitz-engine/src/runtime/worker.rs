@@ -1196,10 +1196,12 @@ impl WorkerProcess {
     /// positive-weight, non-null row of this worker's committed partition of
     /// `owner_id` to the native u128 index key of `col_idx` (the same
     /// `for_each_index_key` contract the master's filter warmup and merge
-    /// use), sort the keys, and stream them back sorted. No local dedup and
-    /// no within-partition duplicate check: the master's adjacent-equal merge
-    /// subsumes both, and a `Vec<u128>` (16 B/key contiguous) beats a
-    /// `BTreeSet` on both memory and sort cost.
+    /// use), sort the keys, and stream them back sorted. A consolidated row
+    /// at weight ≥ 2 emits its key twice — it IS that many live instances of
+    /// the key, and the duplicate must be visible to the merge as an adjacent
+    /// pair. No local dedup and no within-partition duplicate check: the
+    /// master's adjacent-equal merge subsumes both, and a `Vec<u128>`
+    /// (16 B/key contiguous) beats a `BTreeSet` on both memory and sort cost.
     ///
     /// MUST observe the same snapshot `backfill_index` will later project:
     /// the master sends this command inside the DDL critical section
@@ -1237,8 +1239,12 @@ impl WorkerProcess {
         if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
                 keys.reserve(chunk.count);
-                for_each_index_key(&chunk.as_mem_batch(), loc, |k| {
+                for_each_index_key(&chunk.as_mem_batch(), loc, |k, w| {
                     keys.push(k);
+                    // Chunks are consolidated: weight ≥ 2 is the same row w
+                    // times; one extra copy suffices to put an adjacent equal
+                    // pair in the sorted stream for the master's merge.
+                    if w > 1 { keys.push(k); }
                     true
                 });
             }

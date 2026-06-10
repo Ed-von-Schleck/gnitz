@@ -233,6 +233,33 @@ fn test_validate_unique_indices_batch_internal_dup() {
 }
 
 #[test]
+fn test_validate_unique_indices_weight2_row_is_batch_dup() {
+    // One row at weight w is the value w times: a fresh-value row pushed at
+    // weight 2 on a non-unique_pk table commits two live instances — the same
+    // violation as two +1 rows of the value, which the in-batch check rejects.
+    let dir = temp_dir("catalog_uidx_weight2");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", "val", true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 2); bb.put_u64(99); bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err(), "weight-2 fresh-value row must be an in-batch duplicate");
+    assert!(result.unwrap_err().contains("duplicate in batch"));
+
+    // The same row at unit weight passes.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(99); bb.end_row();
+    assert!(engine.validate_unique_indices(tid, &bb.finish()).is_ok());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_validate_unique_indices_upsert_same_value_ok() {
     let dir = temp_dir("catalog_uidx_upsert_same");
     let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -1709,6 +1736,67 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
     engine.ddl_scan_chunk_rows = 3;
     assert!(engine.create_index("public.child", "refc", true).is_err(),
         "cross-chunk duplicate must fail the promotion scan");
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false),
+        "the incumbent FK circuit must stay non-unique");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_weight2_row_rejected() {
+    // On a non-unique_pk table the identical (PK, payload) row inserted twice
+    // consolidates into ONE row with weight 2 — two live instances of its
+    // index key that never surface as two catchable rows. The backfill gate
+    // must read the weight, not just the sign.
+    let dir = temp_dir("unique_idx_weight2");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    for _ in 0..2 {
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1u128, 1); bb.put_u64(42); bb.end_row();
+        engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    }
+    engine.flush_family(tid).unwrap();
+
+    let before = count_records(&mut engine.sys_indices);
+    let r = engine.create_index("public.t", "val", true);
+    assert!(r.is_err(), "unique index over a weight-2 duplicate must fail");
+    assert!(r.unwrap_err().contains("duplicate values"));
+    assert_eq!(count_records(&mut engine.sys_indices), before,
+        "the failed unique index row must net out of sys_indices");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_promote_unique_weight2_row_rejected() {
+    // The same consolidated weight-2 duplicate behind an incumbent FK
+    // auto-index: the UNIQUE newcomer folds into the incumbent via the
+    // promotion scan, which must also count weight ≥ 2 as duplicate
+    // instances and leave the incumbent non-unique.
+    let dir = temp_dir("promote_weight2");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], false).unwrap();
+
+    let schema = engine.get_schema(child_tid).unwrap();
+    for _ in 0..2 {
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1u128, 1); bb.put_u64(7); bb.end_row();
+        engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
+    }
+    engine.flush_family(child_tid).unwrap();
+
+    assert!(engine.create_index("public.child", "refc", true).is_err(),
+        "promotion over a weight-2 duplicate must fail");
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false),
         "the incumbent FK circuit must stay non-unique");
 

@@ -261,10 +261,19 @@ impl CatalogEngine {
             }
 
             for row in 0..batch.count {
-                if batch.get_weight(row) <= 0 { continue; }
+                let w = batch.get_weight(row);
+                if w <= 0 { continue; }
                 // PK columns are non-nullable; a NULL payload column is skipped.
                 if loc.is_null(&mb, row) { continue; }
                 let key_u128 = loc.native_key(&mb, row);
+
+                // One row at weight w is the value w times. On a non-unique_pk
+                // table that is w live instances (enforce_unique_pk collapses
+                // it to one on unique_pk tables) — the same violation as w
+                // separate +1 rows, which `seen` below rejects.
+                if !unique_pk && w > 1 {
+                    return Err(self.unique_violation_err(table_id, source_col_idx, true));
+                }
 
                 // UPSERT iff the row's PK is a net-positive PK in this batch AND
                 // already has a live base-table row. The net-positive gate (not

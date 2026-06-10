@@ -572,6 +572,15 @@ impl Batch {
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * 8)
     }
+    /// Overwrite a row's weight in place. Clears `consolidated`: the new
+    /// weight may equal an adjacent row's element weight or zero.
+    #[inline]
+    pub fn set_weight(&mut self, row: usize, w: i64) {
+        debug_assert!(row < self.count, "set_weight: row {} out of bounds ({})", row, self.count);
+        let off = self.offsets[REG_WEIGHT] + row * 8;
+        self.data[off..off + 8].copy_from_slice(&w.to_le_bytes());
+        self.consolidated = false;
+    }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * 8)

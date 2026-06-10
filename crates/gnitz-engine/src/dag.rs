@@ -1652,6 +1652,21 @@ impl DagEngine {
         self.execute_post_multi(view_id, vec![(a_seed, cons_a), (b_seed, cons_b)])
     }
 
+    /// unique_pk contract: per-PK accumulated weight ∈ {0, 1}. A pushed row at
+    /// |w| > 1 is the row repeated; retract-before-insert collapses repeats to
+    /// one live instance (and a delete removes at most one), so normalize
+    /// weights to ±1 before the enforcement walk. Must run on the input batch,
+    /// not at append time: `append_batch_negated` re-reads the original row,
+    /// so clamping only the appended copy would emit `+1` then `-w` for the
+    /// same element and drive intra-batch dedup net-negative.
+    fn normalize_unique_pk_weights(batch: &mut Batch) {
+        for row in 0..batch.count {
+            let w = batch.get_weight(row);
+            if w > 1 { batch.set_weight(row, 1); }
+            else if w < -1 { batch.set_weight(row, -1); }
+        }
+    }
+
     /// Enforce unique PK semantics: retract existing rows before inserting.
     /// Port of `registry._enforce_unique_pk()`.
     /// Used for Single (view) stores where retractions don't need to propagate
@@ -1664,11 +1679,12 @@ impl DagEngine {
     fn enforce_unique_pk(
         table: &mut Table,
         schema: &SchemaDescriptor,
-        batch: Batch,
+        mut batch: Batch,
     ) -> Batch {
         if batch.count == 0 {
             return batch;
         }
+        Self::normalize_unique_pk_weights(&mut batch);
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
         // pk → batch row index of the last +1 insertion in this batch.
@@ -1717,7 +1733,7 @@ impl DagEngine {
     fn enforce_unique_pk_partitioned(
         ptable: &mut PartitionedTable,
         schema: &SchemaDescriptor,
-        batch: Batch,
+        mut batch: Batch,
     ) -> Batch {
         // Retain the empty-batch guard: this is the sole path now, and
         // `Batch::with_schema(_, 0)` still allocates (capacity is forced to ≥1,
@@ -1727,6 +1743,7 @@ impl DagEngine {
         if batch.count == 0 {
             return batch;
         }
+        Self::normalize_unique_pk_weights(&mut batch);
 
         let mut effective = Batch::with_schema(*schema, batch.count * 2);
         // pk → batch row index of the last +1 insertion in this batch.
@@ -2086,6 +2103,68 @@ mod tests {
         // negative-PK row then nets to zero and is gone.
         pt.ingest_owned_batch(effective).unwrap();
         assert!(!pt.has_pk_bytes(&opk), "stored negative-PK row must be gone after retraction");
+    }
+
+    // unique_pk contract: per-PK accumulated weight ∈ {0, 1}. A pushed row at
+    // |w| > 1 is the row repeated; retract-before-insert collapses repeats to
+    // one live instance, so the effective batch must carry unit weights —
+    // otherwise a weight-2 PK row lands (two live instances the -1-normalized
+    // retraction arm can never fully delete) and the CREATE UNIQUE INDEX PK
+    // short-circuit's premise breaks.
+    #[test]
+    fn test_enforce_unique_pk_partitioned_weight_normalized() {
+        use crate::schema::{SchemaColumn, type_code};
+        crate::util::raise_fd_limit_for_tests();
+
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0), // PK
+                SchemaColumn::new(type_code::I64, 0), // payload
+            ],
+            &[0],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("enforce_weight_norm");
+        let mut pt = crate::storage::PartitionedTable::new(
+            tdir.to_str().unwrap(), "enforce_weight_norm", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
+            crate::storage::partition_arena_size(256),
+        ).unwrap();
+
+        let row_pk1 = |payload: i64, weight: i64| {
+            let mut b = Batch::with_schema(schema, 1);
+            b.extend_pk_opk(&schema, &[1u128]);
+            b.extend_weight(&weight.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &payload.to_le_bytes());
+            b.count += 1;
+            b
+        };
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&1u64.to_le_bytes(), type_code::U64, &mut opk);
+
+        // Case 1 — fresh insert at weight 2: one effective row at weight 1.
+        let effective = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, row_pk1(100, 2));
+        assert_eq!(effective.count, 1, "one effective insert row expected");
+        assert_eq!(effective.get_weight(0), 1, "insert weight must be normalized to 1");
+        pt.ingest_owned_batch(effective).unwrap();
+        assert!(pt.has_pk_bytes(&opk), "row must be live after the clamped insert");
+
+        // Case 2 — upsert at weight 2 over the committed row: retraction of the
+        // stored payload at -1, then the new payload at 1.
+        let effective = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, row_pk1(200, 2));
+        assert_eq!(effective.count, 2, "stored retraction + new insert expected");
+        assert_eq!(effective.get_weight(0), -1, "stored-row retraction must be -1");
+        assert_eq!(effective.get_weight(1), 1, "upsert weight must be normalized to 1");
+        pt.ingest_owned_batch(effective).unwrap();
+        assert!(pt.has_pk_bytes(&opk), "row must be live after the upsert");
+
+        // Case 3 — DELETE at weight -3: one -1 retraction; re-ingest nets the
+        // store to exactly zero (no ghost weight survives, no negative net).
+        let effective = DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, row_pk1(200, -3));
+        assert_eq!(effective.count, 1, "one net retraction row expected");
+        assert_eq!(effective.get_weight(0), -1, "retraction weight must be normalized to -1");
+        pt.ingest_owned_batch(effective).unwrap();
+        assert!(!pt.has_pk_bytes(&opk), "row must be fully gone after the delete");
     }
 
     // Positivity regression: a retraction of a key that is absent (never inserted)

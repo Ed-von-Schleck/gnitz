@@ -196,7 +196,7 @@ fn preflight_signed_payload_projection_roundtrip() {
     }
 
     let mut keys: Vec<u128> = Vec::new();
-    for_each_index_key(&batch.as_mem_batch(), schema.locate(1), |k| { keys.push(k); true });
+    for_each_index_key(&batch.as_mem_batch(), schema.locate(1), |k, _w| { keys.push(k); true });
     keys.sort_unstable();
 
     let expected: Vec<u128> = {
@@ -218,6 +218,45 @@ fn preflight_signed_payload_projection_roundtrip() {
         let dup_key = ((-5i64) as u64) as u128;
         assert_eq!(got.iter().filter(|&&k| k == dup_key).count(), 2);
     });
+}
+
+/// A consolidated row at weight 2 is the same (PK, payload) twice: the worker
+/// collection contract (one key per unit of weight, capped at a pair) makes
+/// the multiplicity visible to the merge as an adjacent equal pair, and the
+/// accumulator's verdict is duplicate.
+#[test]
+fn preflight_weight2_row_emits_adjacent_pair() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let mut batch = Batch::with_schema(schema, 4);
+    let rows: [(u128, i64, i64, u64); 3] = [
+        (1, 7, 1, 0),
+        (2, 9, 2, 0),   // consolidated duplicate: weight 2
+        (3, 11, 1, 0),
+    ];
+    for &(pk, val, weight, null_word) in &rows {
+        unsafe {
+            batch.append_row_simple(pk, weight, null_word, &[val], &[0], &[std::ptr::null()], &[0]);
+        }
+    }
+
+    let mut keys: Vec<u128> = Vec::new();
+    for_each_index_key(&batch.as_mem_batch(), schema.locate(1), |k, w| {
+        keys.push(k);
+        if w > 1 { keys.push(k); }
+        true
+    });
+    keys.sort_unstable();
+    assert_eq!(keys, vec![7u128, 9, 9, 11], "weight-2 row must emit its key twice");
+
+    let mut acc = PreflightAccumulator::new(1000);
+    assert!(!offer_all(&mut acc, &keys), "the adjacent pair must flip the verdict");
+    assert!(acc.duplicate);
 }
 
 // ---------------------------------------------------------------------------

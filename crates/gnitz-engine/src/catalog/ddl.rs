@@ -607,7 +607,13 @@ fn projected_chunk_has_dup_keys(
     debug_assert!(key_size <= 16,
         "unique index key size {} exceeds 16-byte dedup buffer", key_size);
     for row in 0..projected.count {
-        if projected.get_weight(row) <= 0 { continue; }
+        let weight = projected.get_weight(row);
+        if weight <= 0 { continue; }
+        // Base-table scan chunks are consolidated: weight ≥ 2 is the same
+        // (PK, payload) row inserted multiple times — that many live
+        // instances of the same index key. NULL-valued rows never reach
+        // here (batch_project_index skips them).
+        if weight > 1 { return true; }
         let pk_bytes = projected.get_pk_bytes(row);
         let mut buf = [0u8; 16];
         buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);

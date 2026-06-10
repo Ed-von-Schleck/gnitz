@@ -601,8 +601,11 @@ impl ColumnLocator {
     }
 }
 
-/// Invoke `f` with the native `u128` index key of every positive-weight,
-/// non-null row of `batch`, reading the indexed column through `loc`.
+/// Invoke `f` with the native `u128` index key and the weight of every
+/// positive-weight, non-null row of `batch`, reading the indexed column
+/// through `loc`. The weight matters because scans are consolidated: a row at
+/// weight `w ≥ 2` is the same (PK, payload) element `w` times, and uniqueness
+/// consumers must see that multiplicity (membership-only consumers ignore it).
 /// Returning `false` from `f` stops *this batch's* walk early (callers use it
 /// to bail once a filter caps or a duplicate is found); it does NOT stop any
 /// surrounding frame drain — the master's drains keep consuming every frame
@@ -624,13 +627,14 @@ impl ColumnLocator {
 pub(crate) fn for_each_index_key(
     batch: &MemBatch<'_>,
     loc: ColumnLocator,
-    mut f: impl FnMut(u128) -> bool,
+    mut f: impl FnMut(u128, i64) -> bool,
 ) {
     for i in 0..batch.count {
-        if batch.get_weight(i) <= 0 { continue; }
+        let w = batch.get_weight(i);
+        if w <= 0 { continue; }
         // PK columns are never null; a NULL payload column is skipped.
         if loc.is_null(batch, i) { continue; }
-        if !f(loc.native_key(batch, i)) { return; }
+        if !f(loc.native_key(batch, i), w) { return; }
     }
 }
 
