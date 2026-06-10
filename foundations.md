@@ -151,6 +151,17 @@ Only non-linear and bilinear operators need the integral. The output of
   `d(A ⋈ B) = dA ⋈ z⁻¹(I(B)) + dB ⋈ z⁻¹(I(A))`
   Both sides use old-state cursors. Correct under single-source-per-epoch
   (dA ⋈ dB = 0).
+- **Shared-source branches** (`t ⋈ view-over-t`) do not break this: one
+  user push reaches the two join inputs in two *separate* epochs
+  (`evaluate_dag` queues work per `(view, source_id)` edge), and trace
+  cursors are rebuilt at each epoch start. The later epoch joins its
+  delta against a trace that already absorbed the earlier epoch's delta,
+  so the cross-term `dA ⋈ dB` is emitted exactly once — the asymmetric
+  2-term form, realized across epochs. The only shape that would place
+  two simultaneous deltas in one epoch — the same `source_id` feeding
+  both join inputs — is rejected by the planner (self-join and
+  same-relation INTERSECT/EXCEPT guards; the discriminator is source-id
+  equality, not base-table overlap).
 - Require integral of both operands. Consolidation required.
 - **Join output schema:** `[left_PK, left_payload..., right_payload...]`.
   Output PK = left input PK (= join key after exchange repartition).

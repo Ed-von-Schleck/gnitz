@@ -118,11 +118,10 @@ impl CatalogEngine {
     /// the shared tail of [`CatalogDeltaSink::submit`] / `submit_local`. When
     /// `pin_lsn` is `Some(lsn)` it pins the family's `current_lsn` to `lsn.get()`
     /// (the DDL zone LSN) so recovery's dedup check (`msg.lsn <= flushed`) matches
-    /// the SAL group LSN. At boot `ingest_lsn` is seeded above every table's
-    /// `current_lsn`, so the first pins never regress the counter; at runtime
-    /// un-pinned sys-table ingests auto-bump counters past the zone allocator, so
-    /// a later pin can regress a drifted counter (a pre-existing watermark
-    /// hazard, unrelated to this method). Does NOT broadcast.
+    /// the SAL group LSN. Pins never regress the counter: the zone allocator
+    /// takes `max(ingest_lsn, max_table_current_lsn()) + 1`, so even counters
+    /// drifted by un-pinned auto-bump ingests sit strictly below every newly
+    /// allocated zone LSN. Does NOT broadcast.
     fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: Option<NonZeroU64>) -> Result<(), String> {
         let id = family.id();
         let table = self.sys_table_mut(id)
@@ -1378,10 +1377,11 @@ impl CatalogEngine {
     }
 
     /// Maximum `current_lsn` across all tables — system and user. The
-    /// executor seeds `shared.ingest_lsn` from this at boot so the next
-    /// allocated zone LSN is strictly greater than every table's current
-    /// counter, keeping the direct assignment in `ingest_to_family`
-    /// monotonic across upgrades and restarts.
+    /// executor seeds `shared.ingest_lsn` from this at boot and the DDL
+    /// zone allocator re-reads it per DDL, so every allocated zone LSN is
+    /// strictly greater than each table's current counter: no recovery
+    /// watermark a checkpoint persisted can cover a committed-but-unflushed
+    /// zone, and a failed zone's pinned LSN is never reused.
     pub fn max_table_current_lsn(&self) -> u64 {
         let mut max_lsn = 0u64;
         for &tid in SYS_TABLE_IDS {

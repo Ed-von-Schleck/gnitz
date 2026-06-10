@@ -294,6 +294,86 @@ def test_ddl_crash_with_workers_no_orphans():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _index_on_col(conn, owner_tid, col_idx):
+    """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
+    from gnitz.core import IDX_TAB
+    _, batch_obj, _ = conn._client.scan(IDX_TAB)
+    if batch_obj is None:
+        return False
+    for i in range(len(batch_obj.pks)):
+        if batch_obj.weights[i] <= 0:
+            continue
+        if (batch_obj.columns[1][i] == owner_tid
+                and batch_obj.columns[3][i] == col_idx):
+            return True
+    return False
+
+
+def test_create_index_after_fk_tables_survives_crash():
+    """An fsync-acknowledged CREATE INDEX must survive a crash that happens
+    before the next checkpoint.
+
+    FK auto-indices are applied via un-pinned local ingests that bump
+    sys_indices' current_lsn once per non-PK FK column, while the CREATE TABLE
+    consumes a single zone LSN — so the IDX_TAB recovery watermark drifts ahead
+    of the zone allocator. A checkpoint persists the drifted counter, and a
+    later CREATE INDEX whose zone LSN sits at or below it is deduped away by
+    recovery's `msg.lsn <= flushed` check: the index vanishes despite the ACK.
+    """
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # Tiny checkpoint threshold: the DDL broadcasts below push the SAL
+        # cursor far past 1 KB, so the first INSERT's committer cycle runs a
+        # checkpoint — and completes it before acking the push.
+        proc = _start_server(
+            data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"},
+        )
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("idxcrash")
+        conn.execute_sql(
+            "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="idxcrash",
+        )
+        # Three child tables x four non-PK FK columns: each CREATE TABLE
+        # consumes one zone LSN but bumps sys_indices' counter by four,
+        # drifting the IDX_TAB watermark well past the zone allocator.
+        for t in ("c1", "c2", "c3"):
+            conn.execute_sql(
+                f"CREATE TABLE {t} ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  f1 BIGINT NOT NULL REFERENCES p(id),"
+                "  f2 BIGINT NOT NULL REFERENCES p(id),"
+                "  f3 BIGINT NOT NULL REFERENCES p(id),"
+                "  f4 BIGINT NOT NULL REFERENCES p(id),"
+                "  val BIGINT NOT NULL)",
+                schema_name="idxcrash",
+            )
+        # Committer checkpoint fires before this push is acked, persisting
+        # the drifted IDX_TAB watermark.
+        conn.execute_sql("INSERT INTO p VALUES (1, 100)", schema_name="idxcrash")
+
+        # The acknowledged DDL under test.
+        conn.execute_sql("CREATE INDEX ON c1(val)", schema_name="idxcrash")
+        c1_tid, _ = conn.resolve_table("idxcrash", "c1")
+        VAL_COL = 5  # cid, f1..f4, val
+        assert _index_on_col(conn, c1_tid, VAL_COL), "index missing pre-crash"
+        conn.close()
+
+        # SIGKILL before any further checkpoint: the CREATE INDEX lives only
+        # in the SAL, guarded by the watermark dedup.
+        proc = _restart_server(proc, data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        c1_tid2, _ = conn.resolve_table("idxcrash", "c1")
+        assert c1_tid2 == c1_tid
+        assert _index_on_col(conn, c1_tid2, VAL_COL), \
+            "acknowledged CREATE INDEX lost after crash recovery"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Orphan table/view/index directory reclamation on boot (gc_orphan_directories)
 # ---------------------------------------------------------------------------

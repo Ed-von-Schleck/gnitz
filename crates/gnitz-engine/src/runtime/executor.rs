@@ -1117,7 +1117,18 @@ async fn handle_system_dml(
     // visible to readers only after fsync confirms durability — Cleanup D
     // closes the pre-fsync window where clients could see an LSN whose
     // backing data is not yet on disk.
-    let zone_lsn = shared.ingest_lsn.get() + 1;
+    //
+    // Allocation must dominate every family's current_lsn, not just
+    // ingest_lsn: un-pinned sys-table ingests (FK auto-indices, rollback
+    // compensation) auto-bump family counters past the zone allocator, and
+    // a checkpoint persists drifted counters as recovery dedup watermarks.
+    // A zone LSN at or below such a watermark would have its committed-but-
+    // unflushed deltas deduped away on recovery (`msg.lsn <= flushed`),
+    // silently dropping an fsync-acknowledged DDL. Taking the max also
+    // keeps a failed DDL's pinned LSN (never published to ingest_lsn) from
+    // being reused by the next zone.
+    let zone_lsn = shared.ingest_lsn.get()
+        .max(unsafe { (*cat_ptr_raw).max_table_current_lsn() }) + 1;
     let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
     unsafe { (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz); }
 
